@@ -2,12 +2,6 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "glm-correctness",
-        "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "correctness",
-        "variant": "low"
-      },
-      {
         "id": "minimax-high",
         "model": "minimax/MiniMax-M3",
         "prompt": "correctness",
@@ -18,28 +12,20 @@
         "model": "minimax/MiniMax-M3",
         "prompt": "correctness",
         "variant": "max"
-      },
-      {
-        "id": "kimi-correctness",
-        "model": "openrouter/moonshotai/kimi-k2.7-code",
-        "prompt": "correctness",
-        "variant": "low"
-      },
-      {
-        "id": "nemotron-correctness",
-        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "correctness",
-        "variant": "low"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "deepseek-verifier",
-        "model": "openrouter/deepseek/deepseek-v4-pro",
+        "id": "glm-flash-verifier",
+        "model": "openrouter/z-ai/glm-4.7-flash",
         "prompt": "verify",
         "variant": "low"
       }
-    ]
+    ],
+    "deduper": {
+      "model": "openrouter/minimax/minimax-m3",
+      "variant": "low"
+    }
   },
   "critical": {
     "review_lanes": [
@@ -85,6 +71,10 @@
         "model": "openai/gpt-5.5",
         "prompt": "verify-critical"
       }
-    ]
+    ],
+    "deduper": {
+      "model": "openrouter/minimax/minimax-m3",
+      "variant": "low"
+    }
   }
 }

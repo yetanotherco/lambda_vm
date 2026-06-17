@@ -37,6 +37,7 @@ jobs:
       head_ref: ${{ steps.prepare.outputs.head_ref }}
       review_lanes: ${{ steps.prepare.outputs.review_lanes }}
       verifier_lanes: ${{ steps.prepare.outputs.verifier_lanes }}
+      deduper: ${{ steps.prepare.outputs.deduper }}
       custom_prompt: ${{ steps.prepare.outputs.custom_prompt }}
     steps:
       - name: Checkout review runner
@@ -218,11 +219,14 @@ jobs:
 
       - name: Merge candidate findings
         id: candidates
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
         run: |
           python3 runner/.github/scripts/ai_review.py candidates \
             --lanes-dir ai-review-lanes \
             --context ai-review-context/context.json \
             --out-dir ai-review-candidates \
+            --deduper '${{ needs.prepare.outputs.deduper }}' \
             --output "$GITHUB_OUTPUT"
 
       - name: Upload candidates

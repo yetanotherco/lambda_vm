@@ -102,6 +102,7 @@ def main() -> int:
     candidates.add_argument("--lanes-dir", required=True)
     candidates.add_argument("--context", required=True)
     candidates.add_argument("--out-dir", required=True)
+    candidates.add_argument("--deduper", help="JSON {model, variant} for the LLM dedup pass")
     candidates.add_argument("--output")
 
     verify = sub.add_parser("verify-lane")
@@ -187,6 +188,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "head_ref": f"refs/remotes/origin/pr/{pr_number}/head",
         "review_lanes": json.dumps(review_lanes, separators=(",", ":")),
         "verifier_lanes": json.dumps(verifier_lanes, separators=(",", ":")),
+        "deduper": json.dumps(tier_config.get("deduper") or {}, separators=(",", ":")),
         "custom_prompt": custom_prompt,
     }
     write_github_outputs(pathlib.Path(args.output), outputs)
@@ -279,6 +281,13 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     lane_results = load_json_files(pathlib.Path(args.lanes_dir))
     context = read_json(pathlib.Path(args.context))
     candidates = build_candidates(lane_results, context)
+    # Second-pass LLM dedup (configured per tier as "deduper" in matrix.json) catches
+    # reworded duplicates the file+text heuristic misses. Safe to skip on any failure.
+    deduper = json.loads(args.deduper) if getattr(args, "deduper", None) else None
+    before = len(candidates.get("issues", []))
+    candidates = llm_dedup_candidates(candidates, deduper, os.environ.get("OPENROUTER_API_KEY"))
+    if deduper and deduper.get("model"):
+        print(f"llm dedup: {before} -> {len(candidates.get('issues', []))} candidates", file=sys.stderr)
     out_dir = pathlib.Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     write_json(out_dir / "candidates.json", candidates)
@@ -961,6 +970,9 @@ def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str
     provider = lane.get("provider")
     if provider is not None:
         payload["provider"] = provider
+    reasoning = lane.get("reasoning")
+    if reasoning is not None:
+        payload["reasoning"] = reasoning
     return payload
 
 
@@ -1031,6 +1043,78 @@ def format_file_context(context: dict[str, Any]) -> str:
             suffix = "\n[base content truncated]" if item.get("base_truncated") else ""
             parts.append(item["base"] + suffix)
     return "\n".join(parts)
+
+
+DEDUP_SYSTEM = (
+    "You de-duplicate code-review findings reported by several reviewers of the same PR. "
+    "You will get a JSON list of findings (id, file, line, title, claim). Group the ids that "
+    "describe the SAME underlying issue (same root cause and fix). Be CONSERVATIVE: only "
+    "group findings that are clearly the same issue; when in doubt do NOT group them. Two "
+    "DIFFERENT bugs that happen to sit on the same line are NOT the same issue. Reply with "
+    'ONLY this JSON and nothing else: {"groups": [["AI-001","AI-007"], ...]} listing only '
+    "groups containing more than one id. Findings not listed are treated as unique."
+)
+
+
+def llm_dedup_candidates(
+    candidates: dict[str, Any], deduper: dict[str, Any] | None, api_key: str | None
+) -> dict[str, Any]:
+    # Conservative LLM clustering of candidates that the file+text heuristic missed
+    # (reworded duplicates from different models). Failure is safe: any error keeps the
+    # heuristic candidates unchanged — at worst some duplicates remain (never a lost finding).
+    issues = candidates.get("issues", [])
+    if not deduper or not deduper.get("model") or not api_key or len(issues) < 2:
+        return candidates
+    compact = [
+        {
+            "id": i["issue_id"],
+            "file": i.get("file"),
+            "line": i.get("line"),
+            "title": i.get("title"),
+            "claim": (i.get("claim") or "")[:300],
+        }
+        for i in issues
+    ]
+    variant = (deduper.get("variant") or "low").lower()
+    effort = variant if variant in {"low", "medium", "high"} else "high"
+    lane = {
+        "model": deduper["model"].removeprefix("openrouter/"),
+        "temperature": 0,
+        "max_output_tokens": int(deduper.get("max_output_tokens", 40000)),
+        "reasoning": {"effort": effort},
+    }
+    try:
+        result = openrouter_chat(lane, DEDUP_SYSTEM, json.dumps(compact, indent=1), api_key)
+        if result.get("status") != "success":
+            return candidates
+        parsed, _ = extract_json(result.get("raw_response", ""), required_key="groups")
+        groups = parsed.get("groups", []) if isinstance(parsed, dict) else []
+    except Exception:
+        return candidates
+    return apply_dedup_clusters(candidates, groups)
+
+
+def apply_dedup_clusters(candidates: dict[str, Any], groups: Any) -> dict[str, Any]:
+    if not isinstance(groups, list) or not groups:
+        return candidates
+    by_id = {i["issue_id"]: i for i in candidates.get("issues", [])}
+    removed: set[str] = set()
+    for group in groups:
+        ids = [g for g in group if isinstance(g, str) and g in by_id and g not in removed] if isinstance(group, list) else []
+        if len(ids) < 2:
+            continue
+        canon = by_id[ids[0]]
+        for other_id in ids[1:]:
+            other = by_id[other_id]
+            for src in other.get("found_by", []):
+                if src not in canon["found_by"]:
+                    canon["found_by"].append(src)
+            canon.setdefault("sources", []).extend(other.get("sources", []))
+            canon["severity"] = higher_severity(canon.get("severity", "low"), other.get("severity", "low"))
+            removed.add(other_id)
+    if removed:
+        candidates["issues"] = [i for i in candidates.get("issues", []) if i["issue_id"] not in removed]
+    return candidates
 
 
 def build_candidates(lane_results: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:

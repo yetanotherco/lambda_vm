@@ -581,6 +581,27 @@ class AiReviewSubmissionTests(unittest.TestCase):
         self.assertFalse(sub["submitted"])
         self.assertEqual(sub["items"], [])
 
+    def test_apply_dedup_clusters_merges_and_escalates(self) -> None:
+        cands = {
+            "issues": [
+                {"issue_id": "AI-001", "severity": "low", "title": "docs drift", "found_by": ["a:m"], "sources": [1]},
+                {"issue_id": "AI-002", "severity": "high", "title": "docs out of sync", "found_by": ["b:m"], "sources": [2]},
+                {"issue_id": "AI-003", "severity": "medium", "title": "unrelated", "found_by": ["c:m"], "sources": [3]},
+            ]
+        }
+        out = ai_review.apply_dedup_clusters(cands, [["AI-001", "AI-002"]])
+        ids = [i["issue_id"] for i in out["issues"]]
+        self.assertEqual(ids, ["AI-001", "AI-003"])  # AI-002 merged away
+        merged = out["issues"][0]
+        self.assertEqual(merged["severity"], "high")  # escalated from low
+        self.assertEqual(sorted(merged["found_by"]), ["a:m", "b:m"])
+
+    def test_apply_dedup_clusters_ignores_singletons_and_garbage(self) -> None:
+        cands = {"issues": [{"issue_id": "AI-001", "severity": "low", "title": "x", "found_by": [], "sources": []}]}
+        # singleton group, unknown id, non-list — all no-ops
+        out = ai_review.apply_dedup_clusters(cands, [["AI-001"], ["AI-999", "AI-998"], "junk"])
+        self.assertEqual([i["issue_id"] for i in out["issues"]], ["AI-001"])
+
     def test_clean_path_normalizes_runner_checkout_prefix(self) -> None:
         self.assertEqual(
             ai_review.clean_path("runner/.github/scripts/ai_review.py"),
