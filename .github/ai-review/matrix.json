@@ -2,19 +2,10 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "qwen-flash-correctness",
-        "model": "openrouter/qwen/qwen3-30b-a3b-instruct-2507",
-        "prompt": "correctness"
-      },
-      {
-        "id": "glm-flash-correctness",
-        "model": "openrouter/z-ai/glm-4.7-flash",
-        "prompt": "correctness"
-      },
-      {
-        "id": "nemotron-nano-correctness",
-        "model": "openrouter/nvidia/nemotron-3-nano-30b-a3b",
-        "prompt": "correctness"
+        "id": "glm-correctness",
+        "model": "openrouter/z-ai/glm-5.2",
+        "prompt": "correctness",
+        "variant": "low"
       }
     ],
     "verifier_lanes": [
