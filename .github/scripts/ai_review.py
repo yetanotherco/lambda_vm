@@ -402,11 +402,15 @@ def run_opencode_agent(
     # final findings JSON) arrives in "text" events. The human-rendered default format
     # drops the final message in non-TTY environments, so we always parse the stream.
     # Passing session_id resumes a prior turn (same context) via --session.
+    # The message (prompt + full PR diff) is delivered on STDIN, not as an argv string:
+    # a single argv exceeding ~128KB (Linux MAX_ARG_STRLEN) fails with E2BIG, and the
+    # diff easily crosses that. opencode reads the message from stdin when no positional
+    # message is given.
     # --print-logs --log-level WARN sends opencode's own warnings/errors (e.g. auth or
     # provider failures) to stderr, where we capture them — without polluting the JSON
     # event stream on stdout. This is how a silently-empty lane reveals its cause.
     cmd = [
-        "opencode", "run", message,
+        "opencode", "run",
         "--agent", agent, "-m", model, "--format", "json",
         "--print-logs", "--log-level", "WARN",
     ]
@@ -415,6 +419,7 @@ def run_opencode_agent(
     proc = subprocess.run(
         cmd,
         cwd=str(repo),
+        input=message.encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         env=dict(os.environ),
