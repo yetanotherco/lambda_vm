@@ -212,19 +212,15 @@ def cmd_context(args: argparse.Namespace) -> int:
         diff = diff[: args.max_diff_chars] + "\n\n[diff truncated by ai-review]\n"
 
     file_context: list[dict[str, Any]] = []
-    remaining = args.max_file_chars
-    for changed in changed_files:
-        if remaining <= 0:
-            break
-        if changed["status"] == "D":
-            continue
+    # Give each changed (non-deleted) file an equal share of the budget, split between head
+    # and base — the old `remaining // 2` per file front-loaded the first file with half the
+    # total budget and starved later files.
+    non_deleted = [c for c in changed_files if c["status"] != "D"]
+    per_file = args.max_file_chars // max(1, len(non_deleted))
+    for changed in non_deleted:
         path = changed["path"]
-        head_content, head_truncated = git_file_text(repo, head, path, remaining // 2)
-        if head_content is not None:
-            remaining -= len(head_content)
-        base_content, base_truncated = git_file_text(repo, base, path, max(0, remaining // 2))
-        if base_content is not None:
-            remaining -= len(base_content)
+        head_content, head_truncated = git_file_text(repo, head, path, per_file // 2)
+        base_content, base_truncated = git_file_text(repo, base, path, per_file // 2)
         if head_content is None and base_content is None:
             continue
         file_context.append(
@@ -411,11 +407,46 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
                 base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
                 base_result["parse_error"] = parse_error or "submit_verifications tool was never called"
     except subprocess.TimeoutExpired:
-        base_result.update({"status": "error", "error": f"agentic lane timed out after {args.timeout}s"})
+        # The model may have already reported via the tool before the process was killed;
+        # salvage those results instead of discarding the whole lane.
+        sp = pathlib.Path(args.out).with_name(f"lane-{lane['id']}.submit.json").resolve()
+        key = "findings" if args.kind == "review" else "verifications"
+        sub = read_submission(sp, key)
+        if sub["submitted"]:
+            base_result["status"] = "success"
+            base_result[key] = lane_items({key: sub["items"]}, lane, args.kind)
+            base_result["summary"] = sub["summary"]
+            base_result["submission"] = {"submitted": True, "count": len(base_result[key])}
+            base_result["note"] = f"process timed out after {args.timeout}s but results were already submitted"
+        else:
+            base_result.update({"status": "error", "error": f"agentic lane timed out after {args.timeout}s"})
     except Exception as exc:
         base_result.update({"status": "error", "error": f"agentic lane failed: {exc}"})
     write_json(pathlib.Path(args.out), base_result)
     return 0
+
+
+PROVIDER_KEYS = {
+    "openrouter/": "OPENROUTER_API_KEY",
+    "minimax/": "MINIMAX_API_KEY",
+    "anthropic/": "ANTHROPIC_API_KEY",
+    "openai/": "OPENAI_API_KEY",
+    "moonshotai/": "MOONSHOT_API_KEY",
+}
+
+
+def scoped_provider_env(model: str) -> dict[str, str]:
+    # Least privilege: a lane only needs its own provider's key, so strip the other provider
+    # secrets from the subprocess env. Defense-in-depth — the sandbox already blocks the agent
+    # from reading env/files, but a lane shouldn't carry keys it can't use. Unknown providers
+    # keep the full env (don't break a newly added one).
+    env = dict(os.environ)
+    needed = next((k for prefix, k in PROVIDER_KEYS.items() if model.startswith(prefix)), None)
+    if needed is not None:
+        for key in set(PROVIDER_KEYS.values()):
+            if key != needed:
+                env.pop(key, None)
+    return env
 
 
 def run_opencode_agent(
@@ -458,7 +489,7 @@ def run_opencode_agent(
         input=message.encode("utf-8"),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        env=dict(os.environ),
+        env=scoped_provider_env(model),
         timeout=timeout,
     )
     out = proc.stdout.decode("utf-8", errors="replace")
@@ -1497,9 +1528,11 @@ def parse_name_status(text: str) -> list[dict[str, Any]]:
             continue
         parts = line.split("\t")
         status = parts[0]
-        if status.startswith("R") or status.startswith("C"):
+        # Rename/copy lines are status\told\tnew, but guard against malformed/short output
+        # rather than IndexError out of the whole review.
+        if (status.startswith("R") or status.startswith("C")) and len(parts) >= 3:
             changed.append({"status": status[0], "old_path": parts[1], "path": parts[2]})
-        else:
+        elif len(parts) >= 2:
             changed.append({"status": status[0], "path": parts[-1]})
     return changed
 
@@ -1516,7 +1549,9 @@ def git_text(repo: pathlib.Path, *args: str) -> str:
 
 def git_file_text(repo: pathlib.Path, ref: str, path: str, max_chars: int) -> tuple[str | None, bool]:
     if max_chars <= 0:
-        return "", True
+        # No budget left → signal "no content" (None), not an empty-but-present string;
+        # callers check `is not None`, and "" would be mistaken for real content.
+        return None, False
     try:
         result = subprocess.run(
             ["git", "-C", str(repo), "show", f"{ref}:{path}"],
@@ -1663,7 +1698,8 @@ def post_or_update_comment(pr_number: int, body: str, tier: str) -> None:
     token = os.environ["GITHUB_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
     marker = f"<!-- ai-review:{tier} -->"
-    comments = github_json("GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100", token=token)
+    # github_json returns None on an empty body; coerce to [] so reversed() can't crash.
+    comments = github_json("GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100", token=token) or []
     existing_id = None
     for comment in reversed(comments):
         if marker in comment.get("body", ""):
@@ -1680,7 +1716,11 @@ def write_github_outputs(path: pathlib.Path, outputs: dict[str, Any]) -> None:
         for key, value in outputs.items():
             text = str(value)
             if "\n" in text:
+                # Ensure the heredoc delimiter can't appear in the payload (which would
+                # corrupt $GITHUB_OUTPUT). Extend it until it's absent from the value.
                 delimiter = f"__AI_REVIEW_{key.upper()}__"
+                while delimiter in text:
+                    delimiter += "_X"
                 handle.write(f"{key}<<{delimiter}\n{text}\n{delimiter}\n")
             else:
                 handle.write(f"{key}={text}\n")
@@ -1722,8 +1762,13 @@ def clean_path(value: Any) -> str | None:
     # absolute report is GITHUB_WORKSPACE + path; strip that prefix. (Don't pattern-match
     # "runner/" — the runner's HOME is /home/runner, which would false-match.)
     workspace = os.environ.get("GITHUB_WORKSPACE")
-    if workspace and text.startswith(workspace):
-        text = text[len(workspace) :]
+    if workspace:
+        # Only strip a true path-prefix (exact dir or `workspace/...`) — not a sibling like
+        # `<workspace>_backup/...` that merely shares the string prefix.
+        if text == workspace:
+            text = ""
+        elif text.startswith(workspace + "/"):
+            text = text[len(workspace) + 1 :]
     if text.startswith("./"):
         text = text[2:]
     text = text.lstrip("/")
@@ -1758,7 +1803,8 @@ def normalize_text(text: str) -> str:
 def format_location(issue: dict[str, Any]) -> str:
     file = issue.get("file") or "unknown"
     line = issue.get("line")
-    return f"{file}:{line}" if line is not None else file
+    # Models use line 0 / null for "whole file or unknown line"; don't render "file:0".
+    return f"{file}:{line}" if line else file
 
 
 def md_escape(text: str) -> str:

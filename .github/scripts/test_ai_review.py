@@ -602,6 +602,50 @@ class AiReviewSubmissionTests(unittest.TestCase):
         out = ai_review.apply_dedup_clusters(cands, [["AI-001"], ["AI-999", "AI-998"], "junk"])
         self.assertEqual([i["issue_id"] for i in out["issues"]], ["AI-001"])
 
+    def test_parse_name_status_tolerates_malformed_rename(self) -> None:
+        # A rename status with a missing field must not IndexError out of the whole review;
+        # the well-formed line must still parse.
+        rows = ai_review.parse_name_status("R100\tonly_one_field\nM\tfoo.py\n")
+        self.assertIn("foo.py", [r["path"] for r in rows])
+        # a proper rename still keeps old/new
+        rows2 = ai_review.parse_name_status("R100\told.py\tnew.py\n")
+        self.assertEqual(rows2[0], {"status": "R", "old_path": "old.py", "path": "new.py"})
+
+    def test_format_location_hides_zero_line(self) -> None:
+        self.assertEqual(ai_review.format_location({"file": "a.py", "line": 0}), "a.py")
+        self.assertEqual(ai_review.format_location({"file": "a.py", "line": 5}), "a.py:5")
+
+    def test_clean_path_does_not_strip_sibling_prefix(self) -> None:
+        old = os.environ.get("GITHUB_WORKSPACE")
+        os.environ["GITHUB_WORKSPACE"] = "/ws/repo"
+        try:
+            self.assertEqual(ai_review.clean_path("/ws/repo/.github/x.py"), ".github/x.py")
+            # sibling dir sharing the string prefix must NOT be stripped
+            self.assertEqual(ai_review.clean_path("/ws/repo_backup/x.py"), "/ws/repo_backup/x.py".lstrip("/"))
+        finally:
+            if old is None:
+                os.environ.pop("GITHUB_WORKSPACE", None)
+            else:
+                os.environ["GITHUB_WORKSPACE"] = old
+
+    def test_scoped_provider_env_keeps_only_relevant_key(self) -> None:
+        saved = {k: os.environ.get(k) for k in ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY"]}
+        os.environ.update({"OPENROUTER_API_KEY": "or", "ANTHROPIC_API_KEY": "an", "MINIMAX_API_KEY": "mm"})
+        try:
+            env = ai_review.scoped_provider_env("openrouter/z-ai/glm-5.2")
+            self.assertEqual(env.get("OPENROUTER_API_KEY"), "or")
+            self.assertNotIn("ANTHROPIC_API_KEY", env)
+            self.assertNotIn("MINIMAX_API_KEY", env)
+            env2 = ai_review.scoped_provider_env("minimax/MiniMax-M3")
+            self.assertEqual(env2.get("MINIMAX_API_KEY"), "mm")
+            self.assertNotIn("OPENROUTER_API_KEY", env2)
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
     def test_clean_path_strips_workspace_prefix(self) -> None:
         old = os.environ.get("GITHUB_WORKSPACE")
         os.environ["GITHUB_WORKSPACE"] = "/home/runner/work/lambda_vm/lambda_vm"
