@@ -1633,7 +1633,19 @@ def clean_path(value: Any) -> str | None:
     text = str(value).strip()
     if not text or text.lower() in {"n/a", "none", "-"}:
         return None
-    return text
+    # Normalize to a repo-relative path so the SAME file reported differently across lanes
+    # collapses in dedup. opencode runs inside the `runner/` checkout, so a file arrives as
+    # an absolute ".../runner/<path>", a workspace-relative "runner/<path>", or an
+    # already-relative "<path>". Strip everything up to and including the checkout's
+    # "runner/" segment (assumes the checkout dir is named "runner", which the workflow
+    # guarantees).
+    idx = text.rfind("runner/")
+    if idx != -1:
+        text = text[idx + len("runner/") :]
+    if text.startswith("./"):
+        text = text[2:]
+    text = text.lstrip("/")
+    return text or None
 
 
 def severity_rank(severity: str) -> int:
