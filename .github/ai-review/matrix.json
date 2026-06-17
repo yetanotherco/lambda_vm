@@ -2,8 +2,8 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "glm-correctness",
-        "model": "openrouter/z-ai/glm-5.2",
+        "id": "minimax-correctness",
+        "model": "minimax/MiniMax-M3",
         "prompt": "correctness",
         "variant": "low"
       }
