@@ -406,8 +406,8 @@ impl Instruction {
                         let addr_xr = registers.read(10)?;
                         let addr_xg = registers.read(11)?;
                         let addr_k = registers.read(12)?;
-                        if !ecsm_addr_ok(addr_xg, 24)
-                            || !ecsm_addr_ok(addr_xr, 24)
+                        if !ecsm_addr_ok(addr_xg, 31)
+                            || !ecsm_addr_ok(addr_xr, 31)
                             || !ecsm_addr_ok(addr_k, 31)
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);

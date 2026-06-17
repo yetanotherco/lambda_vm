@@ -158,11 +158,14 @@ fn ecsm_syscall_rejects_overlapping_xg_k() {
 
 #[test]
 fn ecsm_syscall_rejects_address_overflow() {
-    // xR/xG check the last doubleword base (+24); k checks every scalar byte (+31).
+    // Every operand's last accessed byte must stay in the limb (+31); the 0xFFFF_FFE1
+    // cases are the off-by-7 window the old +24 bound for xR/xG let through.
     for (addr_xr, addr_xg, addr_k) in [
         (0xFFFF_FFE8, 0x2000, 0x3000),
         (0x1000, 0xFFFF_FFE8, 0x3000),
         (0x1000, 0x2000, 0xFFFF_FFF0),
+        (0xFFFF_FFE1, 0x1000, 0x2000),
+        (0x1000, 0xFFFF_FFE1, 0x2000),
     ] {
         let err = run_ecsm_at(addr_xr, addr_xg, addr_k).unwrap_err();
         assert!(
