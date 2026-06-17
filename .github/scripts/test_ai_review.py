@@ -581,6 +581,18 @@ class AiReviewSubmissionTests(unittest.TestCase):
         self.assertFalse(sub["submitted"])
         self.assertEqual(sub["items"], [])
 
+    def test_format_source_cell_breaks_model_onto_own_line(self) -> None:
+        cell = ai_review.format_source_cell(["minimax-correctness:minimax/MiniMax-M3"])
+        self.assertIn("<br>", cell)
+        self.assertEqual(cell, "minimax-correctness<br>minimax/MiniMax-M3")
+        self.assertEqual(ai_review.format_source_cell([]), "-")
+
+    def test_format_verifier_label_lists_verifier_lanes(self) -> None:
+        label = ai_review.format_verifier_label(
+            [{"kind": "verification", "lane_id": "deepseek-verifier", "model": "openrouter/deepseek/deepseek-v4-pro"}]
+        )
+        self.assertEqual(label, "deepseek-verifier (openrouter/deepseek/deepseek-v4-pro)")
+
     def test_stream_meta_timeline_records_tool_calls_and_tokens(self) -> None:
         stream = "\n".join(
             [

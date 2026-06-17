@@ -1146,6 +1146,24 @@ def build_final_issues(candidates: dict[str, Any], verification_results: list[di
     }
 
 
+def format_source_cell(sources: list[str]) -> str:
+    # "lane_id:model" -> "lane_id<br>model" so the model wraps to its own line and the
+    # table stays narrow; multiple finders are stacked with <br> too.
+    parts = []
+    for src in sources:
+        lane, sep, model = src.partition(":")
+        parts.append(f"{md_escape(lane)}<br>{md_escape(model)}" if sep else md_escape(lane))
+    return "<br>".join(parts) or "-"
+
+
+def format_verifier_label(verification_results: list[dict[str, Any]]) -> str:
+    verifiers = sorted(
+        {f"{r.get('lane_id', '')} ({r.get('model', '')})"
+         for r in verification_results if r.get("kind") == "verification"}
+    )
+    return ", ".join(v for v in verifiers if v.strip(" ()"))
+
+
 def render_report(
     context: dict[str, Any],
     final: dict[str, Any],
@@ -1169,21 +1187,23 @@ def render_report(
 
     lines.extend(["", "### Findings", ""])
     if visible_issues:
-        lines.append("| Status | Sev | Location | Finding | Found by | Verified by |")
-        lines.append("| --- | --- | --- | --- | --- | --- |")
+        lines.append("| Status | Sev | Location | Finding | Found by |")
+        lines.append("| --- | --- | --- | --- | --- |")
         for issue in visible_issues[:20]:
             lines.append(
-                "| {status} | {severity} | {where} | {finding} | {found_by} | {verified_by} |".format(
+                "| {status} | {severity} | {where} | {finding} | {found_by} |".format(
                     status=issue["status"],
                     severity=issue["severity"],
                     where=md_escape(format_location(issue)),
                     finding=md_escape(issue["title"] or issue["claim"]),
-                    found_by=md_escape(", ".join(issue.get("found_by", []))),
-                    verified_by=md_escape(", ".join(issue.get("verified_by", [])) or "-"),
+                    found_by=format_source_cell(issue.get("found_by", [])),
                 )
             )
         if len(visible_issues) > 20:
             lines.append(f"\n_Only the first 20 findings are shown. See artifacts for all {len(visible_issues)}._")
+        verifier_label = format_verifier_label(verification_results)
+        if verifier_label:
+            lines.append(f"\n_Status column reflects the verdict from the verifier: {verifier_label}._")
     else:
         lines.append("No non-rejected structured findings were reported.")
 
@@ -1256,7 +1276,24 @@ def render_report(
             ]
         )
     if rejected:
-        lines.append(f"\nRejected candidates: {len(rejected)}. See `final-issues.json` artifact for details.")
+        lines.extend(
+            ["", f"<details><summary>Discarded candidates ({len(rejected)}) — rejected by the verifier</summary>", ""]
+        )
+        for issue in rejected[:15]:
+            reason = next(
+                (v.get("rationale", "") for v in issue.get("verification", []) if v.get("status") == "rejected"),
+                "",
+            )
+            title = issue.get("title") or issue.get("claim") or issue["issue_id"]
+            found = md_escape(", ".join(issue.get("found_by", [])))
+            lines.append(
+                f"- **{md_escape(title)}** (`{format_location(issue)}`"
+                + (f", found by {found}" if found else "")
+                + f") — {md_escape(reason.strip()) or 'no reason recorded'}"
+            )
+        if len(rejected) > 15:
+            lines.append(f"\n_…and {len(rejected) - 15} more. See `final-issues.json` artifact._")
+        lines.extend(["", "</details>"])
     lines.append("\nRaw lane outputs, candidates, final issues, and model metrics are uploaded as workflow artifacts.")
 
     rendered = "\n".join(lines)
