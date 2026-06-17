@@ -2,36 +2,21 @@
   "standard": {
     "review_lanes": [
       {
-        "id": "minimax-correctness",
-        "model": "minimax/MiniMax-M3",
-        "prompt": "correctness",
-        "variant": "low"
+        "id": "claude-haiku-correctness",
+        "model": "anthropic/claude-haiku-4-5",
+        "prompt": "correctness"
       },
       {
-        "id": "kimi-correctness",
-        "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "correctness",
-        "variant": "low"
-      },
-      {
-        "id": "nemotron-correctness",
-        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "correctness",
-        "variant": "low"
-      },
-      {
-        "id": "glm-correctness",
-        "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "correctness",
-        "variant": "low"
+        "id": "gpt-mini-correctness",
+        "model": "openai/gpt-5-mini",
+        "prompt": "correctness"
       }
     ],
     "verifier_lanes": [
       {
-        "id": "deepseek-verifier",
-        "model": "openrouter/deepseek/deepseek-v4-pro",
-        "prompt": "verify",
-        "variant": "low"
+        "id": "claude-haiku-verifier",
+        "model": "anthropic/claude-haiku-4-5",
+        "prompt": "verify"
       }
     ]
   },
