@@ -82,7 +82,7 @@ jobs:
       - name: Build review context
         run: |
           python3 runner/.github/scripts/ai_review.py context \
-            --repo subject \
+            --repo runner \
             --base-sha "${{ needs.prepare.outputs.base_sha }}" \
             --head-ref "${{ needs.prepare.outputs.head_ref }}" \
             --pr-number "${{ needs.prepare.outputs.pr_number }}" \
@@ -117,18 +117,12 @@ jobs:
         with:
           path: runner
 
-      - name: Checkout PR for exploration
-        uses: actions/checkout@v4
-        with:
-          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
-          path: subject
-
-      - name: Install trusted sandbox config
+      - name: Install sandbox agent
         run: |
-          # Strip any PR-provided opencode config so a PR cannot weaken its own
-          # sandbox, then install the trusted read-only agent globally so opencode
-          # discovers it regardless of working directory or version.
-          rm -rf subject/.opencode subject/opencode.json subject/opencode.jsonc
+          # Run opencode in the single `runner` checkout (already the PR merge).
+          # A second identical PR checkout made the agent wander between two copies
+          # of every file and exhaust its step budget. Install the read-only agent
+          # globally so discovery is version-independent.
           mkdir -p "$HOME/.config/opencode/agent"
           cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
 
@@ -168,7 +162,7 @@ jobs:
             --context ai-review-context/context.json \
             --kind review \
             --prompt-dir runner/.github/ai-review/prompts \
-            --repo subject \
+            --repo runner \
             --agent review-ro \
             --timeout 700 \
             --out "$LANE_OUT"
@@ -257,18 +251,12 @@ jobs:
         with:
           path: runner
 
-      - name: Checkout PR for exploration
-        uses: actions/checkout@v4
-        with:
-          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
-          path: subject
-
-      - name: Install trusted sandbox config
+      - name: Install sandbox agent
         run: |
-          # Strip any PR-provided opencode config so a PR cannot weaken its own
-          # sandbox, then install the trusted read-only agent globally so opencode
-          # discovers it regardless of working directory or version.
-          rm -rf subject/.opencode subject/opencode.json subject/opencode.jsonc
+          # Run opencode in the single `runner` checkout (already the PR merge).
+          # A second identical PR checkout made the agent wander between two copies
+          # of every file and exhaust its step budget. Install the read-only agent
+          # globally so discovery is version-independent.
           mkdir -p "$HOME/.config/opencode/agent"
           cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
 
@@ -315,7 +303,7 @@ jobs:
             --kind verification \
             --candidates ai-review-candidates/candidates.json \
             --prompt-dir runner/.github/ai-review/prompts \
-            --repo subject \
+            --repo runner \
             --agent review-ro \
             --timeout 700 \
             --out "$LANE_OUT"
