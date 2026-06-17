@@ -406,13 +406,13 @@ def run_opencode_agent(
     # a single argv exceeding ~128KB (Linux MAX_ARG_STRLEN) fails with E2BIG, and the
     # diff easily crosses that. opencode reads the message from stdin when no positional
     # message is given.
-    # --print-logs --log-level WARN sends opencode's own warnings/errors (e.g. auth or
-    # provider failures) to stderr, where we capture them — without polluting the JSON
+    # --print-logs --log-level INFO sends opencode's own logs (incl. provider failures and
+    # the per-step loop) to stderr, where we capture them — without polluting the JSON
     # event stream on stdout. This is how a silently-empty lane reveals its cause.
     cmd = [
         "opencode", "run",
         "--agent", agent, "-m", model, "--format", "json",
-        "--print-logs", "--log-level", "WARN",
+        "--print-logs", "--log-level", "INFO",
     ]
     if session_id:
         cmd += ["--session", session_id]
@@ -429,7 +429,8 @@ def run_opencode_agent(
     err = proc.stderr.decode("utf-8", errors="replace")
     text = opencode_assistant_text(out)
     meta = opencode_stream_meta(out)
-    meta["stderr_tail"] = err[-3000:]
+    meta["stderr_tail"] = err[-5000:]
+    meta["returncode"] = proc.returncode
     meta["session_id"] = opencode_session_id(out) or session_id
     if not text.strip():
         # Surface diagnostics so the lane result shows why nothing was produced.
