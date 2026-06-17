@@ -360,7 +360,11 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
         # emits its final JSON. When the first pass yielded nothing parseable, resume the
         # same session and demand only the JSON — the model retains its exploration.
         session_id = meta.get("session_id")
-        if not items and parse_error and session_id:
+        # Retry when we got no usable items and either parsing failed OR the model emitted
+        # no assistant text at all (opencode ended the turn empty — parse_error can be None
+        # in that case because the diagnostic fallback contains no findings-shaped JSON).
+        needs_retry = not items and (parse_error or meta.get("no_assistant_text"))
+        if needs_retry and session_id:
             cont_msg = CONTINUATION_REVIEW if args.kind == "review" else CONTINUATION_VERIFY
             # The continuation does no exploration (it just emits the JSON), so cap it well
             # below the exploration timeout to leave wall-clock room within the job.
@@ -441,6 +445,7 @@ def run_opencode_agent(
     meta["stderr_tail"] = err[-5000:]
     meta["returncode"] = proc.returncode
     meta["session_id"] = opencode_session_id(out) or session_id
+    meta["no_assistant_text"] = not text.strip()
     if not text.strip():
         # Surface diagnostics so the lane result shows why nothing was produced.
         text = f"[opencode produced no assistant text]\nstderr:\n{err[-3000:]}\nstdout-tail:\n{strip_ansi(out)[-3000:]}"

@@ -148,7 +148,7 @@ jobs:
 
       - name: Run agentic review lane
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_TEST_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
@@ -288,7 +288,7 @@ jobs:
 
       - name: Run agentic verifier lane
         env:
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_TEST_KEY }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
