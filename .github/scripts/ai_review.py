@@ -345,8 +345,10 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
         if args.kind == "review":
             # Review lanes report via the submit_findings tool, which writes findings to
             # this file. Pre-create it with submitted=False so afterwards we can tell
-            # "tool never called" from "ran, found nothing".
-            submit_path = pathlib.Path(args.out).with_name(f"lane-{lane['id']}.submit.json")
+            # "tool never called" from "ran, found nothing". The path MUST be absolute:
+            # opencode runs with a different cwd than this script (--repo points elsewhere),
+            # so a relative AI_REVIEW_OUT would have the tool write to the wrong directory.
+            submit_path = pathlib.Path(args.out).with_name(f"lane-{lane['id']}.submit.json").resolve()
             write_json(submit_path, {"submitted": False, "findings": [], "summary": ""})
             os.environ["AI_REVIEW_OUT"] = str(submit_path)
 
