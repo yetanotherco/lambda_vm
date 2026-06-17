@@ -169,9 +169,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     token = os.environ["GITHUB_TOKEN"]
     pr = github_json("GET", f"/repos/{repo}/pulls/{pr_number}", token=token)
 
-    # Single native-review prompt (fed to the native Codex/Claude reviews via the
-    # custom_prompt output); decoupled from the tier key.
-    prompt_path = pathlib.Path(args.prompt_dir) / "native-review.md"
+    # The native Codex/Claude reviews use the SAME generic prompt as the swarm
+    # (general.md). There is no separate soundness brief: a buzzword list does not
+    # help a model find soundness bugs, and real soundness review is deferred to
+    # dedicated tooling.
+    prompt_path = pathlib.Path(args.prompt_dir) / "general.md"
     custom_prompt = prompt_path.read_text(encoding="utf-8")
     tier_config = matrix[tier]
 

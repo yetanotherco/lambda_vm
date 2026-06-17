@@ -28,10 +28,11 @@ collaborators. Label triggers are controlled by GitHub's label permissions.
 Reviewer prompts live in `.github/ai-review/prompts/` so they can be reused by
 any model runner:
 
-- `general.md` is the finder prompt used by every swarm lane.
+- `general.md` is the review prompt used by every swarm lane **and** by the
+  native Codex/Claude reviews (passed as their `custom_prompt` input). There is
+  one generic review prompt; there is intentionally no separate soundness brief
+  (see "Lessons learned").
 - `lanes/verify.md` is the verifier prompt.
-- `native-review.md` is the brief handed to the native Codex and Claude reviews
-  (passed as the `custom_prompt` input to their workflows).
 
 Model-specific workflows should load one of these prompt files and pass its
 contents to the reviewer. Do not duplicate prompt bodies inside model-specific
@@ -44,35 +45,32 @@ prompt.
 
 ## What the review covers
 
-The review is one flow with two independent parts:
-
-**1. Structured swarm** (open-weight finders + verifier) → one deduplicated
-report with per-finding provenance. It focuses on:
+The review is one flow with two independent parts, and **both use the same
+generic `general.md` prompt**. It focuses on:
 
 - correctness and regressions introduced by the branch
+- safety/security: unsafe Rust, panics, memory safety, resource exhaustion
 - local constraint, trace, and bus consistency when those files change
+- VM/executor behavior, memory access, state transitions
 - missing tests or changed test intent
-- simplicity and maintainability
-- stale comments, stale names, misleading docs, and scope drift
+- simplicity, maintainability, stale comments/names/docs, scope drift
 
-It reviews constraint changes in the PR but is not a proof-system or transcript
-design audit — that depth comes from the native reviews below.
+**1. Structured swarm** (open-weight finders + verifier) → one deduplicated
+report with per-finding provenance.
 
 **2. Native Codex + Claude (opus) reviews** run independently in the vendors'
-own harnesses (the `native-review.md` brief) and post their own comments. They
-are the soundness-aware pass, covering:
+own harnesses and post their own comments. Treat them as separate reviewer
+opinions; they are not included in the structured provenance report. They run
+flagship models in full agentic harnesses, so they tend to explore deeper than
+the constrained swarm — but they get the **same generic prompt**, not a
+soundness brief.
 
-- soundness-sensitive prover constraints, trace generation, buses, AIR
-  inclusion, or statements
-- VM, executor, memory, CPU, ALU, load/store, branch, decode, or halt behavior
-- hashing, Fiat-Shamir transcripts, FRI, Merkle commitments, challenge
-  derivation, or broader prover/verifier soundness assumptions
-- GPU/CUDA proving paths
-- security-sensitive infra or CI behavior
-- merge-conflict resolutions in high-risk branches
-
-Treat the native results as separate reviewer opinions; they are not included in
-the structured provenance report.
+**Soundness is a deliberate gap.** Neither part is equipped to find real
+soundness bugs (under-constrained AIRs, transcript/Fiat-Shamir/commitment
+mistakes, witness-soundness drift). A generic prompt that merely *names* those
+topics does not help a model find them — soundness review needs dedicated
+tooling (concrete failure patterns, spec context, targeted reasoning) and is
+deferred to that future work, not attempted here.
 
 ## Reviewer Matrix
 
@@ -124,9 +122,9 @@ one pass), at `low` effort except minimax (`high`, its measured sweet spot — s
 | deduper | `openrouter/minimax/minimax-m3` | — | low |
 
 Alongside the swarm, the flow **also** triggers the native **Codex** (GPT) and
-native **Claude** (opus) reviews — they run in their own vendor harnesses
-(`native-review.md` brief) and post their own independent comments, outside the
-structured report. The flagship closed models contribute as independent native
+native **Claude** (opus) reviews — they run in their own vendor harnesses (with
+the same generic `general.md` prompt) and post their own independent comments,
+outside the structured report. The flagship closed models contribute as independent native
 reviews rather than swarm finders: in measured runs the native Codex pass found
 a high-severity issue the whole swarm missed, while an opus *swarm* finder cost
 ~$1/run for only one unique low finding — so opus was moved out of the swarm and
@@ -219,6 +217,14 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   finding.
 - **`found_by` is provenance.** Both merge stages union it, so the report shows
   every lane (hence variant) that found each issue.
+- **No soundness prompt (yet).** The swarm and the native reviews share one
+  generic `general.md`. A prompt that merely *names* soundness topics
+  (Fiat-Shamir, commitments, AIR inclusion, witness-soundness) does not help a
+  model find soundness bugs — those need counterexample reasoning, spec
+  knowledge, and knowing what a constraint must enforce. Naming the topics just
+  *looks* like coverage we lack. Real soundness review is deferred to dedicated
+  tooling; the generic prompt honestly targets correctness/security, not
+  soundness.
 - **OpenRouter vs direct.** OpenRouter mangles tool-calling for some models, so
   agentic lanes prefer direct keys where possible; OpenRouter is fine for cheap
   finders and single-shot calls. Kimi must go via OpenRouter (direct Moonshot
