@@ -1248,42 +1248,58 @@ def extract_json(text: str, required_key: str | None = None) -> tuple[Any, str |
         return None, "empty model response"
 
     fenced = re.findall(r"```(?:json)?\s*(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    decode_error = None
+    candidates: list[Any] = []
     if fenced:
-        schema_error = None
-        decode_error = None
         for block in fenced:
             try:
-                parsed = json.loads(block)
+                candidates.append(json.loads(block))
             except json.JSONDecodeError as exc:
                 decode_error = decode_error or f"invalid JSON in fenced block: {exc.msg}"
+    else:
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(text):
+            if char not in "[{":
                 continue
-            if json_has_required_shape(parsed, required_key):
-                return parsed, None
-            schema_error = schema_error or json_shape_error(required_key)
-        for block in fenced:
-            repaired = repair_malformed_json(block, required_key)
-            if repaired is not None:
-                return repaired, f"recovered malformed JSON via json-repair ({decode_error or schema_error})"
-        return None, schema_error or decode_error or "could not parse JSON from model response"
+            try:
+                parsed, _ = decoder.raw_decode(text[idx:])
+            except json.JSONDecodeError as exc:
+                decode_error = decode_error or f"invalid JSON in model response: {exc.msg}"
+                continue
+            candidates.append(parsed)
 
-    decoder = json.JSONDecoder()
-    schema_error = None
-    decode_error = None
-    for idx, char in enumerate(text):
-        if char not in "[{":
-            continue
-        try:
-            parsed, _ = decoder.raw_decode(text[idx:])
-        except json.JSONDecodeError as exc:
-            decode_error = decode_error or f"invalid JSON in model response: {exc.msg}"
-            continue
-        if json_has_required_shape(parsed, required_key):
-            return parsed, None
-        schema_error = schema_error or json_shape_error(required_key)
-    repaired = repair_malformed_json(text, required_key)
-    if repaired is not None:
-        return repaired, f"recovered malformed JSON via json-repair ({decode_error or schema_error})"
-    return None, schema_error or decode_error or "could not parse JSON from model response"
+    chosen = choose_json_candidate(candidates, required_key)
+    if chosen is not None:
+        return chosen, None
+
+    for block in fenced or [text]:
+        repaired = repair_malformed_json(block, required_key)
+        if repaired is not None:
+            reason = decode_error or json_shape_error(required_key)
+            return repaired, f"recovered malformed JSON via json-repair ({reason})"
+
+    if candidates:
+        return None, json_shape_error(required_key)
+    return None, decode_error or "could not parse JSON from model response"
+
+
+def choose_json_candidate(candidates: list[Any], required_key: str | None) -> Any:
+    if not candidates:
+        return None
+    if required_key is None:
+        return candidates[0]
+    # Prefer the LAST object that actually contains the required key. Models narrate,
+    # quote code arrays, or emit a draft before the final answer; the earlier blob is
+    # not the result. A bare object lacking the key or a scalar array is ignored — this
+    # is the fix for grabbing a stray `[...]` and reporting zero findings.
+    dict_hits = [c for c in candidates if isinstance(c, dict) and required_key in c]
+    if dict_hits:
+        return dict_hits[-1]
+    # Fallback: a wrapper-less array whose items are objects (some models omit the key).
+    list_hits = [c for c in candidates if isinstance(c, list) and any(isinstance(x, dict) for x in c)]
+    if list_hits:
+        return list_hits[-1]
+    return None
 
 
 def repair_malformed_json(candidate: str, required_key: str | None) -> Any:
