@@ -82,7 +82,7 @@ jobs:
       - name: Build review context
         run: |
           python3 runner/.github/scripts/ai_review.py context \
-            --repo runner \
+            --repo subject \
             --base-sha "${{ needs.prepare.outputs.base_sha }}" \
             --head-ref "${{ needs.prepare.outputs.head_ref }}" \
             --pr-number "${{ needs.prepare.outputs.pr_number }}" \
