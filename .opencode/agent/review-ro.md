@@ -16,6 +16,10 @@ permission:
   write: deny
   patch: deny
   webfetch: deny
+  # Hard-deny reads/writes outside the project dir so a prompt-injection can't reach
+  # /proc/self/environ or credential files to exfiltrate provider keys. Explicit deny
+  # (not the "ask" default) also holds under --dangerously-skip-permissions.
+  external_directory: deny
 ---
 You are a senior code reviewer reviewing a single pull request.
 
