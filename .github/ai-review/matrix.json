@@ -2,6 +2,24 @@
   "standard": {
     "review_lanes": [
       {
+        "id": "minimax-correctness",
+        "model": "minimax/MiniMax-M3",
+        "prompt": "correctness",
+        "variant": "low"
+      },
+      {
+        "id": "kimi-correctness",
+        "model": "moonshotai/kimi-k2.7-code",
+        "prompt": "correctness",
+        "variant": "low"
+      },
+      {
+        "id": "nemotron-correctness",
+        "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
+        "prompt": "correctness",
+        "variant": "low"
+      },
+      {
         "id": "glm-correctness",
         "model": "openrouter/z-ai/glm-5.2",
         "prompt": "correctness",
@@ -10,9 +28,10 @@
     ],
     "verifier_lanes": [
       {
-        "id": "glm-flash-verifier",
-        "model": "openrouter/z-ai/glm-4.7-flash",
-        "prompt": "verify"
+        "id": "deepseek-verifier",
+        "model": "openrouter/deepseek/deepseek-v4-pro",
+        "prompt": "verify",
+        "variant": "low"
       }
     ]
   },
