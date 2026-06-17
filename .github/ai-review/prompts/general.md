@@ -1,5 +1,7 @@
 1. **Safety and security issues** - Label by criticality (Critical/High/Medium/Low)
    - Rust: unsafe blocks, error handling, panics, memory safety issues
+   - GPU/CUDA: device-memory exhaustion or leaks that crash the run, unbounded
+     allocations, buffer lifetime, host/device synchronization
    - VM/executor: instruction semantics, memory access, state transitions,
      inconsistent execution/proving behavior
 

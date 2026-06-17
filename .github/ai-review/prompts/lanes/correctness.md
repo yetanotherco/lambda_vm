@@ -10,6 +10,10 @@ Focus on:
   index, and length arithmetic
 - out-of-bounds and off-by-one in trace rows, memory, and bus indexing
 - incorrect or missing error handling
+- GPU/CUDA code: device-memory exhaustion or leaks that can crash the run
+  (unbounded allocations, growth across iterations or batches, buffers not
+  freed), plus other GPU hazards such as buffer lifetime and host/device
+  synchronization
 - serialization and byte/word-packing mistakes, and iteration-order or other
   nondeterminism that can change a commitment or Merkle root
 - VM, executor, prover, memory, trace, bus, and constraint behavior affected by
