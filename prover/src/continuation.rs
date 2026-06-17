@@ -9,10 +9,14 @@
 //! recomputes the per-page preprocessed init commitment from the ELF in
 //! `verify_global`, so the starting memory cannot be prover-supplied.
 //!
+//! The local-to-global columns are range-checked (values are bytes, every other
+//! quantity is built from `IsHalfword`-checked halfwords) in the epoch proof,
+//! which carries the BITWISE provider; the global proof commits the identical
+//! trace, so it inherits the guarantee via the commitment binding.
+//!
 //! This is a FIRST implementation and is NOT yet fully sound: cross-epoch
 //! registers are not bound (epoch `i`'s register init is a prover-supplied
-//! snapshot, unlinked to epoch `i-1`'s fini) and the local-to-global columns
-//! are not range-checked. Those are deferred.
+//! snapshot, unlinked to epoch `i-1`'s fini). That is deferred.
 
 use std::collections::HashMap;
 
@@ -65,12 +69,19 @@ fn l2g_global_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstra
 }
 
 /// Local-to-global AIR on the epoch-local Memory bus (used inside an epoch proof).
+///
+/// Carries the column range checks too: this proof has the BITWISE provider, and
+/// the global proof commits the identical trace (the commitment binding compares
+/// roots), so range-checking here covers both.
 fn l2g_memory_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let interactions = [
+        local_to_global::memory_bus_interactions(),
+        local_to_global::range_check_interactions(),
+    ]
+    .concat();
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
-        AuxiliaryTraceBuildData {
-            interactions: local_to_global::memory_bus_interactions(),
-        },
+        AuxiliaryTraceBuildData { interactions },
         opts,
         1,
         empty_constraints(),
@@ -170,6 +181,15 @@ fn prove_verify_epoch(
     // Its init value equals the epoch-start value either way, so the epoch-local
     // Memory bus still balances.
     traces.local_to_global = local_to_global::generate_local_to_global_trace(boundary);
+
+    // Count this L2G table's range-check lookups into the (full, untrimmed)
+    // BITWISE table so its AreBytes/IsHalfword multiplicities balance the
+    // range-check senders in `l2g_memory_air`. Must use the same `boundary` the
+    // committed L2G trace was built from.
+    crate::tables::bitwise::update_multiplicities(
+        &mut traces.bitwise,
+        &local_to_global::collect_bitwise_from_l2g(boundary),
+    );
 
     let table_counts = traces.table_counts();
     let register_init_arg = if start.is_first {

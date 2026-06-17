@@ -7,15 +7,25 @@
 //! access timestamp). A final LogUp matches each `fini` against the `init` of the
 //! next epoch that touches the same cell, proving global memory consistency.
 //!
-//! This module currently provides only the boundary-claim data and the
-//! provenance/telescoping logic. The AIR table, bus, and prover wiring come in
-//! later steps.
+//! ## Range-checked columns
+//!
+//! Every column is range-checked so it cannot hold an out-of-range field
+//! element: the two value columns are bytes (checked via the `AreBytes` bus) and
+//! every other quantity (address, epoch, timestamp) is stored as 16-bit
+//! halfword columns checked via the `IsHalfword` bus. The wider 32-bit values
+//! the buses match on are never stored directly — they are reconstructed from
+//! the (range-checked) halfwords by a linear combination, so a malicious prover
+//! cannot smuggle a non-canonical value past the lookup. The range-check
+//! lookups are emitted on the epoch-local table (which has the BITWISE provider);
+//! the global proof commits the identical trace (the commitment binding compares
+//! their roots), so it inherits the same guarantee.
 
 use std::collections::HashMap;
 
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
+use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::paged_mem::PagedMem;
 
@@ -127,24 +137,98 @@ pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> Provenance {
 // =========================================================================
 
 /// Column indices for the local-to-global table: one row per touched cell.
-/// Address and timestamp are split into lo/hi 32-bit words (a full `u64` does
-/// not fit a single Goldilocks element); value is a single byte (byte-granular
-/// RAM) and epoch is a single small counter.
+///
+/// Every wide quantity is stored as 16-bit halfword columns so each one can be
+/// `IsHalfword`-range-checked directly; the 32-bit values the buses match on
+/// (`address_lo/hi`, `epoch`, `timestamp_lo/hi`) are reconstructed from those
+/// halfwords via a linear combination (see [`word`]). The two value columns are
+/// single bytes (RAM is byte-granular), range-checked via `AreBytes`.
 pub mod cols {
-    pub const ADDRESS_LO: usize = 0;
-    pub const ADDRESS_HI: usize = 1;
-    /// Value is a single byte (RAM is byte-granular), like PAGE's `value`.
-    pub const INIT_VALUE: usize = 2;
-    /// Epoch is a small counter — a single column (no hi word).
-    pub const INIT_EPOCH: usize = 3;
-    pub const INIT_TIMESTAMP_LO: usize = 4;
-    pub const INIT_TIMESTAMP_HI: usize = 5;
-    pub const FINI_VALUE: usize = 6;
-    pub const FINI_EPOCH: usize = 7;
-    pub const FINI_TIMESTAMP_LO: usize = 8;
-    pub const FINI_TIMESTAMP_HI: usize = 9;
+    // Address (64-bit) as four 16-bit halfwords: `address_lo = A0 + 2^16·A1`,
+    // `address_hi = A2 + 2^16·A3`.
+    pub const ADDR_0: usize = 0;
+    pub const ADDR_1: usize = 1;
+    pub const ADDR_2: usize = 2;
+    pub const ADDR_3: usize = 3;
 
-    pub const NUM_COLUMNS: usize = 10;
+    /// Init value: a single byte, like PAGE's `value`.
+    pub const INIT_VALUE: usize = 4;
+
+    // Init epoch (fits 32 bits; `GENESIS_EPOCH` reduces to `2^32-2`): two halfwords.
+    pub const INIT_EPOCH_0: usize = 5;
+    pub const INIT_EPOCH_1: usize = 6;
+
+    // Init timestamp (64-bit) as four halfwords (`ts_lo = T0 + 2^16·T1`, etc.).
+    pub const INIT_TS_0: usize = 7;
+    pub const INIT_TS_1: usize = 8;
+    pub const INIT_TS_2: usize = 9;
+    pub const INIT_TS_3: usize = 10;
+
+    /// Fini value: a single byte.
+    pub const FINI_VALUE: usize = 11;
+
+    // Fini epoch: two halfwords.
+    pub const FINI_EPOCH_0: usize = 12;
+    pub const FINI_EPOCH_1: usize = 13;
+
+    // Fini timestamp: four halfwords.
+    pub const FINI_TS_0: usize = 14;
+    pub const FINI_TS_1: usize = 15;
+    pub const FINI_TS_2: usize = 16;
+    pub const FINI_TS_3: usize = 17;
+
+    pub const NUM_COLUMNS: usize = 18;
+
+    /// The halfword columns, in order — every column that is `IsHalfword`-checked.
+    pub const HALFWORD_COLUMNS: [usize; 16] = [
+        ADDR_0,
+        ADDR_1,
+        ADDR_2,
+        ADDR_3,
+        INIT_EPOCH_0,
+        INIT_EPOCH_1,
+        INIT_TS_0,
+        INIT_TS_1,
+        INIT_TS_2,
+        INIT_TS_3,
+        FINI_EPOCH_0,
+        FINI_EPOCH_1,
+        FINI_TS_0,
+        FINI_TS_1,
+        FINI_TS_2,
+        FINI_TS_3,
+    ];
+}
+
+/// Little-endian 16-bit halfwords of a 64-bit value: `[bits 0-15, 16-31, 32-47, 48-63]`.
+fn halfwords64(v: u64) -> [u64; 4] {
+    [
+        v & 0xFFFF,
+        (v >> 16) & 0xFFFF,
+        (v >> 32) & 0xFFFF,
+        (v >> 48) & 0xFFFF,
+    ]
+}
+
+/// Canonical 32-bit field value of an epoch index, matching `FE::from(epoch)`.
+///
+/// Real epoch indices are small (< 2^32) and map to themselves; the genesis
+/// sentinel [`GENESIS_EPOCH`] (`u64::MAX`) reduces to `2^32 - 2` modulo the
+/// Goldilocks prime, which is exactly what `global_memory` emits via
+/// `FE::from(GENESIS_EPOCH)`, so the two sides match on the bus.
+fn epoch_field_low32(epoch: u64) -> u64 {
+    if epoch == GENESIS_EPOCH {
+        (1 << 32) - 2
+    } else {
+        debug_assert!(epoch < (1 << 32), "epoch index exceeds 32 bits");
+        epoch
+    }
+}
+
+/// The two halfwords of an epoch index (its canonical 32-bit field value).
+fn epoch_halfwords(epoch: u64) -> [u64; 2] {
+    let v = epoch_field_low32(epoch);
+    [v & 0xFFFF, (v >> 16) & 0xFFFF]
 }
 
 // =========================================================================
@@ -161,16 +245,30 @@ pub fn generate_local_to_global_trace(
 
     for (row, b) in boundaries.iter().enumerate() {
         let base = row * cols::NUM_COLUMNS;
-        data[base + cols::ADDRESS_LO] = FE::from(b.address & 0xFFFF_FFFF);
-        data[base + cols::ADDRESS_HI] = FE::from(b.address >> 32);
+        let addr = halfwords64(b.address);
+        let init_ts = halfwords64(b.init.timestamp);
+        let fini_ts = halfwords64(b.fini.timestamp);
+        let init_epoch = epoch_halfwords(b.init.originating_epoch);
+        let fini_epoch = epoch_halfwords(b.fini.epoch);
+
+        data[base + cols::ADDR_0] = FE::from(addr[0]);
+        data[base + cols::ADDR_1] = FE::from(addr[1]);
+        data[base + cols::ADDR_2] = FE::from(addr[2]);
+        data[base + cols::ADDR_3] = FE::from(addr[3]);
         data[base + cols::INIT_VALUE] = FE::from(b.init.value & 0xFF);
-        data[base + cols::INIT_EPOCH] = FE::from(b.init.originating_epoch);
-        data[base + cols::INIT_TIMESTAMP_LO] = FE::from(b.init.timestamp & 0xFFFF_FFFF);
-        data[base + cols::INIT_TIMESTAMP_HI] = FE::from(b.init.timestamp >> 32);
+        data[base + cols::INIT_EPOCH_0] = FE::from(init_epoch[0]);
+        data[base + cols::INIT_EPOCH_1] = FE::from(init_epoch[1]);
+        data[base + cols::INIT_TS_0] = FE::from(init_ts[0]);
+        data[base + cols::INIT_TS_1] = FE::from(init_ts[1]);
+        data[base + cols::INIT_TS_2] = FE::from(init_ts[2]);
+        data[base + cols::INIT_TS_3] = FE::from(init_ts[3]);
         data[base + cols::FINI_VALUE] = FE::from(b.fini.value & 0xFF);
-        data[base + cols::FINI_EPOCH] = FE::from(b.fini.epoch);
-        data[base + cols::FINI_TIMESTAMP_LO] = FE::from(b.fini.timestamp & 0xFFFF_FFFF);
-        data[base + cols::FINI_TIMESTAMP_HI] = FE::from(b.fini.timestamp >> 32);
+        data[base + cols::FINI_EPOCH_0] = FE::from(fini_epoch[0]);
+        data[base + cols::FINI_EPOCH_1] = FE::from(fini_epoch[1]);
+        data[base + cols::FINI_TS_0] = FE::from(fini_ts[0]);
+        data[base + cols::FINI_TS_1] = FE::from(fini_ts[1]);
+        data[base + cols::FINI_TS_2] = FE::from(fini_ts[2]);
+        data[base + cols::FINI_TS_3] = FE::from(fini_ts[3]);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -179,6 +277,27 @@ pub fn generate_local_to_global_trace(
 // =========================================================================
 // Bus interactions
 // =========================================================================
+
+/// A 32-bit value reconstructed from its two halfword columns: `lo + 2^16·hi`.
+fn word(lo_col: usize, hi_col: usize) -> BusValue {
+    BusValue::linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: lo_col,
+        },
+        LinearTerm::Column {
+            coefficient: 1 << 16,
+            column: hi_col,
+        },
+    ])
+}
+
+fn byte(column: usize) -> BusValue {
+    BusValue::Packed {
+        start_column: column,
+        packing: Packing::Direct,
+    }
+}
 
 /// Cross-epoch memory bus interactions, two per row (one touched cell):
 /// - **receive** the `init` token `(address, value, originating_epoch, timestamp)`
@@ -197,30 +316,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::GlobalMemory,
             Multiplicity::One,
             vec![
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_HI,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::INIT_VALUE,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::INIT_EPOCH,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::INIT_TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::INIT_TIMESTAMP_HI,
-                    packing: Packing::Direct,
-                },
+                word(cols::ADDR_0, cols::ADDR_1),
+                word(cols::ADDR_2, cols::ADDR_3),
+                byte(cols::INIT_VALUE),
+                word(cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
+                word(cols::INIT_TS_0, cols::INIT_TS_1),
+                word(cols::INIT_TS_2, cols::INIT_TS_3),
             ],
         ),
         // fini: send the token for the next epoch to consume.
@@ -228,30 +329,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::GlobalMemory,
             Multiplicity::One,
             vec![
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_HI,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_VALUE,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_EPOCH,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_HI,
-                    packing: Packing::Direct,
-                },
+                word(cols::ADDR_0, cols::ADDR_1),
+                word(cols::ADDR_2, cols::ADDR_3),
+                byte(cols::FINI_VALUE),
+                word(cols::FINI_EPOCH_0, cols::FINI_EPOCH_1),
+                word(cols::FINI_TS_0, cols::FINI_TS_1),
+                word(cols::FINI_TS_2, cols::FINI_TS_3),
             ],
         ),
     ]
@@ -274,20 +357,11 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::One,
             vec![
                 BusValue::constant(0),
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_HI,
-                    packing: Packing::Direct,
-                },
+                word(cols::ADDR_0, cols::ADDR_1),
+                word(cols::ADDR_2, cols::ADDR_3),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                BusValue::Packed {
-                    start_column: cols::INIT_VALUE,
-                    packing: Packing::Direct,
-                },
+                byte(cols::INIT_VALUE),
             ],
         ),
         // fini: send the cell's final token at the last access timestamp.
@@ -296,29 +370,99 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::One,
             vec![
                 BusValue::constant(0),
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::ADDRESS_HI,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_HI,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_VALUE,
-                    packing: Packing::Direct,
-                },
+                word(cols::ADDR_0, cols::ADDR_1),
+                word(cols::ADDR_2, cols::ADDR_3),
+                word(cols::FINI_TS_0, cols::FINI_TS_1),
+                word(cols::FINI_TS_2, cols::FINI_TS_3),
+                byte(cols::FINI_VALUE),
             ],
         ),
     ]
+}
+
+/// Range-check bus interactions: one `AreBytes` lookup for the two value bytes
+/// and one `IsHalfword` lookup per halfword column. They fire on every row
+/// (Multiplicity::One), so the matching multiplicities — including the all-zero
+/// padding rows — are emitted by [`collect_bitwise_from_l2g`].
+///
+/// These are committed only on the epoch-local table (`l2g_memory_air`), whose
+/// proof carries the BITWISE provider; the global proof commits the identical
+/// trace, so its columns inherit the same range guarantee via the commitment
+/// binding. Keep this in sync with [`collect_bitwise_from_l2g`].
+pub fn range_check_interactions() -> Vec<BusInteraction> {
+    let mut interactions = Vec::with_capacity(1 + cols::HALFWORD_COLUMNS.len());
+    interactions.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::One,
+        vec![byte(cols::INIT_VALUE), byte(cols::FINI_VALUE)],
+    ));
+    for &column in &cols::HALFWORD_COLUMNS {
+        interactions.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            Multiplicity::One,
+            vec![byte(column)],
+        ));
+    }
+    interactions
+}
+
+/// The BITWISE lookups the L2G range checks send, so the BITWISE table's
+/// multiplicities balance the [`range_check_interactions`] senders. Emits one
+/// `AreBytes` and 16 `IsHalfword` ops per row, padded to a power of two with
+/// all-zero rows (which still fire, since the senders are unconditional).
+pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOperation> {
+    let num_rows = boundaries.len().next_power_of_two().max(1);
+    let mut ops = Vec::with_capacity(num_rows * (1 + cols::HALFWORD_COLUMNS.len()));
+
+    let push_halfword = |ops: &mut Vec<BitwiseOperation>, v16: u64| {
+        ops.push(BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (v16 & 0xFF) as u8,
+            ((v16 >> 8) & 0xFF) as u8,
+        ));
+    };
+
+    for b in boundaries {
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            (b.init.value & 0xFF) as u8,
+            (b.fini.value & 0xFF) as u8,
+        ));
+        let addr = halfwords64(b.address);
+        let init_ts = halfwords64(b.init.timestamp);
+        let fini_ts = halfwords64(b.fini.timestamp);
+        let init_epoch = epoch_halfwords(b.init.originating_epoch);
+        let fini_epoch = epoch_halfwords(b.fini.epoch);
+        for v in addr {
+            push_halfword(&mut ops, v);
+        }
+        for v in init_epoch {
+            push_halfword(&mut ops, v);
+        }
+        for v in init_ts {
+            push_halfword(&mut ops, v);
+        }
+        for v in fini_epoch {
+            push_halfword(&mut ops, v);
+        }
+        for v in fini_ts {
+            push_halfword(&mut ops, v);
+        }
+    }
+
+    // Padding rows are all zero: AreBytes(0, 0) + 16 × IsHalfword(0).
+    for _ in boundaries.len()..num_rows {
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            0,
+            0,
+        ));
+        for _ in 0..cols::HALFWORD_COLUMNS.len() {
+            push_halfword(&mut ops, 0);
+        }
+    }
+
+    ops
 }
 
 #[cfg(test)]
@@ -462,57 +606,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 10);
+    /// Reconstruct a 32-bit value from its two halfword columns, as the bus does.
+    fn word_value(
+        trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
+        lo: usize,
+        hi: usize,
+    ) -> FE {
+        *trace.main_table.get(0, lo) + FE::from(1u64 << 16) * *trace.main_table.get(0, hi)
     }
 
     #[test]
-    fn test_trace_columns_hold_lo_hi_split_values() {
+    fn test_num_columns() {
+        assert_eq!(cols::NUM_COLUMNS, 18);
+        assert_eq!(cols::HALFWORD_COLUMNS.len(), 16);
+    }
+
+    #[test]
+    fn test_halfword_columns_reconstruct_to_the_split_values() {
         let b = sample_boundary(0x4_0000_0001);
         let trace = generate_local_to_global_trace(&[b]);
 
-        // One row padded up to the next power of two (1).
         assert_eq!(trace.num_rows(), 1);
 
-        let lo = |v: u64| FE::from(v & 0xFFFF_FFFF);
-        let hi = |v: u64| FE::from(v >> 32);
+        let lo32 = |v: u64| FE::from(v & 0xFFFF_FFFF);
+        let hi32 = |v: u64| FE::from(v >> 32);
         let byte = |v: u64| FE::from(v & 0xFF);
 
-        assert_eq!(*trace.main_table.get(0, cols::ADDRESS_LO), lo(b.address));
-        assert_eq!(*trace.main_table.get(0, cols::ADDRESS_HI), hi(b.address));
+        // Address halfwords reconstruct to address_lo / address_hi.
+        assert_eq!(
+            word_value(&trace, cols::ADDR_0, cols::ADDR_1),
+            lo32(b.address)
+        );
+        assert_eq!(
+            word_value(&trace, cols::ADDR_2, cols::ADDR_3),
+            hi32(b.address)
+        );
+        // Values are stored as single bytes.
         assert_eq!(
             *trace.main_table.get(0, cols::INIT_VALUE),
             byte(b.init.value)
         );
         assert_eq!(
-            *trace.main_table.get(0, cols::INIT_EPOCH),
-            FE::from(b.init.originating_epoch)
-        );
-        assert_eq!(
-            *trace.main_table.get(0, cols::INIT_TIMESTAMP_LO),
-            lo(b.init.timestamp)
-        );
-        assert_eq!(
-            *trace.main_table.get(0, cols::INIT_TIMESTAMP_HI),
-            hi(b.init.timestamp)
-        );
-        assert_eq!(
             *trace.main_table.get(0, cols::FINI_VALUE),
             byte(b.fini.value)
         );
+        // Timestamps reconstruct to lo / hi 32-bit words.
         assert_eq!(
-            *trace.main_table.get(0, cols::FINI_EPOCH),
+            word_value(&trace, cols::INIT_TS_0, cols::INIT_TS_1),
+            lo32(b.init.timestamp)
+        );
+        assert_eq!(
+            word_value(&trace, cols::INIT_TS_2, cols::INIT_TS_3),
+            hi32(b.init.timestamp)
+        );
+        assert_eq!(
+            word_value(&trace, cols::FINI_TS_0, cols::FINI_TS_1),
+            lo32(b.fini.timestamp)
+        );
+        assert_eq!(
+            word_value(&trace, cols::FINI_TS_2, cols::FINI_TS_3),
+            hi32(b.fini.timestamp)
+        );
+        // Fini epoch reconstructs to the epoch index.
+        assert_eq!(
+            word_value(&trace, cols::FINI_EPOCH_0, cols::FINI_EPOCH_1),
             FE::from(b.fini.epoch)
         );
+    }
+
+    #[test]
+    fn test_genesis_epoch_halfwords_match_global_memory_encoding() {
+        // The genesis init-epoch halfwords must reconstruct to FE::from(GENESIS_EPOCH),
+        // the exact value global_memory sends on the GlobalMemory bus.
+        let b = sample_boundary(0x1000);
+        let trace = generate_local_to_global_trace(&[b]);
         assert_eq!(
-            *trace.main_table.get(0, cols::FINI_TIMESTAMP_LO),
-            lo(b.fini.timestamp)
+            word_value(&trace, cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
+            FE::from(GENESIS_EPOCH)
         );
-        assert_eq!(
-            *trace.main_table.get(0, cols::FINI_TIMESTAMP_HI),
-            hi(b.fini.timestamp)
-        );
+        // And every halfword is genuinely a halfword (< 2^16).
+        for &col in &cols::HALFWORD_COLUMNS {
+            let raw = *trace.main_table.get(0, col).value();
+            assert!(raw < (1 << 16), "column {col} is not a halfword: {raw}");
+        }
     }
 
     #[test]
@@ -554,5 +730,83 @@ mod tests {
         // epochs: address(lo,hi), value(byte), epoch, timestamp(lo,hi).
         assert_eq!(init.values.len(), 6);
         assert_eq!(fini.values.len(), 6);
+    }
+
+    #[test]
+    fn test_range_check_interactions_cover_every_column() {
+        let interactions = range_check_interactions();
+        // 1 AreBytes (two value bytes) + one IsHalfword per halfword column.
+        assert_eq!(interactions.len(), 1 + cols::HALFWORD_COLUMNS.len());
+        let are_bytes = u64::from(BusId::AreBytes);
+        let is_halfword = u64::from(BusId::IsHalfword);
+        assert_eq!(interactions[0].bus_id, are_bytes);
+        assert_eq!(interactions[0].values.len(), 2);
+        for interaction in &interactions[1..] {
+            assert!(interaction.is_sender);
+            assert_eq!(interaction.bus_id, is_halfword);
+            assert_eq!(interaction.values.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_collect_bitwise_matches_sender_count() {
+        // One AreBytes + 16 IsHalfword per row, padded to a power of two.
+        let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
+        let ops = collect_bitwise_from_l2g(&boundaries);
+        let num_rows = 4; // 3 padded to 4
+        let per_row = 1 + cols::HALFWORD_COLUMNS.len();
+        assert_eq!(ops.len(), num_rows * per_row);
+
+        let are_bytes = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::AreBytes)
+            .count();
+        let is_half = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
+            .count();
+        assert_eq!(are_bytes, num_rows);
+        assert_eq!(is_half, num_rows * cols::HALFWORD_COLUMNS.len());
+    }
+
+    #[test]
+    fn test_collect_bitwise_values_match_the_committed_halfword_columns() {
+        // Each IsHalfword op the collector emits must carry the same value as the
+        // corresponding halfword column the range-check sender reads, so the bus
+        // balances on the right BITWISE rows (not just the right counts). Use a
+        // boundary with distinct values in every quantity.
+        let b = CellBoundary {
+            address: 0x1234_5678_9abc_def0,
+            init: InitClaim {
+                value: 0xAB,
+                originating_epoch: 0x0011_2233,
+                timestamp: 0x4455_6677_8899_aabb,
+            },
+            fini: FiniClaim {
+                value: 0xCD,
+                epoch: 0x00aa_00bb,
+                timestamp: 0xccdd_eeff_0011_2233,
+            },
+        };
+        let trace = generate_local_to_global_trace(&[b]);
+        let ops = collect_bitwise_from_l2g(&[b]);
+
+        // The single AreBytes op carries the two value bytes.
+        assert_eq!(ops[0].lookup_type, BitwiseOperationType::AreBytes);
+        assert_eq!(ops[0].x as u64, b.init.value & 0xFF);
+        assert_eq!(ops[0].y as u64, b.fini.value & 0xFF);
+
+        // The 16 IsHalfword ops follow, in HALFWORD_COLUMNS order, each matching
+        // the value committed in that column.
+        for (i, &col) in cols::HALFWORD_COLUMNS.iter().enumerate() {
+            let op = &ops[1 + i];
+            assert_eq!(op.lookup_type, BitwiseOperationType::IsHalf);
+            let op_value = op.x as u64 + ((op.y as u64) << 8);
+            assert_eq!(
+                FE::from(op_value),
+                *trace.main_table.get(0, col),
+                "IsHalfword op {i} value disagrees with column {col}"
+            );
+        }
     }
 }
