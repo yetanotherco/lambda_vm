@@ -152,6 +152,29 @@ def main() -> int:
     raise AssertionError(args.command)
 
 
+LANE_ID_RE = re.compile(r"\A[A-Za-z0-9._-]+\Z")
+
+
+def pr_is_from_fork(pr: dict[str, Any]) -> bool:
+    """True unless the PR head branch lives in the same repo as the base.
+
+    The review workflow checks out the PR merge ref and EXECUTES code from it
+    (ai_review.py, .opencode tools, matrix, prompts) in steps that hold provider
+    secrets. Only same-repo branches (which require write access) may do that, so
+    fork PRs — where an untrusted author controls that code — must be refused.
+    """
+    head = ((pr.get("head") or {}).get("repo") or {}).get("full_name")
+    base = ((pr.get("base") or {}).get("repo") or {}).get("full_name")
+    return not head or not base or head != base
+
+
+def assert_safe_lane_id(lane_id: str) -> None:
+    """Lane ids flow into shell paths and artifact names downstream; reject any id
+    outside a safe charset so a crafted id cannot inject shell."""
+    if not LANE_ID_RE.match(lane_id or ""):
+        raise SystemExit(f"Unsafe lane id {lane_id!r}; allowed charset: [A-Za-z0-9._-]")
+
+
 def cmd_prepare(args: argparse.Namespace) -> int:
     event = read_json(pathlib.Path(args.event))
     tier, pr_number = parse_review_trigger(event)
@@ -169,6 +192,17 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     token = os.environ["GITHUB_TOKEN"]
     pr = github_json("GET", f"/repos/{repo}/pulls/{pr_number}", token=token)
 
+    # SECURITY: refuse fork PRs. The lane jobs run PR-controlled code with provider
+    # secrets in their env, so only same-repo branches (write-access users) may run.
+    if pr_is_from_fork(pr):
+        print(
+            "::error::ai-review refuses fork PRs: it executes PR-controlled code "
+            "(ai_review.py, .opencode tools, matrix) in steps that hold provider "
+            "secrets. Only same-repo branches may run."
+        )
+        write_github_outputs(pathlib.Path(args.output), outputs)
+        return 0
+
     # The native Codex/Claude reviews use the SAME generic prompt as the swarm
     # (general.md). There is no separate soundness brief: a buzzword list does not
     # help a model find soundness bugs, and real soundness review is deferred to
@@ -181,6 +215,9 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # regardless of lane id/prompt naming (infer_tier_from_lane is only a fallback).
     review_lanes = [{**lane, "tier": tier} for lane in tier_config["review_lanes"]]
     verifier_lanes = [{**lane, "tier": tier} for lane in tier_config["verifier_lanes"]]
+
+    for lane in review_lanes + verifier_lanes:
+        assert_safe_lane_id(str(lane.get("id", "")))
 
     outputs = {
         "should_run": "true",

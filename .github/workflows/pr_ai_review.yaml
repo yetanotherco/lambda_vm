@@ -161,9 +161,12 @@ jobs:
           MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
+          LANE_ID: ${{ matrix.lane.id }}
         run: |
           set +e
-          LANE_OUT="ai-review-lane/${{ matrix.lane.id }}.json"
+          # Use the env var (not raw ${{ }} interpolation) so the id is not parsed
+          # as shell; prepare also validates it against [A-Za-z0-9._-].
+          LANE_OUT="ai-review-lane/$LANE_ID.json"
           timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
@@ -310,9 +313,12 @@ jobs:
           MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
+          LANE_ID: ${{ matrix.lane.id }}
         run: |
           set +e
-          LANE_OUT="ai-review-verification/${{ matrix.lane.id }}.json"
+          # Use the env var (not raw ${{ }} interpolation) so the id is not parsed
+          # as shell; prepare also validates it against [A-Za-z0-9._-].
+          LANE_OUT="ai-review-verification/$LANE_ID.json"
           timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \

@@ -230,11 +230,28 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   finders and single-shot calls. Kimi must go via OpenRouter (direct Moonshot
   returned `401`). The OpenRouter key has a **daily spend cap** — heavy
   experimentation exhausts it.
-- **Security.** The agent is read-only (`bash`/`edit`/`write`/`patch`/`webfetch`
-  denied) with `external_directory: deny`, so it can't read `/proc/self/environ`
-  or credential files to leak keys via the report (verified). **Open issue:** the
-  workflow installs the agent + tools by copying them *from the PR checkout*, so a
-  malicious PR could weaken its own sandbox — install them from the base branch.
+- **Security — the agent sandbox is not the main control.** The agent is
+  read-only (`bash`/`edit`/`write`/`patch`/`webfetch` denied) with
+  `external_directory: deny`, so the *LLM* can't read `/proc/self/environ` to
+  leak keys (verified). But the sandbox does **not** stop PR-controlled *code*
+  (`ai_review.py`, `.opencode/tools/*.ts`) from exfiltrating: that code runs as
+  the workflow step, with the provider secrets in its env. This is a "pwn
+  request": the danger is *whose code runs*, not who triggers — a trusted member
+  running `/ai-review` on an external PR would execute that PR's code with the
+  secrets.
+- **Mitigation: refuse fork PRs.** `prepare` rejects any PR whose head repo ≠
+  base repo (`pr_is_from_fork`), so only same-repo branches — which require write
+  access — reach the secret-bearing, code-executing steps. (`pull_request` also
+  withholds secrets from forks by default; this additionally covers the
+  `issue_comment` path, which has secrets on any PR.) Comment triggers are
+  already gated to OWNER/MEMBER/COLLABORATOR; the fork block is what actually
+  protects the secrets. Lane ids are validated to `[A-Za-z0-9._-]` and passed via
+  env (not raw `${{ }}` shell interpolation) to close matrix→shell injection.
+  Residual (accepted): a *write-access* user could still run malicious code with
+  the secrets — they can already reach secrets via other workflows, so it's
+  within the trust boundary. The fuller fix (run trusted runner code from the
+  base ref, check out the PR only as read-only review data) is a future option;
+  it has a bootstrapping circularity and the same effective boundary.
 - **Diagnostics.** Each lane records an opencode `timeline` (tool calls + args,
   text previews, per-step output/reasoning tokens), `cost`, `tokens`,
   `returncode`, and a stderr tail — that is how every failure above was diagnosed.

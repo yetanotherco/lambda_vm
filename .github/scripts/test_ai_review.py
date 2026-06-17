@@ -328,6 +328,34 @@ class AiReviewTriggerTests(unittest.TestCase):
 
         self.assertEqual(ai_review.parse_review_trigger(event), ("critical", 671))
 
+    def test_same_repo_pr_is_not_a_fork(self) -> None:
+        pr = {
+            "head": {"repo": {"full_name": "org/repo"}},
+            "base": {"repo": {"full_name": "org/repo"}},
+        }
+        self.assertFalse(ai_review.pr_is_from_fork(pr))
+
+    def test_fork_pr_is_detected(self) -> None:
+        pr = {
+            "head": {"repo": {"full_name": "attacker/repo"}},
+            "base": {"repo": {"full_name": "org/repo"}},
+        }
+        self.assertTrue(ai_review.pr_is_from_fork(pr))
+
+    def test_deleted_fork_repo_is_treated_as_fork(self) -> None:
+        # head.repo is null when the fork was deleted; must not be treated as same-repo
+        pr = {"head": {"repo": None}, "base": {"repo": {"full_name": "org/repo"}}}
+        self.assertTrue(ai_review.pr_is_from_fork(pr))
+
+    def test_safe_lane_ids_are_accepted(self) -> None:
+        for lane_id in ("glm", "deepseek-verifier", "lane_1.2", "GPT-5"):
+            ai_review.assert_safe_lane_id(lane_id)  # must not raise
+
+    def test_unsafe_lane_ids_are_rejected(self) -> None:
+        for lane_id in ("a;b", "$(curl evil)", "a b", "`id`", "", "x/../y"):
+            with self.assertRaises(SystemExit):
+                ai_review.assert_safe_lane_id(lane_id)
+
 
 class AiReviewCandidateTests(unittest.TestCase):
     def test_build_candidates_merges_duplicate_findings_and_preserves_sources(self) -> None:
