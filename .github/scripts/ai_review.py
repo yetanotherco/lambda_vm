@@ -194,6 +194,11 @@ def cmd_prepare(args: argparse.Namespace) -> int:
 
     # SECURITY: refuse fork PRs. The lane jobs run PR-controlled code with provider
     # secrets in their env, so only same-repo branches (write-access users) may run.
+    # NOTE on layering: for the `pull_request` (label) trigger this script is itself
+    # checked out from the PR, so a fork could bypass this check — that arm is gated
+    # in the workflow `if` (trusted event context, before checkout). This check is
+    # the gate for the `issue_comment` arm (where prepare runs trusted default-branch
+    # code) and defense-in-depth everywhere.
     if pr_is_from_fork(pr):
         print(
             "::error::ai-review refuses fork PRs: it executes PR-controlled code "

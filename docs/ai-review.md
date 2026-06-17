@@ -239,14 +239,20 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   request": the danger is *whose code runs*, not who triggers — a trusted member
   running `/ai-review` on an external PR would execute that PR's code with the
   secrets.
-- **Mitigation: refuse fork PRs.** `prepare` rejects any PR whose head repo ≠
-  base repo (`pr_is_from_fork`), so only same-repo branches — which require write
-  access — reach the secret-bearing, code-executing steps. (`pull_request` also
-  withholds secrets from forks by default; this additionally covers the
-  `issue_comment` path, which has secrets on any PR.) Comment triggers are
-  already gated to OWNER/MEMBER/COLLABORATOR; the fork block is what actually
-  protects the secrets. Lane ids are validated to `[A-Za-z0-9._-]` and passed via
-  env (not raw `${{ }}` shell interpolation) to close matrix→shell injection.
+- **Mitigation: refuse fork PRs — in the trusted layer.** Only same-repo
+  branches (which require write access) may reach the secret-bearing,
+  code-executing steps. This must be enforced in *trusted* code: on the
+  `pull_request` (label) arm `prepare` runs `ai_review.py` checked out **from the
+  PR**, so a fork could rewrite the gate itself — that arm is therefore gated in
+  the **workflow `if`** using the trusted event context
+  (`head.repo.full_name == base.repo.full_name`), before any checkout, so a fork
+  PR's job never starts. The `issue_comment` arm runs `prepare` from the default
+  branch (trusted), so its fork gate is the `pr_is_from_fork` check there (the
+  comment event lacks head-repo info for the `if`); that check is also
+  defense-in-depth everywhere. (`pull_request` additionally withholds secrets and
+  the write token from forks by default.) Comment triggers are gated to
+  OWNER/MEMBER/COLLABORATOR. Lane ids are validated to `[A-Za-z0-9._-]` and passed
+  via env (not raw `${{ }}` shell interpolation) to close matrix→shell injection.
   Residual (accepted): a *write-access* user could still run malicious code with
   the secrets — they can already reach secrets via other workflows, so it's
   within the trust boundary. The fuller fix (run trusted runner code from the
