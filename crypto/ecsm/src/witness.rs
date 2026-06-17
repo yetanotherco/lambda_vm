@@ -109,10 +109,12 @@ fn limb_carries(relation: &str, terms: &[i128; 64]) -> [i64; 64] {
     for i in 0..64 {
         let s = carry + terms[i];
         assert!(
-            s % 256 == 0,
+            (s & 0xFF) == 0,
             "ECSM witness {relation}: limb {i} not divisible by 256"
         );
-        carry = s / 256;
+        // `s` is a multiple of 256 (asserted), so the arithmetic shift equals the
+        // truncating division `s / 256` even when `s` is negative.
+        carry = s >> 8;
         c[i] = carry as i64;
     }
     assert!(
