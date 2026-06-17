@@ -4,29 +4,34 @@
       {
         "id": "minimax-correctness",
         "model": "minimax/MiniMax-M3",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "kimi-correctness",
         "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "nemotron-correctness",
         "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "glm-correctness",
         "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       }
     ],
     "verifier_lanes": [
       {
         "id": "deepseek-verifier",
         "model": "openrouter/deepseek/deepseek-v4-pro",
-        "prompt": "verify"
+        "prompt": "verify",
+        "variant": "low"
       }
     ]
   },
@@ -35,22 +40,26 @@
       {
         "id": "minimax-correctness",
         "model": "minimax/MiniMax-M3",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "kimi-correctness",
         "model": "moonshotai/kimi-k2.7-code",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "nemotron-correctness",
         "model": "openrouter/nvidia/nemotron-3-ultra-550b-a55b",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "glm-correctness",
         "model": "openrouter/z-ai/glm-5.2",
-        "prompt": "correctness"
+        "prompt": "correctness",
+        "variant": "low"
       },
       {
         "id": "claude-general",

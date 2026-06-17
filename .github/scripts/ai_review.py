@@ -347,7 +347,10 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
             message = build_agentic_verification_message(lane, context, candidates, prompt)
             required_key = "verifications"
         repo = pathlib.Path(args.repo)
-        raw, meta = run_opencode_agent(repo, lane["model"], args.agent, message, args.timeout)
+        variant = lane.get("variant")
+        raw, meta = run_opencode_agent(
+            repo, lane["model"], args.agent, message, args.timeout, variant=variant
+        )
         base_result["raw_response"] = raw[-20000:]
         base_result["opencode"] = meta
         parsed, parse_error = extract_json(raw, required_key=required_key)
@@ -363,7 +366,8 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
             # below the exploration timeout to leave wall-clock room within the job.
             cont_timeout = min(args.timeout, 300)
             raw2, meta2 = run_opencode_agent(
-                repo, lane["model"], args.agent, cont_msg, cont_timeout, session_id=session_id
+                repo, lane["model"], args.agent, cont_msg, cont_timeout,
+                session_id=session_id, variant=variant,
             )
             base_result["continuation"] = meta2
             parsed2, parse_error2 = extract_json(raw2, required_key=required_key)
@@ -394,6 +398,7 @@ def run_opencode_agent(
     message: str,
     timeout: int,
     session_id: str | None = None,
+    variant: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     # model is a fully provider-qualified opencode id (e.g. "openrouter/z-ai/glm-5.2",
     # "minimax-coding-plan/MiniMax-M3", "anthropic/claude-opus-4-8"). opencode resolves
@@ -409,11 +414,15 @@ def run_opencode_agent(
     # --print-logs --log-level INFO sends opencode's own logs (incl. provider failures and
     # the per-step loop) to stderr, where we capture them — without polluting the JSON
     # event stream on stdout. This is how a silently-empty lane reveals its cause.
+    # --variant caps reasoning effort (e.g. "low"): heavy-reasoning models otherwise spend
+    # the whole turn on reasoning tokens and emit empty output or time out.
     cmd = [
         "opencode", "run",
         "--agent", agent, "-m", model, "--format", "json",
         "--print-logs", "--log-level", "INFO",
     ]
+    if variant:
+        cmd += ["--variant", variant]
     if session_id:
         cmd += ["--session", session_id]
     proc = subprocess.run(
