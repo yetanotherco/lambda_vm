@@ -123,8 +123,11 @@ jobs:
           # A second identical PR checkout made the agent wander between two copies
           # of every file and exhaust its step budget. Install the read-only agent
           # globally so discovery is version-independent.
-          mkdir -p "$HOME/.config/opencode/agent"
+          mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
           cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          # Install custom tools (submit_findings) globally too, so review lanes report
+          # findings via a tool call instead of hand-written JSON.
+          cp runner/.opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -257,8 +260,11 @@ jobs:
           # A second identical PR checkout made the agent wander between two copies
           # of every file and exhaust its step budget. Install the read-only agent
           # globally so discovery is version-independent.
-          mkdir -p "$HOME/.config/opencode/agent"
+          mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
           cp runner/.opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          # Install custom tools (submit_findings) globally too, so review lanes report
+          # findings via a tool call instead of hand-written JSON.
+          cp runner/.opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4

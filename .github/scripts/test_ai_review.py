@@ -548,5 +548,53 @@ class AiReviewVerificationTests(unittest.TestCase):
         self.assertEqual(by_id["AI-005"]["status"], "uncertain")
 
 
+class AiReviewSubmissionTests(unittest.TestCase):
+    def _write(self, content: str) -> pathlib.Path:
+        import tempfile
+
+        path = pathlib.Path(tempfile.mkdtemp()) / "sub.json"
+        path.write_text(content, encoding="utf-8")
+        return path
+
+    def test_read_submission_placeholder_not_submitted(self) -> None:
+        path = self._write(json.dumps({"submitted": False, "findings": [], "summary": ""}))
+        sub = ai_review.read_submission(path)
+        self.assertFalse(sub["submitted"])
+        self.assertEqual(sub["findings"], [])
+
+    def test_read_submission_submitted_with_findings(self) -> None:
+        path = self._write(
+            json.dumps({"submitted": True, "summary": "s", "findings": [{"title": "t", "claim": "c"}]})
+        )
+        sub = ai_review.read_submission(path)
+        self.assertTrue(sub["submitted"])
+        self.assertEqual(len(sub["findings"]), 1)
+        self.assertEqual(sub["summary"], "s")
+
+    def test_read_submission_coerces_stringified_findings(self) -> None:
+        path = self._write(json.dumps({"submitted": True, "findings": "[{\"title\": \"t\"}]"}))
+        sub = ai_review.read_submission(path)
+        self.assertEqual(len(sub["findings"]), 1)
+
+    def test_read_submission_missing_file_is_not_submitted(self) -> None:
+        sub = ai_review.read_submission(pathlib.Path("/nonexistent/does-not-exist.json"))
+        self.assertFalse(sub["submitted"])
+        self.assertEqual(sub["findings"], [])
+
+    def test_stream_meta_timeline_records_tool_calls_and_tokens(self) -> None:
+        stream = "\n".join(
+            [
+                json.dumps({"type": "tool_use", "part": {"tool": "read", "state": {"status": "completed", "input": {"filePath": "a.py"}}}}),
+                json.dumps({"type": "tool_use", "part": {"tool": "submit_findings", "state": {"status": "completed", "input": {"findings": []}}}}),
+                json.dumps({"type": "step_finish", "part": {"tokens": {"output": 0, "reasoning": 6587}}}),
+            ]
+        )
+        meta = ai_review.opencode_stream_meta(stream)
+        tools = [e for e in meta["timeline"] if e["t"] == "tool"]
+        self.assertEqual([t["tool"] for t in tools], ["read", "submit_findings"])
+        steps = [e for e in meta["timeline"] if e["t"] == "step"]
+        self.assertEqual(steps[0]["reasoning"], 6587)
+
+
 if __name__ == "__main__":
     unittest.main()
