@@ -157,7 +157,7 @@ jobs:
         run: |
           set +e
           LANE_OUT="ai-review-lane/${{ matrix.lane.id }}.json"
-          timeout 760s python3 runner/.github/scripts/ai_review.py agentic-lane \
+          timeout 1100s python3 runner/.github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --kind review \
@@ -297,7 +297,7 @@ jobs:
         run: |
           set +e
           LANE_OUT="ai-review-verification/${{ matrix.lane.id }}.json"
-          timeout 760s python3 runner/.github/scripts/ai_review.py agentic-lane \
+          timeout 1100s python3 runner/.github/scripts/ai_review.py agentic-lane \
             --lane-json "$LANE_JSON" \
             --context ai-review-context/context.json \
             --kind verification \

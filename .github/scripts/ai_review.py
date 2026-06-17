@@ -63,6 +63,24 @@ VERIFY_SCHEMA_INSTRUCTION = textwrap.dedent(
     }"""
 )
 
+# opencode frequently ends the agent turn (reasoning/step budget exhausted) before the
+# model emits its final JSON. When the first pass produces no parseable result we resume
+# the SAME session with one of these and demand only the JSON — the model keeps all the
+# repository context it already explored, so it just has to write the answer.
+CONTINUATION_REVIEW = (
+    "Stop exploring now. Do not call any more tools and do not write any analysis, "
+    "reasoning, or commentary. Based on everything you have already read, emit your final "
+    'answer as ONLY this JSON object: {"summary": "...", "findings": [ ... ]} using the '
+    "schema from the original instructions. If you found no real issues, emit "
+    '{"summary": "...", "findings": []}. Output nothing before or after the JSON.'
+)
+CONTINUATION_VERIFY = (
+    "Stop now. Do not call any more tools and do not write any analysis or commentary. "
+    'Emit your final answer as ONLY this JSON object: {"summary": "...", "verifications": '
+    "[ ... ]} using the schema from the original instructions. Output nothing before or "
+    "after the JSON."
+)
+
 
 def main() -> int:
     parser = argparse.ArgumentParser()
@@ -328,20 +346,37 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
         else:
             message = build_agentic_verification_message(lane, context, candidates, prompt)
             required_key = "verifications"
-        raw, meta = run_opencode_agent(
-            pathlib.Path(args.repo), lane["model"], args.agent, message, args.timeout
-        )
+        repo = pathlib.Path(args.repo)
+        raw, meta = run_opencode_agent(repo, lane["model"], args.agent, message, args.timeout)
         base_result["raw_response"] = raw[-20000:]
         base_result["opencode"] = meta
         parsed, parse_error = extract_json(raw, required_key=required_key)
+        items = lane_items(parsed, lane, args.kind)
+
+        # opencode often ends the agent turn (reasoning/step budget) before the model
+        # emits its final JSON. When the first pass yielded nothing parseable, resume the
+        # same session and demand only the JSON — the model retains its exploration.
+        session_id = meta.get("session_id")
+        if not items and parse_error and session_id:
+            cont_msg = CONTINUATION_REVIEW if args.kind == "review" else CONTINUATION_VERIFY
+            # The continuation does no exploration (it just emits the JSON), so cap it well
+            # below the exploration timeout to leave wall-clock room within the job.
+            cont_timeout = min(args.timeout, 300)
+            raw2, meta2 = run_opencode_agent(
+                repo, lane["model"], args.agent, cont_msg, cont_timeout, session_id=session_id
+            )
+            base_result["continuation"] = meta2
+            parsed2, parse_error2 = extract_json(raw2, required_key=required_key)
+            items2 = lane_items(parsed2, lane, args.kind)
+            if items2 or not parse_error2:
+                raw, parsed, parse_error, items = raw2, parsed2, parse_error2, items2
+                base_result["raw_response"] = raw2[-20000:]
+
         if args.kind == "review":
-            findings = parse_findings(parsed, lane)
-            base_result["findings"] = [f for f in findings if f.get("claim") or f.get("title")]
-            base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
+            base_result["findings"] = items
         else:
-            verifications = parse_verifications(parsed, lane)
-            base_result["verifications"] = [v for v in verifications if v.get("issue_id")]
-            base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
+            base_result["verifications"] = items
+        base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
         if parse_error:
             base_result["parse_error"] = parse_error
     except subprocess.TimeoutExpired:
@@ -353,7 +388,12 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
 
 
 def run_opencode_agent(
-    repo: pathlib.Path, model: str, agent: str, message: str, timeout: int
+    repo: pathlib.Path,
+    model: str,
+    agent: str,
+    message: str,
+    timeout: int,
+    session_id: str | None = None,
 ) -> tuple[str, dict[str, Any]]:
     # model is a fully provider-qualified opencode id (e.g. "openrouter/z-ai/glm-5.2",
     # "minimax-coding-plan/MiniMax-M3", "anthropic/claude-opus-4-8"). opencode resolves
@@ -361,7 +401,17 @@ def run_opencode_agent(
     # --format json emits a JSONL event stream; the assistant's output (including the
     # final findings JSON) arrives in "text" events. The human-rendered default format
     # drops the final message in non-TTY environments, so we always parse the stream.
-    cmd = ["opencode", "run", message, "--agent", agent, "-m", model, "--format", "json"]
+    # Passing session_id resumes a prior turn (same context) via --session.
+    # --print-logs --log-level WARN sends opencode's own warnings/errors (e.g. auth or
+    # provider failures) to stderr, where we capture them — without polluting the JSON
+    # event stream on stdout. This is how a silently-empty lane reveals its cause.
+    cmd = [
+        "opencode", "run", message,
+        "--agent", agent, "-m", model, "--format", "json",
+        "--print-logs", "--log-level", "WARN",
+    ]
+    if session_id:
+        cmd += ["--session", session_id]
     proc = subprocess.run(
         cmd,
         cwd=str(repo),
@@ -374,11 +424,31 @@ def run_opencode_agent(
     err = proc.stderr.decode("utf-8", errors="replace")
     text = opencode_assistant_text(out)
     meta = opencode_stream_meta(out)
-    meta["stderr_tail"] = err[-1500:]
+    meta["stderr_tail"] = err[-3000:]
+    meta["session_id"] = opencode_session_id(out) or session_id
     if not text.strip():
         # Surface diagnostics so the lane result shows why nothing was produced.
         text = f"[opencode produced no assistant text]\nstderr:\n{err[-3000:]}\nstdout-tail:\n{strip_ansi(out)[-3000:]}"
     return text, meta
+
+
+def opencode_session_id(stdout: str) -> str | None:
+    # Every event in the --format json stream carries the session id (top-level
+    # "sessionID", sometimes also nested under "part"). Return the first one seen.
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(event, dict):
+            continue
+        for sid in (event.get("sessionID"), (event.get("part") or {}).get("sessionID")):
+            if isinstance(sid, str) and sid:
+                return sid
+    return None
 
 
 def opencode_stream_meta(stdout: str) -> dict[str, Any]:
@@ -443,6 +513,14 @@ def parse_verifications(parsed: Any, lane: dict[str, Any]) -> list[dict[str, Any
     if not isinstance(raw_items, list):
         return []
     return [normalize_verification(v, lane) for v in raw_items if isinstance(v, dict)]
+
+
+def lane_items(parsed: Any, lane: dict[str, Any], kind: str) -> list[dict[str, Any]]:
+    # Parse + apply the same "is this a usable item" filter the lane stores, so the
+    # continuation retry decision uses the exact count that ends up in the result.
+    if kind == "review":
+        return [f for f in parse_findings(parsed, lane) if f.get("claim") or f.get("title")]
+    return [v for v in parse_verifications(parsed, lane) if v.get("issue_id")]
 
 
 def build_agentic_review_message(lane: dict[str, Any], context: dict[str, Any], prompt: str) -> str:
