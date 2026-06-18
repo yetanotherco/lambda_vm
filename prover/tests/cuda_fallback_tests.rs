@@ -14,7 +14,7 @@
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
-use stark::gpu_lde::{gpu_fri_calls, reset_all_gpu_call_counters};
+use stark::gpu_lde::{gpu_batch_invert_calls, gpu_fri_calls, reset_all_gpu_call_counters};
 
 /// FRI commit-phase CPU fallback: when the GPU dispatch errors after the
 /// first transcript mutation, `try_fri_commit_gpu` must restore the
@@ -59,4 +59,44 @@ fn gpu_fri_fault_falls_back_to_cpu() {
 
     // Reset injection state for any subsequent tests in the same process.
     stark::gpu_lde::schedule_fri_fold_fault(-1);
+}
+
+/// Batch-invert CPU fallback: when `compute_and_invert_denoms_ext3_dev`
+/// errors, `try_compute_and_invert_inv_denoms_dev` must return None so the
+/// caller (R3 OOD in `trace.rs` or R4 DEEP in `prover.rs`) builds inv_denoms
+/// on CPU and the remaining GPU path keeps running.
+///
+/// The injection fires the Nth time the math-cuda entry point is reached,
+/// across all tables. We assert that a single fault drops `gpu_batch_invert_calls`
+/// by exactly one (one table fell back, the rest succeeded) and that the
+/// recovered proof still verifies.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_batch_invert_fault_falls_back_to_cpu() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let _ = prove(&elf).expect("warm-up");
+    let clean = gpu_batch_invert_calls();
+    assert!(
+        clean > 0,
+        "GPU batch-invert never ran, cannot test fallback"
+    );
+
+    for n in 1..=3i64 {
+        stark::gpu_lde::schedule_inverse_fault(n);
+        reset_all_gpu_call_counters();
+
+        let recovered = prove(&elf).expect("prove after fault");
+        assert_eq!(
+            gpu_batch_invert_calls(),
+            clean - 1,
+            "expected exactly one GPU batch-invert fallback (fault #{n})"
+        );
+        assert!(
+            verify(&recovered, &elf).expect("verify recovered"),
+            "post-fallback proof failed verification (batch-invert fault #{n})"
+        );
+    }
+
+    stark::gpu_lde::schedule_inverse_fault(-1);
 }

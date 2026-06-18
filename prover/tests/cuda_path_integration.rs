@@ -11,8 +11,8 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_comp_poly_tree_calls, gpu_deep_calls, gpu_fri_calls, gpu_lde_calls,
-    gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
+    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -52,6 +52,14 @@ fn gpu_path_fires_end_to_end() {
 
     // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");
+
+    // GPU batch-invert dispatch fires for the R3 OOD and R4 DEEP
+    // inv_denoms pipelines. A regression where either silently fell back
+    // to host inv_denoms would drop this to zero.
+    assert!(
+        gpu_batch_invert_calls() > 0,
+        "GPU batch-invert dispatch did not fire on R3 + R4"
+    );
 
     // Counters only prove the dispatches ran; this checks the GPU proof
     // actually satisfies the verifier.
