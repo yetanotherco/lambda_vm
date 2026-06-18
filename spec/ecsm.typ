@@ -106,6 +106,13 @@ This chip is triggered by an `ECALL` with the opcode indicating this chip:
 Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently loads $x_G$ in (@ec:c:read_xG).
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
 
+=== Range check `xG`
+Before continuing, it is verified that $x_G in [0, p)$.
+To this end, witness $#`xG_sub_p` := #`xG` - p mod 2^256$ is added to `p`; if the addition sums to `xG` and overflows $mod 2^256$, it must hold that $#`xG` < p$.
+The addition is constrained by requiring that `c2` are bits (@ec:c:range_c2); an overflow occurs if and only if $#`c2[7]` = 1$ (@ec:c:xG_addition_overflows).
+
+#render_constraint_table(ecsm_chip, config, groups: "range_xG")
+
 === Constrain `yG`
 With $x_G$ read and range checked, we direct our attention to $y_G$.
 Rather than reading it from memory, the prover provides it as a witness and proves it to be correct.
@@ -157,7 +164,7 @@ After completing its double-and-add sequence, the result is captured in `(xR,yR)
 === Range check `xR`
 Before storing $x_R$, it is verified that $x_R in [0, p)$.
 To this end, witness $#`xR_sub_p` := #`xR` - p mod 2^256$ is added to `p`; if the addition sums to `xR` and overflows $mod 2^256$, it must hold that $#`xR` < p$.
-The addition is constrained by requiring that `c3` are bits (@ec:c:range_c3); an overflow occurs if and only if $#`c3[7]` = 1$ (@ec:c:xR_addition_overflows).
+The addition is constrained by requiring that `c4` are bits (@ec:c:range_c4); an overflow occurs if and only if $#`c4[7]` = 1$ (@ec:c:xR_addition_overflows).
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
@@ -308,6 +315,8 @@ $#`carry_offsets` = (32636, 8161, 16320)$
   This modification saves 6 columns.
 - the design of these chip is generic, and makes no assumptions on the parameters $b$, $p$ and $N$.
   It might be possible to arrive at more compact design by making some assumptions on these values.
+- It is not entirely clear whether `ECSM` has to enforce $#`xG` < p$.
+  If this constraint can be removed, witness `xG_sub_P` can be scrapped, saving 16 columns.
 
 = Discussing the carries <ecsm-limb_carry>
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:

@@ -91,6 +91,12 @@ desc = "carries for computing `yG`"
 pad = 0
 
 [[variables.auxiliary]]
+name = "xG_sub_p"
+type = "U256HL"
+desc = "$x_G - #`p` mod 2^256$"
+pad = 0
+
+[[variables.auxiliary]]
 name = "k_sub_N"
 type = "U256HL"
 desc = "$#`k`- #`N` mod 2^256$"
@@ -113,19 +119,28 @@ def = {polys=[
 [[variables.virtual]]
 name = "c2"
 type = ["Bit", 8]
-desc = "carries for computing $#`N` + #`k_sub_N`$"
+desc = "carries for computing $#`P` + #`xG_sub_p`$"
 def = {polys=[
-    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_p", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
 name = "c3"
 type = ["Bit", 8]
-desc = "carries for computing $#`P` + #`xR_sub_p`$"
+desc = "carries for computing $#`N` + #`k_sub_N`$"
+def = {polys=[
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+]}
+
+[[variables.virtual]]
+name = "c4"
+type = ["Bit", 8]
+desc = "carries for computing $#`p` + #`xR_sub_p`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c4", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -284,6 +299,33 @@ output = ["arr",
 iter = ["i", 0, 3]
 multiplicity = "μ"
 ref = "ec:c:read_xG"
+
+# Range check xG
+
+[[constraint_groups]]
+name = "range_xG"
+
+[[constraints.range_xG]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "xG_sub_p", "i"]]
+iter = ["i", 0, 15]
+multiplicity = "μ"
+ref = "ec:c:range_xG_sub_p"
+
+[[constraints.range_xG]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "c2", "i"]]
+iter = ["i", 0, 6]
+cond = "μ"
+ref = "ec:c:range_c2"
+
+[[constraints.range_xG]]
+kind = "arith"
+constraint = "$#`μ` => #`c2`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c2", 7]]]
+ref = "ec:c:xG_addition_overflows"
 
 # Computing xG^2
 
@@ -500,15 +542,15 @@ ref = "ec:c:range_k_sub_N"
 [[constraints.verify_k]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "c2", "i"]]
+input = [["idx", "c3", "i"]]
 iter = ["i", 0, 6]
 cond = "μ"
-ref = "ec:c:range_c2"
+ref = "ec:c:range_c3"
 
 [[constraints.verify_k]]
 kind = "arith"
-constraint = "$#`μ` => #`c2`_7 = 1$"
-poly = ["*", "μ", ["not", ["idx", "c2", 7]]]
+constraint = "$#`μ` => #`c3`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
 ref = "ec:c:k_lt_N"
 
 [[constraints.verify_k]]
@@ -568,15 +610,15 @@ ref = "ec:c:range_xR_sub_p"
 [[constraints.range_xR]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "c3", "i"]]
+input = [["idx", "c4", "i"]]
 iter = ["i", 0, 6]
 cond = "μ"
-ref = "ec:c:range_c3"
+ref = "ec:c:range_c4"
 
 [[constraints.range_xR]]
 kind = "arith"
-constraint = "$#`μ` => #`c3`_7 = 1$"
-poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
+constraint = "$#`μ` => #`c4`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c4", 7]]]
 ref = "ec:c:xR_addition_overflows"
 
 
