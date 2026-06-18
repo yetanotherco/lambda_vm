@@ -85,12 +85,6 @@ def main() -> int:
     context.add_argument("--max-diff-chars", type=int, default=350000)
     context.add_argument("--max-file-chars", type=int, default=220000)
 
-    run_lane = sub.add_parser("run-lane")
-    run_lane.add_argument("--lane-json", required=True)
-    run_lane.add_argument("--context", required=True)
-    run_lane.add_argument("--prompt-dir", required=True)
-    run_lane.add_argument("--out", required=True)
-
     lane_error = sub.add_parser("lane-error")
     lane_error.add_argument("--lane-json", required=True)
     lane_error.add_argument("--context", required=True)
@@ -104,13 +98,6 @@ def main() -> int:
     candidates.add_argument("--out-dir", required=True)
     candidates.add_argument("--deduper", help="JSON {model, variant} for the LLM dedup pass")
     candidates.add_argument("--output")
-
-    verify = sub.add_parser("verify-lane")
-    verify.add_argument("--lane-json", required=True)
-    verify.add_argument("--context", required=True)
-    verify.add_argument("--candidates", required=True)
-    verify.add_argument("--prompt-dir", required=True)
-    verify.add_argument("--out", required=True)
 
     agentic = sub.add_parser("agentic-lane")
     agentic.add_argument("--lane-json", required=True)
@@ -137,14 +124,10 @@ def main() -> int:
         return cmd_prepare(args)
     if args.command == "context":
         return cmd_context(args)
-    if args.command == "run-lane":
-        return cmd_run_lane(args)
     if args.command == "lane-error":
         return cmd_lane_error(args)
     if args.command == "candidates":
         return cmd_candidates(args)
-    if args.command == "verify-lane":
-        return cmd_verify_lane(args)
     if args.command == "agentic-lane":
         return cmd_agentic_lane(args)
     if args.command == "report":
@@ -297,19 +280,6 @@ def cmd_context(args: argparse.Namespace) -> int:
     return 0
 
 
-def cmd_run_lane(args: argparse.Namespace) -> int:
-    lane = json.loads(args.lane_json)
-    context = read_json(pathlib.Path(args.context))
-    try:
-        prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
-        result = run_review_lane(lane, context, prompt)
-    except Exception as exc:
-        result = lane_base_result(lane, context, kind="review")
-        result.update({"status": "error", "error": f"lane failed: {exc}"})
-    write_json(pathlib.Path(args.out), result)
-    return 0
-
-
 def cmd_lane_error(args: argparse.Namespace) -> int:
     lane = json.loads(args.lane_json)
     context = read_json(pathlib.Path(args.context))
@@ -343,20 +313,6 @@ def cmd_candidates(args: argparse.Namespace) -> int:
                 "candidate_count": str(len(candidates["issues"])),
             },
         )
-    return 0
-
-
-def cmd_verify_lane(args: argparse.Namespace) -> int:
-    lane = json.loads(args.lane_json)
-    context = read_json(pathlib.Path(args.context))
-    candidates = read_json(pathlib.Path(args.candidates))
-    try:
-        prompt = load_prompt(pathlib.Path(args.prompt_dir), lane["prompt"])
-        result = run_verifier_lane(lane, context, candidates, prompt)
-    except Exception as exc:
-        result = lane_base_result(lane, context, kind="verification")
-        result.update({"status": "error", "error": f"lane failed: {exc}"})
-    write_json(pathlib.Path(args.out), result)
     return 0
 
 
@@ -801,123 +757,6 @@ def parse_review_trigger(event: dict[str, Any]) -> tuple[str | None, int | None]
         return tier, int(event["pull_request"]["number"])
 
     return None, None
-
-
-def run_review_lane(lane: dict[str, Any], context: dict[str, Any], prompt: str) -> dict[str, Any]:
-    base_result = lane_base_result(lane, context, kind="review")
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        base_result.update({"status": "skipped", "error": "OPENROUTER_API_KEY is not set"})
-        return base_result
-
-    system = textwrap.dedent(
-        """\
-        You are a senior code reviewer. Review only issues introduced or exposed
-        by this PR. Return only valid JSON with this schema:
-        {
-          "summary": "brief summary",
-          "findings": [
-            {
-              "severity": "critical|high|medium|low",
-              "confidence": "high|medium|low",
-              "title": "short title",
-              "file": "path/to/file",
-              "line": 123,
-              "claim": "what is wrong",
-              "evidence": "why the diff supports this",
-              "suggested_fix": "specific fix"
-            }
-          ]
-        }
-        Use an empty findings array when there are no issues.
-        """
-    )
-    user = format_review_prompt(lane, context, prompt)
-    response = openrouter_chat(lane, system, user, api_key)
-    base_result.update(response)
-    if response["status"] != "success":
-        return base_result
-
-    if not response.get("raw_response", "").strip():
-        base_result.update({"status": "error", "error": "model returned empty response"})
-        return base_result
-
-    parsed, parse_error = extract_json(response["raw_response"], required_key="findings")
-    findings = []
-    if isinstance(parsed, dict):
-        raw_findings = parsed.get("findings", [])
-        if isinstance(raw_findings, list):
-            findings = [normalize_finding(f, lane) for f in raw_findings if isinstance(f, dict)]
-        else:
-            parse_error = parse_error or "top-level 'findings' must be an array"
-        base_result["summary"] = parsed.get("summary", "")
-    elif isinstance(parsed, list):
-        findings = [normalize_finding(f, lane) for f in parsed if isinstance(f, dict)]
-    else:
-        parse_error = parse_error or "response did not contain top-level findings JSON"
-
-    base_result["findings"] = [f for f in findings if f.get("claim") or f.get("title")]
-    if parse_error:
-        base_result["parse_error"] = parse_error
-    return base_result
-
-
-def run_verifier_lane(
-    lane: dict[str, Any], context: dict[str, Any], candidates: dict[str, Any], prompt: str
-) -> dict[str, Any]:
-    base_result = lane_base_result(lane, context, kind="verification")
-    api_key = os.environ.get("OPENROUTER_API_KEY")
-    if not api_key:
-        base_result.update({"status": "skipped", "error": "OPENROUTER_API_KEY is not set"})
-        return base_result
-    if not candidates.get("issues"):
-        base_result.update({"status": "skipped", "error": "No candidate issues to verify"})
-        return base_result
-
-    system = textwrap.dedent(
-        """\
-        You verify AI code review findings. Do not create new findings. Return
-        only valid JSON with this schema:
-        {
-          "summary": "brief summary",
-          "verifications": [
-            {
-              "issue_id": "AI-001",
-              "status": "confirmed|rejected|uncertain",
-              "confidence": "high|medium|low",
-              "rationale": "why"
-            }
-          ]
-        }
-        """
-    )
-    user = format_verification_prompt(lane, context, candidates, prompt)
-    response = openrouter_chat(lane, system, user, api_key)
-    base_result.update(response)
-    if response["status"] != "success":
-        return base_result
-
-    if not response.get("raw_response", "").strip():
-        base_result.update({"status": "error", "error": "model returned empty response"})
-        return base_result
-
-    parsed, parse_error = extract_json(response["raw_response"], required_key="verifications")
-    verifications = []
-    if isinstance(parsed, dict):
-        raw_items = parsed.get("verifications", [])
-        if isinstance(raw_items, list):
-            verifications = [normalize_verification(v, lane) for v in raw_items if isinstance(v, dict)]
-        else:
-            parse_error = parse_error or "top-level 'verifications' must be an array"
-        base_result["summary"] = parsed.get("summary", "")
-    elif isinstance(parsed, list):
-        verifications = [normalize_verification(v, lane) for v in parsed if isinstance(v, dict)]
-    else:
-        parse_error = parse_error or "response did not contain top-level verifications JSON"
-    base_result["verifications"] = [v for v in verifications if v.get("issue_id")]
-    if parse_error:
-        base_result["parse_error"] = parse_error
-    return base_result
 
 
 def lane_base_result(lane: dict[str, Any], context: dict[str, Any], kind: str) -> dict[str, Any]:

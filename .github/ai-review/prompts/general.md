@@ -12,6 +12,8 @@
 4. **Simplicity and readability** - Prefer simple, readable code over clever
    abstractions. Cosmetic rewrites are acceptable when they make changed code,
    names, comments, or docs easier to understand.
+   - Dead code: flag functions, branches, CLI paths, or tests the PR leaves
+     unreachable or unused — call it out so it is removed, not left behind.
 
 Guidelines:
 - Be concise and to the point
