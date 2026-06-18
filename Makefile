@@ -48,13 +48,9 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
 SYSROOT_DIR ?= /opt/lambda-vm-sysroot
-# Fixed, global path: prepare-sysroot assumes a single writer at a time. The recipe
-# `rm -f`s this before downloading, so a stale tarball can't be extracted — but two
-# concurrent `make prepare-sysroot` on one host would race on it. The current CI runs
-# no concurrent jobs sharing a SYSROOT_DIR; revisit (e.g. mktemp/flock) if that changes.
-SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
-# CFLAGS for ckzg / ethrex guest programs: overrides the hardcoded `/opt/lambda-vm-sysroot`
+SYSROOT_SHA256 := 420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7
+# CFLAGS for guest programs with C dependencies: overrides the hardcoded `/opt/lambda-vm-sysroot`
 # in their .cargo/config.toml so cargo picks up our $(SYSROOT_DIR) instead.
 # $(abspath ...) because the build rule cd's into the program dir before invoking cargo.
 SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(abspath $(SYSROOT_DIR))
@@ -86,23 +82,42 @@ prepare-sysroot:
 			lambda-vm-sysroot|.lambda-vm-sysroot) : ;; \
 			*) echo "prepare-sysroot: refusing to (sudo) rm -rf SYSROOT_DIR=$(SYSROOT_DIR) - expected a path ending in lambda-vm-sysroot or .lambda-vm-sysroot"; exit 1 ;; \
 		esac; \
+		tmp_dir=""; \
+		cleanup() { if [ -n "$$tmp_dir" ]; then rm -rf "$$tmp_dir"; fi; }; \
+		trap 'cleanup' EXIT; \
+		trap 'cleanup; exit 130' INT; \
+		trap 'cleanup; exit 143' TERM; \
+		tmp_dir="$$(mktemp -d /tmp/lambda-vm-sysroot.XXXXXX)"; \
+		tarball="$$tmp_dir/lambda-vm-sysroot-rv64im.tar.gz"; \
 		echo "Provisioning sysroot at $(SYSROOT_DIR) (downloading lambda-vm-sysroot-rv64im.tar.gz)..."; \
-		rm -f "$(SYSROOT_TARBALL)"; \
-		curl -fL --proto '=https' "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)" \
-			|| { rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
+		curl -fL --proto '=https' "$(SYSROOT_URL)" -o "$$tarball"; \
+		echo "Verifying sysroot checksum..."; \
+		checksum_ok=false; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			printf '%s  %s\n' "$(SYSROOT_SHA256)" "$$tarball" | sha256sum -c - >/dev/null && checksum_ok=true; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			actual="$$(shasum -a 256 "$$tarball" | awk '{print $$1}')"; \
+			[ "$$actual" = "$(SYSROOT_SHA256)" ] && checksum_ok=true; \
+		else \
+			echo "prepare-sysroot: missing sha256sum or shasum for checksum verification" >&2; \
+			exit 1; \
+		fi; \
+		if [ "$$checksum_ok" != true ]; then \
+			echo "prepare-sysroot: checksum mismatch for $(SYSROOT_URL)" >&2; \
+			exit 1; \
+		fi; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
 		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
 			rm -rf "$(SYSROOT_DIR)" && mkdir -p "$(SYSROOT_DIR)" \
-				&& tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
-				|| { rm -rf "$(SYSROOT_DIR)" "$(SYSROOT_TARBALL)"; exit 1; }; \
+				&& tar -xzf "$$tarball" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
+				|| { rm -rf "$(SYSROOT_DIR)"; exit 1; }; \
 		else \
 			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
 			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
 			sudo rm -rf "$(SYSROOT_DIR)" && sudo mkdir -p "$(SYSROOT_DIR)" \
-				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
-				|| { sudo rm -rf "$(SYSROOT_DIR)"; rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
+				&& sudo tar -xzf "$$tarball" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
+				|| { sudo rm -rf "$(SYSROOT_DIR)"; exit 1; }; \
 		fi; \
-		rm -f "$(SYSROOT_TARBALL)"; \
 	fi
 
 compile-programs-asm:
@@ -123,7 +138,7 @@ compile-programs: compile-programs-asm compile-programs-rust compile-bench
 # Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
 # first (the aggregate compile-programs-rust/compile-bench targets already do, but a
 # bare pattern-rule invocation like `make -B .../ethrex.elf` would otherwise skip it
-# and fail to compile C deps such as c-kzg). Order-only because prepare-sysroot is
+# and fail to compile guest C dependencies). Order-only because prepare-sysroot is
 # .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
 $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	@mkdir -p $(RUST_ARTIFACTS_DIR)

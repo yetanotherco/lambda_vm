@@ -56,8 +56,8 @@ jobs:
         run: |
           # Provision the RISC-V sysroot in a user-writable dir instead of the default
           # /opt/lambda-vm-sysroot, which on the self-hosted bench runner is root-owned
-          # and was never fully provisioned (missing libc headers → c-kzg failed to find
-          # stdlib.h). `make` (via SYSROOT_DIR ?=) picks this up and passes it as clang's
+          # and was never fully provisioned (missing libc headers for guest C dependencies).
+          # `make` (via SYSROOT_DIR ?=) picks this up and passes it as clang's
           # --sysroot, so the guest ELF rebuild self-provisions with no sudo, and the
           # extracted sysroot persists in $HOME across runs on the persistent
           # self-hosted runner (no actions/cache step is involved).
