@@ -7,6 +7,10 @@
 //!   cargo run -- 1  ../../executor/tests/ethrex_simple_tx.bin
 //!   cargo run -- 10 ../../executor/tests/ethrex_10_transfers.bin
 //!
+//! TODO(ethrex-integration, PR #666): TEMPORARY. Delete this whole crate once
+//! the LambdaVM-backend ethrex PR lands on ethrex `main` and fixtures are
+//! generated via `ethrex-replay custom block` instead.
+//!
 //! Pinned to the same ethrex rev as the guest, so the rkyv `ProgramInput`
 //! layout matches what the guest deserializes.
 

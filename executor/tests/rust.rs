@@ -321,6 +321,27 @@ fn test_ethrex_simple_tx() {
     );
 }
 
+/// Executes a stateless ethrex block with NO transactions (empty block).
+/// Execution only — no proving. Pins the committed `ethrex_empty_block.bin`
+/// fixture into the default suite so its rkyv `ProgramInput` layout (the 0-tx
+/// edge case) is exercised and stays consistent with the guest across ethrex
+/// rev bumps. Mirrors `test_ethrex_simple_tx`; see `tests/README.md`.
+#[test]
+fn test_ethrex_empty_block() {
+    use ethrex_guest_program::crypto::NativeCrypto;
+    use ethrex_guest_program::l1::{ProgramInput, execution_program};
+    use rkyv::rancor::Error;
+    use std::sync::Arc;
+    let inputs = std::fs::read("tests/ethrex_empty_block.bin").unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input, Arc::new(NativeCrypto)).unwrap();
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/ethrex.elf",
+        output.encode(),
+        inputs,
+    );
+}
+
 #[ignore = "Ignored until the vm is fast enough to run this test"]
 #[test]
 fn test_ckzg() {
