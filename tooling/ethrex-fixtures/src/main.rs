@@ -31,13 +31,25 @@ use secp256k1::SecretKey;
 const RICH_PK: &str = "bcdf20249abf0ed6d944c0288fad489e33f66b3960d9e6229c1cd214ed3bbe31";
 const GENESIS_JSON: &str = include_str!("../genesis.json");
 
+fn usage_and_exit(program: &str) -> ! {
+    eprintln!("usage: {program} <n_transfers> <out.bin>");
+    std::process::exit(2);
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut args = std::env::args().skip(1);
-    let n_transfers: u64 = args.next().unwrap_or_else(|| "1".into()).parse()?;
-    let out_path = args
-        .next()
-        .unwrap_or_else(|| "ethrex_generated.bin".into());
+    let mut args = std::env::args();
+    let program = args.next().unwrap_or_else(|| "ethrex-fixtures".into());
+    let Some(n_transfers) = args.next() else {
+        usage_and_exit(&program);
+    };
+    let Some(out_path) = args.next() else {
+        usage_and_exit(&program);
+    };
+    if args.next().is_some() {
+        usage_and_exit(&program);
+    }
+    let n_transfers: u64 = n_transfers.parse()?;
 
     // --- 1. genesis -> in-memory store -------------------------------------
     let genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;
@@ -98,7 +110,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // --- 4. stateless witness -> ProgramInput -> rkyv ----------------------
-    let witness = blockchain.generate_witness_for_blocks(&[block.clone()]).await?;
+    let witness = blockchain
+        .generate_witness_for_blocks(&[block.clone()])
+        .await?;
     let program_input = ProgramInput::new(vec![block], witness);
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input)?;
     std::fs::write(&out_path, &bytes)?;
