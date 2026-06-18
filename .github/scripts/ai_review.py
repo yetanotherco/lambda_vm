@@ -292,7 +292,7 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     candidates = build_candidates(lane_results, context)
     # Second-pass LLM dedup (configured as "deduper" in matrix.json) catches
     # reworded duplicates the file+text heuristic misses. Safe to skip on any failure.
-    deduper = json.loads(args.deduper) if getattr(args, "deduper", None) else None
+    deduper = json.loads(args.deduper) if args.deduper else None
     before = len(candidates.get("issues", []))
     candidates = llm_dedup_candidates(candidates, deduper, os.environ.get("OPENROUTER_API_KEY"))
     if deduper and deduper.get("model"):

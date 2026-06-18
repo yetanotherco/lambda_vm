@@ -268,12 +268,13 @@ jobs:
         id: candidates
         env:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DEDUPER_JSON: ${{ needs.prepare.outputs.deduper }}
         run: |
           python3 runner/.github/scripts/ai_review.py candidates \
             --lanes-dir ai-review-lanes \
             --context ai-review-context/context.json \
             --out-dir ai-review-candidates \
-            --deduper '${{ needs.prepare.outputs.deduper }}' \
+            --deduper "$DEDUPER_JSON" \
             --output "$GITHUB_OUTPUT"
 
       - name: Upload candidates
