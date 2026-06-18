@@ -150,20 +150,29 @@ APP_CLAUDE
 
 # --- 8. lambda-vm sysroot (rv64im) ------------------------------------------
 # Guard on include/stdlib.h and re-extract from scratch so a partial/interrupted extract
-# self-heals on re-run; a bare `[ ! -d ]` guard left a headerless sysroot that broke c-kzg.
+# self-heals on re-run; a bare `[ ! -d ]` guard left a headerless sysroot that broke
+# guest C dependencies.
 SYSROOT_DIR=/opt/lambda-vm-sysroot
 SYSROOT_URL=https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+SYSROOT_SHA256=420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7
 if [ -f "$SYSROOT_DIR/include/stdlib.h" ] && [ -d "$SYSROOT_DIR/lib" ]; then
     log "sysroot already present at $SYSROOT_DIR"
 else
     log "provisioning sysroot at $SYSROOT_DIR"
-    curl -fL --proto '=https' "$SYSROOT_URL" -o /tmp/sysroot.tar.gz \
-        || { rm -f /tmp/sysroot.tar.gz; exit 1; }
+    sysroot_tmp_dir=$(mktemp -d /tmp/lambda-vm-sysroot.XXXXXX)
+    sysroot_tarball="$sysroot_tmp_dir/lambda-vm-sysroot-rv64im.tar.gz"
+    cleanup_sysroot_tmp() { rm -rf "$sysroot_tmp_dir"; }
+    trap cleanup_sysroot_tmp EXIT
+
+    curl -fL --proto '=https' "$SYSROOT_URL" -o "$sysroot_tarball"
+    printf '%s  %s\n' "$SYSROOT_SHA256" "$sysroot_tarball" | sha256sum -c -
+
     rm -rf "$SYSROOT_DIR"
     mkdir -p /opt
-    tar -xzf /tmp/sysroot.tar.gz -C /opt --no-same-owner \
-        || { rm -rf "$SYSROOT_DIR"; rm -f /tmp/sysroot.tar.gz; exit 1; }
-    rm -f /tmp/sysroot.tar.gz
+    tar -xzf "$sysroot_tarball" -C /opt --no-same-owner \
+        || { rm -rf "$SYSROOT_DIR"; exit 1; }
+    rm -rf "$sysroot_tmp_dir"
+    trap - EXIT
 fi
 
 # --- 9. Clone lambda_vm (as app, public repo over HTTPS) ---------------------
