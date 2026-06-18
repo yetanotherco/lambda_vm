@@ -11,7 +11,6 @@ import pathlib
 import re
 import subprocess
 import sys
-import textwrap
 import time
 import urllib.error
 import urllib.parse
@@ -891,86 +890,6 @@ def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str
     if reasoning is not None:
         payload["reasoning"] = reasoning
     return payload
-
-
-def format_review_prompt(lane: dict[str, Any], context: dict[str, Any], prompt: str) -> str:
-    return "\n\n".join(
-        [
-            f"PR #{context['pr_number']}",
-            f"Lane: {lane['id']}",
-            f"Model: {lane['model']}",
-            "Lane instructions:\n" + prompt.strip(),
-            format_changed_files(context),
-            "Diff:\n" + context.get("diff", ""),
-            format_file_context(context),
-        ]
-    )
-
-
-def format_verification_prompt(
-    lane: dict[str, Any], context: dict[str, Any], candidates: dict[str, Any], prompt: str
-) -> str:
-    compact_candidates = [
-        {
-            "issue_id": issue["issue_id"],
-            "severity": issue["severity"],
-            "title": issue["title"],
-            "file": issue.get("file"),
-            "line": issue.get("line"),
-            "claim": issue["claim"],
-            "evidence": issue.get("evidence"),
-            "found_by": issue["found_by"],
-        }
-        for issue in candidates.get("issues", [])
-    ]
-    return "\n\n".join(
-        [
-            f"PR #{context['pr_number']}",
-            f"Verifier lane: {lane['id']}",
-            "Verifier instructions:\n" + prompt.strip(),
-            "Candidate findings:\n" + json.dumps(compact_candidates, indent=2),
-            format_changed_files(context),
-            "Diff:\n" + context.get("diff", ""),
-            format_file_context(context),
-        ]
-    )
-
-
-def format_changed_files(context: dict[str, Any]) -> str:
-    lines = [f"Changed files ({context.get('changed_file_count', 0)}):"]
-    for item in context.get("changed_files", []):
-        old_path = f" from {item['old_path']}" if item.get("old_path") else ""
-        lines.append(f"- {item['status']} {item['path']}{old_path}")
-    if context.get("diff_truncated"):
-        lines.append("- Warning: diff was truncated by ai-review.")
-    return "\n".join(lines)
-
-
-def format_file_context(context: dict[str, Any]) -> str:
-    parts = ["Changed file context:"]
-    for item in context.get("file_context", []):
-        parts.append(f"--- {item['path']} ({item['status']}) HEAD ---")
-        if item.get("head") is None:
-            parts.append("[not available]")
-        else:
-            suffix = "\n[head content truncated]" if item.get("head_truncated") else ""
-            parts.append(item["head"] + suffix)
-        if item.get("base") is not None:
-            parts.append(f"--- {item['path']} BASE ---")
-            suffix = "\n[base content truncated]" if item.get("base_truncated") else ""
-            parts.append(item["base"] + suffix)
-    return "\n".join(parts)
-
-
-DEDUP_SYSTEM = (
-    "You de-duplicate code-review findings reported by several reviewers of the same PR. "
-    "You will get a JSON list of findings (id, file, line, title, claim). Group the ids that "
-    "describe the SAME underlying issue (same root cause and fix). Be CONSERVATIVE: only "
-    "group findings that are clearly the same issue; when in doubt do NOT group them. Two "
-    "DIFFERENT bugs that happen to sit on the same line are NOT the same issue. Reply with "
-    'ONLY this JSON and nothing else: {"groups": [["AI-001","AI-007"], ...]} listing only '
-    "groups containing more than one id. Findings not listed are treated as unique."
-)
 
 
 def llm_dedup_candidates(
