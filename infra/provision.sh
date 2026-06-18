@@ -149,14 +149,21 @@ grep -qxF "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null \
 APP_CLAUDE
 
 # --- 8. lambda-vm sysroot (rv64im) ------------------------------------------
+# Guard on include/stdlib.h and re-extract from scratch so a partial/interrupted extract
+# self-heals on re-run; a bare `[ ! -d ]` guard left a headerless sysroot that broke c-kzg.
 SYSROOT_DIR=/opt/lambda-vm-sysroot
 SYSROOT_URL=https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
-if [ ! -d "$SYSROOT_DIR" ]; then
-    log "downloading sysroot to $SYSROOT_DIR"
-    curl -L "$SYSROOT_URL" -o /tmp/sysroot.tar.gz
+if [ -f "$SYSROOT_DIR/include/stdlib.h" ] && [ -d "$SYSROOT_DIR/lib" ]; then
+    log "sysroot already present at $SYSROOT_DIR"
+else
+    log "provisioning sysroot at $SYSROOT_DIR"
+    curl -fL --proto '=https' "$SYSROOT_URL" -o /tmp/sysroot.tar.gz \
+        || { rm -f /tmp/sysroot.tar.gz; exit 1; }
+    rm -rf "$SYSROOT_DIR"
     mkdir -p /opt
-    tar -xzf /tmp/sysroot.tar.gz -C /opt
-    rm /tmp/sysroot.tar.gz
+    tar -xzf /tmp/sysroot.tar.gz -C /opt --no-same-owner \
+        || { rm -rf "$SYSROOT_DIR"; rm -f /tmp/sysroot.tar.gz; exit 1; }
+    rm -f /tmp/sysroot.tar.gz
 fi
 
 # --- 9. Clone lambda_vm (as app, public repo over HTTPS) ---------------------
