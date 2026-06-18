@@ -61,14 +61,10 @@ BLOCKS=(
 
 ### Daily run
 The nightly workflow `.github/workflows/bench-vs-nightly.yml` calls
-`run_ethrex.sh` and posts results to Slack via
+`run_ethrex.sh --rebuild-elf` and posts results to Slack via
 `.github/scripts/publish_bench_vs.sh`. Because the script is data-driven, any
 block added to `BLOCKS` is picked up automatically; to also show it in the
 Slack post, add a line in `publish_bench_vs.sh` (see the `ethrex_line` helper).
-
-> Note: the nightly currently copies a **cached** `ethrex.elf` onto the runner
-> (a temporary step until the sysroot is provisioned there). Refresh that cache
-> when the guest or its ethrex dependency changes.
 
 ---
 
@@ -78,7 +74,7 @@ Slack post, add a line in `publish_bench_vs.sh` (see the `ethrex_line` helper).
 fixtures (`*.bin`) are small and committed.
 
 ```bash
-# One-time: fetch the RV64 sysroot (needed for ethrex's C deps: c-kzg, etc.)
+# One-time: fetch the RV64 sysroot used by the guest build.
 make prepare-sysroot SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 
 # Build just the ethrex guest ELF (or `make compile-programs-rust` for all):
@@ -89,9 +85,9 @@ What the build needs:
 - **Toolchains:** `1.94.0` stable (workspace) + `nightly-2026-02-01` with
   `rust-src` (the Makefile pins it; builds the guest via `-Z build-std`).
 - **clang + lld** for ethrex's C dependencies.
-- **Network**, the first time: cargo fetches `guest_program` from
+- **Network**, the first time: cargo fetches `ethrex-guest-program` from
   `github.com/lambdaclass/ethrex.git` (commit pinned as `rev` in the guest `Cargo.toml`).
 - **`SYSROOT_DIR` must match** between `prepare-sysroot` and the build.
 
-The guest source is `executor/programs/rust/ethrex/` (an 11-line `main.rs` that
+The guest source is `executor/programs/rust/ethrex/` (a small `main.rs` that
 reads the private input, calls `execution_program`, and commits the output).

@@ -175,7 +175,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 12. /etc/environment + locale ------------------------------------------
+# --- 11. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -186,7 +186,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 13. sshd hardening (last; reload won't drop existing session) ----------
+# --- 12. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no
