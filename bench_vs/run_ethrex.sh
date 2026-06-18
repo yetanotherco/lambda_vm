@@ -10,7 +10,8 @@
 #
 # Prerequisites:
 #   - Lambda VM CLI build dependencies available
-#   - Sysroot present at /opt/lambda-vm-sysroot (run `make prepare-sysroot` first)
+#   - RISC-V sysroot: auto-provisioned by the guest ELF build (the .elf rules depend on
+#     `make prepare-sysroot`). Override the location with SYSROOT_DIR (default /opt/lambda-vm-sysroot).
 #   - Rust stable + nightly-2026-02-01 installed
 
 set -euo pipefail

@@ -78,12 +78,19 @@ prepare-test-data:
 # as incomplete and re-provisioned, instead of being mistaken for a complete one. When it
 # re-provisions, it first removes any existing $(SYSROOT_DIR) and re-extracts from scratch,
 # so a partial/stale/corrupt sysroot self-heals without manual intervention on the runner.
+# A basename allowlist guards the rm -rf: since SYSROOT_DIR is overrideable, it must end in
+# lambda-vm-sysroot or .lambda-vm-sysroot, so an accidental override (e.g. SYSROOT_DIR=/opt)
+# can never be wiped — especially via the sudo fallback path.
 prepare-sysroot:
 	@if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	else \
+		case "$$(basename "$(SYSROOT_DIR)")" in \
+			lambda-vm-sysroot|.lambda-vm-sysroot) : ;; \
+			*) echo "prepare-sysroot: refusing to (sudo) rm -rf SYSROOT_DIR=$(SYSROOT_DIR) — expected a path ending in lambda-vm-sysroot or .lambda-vm-sysroot"; exit 1 ;; \
+		esac; \
 		echo "Provisioning sysroot at $(SYSROOT_DIR) (downloading lambda-vm-sysroot-rv64im.tar.gz)..."; \
-		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		curl -fL "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
 		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
 			rm -rf "$(SYSROOT_DIR)" && mkdir -p "$(SYSROOT_DIR)" \
