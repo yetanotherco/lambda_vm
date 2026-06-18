@@ -50,8 +50,9 @@ cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
 cargo run --release -- 50 /tmp/ethrex_50_transfers.bin
 ```
 
-After regenerating any committed fixture, refresh its checksum in
-`executor/tests/README.md`.
+For committed fixtures, prefer `make regen-ethrex-fixtures` from the repo root;
+it regenerates the standard fixtures and refreshes
+`executor/tests/README.md` checksums.
 
 > Note: bigger blocks cost ~4M cycles per transfer (software ecrecover
 > dominates), so they execute fine but may be too heavy to *prove* on a typical

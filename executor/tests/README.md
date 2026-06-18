@@ -29,8 +29,9 @@ cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin  # 10 tra
 ```
 
 To regenerate after an ethrex rev bump, update the `rev` in
-`tooling/ethrex-fixtures/Cargo.toml` (and the guest's), rerun the commands above,
-and refresh the checksums below.
+`tooling/ethrex-fixtures/Cargo.toml` (and the guest's), then run
+`make regen-ethrex-fixtures` from the repo root. The target rebuilds the
+committed fixtures and refreshes the checksums below.
 
 Known fixtures:
 
