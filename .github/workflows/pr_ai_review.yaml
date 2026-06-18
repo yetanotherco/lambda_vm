@@ -12,11 +12,12 @@ concurrency:
   group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
+# Default least-privilege for the internal jobs. id-token (OIDC) is granted only to
+# the native Claude job that actually needs it, not workflow-wide.
 permissions:
   contents: read
   issues: write
   pull-requests: write
-  id-token: write
 
 jobs:
   prepare:
@@ -478,6 +479,10 @@ jobs:
   codex-critical-review:
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
     uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
     with:
       custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
@@ -487,6 +492,11 @@ jobs:
   claude-critical-review:
     needs: prepare
     if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
     uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
     with:
       model: opus

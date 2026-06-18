@@ -987,6 +987,11 @@ def apply_dedup_clusters(candidates: dict[str, Any], groups: Any) -> dict[str, A
                     canon["found_by"].append(src)
             canon.setdefault("sources", []).extend(other.get("sources", []))
             canon["severity"] = higher_severity(canon.get("severity", "low"), other.get("severity", "low"))
+            # Keep the richest evidence/suggested_fix across the merged duplicates,
+            # rather than always discarding the other reviewers' detail.
+            for field in ("evidence", "suggested_fix"):
+                if len(str(other.get(field) or "")) > len(str(canon.get(field) or "")):
+                    canon[field] = other[field]
             removed.add(other_id)
     if removed:
         candidates["issues"] = [i for i in candidates.get("issues", []) if i["issue_id"] not in removed]
@@ -1543,13 +1548,21 @@ def post_or_update_comment(pr_number: int, body: str, tier: str) -> None:
     token = os.environ["GITHUB_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
     marker = f"<!-- ai-review:{tier} -->"
-    # github_json returns None on an empty body; coerce to [] so reversed() can't crash.
-    comments = github_json("GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100", token=token) or []
+    # Find our existing comment across ALL pages — a busy PR can have >100 comments, and
+    # missing the marker means posting a duplicate report. Comments are oldest-first, so the
+    # last match is the most recent. github_json returns None on an empty body.
     existing_id = None
-    for comment in reversed(comments):
-        if marker in comment.get("body", ""):
-            existing_id = comment["id"]
+    page = 1
+    while True:
+        comments = github_json(
+            "GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100&page={page}", token=token
+        ) or []
+        for comment in comments:
+            if marker in comment.get("body", ""):
+                existing_id = comment["id"]
+        if len(comments) < 100:
             break
+        page += 1
     if existing_id:
         github_json("PATCH", f"/repos/{repo}/issues/comments/{existing_id}", token=token, body={"body": body})
     else:
@@ -1608,6 +1621,7 @@ def clean_path(value: Any) -> str | None:
     # "runner/" — the runner's HOME is /home/runner, which would false-match.)
     workspace = os.environ.get("GITHUB_WORKSPACE")
     if workspace:
+        workspace = workspace.rstrip("/")  # tolerate a trailing slash in GITHUB_WORKSPACE
         # Only strip a true path-prefix (exact dir or `workspace/...`) — not a sibling like
         # `<workspace>_backup/...` that merely shares the string prefix.
         if text == workspace:
