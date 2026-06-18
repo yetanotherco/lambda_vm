@@ -6,19 +6,19 @@ for them, never automatically on PR open.
 
 ## Commands
 
-Comment `/ai-review` on a pull request to run the review. There is a single
-flow; the legacy `/ai-review standard` and `/ai-review critical` forms still
-work and run the same thing.
+Comment `/ai-review` on a pull request to run the review. There is one flow —
+no standard/critical distinction. (A trailing word like `/ai-review critical` is
+tolerated and runs the same thing, but isn't needed.)
 
 | Command | Reviewers | Use when |
 | --- | --- | --- |
 | `/ai-review` | Open-weight swarm + verifier (structured report), plus native Codex and Claude (opus) | Any PR worth a serious review — especially soundness-, security-, VM-, prover-, crypto-, GPU-, or infra-sensitive changes. |
 
-You can also add the `ai-review` label to a pull request (the legacy
-`ai-review-standard` / `ai-review-critical` labels also work and run the same
-flow). The label trigger is useful for testing workflow changes before they are
-merged, because `pull_request` label events run against the PR workflow
-definition.
+You can also add the `ai-review` label to a pull request. (The older
+`ai-review-standard` / `ai-review-critical` labels still trigger the same flow,
+kept for back-compat.) The label trigger is useful for testing workflow changes
+before they are merged, because `pull_request` label events run against the PR
+workflow definition.
 
 > **Note:** the **native Claude** review and the `/ai-review` **comment** trigger
 > only activate once this workflow is merged to the default branch.

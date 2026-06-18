@@ -1354,7 +1354,7 @@ def render_report(
     rejected = [i for i in final["issues"] if i["status"] == "rejected"]
     lines = [
         marker,
-        f"## AI Review ({tier})",
+        "## AI Review",
         "",
         f"PR #{context['pr_number']} · {len(context.get('changed_files', []))} changed files",
     ]
