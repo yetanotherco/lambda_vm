@@ -10,7 +10,8 @@
 #
 # Prerequisites:
 #   - Lambda VM CLI build dependencies available
-#   - Sysroot present at /opt/lambda-vm-sysroot (run `make prepare-sysroot` first)
+#   - RISC-V sysroot: auto-provisioned by the guest ELF build (the .elf rules depend on
+#     `make prepare-sysroot`). Override the location with SYSROOT_DIR (default /opt/lambda-vm-sysroot).
 #   - Rust stable + nightly-2026-02-01 installed
 
 set -euo pipefail
@@ -32,6 +33,10 @@ NC='\033[0m'
 BLOCKS=(
     "ethrex empty block|ethrex_empty_block.bin"
     "ethrex 1 tx|ethrex_simple_tx.bin"
+    # ethrex_10_transfers.bin (~42M cycles) executes fine but is too heavy to
+    # prove on a typical machine (OOMs ~36 GB) — software ecrecover dominates
+    # (~4M cycles/transfer). Kept as a fixture; add here once ecrecover is a
+    # precompile or for big-memory/nightly proving.
 )
 
 # --- Parse args -------------------------------------------------------------

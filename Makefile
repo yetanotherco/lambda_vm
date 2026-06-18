@@ -1,7 +1,9 @@
-.PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
+.PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
 UNAME := $(shell uname)
 
@@ -43,15 +45,12 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
-ETHREX_FILE := executor/tests/ethrex_hoodi.bin
-ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
-
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
 SYSROOT_DIR ?= /opt/lambda-vm-sysroot
-SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
-# CFLAGS for ckzg / ethrex guest programs: overrides the hardcoded `/opt/lambda-vm-sysroot`
+SYSROOT_SHA256 := 420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7
+# CFLAGS for guest programs with C dependencies: overrides the hardcoded `/opt/lambda-vm-sysroot`
 # in their .cargo/config.toml so cargo picks up our $(SYSROOT_DIR) instead.
 # $(abspath ...) because the build rule cd's into the program dir before invoking cargo.
 SYSROOT_CFLAGS := --target=riscv64 -march=rv64im -mabi=lp64 --sysroot=$(abspath $(SYSROOT_DIR))
@@ -63,37 +62,63 @@ ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
-.PHONY: test prepare-test-data prepare-sysroot
+.PHONY: test prepare-sysroot
 
-prepare-test-data:
-	@if [ ! -f "$(ETHREX_FILE)" ]; then \
-		echo "Downloading ethrex_hoodi.bin..."; \
-		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
-	else \
-		echo "ethrex_hoodi.bin already exists"; \
-	fi
-
+# The guard checks for include/stdlib.h (not just the include/ dir) so that a PARTIAL
+# sysroot — directories present but missing the C standard library headers — is detected
+# as incomplete and re-provisioned, instead of being mistaken for a complete one. When it
+# re-provisions, it first removes any existing $(SYSROOT_DIR) and re-extracts from scratch,
+# so a partial/stale/corrupt sysroot self-heals without manual intervention on the runner.
+# A basename allowlist guards the rm -rf: SYSROOT_DIR must end in lambda-vm-sysroot or
+# .lambda-vm-sysroot, so an accidental override (e.g. SYSROOT_DIR=/opt) can't be wiped,
+# especially via the sudo fallback. This is typo/misconfig prevention, NOT a security
+# boundary — a caller that controls SYSROOT_DIR can still point it at any */lambda-vm-sysroot.
 prepare-sysroot:
-	@if [ -d "$(SYSROOT_DIR)/include" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
+	@set -e; \
+	if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	else \
-		echo "Downloading lambda-vm-sysroot-rv64im.tar.gz..."; \
-		curl -L "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		case "$$(basename "$(SYSROOT_DIR)")" in \
+			lambda-vm-sysroot|.lambda-vm-sysroot) : ;; \
+			*) echo "prepare-sysroot: refusing to (sudo) rm -rf SYSROOT_DIR=$(SYSROOT_DIR) - expected a path ending in lambda-vm-sysroot or .lambda-vm-sysroot"; exit 1 ;; \
+		esac; \
+		tmp_dir=""; \
+		cleanup() { if [ -n "$$tmp_dir" ]; then rm -rf "$$tmp_dir"; fi; }; \
+		trap 'cleanup' EXIT; \
+		trap 'cleanup; exit 130' INT; \
+		trap 'cleanup; exit 143' TERM; \
+		tmp_dir="$$(mktemp -d /tmp/lambda-vm-sysroot.XXXXXX)"; \
+		tarball="$$tmp_dir/lambda-vm-sysroot-rv64im.tar.gz"; \
+		echo "Provisioning sysroot at $(SYSROOT_DIR) (downloading lambda-vm-sysroot-rv64im.tar.gz)..."; \
+		curl -fL --proto '=https' "$(SYSROOT_URL)" -o "$$tarball"; \
+		echo "Verifying sysroot checksum..."; \
+		checksum_ok=false; \
+		if command -v sha256sum >/dev/null 2>&1; then \
+			printf '%s  %s\n' "$(SYSROOT_SHA256)" "$$tarball" | sha256sum -c - >/dev/null && checksum_ok=true; \
+		elif command -v shasum >/dev/null 2>&1; then \
+			actual="$$(shasum -a 256 "$$tarball" | awk '{print $$1}')"; \
+			[ "$$actual" = "$(SYSROOT_SHA256)" ] && checksum_ok=true; \
+		else \
+			echo "prepare-sysroot: missing sha256sum or shasum for checksum verification" >&2; \
+			exit 1; \
+		fi; \
+		if [ "$$checksum_ok" != true ]; then \
+			echo "prepare-sysroot: checksum mismatch for $(SYSROOT_URL)" >&2; \
+			exit 1; \
+		fi; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
 		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
-			tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
-				|| { rm -rf "$(SYSROOT_DIR)" "$(SYSROOT_TARBALL)"; exit 1; }; \
+			rm -rf "$(SYSROOT_DIR)" && mkdir -p "$(SYSROOT_DIR)" \
+				&& tar -xzf "$$tarball" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
+				|| { rm -rf "$(SYSROOT_DIR)"; exit 1; }; \
 		else \
 			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
 			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
-			sudo mkdir -p "$(SYSROOT_DIR)" \
-				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
-				|| { sudo rm -rf "$(SYSROOT_DIR)"; rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
+			sudo rm -rf "$(SYSROOT_DIR)" && sudo mkdir -p "$(SYSROOT_DIR)" \
+				&& sudo tar -xzf "$$tarball" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
+				|| { sudo rm -rf "$(SYSROOT_DIR)"; exit 1; }; \
 		fi; \
-		rm "$(SYSROOT_TARBALL)"; \
 	fi
-# Note: the tarball rm above only runs on success — each error handler
-# cleans up the tarball itself before `exit 1`.
 
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)
@@ -110,7 +135,12 @@ compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
 
 # Compile rust (64-bit)
-$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
+# Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
+# first (the aggregate compile-programs-rust/compile-bench targets already do, but a
+# bare pattern-rule invocation like `make -B .../ethrex.elf` would otherwise skip it
+# and fail to compile guest C dependencies). Order-only because prepare-sysroot is
+# .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
+$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	@mkdir -p $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
@@ -123,7 +153,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches (64-bit)
-$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml
+$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	@mkdir -p $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
@@ -156,19 +186,34 @@ test-asm: compile-programs-asm test-asm-no-compile
 test-asm-no-compile:
 	cargo test -p executor --test asm
 
-test-rust: compile-programs-rust prepare-test-data
+test-rust: compile-programs-rust
 	cargo test -p executor --test rust
 
 test-rust-no-compile:
 	cargo test -p executor --test rust
 
-test-no-compile: prepare-test-data
+test-no-compile:
 	cargo test -p executor
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
 
-test: compile-programs prepare-test-data
+# Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
+# Run after bumping the ethrex rev; README checksums are refreshed automatically.
+regen-ethrex-fixtures:
+	cd tooling/ethrex-fixtures && \
+		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
+		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
+		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+	$(MAKE) update-ethrex-fixture-checksums
+
+update-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py
+
+check-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py --check
+
+test: compile-programs
 	cargo test
 
 # === Quick test shortcuts ===

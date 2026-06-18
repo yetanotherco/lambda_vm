@@ -48,8 +48,20 @@ jobs:
             --no-color
 
       - name: Run ethrex block benchmarks
+        id: ethrex_bench
+        # continue-on-error so the artifact upload, summary, and Slack steps below still
+        # run even when the ethrex bench fails; the "Fail if ethrex benchmark failed" step
+        # at the end of the job re-surfaces the failure so the run shows red.
         continue-on-error: true
         run: |
+          # Provision the RISC-V sysroot in a user-writable dir instead of the default
+          # /opt/lambda-vm-sysroot, which on the self-hosted bench runner is root-owned
+          # and was never fully provisioned (missing libc headers for guest C dependencies).
+          # `make` (via SYSROOT_DIR ?=) picks this up and passes it as clang's
+          # --sysroot, so the guest ELF rebuild self-provisions with no sudo, and the
+          # extracted sysroot persists in $HOME across runs on the persistent
+          # self-hosted runner (no actions/cache step is involved).
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           bash ./bench_vs/run_ethrex.sh \
             --report-dir bench_vs_artifacts \
             --rebuild-elf \
@@ -70,3 +82,9 @@ jobs:
         env:
           SLACK_WEBHOOK: ${{ github.event_name == 'workflow_dispatch' && secrets.BENCH_VS_SLACK_WEBHOOK_TEST || secrets.BENCH_VS_SLACK_WEBHOOK }}
         run: bash .github/scripts/publish_bench_vs.sh "$SLACK_WEBHOOK"
+
+      - name: Fail if ethrex benchmark failed
+        if: always() && steps.ethrex_bench.outcome == 'failure'
+        run: |
+          echo "::error::ethrex block benchmark step failed - see the 'Run ethrex block benchmarks' step logs"
+          exit 1

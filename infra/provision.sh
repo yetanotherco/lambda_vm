@@ -149,14 +149,30 @@ grep -qxF "$PATH_LINE" "$HOME/.bashrc" 2>/dev/null \
 APP_CLAUDE
 
 # --- 8. lambda-vm sysroot (rv64im) ------------------------------------------
+# Guard on include/stdlib.h and re-extract from scratch so a partial/interrupted extract
+# self-heals on re-run; a bare `[ ! -d ]` guard left a headerless sysroot that broke
+# guest C dependencies.
 SYSROOT_DIR=/opt/lambda-vm-sysroot
 SYSROOT_URL=https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
-if [ ! -d "$SYSROOT_DIR" ]; then
-    log "downloading sysroot to $SYSROOT_DIR"
-    curl -L "$SYSROOT_URL" -o /tmp/sysroot.tar.gz
+SYSROOT_SHA256=420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7
+if [ -f "$SYSROOT_DIR/include/stdlib.h" ] && [ -d "$SYSROOT_DIR/lib" ]; then
+    log "sysroot already present at $SYSROOT_DIR"
+else
+    log "provisioning sysroot at $SYSROOT_DIR"
+    sysroot_tmp_dir=$(mktemp -d /tmp/lambda-vm-sysroot.XXXXXX)
+    sysroot_tarball="$sysroot_tmp_dir/lambda-vm-sysroot-rv64im.tar.gz"
+    cleanup_sysroot_tmp() { rm -rf "$sysroot_tmp_dir"; }
+    trap cleanup_sysroot_tmp EXIT
+
+    curl -fL --proto '=https' "$SYSROOT_URL" -o "$sysroot_tarball"
+    printf '%s  %s\n' "$SYSROOT_SHA256" "$sysroot_tarball" | sha256sum -c -
+
+    rm -rf "$SYSROOT_DIR"
     mkdir -p /opt
-    tar -xzf /tmp/sysroot.tar.gz -C /opt
-    rm /tmp/sysroot.tar.gz
+    tar -xzf "$sysroot_tarball" -C /opt --no-same-owner \
+        || { rm -rf "$SYSROOT_DIR"; exit 1; }
+    rm -rf "$sysroot_tmp_dir"
+    trap - EXIT
 fi
 
 # --- 9. Clone lambda_vm (as app, public repo over HTTPS) ---------------------
@@ -167,15 +183,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 10. ethrex test fixture ------------------------------------------------
-ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
-ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
-if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
-    log "downloading ethrex_hoodi.bin"
-    sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
-fi
-
-# --- 11. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 10. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -183,7 +191,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 12. /etc/environment + locale ------------------------------------------
+# --- 11. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -194,7 +202,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 13. sshd hardening (last; reload won't drop existing session) ----------
+# --- 12. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no

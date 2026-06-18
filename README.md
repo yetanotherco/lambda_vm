@@ -50,14 +50,15 @@ Some of the tests require linking with C libraries.
 The easiest way is to let `make` do it:
 
 ```sh
+SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # recommended: user-writable, no sudo
 make prepare-sysroot                                       # installs to /opt (uses sudo)
-SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # user-writable, no sudo
 ```
 
 Or do it manually:
 
 ```sh
 wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+echo "420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7  lambda-vm-sysroot-rv64im.tar.gz" | sha256sum -c -
 sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 
