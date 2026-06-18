@@ -1,7 +1,7 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     logs::Log,
-    memory::Memory,
+    memory::{Memory, MemoryError},
     registers::Registers,
 };
 
@@ -14,6 +14,8 @@ pub enum SyscallNumbers {
     Panic = 2,
     Commit = 64,
     Halt = 93,
+    // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
+    Ecsm = 94,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -21,6 +23,17 @@ pub enum SyscallNumbers {
 /// Cannot be an enum discriminant because it exceeds isize::MAX.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 const KECCAK_STATE_BYTES: u64 = 25 * 8;
+
+/// Syscall number for the ECSM (elliptic-curve scalar multiply) accelerator.
+///
+/// The spec uses ECALL number `-11`; interpreted as an unsigned 64-bit value that is
+/// `u64::MAX - 10 = 0xFFFF_FFFF_FFFF_FFF5`, which the ECSM core table puts on the `Ecall`
+/// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
+pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
+
+/// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
+/// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
+const LOW_LIMB: u64 = 1 << 32;
 
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
@@ -31,9 +44,35 @@ impl TryFrom<u64> for SyscallNumbers {
             64 => Ok(SyscallNumbers::Commit),
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
+            v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             _ => Err(()),
         }
     }
+}
+
+/// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
+fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
+    let mut out = [0u8; 32];
+    for i in 0..4 {
+        let dw = memory.load_doubleword(addr + (i as u64) * 8)?;
+        out[i * 8..i * 8 + 8].copy_from_slice(&dw.to_le_bytes());
+    }
+    Ok(out)
+}
+
+/// Writes a 256-bit little-endian value as four doublewords at `addr + 8i`.
+fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(), MemoryError> {
+    for i in 0..4 {
+        let mut dw = [0u8; 8];
+        dw.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+        memory.store_doubleword(addr + (i as u64) * 8, u64::from_le_bytes(dw))?;
+    }
+    Ok(())
+}
+
+/// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
+fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
+    (addr % LOW_LIMB) + max_offset < LOW_LIMB
 }
 
 impl Instruction {
@@ -359,6 +398,37 @@ impl Instruction {
                         }
                         src2_val = state_addr;
                     }
+                    SyscallNumbers::Ecsm => {
+                        // ECSM(-11): k×G on secp256k1.
+                        // x10 = addr to write xR, x11 = addr of xG, x12 = addr of k.
+                        // xG, k, xR are 32-byte little-endian values; xG and xR must be
+                        // canonical field elements and k must be in [1, N).
+                        let addr_xr = registers.read(10)?;
+                        let addr_xg = registers.read(11)?;
+                        let addr_k = registers.read(12)?;
+                        if !ecsm_addr_ok(addr_xg, 31)
+                            || !ecsm_addr_ok(addr_xr, 31)
+                            || !ecsm_addr_ok(addr_k, 31)
+                        {
+                            return Err(ExecutionError::EcsmAddressOverflow);
+                        }
+                        // xG and k are both read at the same proof timestamp, so their
+                        // 32-byte ranges must be disjoint or the trace is unprovable
+                        // (MEMW orders accesses per address by strictly increasing
+                        // timestamp). xR may alias either: its accesses are offset to
+                        // later timestamps.
+                        if addr_xg.abs_diff(addr_k) < 32 {
+                            return Err(ExecutionError::EcsmOperandOverlap);
+                        }
+                        let xg = load_u256_le(memory, addr_xg)?;
+                        let k = load_u256_le(memory, addr_k)?;
+                        let xr = ecsm::scalar_mul_x(&k, &xg)?;
+                        store_u256_le(memory, addr_xr, &xr)?;
+                        // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10
+                        // by the ECSM register-read path in the trace builder.
+                        src2_val = addr_xg;
+                        dst_val = addr_k;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -535,6 +605,12 @@ pub enum ExecutionError {
     UnalignedKeccakStateAddress(u64),
     #[error("Keccak state address range overflows: {0:#018x}")]
     KeccakStateAddressOverflow(u64),
+    #[error("ECSM address range overflows the lower 32-bit limb")]
+    EcsmAddressOverflow,
+    #[error("ECSM xG and k operand ranges overlap")]
+    EcsmOperandOverlap,
+    #[error("ECSM scalar multiplication error: {0}")]
+    Ecsm(#[from] ecsm::EcsmError),
 }
 
 // =============================================================================

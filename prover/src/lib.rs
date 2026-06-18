@@ -49,11 +49,11 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_eq_air,
-    create_halt_air, create_keccak_air, create_keccak_rc_air, create_keccak_rnd_air,
-    create_load_air, create_lt_air, create_memw_air, create_memw_aligned_air,
-    create_memw_register_air, create_mul_air, create_page_air, create_register_air,
-    create_shift_air, create_store_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_scalar_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
+    create_register_air, create_shift_air, create_store_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -70,6 +70,11 @@ pub struct RuntimePageRange {
     /// Number of contiguous 4KB pages starting at `base`.
     pub count: u64,
 }
+
+/// Number of tables that always contribute exactly one sub-proof, regardless
+/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
+/// keccak_rc, register, ecsm, ec_scalar, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 11;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -223,6 +228,9 @@ pub(crate) struct VmAirs {
     pub keccak: VmAir,
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
+    pub ecsm: VmAir,
+    pub ec_scalar: VmAir,
+    pub ecdas: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -244,6 +252,9 @@ impl VmAirs {
             (&self.keccak, &mut traces.keccak, &()),
             (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
             (&self.keccak_rc, &mut traces.keccak_rc, &()),
+            (&self.ecsm, &mut traces.ecsm, &()),
+            (&self.ec_scalar, &mut traces.ec_scalar, &()),
+            (&self.ecdas, &mut traces.ecdas, &()),
             (&self.register, &mut traces.register, &()),
         ];
 
@@ -314,6 +325,9 @@ impl VmAirs {
             &self.keccak,
             &self.keccak_rnd,
             &self.keccak_rc,
+            &self.ecsm,
+            &self.ec_scalar,
+            &self.ecdas,
             &self.register,
         ];
 
@@ -454,6 +468,9 @@ impl VmAirs {
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
+        let ecsm = create_ecsm_air(proof_options);
+        let ec_scalar = create_ec_scalar_air(proof_options);
+        let ecdas = create_ecdas_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, elf.entry_point),
             register::NUM_PREPROCESSED_COLS,
@@ -530,6 +547,9 @@ impl VmAirs {
             keccak,
             keccak_rnd,
             keccak_rc,
+            ecsm,
+            ec_scalar,
+            ecdas,
             register,
             pages,
             memw_registers,
@@ -890,11 +910,12 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register) = 8, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 8 + page_configs.len();
+    // FIXED_TABLE_COUNT always-present tables, plus page tables.
+    let expected_proof_count =
+        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 8 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

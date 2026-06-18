@@ -1,0 +1,23 @@
+1. **Safety and security issues** - Label by criticality (Critical/High/Medium/Low)
+   - Rust: unsafe blocks, error handling, panics, memory safety issues
+   - GPU/CUDA: device-memory exhaustion or leaks that crash the run, unbounded
+     allocations, buffer lifetime, host/device synchronization
+   - VM/executor: instruction semantics, memory access, state transitions,
+     inconsistent execution/proving behavior
+
+2. **Potential bugs** - Logic errors, edge cases, incorrect behavior, race conditions
+
+3. **Performance issues** - Only significant: e.g. O(n^2) on unbounded input, unnecessary allocations, hot path inefficiencies
+
+4. **Simplicity and readability** - Prefer simple, readable code over clever
+   abstractions. Cosmetic rewrites are acceptable when they make changed code,
+   names, comments, or docs easier to understand.
+   - Dead code: flag functions, branches, CLI paths, or tests the PR leaves
+     unreachable or unused — call it out so it is removed, not left behind.
+
+Guidelines:
+- Be concise and to the point
+- Do NOT suggest micro-optimizations, churn, or premature abstractions
+- Always prefer simplicity over complexity when performance gains are marginal
+- Focus on real issues, not hypothetical improvements
+- Be concise and actionable

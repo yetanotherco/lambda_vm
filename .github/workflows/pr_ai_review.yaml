@@ -1,0 +1,512 @@
+name: AI Review
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request:
+    types: [labeled]
+
+# One review at a time per PR; a re-trigger cancels the in-flight run so rapid
+# re-labels/comments can't race and post duplicate report comments.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+# Default least-privilege: read-only. Only the jobs that need to write (final-report
+# posts the comment; the native reviews) request write/id-token at the job level.
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  prepare:
+    if: |
+      (
+        github.event_name == 'issue_comment' &&
+        github.event.issue.pull_request &&
+        contains(github.event.comment.body, '/ai-review') &&
+        contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
+      ) ||
+      (
+        github.event_name == 'pull_request' &&
+        github.event.action == 'labeled' &&
+        startsWith(github.event.label.name, 'ai-review') &&
+        github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+      )
+    runs-on: ubuntu-latest
+    outputs:
+      should_run: ${{ steps.prepare.outputs.should_run }}
+      pr_number: ${{ steps.prepare.outputs.pr_number }}
+      base_sha: ${{ steps.prepare.outputs.base_sha }}
+      base_ref: ${{ steps.prepare.outputs.base_ref }}
+      head_sha: ${{ steps.prepare.outputs.head_sha }}
+      head_ref: ${{ steps.prepare.outputs.head_ref }}
+      review_lanes: ${{ steps.prepare.outputs.review_lanes }}
+      verifier_lanes: ${{ steps.prepare.outputs.verifier_lanes }}
+      deduper: ${{ steps.prepare.outputs.deduper }}
+      custom_prompt: ${{ steps.prepare.outputs.custom_prompt }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Parse review command
+        id: prepare
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py prepare \
+            --event "$GITHUB_EVENT_PATH" \
+            --matrix runner/.github/ai-review/matrix.json \
+            --prompt-dir runner/.github/ai-review/prompts \
+            --output "$GITHUB_OUTPUT"
+
+  context:
+    needs: prepare
+    if: |
+      needs.prepare.outputs.should_run == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Checkout PR merge
+        uses: actions/checkout@v4
+        with:
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+          fetch-depth: 0
+          path: subject
+
+      - name: Fetch base and head refs
+        working-directory: subject
+        run: |
+          git fetch --no-tags origin \
+            ${{ needs.prepare.outputs.base_sha }} \
+            +refs/pull/${{ needs.prepare.outputs.pr_number }}/head:${{ needs.prepare.outputs.head_ref }}
+
+      - name: Build review context
+        run: |
+          python3 runner/.github/scripts/ai_review.py context \
+            --repo subject \
+            --base-sha "${{ needs.prepare.outputs.base_sha }}" \
+            --head-ref "${{ needs.prepare.outputs.head_ref }}" \
+            --pr-number "${{ needs.prepare.outputs.pr_number }}" \
+            --out-dir ai-review-context
+
+      - name: Upload review context
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+  openrouter-review:
+    needs: [prepare, context]
+    if: |
+      needs.prepare.outputs.should_run == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    # Least privilege: agentic lanes get read-only repo access and the OpenRouter key
+    # only. They never receive write permissions or the comment-posting token.
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJson(needs.prepare.outputs.review_lanes) }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          # Allowlist harvested from the harden-runner audit of a real run. Covers:
+          # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
+          # model APIs actually used (openrouter + direct MiniMax). Adding a new
+          # direct provider means adding its host here or the lane is blocked.
+          allowed-endpoints: >
+            api.github.com:443
+            api.minimax.io:443
+            broker.actions.githubusercontent.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            models.dev:443
+            opencode.ai:443
+            openrouter.ai:443
+            productionresultssa19.blob.core.windows.net:443
+            pypi.org:443
+            raw.githubusercontent.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            static.rust-lang.org:443
+
+      - name: Checkout PR merge at workspace root
+        uses: actions/checkout@v4
+        with:
+          # Explicit PR merge ref so BOTH triggers review the PR: label (pull_request)
+          # already defaults to the merge ref, but the /ai-review issue_comment trigger
+          # would otherwise check out the default branch and review the wrong code.
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+
+      - name: Install sandbox agent
+        run: |
+          # The repo is checked out at the workspace root (no subdir) so opencode's cwd is
+          # the repo root: the agent's file paths (incl. naive absolute ones) resolve to
+          # real files instead of a sibling dir. Install the read-only agent globally so
+          # discovery is version-independent.
+          mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
+          cp .opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          # Install custom tools (submit_findings) globally too, so review lanes report
+          # findings via a tool call instead of hand-written JSON.
+          cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Install opencode and JSON repair
+        run: |
+          # Pin json-repair with hashes (it is imported in this secret-bearing step,
+          # so an unpinned/hijacked release could run import-time code with the keys).
+          # pip only honors --hash inside a requirements file with --require-hashes.
+          printf '%s\n' 'json-repair==0.61.0 --hash=sha256:ee9fe5f95fcb2713d72d4495b67b794b62ff2cd24d6dba3bfb3173d9f7ab0f7d --hash=sha256:48759cc6c3052814c797d1d56787d9e1d451603a8760a55d619e97d2f49353d6' > /tmp/json-repair-req.txt
+          python3 -m pip install --quiet --require-hashes -r /tmp/json-repair-req.txt
+          # Pin a known-good version AND verify the installer script itself —
+          # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
+          # that holds the provider secrets). Fail closed if the script changes.
+          OPENCODE_INSTALL_SHA=fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e
+          curl -fsSL https://opencode.ai/install -o /tmp/opencode-install.sh
+          echo "$OPENCODE_INSTALL_SHA  /tmp/opencode-install.sh" | sha256sum -c -
+          bash /tmp/opencode-install.sh --version 1.16.2
+          # add likely install locations to PATH for subsequent steps
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Verify opencode
+        run: opencode --version
+
+      - name: Run agentic review lane
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          LANE_JSON: ${{ toJson(matrix.lane) }}
+          LANE_ID: ${{ matrix.lane.id }}
+        run: |
+          set +e
+          # Pass the id through the env var so the runner never parses it as
+          # shell; prepare also validates it against [A-Za-z0-9._-].
+          LANE_OUT="ai-review-lane/$LANE_ID.json"
+          timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
+            --lane-json "$LANE_JSON" \
+            --context ai-review-context/context.json \
+            --kind review \
+            --prompt-dir .github/ai-review/prompts \
+            --repo . \
+            --agent review-ro \
+            --timeout 1800 \
+            --out "$LANE_OUT"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            python3 .github/scripts/ai_review.py lane-error \
+              --lane-json "$LANE_JSON" \
+              --context ai-review-context/context.json \
+              --kind review \
+              --message "agentic lane exited with status $status" \
+              --out "$LANE_OUT"
+          fi
+
+      - name: Upload lane result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-lane-${{ matrix.lane.id }}
+          path: ai-review-lane
+
+  candidates:
+    needs: [prepare, context, openrouter-review]
+    if: |
+      always() &&
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.context.result == 'success' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    outputs:
+      has_candidates: ${{ steps.candidates.outputs.has_candidates }}
+      candidate_count: ${{ steps.candidates.outputs.candidate_count }}
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download lane results
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-lane-*
+          path: ai-review-lanes
+          merge-multiple: true
+
+      - name: Merge candidate findings
+        id: candidates
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          DEDUPER_JSON: ${{ needs.prepare.outputs.deduper }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py candidates \
+            --lanes-dir ai-review-lanes \
+            --context ai-review-context/context.json \
+            --out-dir ai-review-candidates \
+            --deduper "$DEDUPER_JSON" \
+            --output "$GITHUB_OUTPUT"
+
+      - name: Upload candidates
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+  openrouter-verify:
+    needs: [prepare, context, candidates]
+    if: |
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.candidates.outputs.has_candidates == 'true' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: ${{ fromJson(needs.prepare.outputs.verifier_lanes) }}
+    steps:
+      - name: Harden runner
+        uses: step-security/harden-runner@v2
+        with:
+          egress-policy: block
+          # Allowlist harvested from the harden-runner audit of a real run. Covers:
+          # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
+          # model APIs actually used (openrouter + direct MiniMax). Adding a new
+          # direct provider means adding its host here or the lane is blocked.
+          allowed-endpoints: >
+            api.github.com:443
+            api.minimax.io:443
+            broker.actions.githubusercontent.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            models.dev:443
+            opencode.ai:443
+            openrouter.ai:443
+            productionresultssa19.blob.core.windows.net:443
+            pypi.org:443
+            raw.githubusercontent.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            static.rust-lang.org:443
+
+      - name: Checkout PR merge at workspace root
+        uses: actions/checkout@v4
+        with:
+          # Explicit PR merge ref so BOTH triggers review the PR: label (pull_request)
+          # already defaults to the merge ref, but the /ai-review issue_comment trigger
+          # would otherwise check out the default branch and review the wrong code.
+          ref: refs/pull/${{ needs.prepare.outputs.pr_number }}/merge
+
+      - name: Install sandbox agent
+        run: |
+          # The repo is checked out at the workspace root (no subdir) so opencode's cwd is
+          # the repo root: the agent's file paths (incl. naive absolute ones) resolve to
+          # real files instead of a sibling dir. Install the read-only agent globally so
+          # discovery is version-independent.
+          mkdir -p "$HOME/.config/opencode/agent" "$HOME/.config/opencode/tools"
+          cp .opencode/agent/review-ro.md "$HOME/.config/opencode/agent/review-ro.md"
+          # Install custom tools (submit_findings) globally too, so review lanes report
+          # findings via a tool call instead of hand-written JSON.
+          cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+      - name: Install opencode and JSON repair
+        run: |
+          # Pin json-repair with hashes (it is imported in this secret-bearing step,
+          # so an unpinned/hijacked release could run import-time code with the keys).
+          # pip only honors --hash inside a requirements file with --require-hashes.
+          printf '%s\n' 'json-repair==0.61.0 --hash=sha256:ee9fe5f95fcb2713d72d4495b67b794b62ff2cd24d6dba3bfb3173d9f7ab0f7d --hash=sha256:48759cc6c3052814c797d1d56787d9e1d451603a8760a55d619e97d2f49353d6' > /tmp/json-repair-req.txt
+          python3 -m pip install --quiet --require-hashes -r /tmp/json-repair-req.txt
+          # Pin a known-good version AND verify the installer script itself —
+          # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
+          # that holds the provider secrets). Fail closed if the script changes.
+          OPENCODE_INSTALL_SHA=fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e
+          curl -fsSL https://opencode.ai/install -o /tmp/opencode-install.sh
+          echo "$OPENCODE_INSTALL_SHA  /tmp/opencode-install.sh" | sha256sum -c -
+          bash /tmp/opencode-install.sh --version 1.16.2
+          # add likely install locations to PATH for subsequent steps
+          echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "$HOME/bin" >> "$GITHUB_PATH"
+
+      - name: Verify opencode
+        run: opencode --version
+
+      - name: Run agentic verifier lane
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          LANE_JSON: ${{ toJson(matrix.lane) }}
+          LANE_ID: ${{ matrix.lane.id }}
+        run: |
+          set +e
+          # Pass the id through the env var so the runner never parses it as
+          # shell; prepare also validates it against [A-Za-z0-9._-].
+          LANE_OUT="ai-review-verification/$LANE_ID.json"
+          timeout 2200s python3 .github/scripts/ai_review.py agentic-lane \
+            --lane-json "$LANE_JSON" \
+            --context ai-review-context/context.json \
+            --kind verification \
+            --candidates ai-review-candidates/candidates.json \
+            --prompt-dir .github/ai-review/prompts \
+            --repo . \
+            --agent review-ro \
+            --timeout 1800 \
+            --out "$LANE_OUT"
+          status=$?
+          if [ "$status" -ne 0 ]; then
+            python3 .github/scripts/ai_review.py lane-error \
+              --lane-json "$LANE_JSON" \
+              --context ai-review-context/context.json \
+              --kind verification \
+              --message "agentic lane exited with status $status" \
+              --out "$LANE_OUT"
+          fi
+
+      - name: Upload verification result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-verification-${{ matrix.lane.id }}
+          path: ai-review-verification
+
+  final-report:
+    needs: [prepare, context, openrouter-review, candidates, openrouter-verify]
+    if: |
+      always() &&
+      needs.prepare.outputs.should_run == 'true' &&
+      needs.candidates.result == 'success' &&
+      (github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Checkout review runner
+        uses: actions/checkout@v4
+        with:
+          path: runner
+
+      - name: Download review context
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-context-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-context
+
+      - name: Download lane results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ai-review-lane-*
+          path: ai-review-lanes
+          merge-multiple: true
+
+      - name: Download candidates
+        uses: actions/download-artifact@v4
+        with:
+          name: ai-review-candidates-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-candidates
+
+      - name: Download verification results
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          pattern: ai-review-verification-*
+          path: ai-review-verifications
+          merge-multiple: true
+
+      - name: Build and post report
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 runner/.github/scripts/ai_review.py report \
+            --lanes-dir ai-review-lanes \
+            --verifications-dir ai-review-verifications \
+            --context ai-review-context/context.json \
+            --candidates ai-review-candidates/candidates.json \
+            --out-dir ai-review-final \
+            --post-comment
+
+      - name: Upload final report artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-review-final-${{ needs.prepare.outputs.pr_number }}
+          path: ai-review-final
+
+  codex-review:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+    uses: yetanotherco/actions/.github/workflows/pr_review_codex.yml@v1.0.0
+    with:
+      custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+  claude-review:
+    needs: prepare
+    if: needs.prepare.outputs.should_run == 'true'
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: read
+      id-token: write
+    uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
+    with:
+      model: opus
+      max_turns: 30
+      custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
+    secrets:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
