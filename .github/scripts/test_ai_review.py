@@ -211,11 +211,11 @@ Second try:
 
 
 class AiReviewTriggerTests(unittest.TestCase):
-    def test_authorized_comment_trigger_returns_tier_and_pr_number(self) -> None:
+    def test_authorized_comment_trigger_returns_pr_number(self) -> None:
         event = {
             "comment": {
                 "author_association": "MEMBER",
-                "body": "please run\n/ai-review Critical\nthanks",
+                "body": "please run\n/ai-review\nthanks",
             },
             "issue": {
                 "number": 671,
@@ -223,13 +223,13 @@ class AiReviewTriggerTests(unittest.TestCase):
             },
         }
 
-        self.assertEqual(ai_review.parse_review_trigger(event), ("critical", 671))
+        self.assertEqual(ai_review.parse_review_trigger(event), 671)
 
     def test_unauthorized_comment_trigger_is_ignored(self) -> None:
         event = {
             "comment": {
                 "author_association": "CONTRIBUTOR",
-                "body": "/ai-review standard",
+                "body": "/ai-review",
             },
             "issue": {
                 "number": 671,
@@ -237,16 +237,16 @@ class AiReviewTriggerTests(unittest.TestCase):
             },
         }
 
-        self.assertEqual(ai_review.parse_review_trigger(event), (None, None))
+        self.assertIsNone(ai_review.parse_review_trigger(event))
 
-    def test_label_trigger_maps_to_tier(self) -> None:
+    def test_label_trigger_returns_pr_number(self) -> None:
         event = {
             "action": "labeled",
-            "label": {"name": "AI-Review-Critical"},
+            "label": {"name": "AI-Review"},
             "pull_request": {"number": 671},
         }
 
-        self.assertEqual(ai_review.parse_review_trigger(event), ("critical", 671))
+        self.assertEqual(ai_review.parse_review_trigger(event), 671)
 
     def test_same_repo_pr_is_not_a_fork(self) -> None:
         pr = {

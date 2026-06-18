@@ -37,7 +37,6 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       should_run: ${{ steps.prepare.outputs.should_run }}
-      tier: ${{ steps.prepare.outputs.tier }}
       pr_number: ${{ steps.prepare.outputs.pr_number }}
       base_sha: ${{ steps.prepare.outputs.base_sha }}
       base_ref: ${{ steps.prepare.outputs.base_ref }}
@@ -473,12 +472,12 @@ jobs:
       - name: Upload final report artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: ai-review-final-${{ needs.prepare.outputs.tier }}-${{ needs.prepare.outputs.pr_number }}
+          name: ai-review-final-${{ needs.prepare.outputs.pr_number }}
           path: ai-review-final
 
-  codex-critical-review:
+  codex-review:
     needs: prepare
-    if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    if: needs.prepare.outputs.should_run == 'true'
     permissions:
       contents: read
       pull-requests: write
@@ -489,9 +488,9 @@ jobs:
     secrets:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
-  claude-critical-review:
+  claude-review:
     needs: prepare
-    if: needs.prepare.outputs.should_run == 'true' && needs.prepare.outputs.tier == 'critical'
+    if: needs.prepare.outputs.should_run == 'true'
     permissions:
       contents: read
       pull-requests: write

@@ -25,6 +25,9 @@ except ImportError:  # pragma: no cover
 
 
 AUTHORIZED_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+
+# Hidden marker used to find/update our own PR comment in place (single review flow).
+REVIEW_COMMENT_MARKER = "<!-- ai-review -->"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 COMMENT_LIMIT = 60000
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
@@ -158,16 +161,14 @@ def assert_safe_lane_id(lane_id: str) -> None:
 
 def cmd_prepare(args: argparse.Namespace) -> int:
     event = read_json(pathlib.Path(args.event))
-    tier, pr_number = parse_review_trigger(event)
+    pr_number = parse_review_trigger(event)
 
     outputs: dict[str, Any] = {"should_run": "false"}
-    if not tier or not pr_number:
+    if not pr_number:
         write_github_outputs(pathlib.Path(args.output), outputs)
         return 0
 
     matrix = read_json(pathlib.Path(args.matrix))
-    if tier not in matrix:
-        raise SystemExit(f"Tier {tier!r} not found in {args.matrix}")
 
     repo = os.environ["GITHUB_REPOSITORY"]
     token = os.environ["GITHUB_TOKEN"]
@@ -195,19 +196,14 @@ def cmd_prepare(args: argparse.Namespace) -> int:
     # dedicated tooling.
     prompt_path = pathlib.Path(args.prompt_dir) / "general.md"
     custom_prompt = prompt_path.read_text(encoding="utf-8")
-    tier_config = matrix[tier]
-
-    # Stamp the tier onto every lane so lane results are classified correctly
-    # regardless of lane id/prompt naming (infer_tier_from_lane is only a fallback).
-    review_lanes = [{**lane, "tier": tier} for lane in tier_config["review_lanes"]]
-    verifier_lanes = [{**lane, "tier": tier} for lane in tier_config["verifier_lanes"]]
+    review_lanes = [dict(lane) for lane in matrix["review_lanes"]]
+    verifier_lanes = [dict(lane) for lane in matrix["verifier_lanes"]]
 
     for lane in review_lanes + verifier_lanes:
         assert_safe_lane_id(str(lane.get("id", "")))
 
     outputs = {
         "should_run": "true",
-        "tier": tier,
         "pr_number": str(pr_number),
         "base_sha": pr["base"]["sha"],
         "base_ref": pr["base"]["ref"],
@@ -215,7 +211,7 @@ def cmd_prepare(args: argparse.Namespace) -> int:
         "head_ref": f"refs/remotes/origin/pr/{pr_number}/head",
         "review_lanes": json.dumps(review_lanes, separators=(",", ":")),
         "verifier_lanes": json.dumps(verifier_lanes, separators=(",", ":")),
-        "deduper": json.dumps(tier_config.get("deduper") or {}, separators=(",", ":")),
+        "deduper": json.dumps(matrix.get("deduper") or {}, separators=(",", ":")),
         "custom_prompt": custom_prompt,
     }
     write_github_outputs(pathlib.Path(args.output), outputs)
@@ -294,7 +290,7 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     lane_results = load_json_files(pathlib.Path(args.lanes_dir))
     context = read_json(pathlib.Path(args.context))
     candidates = build_candidates(lane_results, context)
-    # Second-pass LLM dedup (configured per tier as "deduper" in matrix.json) catches
+    # Second-pass LLM dedup (configured as "deduper" in matrix.json) catches
     # reworded duplicates the file+text heuristic misses. Safe to skip on any failure.
     deduper = json.loads(args.deduper) if getattr(args, "deduper", None) else None
     before = len(candidates.get("issues", []))
@@ -748,50 +744,42 @@ def cmd_report(args: argparse.Namespace) -> int:
     (out_dir / "report.md").write_text(report, encoding="utf-8")
 
     if args.post_comment:
-        post_or_update_comment(context["pr_number"], report, final["tier"])
+        post_or_update_comment(context["pr_number"], report)
     return 0
 
 
-def parse_tier_command(body: str) -> str | None:
-    # Single review flow: any /ai-review comment (with or without a legacy
-    # standard|critical argument) runs the one "critical" flow.
-    if re.search(r"(?im)^\s*/ai-review\b", body):
-        return "critical"
-    return None
+def is_review_command(body: str) -> bool:
+    # Any /ai-review comment (with or without a legacy standard|critical argument).
+    return bool(re.search(r"(?im)^\s*/ai-review\b", body))
 
 
-def parse_tier_label(name: str) -> str | None:
-    # Any ai-review* label (including legacy ai-review-standard/-critical) runs
-    # the single "critical" flow.
-    if name.strip().lower().startswith("ai-review"):
-        return "critical"
-    return None
+def is_review_label(name: str) -> bool:
+    # Any ai-review* label (including the legacy ai-review-standard/-critical labels).
+    return name.strip().lower().startswith("ai-review")
 
 
-def parse_review_trigger(event: dict[str, Any]) -> tuple[str | None, int | None]:
+def parse_review_trigger(event: dict[str, Any]) -> int | None:
+    """Return the PR number to review, or None if this event is not a review trigger."""
     if event.get("comment") and event.get("issue", {}).get("pull_request"):
         association = event.get("comment", {}).get("author_association", "")
         if association not in AUTHORIZED_ASSOCIATIONS:
-            return None, None
-        tier = parse_tier_command(event.get("comment", {}).get("body", ""))
-        if not tier:
-            return None, None
-        return tier, int(event["issue"]["number"])
+            return None
+        if not is_review_command(event.get("comment", {}).get("body", "")):
+            return None
+        return int(event["issue"]["number"])
 
     if event.get("action") == "labeled" and event.get("pull_request"):
-        tier = parse_tier_label(event.get("label", {}).get("name", ""))
-        if not tier:
-            return None, None
-        return tier, int(event["pull_request"]["number"])
+        if not is_review_label(event.get("label", {}).get("name", "")):
+            return None
+        return int(event["pull_request"]["number"])
 
-    return None, None
+    return None
 
 
 def lane_base_result(lane: dict[str, Any], context: dict[str, Any], kind: str) -> dict[str, Any]:
     return {
         "kind": kind,
         "status": "success",
-        "tier": lane.get("tier") or infer_tier_from_lane(lane),
         "pr_number": context["pr_number"],
         "lane_id": lane["id"],
         "model": lane["model"],
@@ -799,14 +787,6 @@ def lane_base_result(lane: dict[str, Any], context: dict[str, Any], kind: str) -
         "findings": [],
         "verifications": [],
     }
-
-
-def infer_tier_from_lane(lane: dict[str, Any]) -> str:
-    lane_id = lane.get("id", "")
-    prompt = lane.get("prompt", "")
-    if "critical" in lane_id or prompt == "critical" or "critical" in prompt:
-        return "critical"
-    return "standard"
 
 
 RETRYABLE_HTTP_STATUS = {408, 409, 429, 500, 502, 503, 504}
@@ -1001,9 +981,7 @@ def apply_dedup_clusters(candidates: dict[str, Any], groups: Any) -> dict[str, A
 def build_candidates(lane_results: list[dict[str, Any]], context: dict[str, Any]) -> dict[str, Any]:
     groups: list[dict[str, Any]] = []
     all_findings = []
-    tier = "standard"
     for result in lane_results:
-        tier = result.get("tier") or tier
         if result.get("kind") != "review" or result.get("status") != "success":
             continue
         for finding in result.get("findings", []):
@@ -1034,7 +1012,6 @@ def build_candidates(lane_results: list[dict[str, Any]], context: dict[str, Any]
         merge_finding_into_group(group, finding)
 
     return {
-        "tier": tier,
         "pr_number": context["pr_number"],
         "base_sha": context["base_sha"],
         "generated_at": int(time.time()),
@@ -1118,7 +1095,6 @@ def build_final_issues(candidates: dict[str, Any], verification_results: list[di
         final_issues.append(final_issue)
 
     return {
-        "tier": candidates.get("tier", "standard"),
         "pr_number": candidates["pr_number"],
         "base_sha": candidates["base_sha"],
         "generated_at": int(time.time()),
@@ -1151,8 +1127,7 @@ def render_report(
     verification_results: list[dict[str, Any]],
     metrics: dict[str, Any],
 ) -> str:
-    tier = final["tier"]
-    marker = f"<!-- ai-review:{tier} -->"
+    marker = REVIEW_COMMENT_MARKER
     visible_issues = [i for i in final["issues"] if i["status"] != "rejected"]
     rejected = [i for i in final["issues"] if i["status"] == "rejected"]
     lines = [
@@ -1247,14 +1222,13 @@ def render_report(
                 )
             )
 
-    if tier == "critical":
-        lines.extend(
-            [
-                "",
-                "Native Codex and Claude critical reviews are triggered as separate reviewer comments. "
-                "They are not included in this structured provenance report yet.",
-            ]
-        )
+    lines.extend(
+        [
+            "",
+            "Native Codex and Claude reviews run separately and post their own comments. "
+            "They are not included in this structured provenance report.",
+        ]
+    )
     if rejected:
         lines.extend(
             ["", f"<details><summary>Discarded candidates ({len(rejected)}) — rejected by the verifier</summary>", ""]
@@ -1544,10 +1518,10 @@ def github_json(method: str, path: str, token: str, body: dict[str, Any] | None 
         return json.loads(raw) if raw else None
 
 
-def post_or_update_comment(pr_number: int, body: str, tier: str) -> None:
+def post_or_update_comment(pr_number: int, body: str) -> None:
     token = os.environ["GITHUB_TOKEN"]
     repo = os.environ["GITHUB_REPOSITORY"]
-    marker = f"<!-- ai-review:{tier} -->"
+    marker = REVIEW_COMMENT_MARKER
     # Find our existing comment across ALL pages — a busy PR can have >100 comments, and
     # missing the marker means posting a duplicate report. Comments are oldest-first, so the
     # last match is the most recent. github_json returns None on an empty body.
