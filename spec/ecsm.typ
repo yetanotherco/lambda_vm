@@ -96,9 +96,6 @@ where it is assumed that $x_G, x_R$ and $k$ are provided as little-endian.
 The #ecsm chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(ecsm_chip, config)
 
-== Assumptions
-#render_chip_assumptions(ecsm_chip, config)
-
 == Constraints
 
 === Interactions
@@ -106,9 +103,7 @@ This chip is triggered by an `ECALL` with the opcode indicating this chip:
 #render_constraint_table(ecsm_chip, config, groups: "ecall")
 
 === Read `xG`
-Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently load $x_G$ in (@ec:c:read_xG).
-Assumption @ec:a:addr_xG_alignment ensures no overflows happen when incrementing the address in @ec:c:read_xG.
-Note: `xG` is assumed to be range checked, since they're read from memory.
+Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently loads $x_G$ in (@ec:c:read_xG).
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
 
 === Constrain `yG`
@@ -146,7 +141,6 @@ Note there that @ec:c:c1_0 and @ec:c:c1_i multiply `B` by `μ` to simplify the p
 
 === Read and verify `k`
 After reading `addr_k` from `x12` (@ec:c:read_addr_k), we read `k` from this address (@ec:c:load_k).
-Similar to `addr_xG`, assumption @ec:a:addr_k_alignment ensures the address offsets in @ec:c:load_k do not overflow the lower limb.
 To prevent the point at infinity from showing up during the scalar multiplication, we require that $#`k` < #`N`$.
 This is achieved by requiring that the addition $#`N` + (#`k` - #`N`)$ overflows $mod 2^256$ (@ec:c:k_lt_N).
 Additionally, @ec:c:k_gt_0 ensures that $#`k` > 0$, preventing a case where $#`k` times #`G` = #inf$.
@@ -168,9 +162,8 @@ The addition is constrained by requiring that `c3` are bits (@ec:c:range_c3); an
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
 === Write `xR`
-We read `addr_xR` from register `x10` (@ec:c:load_addrR), and subsequently write `xR` to this address (@ec:c:write_xR).
+We read `addr_xR` from register `x10` (@ec:c:load_addr_xR), and subsequently write `xR` to this address (@ec:c:write_xR).
 Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` to equal `addr_xG` and thus for $x_R$ to overwrite $x_G$ in memory.
-Similar to `addr_xG` and `addr_k`, it is assumed that the addition of the small offsets will not overflow the lower limb of `addr_xR` (@ec:a:addr_xR_alignment).
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
 == Carry offset
@@ -310,6 +303,9 @@ $#`carry_offsets` = (32636, 8161, 16320)$
     - it would be possible to perform a 24-bit range-check lookup,
     - one could set up a 24-bit range-check table. This could be as narrow as two columns.
     - have some hybrid version, where there is a native lookup table for x-bits, and a dynamic table for outliers (high carries are not encountered frequently).
+- `addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than `HL`s.
+  We use `HL`s as conventient notation.
+  This modification saves 6 columns.
 
 = Discussing the carries <ecsm-limb_carry>
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:

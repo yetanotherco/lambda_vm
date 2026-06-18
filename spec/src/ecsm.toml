@@ -8,19 +8,19 @@ pad = 0
 
 [[variables.input]]
 name = "addr_xG"
-type = "DWordWL"
+type = ["DWordHL", 4]
 desc = "address at which `x`-coordinate of start point `G` is stored"
 pad = 0
 
 [[variables.input]]
 name = "addr_k"
-type = "DWordWL"
+type = ["DWordHL", 4]
 desc = "address at which scalar `k` is stored"
 pad = 0
 
 [[variables.input]]
 name = "addr_xR"
-type = "DWordWL"
+type = ["DWordHL", 4]
 desc = "address to which the `x`-coordinate of result point `R` is to be written"
 pad = 0
 
@@ -217,20 +217,6 @@ type = "Bit"
 desc = ""
 pad = 0
 
-
-[[assumptions]]
-desc = "$(#`addr_xG` mod 2^32) + 24 < 2^32$"
-ref = "ec:a:addr_xG_alignment"
-
-[[assumptions]]
-desc = "$(#`addr_k` mod 2^32) + 31 < 2^32$"
-ref = "ec:a:addr_k_alignment"
-
-[[assumptions]]
-desc = "$(#`addr_xR` mod 2^32) + 24 < 2^32$"
-ref = "ec:a:addr_xR_alignment"
-
-
 # Load xG from memory
 
 [[constraint_groups]]
@@ -242,19 +228,36 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 11], "DWordWL"],
-    ["arr", ["idx", "addr_xG", 0], ["idx", "addr_xG", 1], 0, 0, 0, 0, 0, 0],
+    ["arr", ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
     "timestamp", 
     1, 0, 0]
-output = ["arr", ["idx", "addr_xG", 0], ["idx", "addr_xG", 1], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:read_addr_xG"
+
+[[constraints.read_xG]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", "addr_xG", "i"], "j"]]
+iters = [["i", 0, 3], ["j", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_xG"
+
+[[constraints.read_xG]]
+kind = "template"
+tag = "ADD"
+input = [["cast", ["idx", "addr_xG", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
+output = ["cast", ["idx", "addr_xG", "i"], "DWordWL"]
+iter = ["i", 1, 3]
+cond = "μ"
+ref = "ec:c:extrapolate_addr_xG"
 
 [[constraints.read_xG]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["+", "addr_xG", ["cast", ["*", 8, "i"], "DWordWL"]],
+    ["cast", ["idx", "addr_xG", "i"], "DWordWL"],
     ["arr",
         ["idx", "xG", ["+", ["*", 8, "i"], 0]],
         ["idx", "xG", ["+", ["*", 8, "i"], 1]],
@@ -422,12 +425,29 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 12], "DWordWL"],
-    ["arr", ["idx", "addr_k", 0], ["idx", "addr_k", 1], 0, 0, 0, 0, 0, 0],
+    ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
     "timestamp", 
     1, 0, 0]
-output = ["arr", ["idx", "addr_k", 0], ["idx", "addr_k", 1], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "ec:c:read_addr_k"
+
+[[constraints.verify_k]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", "addr_k", "i"], "j"]]
+iters = [["i", 0, 3], ["j", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_k"
+
+[[constraints.verify_k]]
+kind = "template"
+tag = "ADD"
+input = [["cast", ["idx", "addr_k", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
+output = ["cast", ["idx", "addr_k", "i"], "DWordWL"]
+iter = ["i", 1, 3]
+cond = "μ"
+ref = "ec:c:extrapolate_addr_k"
 
 [[constraints.verify_k]]
 kind = "template"
@@ -441,7 +461,7 @@ kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["+", "addr_k", ["cast", ["*", 8, "i"], "DWordWL"]],
+    ["cast", ["idx", "addr_k", "i"], "DWordWL"],
     ["arr",
         ["idx", "byte_k", ["+", ["*", 8, "i"], 0]],
         ["idx", "byte_k", ["+", ["*", 8, "i"], 1]],
@@ -571,19 +591,36 @@ tag = "MEMW"
 input = [
     1, 
     ["cast", ["*", 2, 10], "DWordWL"],
-    ["arr", ["idx", "addr_xR", 0], ["idx", "addr_xR", 1], 0, 0, 0, 0, 0, 0],
+    ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
     ["+", "timestamp", ["cast", 1, "DWordWL"]],
     1, 0, 0]
-output = ["arr", ["idx", "addr_xR", 0], ["idx", "addr_xR", 1], 0, 0, 0, 0, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
-ref = "ec:c:load_addrR"
+ref = "ec:c:load_addr_xR"
+
+[[constraints.write_xR]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", ["idx", "addr_xR", "i"], "j"]]
+iters = [["i", 0, 3], ["j", 0, 3]]
+multiplicity = "μ"
+ref = "ec:c:range_addr_xR"
+
+[[constraints.write_xR]]
+kind = "template"
+tag = "ADD"
+input = [["cast", ["idx", "addr_xR", 0], "DWordWL"], ["cast", ["*", 8, "i"], "DWordWL"]]
+output = ["cast", ["idx", "addr_xR", "i"], "DWordWL"]
+iter = ["i", 0, 3]
+cond = "μ"
+ref = "ec:c:extrapolate_addr_xR"
 
 [[constraints.write_xR]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
-    ["+", "addr_xR", ["cast", ["*", 8, "i"], "DWordWL"]],
+    ["cast", ["idx", "addr_xR", "i"], "DWordWL"],
     ["arr",
         ["idx", "xR", ["+", ["*", 8, "i"], 0]],
         ["idx", "xR", ["+", ["*", 8, "i"], 1]],
