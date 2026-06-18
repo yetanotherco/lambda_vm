@@ -33,6 +33,10 @@ NC='\033[0m'
 BLOCKS=(
     "ethrex empty block|ethrex_empty_block.bin"
     "ethrex 1 tx|ethrex_simple_tx.bin"
+    # ethrex_10_transfers.bin (~42M cycles) executes fine but is too heavy to
+    # prove on a typical machine (OOMs ~36 GB) — software ecrecover dominates
+    # (~4M cycles/transfer). Kept as a fixture; add here once ecrecover is a
+    # precompile or for big-memory/nightly proving.
 )
 
 # --- Parse args -------------------------------------------------------------
