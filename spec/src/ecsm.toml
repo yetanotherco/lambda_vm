@@ -38,14 +38,14 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "k"
-type = "U256BL"
+type = ["Bit", 256]
 desc = "`k`"
 pad = 0
 
 [[variables.auxiliary]]
 name = "idx_k"
 type = "Byte"
-desc = "Index of `k`'s most significant 1-bit"
+desc = "Zero-based index of `k`'s most significant 1-bit"
 pad = 0
 
 [[variables.auxiliary]]
@@ -103,12 +103,20 @@ desc = "$x_R - #`p` mod 2^256$"
 pad = 0
 
 [[variables.virtual]]
+name = "byte_k"
+type = "U256BL"
+desc = "`k`, as bytes"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["sum",["=", "j", 0], 7, ["*", ["^", 2, "j"], ["idx", "k", ["+", ["*", 8, "i"], "j"]]]]}
+]}
+
+[[variables.virtual]]
 name = "c2"
 type = ["Bit", 8]
 desc = "carries for computing $#`N` + #`k_sub_N`$"
 def = {polys=[
-    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "k", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "k", "U256WL"], "i"]]]},
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -422,33 +430,40 @@ multiplicity = "μ"
 ref = "ec:c:read_addr_k"
 
 [[constraints.verify_k]]
+kind = "template"
+tag = "IS_BIT"
+input = [["idx", "k", "i"]]
+iter = ["i", 0, 255]
+ref = "ec:c:range_k"
+
+[[constraints.verify_k]]
 kind = "interaction"
 tag = "MEMW"
 input = [
     0,
     ["+", "addr_k", ["cast", ["*", 8, "i"], "DWordWL"]],
     ["arr",
-        ["idx", "k", ["+", ["*", 8, "i"], 0]],
-        ["idx", "k", ["+", ["*", 8, "i"], 1]],
-        ["idx", "k", ["+", ["*", 8, "i"], 2]],
-        ["idx", "k", ["+", ["*", 8, "i"], 3]],
-        ["idx", "k", ["+", ["*", 8, "i"], 4]],
-        ["idx", "k", ["+", ["*", 8, "i"], 5]],
-        ["idx", "k", ["+", ["*", 8, "i"], 6]],
-        ["idx", "k", ["+", ["*", 8, "i"], 7]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 0]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 1]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 2]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 3]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 4]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 5]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 6]],
+        ["idx", "byte_k", ["+", ["*", 8, "i"], 7]],
     ],
     "timestamp",
     0, 0, 1
 ]
 output = ["arr",
-    ["idx", "k", ["+", ["*", 8, "i"], 0]],
-    ["idx", "k", ["+", ["*", 8, "i"], 1]],
-    ["idx", "k", ["+", ["*", 8, "i"], 2]],
-    ["idx", "k", ["+", ["*", 8, "i"], 3]],
-    ["idx", "k", ["+", ["*", 8, "i"], 4]],
-    ["idx", "k", ["+", ["*", 8, "i"], 5]],
-    ["idx", "k", ["+", ["*", 8, "i"], 6]],
-    ["idx", "k", ["+", ["*", 8, "i"], 7]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 0]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 1]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 2]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 3]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 4]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 5]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 6]],
+    ["idx", "byte_k", ["+", ["*", 8, "i"], 7]],
 ]
 iter = ["i", 0, 3]
 multiplicity = "μ"
@@ -480,38 +495,38 @@ ref = "ec:c:k_lt_N"
 kind = "interaction"
 tag = "ZERO"
 input = [["+", 
-    ["idx", "k", 0],
-    ["idx", "k", 1],
-    ["idx", "k", 2],
-    ["idx", "k", 3],
-    ["idx", "k", 4],
-    ["idx", "k", 5],
-    ["idx", "k", 6],
-    ["idx", "k", 7],
-    ["idx", "k", 8],
-    ["idx", "k", 9],
-    ["idx", "k", 10],
-    ["idx", "k", 11],
-    ["idx", "k", 12],
-    ["idx", "k", 13],
-    ["idx", "k", 14],
-    ["idx", "k", 15],
-    ["idx", "k", 16],
-    ["idx", "k", 17],
-    ["idx", "k", 18],
-    ["idx", "k", 19],
-    ["idx", "k", 20],
-    ["idx", "k", 21],
-    ["idx", "k", 22],
-    ["idx", "k", 23],
-    ["idx", "k", 24],
-    ["idx", "k", 25],
-    ["idx", "k", 26],
-    ["idx", "k", 27],
-    ["idx", "k", 28],
-    ["idx", "k", 29],
-    ["idx", "k", 30],
-    ["idx", "k", 31]
+    ["idx", "byte_k", 0],
+    ["idx", "byte_k", 1],
+    ["idx", "byte_k", 2],
+    ["idx", "byte_k", 3],
+    ["idx", "byte_k", 4],
+    ["idx", "byte_k", 5],
+    ["idx", "byte_k", 6],
+    ["idx", "byte_k", 7],
+    ["idx", "byte_k", 8],
+    ["idx", "byte_k", 9],
+    ["idx", "byte_k", 10],
+    ["idx", "byte_k", 11],
+    ["idx", "byte_k", 12],
+    ["idx", "byte_k", 13],
+    ["idx", "byte_k", 14],
+    ["idx", "byte_k", 15],
+    ["idx", "byte_k", 16],
+    ["idx", "byte_k", 17],
+    ["idx", "byte_k", 18],
+    ["idx", "byte_k", 19],
+    ["idx", "byte_k", 20],
+    ["idx", "byte_k", 21],
+    ["idx", "byte_k", 22],
+    ["idx", "byte_k", 23],
+    ["idx", "byte_k", 24],
+    ["idx", "byte_k", 25],
+    ["idx", "byte_k", 26],
+    ["idx", "byte_k", 27],
+    ["idx", "byte_k", 28],
+    ["idx", "byte_k", 29],
+    ["idx", "byte_k", 30],
+    ["idx", "byte_k", 31]
 ]]
 output = 0
 multiplicity = "μ"
@@ -607,13 +622,15 @@ name = "delegate"
 
 [[constraints.delegate]]
 kind = "interaction"
-tag = "SERVE_K"
-input = [
-    "timestamp",
-    ["cast", "addr_k", "DWordWL"],
-    31
-]
-multiplicity = "μ"
+tag = "BIT"
+input = ["timestamp", "i"]
+iter = ["i", 0, 255]
+multiplicity = ["idx", "k", "i"]
+
+[[constraints.delegate]]
+kind = "arith"
+constraint = "$#`k` != 0 => #`μ` != 0$"
+poly = ["*", ["sum", ["=", "i", 0], 255, ["idx", "k", "i"]], ["not", "μ"]]
 
 [[constraints.delegate]]
 kind = "interaction"

@@ -59,7 +59,7 @@ In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-
     As such, *this accelerator should only be used for input sets with public $k$.*
 ]
 
-The accelerator comprises three chips:
+The accelerator comprises two chips:
 - *`ECSM` (Elliptic Curve Scalar Multiply)*.
     This chip is responsible for 
     - loading $k$ from memory and verifying that is is contained in $[1, N)$,
@@ -72,8 +72,6 @@ The accelerator comprises three chips:
     At each step, the chip either adds the point to the accumulator ($A <- A + G$) or doubles the accumulator ($A <- 2A$), where the sequence of doubles and adds is dependent on $k$.
     The process is repeated until $A = k times G$.
     This technique is called _double-and-add_ #footnote(link("https://en.wikipedia.org/wiki/Elliptic_curve_point_multiplication#Double-and-add")) and manages to compute the multiplication in $O(log(k))$ doubling-steps and $O(w_H (k)) = O(log(k))$ addition-steps, where $w_H (dot)$ denotes the hamming-weight of a bitstring.
-- *`EC_SCALAR`*.
-    Per the direction of `ECSM`, this chip serves $k$ bit-by-bit to the `ECDAS` chip to inform the flow of the double-and-add sequence.
 
 = ECSM <ecsm-sm>
 
@@ -155,11 +153,11 @@ Additionally, @ec:c:k_gt_0 ensures that $#`k` > 0$, preventing a case where $#`k
 #render_constraint_table(ecsm_chip, config, groups: "verify_k")
 
 === Subroutine
-With point $G$ and scalar $k$ fully constructed, we delegate bit-by-bit serving of the scalar `k` to the `EC_SCALAR` chip.
-Here, we capture the index of the most significant 1-bit of `k` in `idx_k`.
+With point $G$ and scalar $k$ fully constructed, we serve scalar `k` bit-by-bit to the `ECDAS` chip.
+On this chip, we do capture the index of the most significant 1-bit of `k` in `idx_k`, to instruct the `ECDAS` chip where to start.
 Note: if the prover decides to capture a lesser significant bit here, the LogUp will not balance, as the skipped bits will never taken off the bus.
-Next, we interact with the `ECDAS` chip, providing `G` both as the accumulator, and increment (@ec:c:start_double_add); we specifically instruct the chip to start with a _double_-operation.
-After completing its double-and-add sequence, the result is captured in `R` (@ec:c:receive_double_add).
+Next, we interact with the `ECDAS` chip, providing `G` both as the accumulator and generator, and increment (@ec:c:start_double_add); we specifically instruct the chip to start with a _double_-operation.
+After completing its double-and-add sequence, the result is captured in `(xR,yR)` (@ec:c:receive_double_add).
 #render_constraint_table(ecsm_chip, config, groups: "delegate")
 
 === Range check `xR`
@@ -301,46 +299,6 @@ $#`carry_offsets` = (32636, 8161, 16320)$
 
 == Padding
 #render_chip_padding_table(ecdas_chip, config)
-
-
-= EC-Scalar
-#let ecscalar_chip = load_chip("src/ec_scalar.toml", config)
-#let ecscalar = raw(ecscalar_chip.name)
-
-== Columns
-#let nr_variables = total_nr_variables(ecscalar_chip)
-#let nr_columns = total_nr_instantiated_columns(ecscalar_chip, config)
-#let nr_interactions = compute_nr_interactions(ecscalar_chip)
-
-The #ecscalar chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
-#render_chip_variable_table(ecscalar_chip, config)
-
-== Assumptions
-This chip makes an assumption:
-#render_chip_assumptions(ecscalar_chip, config)
-
-== Constraints
-The chip starts by extracting the input information from the bus when its multiplicity is set.
-#render_constraint_table(ecscalar_chip, config, groups: "recv")
-
-Next, it reads `limb` from address $#`ptr` + #`offset`$.
-Note that the read-timestamp is offset by $1$ to prevent a collision with read of $k$ performed by #ecsm.
-Since `limb` is reconstructed from `limb_bits`, it is ensured those are in fact bits.
-#render_constraint_table(ecscalar_chip, config, groups: "read")
-
-For each `limb_bit` that is set, an `BIT`-interaction is sent on the bus, to inform the double-and-add sequence on the #ecdas chip. 
-To prevent interactions from occurring in padding rows, an active limb bit requires a non-zero multiplicity.
-#render_constraint_table(ecscalar_chip, config, groups: "serve")
-
-Unless this was the `last_limb` (i.e., $#`offset` = 0$), we recurse on serving the previous limb.
-
-#render_constraint_table(ecscalar_chip, config, groups: "recurse")
-`last_limb` is a witness provided by the prover, which, technically, could be kept at $0$ when $#`offset` = 0$.
-However, that would require an additional $2^64$ table entries to balance out the LogUp bus.
-Since this is assumed infeasible, the prover is constrained to set `last_limb` appropriately.
-
-== Padding
-#render_chip_padding_table(ecscalar_chip, config)
 
 = Notes / optimizations
 - To utilize the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the
