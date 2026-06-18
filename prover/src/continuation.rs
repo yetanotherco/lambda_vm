@@ -58,6 +58,21 @@ fn empty_constraints()
     vec![]
 }
 
+/// The L2G table's AIR constraint: the `MU` selector column is boolean.
+///
+/// The Memory bus already pins `MU = 1` on real rows and `MU = 0` on padding —
+/// it's anchored to MEMW's own bit-constrained multiplicity, since a non-1 `MU`
+/// leaves the cell's seed/fini tokens unmatched. This constraint makes
+/// "`MU ∈ {0,1}`" explicit on the table itself rather than relying on that
+/// cross-bus argument. Lives on the epoch-local air; the global proof commits the
+/// identical trace (root-bound), so it inherits it.
+fn l2g_constraints()
+-> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
+    use crate::constraints::templates::IsBitConstraint;
+    use stark::constraints::transition::TransitionConstraint;
+    vec![IsBitConstraint::unconditional(local_to_global::cols::MU, 0).boxed()]
+}
+
 /// Local-to-global AIR on the cross-epoch GlobalMemory bus (used in the global proof).
 ///
 /// `epoch_label` is this epoch's 1-based label; it is the `fini_epoch` constant
@@ -97,7 +112,7 @@ fn l2g_memory_air(
         AuxiliaryTraceBuildData { interactions },
         opts,
         1,
-        empty_constraints(),
+        l2g_constraints(),
     )
 }
 
@@ -203,7 +218,7 @@ fn prove_verify_epoch(
     // committed L2G trace was built from.
     crate::tables::bitwise::update_multiplicities(
         &mut traces.bitwise,
-        &local_to_global::collect_bitwise_from_l2g(boundary),
+        &local_to_global::collect_bitwise_from_l2g(boundary, start.label),
     );
 
     let table_counts = traces.table_counts();
