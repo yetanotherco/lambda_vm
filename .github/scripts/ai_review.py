@@ -227,7 +227,7 @@ def cmd_context(args: argparse.Namespace) -> int:
     head = args.head_ref
     pr_range = f"{base}...{head}"
     diff = git_text(repo, "diff", "--find-renames", "--find-copies", "--unified=80", pr_range)
-    name_status = git_text(repo, "diff", "--name-status", pr_range)
+    name_status = git_text(repo, "diff", "--name-status", "--find-renames", "--find-copies", pr_range)
     changed_files = parse_name_status(name_status)
 
     diff_truncated = len(diff) > args.max_diff_chars
