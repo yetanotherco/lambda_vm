@@ -1617,41 +1617,63 @@ pub trait IsStarkProver<
         // Number of main and aux columns in the LDE trace
         let num_main_cols = lde_trace.num_main_cols();
         let num_aux_cols = lde_trace.num_aux_cols();
-
-        // Precompute all inverse denominators at ALL LDE points via batch inversion.
         let lde_size = domain.lde_roots_of_unity_coset.len();
-        let num_denoms = lde_size * (1 + num_eval_points);
-        let mut denoms: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_denoms);
-
-        // H-term denominators: x_i - z^K (all 2N LDE points)
-        for i in 0..lde_size {
-            let x_i = &domain.lde_roots_of_unity_coset[i];
-            denoms.push(x_i - &z_power);
-        }
-
-        // Trace-term denominators: x_i - z_shifted[k] (all 2N LDE points)
-        for z_k in z_shifted.iter().take(num_eval_points) {
-            for i in 0..lde_size {
-                let x_i = &domain.lde_roots_of_unity_coset[i];
-                denoms.push(x_i - z_k);
-            }
-        }
-
-        FieldElement::inplace_batch_inverse(&mut denoms)
-            .expect("Denominators should be non-zero: coset points are base field, poles are extension field");
-
-        let inv_h = &denoms[0..lde_size];
 
         // OOD evaluations
         let h_ood = &round_3_result.composition_poly_parts_ood_evaluation;
         let trace_ood_columns = round_3_result.trace_ood_evaluations.columns();
         let num_total_cols = num_main_cols + num_aux_cols;
 
-        // GPU fast path: device-resident DEEP composition. Reuses the R1
-        // main/aux LDE handles on `lde_trace` and (when the R2 fused path
-        // ran) the parts handle on `round_2_result.gpu_composition_parts`.
-        // Falls back to the CPU rayon loop below on any precondition miss
-        // or kernel failure.
+        // Fully device-resident GPU fast path: build inv_denoms on device
+        // ([z^K, z_shifted[0..]] over the full LDE coset), then run R4
+        // DEEP composition reading the same device buffer. Skips the
+        // CPU `inplace_batch_inverse` on the happy path; on any GPU
+        // failure we fall through and compute denoms on CPU below.
+        #[cfg(feature = "cuda")]
+        {
+            let z_scalars: Vec<FieldElement<FieldExtension>> = core::iter::once(z_power.clone())
+                .chain(z_shifted.iter().cloned())
+                .collect();
+            if let Some((inv_dev, stream)) =
+                crate::gpu_lde::try_inv_denoms_dev_with_stream::<Field, FieldExtension>(
+                    &domain.lde_roots_of_unity_coset,
+                    &z_scalars,
+                    math_cuda::inverse::DenomSign::XMinusZ,
+                )
+                && let Some(deep_evals) =
+                    crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
+                        lde_trace,
+                        round_2_result.gpu_composition_parts.as_ref(),
+                        &round_2_result.lde_composition_poly_evaluations,
+                        h_ood,
+                        &trace_ood_columns,
+                        composition_poly_gammas,
+                        trace_terms_gammas,
+                        &[],
+                        Some((&inv_dev, &stream)),
+                        num_eval_points,
+                    )
+            {
+                return deep_evals;
+            }
+        }
+
+        // CPU denoms + batch inverse for the fallback paths below.
+        // Single-source helper shared with the GPU parity test so any
+        // sign/ordering/layout drift breaks the test instead of silently
+        // diverging CUDA vs non-CUDA proofs.
+        let denoms = crate::r4_denoms::build_r4_inv_denoms_cpu::<Field, FieldExtension>(
+            &domain.lde_roots_of_unity_coset,
+            &z_power,
+            &z_shifted,
+        )
+        .expect("R4 inv denoms: coset points are base field, poles are extension field");
+
+        let inv_h = &denoms[0..lde_size];
+
+        // GPU mixed path: dev parts (when R2 keep handle exists) + host
+        // inv_denoms. Used when the dev-inv-denoms path above didn't fire
+        // (e.g., cudarc error in compute_denoms / scan).
         #[cfg(feature = "cuda")]
         {
             if let Some(deep_evals) =
@@ -1664,6 +1686,7 @@ pub trait IsStarkProver<
                     composition_poly_gammas,
                     trace_terms_gammas,
                     &denoms,
+                    None,
                     num_eval_points,
                 )
             {

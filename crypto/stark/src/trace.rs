@@ -571,7 +571,23 @@ where
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
-    for eval_point in &evaluation_points {
+    // GPU fast path for R3 OOD: bundle the inverted inv_denoms (all
+    // eval points in one buffer) and the trace-size coset_points upload
+    // into a single device context. The barycentric kernels below read
+    // both via offset, with no per-eval-point or per-{main,aux} H2D.
+    #[cfg(feature = "cuda")]
+    let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
+        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(&dc.points, &evaluation_points);
+    #[allow(unused_variables)]
+    #[cfg(not(feature = "cuda"))]
+    let r3_ctx: Option<()> = None;
+
+    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_enumerate_index))]
+    for (eval_point_idx, eval_point) in evaluation_points.iter().enumerate() {
+        // Silence unused warning under non-cuda where eval_point_idx is
+        // only read inside the cuda-only block below.
+        #[cfg(not(feature = "cuda"))]
+        let _ = eval_point_idx;
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
@@ -579,11 +595,20 @@ where
         let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
         let vanishing_factor = &n_inv_g_n_inv * &vanishing;
 
-        // Precompute inv_denoms = 1/(eval_point - coset_point_i), shared across all columns.
-        // Stays on CPU: the batch-invert cost at this scale (n * num_eval_points) is already
-        // rayon-parallelised across tables, and a GPU port regressed wall time in a
-        // 2x15-trial A/B due to stream contention from many concurrent launches.
-        let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
+        // CPU inv_denoms = 1/(eval_point - coset_point_i). Materialised
+        // eagerly only when the GPU dispatcher will need to H2D it (no
+        // device-side inv_denoms buffer available). On the all-GPU happy
+        // path it stays None and the `barycentric_inv_denoms` call is
+        // skipped entirely (the GPU buffer covers every eval point).
+        #[cfg(feature = "cuda")]
+        let mut inv_denoms: Option<Vec<FieldElement<E>>> = if r3_ctx.is_some() {
+            None
+        } else {
+            Some(barycentric_inv_denoms(eval_point, &dc.points))
+        };
+        #[cfg(not(feature = "cuda"))]
+        let mut inv_denoms: Option<Vec<FieldElement<E>>> =
+            Some(barycentric_inv_denoms(eval_point, &dc.points));
 
         // col_scale[i] = point[i] * inv_denom[i], shared across ALL CPU column
         // loops below. Computed lazily on first CPU-fallback use so the all-GPU
@@ -595,6 +620,10 @@ where
         // for this table (handle absent), the size is below threshold, types
         // don't match, or the math-cuda call errored. Caller falls through
         // to the existing rayon CPU loop.
+        // Per-eval-point block offset into the GPU inv_denoms buffer:
+        // block k starts at u64 index k * 3 * n.
+        #[cfg(feature = "cuda")]
+        let r3_arg = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
         #[cfg(feature = "cuda")]
         let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
             lde_trace,
@@ -604,7 +633,8 @@ where
             &dc.size_inv,
             &dc.offset_pow_n_inv,
             &z_pow_n,
-            &inv_denoms,
+            inv_denoms.as_deref().unwrap_or(&[]),
+            r3_arg,
         );
         #[cfg(not(feature = "cuda"))]
         let main_gpu: Option<Vec<FieldElement<E>>> = None;
@@ -612,10 +642,12 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
+            let inv_denoms_v =
+                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
-                    .zip(inv_denoms.iter())
+                    .zip(inv_denoms_v.iter())
                     .map(|(point, inv_d)| point * inv_d)
                     .collect()
             });
@@ -642,6 +674,8 @@ where
 
         // GPU fast path for aux columns reading the de-interleaved ext3 LDE handle.
         #[cfg(feature = "cuda")]
+        let r3_arg_aux = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
+        #[cfg(feature = "cuda")]
         let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
             lde_trace,
             bf,
@@ -650,7 +684,8 @@ where
             &dc.size_inv,
             &dc.offset_pow_n_inv,
             &z_pow_n,
-            &inv_denoms,
+            inv_denoms.as_deref().unwrap_or(&[]),
+            r3_arg_aux,
         );
         #[cfg(not(feature = "cuda"))]
         let aux_gpu: Option<Vec<FieldElement<E>>> = None;
@@ -658,10 +693,12 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
+            let inv_denoms_v =
+                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
                 dc.points
                     .iter()
-                    .zip(inv_denoms.iter())
+                    .zip(inv_denoms_v.iter())
                     .map(|(point, inv_d)| point * inv_d)
                     .collect()
             });
