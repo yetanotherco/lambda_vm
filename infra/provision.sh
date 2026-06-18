@@ -167,15 +167,7 @@ if [ ! -d "$REPO_DIR/.git" ]; then
     sudo -u app -H git clone "$REPO_URL" "$REPO_DIR"
 fi
 
-# --- 10. ethrex test fixture ------------------------------------------------
-ETHREX_FILE=/home/app/lambda_vm/executor/tests/ethrex_hoodi.bin
-ETHREX_URL=https://lambda.alignedlayer.com/ethrex_hoodi.bin
-if [ -d /home/app/lambda_vm/executor/tests ] && [ ! -f "$ETHREX_FILE" ]; then
-    log "downloading ethrex_hoodi.bin"
-    sudo -u app -H curl -L "$ETHREX_URL" -o "$ETHREX_FILE"
-fi
-
-# --- 11. ufw firewall (default deny in, allow out, only ssh in) -------------
+# --- 10. ufw firewall (default deny in, allow out, only ssh in) -------------
 log "ufw: default deny in / allow out, allow ssh (22/tcp) only"
 ufw --force reset >/dev/null
 ufw default deny incoming
@@ -183,7 +175,7 @@ ufw default allow outgoing
 ufw allow 22/tcp
 ufw --force enable
 
-# --- 12. /etc/environment + locale ------------------------------------------
+# --- 11. /etc/environment + locale ------------------------------------------
 log "writing /etc/environment"
 cat > /etc/environment <<'EOF'
 LANG=en_US.UTF-8
@@ -194,7 +186,7 @@ LC_CTYPE=en_US.UTF-8
 EOF
 locale-gen en_US.UTF-8
 
-# --- 13. sshd hardening (last; reload won't drop existing session) ----------
+# --- 12. sshd hardening (last; reload won't drop existing session) ----------
 log "writing /etc/ssh/sshd_config.d/99-hardening.conf"
 cat > /etc/ssh/sshd_config.d/99-hardening.conf <<'EOF'
 PermitRootLogin no

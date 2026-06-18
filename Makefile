@@ -1,7 +1,9 @@
-.PHONY: deps deps-linux deps-macos prepare-test-data compile-programs-asm compile-programs-rust compile-bench \
+.PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
 UNAME := $(shell uname)
 
@@ -43,9 +45,6 @@ BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
 
-ETHREX_FILE := executor/tests/ethrex_hoodi.bin
-ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
-
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
 SYSROOT_DIR ?= /opt/lambda-vm-sysroot
@@ -63,15 +62,7 @@ ASM_LDFLAGS ?= -fuse-ld=lld -nostdlib -Wl,-e,main
 # Custom RV64IM target spec location
 RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 
-.PHONY: test prepare-test-data prepare-sysroot
-
-prepare-test-data:
-	@if [ ! -f "$(ETHREX_FILE)" ]; then \
-		echo "Downloading ethrex_hoodi.bin..."; \
-		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
-	else \
-		echo "ethrex_hoodi.bin already exists"; \
-	fi
+.PHONY: test prepare-sysroot
 
 prepare-sysroot:
 	@if [ -d "$(SYSROOT_DIR)/include" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
@@ -156,19 +147,34 @@ test-asm: compile-programs-asm test-asm-no-compile
 test-asm-no-compile:
 	cargo test -p executor --test asm
 
-test-rust: compile-programs-rust prepare-test-data
+test-rust: compile-programs-rust
 	cargo test -p executor --test rust
 
 test-rust-no-compile:
 	cargo test -p executor --test rust
 
-test-no-compile: prepare-test-data
+test-no-compile:
 	cargo test -p executor
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
 
-test: compile-programs prepare-test-data
+# Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
+# Run after bumping the ethrex rev; README checksums are refreshed automatically.
+regen-ethrex-fixtures:
+	cd tooling/ethrex-fixtures && \
+		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
+		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
+		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+	$(MAKE) update-ethrex-fixture-checksums
+
+update-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py
+
+check-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py --check
+
+test: compile-programs
 	cargo test
 
 # === Quick test shortcuts ===
