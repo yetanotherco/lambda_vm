@@ -6,11 +6,20 @@ on:
   pull_request:
     types: [labeled]
 
-# One review at a time per PR; a re-trigger cancels the in-flight run so rapid
-# re-labels/comments can't race and post duplicate report comments.
+# One review at a time per PR; a genuine re-request cancels the in-flight run so
+# rapid re-labels/`/ai-review` comments can't race and post duplicate reports.
+#
+# cancel-in-progress is gated on the trigger being a REAL request. The native
+# claude-review job posts its report as a GitHub App comment (claude[bot]), and
+# App-token comments DO fire issue_comment events (unlike github-actions[bot]
+# comments, which GitHub suppresses). Since concurrency is evaluated before any
+# job-level `if:`, an unconditional cancel let that bot comment spawn a run that
+# skipped every job yet still cancelled the original mid-flight — killing the
+# slower matrix lanes while only the fastest (minimax) survived into the report.
+# Gating the cancel means such non-command comments queue-and-skip instead.
 concurrency:
   group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/ai-review')) }}
 
 # Default least-privilege: read-only. Only the jobs that need to write (final-report
 # posts the comment; the native reviews) request write/id-token at the job level.
