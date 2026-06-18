@@ -315,6 +315,17 @@ def cmd_candidates(args: argparse.Namespace) -> int:
     return 0
 
 
+def opencode_failed(meta: dict[str, Any] | None) -> bool:
+    # opencode can surface a provider/auth/runtime failure either as a non-zero exit
+    # OR (e.g. an HTTP 402 / provider outage) as an `error` event while still exiting 0.
+    # Either means the lane did not actually review and must not be reported as success.
+    if not meta:
+        return False
+    if meta.get("returncode") not in (0, None):
+        return True
+    return bool((meta.get("event_counts") or {}).get("error"))
+
+
 def cmd_agentic_lane(args: argparse.Namespace) -> int:
     lane = json.loads(args.lane_json)
     context = read_json(pathlib.Path(args.context))
@@ -373,6 +384,15 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
                 base_result["findings"] = lane_items(parsed, lane, "review")
                 base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
                 base_result["parse_error"] = parse_error or "submit_findings tool was never called"
+                # A provider/auth/runtime failure (e.g. 402, outage) with no findings must be
+                # a lane ERROR, not a silent "success with 0 findings" that masks the failure.
+                if not base_result["findings"] and (
+                    opencode_failed(meta) or opencode_failed(base_result.get("continuation"))
+                ):
+                    base_result.update({
+                        "status": "error",
+                        "error": "opencode failed (provider/auth/runtime error) and no findings were submitted",
+                    })
         else:
             # Verifier lanes report via the submit_verifications tool — same structured
             # channel as the finders, for the same reason.
@@ -407,6 +427,13 @@ def cmd_agentic_lane(args: argparse.Namespace) -> int:
                 base_result["verifications"] = lane_items(parsed, lane, "verification")
                 base_result["summary"] = parsed.get("summary", "") if isinstance(parsed, dict) else ""
                 base_result["parse_error"] = parse_error or "submit_verifications tool was never called"
+                if not base_result["verifications"] and (
+                    opencode_failed(meta) or opencode_failed(base_result.get("continuation"))
+                ):
+                    base_result.update({
+                        "status": "error",
+                        "error": "opencode failed (provider/auth/runtime error) and no verifications were submitted",
+                    })
     except subprocess.TimeoutExpired:
         # The model may have already reported via the tool before the process was killed;
         # salvage those results instead of discarding the whole lane.

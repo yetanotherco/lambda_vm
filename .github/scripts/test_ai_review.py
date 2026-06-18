@@ -592,6 +592,15 @@ class AiReviewSubmissionTests(unittest.TestCase):
         steps = [e for e in meta["timeline"] if e["t"] == "step"]
         self.assertEqual(steps[0]["reasoning"], 6587)
 
+    def test_opencode_failed_detects_error_event_and_nonzero_exit(self) -> None:
+        # 402/outage: opencode exits 0 but emits an error event — must count as failed.
+        self.assertTrue(ai_review.opencode_failed({"returncode": 0, "event_counts": {"error": 1}}))
+        # non-zero exit is also a failure
+        self.assertTrue(ai_review.opencode_failed({"returncode": 1, "event_counts": {}}))
+        # a clean run is not a failure
+        self.assertFalse(ai_review.opencode_failed({"returncode": 0, "event_counts": {"step_finish": 5}}))
+        self.assertFalse(ai_review.opencode_failed(None))
+
 
 if __name__ == "__main__":
     unittest.main()
