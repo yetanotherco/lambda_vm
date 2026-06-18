@@ -59,7 +59,8 @@ jobs:
           # and was never fully provisioned (missing libc headers → c-kzg failed to find
           # stdlib.h). `make` (via SYSROOT_DIR ?=) picks this up and passes it as clang's
           # --sysroot, so the guest ELF rebuild self-provisions with no sudo, and the
-          # extracted sysroot is cached in $HOME across nightly runs.
+          # extracted sysroot persists in $HOME across runs on the persistent
+          # self-hosted runner (no actions/cache step is involved).
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           bash ./bench_vs/run_ethrex.sh \
             --report-dir bench_vs_artifacts \
@@ -85,5 +86,5 @@ jobs:
       - name: Fail if ethrex benchmark failed
         if: always() && steps.ethrex_bench.outcome == 'failure'
         run: |
-          echo "::error::ethrex block benchmark step failed — see the 'Run ethrex block benchmarks' step logs"
+          echo "::error::ethrex block benchmark step failed - see the 'Run ethrex block benchmarks' step logs"
           exit 1

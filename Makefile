@@ -66,9 +66,11 @@ RV64_TARGET_SPEC=$(CURDIR)/executor/programs/riscv64im-lambda-vm-elf.json
 .PHONY: test prepare-test-data prepare-sysroot
 
 prepare-test-data:
-	@if [ ! -f "$(ETHREX_FILE)" ]; then \
+	@set -e; \
+	if [ ! -f "$(ETHREX_FILE)" ]; then \
 		echo "Downloading ethrex_hoodi.bin..."; \
-		curl -L "$(ETHREX_URL)" -o "$(ETHREX_FILE)"; \
+		curl -fL --proto '=https' "$(ETHREX_URL)" -o "$(ETHREX_FILE)" \
+			|| { rm -f "$(ETHREX_FILE)"; exit 1; }; \
 	else \
 		echo "ethrex_hoodi.bin already exists"; \
 	fi
@@ -83,31 +85,32 @@ prepare-test-data:
 # especially via the sudo fallback. This is typo/misconfig prevention, NOT a security
 # boundary — a caller that controls SYSROOT_DIR can still point it at any */lambda-vm-sysroot.
 prepare-sysroot:
-	@if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
+	@set -e; \
+	if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
 	else \
 		case "$$(basename "$(SYSROOT_DIR)")" in \
 			lambda-vm-sysroot|.lambda-vm-sysroot) : ;; \
-			*) echo "prepare-sysroot: refusing to (sudo) rm -rf SYSROOT_DIR=$(SYSROOT_DIR) — expected a path ending in lambda-vm-sysroot or .lambda-vm-sysroot"; exit 1 ;; \
+			*) echo "prepare-sysroot: refusing to (sudo) rm -rf SYSROOT_DIR=$(SYSROOT_DIR) - expected a path ending in lambda-vm-sysroot or .lambda-vm-sysroot"; exit 1 ;; \
 		esac; \
 		echo "Provisioning sysroot at $(SYSROOT_DIR) (downloading lambda-vm-sysroot-rv64im.tar.gz)..."; \
-		curl -fL "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)"; \
+		rm -f "$(SYSROOT_TARBALL)"; \
+		curl -fL --proto '=https' "$(SYSROOT_URL)" -o "$(SYSROOT_TARBALL)" \
+			|| { rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
 		echo "Extracting sysroot to $(SYSROOT_DIR)..."; \
 		if mkdir -p "$(SYSROOT_DIR)" 2>/dev/null && [ -w "$(SYSROOT_DIR)" ]; then \
 			rm -rf "$(SYSROOT_DIR)" && mkdir -p "$(SYSROOT_DIR)" \
-				&& tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
+				&& tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
 				|| { rm -rf "$(SYSROOT_DIR)" "$(SYSROOT_TARBALL)"; exit 1; }; \
 		else \
 			echo "$(SYSROOT_DIR) is not writable; using sudo."; \
 			echo "Tip: re-run with SYSROOT_DIR=\$$HOME/.lambda-vm-sysroot to avoid sudo."; \
 			sudo rm -rf "$(SYSROOT_DIR)" && sudo mkdir -p "$(SYSROOT_DIR)" \
-				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 \
+				&& sudo tar -xzf "$(SYSROOT_TARBALL)" -C "$(SYSROOT_DIR)" --strip-components=1 --no-same-owner \
 				|| { sudo rm -rf "$(SYSROOT_DIR)"; rm -f "$(SYSROOT_TARBALL)"; exit 1; }; \
 		fi; \
-		rm "$(SYSROOT_TARBALL)"; \
+		rm -f "$(SYSROOT_TARBALL)"; \
 	fi
-# Note: the tarball rm above only runs on success — each error handler
-# cleans up the tarball itself before `exit 1`.
 
 compile-programs-asm:
 	@mkdir -p $(ASM_ARTIFACTS_DIR)

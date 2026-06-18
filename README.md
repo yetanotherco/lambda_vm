@@ -50,8 +50,8 @@ Some of the tests require linking with C libraries.
 The easiest way is to let `make` do it:
 
 ```sh
+SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # recommended: user-writable, no sudo
 make prepare-sysroot                                       # installs to /opt (uses sudo)
-SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # user-writable, no sudo
 ```
 
 Or do it manually:
