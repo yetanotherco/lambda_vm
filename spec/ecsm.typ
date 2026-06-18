@@ -306,6 +306,8 @@ $#`carry_offsets` = (32636, 8161, 16320)$
 - `addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than `HL`s.
   We use `HL`s as conventient notation.
   This modification saves 6 columns.
+- the design of these chip is generic, and makes no assumptions on the parameters $b$, $p$ and $N$.
+  It might be possible to arrive at more compact design by making some assumptions on these values.
 
 = Discussing the carries <ecsm-limb_carry>
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
