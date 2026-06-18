@@ -6,6 +6,12 @@ on:
   pull_request:
     types: [labeled]
 
+# One review at a time per PR; a re-trigger cancels the in-flight run so rapid
+# re-labels/comments can't race and post duplicate report comments.
+concurrency:
+  group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   issues: write
@@ -190,7 +196,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
           LANE_ID: ${{ matrix.lane.id }}
@@ -374,7 +379,6 @@ jobs:
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          MOONSHOT_API_KEY: ${{ secrets.KIMI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
           LANE_ID: ${{ matrix.lane.id }}

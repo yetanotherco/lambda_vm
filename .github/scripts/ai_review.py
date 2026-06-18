@@ -13,7 +13,6 @@ import subprocess
 import sys
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from typing import Any
 
@@ -917,6 +916,17 @@ def openrouter_payload(lane: dict[str, Any], system: str, user: str) -> dict[str
     if reasoning is not None:
         payload["reasoning"] = reasoning
     return payload
+
+
+DEDUP_SYSTEM = (
+    "You de-duplicate code-review findings reported by several reviewers of the same PR. "
+    "You will get a JSON list of findings (id, file, line, title, claim). Group the ids that "
+    "describe the SAME underlying issue (same root cause and fix). Be CONSERVATIVE: only "
+    "group findings that are clearly the same issue; when in doubt do NOT group them. Two "
+    "DIFFERENT bugs that happen to sit on the same line are NOT the same issue. Reply with "
+    'ONLY this JSON and nothing else: {"groups": [["AI-001","AI-007"], ...]} listing only '
+    "groups containing more than one id. Findings not listed are treated as unique."
+)
 
 
 def llm_dedup_candidates(

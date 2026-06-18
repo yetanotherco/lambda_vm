@@ -503,6 +503,25 @@ class AiReviewSubmissionTests(unittest.TestCase):
         out = ai_review.apply_dedup_clusters(cands, [["AI-001"], ["AI-999", "AI-998"], "junk"])
         self.assertEqual([i["issue_id"] for i in out["issues"]], ["AI-001"])
 
+    def test_llm_dedup_candidates_uses_dedup_system_and_merges(self) -> None:
+        # Regression guard: DEDUP_SYSTEM must exist and the dedup must reach the model call
+        # and merge. A missing constant previously NameError'd and was silently swallowed,
+        # leaving the LLM dedup a no-op.
+        self.assertTrue(isinstance(ai_review.DEDUP_SYSTEM, str) and ai_review.DEDUP_SYSTEM)
+        cands = {"issues": [
+            {"issue_id": "AI-001", "severity": "low", "title": "x", "claim": "a", "found_by": ["m1"], "sources": []},
+            {"issue_id": "AI-002", "severity": "low", "title": "x", "claim": "a", "found_by": ["m2"], "sources": []},
+        ]}
+        orig = ai_review.openrouter_chat
+        ai_review.openrouter_chat = lambda lane, system, user, api_key: {
+            "status": "success", "raw_response": '{"groups": [["AI-001", "AI-002"]]}',
+        }
+        try:
+            out = ai_review.llm_dedup_candidates(cands, {"model": "openrouter/x/y"}, "key")
+        finally:
+            ai_review.openrouter_chat = orig
+        self.assertEqual(len(out["issues"]), 1)
+
     def test_parse_name_status_tolerates_malformed_rename(self) -> None:
         # A rename status with a missing field must not IndexError out of the whole review;
         # the well-formed line must still parse.
