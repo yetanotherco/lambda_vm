@@ -36,13 +36,18 @@ The keccak accelerator comprises two chips: a core chip that interacts with the 
 The #keccak chip is comprised of #nr_variables variables that are expressed using #nr_columns columns and leverages #nr_interactions interaction(s):
 #render_chip_variable_table(chip, config)
 
+== Assumptions
+To simplify the construction of `state_ptr`, it is assumed that adding $192$ to pointer `addr` will not lead to an overflow of its lower limb.
+Guest programs breaking this assumption cannot be proven correct.
+#render_chip_assumptions(chip, config)
+
 == Constraints
 In this VM, we assign syscall number -2 to the #keccak accelerator.
 The chip therefore contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "output")
 
 The address containing the state to be permuted is passed in as argument `A0 = x10`.
-The following constraints describe that this address is read into `addr` (@keccak:c:read_addr), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr).
+The following constraints describe that this address is read into `addr` (@keccak:c:read_addr), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is constructed.
 The state is then read into `input_state`, while the `output_state` is written back to the indicated address (@keccak:c:load_store_state).
 #render_constraint_table(chip, config, groups: "mem")
 
