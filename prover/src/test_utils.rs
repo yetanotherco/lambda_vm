@@ -58,6 +58,11 @@ use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
+use crate::tables::ec_scalar::{
+    bus_interactions as ec_scalar_bus_interactions, cols as ec_scalar_cols,
+};
+use crate::tables::ecdas::{bus_interactions as ecdas_bus_interactions, cols as ecdas_cols};
+use crate::tables::ecsm::{bus_interactions as ecsm_bus_interactions, cols as ecsm_cols};
 use crate::tables::eq::{bus_interactions as eq_bus_interactions, cols as eq_cols, eq_constraints};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
@@ -1039,4 +1044,52 @@ pub fn create_keccak_rc_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("KECCAK_RC")
+}
+
+/// Create ECSM core AIR (secp256k1 scalar-multiplication orchestrator).
+pub fn create_ecsm_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = crate::tables::ecsm::create_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: ecsm_bus_interactions(),
+    };
+    AirWithBuses::new(
+        ecsm_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("ECSM")
+}
+
+/// Create EC_SCALAR AIR (serves the scalar bit-by-bit to ECDAS).
+pub fn create_ec_scalar_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = crate::tables::ec_scalar::create_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: ec_scalar_bus_interactions(),
+    };
+    AirWithBuses::new(
+        ec_scalar_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("EC_SCALAR")
+}
+
+/// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).
+pub fn create_ecdas_air(proof_options: &ProofOptions) -> VmAir {
+    let (transition_constraints, _) = crate::tables::ecdas::create_constraints(0);
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: ecdas_bus_interactions(),
+    };
+    AirWithBuses::new(
+        ecdas_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("ECDAS")
 }

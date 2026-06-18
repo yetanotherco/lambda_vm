@@ -31,6 +31,12 @@ pub mod disk_spill_tests;
 #[cfg(test)]
 pub mod dvrm_tests;
 #[cfg(test)]
+pub mod ec_scalar_tests;
+#[cfg(test)]
+pub mod ecdas_tests;
+#[cfg(test)]
+pub mod ecsm_tests;
+#[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
