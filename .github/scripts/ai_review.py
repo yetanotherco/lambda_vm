@@ -246,8 +246,11 @@ def cmd_context(args: argparse.Namespace) -> int:
     per_file = args.max_file_chars // max(1, len(non_deleted))
     for changed in non_deleted:
         path = changed["path"]
+        # For a rename/copy the file lives under old_path at the base ref, so fetch base
+        # content from there — otherwise the base side is silently empty for renamed files.
+        base_path = changed.get("old_path") or path
         head_content, head_truncated = git_file_text(repo, head, path, per_file // 2)
-        base_content, base_truncated = git_file_text(repo, base, path, per_file // 2)
+        base_content, base_truncated = git_file_text(repo, base, base_path, per_file // 2)
         if head_content is None and base_content is None:
             continue
         file_context.append(
