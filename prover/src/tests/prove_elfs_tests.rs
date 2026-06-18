@@ -1075,6 +1075,176 @@ fn test_prove_elfs_keccak_multi_call() {
     );
 }
 
+#[test]
+fn test_prove_elfs_ecsm() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // The guest computes 5·G and commits the 32-byte x-coordinate; cross-check it against
+    // the reference scalar multiplication. Gx, little-endian:
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    let expected_xr = ecsm::scalar_mul_x(&k, &gx).unwrap();
+    assert_eq!(
+        result.return_values.memory_values,
+        expected_xr.to_vec(),
+        "committed xR must equal x(5G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM prove/verify failed"
+    );
+}
+
+#[test]
+fn test_prove_elfs_ecsm_multi() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm_multi");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+
+    // Gx little-endian.
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+
+    // The guest commits x(1·G) || x(5·G) || x(0xABCDEF·G); cross-check each 32-byte chunk.
+    // k=1 exercises the zero-ECDAS-steps edge; 0xABCDEF exercises many doubles + adds.
+    let mut expected = Vec::new();
+    for kv in [1u64, 5, 0xABCDEF] {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&kv.to_le_bytes());
+        expected.extend_from_slice(&ecsm::scalar_mul_x(&k, &gx).unwrap());
+    }
+    assert_eq!(
+        result.return_values.memory_values, expected,
+        "committed outputs must equal x(1G) || x(5G) || x(0xABCDEF·G)"
+    );
+
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "ECSM multi-call prove/verify failed"
+    );
+}
+
+/// End-to-end via the **Rust-guest path**: the `syscalls::ecsm_mul` wrapper computes 5·G and
+/// commits its x-coordinate. Verifies the wrapper works end-to-end (parity with the asm guest).
+#[test]
+fn test_prove_ecsm_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes = std::fs::read(workspace_root.join("executor/program_artifacts/rust/ecsm.elf"))
+        .expect("ecsm.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "ecsm rust guest should verify"
+    );
+
+    // Committed output must equal x(5·G).
+    let mut gx = [
+        0x79u8, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B,
+        0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8,
+        0x17, 0x98,
+    ];
+    gx.reverse();
+    let mut k = [0u8; 32];
+    k[0] = 5;
+    assert_eq!(
+        proof.public_output,
+        ecsm::scalar_mul_x(&k, &gx).unwrap().to_vec()
+    );
+}
+
+/// Soundness: the verifier REJECTS a forged ECSM result.
+///
+/// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
+/// x-coordinate `xR` in the ECSM trace (to a different valid byte). `xR` is bound by the
+/// final ECDAS-bus tuple (the constrained double-and-add output) and by the `xR < p`
+/// carry-chain check, so the forgery unbalances the buses / breaks the constraints and the
+/// proof must fail to verify.
+#[test]
+fn test_prove_elfs_ecsm_forged_result_rejected() {
+    use crate::tables::ecsm::cols as ecsm_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of xR on the (single) real ECSM row.
+    let orig = *traces.ecsm.main_table.get(0, ecsm_cols::xr(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.ecsm.main_table.set(0, ecsm_cols::xr(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged ECSM result xR"
+    );
+}
+
+/// Regression test: `µ` is the multiplicity of every ECDAS bus interaction, so it must remain
+/// boolean. Forge a non-boolean `µ` on a real ECDAS row and assert the verifier rejects.
+/// (k=5 produces 3 ECDAS rows.)
+#[test]
+fn test_prove_elfs_ecsm_forged_ecdas_mu_rejected() {
+    use crate::tables::ecdas::cols as ecdas_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_ecsm");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor =
+        executor::vm::execution::Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Row 0 is a real ECDAS step (µ=1); forge µ to a non-boolean value.
+    traces.ecdas.main_table.set(
+        0,
+        ecdas_cols::MU,
+        FieldElement::<GoldilocksField>::from(2u64),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a non-boolean ECDAS multiplicity"
+    );
+}
+
 /// Verifier REJECTS a forged trace where an addr byte cell is set to a
 /// non-byte field element.
 ///
@@ -2260,7 +2430,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
     let airs = VmAirs::new(&elf, &proof_options, true, &[], &zero_counts, None, None);
 
     let verifier_air_refs = airs.air_refs();
-    assert_eq!(verifier_air_refs.len(), 8);
+    assert_eq!(verifier_air_refs.len(), crate::FIXED_TABLE_COUNT);
 
     let mut bitwise_trace = crate::tables::bitwise::generate_bitwise_trace();
 

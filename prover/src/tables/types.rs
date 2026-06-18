@@ -128,6 +128,18 @@ pub enum BusId {
     /// CPU → CPU32 delegation of word (`*W`) instructions:
     /// `CPU32[timestamp, pc, instruction_length]`.
     Cpu32 = 27,
+
+    // =========================================================================
+    // EC scalar multiplication accelerator (ECSM / ECDAS / EC_SCALAR)
+    // =========================================================================
+    /// ECDAS self-referential double/add sequence bus:
+    /// (timestamp, xA, yA, xG, yG, round, op). ECSM seeds and drains it.
+    Ecdas = 28,
+    /// EC_SCALAR self-referential scalar-byte server bus: (timestamp, ptr, offset).
+    ServeK = 29,
+    /// Scalar-bit bus: EC_SCALAR sends one per set bit (timestamp, bit_index);
+    /// ECDAS receives one per add, ECSM receives the MSB.
+    Bit = 30,
 }
 
 impl BusId {
@@ -154,6 +166,9 @@ impl BusId {
             BusId::Alu => "Alu",
             BusId::MemoryOp => "MemoryOp",
             BusId::Cpu32 => "Cpu32",
+            BusId::Ecdas => "Ecdas",
+            BusId::ServeK => "ServeK",
+            BusId::Bit => "Bit",
         }
     }
 }
@@ -183,6 +198,9 @@ impl TryFrom<u64> for BusId {
             25 => Ok(BusId::Alu),
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
+            28 => Ok(BusId::Ecdas),
+            29 => Ok(BusId::ServeK),
+            30 => Ok(BusId::Bit),
             other => Err(other),
         }
     }
