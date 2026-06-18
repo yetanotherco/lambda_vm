@@ -457,7 +457,6 @@ PROVIDER_KEYS = {
     "minimax/": "MINIMAX_API_KEY",
     "anthropic/": "ANTHROPIC_API_KEY",
     "openai/": "OPENAI_API_KEY",
-    "moonshotai/": "MOONSHOT_API_KEY",
 }
 
 
@@ -1139,6 +1138,16 @@ def render_report(
     if context.get("diff_truncated"):
         lines.append("")
         lines.append("> Warning: the diff was truncated before review.")
+
+    # Don't let a total reviewer outage read as a clean PR: if there were review lanes
+    # but none succeeded, say so loudly rather than implying "no issues found".
+    review_lanes = [r for r in lane_results if r.get("kind") == "review"]
+    if review_lanes and not any(r.get("status") == "success" for r in review_lanes):
+        lines.append("")
+        lines.append(
+            f"> **⚠️ All {len(review_lanes)} reviewers failed** (see Reviewer Lanes below) — "
+            "this is NOT a clean result; the review did not run."
+        )
 
     lines.extend(["", "### Findings", ""])
     if visible_issues:

@@ -12,12 +12,11 @@ concurrency:
   group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
   cancel-in-progress: true
 
-# Default least-privilege for the internal jobs. id-token (OIDC) is granted only to
-# the native Claude job that actually needs it, not workflow-wide.
+# Default least-privilege: read-only. Only the jobs that need to write (final-report
+# posts the comment; the native reviews) request write/id-token at the job level.
 permissions:
   contents: read
-  issues: write
-  pull-requests: write
+  pull-requests: read
 
 jobs:
   prepare:
@@ -423,6 +422,10 @@ jobs:
       (github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
     steps:
       - name: Checkout review runner
         uses: actions/checkout@v4
