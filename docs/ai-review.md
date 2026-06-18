@@ -111,7 +111,7 @@ not free-text JSON:
 The tool writes the validated result to `$AI_REVIEW_OUT`, which the orchestrator
 reads back. Flow: **finders → heuristic + LLM dedup → verifier → report**. The
 matrix (`.github/ai-review/matrix.json`) holds the single flow's `review_lanes`,
-`verifier_lanes`, and a `deduper` (keyed `critical` for backward compatibility).
+`verifier_lanes`, and a `deduper` (flat — there is no tier key).
 Each lane is `{id, model, prompt, variant}`; `variant` is opencode's reasoning
 effort (see "Reasoning effort" below).
 
@@ -306,7 +306,7 @@ ai-review-candidates-<pr-number>/
   model-metrics.json
 ai-review-verification-<lane-id>/
   <lane-id>.json
-ai-review-final-<tier>-<pr-number>/
+ai-review-final-<pr-number>/
   final-issues.json
   model-metrics.json
   report.md
