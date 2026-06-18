@@ -165,7 +165,11 @@ jobs:
 
       - name: Install opencode and JSON repair
         run: |
-          python3 -m pip install --quiet json-repair
+          # Pin json-repair with hashes (it is imported in this secret-bearing step,
+          # so an unpinned/hijacked release could run import-time code with the keys).
+          # pip only honors --hash inside a requirements file with --require-hashes.
+          printf '%s\n' 'json-repair==0.61.0 --hash=sha256:ee9fe5f95fcb2713d72d4495b67b794b62ff2cd24d6dba3bfb3173d9f7ab0f7d --hash=sha256:48759cc6c3052814c797d1d56787d9e1d451603a8760a55d619e97d2f49353d6' > /tmp/json-repair-req.txt
+          python3 -m pip install --quiet --require-hashes -r /tmp/json-repair-req.txt
           # Pin a known-good version AND verify the installer script itself —
           # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
           # that holds the provider secrets). Fail closed if the script changes.
@@ -345,7 +349,11 @@ jobs:
 
       - name: Install opencode and JSON repair
         run: |
-          python3 -m pip install --quiet json-repair
+          # Pin json-repair with hashes (it is imported in this secret-bearing step,
+          # so an unpinned/hijacked release could run import-time code with the keys).
+          # pip only honors --hash inside a requirements file with --require-hashes.
+          printf '%s\n' 'json-repair==0.61.0 --hash=sha256:ee9fe5f95fcb2713d72d4495b67b794b62ff2cd24d6dba3bfb3173d9f7ab0f7d --hash=sha256:48759cc6c3052814c797d1d56787d9e1d451603a8760a55d619e97d2f49353d6' > /tmp/json-repair-req.txt
+          python3 -m pip install --quiet --require-hashes -r /tmp/json-repair-req.txt
           # Pin a known-good version AND verify the installer script itself —
           # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
           # that holds the provider secrets). Fail closed if the script changes.

@@ -1231,7 +1231,7 @@ def render_report(
                 "",
                 f"- Status: `{issue['status']}`",
                 f"- Severity: `{issue['severity']}`",
-                f"- Location: `{format_location(issue)}`",
+                f"- Location: `{format_location_code(issue)}`",
                 f"- Found by: `{', '.join(issue.get('found_by', []))}`",
                 f"- Verified by: `{', '.join(issue.get('verified_by', [])) or '-'}`",
                 f"- Rejected by: `{', '.join(issue.get('rejected_by', [])) or '-'}`",
@@ -1303,7 +1303,7 @@ def render_report(
             title = issue.get("title") or issue.get("claim") or issue["issue_id"]
             found = md_escape(", ".join(issue.get("found_by", [])))
             lines.append(
-                f"- **{md_escape(title)}** (`{format_location(issue)}`"
+                f"- **{md_escape(title)}** (`{format_location_code(issue)}`"
                 + (f", found by {found}" if found else "")
                 + f") — {md_escape(reason.strip()) or 'no reason recorded'}"
             )
@@ -1691,6 +1691,13 @@ def format_location(issue: dict[str, Any]) -> str:
     line = issue.get("line")
     # Models use line 0 / null for "whole file or unknown line"; don't render "file:0".
     return f"{file}:{line}" if line else file
+
+
+def format_location_code(issue: dict[str, Any]) -> str:
+    # `file` is model/tool-supplied; strip backticks/newlines so it cannot break out
+    # of the markdown `code span` it is rendered in. (HTML is already literal inside a
+    # code span, so no entity-escaping is needed here.)
+    return format_location(issue).replace("`", "").replace("\n", " ")
 
 
 def html_escape(text: str) -> str:
