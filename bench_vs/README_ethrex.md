@@ -10,8 +10,8 @@ different block inputs:
 | 1 transaction (plain ETH transfer) | `executor/tests/ethrex_simple_tx.bin` | ~4.4M |
 
 Each input is a serialized `ProgramInput` (the block + its execution witness,
-rkyv-encoded) for the ethrex commit pinned in
-`executor/programs/rust/ethrex/Cargo.lock`. The guest reads it via
+rkyv-encoded) for the ethrex commit pinned (as `rev`) in
+`executor/programs/rust/ethrex/Cargo.toml`. The guest reads it via
 `get_private_input()` and runs ethrex's `execution_program`.
 
 The timing window is **single-shot end-to-end prove** (ELF load + execution +
@@ -90,7 +90,7 @@ What the build needs:
   `rust-src` (the Makefile pins it; builds the guest via `-Z build-std`).
 - **clang + lld** for ethrex's C dependencies.
 - **Network**, the first time: cargo fetches `guest_program` from
-  `github.com/lambdaclass/ethrex.git` (commit pinned in the guest `Cargo.lock`).
+  `github.com/lambdaclass/ethrex.git` (commit pinned as `rev` in the guest `Cargo.toml`).
 - **`SYSROOT_DIR` must match** between `prepare-sysroot` and the build.
 
 The guest source is `executor/programs/rust/ethrex/` (an 11-line `main.rs` that

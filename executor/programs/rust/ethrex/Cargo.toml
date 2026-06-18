@@ -7,10 +7,13 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
-# Pinned to the open LambdaVM-backend PR branch (feat/lambdavm-prover-backend)
-# until it merges to ethrex `main`; then re-pin to the merge commit. The
-# `lambdavm` feature provides `crypto::lambdavm::LambdaVmCrypto` (keccak via our
-# precompile syscall, the rest via pure-Rust crates incl. kzg-rs).
+# Pinned by immutable `rev` to a commit on the open LambdaVM-backend PR branch
+# (feat/lambdavm-prover-backend) of ethrex; re-pin to the merge commit once it
+# lands on ethrex `main`. The `lambdavm` feature provides
+# `crypto::lambdavm::LambdaVmCrypto` (keccak via our precompile syscall; ECDSA
+# and BN254 via pure-Rust crates). KZG is NOT linked under this feature (no
+# kzg-rs/c-kzg in the guest Cargo.lock), so the point-evaluation precompile
+# (0x0a) is unsupported — see src/main.rs.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
 # executor test reader so the rkyv ProgramInput layout stays consistent.

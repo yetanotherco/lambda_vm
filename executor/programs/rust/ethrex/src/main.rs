@@ -12,7 +12,10 @@ pub fn main() {
     // `ethrex_crypto::keccak::keccak_hash` fn, which still runs software keccak on
     // riscv64, so the precompile only covers trait-routed keccak today. ECDSA and
     // BN254 use pure-Rust crates; KZG is unimplemented under the `lambdavm`
-    // feature, so blob (EIP-4844) transactions are not supported.
+    // feature: blob (EIP-4844) transactions still execute (stateless block
+    // execution does not verify blob proofs), but a contract call to the
+    // point-evaluation precompile (0x0a) fails closed (reverts) instead of
+    // returning a result.
     let crypto = Arc::new(LambdaVmCrypto);
     let output = execution_program(input, crypto).unwrap();
     lambda_vm_syscalls::syscalls::commit(&output.encode());
