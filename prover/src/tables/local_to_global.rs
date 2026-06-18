@@ -7,6 +7,24 @@
 //! access timestamp). A final LogUp matches each `fini` against the `init` of the
 //! next epoch that touches the same cell, proving global memory consistency.
 //!
+//! ## Epoch labels
+//!
+//! Epochs are labelled 1-based (epoch index `i` → label `i+1`) and the genesis
+//! sentinel is `0` ([`GENESIS_EPOCH`]). This makes "the originating epoch is
+//! strictly earlier" a plain `init_epoch < fini_epoch` — genesis (`0`) is below
+//! every real epoch, so it needs no special case.
+//!
+//! ## Ordering constraint
+//!
+//! The GlobalMemory LogUp only proves the init/fini tokens *match as a set*; it
+//! does not by itself force the chain to be consumed in increasing-epoch order.
+//! Without that, a prover could let an init consume a *later* epoch's fini (a
+//! backward/self edge), seeding a cell with an unjustified value. So each real
+//! row also proves `init_epoch < fini_epoch` via an `IsB20` lookup on
+//! `fini_epoch − 1 − init_epoch` (it must be a valid 20-bit value). This bounds
+//! the number of epochs to `< 2^20` (~1M) — unreachable in practice (optimal
+//! epochs are millions of cycles, so thousands of epochs) and fails closed.
+//!
 //! ## Range-checked columns
 //!
 //! A column needs an explicit range check only if nothing else already pins it.
@@ -15,18 +33,27 @@
 //! exactly how PAGE relies on MEMW in the monolithic prover. So `address` and
 //! `fini_timestamp` are plain 32-bit columns with no extra check, and the value
 //! bytes get the same batched `AreBytes` check PAGE uses (the `init` value is a
-//! trusted source, so it must be checked).
+//! trusted source, so it must be checked). `fini_epoch` is the same constant for
+//! every row of an epoch's table, so it is supplied as a per-table constant (not
+//! a column) by [`bus_interactions`].
 //!
 //! The columns that live ONLY on the cross-epoch `GlobalMemory` bus have no MEMW
-//! partner: `init_epoch`, `fini_epoch`, and `init_timestamp` (the epoch-local
-//! `init` token is seeded at timestamp 0, so `init_timestamp` never reaches the
-//! Memory bus). These are the ones that genuinely need range-checking, so they
-//! are stored as 16-bit halfword columns, each checked via `IsHalfword`, and the
-//! 32-bit value the bus matches on is rebuilt from them by a linear combination
-//! (see [`word`]) — a prover cannot smuggle a non-canonical value past the
-//! lookup. The checks are emitted on the epoch-local table (which has the BITWISE
-//! provider); the global proof commits the identical trace (the commitment
-//! binding compares their roots), so it inherits the same guarantee.
+//! partner: `init_epoch` and `init_timestamp` (the epoch-local `init` token is
+//! seeded at timestamp 0, so `init_timestamp` never reaches the Memory bus).
+//! These are stored as 16-bit halfword columns, each checked via `IsHalfword`,
+//! and the 32-bit value the bus matches on is rebuilt from them by a linear
+//! combination (see [`word`]). The checks are emitted on the epoch-local table
+//! (which has the BITWISE provider); the global proof commits the identical
+//! trace (the commitment binding compares their roots), so it inherits the same
+//! guarantee.
+//!
+//! ## Padding
+//!
+//! Real rows carry `MU = 1`; the power-of-two padding rows carry `MU = 0`. Every
+//! interaction uses `Multiplicity::Column(MU)`, so padding rows fire nothing —
+//! we never rely on token self-cancellation (this is the standard pattern used
+//! by every variable-length table). `MU` is self-enforced: dropping a real row
+//! (`MU = 0`) breaks its telescoping link → bus imbalance.
 
 use std::collections::HashMap;
 
@@ -42,8 +69,9 @@ use crate::paged_mem::PagedMem;
 type Provenance = PagedMem<(u64, u64, u64)>;
 
 /// Sentinel `originating_epoch` for cells whose value comes from the program's
-/// initial memory — no prior epoch wrote them.
-pub const GENESIS_EPOCH: u64 = u64::MAX;
+/// initial memory — no prior epoch wrote them. Chosen as `0`, below every real
+/// (1-based) epoch label, so `init_epoch < fini_epoch` holds for genesis cells.
+pub const GENESIS_EPOCH: u64 = 0;
 
 /// A cell's state when an epoch first touches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,7 +89,7 @@ pub struct InitClaim {
 pub struct FiniClaim {
     /// Value the cell holds at this epoch's end.
     pub value: u64,
-    /// This epoch's index.
+    /// This epoch's label (1-based).
     pub epoch: u64,
     /// Last access timestamp for the cell this epoch.
     pub timestamp: u64,
@@ -78,6 +106,11 @@ pub struct CellBoundary {
 /// One epoch's touched cells, each as `(address, end_value, end_timestamp)`.
 pub type EpochTouches = Vec<(u64, u64, u64)>;
 
+/// Convert a 0-based epoch index into its 1-based table label.
+pub fn epoch_label(epoch_index: u64) -> u64 {
+    epoch_index + 1
+}
+
 /// Compute the sparse per-epoch boundary claims.
 ///
 /// `initial_memory` maps each address to its program-start value (originating
@@ -85,7 +118,7 @@ pub type EpochTouches = Vec<(u64, u64, u64)>;
 /// epoch `e` with their end value and end timestamp. Returns, per epoch, the
 /// boundary claims for exactly the cells that epoch touched (sparse): each
 /// cell's `init` is taken from the previous epoch that wrote it, and its `fini`
-/// records this epoch as the new writer.
+/// records this epoch (1-based label) as the new writer.
 pub fn epoch_boundaries(
     initial_memory: &HashMap<u64, u64>,
     epochs: &[EpochTouches],
@@ -95,15 +128,20 @@ pub fn epoch_boundaries(
 
     let mut result = Vec::with_capacity(epochs.len());
     for (epoch, touched) in epochs.iter().enumerate() {
-        result.push(epoch_boundary(&mut provenance, epoch as u64, touched));
+        result.push(epoch_boundary(
+            &mut provenance,
+            epoch_label(epoch as u64),
+            touched,
+        ));
     }
     result
 }
 
 /// One epoch's boundaries, taking `init` from the running `provenance` (the cell's
-/// last writer) and updating `provenance` with this epoch's `fini`. This is the
-/// per-epoch step of [`epoch_boundaries`], exposed so the streaming continuation
-/// prover can build each epoch's table incrementally without all epochs at once.
+/// last writer) and updating `provenance` with this epoch's `fini`. `epoch` is the
+/// 1-based label. This is the per-epoch step of [`epoch_boundaries`], exposed so
+/// the streaming continuation prover can build each epoch's table incrementally
+/// without all epochs at once.
 pub fn epoch_boundary(
     provenance: &mut Provenance,
     epoch: u64,
@@ -146,13 +184,12 @@ pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> Provenance {
 
 /// Column indices for the local-to-global table: one row per touched cell.
 ///
-/// `address` and `fini_timestamp` are plain 32-bit columns: they travel on the
-/// epoch-local `Memory` bus and are matched against MEMW, which already range-
-/// checks them (exactly how PAGE relies on MEMW). The cross-epoch-only quantities
-/// — `init_epoch`, `init_timestamp`, `fini_epoch` — have no such partner, so they
-/// are stored as 16-bit halfword columns ([`RANGE_CHECKED_HALFWORDS`]) checked via
-/// `IsHalfword`, and rebuilt into their 32-bit bus value by a linear combination
-/// (see [`word`]). The two value bytes get PAGE's batched `AreBytes` check.
+/// `address` and `fini_timestamp` are plain 32-bit columns (matched on the Memory
+/// bus against MEMW). The cross-epoch-only quantities `init_epoch` and
+/// `init_timestamp` are stored as 16-bit halfword columns ([`RANGE_CHECKED_HALFWORDS`])
+/// checked via `IsHalfword` and rebuilt into their 32-bit bus value via [`word`].
+/// The value bytes get the batched `AreBytes` check. `fini_epoch` is a per-table
+/// constant (not a column). `MU` is the real-row selector / multiplicity.
 pub mod cols {
     /// address_lo: 32-bit; matched on the Memory bus against MEMW.
     pub const ADDRESS_LO: usize = 0;
@@ -162,14 +199,13 @@ pub mod cols {
     /// Init value: a single byte, like PAGE's `value`.
     pub const INIT_VALUE: usize = 2;
 
-    // Init epoch — GlobalMemory-bus only, so range-checked: two halfwords
-    // (`init_epoch = INIT_EPOCH_0 + 2^16·INIT_EPOCH_1`). Fits 32 bits;
-    // `GENESIS_EPOCH` reduces to `2^32-2`.
+    // Init epoch — GlobalMemory-bus only, range-checked: two halfwords
+    // (`init_epoch = INIT_EPOCH_0 + 2^16·INIT_EPOCH_1`).
     pub const INIT_EPOCH_0: usize = 3;
     pub const INIT_EPOCH_1: usize = 4;
 
     // Init timestamp — GlobalMemory-bus only (the Memory-bus init token is seeded
-    // at ts=0), so range-checked: four halfwords (`ts_lo = T0 + 2^16·T1`, etc.).
+    // at ts=0), range-checked: four halfwords (`ts_lo = T0 + 2^16·T1`, etc.).
     pub const INIT_TS_0: usize = 5;
     pub const INIT_TS_1: usize = 6;
     pub const INIT_TS_2: usize = 7;
@@ -178,29 +214,25 @@ pub mod cols {
     /// Fini value: a single byte.
     pub const FINI_VALUE: usize = 9;
 
-    // Fini epoch — GlobalMemory-bus only, so range-checked: two halfwords.
-    pub const FINI_EPOCH_0: usize = 10;
-    pub const FINI_EPOCH_1: usize = 11;
-
     /// fini_timestamp_lo: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_LO: usize = 12;
+    pub const FINI_TIMESTAMP_LO: usize = 10;
     /// fini_timestamp_hi: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_HI: usize = 13;
+    pub const FINI_TIMESTAMP_HI: usize = 11;
 
-    pub const NUM_COLUMNS: usize = 14;
+    /// MU: real-row selector / LogUp multiplicity (1 on real rows, 0 on padding).
+    pub const MU: usize = 12;
+
+    pub const NUM_COLUMNS: usize = 13;
 
     /// The halfword columns (cross-epoch-only quantities), in order — every column
-    /// that is `IsHalfword`-checked. `address`/`fini_timestamp` are deliberately
-    /// absent: MEMW already constrains them on the Memory bus.
-    pub const RANGE_CHECKED_HALFWORDS: [usize; 8] = [
+    /// that is `IsHalfword`-checked.
+    pub const RANGE_CHECKED_HALFWORDS: [usize; 6] = [
         INIT_EPOCH_0,
         INIT_EPOCH_1,
         INIT_TS_0,
         INIT_TS_1,
         INIT_TS_2,
         INIT_TS_3,
-        FINI_EPOCH_0,
-        FINI_EPOCH_1,
     ];
 }
 
@@ -214,25 +246,11 @@ fn halfwords64(v: u64) -> [u64; 4] {
     ]
 }
 
-/// Canonical 32-bit field value of an epoch index, matching `FE::from(epoch)`.
-///
-/// Real epoch indices are small (< 2^32) and map to themselves; the genesis
-/// sentinel [`GENESIS_EPOCH`] (`u64::MAX`) reduces to `2^32 - 2` modulo the
-/// Goldilocks prime, which is exactly what `global_memory` emits via
-/// `FE::from(GENESIS_EPOCH)`, so the two sides match on the bus.
-fn epoch_field_low32(epoch: u64) -> u64 {
-    if epoch == GENESIS_EPOCH {
-        (1 << 32) - 2
-    } else {
-        debug_assert!(epoch < (1 << 32), "epoch index exceeds 32 bits");
-        epoch
-    }
-}
-
-/// The two halfwords of an epoch index (its canonical 32-bit field value).
+/// The two halfwords of an epoch label (genesis `0` or a small 1-based index, all
+/// well under 2^32).
 fn epoch_halfwords(epoch: u64) -> [u64; 2] {
-    let v = epoch_field_low32(epoch);
-    [v & 0xFFFF, (v >> 16) & 0xFFFF]
+    debug_assert!(epoch < (1 << 32), "epoch label exceeds 32 bits");
+    [epoch & 0xFFFF, (epoch >> 16) & 0xFFFF]
 }
 
 // =========================================================================
@@ -240,7 +258,8 @@ fn epoch_halfwords(epoch: u64) -> [u64; 2] {
 // =========================================================================
 
 /// Build the local-to-global trace: one row per touched cell's boundary claims,
-/// padded up to a power of two (padding rows are all zero).
+/// padded up to a power of two. Real rows set `MU = 1`; padding rows stay all-zero
+/// (`MU = 0`), so they fire no interactions.
 pub fn generate_local_to_global_trace(
     boundaries: &[CellBoundary],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -251,7 +270,6 @@ pub fn generate_local_to_global_trace(
         let base = row * cols::NUM_COLUMNS;
         let init_ts = halfwords64(b.init.timestamp);
         let init_epoch = epoch_halfwords(b.init.originating_epoch);
-        let fini_epoch = epoch_halfwords(b.fini.epoch);
 
         // Plain 32-bit columns (MEMW-checked on the Memory bus).
         data[base + cols::ADDRESS_LO] = FE::from(b.address & 0xFFFF_FFFF);
@@ -268,8 +286,8 @@ pub fn generate_local_to_global_trace(
         data[base + cols::INIT_TS_1] = FE::from(init_ts[1]);
         data[base + cols::INIT_TS_2] = FE::from(init_ts[2]);
         data[base + cols::INIT_TS_3] = FE::from(init_ts[3]);
-        data[base + cols::FINI_EPOCH_0] = FE::from(fini_epoch[0]);
-        data[base + cols::FINI_EPOCH_1] = FE::from(fini_epoch[1]);
+        // Real-row selector.
+        data[base + cols::MU] = FE::one();
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -301,25 +319,29 @@ fn direct(column: usize) -> BusValue {
     }
 }
 
+fn mu() -> Multiplicity {
+    Multiplicity::Column(cols::MU)
+}
+
 /// Cross-epoch memory bus interactions, two per row (one touched cell):
 /// - **receive** the `init` token `(address, value, originating_epoch, timestamp)`
 ///   left by the epoch that last wrote the cell;
-/// - **send** the `fini` token `(address, value, current_epoch, timestamp)` for
-///   the next epoch that touches the cell.
+/// - **send** the `fini` token `(address, value, epoch_label, timestamp)` for the
+///   next epoch that touches the cell.
 ///
-/// `epoch` and `init` timestamp come from the range-checked halfword columns via
-/// [`word`]; `address` and `fini` timestamp are direct 32-bit columns.
+/// `fini_epoch` is the per-table constant `epoch_label`; `init_epoch` and `init`
+/// timestamp come from the range-checked halfword columns via [`word`]; `address`
+/// and `fini` timestamp are direct 32-bit columns.
 ///
 /// These tokens are matched ACROSS epochs by the final aggregation LogUp (step 4),
 /// so within a single epoch's table the GlobalMemory bus is deliberately
-/// unbalanced (real rows have `init != fini`). All-zero padding rows self-cancel
-/// because their init and fini tokens are identical.
-pub fn bus_interactions() -> Vec<BusInteraction> {
+/// unbalanced (real rows have `init != fini`). Padding rows fire nothing (`MU = 0`).
+pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     vec![
         // init: receive the token left by the originating epoch.
         BusInteraction::receiver(
             BusId::GlobalMemory,
-            Multiplicity::One,
+            mu(),
             vec![
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
@@ -332,12 +354,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         // fini: send the token for the next epoch to consume.
         BusInteraction::sender(
             BusId::GlobalMemory,
-            Multiplicity::One,
+            mu(),
             vec![
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
                 direct(cols::FINI_VALUE),
-                word(cols::FINI_EPOCH_0, cols::FINI_EPOCH_1),
+                BusValue::constant(epoch_label),
                 direct(cols::FINI_TIMESTAMP_LO),
                 direct(cols::FINI_TIMESTAMP_HI),
             ],
@@ -362,7 +384,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
         // init: receive the cell's initial token at the epoch-start seed (ts = 0).
         BusInteraction::receiver(
             BusId::Memory,
-            Multiplicity::One,
+            mu(),
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -375,7 +397,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
         // fini: send the cell's final token at the last access timestamp.
         BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::One,
+            mu(),
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -388,43 +410,61 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
     ]
 }
 
-/// Range-check bus interactions for the columns nothing else constrains: one
-/// `AreBytes` lookup for the two value bytes (the `init` value is a trusted
-/// source, like PAGE's) and one `IsHalfword` lookup per cross-epoch-only halfword
-/// column. Address and fini timestamp are NOT here — MEMW checks them on the
-/// Memory bus. They fire on every row (Multiplicity::One), so the matching
-/// multiplicities — including the all-zero padding rows — are emitted by
-/// [`collect_bitwise_from_l2g`].
+/// Range-check + ordering bus interactions for the columns nothing else
+/// constrains, all with multiplicity `MU` (so padding fires none):
+/// - one `AreBytes` for the two value bytes (the `init` value is a trusted source);
+/// - one `IsHalfword` per cross-epoch-only halfword column;
+/// - one `IsB20` proving `init_epoch < fini_epoch` (the ordering constraint), via
+///   `fini_epoch − 1 − init_epoch` being a valid 20-bit value. With genesis epoch
+///   `0` this also covers genesis cells (`0 < fini_epoch`) with no special case.
 ///
+/// Address and fini timestamp are NOT here — MEMW checks them on the Memory bus.
 /// These are committed only on the epoch-local table (`l2g_memory_air`), whose
 /// proof carries the BITWISE provider; the global proof commits the identical
-/// trace, so its columns inherit the same range guarantee via the commitment
-/// binding. Keep this in sync with [`collect_bitwise_from_l2g`].
-pub fn range_check_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1 + cols::RANGE_CHECKED_HALFWORDS.len());
+/// trace, so its columns inherit the same guarantee via the commitment binding.
+/// Keep this in sync with [`collect_bitwise_from_l2g`].
+pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
+    let mut interactions = Vec::with_capacity(2 + cols::RANGE_CHECKED_HALFWORDS.len());
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        Multiplicity::One,
+        mu(),
         vec![direct(cols::INIT_VALUE), direct(cols::FINI_VALUE)],
     ));
     for &column in &cols::RANGE_CHECKED_HALFWORDS {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::One,
+            mu(),
             vec![direct(column)],
         ));
     }
+    // Ordering: IsB20[epoch_label - 1 - init_epoch], where
+    // init_epoch = INIT_EPOCH_0 + 2^16·INIT_EPOCH_1.
+    interactions.push(BusInteraction::sender(
+        BusId::IsB20,
+        mu(),
+        vec![BusValue::linear(vec![
+            LinearTerm::Constant(epoch_label as i64 - 1),
+            LinearTerm::Column {
+                coefficient: -1,
+                column: cols::INIT_EPOCH_0,
+            },
+            LinearTerm::Column {
+                coefficient: -(1 << 16),
+                column: cols::INIT_EPOCH_1,
+            },
+        ])],
+    ));
     interactions
 }
 
-/// The BITWISE lookups the L2G range checks send, so the BITWISE table's
-/// multiplicities balance the [`range_check_interactions`] senders. Emits one
-/// `AreBytes` and one `IsHalfword` per cross-epoch-only halfword per row, padded
-/// to a power of two with all-zero rows (which still fire, since the senders are
-/// unconditional).
+/// The BITWISE lookups the L2G range checks + ordering check send, so the BITWISE
+/// table's multiplicities balance the [`range_check_interactions`] senders. Emits,
+/// per real row, one `AreBytes`, one `IsHalfword` per cross-epoch halfword, and one
+/// `IsB20` for the ordering difference. Padding rows fire nothing (`MU = 0`), so
+/// none are emitted for them.
 pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOperation> {
-    let num_rows = boundaries.len().next_power_of_two().max(1);
-    let mut ops = Vec::with_capacity(num_rows * (1 + cols::RANGE_CHECKED_HALFWORDS.len()));
+    let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();
+    let mut ops = Vec::with_capacity(boundaries.len() * per_row);
 
     let push_halfword = |ops: &mut Vec<BitwiseOperation>, v16: u64| {
         ops.push(BitwiseOperation::halfword(
@@ -442,28 +482,21 @@ pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOpera
         ));
         let init_epoch = epoch_halfwords(b.init.originating_epoch);
         let init_ts = halfwords64(b.init.timestamp);
-        let fini_epoch = epoch_halfwords(b.fini.epoch);
         for v in init_epoch {
             push_halfword(&mut ops, v);
         }
         for v in init_ts {
             push_halfword(&mut ops, v);
         }
-        for v in fini_epoch {
-            push_halfword(&mut ops, v);
-        }
-    }
-
-    // Padding rows are all zero: AreBytes(0, 0) + one IsHalfword(0) per column.
-    for _ in boundaries.len()..num_rows {
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            0,
-            0,
+        // Ordering: IsB20[fini_epoch - 1 - init_epoch]. Honest rows have
+        // init_epoch < fini_epoch, so the difference is a small non-negative value.
+        let diff = b.fini.epoch - 1 - b.init.originating_epoch;
+        debug_assert!(diff < (1 << 20), "epoch gap exceeds IsB20 range");
+        ops.push(BitwiseOperation::b20(
+            (diff & 0xFF) as u8,
+            ((diff >> 8) & 0xFF) as u8,
+            ((diff >> 16) & 0xF) as u8,
         ));
-        for _ in 0..cols::RANGE_CHECKED_HALFWORDS.len() {
-            push_halfword(&mut ops, 0);
-        }
     }
 
     ops
@@ -528,16 +561,17 @@ mod tests {
     }
 
     #[test]
-    fn test_fini_records_current_epoch_value_and_timestamp() {
+    fn test_fini_records_current_epoch_label_and_timestamp() {
         let initial_memory = HashMap::from([(10, 5)]);
         let epochs = vec![vec![(10, 7, 3)], vec![(10, 8, 10)]];
         let boundaries = epoch_boundaries(&initial_memory, &epochs);
 
+        // Labels are 1-based: epoch index 0 → label 1, index 1 → label 2.
         assert_eq!(
             find(&boundaries[0], 10).fini,
             FiniClaim {
                 value: 7,
-                epoch: 0,
+                epoch: 1,
                 timestamp: 3,
             }
         );
@@ -545,7 +579,7 @@ mod tests {
             find(&boundaries[1], 10).fini,
             FiniClaim {
                 value: 8,
-                epoch: 1,
+                epoch: 2,
                 timestamp: 10,
             }
         );
@@ -563,15 +597,17 @@ mod tests {
         assert_eq!(fini0.value, init1.value);
         assert_eq!(fini0.epoch, init1.originating_epoch);
         assert_eq!(fini0.timestamp, init1.timestamp);
-        // Concretely: epoch 0 left (7, epoch 0, ts 3).
+        // Concretely: epoch 0 (label 1) left (7, label 1, ts 3).
         assert_eq!(
             init1,
             InitClaim {
                 value: 7,
-                originating_epoch: 0,
+                originating_epoch: 1,
                 timestamp: 3,
             }
         );
+        // And init_epoch (1) < fini_epoch (2), the ordering invariant.
+        assert!(init1.originating_epoch < find(&boundaries[1], 10).fini.epoch);
     }
 
     #[test]
@@ -585,11 +621,10 @@ mod tests {
         ];
         let boundaries = epoch_boundaries(&initial_memory, &epochs);
 
-        // Epoch 2's init for cell 20 links straight back to epoch 0 (no cost
-        // incurred for the epoch that did not touch it).
+        // Epoch 2's init for cell 20 links straight back to epoch 0 (label 1).
         let fini0 = find(&boundaries[0], 20).fini;
         let init2 = find(&boundaries[2], 20).init;
-        assert_eq!(init2.originating_epoch, 0);
+        assert_eq!(init2.originating_epoch, 1);
         assert_eq!(init2.value, fini0.value);
         assert_eq!(init2.timestamp, fini0.timestamp);
     }
@@ -621,8 +656,8 @@ mod tests {
 
     #[test]
     fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 14);
-        assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 8);
+        assert_eq!(cols::NUM_COLUMNS, 13);
+        assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 6);
     }
 
     #[test]
@@ -654,37 +689,27 @@ mod tests {
             word_value(&trace, cols::INIT_TS_2, cols::INIT_TS_3),
             hi32(b.init.timestamp)
         );
-        assert_eq!(
-            word_value(&trace, cols::FINI_EPOCH_0, cols::FINI_EPOCH_1),
-            FE::from(b.fini.epoch)
-        );
-    }
-
-    #[test]
-    fn test_genesis_epoch_halfwords_match_global_memory_encoding() {
-        // The genesis init-epoch halfwords must reconstruct to FE::from(GENESIS_EPOCH),
-        // the exact value global_memory sends on the GlobalMemory bus.
-        let b = sample_boundary(0x1000);
-        let trace = generate_local_to_global_trace(&[b]);
+        // Genesis init epoch reconstructs to 0 (== GENESIS_EPOCH).
         assert_eq!(
             word_value(&trace, cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
             FE::from(GENESIS_EPOCH)
         );
-        // And every range-checked column is genuinely a halfword (< 2^16).
-        for &col in &cols::RANGE_CHECKED_HALFWORDS {
-            let raw = *trace.main_table.get(0, col).value();
-            assert!(raw < (1 << 16), "column {col} is not a halfword: {raw}");
-        }
+        // Real row carries MU = 1.
+        assert_eq!(at(cols::MU), FE::one());
     }
 
     #[test]
-    fn test_trace_padded_to_power_of_two_with_zero_rows() {
-        // 3 boundaries pad up to 4 rows; the padding row is all zero.
+    fn test_padding_rows_are_zero_including_mu() {
+        // 3 boundaries pad up to 4 rows; the padding row is all zero, MU = 0.
         let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
         let trace = generate_local_to_global_trace(&boundaries);
         assert_eq!(trace.num_rows(), 4);
         for col in 0..cols::NUM_COLUMNS {
             assert_eq!(*trace.main_table.get(3, col), FE::zero());
+        }
+        // And real rows have MU = 1.
+        for row in 0..3 {
+            assert_eq!(*trace.main_table.get(row, cols::MU), FE::one());
         }
     }
 
@@ -699,7 +724,7 @@ mod tests {
 
     #[test]
     fn test_bus_interactions() {
-        let interactions = bus_interactions();
+        let interactions = bus_interactions(1);
         assert_eq!(interactions.len(), 2); // init (receive) + fini (send)
 
         let global_memory = u64::from(BusId::GlobalMemory);
@@ -720,58 +745,57 @@ mod tests {
 
     #[test]
     fn test_range_check_interactions_cover_every_column() {
-        let interactions = range_check_interactions();
-        // 1 AreBytes (two value bytes) + one IsHalfword per cross-epoch halfword.
-        assert_eq!(interactions.len(), 1 + cols::RANGE_CHECKED_HALFWORDS.len());
+        let interactions = range_check_interactions(1);
+        // 1 AreBytes + one IsHalfword per cross-epoch halfword + 1 IsB20 ordering.
+        assert_eq!(interactions.len(), 2 + cols::RANGE_CHECKED_HALFWORDS.len());
         let are_bytes = u64::from(BusId::AreBytes);
         let is_halfword = u64::from(BusId::IsHalfword);
+        let is_b20 = u64::from(BusId::IsB20);
         assert_eq!(interactions[0].bus_id, are_bytes);
         assert_eq!(interactions[0].values.len(), 2);
-        for interaction in &interactions[1..] {
+        for interaction in &interactions[1..1 + cols::RANGE_CHECKED_HALFWORDS.len()] {
             assert!(interaction.is_sender);
             assert_eq!(interaction.bus_id, is_halfword);
             assert_eq!(interaction.values.len(), 1);
         }
+        let ordering = interactions.last().unwrap();
+        assert!(ordering.is_sender);
+        assert_eq!(ordering.bus_id, is_b20);
     }
 
     #[test]
     fn test_collect_bitwise_matches_sender_count() {
-        // One AreBytes + one IsHalfword per cross-epoch halfword per row,
-        // padded to a power of two.
+        // Per row: 1 AreBytes + one IsHalfword per cross-epoch halfword + 1 IsB20.
+        // No padding ops (padding has MU = 0 and fires nothing).
         let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
         let ops = collect_bitwise_from_l2g(&boundaries);
-        let num_rows = 4; // 3 padded to 4
-        let per_row = 1 + cols::RANGE_CHECKED_HALFWORDS.len();
-        assert_eq!(ops.len(), num_rows * per_row);
+        let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();
+        assert_eq!(ops.len(), boundaries.len() * per_row);
 
-        let are_bytes = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::AreBytes)
-            .count();
-        let is_half = ops
-            .iter()
-            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
-            .count();
-        assert_eq!(are_bytes, num_rows);
-        assert_eq!(is_half, num_rows * cols::RANGE_CHECKED_HALFWORDS.len());
+        let count = |t: BitwiseOperationType| ops.iter().filter(|o| o.lookup_type == t).count();
+        assert_eq!(count(BitwiseOperationType::AreBytes), boundaries.len());
+        assert_eq!(
+            count(BitwiseOperationType::IsHalf),
+            boundaries.len() * cols::RANGE_CHECKED_HALFWORDS.len()
+        );
+        assert_eq!(count(BitwiseOperationType::IsB20), boundaries.len());
     }
 
     #[test]
     fn test_collect_bitwise_values_match_the_committed_halfword_columns() {
         // Each IsHalfword op the collector emits must carry the same value as the
-        // corresponding halfword column the range-check sender reads, so the bus
-        // balances on the right BITWISE rows (not just the right counts). Use a
-        // boundary with distinct values in every quantity.
+        // corresponding halfword column the range-check sender reads. Use a
+        // boundary with distinct values, and a real (>=1) originating epoch.
         let b = CellBoundary {
             address: 0x1234_5678_9abc_def0,
             init: InitClaim {
                 value: 0xAB,
-                originating_epoch: 0x0011_2233,
+                originating_epoch: 3,
                 timestamp: 0x4455_6677_8899_aabb,
             },
             fini: FiniClaim {
                 value: 0xCD,
-                epoch: 0x00aa_00bb,
+                epoch: 9,
                 timestamp: 0xccdd_eeff_0011_2233,
             },
         };
@@ -795,5 +819,39 @@ mod tests {
                 "IsHalfword op {i} value disagrees with column {col}"
             );
         }
+
+        // The last op is the ordering IsB20 of `fini_epoch - 1 - init_epoch`.
+        let ordering = ops.last().unwrap();
+        assert_eq!(ordering.lookup_type, BitwiseOperationType::IsB20);
+        let value = ordering.x as u64 + ((ordering.y as u64) << 8) + ((ordering.z as u64) << 16);
+        assert_eq!(value, b.fini.epoch - 1 - b.init.originating_epoch);
+    }
+
+    #[test]
+    fn test_ordering_rejects_future_reference() {
+        // The ordering sender computes the field value `fini_epoch - 1 - init_epoch`.
+        // For an honest row (init_epoch < fini_epoch) it's a small valid IsB20 value;
+        // for a forged FUTURE reference (init_epoch >= fini_epoch) it underflows in
+        // the field to a value far outside [0, 2^20), so no IsB20 row matches and the
+        // bus cannot balance.
+        let order_value = |fini_label: u64, init_epoch: u64| -> FE {
+            FE::from(fini_label - 1) - FE::from(init_epoch)
+        };
+
+        // Honest: epoch 5 consuming epoch 2's fini → 5 - 1 - 2 = 2, in range.
+        let honest = order_value(5, 2);
+        assert!(*honest.value() < (1 << 20));
+
+        // Forged future reference: epoch 5's init claims originating epoch 9.
+        let forged = order_value(5, 9);
+        assert!(
+            *forged.value() >= (1 << 20),
+            "a future-epoch reference must fall outside the IsB20 range"
+        );
+
+        // Forged self reference: epoch 5's init claims originating epoch 5.
+        // 5 - 1 - 5 = -1 in the field → also out of range.
+        let self_ref = order_value(5, 5);
+        assert!(*self_ref.value() >= (1 << 20));
     }
 }

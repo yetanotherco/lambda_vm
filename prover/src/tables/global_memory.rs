@@ -139,11 +139,9 @@ pub fn generate_global_trace(
             .unwrap_or(0);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
-        // Genesis epoch carried as a COLUMN (`FE::from(u64)`), matching the L2G's
-        // init-epoch column. It must NOT be a `BusValue::constant(GENESIS_EPOCH)`:
-        // `constant` casts through i64, so `GENESIS_EPOCH = u64::MAX` becomes -1 →
-        // `p-1`, which differs from `FE::from(u64::MAX) = 2^32 - 2` mod the
-        // Goldilocks prime and would silently unbalance the bus.
+        // Genesis epoch carried as a COLUMN, matching the value the L2G init token
+        // reconstructs for a genesis-origin cell. `GENESIS_EPOCH = 0` (below every
+        // 1-based real epoch label), so `FE::from(0)` here equals L2G's `0`.
         data[base + cols::INIT_EPOCH] = FE::from(GENESIS_EPOCH);
 
         // Final state: if touched use it, otherwise the cell stays at genesis

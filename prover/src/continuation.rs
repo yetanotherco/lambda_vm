@@ -59,11 +59,17 @@ fn empty_constraints()
 }
 
 /// Local-to-global AIR on the cross-epoch GlobalMemory bus (used in the global proof).
-fn l2g_global_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+///
+/// `epoch_label` is this epoch's 1-based label; it is the `fini_epoch` constant
+/// the fini token carries (not a trace column, since it's the same for every row).
+fn l2g_global_air(
+    opts: &ProofOptions,
+    epoch_label: u64,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
-            interactions: local_to_global::bus_interactions(),
+            interactions: local_to_global::bus_interactions(epoch_label),
         },
         opts,
         1,
@@ -73,13 +79,17 @@ fn l2g_global_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstra
 
 /// Local-to-global AIR on the epoch-local Memory bus (used inside an epoch proof).
 ///
-/// Carries the column range checks too: this proof has the BITWISE provider, and
-/// the global proof commits the identical trace (the commitment binding compares
-/// roots), so range-checking here covers both.
-fn l2g_memory_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+/// Carries the column range checks and the `init_epoch < fini_epoch` ordering
+/// check too: this proof has the BITWISE provider, and the global proof commits
+/// the identical trace (the commitment binding compares roots), so checking here
+/// covers both. `epoch_label` is the `fini_epoch` constant used by both.
+fn l2g_memory_air(
+    opts: &ProofOptions,
+    epoch_label: u64,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let interactions = [
         local_to_global::memory_bus_interactions(),
-        local_to_global::range_check_interactions(),
+        local_to_global::range_check_interactions(epoch_label),
     ]
     .concat();
     AirWithBuses::new(
@@ -152,6 +162,8 @@ struct EpochStart<'a> {
     image: &'a PagedMem<u8>,
     register_init: HashMap<u64, u32>,
     is_first: bool,
+    /// This epoch's 1-based table label (the `fini_epoch` constant).
+    label: u64,
 }
 
 /// Prove and verify one epoch, committing its local-to-global table (built from
@@ -212,7 +224,7 @@ fn prove_verify_epoch(
         None,
     );
 
-    let l2g_air = l2g_memory_air(opts);
+    let l2g_air = l2g_memory_air(opts, start.label);
     let mut l2g_trace = std::mem::replace(
         &mut traces.local_to_global,
         local_to_global::generate_local_to_global_trace(&[]),
@@ -289,15 +301,19 @@ fn prove_global(
         .map(|config| global_memory::generate_global_trace(config, &final_state))
         .collect();
 
-    let l2g = l2g_global_air(opts);
+    // One L2G air per epoch, each carrying its own 1-based `fini_epoch` constant.
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
     let gm_airs: Vec<_> = gm_configs
         .iter()
         .map(|config| global_memory_air(opts, config))
         .collect();
 
-    let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_traces
-        .iter_mut()
-        .map(|t| (&l2g as AirRef, t, &()))
+    let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
+        .iter()
+        .zip(l2g_traces.iter_mut())
+        .map(|(air, t)| (air as AirRef, t, &()))
         .collect();
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
@@ -319,7 +335,11 @@ fn verify_global(
     private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> bool {
-    let l2g = l2g_global_air(opts);
+    // One L2G air per epoch, each with its own 1-based `fini_epoch` constant —
+    // must match the order/labels the global proof committed in `prove_global`.
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
     // Rebuild the genesis configs FROM THE ELF and recompute their commitments:
     // this is the binding — a prover that claimed different genesis values would
     // commit a different root and fail to verify.
@@ -329,7 +349,7 @@ fn verify_global(
         .map(|config| global_memory_air(opts, config))
         .collect();
 
-    let mut refs: Vec<AirRef> = vec![&l2g; boundaries.len()];
+    let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
@@ -392,13 +412,17 @@ pub fn prove_and_verify_continuation(
         let is_final = executor.pc() == 0;
 
         // `image` is this epoch's starting memory (the previous epoch's fini).
+        // Epoch tables are labelled 1-based (genesis is 0), so the ordering check
+        // `init_epoch < fini_epoch` holds for genesis-origin cells.
+        let label = local_to_global::epoch_label(index);
         let touched = epoch_touched_cells(&elf, &image, &logs)?;
-        let boundary = local_to_global::epoch_boundary(&mut provenance, index, &touched);
+        let boundary = local_to_global::epoch_boundary(&mut provenance, label, &touched);
 
         let start = EpochStart {
             image: &image,
             register_init,
             is_first: index == 0,
+            label,
         };
         match prove_verify_epoch(
             &elf,

@@ -45,12 +45,15 @@ mod anchor_cols {
 
 type Token = (u64, u64, u64, u64);
 
-fn l2g_air(proof_options: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+fn l2g_air(
+    proof_options: &ProofOptions,
+    epoch_label: u64,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
-            interactions: local_to_global::bus_interactions(),
+            interactions: local_to_global::bus_interactions(epoch_label),
         },
         proof_options,
         1,
@@ -328,20 +331,24 @@ pub(crate) fn prove_global(boundaries: &[Vec<CellBoundary>]) -> MultiProof<F, E,
     let mut program_end_trace = anchor_trace(&program_end);
 
     let proof_options = ProofOptions::default_test_options();
-    let l2g = l2g_air(&proof_options);
+    // One L2G air per epoch, each carrying its 1-based `fini_epoch` constant.
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| l2g_air(&proof_options, local_to_global::epoch_label(i as u64)))
+        .collect();
     let genesis_anchor = anchor_air(&proof_options, true);
     let program_end_anchor = anchor_air(&proof_options, false);
 
-    // Per-epoch L2G sub-tables (all sharing the one L2G air), then the anchors.
+    // Per-epoch L2G sub-tables (each with its own air), then the anchors.
     let mut air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
         _,
         _,
-    )> = l2g_traces
-        .iter_mut()
-        .map(|trace| {
+    )> = l2g_airs
+        .iter()
+        .zip(l2g_traces.iter_mut())
+        .map(|(air, trace)| {
             (
-                &l2g as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
                 trace,
                 &(),
             )
@@ -357,13 +364,17 @@ pub(crate) fn prove_and_verify(boundaries: &[Vec<CellBoundary>]) -> bool {
     let proof = prove_global(boundaries);
 
     let proof_options = ProofOptions::default_test_options();
-    let l2g = l2g_air(&proof_options);
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| l2g_air(&proof_options, local_to_global::epoch_label(i as u64)))
+        .collect();
     let genesis_anchor = anchor_air(&proof_options, true);
     let program_end_anchor = anchor_air(&proof_options, false);
 
-    // air_refs must match the air_trace_pairs order: one &l2g per epoch, then anchors.
-    let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&l2g; boundaries.len()];
+    // air_refs must match the air_trace_pairs order: one L2G air per epoch, then anchors.
+    let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = l2g_airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
     airs.push(&genesis_anchor);
     airs.push(&program_end_anchor);
 
