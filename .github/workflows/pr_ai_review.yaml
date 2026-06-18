@@ -115,7 +115,27 @@ jobs:
       - name: Harden runner
         uses: step-security/harden-runner@v2
         with:
-          egress-policy: audit
+          egress-policy: block
+          # Allowlist harvested from the harden-runner audit of a real run. Covers:
+          # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
+          # model APIs actually used (openrouter + direct MiniMax). Adding a new
+          # direct provider means adding its host here or the lane is blocked.
+          allowed-endpoints: >
+            api.github.com:443
+            api.minimax.io:443
+            broker.actions.githubusercontent.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            models.dev:443
+            opencode.ai:443
+            openrouter.ai:443
+            productionresultssa19.blob.core.windows.net:443
+            pypi.org:443
+            raw.githubusercontent.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            static.rust-lang.org:443
 
       - name: Checkout PR merge at workspace root
         uses: actions/checkout@v4
@@ -146,9 +166,13 @@ jobs:
       - name: Install opencode and JSON repair
         run: |
           python3 -m pip install --quiet json-repair
-          # Pin to a known-good version; newer builds changed agent discovery and
-          # crashed on session-title generation in CI.
-          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2
+          # Pin a known-good version AND verify the installer script itself —
+          # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
+          # that holds the provider secrets). Fail closed if the script changes.
+          OPENCODE_INSTALL_SHA=fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e
+          curl -fsSL https://opencode.ai/install -o /tmp/opencode-install.sh
+          echo "$OPENCODE_INSTALL_SHA  /tmp/opencode-install.sh" | sha256sum -c -
+          bash /tmp/opencode-install.sh --version 1.16.2
           # add likely install locations to PATH for subsequent steps
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -265,7 +289,27 @@ jobs:
       - name: Harden runner
         uses: step-security/harden-runner@v2
         with:
-          egress-policy: audit
+          egress-policy: block
+          # Allowlist harvested from the harden-runner audit of a real run. Covers:
+          # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
+          # model APIs actually used (openrouter + direct MiniMax). Adding a new
+          # direct provider means adding its host here or the lane is blocked.
+          allowed-endpoints: >
+            api.github.com:443
+            api.minimax.io:443
+            broker.actions.githubusercontent.com:443
+            files.pythonhosted.org:443
+            github.com:443
+            models.dev:443
+            opencode.ai:443
+            openrouter.ai:443
+            productionresultssa19.blob.core.windows.net:443
+            pypi.org:443
+            raw.githubusercontent.com:443
+            registry.npmjs.org:443
+            release-assets.githubusercontent.com:443
+            results-receiver.actions.githubusercontent.com:443
+            static.rust-lang.org:443
 
       - name: Checkout PR merge at workspace root
         uses: actions/checkout@v4
@@ -302,9 +346,13 @@ jobs:
       - name: Install opencode and JSON repair
         run: |
           python3 -m pip install --quiet json-repair
-          # Pin to a known-good version; newer builds changed agent discovery and
-          # crashed on session-title generation in CI.
-          curl -fsSL https://opencode.ai/install | bash -s -- --version 1.16.2
+          # Pin a known-good version AND verify the installer script itself —
+          # curl|bash otherwise fetches it unpinned (supply-chain RCE in a step
+          # that holds the provider secrets). Fail closed if the script changes.
+          OPENCODE_INSTALL_SHA=fc3c1b2123f49b6df545a7622e5127d21cd794b15134fc3b66e1ca49f7fb297e
+          curl -fsSL https://opencode.ai/install -o /tmp/opencode-install.sh
+          echo "$OPENCODE_INSTALL_SHA  /tmp/opencode-install.sh" | sha256sum -c -
+          bash /tmp/opencode-install.sh --version 1.16.2
           # add likely install locations to PATH for subsequent steps
           echo "$HOME/.opencode/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"

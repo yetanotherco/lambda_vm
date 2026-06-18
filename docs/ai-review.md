@@ -265,7 +265,13 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
   `openrouter-verify`, `final-report`) so the gate isn't a single transitive
   choke point. Model-supplied finding text is HTML-escaped before it goes into the
   posted comment, and the `submit_*` tools only write to the orchestrator's
-  expected `lane-*.submit.json` path.
+  expected `lane-*.submit.json` path. The lane jobs run under harden-runner
+  `egress-policy: block` with an allowlist (GitHub infra, opencode install/binary/
+  catalog, pip + npm, and the model APIs `openrouter.ai` / `api.minimax.io`), and
+  the opencode installer script is fetched with a pinned sha256 — so a compromised
+  dependency or installer can't exfiltrate to an arbitrary host. The allowlist was
+  harvested from a real run's audit; adding a new direct provider means adding its
+  host to `allowed-endpoints` or that lane is blocked.
   Residual (accepted): a *write-access* user could still run malicious code with
   the secrets — they can already reach secrets via other workflows, so it's
   within the trust boundary. The fuller fix (run trusted runner code from the
