@@ -78,9 +78,10 @@ prepare-test-data:
 # as incomplete and re-provisioned, instead of being mistaken for a complete one. When it
 # re-provisions, it first removes any existing $(SYSROOT_DIR) and re-extracts from scratch,
 # so a partial/stale/corrupt sysroot self-heals without manual intervention on the runner.
-# A basename allowlist guards the rm -rf: since SYSROOT_DIR is overrideable, it must end in
-# lambda-vm-sysroot or .lambda-vm-sysroot, so an accidental override (e.g. SYSROOT_DIR=/opt)
-# can never be wiped — especially via the sudo fallback path.
+# A basename allowlist guards the rm -rf: SYSROOT_DIR must end in lambda-vm-sysroot or
+# .lambda-vm-sysroot, so an accidental override (e.g. SYSROOT_DIR=/opt) can't be wiped,
+# especially via the sudo fallback. This is typo/misconfig prevention, NOT a security
+# boundary — a caller that controls SYSROOT_DIR can still point it at any */lambda-vm-sysroot.
 prepare-sysroot:
 	@if [ -f "$(SYSROOT_DIR)/include/stdlib.h" ] && [ -d "$(SYSROOT_DIR)/lib" ]; then \
 		echo "Sysroot already exists at $(SYSROOT_DIR)"; \
