@@ -8,8 +8,8 @@ pad = 0
 
 [[variables.input]]
 name = "addr"
-type = "DWordBL"
-desc = "memory address storing the first bit of the state"
+type = "DWordHL"
+desc = "memory address storing the first byte of the state"
 pad = 0
 
 [[variables.input]]
@@ -56,9 +56,17 @@ name = "mem"
 
 [[constraints.mem]]
 kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "addr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "keccak:c:range_addr"
+
+[[constraints.mem]]
+kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
-output = "addr"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", ["cast", "addr", "DWordWL"], 0], ["idx", ["cast", "addr", "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", ["cast", "addr", "DWordWL"], 0], ["idx", ["cast", "addr", "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
 ref = "keccak:c:read_addr"
 
@@ -76,6 +84,7 @@ tag = "IS_HALF"
 input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
+ref = "keccak:c:range_state_ptr"
 
 [[constraints.mem]]
 kind = "interaction"
