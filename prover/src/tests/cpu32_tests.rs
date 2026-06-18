@@ -197,7 +197,7 @@ fn test_constraints_catch_corruption() {
 
     // Corrupt arg1[1] (the sign-extended high word) → Arg1Hi must fire.
     let mut row = trace.main_table.get_row(0).to_vec();
-    row[cols::ARG1_1] = &row[cols::ARG1_1] + FE::one();
+    row[cols::ARG1_1] += FE::one();
     let bad: TableView<GoldilocksField, GoldilocksExtension> =
         TableView::new(vec![row], vec![vec![]]);
     let c = Cpu32Constraint::new(Cpu32ConstraintKind::Arg1Hi, 0);

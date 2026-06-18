@@ -185,6 +185,9 @@ pub struct CpuOperation {
     pub ecall_keccak: bool,
     /// For KeccakPermute ECALLs: state address from x10.
     pub keccak_state_addr: u64,
+
+    /// Whether this ECALL is an ECSM (elliptic-curve scalar multiply) syscall
+    pub ecall_ecsm: bool,
 }
 
 impl CpuOperation {
@@ -228,6 +231,10 @@ impl CpuOperation {
         let ecall_keccak =
             f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
+        // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
+        // in the trace builder.
+        let ecall_ecsm =
+            f.ecall && log.src1_val == executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -345,6 +352,7 @@ impl CpuOperation {
             commit_count,
             ecall_keccak,
             keccak_state_addr,
+            ecall_ecsm,
         }
     }
 
