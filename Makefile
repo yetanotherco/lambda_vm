@@ -49,6 +49,10 @@ ETHREX_URL := https://lambda.alignedlayer.com/ethrex_hoodi.bin
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
 SYSROOT_DIR ?= /opt/lambda-vm-sysroot
+# Fixed, global path: prepare-sysroot assumes a single writer at a time. The recipe
+# `rm -f`s this before downloading, so a stale tarball can't be extracted — but two
+# concurrent `make prepare-sysroot` on one host would race on it. The current CI runs
+# no concurrent jobs sharing a SYSROOT_DIR; revisit (e.g. mktemp/flock) if that changes.
 SYSROOT_TARBALL := /tmp/lambda-vm-sysroot-rv64im.tar.gz
 SYSROOT_URL := https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
 # CFLAGS for ckzg / ethrex guest programs: overrides the hardcoded `/opt/lambda-vm-sysroot`
