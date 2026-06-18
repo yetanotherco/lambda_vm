@@ -787,8 +787,9 @@ impl DecodeEntry {
 // Fast hashing for op-dedup multiplicity maps
 // =========================================================================
 
-/// rustc's FxHash. The op-dedup maps hash millions of multi-`u64` keys per
-/// proof; DoS resistance buys nothing there, so skip SipHash.
+/// Fast non-cryptographic hash for the op-dedup hot path. Skipping SipHash is
+/// safe here: the maps are per-chunk (bounded ≤ `max_rows`), keyed by the
+/// prover's own trace, and collisions only cost probes, never soundness.
 #[derive(Default)]
 pub struct FxHasher(u64);
 

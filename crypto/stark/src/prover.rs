@@ -428,6 +428,13 @@ fn columns_to_row_major<E: IsField>(
 ) -> (Vec<FieldElement<E>>, usize) {
     let num_cols = columns.len();
     let n = if num_cols > 0 { columns[0].len() } else { 0 };
+    // All columns must be the same length; otherwise `col[row]` below indexes
+    // out of bounds. The producers (CPU/GPU LDE) always emit uniform columns —
+    // this guards against a future regression cheaply (debug builds only).
+    debug_assert!(
+        columns.iter().all(|c| c.len() == n),
+        "columns_to_row_major requires all columns to have equal length"
+    );
     let mut data = Vec::with_capacity(n * num_cols);
     for row in 0..n {
         for col in columns {
