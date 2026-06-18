@@ -9,10 +9,13 @@
 //! recomputes the per-page preprocessed init commitment from the ELF in
 //! `verify_global`, so the starting memory cannot be prover-supplied.
 //!
-//! The local-to-global columns are range-checked (values are bytes, every other
-//! quantity is built from `IsHalfword`-checked halfwords) in the epoch proof,
-//! which carries the BITWISE provider; the global proof commits the identical
-//! trace, so it inherits the guarantee via the commitment binding.
+//! The local-to-global columns are range-checked in the epoch proof (which
+//! carries the BITWISE provider): values are bytes, and the cross-epoch-only
+//! quantities (epoch, init-timestamp) are built from `IsHalfword`-checked
+//! halfwords. Address and fini-timestamp need no extra check — they are matched
+//! against MEMW on the epoch-local Memory bus, exactly as PAGE relies on MEMW.
+//! The global proof commits the identical trace, so it inherits the guarantee
+//! via the commitment binding.
 //!
 //! This is a FIRST implementation and is NOT yet fully sound: cross-epoch
 //! registers are not bound (epoch `i`'s register init is a prover-supplied
