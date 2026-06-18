@@ -168,7 +168,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 
 == Carry offset
 #et[Finish this]
-$#`carry_offset` = 8160$
+$#`offsets` = [8160, 16319]$
 
 == Padding
 #render_chip_padding_table(ecsm_chip, config)

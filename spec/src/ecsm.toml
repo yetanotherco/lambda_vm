@@ -207,9 +207,9 @@ type = "U256BL"
 desc = "Curve order"
 
 [[variables.constant]]
-name = "carry_offset"
-type = "Half"
-desc = "Offset for the range of carry `c2`."
+name = "offsets"
+type = ["Half", 2]
+desc = "Offsets for the range of carries `c0` and `c1`."
 
 [[variables.multiplicity]]
 name = "μ"
@@ -328,7 +328,7 @@ ref = "ec:c:c0_63_is_zero"
 [[constraints.xG2]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], "carry_offset"]]
+input = [["+", ["idx", "c0", "i"], ["idx", "offsets", 0]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ec:c:range_c0"
@@ -408,7 +408,7 @@ ref = "ec:c:c1_63_is_zero"
 [[constraints.yG]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], 16319]]
+input = [["+", ["idx", "c1", "i"], ["idx", "offsets", 1]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ec:c:range_c1"
