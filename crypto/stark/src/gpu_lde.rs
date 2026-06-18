@@ -8,8 +8,11 @@
 use core::mem::transmute_copy;
 use std::any::TypeId;
 use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use math_cuda::{CudaSlice, CudaStream};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
@@ -70,6 +73,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_COMP_POLY_TREE_CALLS.store(0, Ordering::Relaxed);
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
+    GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -716,7 +720,7 @@ where
             FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 1]),
             FieldElement::<Gl>::from_raw(sums_raw[c * 3 + 2]),
         ]);
-        let final_ext3 = &s * &scalar_e;
+        let final_ext3 = s * scalar_e;
         // SAFETY: TypeId-checked at the caller. E == Ext3, identical layout.
         let final_e: FieldElement<E> =
             unsafe { transmute_copy::<FieldElement<Ext3>, FieldElement<E>>(&final_ext3) };
@@ -812,7 +816,8 @@ pub(crate) fn try_barycentric_base_on_handle<F, E>(
     n_inv: &FieldElement<F>,
     g_n_inv: &FieldElement<F>,
     z_pow_n: &FieldElement<E>,
-    inv_denoms: &[FieldElement<E>],
+    inv_denoms_host: &[FieldElement<E>],
+    r3_ctx: Option<(&R3DevContext, usize)>,
 ) -> Option<Vec<FieldElement<E>>>
 where
     F: IsField + IsSubFieldOf<E> + 'static,
@@ -833,28 +838,49 @@ where
     if !n.is_power_of_two() || n < gpu_bary_threshold() {
         return None;
     }
-    if inv_denoms.len() != n || main.lde_size != n.checked_mul(row_stride)? {
+    if main.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    // Host inv_denoms length only matters on the host path.
+    if r3_ctx.is_none() && inv_denoms_host.len() != n {
         return None;
     }
 
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<Gl> is
     // #[repr(transparent)] over u64.
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
-    // SAFETY: E == Ext3 per TypeId check; FieldElement<Ext3> backing is
-    // `[FieldElement<Gl>; 3]` = `[u64; 3]`.
-    let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
-    let inv_denoms_raw: &[u64] =
-        unsafe { from_raw_parts(inv_denoms.as_ptr() as *const u64, inv_denoms_len) };
 
-    let sums_raw = match math_cuda::barycentric::barycentric_base_on_device(
-        main,
-        row_stride,
-        points_raw,
-        inv_denoms_raw,
-        n,
-    ) {
-        Ok(v) => v,
-        Err(_) => return None,
+    let sums_raw = match r3_ctx {
+        Some((ctx, inv_offset_u64)) => {
+            match math_cuda::barycentric::barycentric_base_on_device_with_dev_inv_denoms(
+                &ctx.stream,
+                main,
+                row_stride,
+                &ctx.coset_points,
+                &ctx.inv_denoms,
+                inv_offset_u64,
+                n,
+            ) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        }
+        None => {
+            // SAFETY: E == Ext3 per TypeId check; FieldElement<Ext3> backing is `[u64; 3]`.
+            let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
+            let inv_denoms_raw: &[u64] =
+                unsafe { from_raw_parts(inv_denoms_host.as_ptr() as *const u64, inv_denoms_len) };
+            match math_cuda::barycentric::barycentric_base_on_device(
+                main,
+                row_stride,
+                points_raw,
+                inv_denoms_raw,
+                n,
+            ) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        }
     };
     GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -873,7 +899,8 @@ pub(crate) fn try_barycentric_ext3_on_handle<F, E>(
     n_inv: &FieldElement<F>,
     g_n_inv: &FieldElement<F>,
     z_pow_n: &FieldElement<E>,
-    inv_denoms: &[FieldElement<E>],
+    inv_denoms_host: &[FieldElement<E>],
+    r3_ctx: Option<(&R3DevContext, usize)>,
 ) -> Option<Vec<FieldElement<E>>>
 where
     F: IsField + IsSubFieldOf<E> + 'static,
@@ -894,24 +921,45 @@ where
     if !n.is_power_of_two() || n < gpu_bary_threshold() {
         return None;
     }
-    if inv_denoms.len() != n || aux.lde_size != n.checked_mul(row_stride)? {
+    if aux.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if r3_ctx.is_none() && inv_denoms_host.len() != n {
         return None;
     }
 
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
-    let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
-    let inv_denoms_raw: &[u64] =
-        unsafe { from_raw_parts(inv_denoms.as_ptr() as *const u64, inv_denoms_len) };
 
-    let sums_raw = match math_cuda::barycentric::barycentric_ext3_on_device(
-        aux,
-        row_stride,
-        points_raw,
-        inv_denoms_raw,
-        n,
-    ) {
-        Ok(v) => v,
-        Err(_) => return None,
+    let sums_raw = match r3_ctx {
+        Some((ctx, inv_offset_u64)) => {
+            match math_cuda::barycentric::barycentric_ext3_on_device_with_dev_inv_denoms(
+                &ctx.stream,
+                aux,
+                row_stride,
+                &ctx.coset_points,
+                &ctx.inv_denoms,
+                inv_offset_u64,
+                n,
+            ) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        }
+        None => {
+            let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
+            let inv_denoms_raw: &[u64] =
+                unsafe { from_raw_parts(inv_denoms_host.as_ptr() as *const u64, inv_denoms_len) };
+            match math_cuda::barycentric::barycentric_ext3_on_device(
+                aux,
+                row_stride,
+                points_raw,
+                inv_denoms_raw,
+                n,
+            ) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        }
     };
     GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
 
@@ -936,6 +984,16 @@ pub fn gpu_fri_calls() -> u64 {
     GPU_FRI_CALLS.load(Ordering::Relaxed)
 }
 
+/// Batch-invert dispatch counter (one per
+/// [`try_compute_and_invert_inv_denoms_dev`] call that actually built a
+/// device handle). Fires at most twice per prove per table: once for R3
+/// OOD's `num_eval_points * trace_size` denominators and once for R4
+/// DEEP's `(1 + num_eval_points) * lde_size` denominators.
+pub(crate) static GPU_BATCH_INVERT_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_batch_invert_calls() -> u64 {
+    GPU_BATCH_INVERT_CALLS.load(Ordering::Relaxed)
+}
+
 /// Test-only: schedule the Nth upcoming FRI fold call (1 = first, 2 =
 /// second, ...) to return Err, exercising the snapshot-restore path in
 /// [`try_fri_commit_gpu`]. Pass -1 to disable. Production default is -1.
@@ -943,6 +1001,15 @@ pub fn gpu_fri_calls() -> u64 {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_fri_fold_fault(n_calls_until_err: i64) {
     math_cuda::fri::FAULT_FOLDS_REMAINING_UNTIL_ERR.store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `compute_and_invert_denoms_ext3_dev`
+/// call to return Err, exercising the CPU-fallback path in
+/// [`try_compute_and_invert_inv_denoms_dev`]. Pass -1 to disable.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_inverse_fault(n_calls_until_err: i64) {
+    math_cuda::inverse::FAULT_INVERSE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
 }
 
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
@@ -1084,7 +1151,8 @@ pub(crate) fn try_deep_composition_gpu<F, E>(
     trace_ood_columns: &[Vec<FieldElement<E>>],
     composition_poly_gammas: &[FieldElement<E>],
     trace_terms_gammas: &[Vec<FieldElement<E>>],
-    inv_denoms: &[FieldElement<E>],
+    inv_denoms_host: &[FieldElement<E>],
+    inv_denoms_dev: Option<(&CudaSlice<u64>, &Arc<CudaStream>)>,
     num_eval_points: usize,
 ) -> Option<Vec<FieldElement<E>>>
 where
@@ -1126,7 +1194,15 @@ where
         return None;
     }
     let expected_inv_denoms = lde_size.checked_mul(1 + num_eval_points)?;
-    if inv_denoms.len() != expected_inv_denoms {
+    // The fully-resident `(Some(parts), Some(dev_inv))` arm ignores the
+    // host inv_denoms slice; every other arm slices into it. Validate the
+    // host length whenever the chosen arm will consume it, even when a
+    // dev inv_denoms handle is also present (a (None, Some) combination
+    // is reachable when R2's keep path missed but the batch-invert
+    // dispatch succeeded; without this guard that path would panic
+    // slicing an empty host buffer).
+    let arm_needs_host_inv = !(parts_dev.is_some() && inv_denoms_dev.is_some());
+    if arm_needs_host_inv && inv_denoms_host.len() != expected_inv_denoms {
         return None;
     }
 
@@ -1164,69 +1240,102 @@ where
         gammas_tr_raw.extend_from_slice(slice);
     }
 
-    // inv_denoms is laid out as (1 + num_eval_points) blocks of lde_size
-    // each. Split the H-term block and the trace blocks (concatenated).
-    let inv_h_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(&inv_denoms[0..lde_size]) };
-    let inv_t_raw: &[u64] =
-        unsafe { ext3_slice_to_u64::<E>(&inv_denoms[lde_size..lde_size * (1 + num_eval_points)]) };
-
     // domain_size == lde_size here: R4 DEEP evaluates at every LDE point
     // (Plonky3-style direct LDE). Calling the kernel with row_stride = 1
     // makes its `row = i * row_stride` index every row.
     let domain_size_kernel = lde_size;
     let row_stride_kernel = 1usize;
 
-    // Pack parts host path if no device handle.
+    // Three dispatch paths, in priority order:
+    //   1. Both parts + inv_denoms on device: the fully-resident path.
+    //      Requires the caller's stream so the new inv_denoms_dev producer
+    //      and this kernel run on the same queue (no cross-stream race).
+    //   2. Parts on device, inv_denoms on host.
+    //   3. Both on host (fallback when R2 keep + denom-invert both missed).
     let parts_host_packed: Vec<u64>;
-    let result = if let Some(parts) = parts_dev {
-        math_cuda::deep::deep_composition_ext3_with_dev_parts(
-            main,
-            aux_handle,
-            parts,
-            h_ood_raw,
-            &trace_ood_raw,
-            gammas_h_raw,
-            &gammas_tr_raw,
-            inv_h_raw,
-            inv_t_raw,
-            num_parts,
-            num_main,
-            num_aux,
-            num_eval_points,
-            row_stride_kernel,
-            domain_size_kernel,
-        )
-    } else {
-        // De-interleave each ext3 part column into 3 contiguous base-field
-        // slabs of length `lde_size` (the math-cuda kernel reads the parts
-        // buffer with layout `h_lde[(p*3 + k) * lde_stride + r]`).
-        let mut packed = vec![0u64; num_parts * 3 * lde_size];
-        for (p, col) in parts_host.iter().enumerate() {
-            let slice = unsafe { ext3_slice_to_u64::<E>(col) };
-            for (r, chunk) in slice.chunks_exact(3).enumerate() {
-                packed[(p * 3) * lde_size + r] = chunk[0];
-                packed[(p * 3 + 1) * lde_size + r] = chunk[1];
-                packed[(p * 3 + 2) * lde_size + r] = chunk[2];
-            }
+    let result = match (parts_dev, inv_denoms_dev) {
+        (Some(parts), Some((inv_dev, stream))) => {
+            math_cuda::deep::deep_composition_ext3_with_dev_parts_and_inv_denoms(
+                stream,
+                main,
+                aux_handle,
+                parts,
+                inv_dev,
+                h_ood_raw,
+                &trace_ood_raw,
+                gammas_h_raw,
+                &gammas_tr_raw,
+                num_parts,
+                num_main,
+                num_aux,
+                num_eval_points,
+                row_stride_kernel,
+                domain_size_kernel,
+            )
         }
-        parts_host_packed = packed;
-        math_cuda::deep::deep_composition_ext3(
-            main,
-            aux_handle,
-            &parts_host_packed,
-            h_ood_raw,
-            &trace_ood_raw,
-            gammas_h_raw,
-            &gammas_tr_raw,
-            inv_h_raw,
-            inv_t_raw,
-            num_parts,
-            num_main,
-            num_aux,
-            num_eval_points,
-            row_stride_kernel,
-            domain_size_kernel,
-        )
+        (Some(parts), None) => {
+            let inv_h_raw: &[u64] =
+                unsafe { ext3_slice_to_u64::<E>(&inv_denoms_host[0..lde_size]) };
+            let inv_t_raw: &[u64] = unsafe {
+                ext3_slice_to_u64::<E>(&inv_denoms_host[lde_size..lde_size * (1 + num_eval_points)])
+            };
+            math_cuda::deep::deep_composition_ext3_with_dev_parts(
+                main,
+                aux_handle,
+                parts,
+                h_ood_raw,
+                &trace_ood_raw,
+                gammas_h_raw,
+                &gammas_tr_raw,
+                inv_h_raw,
+                inv_t_raw,
+                num_parts,
+                num_main,
+                num_aux,
+                num_eval_points,
+                row_stride_kernel,
+                domain_size_kernel,
+            )
+        }
+        (None, _) => {
+            // De-interleave each ext3 part column into 3 contiguous base-field
+            // slabs of length `lde_size` (the math-cuda kernel reads the parts
+            // buffer with layout `h_lde[(p*3 + k) * lde_stride + r]`).
+            let mut packed = vec![0u64; num_parts * 3 * lde_size];
+            for (p, col) in parts_host.iter().enumerate() {
+                let slice = unsafe { ext3_slice_to_u64::<E>(col) };
+                for (r, chunk) in slice.chunks_exact(3).enumerate() {
+                    packed[(p * 3) * lde_size + r] = chunk[0];
+                    packed[(p * 3 + 1) * lde_size + r] = chunk[1];
+                    packed[(p * 3 + 2) * lde_size + r] = chunk[2];
+                }
+            }
+            parts_host_packed = packed;
+            // Host inv_denoms required when going through this path; we
+            // validated the slice length above.
+            let inv_h_raw: &[u64] =
+                unsafe { ext3_slice_to_u64::<E>(&inv_denoms_host[0..lde_size]) };
+            let inv_t_raw: &[u64] = unsafe {
+                ext3_slice_to_u64::<E>(&inv_denoms_host[lde_size..lde_size * (1 + num_eval_points)])
+            };
+            math_cuda::deep::deep_composition_ext3(
+                main,
+                aux_handle,
+                &parts_host_packed,
+                h_ood_raw,
+                &trace_ood_raw,
+                gammas_h_raw,
+                &gammas_tr_raw,
+                inv_h_raw,
+                inv_t_raw,
+                num_parts,
+                num_main,
+                num_aux,
+                num_eval_points,
+                row_stride_kernel,
+                domain_size_kernel,
+            )
+        }
     };
 
     let deep_raw = match result {
@@ -1236,6 +1345,166 @@ where
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     debug_assert_eq!(deep_raw.len(), lde_size * 3);
     Some(u64_to_ext3_vec::<E>(&deep_raw))
+}
+
+/// Build `inv_denoms[k*n + i] = 1 / (lift(coset_base[i]) - z_scalars[k])`
+/// entirely on device. Used by both R3 OOD (n = trace_size, k_scalars =
+/// num_eval_points) and R4 DEEP (n = lde_size, k_scalars = 1 +
+/// num_eval_points). Returns a device handle the caller can slice and
+/// thread into downstream dispatchers without ever D2H'ing the inverted
+/// values; on type / threshold / cudarc failure returns `None` so the
+/// caller can fall back to CPU `inplace_batch_inverse`.
+///
+/// The threshold check uses `gpu_lde_threshold()` against `n * k_scalars`,
+/// matching the rest of the dispatch layer.
+pub(crate) fn try_compute_and_invert_inv_denoms_dev<F, E>(
+    coset_base: &[FieldElement<F>],
+    z_scalars: &[FieldElement<E>],
+    sign: math_cuda::inverse::DenomSign,
+    stream: &Arc<CudaStream>,
+) -> Option<CudaSlice<u64>>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n = coset_base.len();
+    let k_scalars = z_scalars.len();
+    if n == 0 || k_scalars == 0 {
+        return None;
+    }
+    let total = n.checked_mul(k_scalars)?;
+    if total < gpu_lde_threshold() {
+        return None;
+    }
+
+    // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
+    // #[repr(transparent)] over u64.
+    let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
+    let coset_dev = match stream.clone_htod(coset_u64) {
+        Ok(s) => s,
+        Err(_) => return None,
+    };
+
+    // SAFETY: E == Ext3 per TypeId check.
+    let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
+
+    let result = math_cuda::inverse::compute_and_invert_denoms_ext3_dev(
+        &coset_dev, z_u64, n, k_scalars, sign, stream,
+    );
+    match result {
+        Ok(handle) => {
+            GPU_BATCH_INVERT_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(handle)
+        }
+        Err(_) => None,
+    }
+}
+
+/// Convenience wrapper for prover callers that don't yet own a stream:
+/// acquires the math-cuda backend, allocates a fresh stream, and produces
+/// a device-resident `inv_denoms` buffer plus the stream that owns it.
+/// The caller passes the tuple through to the downstream dispatch
+/// functions (`try_barycentric_*_on_handle`, `try_deep_composition_gpu`)
+/// so every kernel touching the buffer runs on the same stream (no
+/// cross-stream race).
+///
+/// Returns `None` on type / threshold mismatch, backend init failure, or
+/// any cudarc error; the caller falls back to its CPU
+/// `inplace_batch_inverse` loop.
+pub(crate) fn try_inv_denoms_dev_with_stream<F, E>(
+    coset_base: &[FieldElement<F>],
+    z_scalars: &[FieldElement<E>],
+    sign: math_cuda::inverse::DenomSign,
+) -> Option<(CudaSlice<u64>, Arc<CudaStream>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+    let handle =
+        try_compute_and_invert_inv_denoms_dev::<F, E>(coset_base, z_scalars, sign, &stream)?;
+    Some((handle, stream))
+}
+
+/// R3 OOD device-side context: bundles the inverted denominators, the
+/// coset_points upload (used by every barycentric kernel for this batch),
+/// and the stream so producer + consumers serialize naturally. Hoisting
+/// `coset_points` here means the barycentric kernels read the same
+/// device buffer across `num_eval_points * {main, aux}` calls instead
+/// of re-uploading `dc.points` each iteration.
+#[derive(Debug)]
+pub(crate) struct R3DevContext {
+    pub inv_denoms: CudaSlice<u64>,
+    pub coset_points: CudaSlice<u64>,
+    pub stream: Arc<CudaStream>,
+}
+
+/// Build an [`R3DevContext`] in one stream: acquire backend, allocate
+/// stream, H2D coset_points once, then run `compute_and_invert_denoms`
+/// against that same handle so the coset H2D isn't repeated by any
+/// downstream barycentric kernel.
+///
+/// Returns `None` on type / threshold mismatch, backend init failure, or
+/// any cudarc error.
+pub(crate) fn try_prep_r3_dev_context<F, E>(
+    coset_base: &[FieldElement<F>],
+    z_scalars: &[FieldElement<E>],
+) -> Option<R3DevContext>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let n = coset_base.len();
+    let k_scalars = z_scalars.len();
+    if n == 0 || k_scalars == 0 {
+        return None;
+    }
+    let total = n.checked_mul(k_scalars)?;
+    if total < gpu_lde_threshold() {
+        return None;
+    }
+
+    let be = math_cuda::device::backend().ok()?;
+    let stream = be.next_stream();
+
+    // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
+    // #[repr(transparent)] over u64.
+    let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
+    let coset_points = stream.clone_htod(coset_u64).ok()?;
+
+    // SAFETY: E == Ext3 per TypeId check.
+    let z_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(z_scalars) };
+
+    let inv_denoms = match math_cuda::inverse::compute_and_invert_denoms_ext3_dev(
+        &coset_points,
+        z_u64,
+        n,
+        k_scalars,
+        math_cuda::inverse::DenomSign::ZMinusX,
+        &stream,
+    ) {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    GPU_BATCH_INVERT_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(R3DevContext {
+        inv_denoms,
+        coset_points,
+        stream,
+    })
 }
 
 /// R4 FRI dispatch: drive the full FRI commit phase device-side. Mirrors

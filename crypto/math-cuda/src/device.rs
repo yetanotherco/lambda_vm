@@ -96,6 +96,7 @@ const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
 const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
 const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
+const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -160,6 +161,14 @@ pub struct Backend {
     pub fri_fold_ext3: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
+    // inverse.ptx
+    pub compute_denoms_ext3: CudaFunction,
+    pub block_inclusive_scan_fwd_ext3: CudaFunction,
+    pub apply_block_offsets_fwd_ext3: CudaFunction,
+    pub block_inclusive_scan_rev_ext3: CudaFunction,
+    pub apply_block_offsets_rev_ext3: CudaFunction,
+    pub batch_inverse_combine_ext3: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -180,6 +189,7 @@ impl Backend {
         let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
         let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
+        let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -241,6 +251,14 @@ impl Backend {
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
+            compute_denoms_ext3: inverse.load_function("compute_denoms_ext3")?,
+            block_inclusive_scan_fwd_ext3: inverse
+                .load_function("block_inclusive_scan_fwd_ext3")?,
+            apply_block_offsets_fwd_ext3: inverse.load_function("apply_block_offsets_fwd_ext3")?,
+            block_inclusive_scan_rev_ext3: inverse
+                .load_function("block_inclusive_scan_rev_ext3")?,
+            apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
+            batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

@@ -8,9 +8,14 @@ pub mod barycentric;
 pub mod deep;
 pub mod device;
 pub mod fri;
+pub mod inverse;
 pub mod lde;
 pub mod merkle;
 pub mod ntt;
+
+// Re-exported for downstream crates so they can refer to CUDA primitive
+// types without depending on cudarc directly.
+pub use cudarc::driver::{CudaSlice, CudaStream};
 
 use cudarc::driver::{LaunchConfig, PushKernelArg};
 
