@@ -2,7 +2,7 @@
 //! lambda-vm prover/benchmarks — in-memory, offline, deterministic.
 //!
 //! Usage:
-//!   cargo run -- <n_transfers> <out.bin>
+//!   cargo run -- <n_transfers> <output_path>
 //! e.g.
 //!   cargo run -- 1  ../../executor/tests/ethrex_simple_tx.bin
 //!   cargo run -- 10 ../../executor/tests/ethrex_10_transfers.bin
@@ -32,7 +32,7 @@ const RICH_PK: &str = "bcdf20249abf0ed6d944c0288fad489e33f66b3960d9e6229c1cd214e
 const GENESIS_JSON: &str = include_str!("../genesis.json");
 
 fn usage_and_exit(program: &str) -> ! {
-    eprintln!("usage: {program} <n_transfers> <out.bin>");
+    eprintln!("usage: {program} <n_transfers> <output_path>");
     std::process::exit(2);
 }
 
@@ -49,7 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.next().is_some() {
         usage_and_exit(&program);
     }
-    let n_transfers: u64 = n_transfers.parse()?;
+    let Ok(n_transfers) = n_transfers.parse::<u64>() else {
+        usage_and_exit(&program);
+    };
 
     // --- 1. genesis -> in-memory store -------------------------------------
     let genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;

@@ -1,7 +1,9 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
 test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
 UNAME := $(shell uname)
 
@@ -158,12 +160,19 @@ test-flamegraph:
 	cargo test -p executor --test flamegraph
 
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
-# Run after bumping the ethrex rev; then refresh checksums in executor/tests/README.md.
+# Run after bumping the ethrex rev; README checksums are refreshed automatically.
 regen-ethrex-fixtures:
 	cd tooling/ethrex-fixtures && \
 		cargo run --release -- 0  ../../executor/tests/ethrex_empty_block.bin && \
 		cargo run --release -- 1  ../../executor/tests/ethrex_simple_tx.bin && \
 		cargo run --release -- 10 ../../executor/tests/ethrex_10_transfers.bin
+	$(MAKE) update-ethrex-fixture-checksums
+
+update-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py
+
+check-ethrex-fixture-checksums:
+	python3 tooling/ethrex-fixtures/update_readme_checksums.py --check
 
 test: compile-programs
 	cargo test
