@@ -54,13 +54,6 @@ multiplicity = ["-", "μ"]
 [[constraint_groups]]
 name = "mem"
 
-[[constraints.mem]]
-kind = "interaction"
-tag = "IS_HALF"
-input = [["idx", "addr", "i"]]
-iter = ["i", 0, 3]
-multiplicity = "μ"
-ref = "keccak:c:range_addr"
 
 [[constraints.mem]]
 kind = "interaction"
@@ -77,6 +70,14 @@ input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"
 output = ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"]
 iters = [["x", 0, 4], ["y", 0, 4]]
 ref = "keccak:c:state_ptr"
+
+[[constraints.mem]]
+kind = "interaction"
+tag = "IS_HALF"
+input = [["idx", "addr", "i"]]
+iter = ["i", 0, 3]
+multiplicity = "μ"
+ref = "keccak:c:range_addr"
 
 [[constraints.mem]]
 kind = "interaction"
