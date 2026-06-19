@@ -33,27 +33,7 @@ desc = "whether to load the contents of address `rs2` (1) or `0` (0) into `rv2`.
 [[variables.output]]
 name = "write_register"
 type = "Bit"
-desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`$."
-
-[[variables.output]]
-name = "mem_2B"
-type = "Bit"
-desc = "whether the memory access (read or write) touches exactly $2$ bytes."
-
-[[variables.output]]
-name = "mem_4B"
-type = "Bit"
-desc = "whether the memory access (read or write) touches exactly $4$ bytes."
-
-[[variables.output]]
-name = "mem_8B"
-type = "Bit"
-desc = "whether the memory access (read or write) touches exactly $8$ bytes."
-
-[[variables.output]]
-name = "c_type"
-type = "Bit"
-desc = "Whether the instruction is of type `C`, i.e., whether it is $2$ bytes long instead of $4$."
+desc = "whether the result should be written to `rd` ($=0$ for memory write and when $#`rd` = #`x0`)$."
 
 [[variables.output]]
 name = "imm"
@@ -61,105 +41,124 @@ type = "DWordWL"
 desc = "the *fully extended (!)* 64-bit version of the immediate."
 
 [[variables.output]]
-name = "signed"
-type = "Bit"
-desc = "selector used to indicate signed or unsigned input interpretation."
-
-[[variables.output]]
-name = "mp_selector"
-type = "Bit"
-desc = """Multi-purpose selector used by the CPU to to configure several ALU operations in different ways. 
-          See the `CPU` chip for more details."""
-
-[[variables.output]]
-name = "muldiv_selector"
-type = "Bit"
-desc = "selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted."
-
-[[variables.output]]
 name = "word_instr"
 type = "Bit"
 desc = "Whether the instruction is a `*W` instruction, requiring the inputs and outputs to be (sign) extended."
 
 [[variables.output]]
+name = "ALU"
+type = "Bit"
+desc = "Enable the ALU"
+
+[[variables.output]]
 name = "ADD"
 type = "Bit"
-desc = "ALU selector flag"
+desc = "ALU does an ADD"
 
 [[variables.output]]
 name = "SUB"
 type = "Bit"
-desc = "ALU selector flag"
+desc = "ALU does a SUB"
 
 [[variables.output]]
-name = "SLT"
+name = "BRANCH"
 type = "Bit"
-desc = "ALU selector flag"
+desc = "The instruction is a branch"
 
 [[variables.output]]
-name = "AND"
+name = "MEMORY"
 type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "OR"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "XOR"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "SHIFT"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "JALR"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "BEQ"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "BLT"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "LOAD"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "STORE"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "MUL"
-type = "Bit"
-desc = "ALU selector flag"
-
-[[variables.output]]
-name = "DIVREM"
-type = "Bit"
-desc = "ALU selector flag"
+desc = "The instruction is a memory access"
 
 [[variables.output]]
 name = "ECALL"
 type = "Bit"
-desc = "ALU selector flag"
+desc = "Perform an ECALL"
 
 [[variables.output]]
-name = "EBREAK"
+name = "half_instruction_length"
+type = "Byte"
+desc = "Half of how many bytes this instruction takes up in the program"
+
+[[variables.auxiliary]]
+name = "alu_op"
+type = "B4"
+desc = "Operation selector value for the ALU"
+
+[[variables.auxiliary]]
+name = "signed"
 type = "Bit"
-desc = "ALU selector flag"
+desc = "selector used to indicate signed or unsigned input interpretation."
+
+[[variables.auxiliary]]
+name = "signed2"
+type = "Bit"
+desc = """A second signed bit, useful for MUL instructions"""
+
+[[variables.auxiliary]]
+name = "muldiv_selector"
+type = "Bit"
+desc = "selects which output of `MUL` (lo/hi) or `DVRM` (quo/rem) is wanted."
+
+[[variables.auxiliary]]
+name = "invert"
+type = "Bit"
+desc = "Instructs the EQ or LT chip to invert its result, or inverts the direction of the SHIFT chip (right instead of left)"
+
+[[variables.auxiliary]]
+name = "memory_op"
+type = "Bit"
+desc = "Selects whether to LOAD (0) or STORE (1)"
+
+[[variables.auxiliary]]
+name = "mem_2B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $2$ bytes."
+
+[[variables.auxiliary]]
+name = "mem_4B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $4$ bytes."
+
+[[variables.auxiliary]]
+name = "mem_8B"
+type = "Bit"
+desc = "whether the memory access (read or write) touches exactly $8$ bytes."
+
+[[variables.auxiliary]]
+name = "mem_signed"
+type = "Bit"
+desc = "Whether the memory operation is a signed one, this is distinct from `signed` to enable the `JALR` flag to alias `mem_flags`"
+
+[[variables.auxiliary]]
+name = "JALR"
+type = "Bit"
+desc = "The branch is a JAL(R)"
+
+[[variables.virtual]]
+name = "alu_flags"
+type = "Byte"
+desc = "The combined ALU flags"
+def = ["+",
+          "alu_op",
+          ["*", 32, "signed"],
+          ["*", 64, ["+", "signed2", "invert"]],
+          ["*", 128, "muldiv_selector"]
+]
+
+[[variables.virtual]]
+name = "mem_flags"
+type = "Byte"
+desc = "The combined memory flags (or JALR when BRANCHing)"
+def = ["+",
+          "JALR",
+          "memory_op",
+          ["*", 2, "mem_signed"],
+          ["*", 4, "mem_2B"],
+          ["*", 8, "mem_4B"],
+          ["*", 16, "mem_8B"]
+]
+
 
 [[variables.multiplicity]]
 name = "μ"

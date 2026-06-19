@@ -20,24 +20,16 @@ pub enum SyscallNumbers {
 #[cfg(target_arch = "riscv64")]
 const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 
+/// Syscall number for the ECSM secp256k1 scalar-multiply accelerator (-11 as usize).
 #[cfg(target_arch = "riscv64")]
-/// This is a template for printing in the vm
-pub fn print_string(s: &str) {
-    unsafe {
-        asm!(
-            "ecall",
-            in("a0") s.as_ptr(),
-            in("a1") s.len(),
-            in("a7") SyscallNumbers::Print as usize,
-        );
-    }
-}
+const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
-#[cfg(not(target_arch = "riscv64"))]
-/// This is a template for printing in the vm
-pub fn print_string(_: &str) {
-    unimplemented!("syscalls are only implemented for riscv64 targets");
-}
+/// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
+/// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
+/// needed in provable programs, so `print_string` does nothing on every target.
+/// Keep it as a no-op rather than deleting call sites: that way no guest path can
+/// ever reintroduce an unmatched Print ecall. (See `SyscallNumbers::Print`.)
+pub fn print_string(_s: &str) {}
 
 /// # Safety
 ///
@@ -139,6 +131,28 @@ pub fn keccak_permute(state: &mut [u64; 25]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Apply the Keccak-f[1600] permutation to a 25-element u64 state in-place.
 pub fn keccak_permute(_state: &mut [u64; 25]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator. All values are 32-byte
+/// little-endian. Requires `0 < k < N` and a canonical valid `xG` curve coordinate.
+/// `xG` and `k` must not overlap; `xR` may alias either input.
+pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") xr.as_mut_ptr(), // x10 = address to write xR
+            in("a1") xg.as_ptr(),     // x11 = address of xG
+            in("a2") k.as_ptr(),      // x12 = address of k
+            in("a7") ECSM_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
+pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

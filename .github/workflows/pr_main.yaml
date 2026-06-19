@@ -37,6 +37,9 @@ jobs:
       - name: Run lint checks
         run: make lint
 
+      - name: Check ethrex fixture checksums
+        run: make check-ethrex-fixture-checksums
+
   test-executor:
     name: Executor tests
     runs-on: ubuntu-latest
@@ -96,7 +99,6 @@ jobs:
 
       - name: Run ignored executor tests
         run: |
-          make prepare-test-data
           cargo test --release -p executor test_ethrex -- --ignored
           cargo test --release -p executor test_ckzg -- --ignored
 
@@ -213,7 +215,7 @@ jobs:
       - name: Build and archive prover + crypto tests
         run: |
           cargo nextest archive --release \
-            -p lambda-vm-prover -p stark -p crypto \
+            -p lambda-vm-prover -p stark -p crypto -p ecsm \
             --archive-file prover-tests.tar.zst
 
       - name: Upload test archive

@@ -449,7 +449,7 @@ impl AddConstraint {
         let carry = match self.carry_idx {
             0 => self.compute_carry_0(step),
             1 => self.compute_carry_1(step),
-            _ => panic!("Invalid carry index"),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
 
         if self.cond_cols.is_empty() {

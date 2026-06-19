@@ -26,10 +26,14 @@ and convenience functionalities over small domains.
 
 The #bitwise chip is comprised of #nr_variables variables that are expressed using #nr_columns columns.
 Of these, the _input_ and _output_ variables (#nr_precomputed in total) are precomputed.
+
 #render_chip_variable_table(chip, config)
 
 *Note*: This table contains one row for every possible value of `(X, Y, Z)`.
 As such, it has length $2^8 dot 2^8 dot 2^4 = 2^(20)$.
+
+We use the ALU operation descriptors from @decode to identify the operations in the `BYTE_ALU` interaction.
+Since each of the three columns is only $2^16$ rows long, they can be combined in a single $2^20$ column (with room to spare).
 
 = Lookup
 This chip adds the following interactions to the lookup:
@@ -37,8 +41,6 @@ This chip adds the following interactions to the lookup:
 
 = Notes/Optimizations
 The following ideas may prove to be optimizations for the #bitwise chip:
-+ Extend `IS_BYTE[X]` to `ARE_BYTES[X, Y]`, such that two bytes are range checked at once. 
-  When only a single check is required, one can still execute `IS_BYTE[X] := ARE_BYTES[X, 0]`.
 + Drop `MSB8` column, and instead define the `MSB8` lookup as `MSB8<X> := MSB16[256X]`.
   Note: currently, `MSB8` also implicity range checks the input `X` (the lookup fails if `X` is not a `Byte`).
   This optimization should only be executed when all chips leveraging `MSB8` do _not_ need this implicit range check.

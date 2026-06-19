@@ -7,10 +7,16 @@ license.workspace = true
 [dependencies]
 thiserror = "1.0.68"
 rustc-demangle = "0.1"
+ecsm = { path = "../crypto/ecsm" }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", package="guest_program", default-features = false, branch = "crypto-default-features" }
+# Exact pin: must match the fixture writer + guest so the rkyv ProgramInput
+# layout the executor tests read stays consistent (see tooling/ethrex-fixtures).
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
+# Native reference for the ethrex tests (host-side `execution_program` with
+# `NativeCrypto`). Pinned to the same ethrex rev as the guest ELF
+# (executor/programs/rust/ethrex) — the open LambdaVM-backend PR branch.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program" }

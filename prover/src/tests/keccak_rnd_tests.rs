@@ -47,7 +47,7 @@ fn test_pi_virtual_matches_rotate() {
             for z in 0..8 {
                 let (l_col, r_col) = cols::pi_src_cols(x, y, z);
                 let virtual_pi =
-                    &trace.main_table.data[base + l_col] + &trace.main_table.data[base + r_col];
+                    trace.main_table.data[base + l_col] + trace.main_table.data[base + r_col];
                 let expected = FE::from((rotated >> (z * 8)) & 0xFF);
                 assert_eq!(
                     virtual_pi, expected,

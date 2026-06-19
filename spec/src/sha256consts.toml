@@ -1,0 +1,28 @@
+name = "SHA256_K"
+
+[[variables.input]]
+name = "index"
+type = "BaseField"
+desc = ""
+precomputed = true
+
+[[variables.input]]
+name = "K"
+type = "Word"
+desc = ""
+precomputed = true
+
+[[variables.multiplicity]]
+name = "μ"
+type = "BaseField"
+desc = ""
+
+[[constraint_groups]]
+name = "contributions"
+
+[[constraints.contributions]]
+kind = "interaction"
+tag = "SHA256_K"
+input = ["index"]
+output = "K"
+multiplicity = ["-", "μ"]

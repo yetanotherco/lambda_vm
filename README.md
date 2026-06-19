@@ -4,9 +4,13 @@ A verifiable virtual machine developed in collaboration with [Lambdaclass](https
 
 This open-source zkVM lets users prove the correct execution of a program over a given input stream. The current implementation generates base proofs using STARKs over the Goldilocks field, with 128 bits of security and LogUp as the lookup argument linking tables.
 
-Proof accelerators, GPU support, and proof compression are under development.
+Proof accelerators, GPU support, and proof compression are under development; see the [Roadmap](#roadmap) for the full plan and how the pieces fit together.
 
 > ⚠️ **This project is under active development and experimentation — do not use in production.**
+
+## Roadmap
+
+The **[public roadmap](https://yetanotherco.github.io/lambda_vm_roadmap/)** lays out what's in progress and what's planned, along with the ordering and dependencies between those workstreams.
 
 ## Getting Started
 
@@ -15,7 +19,7 @@ Proof accelerators, GPU support, and proof compression are under development.
 - Rust nightly with `rust-src` component
 - Clang with RISC-V target support and LLD linker (used by `make compile-programs-asm`)
   - **macOS**: `brew install llvm` (the Homebrew LLVM includes `clang` and `lld` with RISC-V support)
-  - **Linux**: `apt install clang lld` (or equivalent for your distribution)
+  - **Linux**: use LLVM 21+ from apt.llvm.org or your distribution; older distro clang packages may reject the assembly fixtures' RISC-V ISA attributes
 
 ### Dev dependencies
 
@@ -46,14 +50,15 @@ Some of the tests require linking with C libraries.
 The easiest way is to let `make` do it:
 
 ```sh
+SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # recommended: user-writable, no sudo
 make prepare-sysroot                                       # installs to /opt (uses sudo)
-SYSROOT_DIR=$HOME/.lambda-vm-sysroot make prepare-sysroot  # user-writable, no sudo
 ```
 
 Or do it manually:
 
 ```sh
 wget https://lambda.alignedlayer.com/lambda-vm-sysroot-rv64im.tar.gz
+echo "420e394a096f3859235e3a8121a8d5a10f995ac48e636e8d700f17d50803a0e7  lambda-vm-sysroot-rv64im.tar.gz" | sha256sum -c -
 sudo mkdir -p /opt && sudo tar -xzf lambda-vm-sysroot-rv64im.tar.gz -C /opt
 ```
 

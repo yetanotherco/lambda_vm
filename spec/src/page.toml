@@ -40,16 +40,14 @@ def = ["+", "page", ["*", "offset", ["cast", 1, "DWordWL"]]]
 name = "all"
 
 [[constraints.all]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["init"]
-multiplicity = 1
 
 [[constraints.all]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = ["fini"]
-multiplicity = 1
 
 [[constraints.all]]
 kind = "interaction"

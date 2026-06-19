@@ -97,6 +97,13 @@ iter = ["i", 0, 1]
 desc = "`IS_BIT<JALR>`"
 
 
+[[constraint_groups]]
+name = "assumptions"
+
+[[constraints.assumptions]]
+kind = "template"
+tag = "IS_BIT"
+input = ["JALR"]
 
 [[constraint_groups]]
 name = "all"
@@ -116,15 +123,15 @@ output = "next_pc_unmasked"
 cond = "JALR"
 
 [[constraints.all]]
-kind = "interaction"
+kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "next_pc_low", 1]]
-multiplicity = "μ"
+cond = "μ"
 
 [[constraints.all]]
 kind = "interaction"
-tag = "AND_BYTE"
-input = ["unmasked_low_byte", 254]
+tag = "BYTE_ALU"
+input = [["opsel", "AND"], "unmasked_low_byte", 254]
 output = ["idx", "next_pc_low", 0]
 multiplicity = "μ"
 
