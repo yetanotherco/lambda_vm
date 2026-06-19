@@ -15,13 +15,15 @@
 //!   where R = rows_per_leaf and br(j) = reverse_index(j, num_rows)
 //! ```
 //!
-//! - `rows_per_leaf == 1`: one row per leaf — main/aux trace LDE columns.
-//! - `rows_per_leaf == 2`: a row pair per leaf — composition-polynomial parts
-//!   (Round 2/3), where leaf `i` hashes rows `2i` and `2i+1`.
+//! - `rows_per_leaf == 2` (`ROWS_PER_LEAF`): a row pair per leaf (leaf `i` hashes
+//!   rows `2i` and `2i+1`). Used by BOTH the main/aux trace LDE and the
+//!   composition-polynomial parts: a FRI query opens a value and its symmetric
+//!   counterpart — exactly this pair — so one Merkle path authenticates both.
+//! - `rows_per_leaf == 1`: one row per leaf. No longer used by the prover; kept
+//!   only so the GPU parity tests can compare against the per-row code path.
 //!
 //! The field-element serialization (`write_bytes_be`) + `hash_bytes` path is kept
-//! exactly as before, so commitments are byte-identical to the previous
-//! per-row / per-row-pair implementations.
+//! exactly as before.
 
 use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
@@ -34,8 +36,9 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 
 /// Number of consecutive (bit-reversed) rows packed into one Merkle leaf for the
-/// composition-polynomial commitment: the row-pair leaf packing the FRI openings
-/// rely on (leaf `i` hashes rows `2i` and `2i+1`).
+/// trace AND composition-polynomial commitments: the row-pair leaf the FRI
+/// openings rely on (leaf `i` hashes rows `2i` and `2i+1`, so one Merkle path
+/// authenticates both a value and its symmetric counterpart).
 pub const ROWS_PER_LEAF: usize = 2;
 
 /// Computes the Keccak-256 leaf hashes for a bit-reversed, column-major commitment,
@@ -103,12 +106,12 @@ where
     result
 }
 
-/// Per-row Keccak-256 leaf hashes (one leaf per bit-reversed row). Used for the
-/// main/aux trace LDE commitments. Thin wrapper over
-/// [`keccak_leaves_bit_reversed_grouped`] with `rows_per_leaf = 1`.
+/// Per-row Keccak-256 leaf hashes (one leaf per bit-reversed row). Thin wrapper
+/// over [`keccak_leaves_bit_reversed_grouped`] with `rows_per_leaf = 1`.
 ///
-/// Kept as a named public function because the GPU parity tests in dependent
-/// crates compare against this exact code path.
+/// The prover no longer commits per-row (trace and composition both use the
+/// row-pair layout, `ROWS_PER_LEAF`); this stays a named public function only so
+/// the GPU parity tests in dependent crates can compare the per-row code path.
 pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
 where
     E: IsField,
