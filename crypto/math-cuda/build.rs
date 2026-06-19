@@ -121,4 +121,5 @@ fn main() {
     compile_ptx("decode_trace.cu", "decode_trace.ptx", have_nvcc);
     compile_ptx("bitwise_trace.cu", "bitwise_trace.ptx", have_nvcc);
     compile_ptx("load_trace.cu", "load_trace.ptx", have_nvcc);
+    compile_ptx("store_trace.cu", "store_trace.ptx", have_nvcc);
 }

@@ -98,6 +98,14 @@ pub fn generate_store_trace(
     operations: &[StoreOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack per-op data into four parallel u64 arrays,
+    // kernel lays out + byte-decomposes values.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_store_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -117,6 +125,49 @@ pub fn generate_store_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_store_trace`. Packs per-op fields into four
+/// parallel u64 arrays (padded to num_rows). Kernel does the byte
+/// decomposition of `value` into VALUE[0..7] columns.
+#[cfg(feature = "cuda")]
+fn try_generate_store_trace_gpu(
+    operations: &[StoreOperation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut base_addresses = vec![0u64; num_rows];
+    let mut timestamps = vec![0u64; num_rows];
+    let mut values = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+
+    for (i, op) in operations.iter().enumerate() {
+        base_addresses[i] = op.base_address;
+        timestamps[i] = op.timestamp;
+        values[i] = op.value;
+        let mut f = 0u64;
+        if op.write2 {
+            f |= 1 << 0;
+        }
+        if op.write4 {
+            f |= 1 << 1;
+        }
+        if op.write8 {
+            f |= 1 << 2;
+        }
+        f |= 1 << 3; // MU = 1 for active rows
+        flags[i] = f;
+    }
+
+    let raw = stark::gpu_lde::try_generate_store_trace_gpu_raw(
+        num_rows,
+        &base_addresses,
+        &timestamps,
+        &values,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================
