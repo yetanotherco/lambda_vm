@@ -43,6 +43,7 @@ use stark::trace::TraceTable;
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::limbs::set_limbs_32;
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW_A table chunk.
@@ -118,8 +119,7 @@ pub fn generate_memw_aligned_trace(
             data[base + cols::VALUE[i]] = FE::from(op.value[i]);
         }
 
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
 
         let (w2, w4, w8) = op.write_flags();
         data[base + cols::WRITE2] = FE::from(w2 as u64);
@@ -131,8 +131,7 @@ pub fn generate_memw_aligned_trace(
         }
 
         // Single old_timestamp (from old_timestamp[0], verified equal for all bytes)
-        data[base + cols::OLD_TIMESTAMP_0] = FE::from(op.old_timestamp[0] & 0xFFFF_FFFF);
-        data[base + cols::OLD_TIMESTAMP_1] = FE::from(op.old_timestamp[0] >> 32);
+        set_limbs_32(&mut data, base + cols::OLD_TIMESTAMP_0, op.old_timestamp[0]);
 
         data[base + cols::MU_READ] = FE::from(op.is_read as u64);
         data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);

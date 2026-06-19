@@ -25,6 +25,7 @@
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::limbs::set_limbs_32;
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -451,8 +452,7 @@ pub fn generate_cpu_trace(
         let effective = |flag: bool| (!word && flag) as u64;
 
         data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.decode.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.decode.pc >> 32);
+        set_limbs_32(&mut data, base + cols::PC_0, op.decode.pc);
 
         // rs1/rs2/rd and read/write flags are only present on non-word rows.
         let (rs1, rs2, rd) = if word {
@@ -480,8 +480,7 @@ pub fn generate_cpu_trace(
             (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
         };
 
-        data[base + cols::IMM_0] = FE::from(imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(imm >> 32);
+        set_limbs_32(&mut data, base + cols::IMM_0, imm);
 
         data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(f.half_instruction_length as u64);
         data[base + cols::WORD_INSTR] = FE::from(word as u64);
@@ -495,19 +494,14 @@ pub fn generate_cpu_trace(
         data[base + cols::BRANCH] = FE::from(effective(f.branch));
         data[base + cols::ECALL] = FE::from(effective(f.ecall));
 
-        data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
-        data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
+        set_limbs_32(&mut data, base + cols::NEXT_PC_0, op.next_pc);
 
-        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(rvd >> 32);
+        set_limbs_32(&mut data, base + cols::RVD_0, rvd);
 
         // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
-        data[base + cols::RV1_0] = FE::from(rv1 & 0xFFFF_FFFF);
-        data[base + cols::RV1_1] = FE::from(rv1 >> 32);
-        data[base + cols::RV2_0] = FE::from(rv2 & 0xFFFF_FFFF);
-        data[base + cols::RV2_1] = FE::from(rv2 >> 32);
-        data[base + cols::ARG2_0] = FE::from(arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(arg2 >> 32);
+        set_limbs_32(&mut data, base + cols::RV1_0, rv1);
+        set_limbs_32(&mut data, base + cols::RV2_0, rv2);
+        set_limbs_32(&mut data, base + cols::ARG2_0, arg2);
 
         // res as DWordHL (4 × 16-bit halves).
         for i in 0..4 {

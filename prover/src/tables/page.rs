@@ -41,6 +41,7 @@ use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::limbs::set_limbs_32;
 
 // =========================================================================
 // Constants
@@ -203,8 +204,7 @@ pub fn generate_page_trace(
         };
 
         data[base + cols::FINI] = FE::from(fini_value as u64);
-        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_LO, timestamp);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
