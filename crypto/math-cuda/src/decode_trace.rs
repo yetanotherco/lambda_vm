@@ -16,6 +16,27 @@ use crate::device::backend;
 
 const BLOCK_SIZE: u32 = 256;
 
+/// Test-only fault injection. Same shape as `page_trace.rs`.
+#[cfg(feature = "test-faults")]
+pub static FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(feature = "test-faults")]
+fn check_decode_trace_fault_injection() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let v = FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed);
+    if v < 0 {
+        return Ok(());
+    }
+    let new = FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if new == 0 {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+    }
+    Ok(())
+}
+
 /// Generate the DECODE table's main columns on device.
 ///
 /// `num_cols` is the table's `cols::NUM_COLUMNS` (currently 6).
@@ -26,6 +47,8 @@ pub fn generate_decode_trace_dev(
     imms: &[u64],
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    check_decode_trace_fault_injection()?;
     assert_eq!(pcs.len(), num_rows);
     assert_eq!(packed_decodes.len(), num_rows);
     assert_eq!(imms.len(), num_rows);

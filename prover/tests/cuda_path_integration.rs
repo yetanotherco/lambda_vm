@@ -11,8 +11,9 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_decode_trace_calls,
+    gpu_deep_calls, gpu_fri_calls, gpu_lde_calls, gpu_page_trace_calls, gpu_parts_lde_calls,
+    reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -59,6 +60,18 @@ fn gpu_path_fires_end_to_end() {
     assert!(
         gpu_batch_invert_calls() > 0,
         "GPU batch-invert dispatch did not fire on R3 + R4"
+    );
+
+    // PR-6 trace-expansion ports: PAGE and DECODE main-column generation.
+    // PAGE fires once per memory page in the program (always >= 1).
+    // DECODE fires once per prove (single table build).
+    assert!(
+        gpu_page_trace_calls() > 0,
+        "PAGE trace expansion did not fire on GPU"
+    );
+    assert!(
+        gpu_decode_trace_calls() > 0,
+        "DECODE trace expansion did not fire on GPU"
     );
 
     // Counters only prove the dispatches ran; this checks the GPU proof

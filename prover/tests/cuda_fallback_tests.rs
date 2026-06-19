@@ -14,7 +14,10 @@
 
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
-use stark::gpu_lde::{gpu_batch_invert_calls, gpu_fri_calls, reset_all_gpu_call_counters};
+use stark::gpu_lde::{
+    gpu_batch_invert_calls, gpu_decode_trace_calls, gpu_fri_calls, gpu_page_trace_calls,
+    reset_all_gpu_call_counters,
+};
 
 /// FRI commit-phase CPU fallback: when the GPU dispatch errors after the
 /// first transcript mutation, `try_fri_commit_gpu` must restore the
@@ -99,4 +102,64 @@ fn gpu_batch_invert_fault_falls_back_to_cpu() {
     }
 
     stark::gpu_lde::schedule_inverse_fault(-1);
+}
+
+/// PAGE-trace CPU fallback: forcing `generate_page_trace_dev` to Err must
+/// make the prover-side wrapper return None and the CPU loop in
+/// `generate_page_trace` run to completion. Recovered proof must verify.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_page_trace_fault_falls_back_to_cpu() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let _ = prove(&elf).expect("warm-up");
+    let clean = gpu_page_trace_calls();
+    assert!(clean > 0, "GPU page-trace never ran, cannot test fallback");
+
+    for n in 1..=3i64 {
+        stark::gpu_lde::schedule_page_trace_fault(n);
+        reset_all_gpu_call_counters();
+
+        let recovered = prove(&elf).expect("prove after fault");
+        assert_eq!(
+            gpu_page_trace_calls(),
+            clean - 1,
+            "expected exactly one GPU page-trace fallback (fault #{n})"
+        );
+        assert!(
+            verify(&recovered, &elf).expect("verify recovered"),
+            "post-fallback proof failed verification (page-trace fault #{n})"
+        );
+    }
+
+    stark::gpu_lde::schedule_page_trace_fault(-1);
+}
+
+/// DECODE-trace CPU fallback: same shape as `gpu_page_trace_fault_...`.
+/// `generate_decode_trace_dev` fires once per prove, so a single injected
+/// fault drops the counter to zero and the entire decode trace is built
+/// by the existing CPU loop.
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_decode_trace_fault_falls_back_to_cpu() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let _ = prove(&elf).expect("warm-up");
+    let clean = gpu_decode_trace_calls();
+    assert!(clean > 0, "GPU decode-trace never ran, cannot test fallback");
+
+    stark::gpu_lde::schedule_decode_trace_fault(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove after fault");
+    assert_eq!(
+        gpu_decode_trace_calls(),
+        clean - 1,
+        "expected exactly one GPU decode-trace fallback",
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "post-fallback proof failed verification (decode-trace fault)",
+    );
+
+    stark::gpu_lde::schedule_decode_trace_fault(-1);
 }

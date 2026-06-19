@@ -16,6 +16,30 @@ use crate::device::backend;
 
 const BLOCK_SIZE: u32 = 256;
 
+/// Test-only fault injection. Same shape as `inverse.rs`'s
+/// `FAULT_INVERSE_REMAINING_UNTIL_ERR`: when `test-faults` is on, setting
+/// this to a finite value forces the next `generate_page_trace_dev` call
+/// to return Err, exercising the prover's CPU fallback.
+#[cfg(feature = "test-faults")]
+pub static FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
+    std::sync::atomic::AtomicI64::new(-1);
+
+#[cfg(feature = "test-faults")]
+fn check_page_trace_fault_injection() -> Result<()> {
+    use std::sync::atomic::Ordering;
+    let v = FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR.load(Ordering::Relaxed);
+    if v < 0 {
+        return Ok(());
+    }
+    let new = FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if new == 0 {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
+        ));
+    }
+    Ok(())
+}
+
 /// Generate one page table's main columns on device. Inputs are length
 /// `page_size` each; output is `page_size * num_cols` u64s row-major.
 ///
@@ -28,6 +52,8 @@ pub fn generate_page_trace_dev(
     final_timestamps: &[u64],
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    #[cfg(feature = "test-faults")]
+    check_page_trace_fault_injection()?;
     assert_eq!(init_values.len(), page_size);
     assert_eq!(final_values.len(), page_size);
     assert_eq!(final_timestamps.len(), page_size);

@@ -1073,6 +1073,22 @@ pub fn schedule_inverse_fault(n_calls_until_err: i64) {
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 
+/// Test-only: schedule the Nth upcoming `generate_page_trace_dev` call to
+/// return Err. Pass -1 to disable.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_page_trace_fault(n_calls_until_err: i64) {
+    math_cuda::page_trace::FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_decode_trace_dev` call to
+/// return Err. Pass -1 to disable.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_decode_trace_fault(n_calls_until_err: i64) {
+    math_cuda::decode_trace::FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
 /// R2 GPU dispatch: batched ext3 LDE over `parts_coefs` (composition-poly
 /// coefficient parts). Returns both the host LDE eval Vecs (needed for the
 /// R2 Merkle commit and R3 OOD path) and a device-resident `GpuLdeExt3`
