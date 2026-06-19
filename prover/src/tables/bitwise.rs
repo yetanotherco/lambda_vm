@@ -448,63 +448,6 @@ pub fn update_multiplicities(
     }
 }
 
-/// Removes rows where all multiplicity columns are zero.
-/// Returns a smaller table containing only rows with actual lookups.
-///
-/// # WARNING: UNSOUND FOR PRODUCTION
-///
-/// This function is for tests only. The reduced table is NOT a valid
-/// preprocessed table because:
-/// 1. Row indices no longer match the (x, y, z) encoding
-/// 2. The verifier cannot verify against a preprocessed commitment
-/// 3. A malicious prover could claim incorrect bitwise results
-///
-/// This is acceptable for tests because we're testing:
-/// - Bus interaction balancing (sends = receives)
-/// - Constraint satisfaction
-/// - LogUp protocol correctness
-#[cfg(test)]
-pub(crate) fn trim_zero_rows(
-    trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use super::types::FE;
-
-    let num_rows = trace.main_table.height;
-
-    // Find rows with any non-zero multiplicity
-    let kept_rows: Vec<usize> = (0..num_rows)
-        .filter(|&row| {
-            let row_data = trace.main_table.get_row(row);
-            // Check all multiplicity columns, including rows used only by a
-            // BYTE_ALU lookup.
-            (cols::MU_MSB8..=cols::MU_BYTE_ALU_XOR).any(|col| row_data[col] != FE::zero())
-        })
-        .collect();
-
-    if kept_rows.is_empty() {
-        // No lookups - return minimal table with 16 rows of zeros
-        let data = vec![FE::zero(); 16 * cols::NUM_COLUMNS];
-        return TraceTable::new_main(data, cols::NUM_COLUMNS, 1);
-    }
-
-    // Determine new table size (next power of 2, minimum 16)
-    let new_size = kept_rows.len().next_power_of_two().max(16);
-
-    // Allocate new trace data
-    let mut new_data = vec![FE::zero(); new_size * cols::NUM_COLUMNS];
-
-    // Copy kept rows to new table
-    for (new_row, &old_row) in kept_rows.iter().enumerate() {
-        let old_row_data = trace.main_table.get_row(old_row);
-        let base = new_row * cols::NUM_COLUMNS;
-        for (col, &val) in old_row_data.iter().enumerate() {
-            new_data[base + col] = val;
-        }
-    }
-
-    TraceTable::new_main(new_data, cols::NUM_COLUMNS, 1)
-}
-
 /// Types of lookups the BITWISE table provides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BitwiseOperationType {

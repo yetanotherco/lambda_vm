@@ -72,3 +72,4 @@ pub mod store_tests;
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
+pub mod trace_test_helpers;
