@@ -8,5 +8,9 @@ pub mod elf;
 pub mod flamegraph;
 #[cfg(test)]
 pub mod tests;
+// `profile` uses std (BTreeMap, io::Write), so gate it like `flamegraph` to
+// keep the no_std guest build (riscv64im-lambda-vm-elf) working.
+#[cfg(feature = "std")]
+pub mod profile;
 #[cfg(feature = "std")]
 pub mod vm;

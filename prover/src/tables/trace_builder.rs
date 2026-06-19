@@ -2440,6 +2440,41 @@ fn generate_page_tables(
 // Trace Generation
 // =============================================================================
 
+/// Per-table trace-size breakdown produced by [`Traces::table_reports`].
+///
+/// `main_cols` excludes preprocessed/precomputed columns (the prover commits
+/// only the witness columns), matching the accounting in
+/// [`Traces::total_field_elements`]. `aux_cols` is the number of committed
+/// extension-field columns (⌈bus_interactions / 2⌉).
+// Gated on `prove`: this host-side profiling report uses `String`/`format!`
+// (alloc-with-std prelude) and is only consumed by the CLI, so it is excluded
+// from the lean no_std guest build of the prover.
+#[cfg(feature = "prove")]
+#[derive(Clone, Debug)]
+pub struct TableReport {
+    /// Table name; split tables are suffixed with the chunk index, e.g. `CPU[0]`.
+    pub name: String,
+    /// Committed rows in this table (chunk).
+    pub rows: u64,
+    /// Committed main-trace (base-field) columns.
+    pub main_cols: usize,
+    /// Committed auxiliary-trace (extension-field) columns.
+    pub aux_cols: usize,
+}
+
+#[cfg(feature = "prove")]
+impl TableReport {
+    /// Main-trace field elements: `rows × main_cols`.
+    pub fn main_elements(&self) -> u64 {
+        self.rows * self.main_cols as u64
+    }
+
+    /// Auxiliary-trace field elements: `rows × aux_cols`.
+    pub fn aux_elements(&self) -> u64 {
+        self.rows * self.aux_cols as u64
+    }
+}
+
 /// All generated trace tables.
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
@@ -3575,6 +3610,225 @@ impl Traces {
         total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total
+    }
+
+    /// Per-table breakdown of trace size: rows, main columns, and aux
+    /// (extension-field) columns, for every table in the trace.
+    ///
+    /// This is the per-table decomposition of [`total_field_elements`] and
+    /// [`total_auxiliary_field_elements`]: summing `main_elements()` /
+    /// `aux_elements()` over the returned reports reproduces those totals
+    /// exactly. Split tables (CPU, MEMW, LT, …) are emitted as one report per
+    /// chunk, named `NAME[i]`, mirroring how the prover commits them.
+    ///
+    /// Intended for profiling: it shows which tables dominate the trace
+    /// (and therefore proving cost) for a given program + input.
+    ///
+    /// Gated on `prove` (returns the `prove`-only [`TableReport`] and uses
+    /// `format!`), so the no_std guest build skips it.
+    #[cfg(feature = "prove")]
+    pub fn table_reports(&self) -> Vec<TableReport> {
+        // NOTE: this branch (try-recursion-with-vkey) predates several tables
+        // present on main. It has no EQ / BYTEWISE / STORE / CPU32 / ECSM /
+        // EC_SCALAR / ECDAS chips (stores go through MEMW, comparisons through
+        // LT), so those blocks are omitted here vs. the main-branch version of
+        // this report.
+        use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
+        use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
+        use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
+        use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
+        use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
+        use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
+        use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
+        use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::halt::cols::NUM_COLUMNS as HALT_COLS;
+        use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
+        use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
+        use super::keccak_rc::cols::NUM_COLUMNS as KECCAK_RC_COLS;
+        use super::keccak_rnd::cols::NUM_COLUMNS as KECCAK_RND_COLS;
+        use super::load::cols::NUM_COLUMNS as LOAD_COLS;
+        use super::lt::cols::NUM_COLUMNS as LT_COLS;
+        use super::memw::cols::NUM_COLUMNS as MEMW_COLS;
+        use super::memw_aligned::cols::NUM_COLUMNS as MEMW_A_COLS;
+        use super::memw_register::cols::NUM_COLUMNS as MEMW_R_COLS;
+        use super::mul::cols::NUM_COLUMNS as MUL_COLS;
+        use super::page::NUM_PREPROCESSED_COLS as PAGE_PREPROCESSED;
+        use super::page::cols::NUM_COLUMNS as PAGE_COLS;
+        use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
+        use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
+        use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
+
+        // ⌈N/2⌉ = number of aux EF columns for a table with N bus interactions.
+        fn aux_cols(n: usize) -> usize {
+            n.div_ceil(2)
+        }
+
+        let mut reports = Vec::new();
+
+        // Single, possibly-split table → one report per chunk named `NAME[i]`.
+        let push_split = |reports: &mut Vec<TableReport>,
+                          name: &str,
+                          tables: &[TraceTable<GoldilocksField, GoldilocksExtension>],
+                          main_cols: usize,
+                          aux: usize| {
+            for (i, t) in tables.iter().enumerate() {
+                reports.push(TableReport {
+                    name: format!("{name}[{i}]"),
+                    rows: t.num_rows() as u64,
+                    main_cols,
+                    aux_cols: aux,
+                });
+            }
+        };
+        // Single, never-split table → one report named `NAME`.
+        let push_one = |reports: &mut Vec<TableReport>,
+                        name: &str,
+                        t: &TraceTable<GoldilocksField, GoldilocksExtension>,
+                        main_cols: usize,
+                        aux: usize| {
+            reports.push(TableReport {
+                name: name.to_string(),
+                rows: t.num_rows() as u64,
+                main_cols,
+                aux_cols: aux,
+            });
+        };
+
+        push_split(
+            &mut reports,
+            "CPU",
+            &self.cpus,
+            CPU_COLS,
+            aux_cols(super::cpu::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "BITWISE",
+            &self.bitwise,
+            BITWISE_COLS - BITWISE_PRECOMPUTED,
+            aux_cols(super::bitwise::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "LT",
+            &self.lts,
+            LT_COLS,
+            aux_cols(super::lt::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "SHIFT",
+            &self.shifts,
+            SHIFT_COLS,
+            aux_cols(super::shift::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "MEMW",
+            &self.memws,
+            MEMW_COLS,
+            aux_cols(super::memw::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "MEMW_ALIGNED",
+            &self.memw_aligneds,
+            MEMW_A_COLS,
+            aux_cols(super::memw_aligned::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "LOAD",
+            &self.loads,
+            LOAD_COLS,
+            aux_cols(super::load::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "DECODE",
+            &self.decode,
+            DECODE_COLS - DECODE_PRECOMPUTED,
+            aux_cols(super::decode::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "MUL",
+            &self.muls,
+            MUL_COLS,
+            aux_cols(super::mul::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "DVRM",
+            &self.dvrms,
+            DVRM_COLS,
+            aux_cols(super::dvrm::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "BRANCH",
+            &self.branches,
+            BRANCH_COLS,
+            aux_cols(super::branch::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "HALT",
+            &self.halt,
+            HALT_COLS,
+            aux_cols(super::halt::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "COMMIT",
+            &self.commit,
+            COMMIT_COLS,
+            aux_cols(super::commit::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "REGISTER",
+            &self.register,
+            REGISTER_COLS - REGISTER_PREPROCESSED,
+            aux_cols(super::register::bus_interactions().len()),
+        );
+        push_split(
+            &mut reports,
+            "PAGE",
+            &self.pages,
+            PAGE_COLS - PAGE_PREPROCESSED,
+            aux_cols(super::page::bus_interactions(0).len()),
+        );
+        push_split(
+            &mut reports,
+            "MEMW_REGISTER",
+            &self.memw_registers,
+            MEMW_R_COLS,
+            aux_cols(super::memw_register::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "KECCAK",
+            &self.keccak,
+            KECCAK_COLS,
+            aux_cols(super::keccak::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "KECCAK_RND",
+            &self.keccak_rnd,
+            KECCAK_RND_COLS,
+            aux_cols(super::keccak_rnd::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "KECCAK_RC",
+            &self.keccak_rc,
+            KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED,
+            aux_cols(super::keccak_rc::bus_interactions().len()),
+        );
+
+        reports
     }
 
     /// Returns the number of chunks for each split table.

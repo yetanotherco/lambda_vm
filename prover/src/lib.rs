@@ -742,6 +742,39 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
     ))
 }
 
+/// Build the trace tables for an ELF + input and return a per-table size
+/// breakdown (rows, main columns, aux columns) without running the STARK proof.
+///
+/// Summing `main_elements()` / `aux_elements()` over the result reproduces the
+/// totals from [`count_elements`] exactly. Intended for profiling: it shows
+/// which tables dominate the trace, and therefore proving cost, for a given
+/// program + input.
+///
+/// Gated on `prove` like [`count_elements`]: it builds traces via the
+/// executor + `Traces::from_elf_and_logs`, which are only compiled with that
+/// feature (so the no_std guest build of the prover stays lean).
+#[cfg(feature = "prove")]
+pub fn table_report(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+) -> Result<Vec<crate::tables::trace_builder::TableReport>, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &MaxRowsConfig::default(),
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )?;
+    Ok(traces.table_reports())
+}
+
 /// Prove an ELF binary execution with custom proof options and max rows config.
 #[cfg(feature = "prove")]
 pub fn prove_with_options(

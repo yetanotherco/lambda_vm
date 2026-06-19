@@ -1,7 +1,7 @@
 //! Lambda VM CLI - execute, prove, and verify RISC-V programs.
 
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -13,9 +13,11 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::{
     elf::{Elf, SymbolTable},
     flamegraph::FlamegraphGenerator,
+    profile::InstrHistogram,
     vm::execution::Executor,
 };
 use prover::VmProof;
+use prover::tables::trace_builder::TableReport;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
@@ -149,6 +151,11 @@ enum Commands {
         /// all tables) and aux-trace field elements (committed EF columns × rows)
         #[arg(long)]
         elements: bool,
+
+        /// With --elements, also print a per-table breakdown (rows, columns,
+        /// field elements, % of total) sorted by cost.
+        #[arg(long)]
+        tables: bool,
     },
 
     /// Verify a proof bundle
@@ -179,6 +186,11 @@ enum Commands {
         /// Path to the private input file
         #[arg(long, value_hint = ValueHint::FilePath)]
         private_input: Option<PathBuf>,
+
+        /// Print a per-table breakdown (rows, columns, field elements, % of
+        /// total) sorted by cost, in addition to the totals.
+        #[arg(long)]
+        tables: bool,
     },
 }
 
@@ -202,6 +214,7 @@ fn main() -> ExitCode {
             cycles,
             flamegraph,
             elements,
+            tables,
         } => cmd_prove(
             elf,
             output,
@@ -211,6 +224,7 @@ fn main() -> ExitCode {
             cycles,
             flamegraph,
             elements,
+            tables,
         ),
         Commands::Verify {
             proof,
@@ -218,7 +232,11 @@ fn main() -> ExitCode {
             blowup,
             time,
         } => cmd_verify(proof, elf, blowup, time),
-        Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
+        Commands::CountElements {
+            elf,
+            private_input,
+            tables,
+        } => cmd_count_elements(elf, private_input, tables),
     }
 }
 
@@ -232,37 +250,64 @@ fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
     }
 }
 
+/// What a profiling run should accumulate, in addition to the cycle count.
+#[derive(Default, Clone, Copy)]
+struct ProfileOpts {
+    flamegraph: bool,
+    histogram: bool,
+}
+
+/// Result of a profiling run (besides the cycle count).
+#[derive(Default)]
+struct ProfileResult {
+    flamegraph: Option<FlamegraphGenerator>,
+    histogram: Option<InstrHistogram>,
+}
+
 /// Run an ELF to completion in chunks, returning the dynamic instruction
-/// (cycle) count and, if `collect_flamegraph` is set, the folded-stack
-/// flamegraph generator (symbols resolved from `elf_data`).
+/// (cycle) count and whichever profiling artifacts `opts` requested
+/// (flamegraph symbols are resolved from `elf_data`).
 ///
-/// Used by both `execute` and the `prove` cycle pre-pass so the same run can
-/// produce a cycle count and a flamegraph without executing twice.
+/// Used by both `execute` and the `prove` cycle pre-pass so a single run can
+/// produce the cycle count plus any requested profiles without re-executing.
 fn run_and_profile(
     program: &Elf,
     elf_data: &[u8],
     private_inputs: Vec<u8>,
-    collect_flamegraph: bool,
-) -> Result<(u64, Option<FlamegraphGenerator>), String> {
+    opts: ProfileOpts,
+) -> Result<(u64, ProfileResult), String> {
     let mut executor = Executor::new(program, private_inputs).map_err(|e| format!("{e:?}"))?;
 
-    let mut generator = collect_flamegraph.then(|| {
+    let mut generator = opts.flamegraph.then(|| {
         let symbols = SymbolTable::parse(elf_data);
         FlamegraphGenerator::new(symbols, program.entry_point)
     });
+    let mut histogram = opts.histogram.then(InstrHistogram::new);
 
     let mut cycle_count: u64 = 0;
     while let Some(logs) = executor.resume().map_err(|e| format!("{e:?}"))? {
         cycle_count += logs.len() as u64;
-        if let Some(ref mut fg) = generator {
+        if generator.is_some() || histogram.is_some() {
             let logs: Vec<_> = logs.to_vec();
-            fg.process_logs(&logs, &executor.instructions)
-                .map_err(|e| format!("Failed to process logs for flamegraph: {e:?}"))?;
+            if let Some(ref mut fg) = generator {
+                fg.process_logs(&logs, &executor.instructions)
+                    .map_err(|e| format!("Failed to process logs for flamegraph: {e:?}"))?;
+            }
+            if let Some(ref mut h) = histogram {
+                h.process_logs(&logs, &executor.instructions)
+                    .map_err(|e| format!("Failed to process logs for histogram: {e:?}"))?;
+            }
         }
     }
     executor.finish().map_err(|e| format!("{e:?}"))?;
 
-    Ok((cycle_count, generator))
+    Ok((
+        cycle_count,
+        ProfileResult {
+            flamegraph: generator,
+            histogram,
+        },
+    ))
 }
 
 /// Write a flamegraph generator's folded stacks to `output_path`.
@@ -355,7 +400,7 @@ fn cmd_execute(
     }
 
     // Write flamegraph output if requested
-    if let (Some(output_path), Some(generator)) = (flamegraph_path, generator)
+    if let (Some(output_path), Some(generator)) = (flamegraph_path, profile.flamegraph)
         && let Err(e) = write_flamegraph(&generator, &output_path)
     {
         eprintln!("Failed to write flamegraph output: {e}");
@@ -379,6 +424,7 @@ fn cmd_prove(
     cycles: bool,
     flamegraph_path: Option<PathBuf>,
     elements: bool,
+    tables: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
@@ -413,19 +459,19 @@ fn cmd_prove(
                 return ExitCode::FAILURE;
             }
         };
-        let (count, generator) = match run_and_profile(
-            &program,
-            &elf_data,
-            private_inputs.clone(),
-            flamegraph_path.is_some(),
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                eprintln!("Execution failed during cycle count pre-pass: {e}");
-                return ExitCode::FAILURE;
-            }
+        let opts = ProfileOpts {
+            flamegraph: flamegraph_path.is_some(),
+            histogram: false,
         };
-        if let (Some(output_path), Some(generator)) = (&flamegraph_path, generator)
+        let (count, profile) =
+            match run_and_profile(&program, &elf_data, private_inputs.clone(), opts) {
+                Ok(result) => result,
+                Err(e) => {
+                    eprintln!("Execution failed during cycle count pre-pass: {e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+        if let (Some(output_path), Some(generator)) = (&flamegraph_path, profile.flamegraph)
             && let Err(e) = write_flamegraph(&generator, output_path)
         {
             eprintln!("Failed to write flamegraph output: {e}");
@@ -437,12 +483,27 @@ fn cmd_prove(
     };
 
     // Pre-pass: build traces and count field elements without running the proof.
+    // When --tables is set, build the per-table report (and derive the totals
+    // from it, so the trace is built only once).
     let element_count = if elements {
-        match prover::count_elements(&elf_data, &private_inputs) {
-            Ok(counts) => Some(counts),
-            Err(e) => {
-                eprintln!("Failed to count elements: {:?}", e);
-                return ExitCode::FAILURE;
+        if tables {
+            match prover::table_report(&elf_data, &private_inputs) {
+                Ok(reports) => {
+                    let totals = print_table_report(&reports);
+                    Some(totals)
+                }
+                Err(e) => {
+                    eprintln!("Failed to build table report: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            }
+        } else {
+            match prover::count_elements(&elf_data, &private_inputs) {
+                Ok(counts) => Some(counts),
+                Err(e) => {
+                    eprintln!("Failed to count elements: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
             }
         }
     } else {
@@ -598,7 +659,11 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
     }
 }
 
-fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) -> ExitCode {
+fn cmd_count_elements(
+    elf_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    tables: bool,
+) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
         Err(e) => {
@@ -615,15 +680,74 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
         }
     };
 
-    match prover::count_elements(&elf_data, &private_inputs) {
-        Ok((main, aux)) => {
-            println!("Elements: {}", main);
-            println!("Aux elements (EF-cols): {}", aux);
-            ExitCode::SUCCESS
+    // With --tables, build the per-table report once and derive the totals
+    // from it; otherwise just count totals.
+    let (main, aux) = if tables {
+        match prover::table_report(&elf_data, &private_inputs) {
+            Ok(reports) => print_table_report(&reports),
+            Err(e) => {
+                eprintln!("Failed to build table report: {:?}", e);
+                return ExitCode::FAILURE;
+            }
         }
-        Err(e) => {
-            eprintln!("Failed to count elements: {:?}", e);
-            ExitCode::FAILURE
+    } else {
+        match prover::count_elements(&elf_data, &private_inputs) {
+            Ok(counts) => counts,
+            Err(e) => {
+                eprintln!("Failed to count elements: {:?}", e);
+                return ExitCode::FAILURE;
+            }
         }
+    };
+
+    println!("Elements: {}", main);
+    println!("Aux elements (EF-cols): {}", aux);
+    ExitCode::SUCCESS
+}
+
+/// Print a per-table breakdown to stderr (rows, columns, main/aux field
+/// elements, % of total main elements), sorted by descending main elements.
+/// Returns the `(total_main_elements, total_aux_elements)` so callers can also
+/// print the existing totals.
+fn print_table_report(reports: &[TableReport]) -> (u64, u64) {
+    let total_main: u64 = reports.iter().map(|r| r.main_elements()).sum();
+    let total_aux: u64 = reports.iter().map(|r| r.aux_elements()).sum();
+
+    // Sort by descending main elements; drop empty (zero-row) tables.
+    let mut sorted: Vec<&TableReport> = reports.iter().filter(|r| r.rows > 0).collect();
+    sorted.sort_by_key(|r| std::cmp::Reverse(r.main_elements()));
+
+    eprintln!();
+    eprintln!("=== TABLE BREAKDOWN (by main-trace field elements) ===");
+    eprintln!(
+        "  {:<16} {:>12} {:>5} {:>5} {:>14} {:>14} {:>7}",
+        "Table", "Rows", "MCol", "ACol", "MainElems", "AuxElems", "%",
+    );
+    eprintln!("  {}", "-".repeat(78));
+    for r in &sorted {
+        let main_e = r.main_elements();
+        let pct = if total_main > 0 {
+            main_e as f64 / total_main as f64 * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "  {:<16} {:>12} {:>5} {:>5} {:>14} {:>14} {:>6.2}%",
+            r.name,
+            r.rows,
+            r.main_cols,
+            r.aux_cols,
+            main_e,
+            r.aux_elements(),
+            pct,
+        );
     }
+    eprintln!("  {}", "-".repeat(78));
+    eprintln!(
+        "  {:<16} {:>12} {:>5} {:>5} {:>14} {:>14}",
+        "TOTAL", "", "", "", total_main, total_aux,
+    );
+    eprintln!();
+
+    (total_main, total_aux)
 }

@@ -60,6 +60,7 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output for the proven run, written during the pre-pass (outside the proving timer). See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
 | `--elements` | Build traces and print main-trace and aux-trace field element counts. |
+| `--tables` | With `--elements`, also print a per-table breakdown (rows, columns, field elements, % of total) to stderr, sorted by cost. |
 
 ### Verify
 
@@ -81,8 +82,13 @@ Returns exit code `0` on successful verification, `1` on failure.
 Build traces and print main-trace and aux-trace field element counts **without** running the proof step. Useful for sizing.
 
 ```sh
-cargo run -p cli --release -- count-elements <PROGRAM.elf> [--private-input <FILE>]
+cargo run -p cli --release -- count-elements <PROGRAM.elf> [--private-input <FILE>] [--tables]
 ```
+
+| Flag | Description |
+|---|---|
+| `--private-input <FILE>` | Pass private input bytes to the guest. |
+| `--tables` | Print a per-table breakdown (rows, main/aux columns, field elements, % of total main elements) to stderr, sorted by cost, in addition to the totals. This is the exact proving-cost decomposition — the per-table totals sum to the `Elements` / `Aux elements` figures. |
 
 ## Examples
 
