@@ -2507,6 +2507,7 @@ struct CollectedOps {
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
 fn chunk_and_generate<T>(
+    #[cfg_attr(not(feature = "instruments"), allow(unused_variables))] name: &str,
     ops: &[T],
     max_rows: usize,
     generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -2519,8 +2520,12 @@ fn chunk_and_generate<T>(
     };
     let mut tables = Vec::with_capacity(op_chunks.len());
     for chunk in op_chunks {
+        #[cfg(feature = "instruments")]
+        let t0 = std::time::Instant::now();
         #[allow(unused_mut)]
         let mut t = generate(chunk);
+        #[cfg(feature = "instruments")]
+        stark::instruments::accum_trace_build_table(name, t0.elapsed());
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             t.main_table
@@ -2801,6 +2806,7 @@ fn build_traces(
     register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
 
     let cpus = chunk_and_generate(
+        "CPU",
         &cpu_ops,
         max_rows.cpu,
         cpu::generate_cpu_trace,
@@ -2808,6 +2814,7 @@ fn build_traces(
         storage_mode,
     )?;
     let memws = chunk_and_generate(
+        "MEMW",
         &memw_ops,
         max_rows.memw,
         memw::generate_memw_trace,
@@ -2815,6 +2822,7 @@ fn build_traces(
         storage_mode,
     )?;
     let memw_aligneds = chunk_and_generate(
+        "MEMW_ALIGNED",
         &memw_aligned_ops,
         max_rows.memw_aligned,
         memw_aligned::generate_memw_aligned_trace,
@@ -2822,6 +2830,7 @@ fn build_traces(
         storage_mode,
     )?;
     let memw_registers = chunk_and_generate(
+        "MEMW_REGISTER",
         &memw_register_ops,
         max_rows.memw_register,
         memw_register::generate_memw_register_trace,
@@ -2829,6 +2838,7 @@ fn build_traces(
         storage_mode,
     )?;
     let loads = chunk_and_generate(
+        "LOAD",
         &load_ops,
         max_rows.load,
         load::generate_load_trace,
@@ -2836,6 +2846,7 @@ fn build_traces(
         storage_mode,
     )?;
     let lts = chunk_and_generate(
+        "LT",
         &lt_ops,
         max_rows.lt,
         lt::generate_lt_trace,
@@ -2843,6 +2854,7 @@ fn build_traces(
         storage_mode,
     )?;
     let shifts = chunk_and_generate(
+        "SHIFT",
         &shift_ops,
         max_rows.shift,
         shift::generate_shift_trace,
@@ -2850,6 +2862,7 @@ fn build_traces(
         storage_mode,
     )?;
     let muls = chunk_and_generate(
+        "MUL",
         &mul_ops,
         max_rows.mul,
         mul::generate_mul_trace,
@@ -2857,6 +2870,7 @@ fn build_traces(
         storage_mode,
     )?;
     let dvrms = chunk_and_generate(
+        "DVRM",
         &dvrm_ops,
         max_rows.dvrm,
         dvrm::generate_dvrm_trace,
@@ -2864,6 +2878,7 @@ fn build_traces(
         storage_mode,
     )?;
     let branches = chunk_and_generate(
+        "BRANCH",
         &branch_ops,
         max_rows.branch,
         branch::generate_branch_trace,
@@ -2873,6 +2888,7 @@ fn build_traces(
 
     // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
     let eqs = chunk_and_generate::<eq::EqOperation>(
+        "EQ",
         &eq_ops,
         max_rows.eq,
         eq::generate_eq_trace,
@@ -2880,6 +2896,7 @@ fn build_traces(
         storage_mode,
     )?;
     let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
+        "BYTEWISE",
         &bytewise_ops,
         max_rows.bytewise,
         bytewise::generate_bytewise_trace,
@@ -2887,6 +2904,7 @@ fn build_traces(
         storage_mode,
     )?;
     let stores = chunk_and_generate::<store::StoreOperation>(
+        "STORE",
         &store_ops,
         max_rows.store,
         store::generate_store_trace,
@@ -2894,6 +2912,7 @@ fn build_traces(
         storage_mode,
     )?;
     let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
+        "CPU32",
         &cpu32_ops,
         max_rows.cpu32,
         cpu32::generate_cpu32_trace,
@@ -2901,27 +2920,41 @@ fn build_traces(
         storage_mode,
     )?;
 
+    #[cfg(feature = "instruments")]
+    let bitwise_t0 = std::time::Instant::now();
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("BITWISE", bitwise_t0.elapsed());
 
     // Update DECODE multiplicities
     // Each CPU operation looks up the DECODE table once
     // Padding rows also look up pc=1 (the CPU padding entry)
     // When CPU is split, each chunk pads independently
+    #[cfg(feature = "instruments")]
+    let decode_t0 = std::time::Instant::now();
     let mut decode = decode_trace;
     let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
     decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
     decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("DECODE", decode_t0.elapsed());
 
     // Prepare register final state before scope (needs register_state ownership)
     let register_final_state = register_state.to_final_state_map();
 
     // Generate remaining traces in parallel (page, register, halt, commit).
     // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+    #[cfg(feature = "instruments")]
+    let commit_t0 = std::time::Instant::now();
     #[allow(unused_mut)]
     let mut commit_trace = commit::generate_commit_trace(&commit_ops);
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("COMMIT", commit_t0.elapsed());
 
     // Generate keccak traces (core table + per-round table + preprocessed RC)
+    #[cfg(feature = "instruments")]
+    let keccak_t0 = std::time::Instant::now();
     let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
         .iter()
         .map(|op| KeccakRoundOperation {
@@ -2934,12 +2967,20 @@ fn build_traces(
     let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
     let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
     keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("KECCAK", keccak_t0.elapsed());
 
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
+    #[cfg(feature = "instruments")]
+    let ec_t0 = std::time::Instant::now();
     let ecsm_trace = ecsm::generate_ecsm_trace(&ecsm_ops);
     let ec_scalar_trace = ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops);
     let ecdas_trace = ecdas::generate_ecdas_trace(&ecdas_ops);
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("EC*", ec_t0.elapsed());
 
+    #[cfg(feature = "instruments")]
+    let prh_t0 = std::time::Instant::now();
     #[allow(unused_mut)]
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
     #[cfg(feature = "parallel")]
@@ -2978,6 +3019,8 @@ fn build_traces(
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
         halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     }
+    #[cfg(feature = "instruments")]
+    stark::instruments::accum_trace_build_table("PAGE+REGISTER+HALT", prh_t0.elapsed());
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
