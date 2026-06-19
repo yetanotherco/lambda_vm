@@ -53,6 +53,52 @@ pub enum InstrClass {
 }
 
 impl InstrClass {
+    /// Approximate number of **main-trace rows** a single instruction of this
+    /// class contributes to the proof. Used to weight the cost flamegraph so
+    /// frame width tracks proving cost rather than raw instruction count.
+    ///
+    /// This is a deliberately coarse, documented model — not the exact committed
+    /// row count (which the prover computes after per-operation dedup and table
+    /// padding; see `lambda_vm_prover::table_report` for exact figures). It
+    /// captures the order-of-magnitude differences that matter for diagnosis:
+    ///
+    /// * every instruction drives one CPU row;
+    /// * ALU-style ops add roughly one chip row (LT/SHIFT/MUL/DVRM/bytewise);
+    /// * memory ops add MEMW + LOAD/STORE rows;
+    /// * the keccak permute syscall expands to 24 round rows plus the core +
+    ///   memory rows it reads/writes;
+    /// * the ECSM syscall expands to a 256-bit scalar decomposition plus its
+    ///   point-arithmetic and memory rows.
+    ///
+    /// Commit cost scales with the committed byte count (not captured here, since
+    /// that needs the per-call count); it is treated as a small constant.
+    pub fn trace_row_weight(self) -> u64 {
+        match self {
+            // 1 CPU row + ~1 chip row.
+            InstrClass::AluBasic => 1,
+            InstrClass::Compare => 2,
+            InstrClass::Shift => 2,
+            InstrClass::Mul => 2,
+            InstrClass::DivRem => 2,
+            // 1 CPU row + MEMW + LOAD/STORE rows.
+            InstrClass::Load => 3,
+            InstrClass::Store => 3,
+            // 1 CPU row + EQ/LT chip + branch row.
+            InstrClass::Branch => 3,
+            // Pure control flow: 1 CPU row.
+            InstrClass::Jump => 1,
+            InstrClass::Fence => 1,
+            // Precompiles dominate proving cost. keccak: 24 round rows + core +
+            // ~50 MEMW rows for the 200-byte state. ecsm: 256-bit scalar
+            // decomposition + point arithmetic + operand memory.
+            InstrClass::EcallKeccak => 80,
+            InstrClass::EcallEcsm => 300,
+            InstrClass::EcallCommit => 2,
+            InstrClass::EcallHalt => 1,
+            InstrClass::EcallOther => 1,
+        }
+    }
+
     /// Stable human-readable label for reports.
     pub fn label(self) -> &'static str {
         match self {
@@ -98,7 +144,7 @@ fn arith_class(op: ArithOp) -> InstrClass {
 
 /// Classify a single executed instruction. For ECALLs the class is refined by
 /// the syscall number, which `Log` records in `src1_val` (the guest's x17).
-fn classify(instruction: Instruction, log: &Log) -> InstrClass {
+pub fn classify(instruction: Instruction, log: &Log) -> InstrClass {
     match instruction {
         Instruction::Arith { op, .. }
         | Instruction::ArithImm { op, .. }

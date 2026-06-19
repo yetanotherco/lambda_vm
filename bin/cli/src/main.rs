@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand, ValueHint};
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::{
     elf::{Elf, SymbolTable},
-    flamegraph::FlamegraphGenerator,
+    flamegraph::{FlamegraphGenerator, WeightMode},
     profile::InstrHistogram,
     vm::execution::Executor,
 };
@@ -111,6 +111,13 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
 
+        /// Weight flamegraph frames by estimated trace-row cost instead of
+        /// instruction count, so frame width tracks proving cost (mul/div and
+        /// especially keccak/ecsm syscalls expand). Coarse estimate; see
+        /// `count-elements --tables` for exact per-table figures.
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_weighted: bool,
+
         /// Print the dynamic instruction (cycle) count
         #[arg(long)]
         cycles: bool,
@@ -146,6 +153,11 @@ enum Commands {
         /// file during the pre-pass (outside the proving timer).
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
+
+        /// Weight flamegraph frames by estimated trace-row cost instead of
+        /// instruction count (see `execute --flamegraph-weighted`).
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_weighted: bool,
 
         /// Build traces and print total main-trace field elements (rows × columns summed across
         /// all tables) and aux-trace field elements (committed EF columns × rows)
@@ -203,6 +215,7 @@ fn main() -> ExitCode {
             elf,
             private_input,
             flamegraph,
+            flamegraph_weighted,
             cycles,
         } => cmd_execute(elf, private_input, flamegraph, cycles),
         Commands::Prove {
@@ -213,6 +226,7 @@ fn main() -> ExitCode {
             time,
             cycles,
             flamegraph,
+            flamegraph_weighted,
             elements,
             tables,
         } => cmd_prove(
@@ -223,6 +237,7 @@ fn main() -> ExitCode {
             time,
             cycles,
             flamegraph,
+            flamegraph_weighted,
             elements,
             tables,
         ),
@@ -251,10 +266,22 @@ fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
 }
 
 /// What a profiling run should accumulate, in addition to the cycle count.
-#[derive(Default, Clone, Copy)]
+#[derive(Clone, Copy)]
 struct ProfileOpts {
     flamegraph: bool,
+    /// Weighting for the flamegraph (instruction count vs estimated trace cost).
+    flamegraph_weight: WeightMode,
     histogram: bool,
+}
+
+impl Default for ProfileOpts {
+    fn default() -> Self {
+        Self {
+            flamegraph: false,
+            flamegraph_weight: WeightMode::InstructionCount,
+            histogram: false,
+        }
+    }
 }
 
 /// Result of a profiling run (besides the cycle count).
@@ -280,7 +307,7 @@ fn run_and_profile(
 
     let mut generator = opts.flamegraph.then(|| {
         let symbols = SymbolTable::parse(elf_data);
-        FlamegraphGenerator::new(symbols, program.entry_point)
+        FlamegraphGenerator::with_weight_mode(symbols, program.entry_point, opts.flamegraph_weight)
     });
     let mut histogram = opts.histogram.then(InstrHistogram::new);
 
@@ -317,18 +344,33 @@ fn write_flamegraph(generator: &FlamegraphGenerator, output_path: &PathBuf) -> R
     generator
         .write_folded(&mut writer)
         .map_err(|e| format!("{e:?}"))?;
+    let unit = match generator.weight_mode() {
+        WeightMode::InstructionCount => "instructions",
+        WeightMode::TraceCost => "estimated trace-row weight",
+    };
     eprintln!(
-        "Flamegraph written to {:?} ({} instructions)",
+        "Flamegraph written to {:?} ({} {})",
         output_path,
-        generator.total_instructions()
+        generator.total_instructions(),
+        unit,
     );
     Ok(())
+}
+
+/// Map the `--flamegraph-weighted` flag to a `WeightMode`.
+fn weight_mode(weighted: bool) -> WeightMode {
+    if weighted {
+        WeightMode::TraceCost
+    } else {
+        WeightMode::InstructionCount
+    }
 }
 
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
     flamegraph_path: Option<PathBuf>,
+    flamegraph_weighted: bool,
     cycles: bool,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
@@ -423,6 +465,7 @@ fn cmd_prove(
     time: bool,
     cycles: bool,
     flamegraph_path: Option<PathBuf>,
+    flamegraph_weighted: bool,
     elements: bool,
     tables: bool,
 ) -> ExitCode {
@@ -461,6 +504,7 @@ fn cmd_prove(
         };
         let opts = ProfileOpts {
             flamegraph: flamegraph_path.is_some(),
+            flamegraph_weight: weight_mode(flamegraph_weighted),
             histogram: false,
         };
         let (count, profile) =

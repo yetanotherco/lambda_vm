@@ -41,6 +41,7 @@ cargo run -p cli --release -- execute <PROGRAM.elf> [--private-input <FILE>] [--
 |---|---|
 | `--private-input <FILE>` | Pass private input bytes to the guest (read via `get_private_input()`). |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output. See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
+| `--flamegraph-weighted` | Weight flamegraph frames by estimated trace-row cost instead of instruction count (requires `--flamegraph`). See [Cost-weighted flamegraphs](#cost-weighted-flamegraphs). |
 | `--cycles` | Count instructions during execution and print the dynamic instruction count. |
 
 ### Prove
@@ -59,6 +60,7 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--time` | Print total proving time. |
 | `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output for the proven run, written during the pre-pass (outside the proving timer). See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
+| `--flamegraph-weighted` | Weight flamegraph frames by estimated trace-row cost instead of instruction count (requires `--flamegraph`). |
 | `--elements` | Build traces and print main-trace and aux-trace field element counts. |
 | `--tables` | With `--elements`, also print a per-table breakdown (rows, columns, field elements, % of total) to stderr, sorted by cost. |
 
@@ -161,3 +163,27 @@ separate manual step and is not a dependency of the prover.
   …). They are single-instruction events, so they are not pushed onto the call
   stack — the instruction after the `ecall` returns to the same caller frame.
   This surfaces precompile syscalls, which dominate verifier runs.
+
+### Cost-weighted flamegraphs
+
+By default each instruction contributes 1 to its frame, so frame width is
+**dynamic instruction count**. With `--flamegraph-weighted`, each instruction
+instead contributes its estimated **trace-row weight**, so frame width tracks
+**proving cost**:
+
+```sh
+cargo run -p cli --release -- execute <PROGRAM.elf> \
+    --flamegraph cost.folded --flamegraph-weighted
+cat cost.folded | inferno-flamegraph --title "trace cost" > cost.svg
+```
+
+This re-weights the same call stacks so the expensive-to-prove work stands out:
+multiply/divide cost a little more than basic ALU ops, memory ops more again,
+and the keccak/ecsm precompile syscalls expand by 1–2 orders of magnitude —
+exactly the frames that dominate a verifier (recursion) run.
+
+The weights are a deliberately coarse, documented model
+(`executor::profile::InstrClass::trace_row_weight`), **not** exact committed row
+counts (which the prover computes after per-operation dedup and table padding).
+Use it to find *where* proving cost concentrates; for exact per-table figures use
+`count-elements --tables`.

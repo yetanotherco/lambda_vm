@@ -1,9 +1,12 @@
 use executor::{
     elf::{FunctionSymbol, SymbolTable},
-    flamegraph::FlamegraphGenerator,
+    flamegraph::{FlamegraphGenerator, WeightMode},
     vm::{
         execution::InstructionCache,
-        instruction::{decoding::Instruction, execution::KECCAK_SYSCALL_NUMBER},
+        instruction::{
+            decoding::{ArithOp, Instruction},
+            execution::KECCAK_SYSCALL_NUMBER,
+        },
         logs::Log,
         memory::U64HashMap,
     },
@@ -557,4 +560,77 @@ fn test_flamegraph_ecall_becomes_leaf_frame() {
         "expected 2 plain-main instructions, got:\n{output_str}"
     );
     assert_eq!(generator.total_instructions(), 3);
+}
+
+#[test]
+fn test_flamegraph_trace_cost_weighting() {
+    // TraceCost mode weights each frame by InstrClass::trace_row_weight: a basic
+    // ALU op is 1, a div is 2, a keccak ecall is large. The same run under
+    // InstructionCount would count each as 1.
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100)]);
+    let mut generator =
+        FlamegraphGenerator::with_weight_mode(symbols, 0x1000, WeightMode::TraceCost);
+
+    let instructions = make_instructions(vec![
+        (
+            0x1000,
+            Instruction::ArithImm {
+                dst: 1,
+                src: 2,
+                imm: 1,
+                op: ArithOp::Add,
+            },
+        ),
+        (
+            0x1004,
+            Instruction::Arith {
+                dst: 1,
+                src1: 2,
+                src2: 3,
+                op: ArithOp::Div,
+            },
+        ),
+        (0x1008, Instruction::EcallEbreak),
+    ]);
+
+    let logs = vec![
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x1008,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x100c,
+            src1_val: KECCAK_SYSCALL_NUMBER,
+            src2_val: 0,
+            dst_val: 0,
+        },
+    ];
+
+    generator.process_logs(&logs, &instructions).unwrap();
+
+    let mut output = Vec::new();
+    generator.write_folded(&mut output).unwrap();
+    let output_str = String::from_utf8(output).unwrap();
+
+    // main = add(1) + div(2) = 3 weight; keccak ecall leaf = 80 weight.
+    assert!(
+        output_str.contains("main 3"),
+        "expected main weight 3 (add 1 + div 2), got:\n{output_str}"
+    );
+    assert!(
+        output_str.contains("main;ecall:keccak_permute 80"),
+        "expected keccak leaf weight 80, got:\n{output_str}"
+    );
+    assert_eq!(generator.weight_mode(), WeightMode::TraceCost);
 }

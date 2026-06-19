@@ -9,6 +9,7 @@ use std::io::{self, Write};
 use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::SymbolTable;
+use crate::profile::classify;
 use crate::vm::execution::InstructionCache;
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
@@ -21,23 +22,48 @@ pub enum FlamegraphError {
     InstructionNotFound,
 }
 
+/// How each instruction contributes to a frame's weight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WeightMode {
+    /// Each instruction adds 1 — frame width is dynamic instruction count.
+    InstructionCount,
+    /// Each instruction adds its approximate trace-row weight
+    /// ([`InstrClass::trace_row_weight`]) — frame width tracks proving cost.
+    /// This is a coarse, documented estimate, not the exact committed row count
+    /// (see `lambda_vm_prover::table_report` for exact per-table figures).
+    TraceCost,
+}
+
 /// Generates flamegraph data by tracking function calls during execution.
 pub struct FlamegraphGenerator {
     /// Symbol table for address-to-name resolution
     symbols: SymbolTable,
     /// Current call stack (function entry addresses)
     call_stack: Vec<u64>,
-    /// Instruction counts per stack state: "main;foo;bar" -> count
+    /// Accumulated weight per stack state: "main;foo;bar" -> weight
     stack_counts: HashMap<String, u64>,
+    /// Whether frames are weighted by instruction count or estimated trace cost.
+    weight_mode: WeightMode,
 }
 
 impl FlamegraphGenerator {
-    /// Create a new flamegraph generator with the given symbol table.
+    /// Create a new flamegraph generator with the given symbol table. Frames
+    /// are weighted by dynamic instruction count.
     pub fn new(symbols: SymbolTable, entry_point: u64) -> Self {
+        Self::with_weight_mode(symbols, entry_point, WeightMode::InstructionCount)
+    }
+
+    /// Create a flamegraph generator with an explicit weighting mode.
+    pub fn with_weight_mode(
+        symbols: SymbolTable,
+        entry_point: u64,
+        weight_mode: WeightMode,
+    ) -> Self {
         Self {
             symbols,
             call_stack: vec![entry_point], // Start with entry point on stack
             stack_counts: HashMap::new(),
+            weight_mode,
         }
     }
 
@@ -64,7 +90,11 @@ impl FlamegraphGenerator {
                 Some(name) => format!("{};{}", self.format_stack(), name),
                 None => self.format_stack(),
             };
-            *self.stack_counts.entry(stack_key).or_insert(0) += 1;
+            let weight = match self.weight_mode {
+                WeightMode::InstructionCount => 1,
+                WeightMode::TraceCost => classify(instruction, log).trace_row_weight(),
+            };
+            *self.stack_counts.entry(stack_key).or_insert(0) += weight;
 
             // Update call stack based on instruction type
             self.update_stack(log, instruction);
@@ -156,9 +186,16 @@ impl FlamegraphGenerator {
         Ok(())
     }
 
-    /// Get the total number of instructions processed.
+    /// Total accumulated weight across all frames. In
+    /// [`WeightMode::InstructionCount`] this is the dynamic instruction count; in
+    /// [`WeightMode::TraceCost`] it is the summed estimated trace-row weight.
     pub fn total_instructions(&self) -> u64 {
         self.stack_counts.values().sum()
+    }
+
+    /// The weighting mode this generator was built with.
+    pub fn weight_mode(&self) -> WeightMode {
+        self.weight_mode
     }
 }
 
