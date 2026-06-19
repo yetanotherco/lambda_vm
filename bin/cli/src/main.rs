@@ -140,6 +140,11 @@ enum Commands {
         #[arg(long)]
         cycles: bool,
 
+        /// Generate flamegraph folded stacks for the proven run, written to this
+        /// file during the pre-pass (outside the proving timer).
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        flamegraph: Option<PathBuf>,
+
         /// Build traces and print total main-trace field elements (rows × columns summed across
         /// all tables) and aux-trace field elements (committed EF columns × rows)
         #[arg(long)]
@@ -195,8 +200,18 @@ fn main() -> ExitCode {
             blowup,
             time,
             cycles,
+            flamegraph,
             elements,
-        } => cmd_prove(elf, output, private_input, blowup, time, cycles, elements),
+        } => cmd_prove(
+            elf,
+            output,
+            private_input,
+            blowup,
+            time,
+            cycles,
+            flamegraph,
+            elements,
+        ),
         Commands::Verify {
             proof,
             elf,
@@ -215,6 +230,54 @@ fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
         }
         None => Ok(vec![]),
     }
+}
+
+/// Run an ELF to completion in chunks, returning the dynamic instruction
+/// (cycle) count and, if `collect_flamegraph` is set, the folded-stack
+/// flamegraph generator (symbols resolved from `elf_data`).
+///
+/// Used by both `execute` and the `prove` cycle pre-pass so the same run can
+/// produce a cycle count and a flamegraph without executing twice.
+fn run_and_profile(
+    program: &Elf,
+    elf_data: &[u8],
+    private_inputs: Vec<u8>,
+    collect_flamegraph: bool,
+) -> Result<(u64, Option<FlamegraphGenerator>), String> {
+    let mut executor = Executor::new(program, private_inputs).map_err(|e| format!("{e:?}"))?;
+
+    let mut generator = collect_flamegraph.then(|| {
+        let symbols = SymbolTable::parse(elf_data);
+        FlamegraphGenerator::new(symbols, program.entry_point)
+    });
+
+    let mut cycle_count: u64 = 0;
+    while let Some(logs) = executor.resume().map_err(|e| format!("{e:?}"))? {
+        cycle_count += logs.len() as u64;
+        if let Some(ref mut fg) = generator {
+            let logs: Vec<_> = logs.to_vec();
+            fg.process_logs(&logs, &executor.instructions)
+                .map_err(|e| format!("Failed to process logs for flamegraph: {e:?}"))?;
+        }
+    }
+    executor.finish().map_err(|e| format!("{e:?}"))?;
+
+    Ok((cycle_count, generator))
+}
+
+/// Write a flamegraph generator's folded stacks to `output_path`.
+fn write_flamegraph(generator: &FlamegraphGenerator, output_path: &PathBuf) -> Result<(), String> {
+    let file = File::create(output_path).map_err(|e| format!("{e}"))?;
+    let mut writer = BufWriter::new(file);
+    generator
+        .write_folded(&mut writer)
+        .map_err(|e| format!("{e:?}"))?;
+    eprintln!(
+        "Flamegraph written to {:?} ({} instructions)",
+        output_path,
+        generator.total_instructions()
+    );
+    Ok(())
 }
 
 fn cmd_execute(
@@ -267,7 +330,7 @@ fn cmd_execute(
         let logs = match executor.resume() {
             Ok(logs) => logs,
             Err(e) => {
-                eprintln!("Execution failed: {:?}", e);
+                eprintln!("Execution failed: {e}");
                 return ExitCode::FAILURE;
             }
         };
@@ -292,25 +355,11 @@ fn cmd_execute(
     }
 
     // Write flamegraph output if requested
-    if let (Some(output_path), Some(generator)) = (flamegraph_path, generator) {
-        let file = match File::create(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to create flamegraph output file: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        let mut writer = BufWriter::new(file);
-        if let Err(e) = generator.write_folded(&mut writer) {
-            eprintln!("Failed to write flamegraph output: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-
-        eprintln!(
-            "Flamegraph written to {:?} ({} instructions)",
-            output_path,
-            generator.total_instructions()
-        );
+    if let (Some(output_path), Some(generator)) = (flamegraph_path, generator)
+        && let Err(e) = write_flamegraph(&generator, &output_path)
+    {
+        eprintln!("Failed to write flamegraph output: {e}");
+        return ExitCode::FAILURE;
     }
 
     if cycles {
@@ -320,6 +369,7 @@ fn cmd_execute(
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_prove(
     elf_path: PathBuf,
     output_path: PathBuf,
@@ -327,6 +377,7 @@ fn cmd_prove(
     blowup: Option<u8>,
     time: bool,
     cycles: bool,
+    flamegraph_path: Option<PathBuf>,
     elements: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
@@ -346,10 +397,15 @@ fn cmd_prove(
         }
     };
 
-    // Pre-pass: execute once outside the timer to count dynamic instructions.
-    // Mirrors SP1's cycle-count pass so both provers report the same kind of
-    // number without inflating the measured proving time.
-    let cycle_count = if cycles {
+    // Pre-pass: execute once outside the timer to count dynamic instructions
+    // and (if requested) build a flamegraph of the proven run. Mirrors SP1's
+    // cycle-count pass so both provers report the same kind of number without
+    // inflating the measured proving time. The flamegraph is folded-stack text
+    // only — rendering to SVG (e.g. with inferno) is a separate manual step and
+    // is not linked into the prover. This pre-pass is read-only and has no
+    // effect on the trace the proof is generated from.
+    let want_prepass = cycles || flamegraph_path.is_some();
+    let cycle_count = if want_prepass {
         let program = match Elf::load(&elf_data) {
             Ok(p) => p,
             Err(e) => {
@@ -357,20 +413,25 @@ fn cmd_prove(
                 return ExitCode::FAILURE;
             }
         };
-        let executor = match Executor::new(&program, private_inputs.clone()) {
-            Ok(e) => e,
+        let (count, generator) = match run_and_profile(
+            &program,
+            &elf_data,
+            private_inputs.clone(),
+            flamegraph_path.is_some(),
+        ) {
+            Ok(result) => result,
             Err(e) => {
-                eprintln!("Failed to create executor for cycle count: {:?}", e);
+                eprintln!("Execution failed during cycle count pre-pass: {e}");
                 return ExitCode::FAILURE;
             }
         };
-        match executor.run() {
-            Ok(result) => Some(result.logs.len() as u64),
-            Err(e) => {
-                eprintln!("Execution failed during cycle count: {:?}", e);
-                return ExitCode::FAILURE;
-            }
+        if let (Some(output_path), Some(generator)) = (&flamegraph_path, generator)
+            && let Err(e) = write_flamegraph(&generator, output_path)
+        {
+            eprintln!("Failed to write flamegraph output: {e}");
+            return ExitCode::FAILURE;
         }
+        cycles.then_some(count)
     } else {
         None
     };

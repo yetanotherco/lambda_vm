@@ -58,6 +58,7 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. [default: 2] |
 | `--time` | Print total proving time. |
 | `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
+| `--flamegraph <FILE>` | Generate folded-stack flamegraph output for the proven run, written during the pre-pass (outside the proving timer). See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
 | `--elements` | Build traces and print main-trace and aux-trace field element counts. |
 
 ### Verify
@@ -129,6 +130,20 @@ cat folded.txt | inferno-flamegraph > flamegraph.svg
 cargo run -p cli --release -- execute executor/program_artifacts/bench/quicksort.elf --flamegraph /tmp/quicksort.txt
 cat /tmp/quicksort.txt | inferno-flamegraph --title "quicksort" > quicksort_flamegraph.svg
 ```
+
+You can also profile the exact run you are proving by passing `--flamegraph` to
+`prove`:
+
+```sh
+cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin --flamegraph folded.txt
+```
+
+The flamegraph is built in the same pre-pass that `--cycles` uses, i.e. an extra
+execution that runs *outside* the proving timer. This means `prove --flamegraph`
+executes the program twice (once to profile, once inside the prover), so it is
+opt-in; the trace the proof is generated from is unaffected. The folded-stack
+output is plain text — rendering it to SVG (inferno, flamegraph.pl) is a
+separate manual step and is not a dependency of the prover.
 
 ### Notes
 
