@@ -14,7 +14,7 @@
 //! - Plonky2: <https://github.com/0xPolygonZero/plonky2>
 //! - Remco Bloemen: <https://xn--2-umb.com/23/gold-reduce/>
 
-use core::hint::unreachable_unchecked;
+use core::hint::{cold_path, unreachable_unchecked};
 
 use crate::field::traits::HasDefaultTranscript;
 use crate::field::{element::FieldElement, errors::FieldError, traits::IsField};
@@ -23,23 +23,6 @@ use crate::traits::{AsBytes, ByteConversion};
 // =====================================================
 // COMPILER HINTS (inspired by Plonky3)
 // =====================================================
-
-/// Hint to the compiler that a branch is unlikely to be taken.
-/// The empty asm block acts as a barrier that prevents the compiler from
-/// converting the branch into a conditional move, which is slower when
-/// the branch is highly predictable.
-#[inline(always)]
-fn branch_hint() {
-    #[cfg(any(
-        target_arch = "aarch64",
-        target_arch = "arm",
-        target_arch = "x86",
-        target_arch = "x86_64",
-    ))]
-    unsafe {
-        core::arch::asm!("", options(nomem, nostack, preserves_flags));
-    }
-}
 
 /// Inform the compiler that a condition is always true.
 ///
@@ -86,7 +69,7 @@ impl IsField for GoldilocksField {
             unsafe {
                 assume(*a > GOLDILOCKS_PRIME && *b > GOLDILOCKS_PRIME);
             }
-            branch_hint();
+            cold_path();
             // After double overflow, sum < EPSILON, so sum + EPSILON < 2^64.
             sum += EPSILON;
         }
@@ -106,7 +89,7 @@ impl IsField for GoldilocksField {
             unsafe {
                 assume(*a < EPSILON - 1 && *b > GOLDILOCKS_PRIME);
             }
-            branch_hint();
+            cold_path();
             diff -= EPSILON;
         }
         diff
@@ -202,7 +185,7 @@ fn reduce128(x: u128) -> u64 {
     // 2^96 ≡ -1 (mod p), so x_hi_hi * 2^96 becomes -x_hi_hi
     let (mut t0, borrow) = x_lo.overflowing_sub(x_hi_hi);
     if borrow {
-        branch_hint();
+        cold_path();
         t0 -= EPSILON; // Cannot underflow
     }
 
@@ -272,7 +255,7 @@ pub(crate) fn dot_product_2(a0: u64, b0: u64, a1: u64, b1: u64) -> u64 {
         // add EPSILON^2 = (2^32-1)^2 = 2^64 - 2^33 + 1.
         // Safety: reduced < 2^64 (it's a u64), EPSILON_SQ < p,
         // so reduced + EPSILON_SQ < 2^64 + p, satisfying add_no_canonicalize's precondition.
-        branch_hint();
+        cold_path();
         const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
         unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) }
     } else {
@@ -302,11 +285,11 @@ pub(crate) fn dot_product_3(a0: u64, b0: u64, a1: u64, b1: u64, a2: u64, b2: u64
         // Each overflow represents +2^128 to the true sum.
         // 2^128 mod p = EPSILON^2 = (2^32 - 1)^2 = 2^64 - 2^33 + 1.
         // Safety: reduced < 2^64, EPSILON_SQ < p, so sum < 2^64 + p.
-        branch_hint();
+        cold_path();
         const EPSILON_SQ: u64 = EPSILON.wrapping_mul(EPSILON);
         reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
         if overflow_count > 1 {
-            branch_hint();
+            cold_path();
             reduced = unsafe { add_no_canonicalize_trashing_input(reduced, EPSILON_SQ) };
         }
     }
@@ -541,13 +524,12 @@ impl IsFFTField for GoldilocksField {
 
 impl HasDefaultTranscript for GoldilocksField {
     fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
-        loop {
+        let mut sample = [0x00u8; 8];
+        let mut int_sample = u64::MAX;
+        while int_sample >= GOLDILOCKS_PRIME {
             rng.fill(&mut sample);
-            let int_sample = u64::from_be_bytes(sample);
-            if int_sample < GOLDILOCKS_PRIME {
-                return FieldElement::from(int_sample);
-            }
+            int_sample = u64::from_be_bytes(sample);
         }
+        FieldElement::from(int_sample)
     }
 }

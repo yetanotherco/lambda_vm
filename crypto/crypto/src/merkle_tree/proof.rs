@@ -1,6 +1,4 @@
 use alloc::{collections::BTreeMap, vec::Vec};
-#[cfg(feature = "alloc")]
-use math::traits::Serializable;
 use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::{
@@ -19,15 +17,30 @@ pub struct Proof<T: PartialEq + Eq> {
     pub merkle_path: Vec<T>,
 }
 
+#[hax_lib::attributes]
 impl<T: PartialEq + Eq> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
+    // Panic-freedom contract: with no precondition, `verify` always returns a
+    // value (no panic, no divergence). The loop is a bounded fold over the
+    // finite `merkle_path`; the only fallible ops (`index % 2`, `index >> 1`)
+    // are total for the constant operands. Proved in Lean via the generated
+    // `Impl.verify` spec (see proofs/hax). hax-lib macros are no-ops in native
+    // builds, so these annotations are unconditional (cf. hax examples).
+    #[hax_lib::requires(true)]
+    #[hax_lib::ensures(|_res| true)]
+    #[hax_lib::lean::proof_method::grind]
     pub fn verify<B>(&self, root_hash: &B::Node, mut index: usize, value: &B::Data) -> bool
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
         let mut hashed_value = B::hash_data(value);
 
-        for sibling_node in self.merkle_path.iter() {
+        // Range loop (not `.iter()`) so the Rust->Lean extractors model it as a
+        // bounded `fold_range` rather than an `Iterator::fold` over a slice
+        // iterator, which the hax Lean proof-lib does not support. Equivalent:
+        // visits each `merkle_path` node once, in order.
+        for i in 0..self.merkle_path.len() {
+            let sibling_node = &self.merkle_path[i];
             if index.is_multiple_of(2) {
                 hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
             } else {
@@ -38,19 +51,6 @@ impl<T: PartialEq + Eq> Proof<T> {
         }
 
         root_hash == &hashed_value
-    }
-}
-
-#[cfg(feature = "alloc")]
-impl<T> Serializable for Proof<T>
-where
-    T: Serializable + PartialEq + Eq,
-{
-    fn serialize(&self) -> Vec<u8> {
-        self.merkle_path
-            .iter()
-            .flat_map(|node| node.serialize())
-            .collect()
     }
 }
 

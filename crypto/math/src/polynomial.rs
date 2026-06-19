@@ -17,14 +17,18 @@ pub struct Polynomial<FE> {
 impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Creates a new polynomial with the given coefficients
     pub fn new(coefficients: &[FieldElement<F>]) -> Self {
-        // Removes trailing zero coefficients at the end
-        let mut unpadded_coefficients = coefficients
-            .iter()
-            .rev()
-            .skip_while(|x| **x == FieldElement::zero())
-            .cloned()
-            .collect::<Vec<FieldElement<F>>>();
-        unpadded_coefficients.reverse();
+        // Removes trailing zero coefficients at the end.
+        // Loop form (not `.rev().skip_while().cloned()`) so the Rust->Lean
+        // extractors don't have to model iterator-adapter trait instances.
+        let zero = FieldElement::zero();
+        let mut len = coefficients.len();
+        while len > 0 && coefficients[len - 1] == zero {
+            len -= 1;
+        }
+        let mut unpadded_coefficients = Vec::with_capacity(len);
+        for coeff in &coefficients[..len] {
+            unpadded_coefficients.push(coeff.clone());
+        }
         Polynomial {
             coefficients: unpadded_coefficients,
         }
@@ -103,14 +107,15 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
     /// Scales the coefficients of a polynomial P by a factor
     /// Returns P(factor * x)
     pub fn scale<S: IsSubFieldOf<F>>(&self, factor: &FieldElement<S>) -> Self {
-        let scaled_coefficients = self
-            .coefficients
-            .iter()
-            .zip(core::iter::successors(Some(FieldElement::one()), |x| {
-                Some(x * factor)
-            }))
-            .map(|(coeff, power)| power * coeff)
-            .collect();
+        // Loop form (not `.zip(successors(..)).map().collect()`) so the
+        // Rust->Lean extractors don't have to model the `Successors`/`Zip`
+        // iterator-adapter trait instances. `power` tracks factorⁱ.
+        let mut scaled_coefficients = Vec::with_capacity(self.coefficients.len());
+        let mut power = FieldElement::one();
+        for coeff in self.coefficients.iter() {
+            scaled_coefficients.push(&power * coeff);
+            power = &power * factor;
+        }
         Self {
             coefficients: scaled_coefficients,
         }
@@ -137,12 +142,14 @@ impl<F: IsField> Polynomial<FieldElement<F>> {
         let coef = self.coefficients();
         let mut parts: Vec<Self> = Vec::with_capacity(number_of_parts);
         for i in 0..number_of_parts {
-            let coeffs: Vec<_> = coef
-                .iter()
-                .skip(i)
-                .step_by(number_of_parts)
-                .cloned()
-                .collect();
+            // Loop form (not `.skip(i).step_by(n).cloned()`) so the Rust->Lean
+            // extractors don't have to model the `Skip`/`StepBy` adapters.
+            let mut coeffs: Vec<_> = Vec::new();
+            let mut j = i;
+            while j < coef.len() {
+                coeffs.push(coef[j].clone());
+                j += number_of_parts;
+            }
             parts.push(Polynomial::new(&coeffs));
         }
         parts
@@ -222,15 +229,15 @@ where
     debug_assert_eq!(coset_points.len(), evaluations.len());
     debug_assert_eq!(coset_points.len(), inv_denoms.len());
 
-    // point * eval: F × E → E (mixed multiplication, cheaper than E × E)
-    let sum: FieldElement<E> = coset_points
-        .iter()
-        .zip(evaluations.iter())
-        .zip(inv_denoms.iter())
-        .fold(FieldElement::<E>::zero(), |acc, ((point, eval), inv_d)| {
-            let numerator = point * eval;
-            acc + numerator * inv_d
-        });
+    // point * eval: F × E → E (mixed multiplication, cheaper than E × E).
+    // Index loop (not `.zip().zip().fold()`) so the Rust->Lean extractors
+    // don't have to model the `Zip` adapter instance. All three slices have
+    // equal length (asserted above).
+    let mut sum: FieldElement<E> = FieldElement::<E>::zero();
+    for i in 0..coset_points.len() {
+        let numerator = &coset_points[i] * &evaluations[i];
+        sum = sum + numerator * &inv_denoms[i];
+    }
 
     // All scalar factors in base field F; vanishing via sub_subfield.
     let vanishing = z_pow_n.sub_subfield(coset_offset_pow_n); // E - F → E
@@ -440,8 +447,11 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
-        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
-            *coeff = w * &*coeff;
+        // Index loop (not `iter_mut().zip()`) so the Rust->Lean extractors
+        // don't hit the &mut-through-iterator restriction (hax #420) / the
+        // `IterMut` adapter instance. `weights` has at least `n` entries.
+        for i in 0..n {
+            buffer[i] = &weights[i] * &buffer[i];
         }
 
         dispatch_fft(buffer, fwd_twiddles)?;
@@ -489,8 +499,11 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         dispatch_ifft(&mut buffer[..n], inv_twiddles)?;
 
         // 2. Scale using pre-computed weights (base field) — F × E → E mixed multiplication.
-        for (coeff, w) in buffer[..n].iter_mut().zip(weights.iter()) {
-            *coeff = w * &*coeff;
+        // Index loop (not `iter_mut().zip()`) so the Rust->Lean extractors
+        // don't hit the &mut-through-iterator restriction (hax #420) / the
+        // `IterMut` adapter instance. `weights` has at least `n` entries.
+        for i in 0..n {
+            buffer[i] = &weights[i] * &buffer[i];
         }
 
         // 3. Zero-pad to lde_size

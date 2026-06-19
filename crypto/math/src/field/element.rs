@@ -112,10 +112,14 @@ impl<F: IsField> FieldElement<F> {
     where
         S: IsSubFieldOf<F>,
     {
-        S::to_subfield_vec(self.value)
-            .into_iter()
-            .map(|x| FieldElement::from_raw(x))
-            .collect()
+        // Index loop (not `.into_iter().map().collect()`) so the Rust->Lean
+        // extractors don't have to model the `IntoIter` adapter instance.
+        let raws = S::to_subfield_vec(self.value);
+        let mut out = alloc::vec::Vec::with_capacity(raws.len());
+        for x in raws {
+            out.push(FieldElement::from_raw(x));
+        }
+        out
     }
 }
 

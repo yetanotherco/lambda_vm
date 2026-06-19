@@ -33,8 +33,18 @@ bincode = "1"
 [features]
 default = ["asm", "std"]
 asm = ["sha3/asm"]
-std = ["math/std", "sha3/std", "serde?/std"]
+std = ["alloc", "math/std", "sha3/std", "serde?/std"]
 serde = ["dep:serde"]
 parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
+
+[dependencies.hax-lib]
+git = "https://github.com/hacspec/hax"
+version = "0.3.7"
+# hax-lib's requires/ensures/attributes proc-macros are no-ops in native builds;
+# kept as a normal (not cfg(hax)-gated) dep so contract annotations compile both
+# natively and under hax extraction (cf. hax's own examples).
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hax)'] }

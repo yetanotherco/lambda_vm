@@ -46,3 +46,6 @@ getrandom = { version = "0.2.15", features = ["js"] }
 [[bench]]
 name = "goldilocks_benchmark"
 harness = false
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(hax)'] }

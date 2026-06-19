@@ -75,20 +75,29 @@ where
         let new_level_begin_index = level_begin_index / 2;
         let new_level_length = level_begin_index - new_level_begin_index;
 
-        let (new_level_iter, children_iter) =
-            nodes[new_level_begin_index..level_end_index + 1].split_at_mut(new_level_length);
-
         #[cfg(feature = "parallel")]
-        let parent_and_children_zipped_iter = new_level_iter
-            .into_par_iter()
-            .zip(children_iter.par_chunks_exact(2));
+        {
+            let (new_level_iter, children_iter) =
+                nodes[new_level_begin_index..level_end_index + 1].split_at_mut(new_level_length);
+            new_level_iter
+                .into_par_iter()
+                .zip(children_iter.par_chunks_exact(2))
+                .for_each(|(new_parent, children)| {
+                    *new_parent = B::hash_new_parent(&children[0], &children[1]);
+                });
+        }
+        // Sequential path as an index loop (not `split_at_mut` +
+        // `iter_mut().zip(chunks_exact)`) so the Rust->Lean extractors don't have
+        // to model the `&mut` slice split or the `Zip`/`ChunksExact` iterator
+        // adapters. Parents occupy `[new_level_begin_index, level_begin_index)`,
+        // strictly below the children read at `level_begin_index + 2k (+1)`, so
+        // the in-place writes never clobber a child still to be read.
         #[cfg(not(feature = "parallel"))]
-        let parent_and_children_zipped_iter =
-            new_level_iter.iter_mut().zip(children_iter.chunks_exact(2));
-
-        parent_and_children_zipped_iter.for_each(|(new_parent, children)| {
-            *new_parent = B::hash_new_parent(&children[0], &children[1]);
-        });
+        for k in 0..new_level_length {
+            let child0 = level_begin_index + 2 * k;
+            let parent = B::hash_new_parent(&nodes[child0], &nodes[child0 + 1]);
+            nodes[new_level_begin_index + k] = parent;
+        }
 
         level_end_index = level_begin_index - 1;
         level_begin_index = new_level_begin_index;

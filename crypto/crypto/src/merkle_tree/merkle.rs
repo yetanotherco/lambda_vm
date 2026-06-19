@@ -172,6 +172,8 @@ where
     ///
     /// This skips the `hash_leaves` step, useful when leaves have already been
     /// hashed externally (e.g., to avoid materializing large intermediate data).
+    #[cfg_attr(hax, hax_lib::requires(hashed_leaves.len().is_power_of_two()))]
+    #[cfg_attr(hax, hax_lib::ensures(|res| true))]
     pub fn build_from_hashed_leaves(hashed_leaves: Vec<B::Node>) -> Option<Self> {
         if hashed_leaves.is_empty() {
             return None;

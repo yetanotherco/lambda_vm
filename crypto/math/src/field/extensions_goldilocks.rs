@@ -241,7 +241,14 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
     fn to_subfield_vec(
         b: <Degree2GoldilocksExtensionField as IsField>::BaseType,
     ) -> alloc::vec::Vec<Self::BaseType> {
-        b.into_iter().map(|x| x.to_raw()).collect()
+        // Index loop (not array `.into_iter().map().collect()`) so the
+        // Rust->Lean extractors don't have to model the array `IntoIter`
+        // adapter instance. `b: [FpE; 2]`, `FpE: Copy`.
+        let mut out = alloc::vec::Vec::with_capacity(b.len());
+        for i in 0..b.len() {
+            out.push(b[i].to_raw());
+        }
+        out
     }
 }
 
@@ -454,7 +461,14 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
     fn to_subfield_vec(
         b: <Degree3GoldilocksExtensionField as IsField>::BaseType,
     ) -> alloc::vec::Vec<Self::BaseType> {
-        b.into_iter().map(|x| x.to_raw()).collect()
+        // Index loop (not array `.into_iter().map().collect()`) so the
+        // Rust->Lean extractors don't have to model the array `IntoIter`
+        // adapter instance. `b: [FpE; 3]`, `FpE: Copy`.
+        let mut out = alloc::vec::Vec::with_capacity(b.len());
+        for i in 0..b.len() {
+            out.push(b[i].to_raw());
+        }
+        out
     }
 }
 

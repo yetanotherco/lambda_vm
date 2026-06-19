@@ -1,0 +1,24 @@
+name = "lambda_vm_hax_proofs"
+version = "0.1.0"
+defaultTargets = ["math"]
+
+# One lean_lib per extracted crate. hax writes each crate to <crate>.lean in this
+# directory, so the lib name matches the (lowercase) crate name / file basename.
+# Add `crypto`, `executor`, ... here as their hax extraction starts working.
+# Local supplement: opaque stubs for core_models.* stdlib models missing from
+# the pinned Hax proof-lib (see CoreModelsSupplement.lean). math.lean imports it
+# (the import is injected by proofs/scripts/patch_hax_math.py after extraction).
+[[lean_lib]]
+name = "CoreModelsSupplement"
+
+[[lean_lib]]
+name = "math"
+
+[[lean_lib]]
+name = "crypto"
+
+[[require]]
+name = "Hax"
+git.url = "https://github.com/cryspen/hax"
+git.subDir = "hax-lib/proof-libs/lean"
+rev = "a1f1f976b893a3d09aac690fd703c87acfe98ea6"
