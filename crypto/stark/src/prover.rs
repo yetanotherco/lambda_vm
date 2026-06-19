@@ -581,17 +581,13 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
 
         let commit = match precomputed {
-            None => {
-                #[allow(unused_mut)]
-                let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, crate::commitment::ROWS_PER_LEAF)
-                    .ok_or(ProvingError::EmptyCommitment)?;
+            None => Self::commit_plain::<Field>(
+                &columns,
                 #[cfg(feature = "disk-spill")]
-                if storage_mode == StorageMode::Disk {
-                    tree.spill_nodes_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("main Merkle tree: {e}")))?;
-                }
-                TableCommit::plain(tree, root)
-            }
+                storage_mode,
+                #[cfg(feature = "disk-spill")]
+                "main Merkle tree",
+            )?,
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
@@ -605,13 +601,9 @@ pub trait IsStarkProver<
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
                 }
                 #[cfg(feature = "disk-spill")]
-                if storage_mode == StorageMode::Disk {
-                    precomputed_tree.spill_nodes_to_disk().map_err(|e| {
-                        ProvingError::DiskSpill(format!("precomputed Merkle tree: {e}"))
-                    })?;
-                    mult_tree
-                        .spill_nodes_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("mult Merkle tree: {e}")))?;
+                {
+                    Self::spill_tree(&mut precomputed_tree, storage_mode, "precomputed Merkle tree")?;
+                    Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 }
                 TableCommit::preprocessed(
                     mult_tree,
@@ -630,6 +622,48 @@ pub trait IsStarkProver<
         return Ok((commit, columns, None));
         #[cfg(not(feature = "cuda"))]
         Ok((commit, columns))
+    }
+
+    /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
+    /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
+    /// site (main / preprocessed split / aux).
+    #[cfg(feature = "disk-spill")]
+    fn spill_tree<C>(
+        tree: &mut BatchedMerkleTree<C>,
+        storage_mode: StorageMode,
+        label: &str,
+    ) -> Result<(), ProvingError>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+    {
+        if storage_mode == StorageMode::Disk {
+            tree.spill_nodes_to_disk()
+                .map_err(|e| ProvingError::DiskSpill(format!("{label}: {e}")))?;
+        }
+        Ok(())
+    }
+
+    /// Commit an already-LDE-expanded plain column set: build the row-paired
+    /// Merkle tree, spill it to disk if requested, and wrap it as a plain
+    /// `TableCommit`. Shared by the main-trace (non-preprocessed) and aux-trace
+    /// commit paths.
+    fn commit_plain<C>(
+        columns: &[Vec<FieldElement<C>>],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+        #[cfg(feature = "disk-spill")] spill_label: &str,
+    ) -> Result<TableCommit<C>, ProvingError>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send + math::traits::ByteConversion,
+    {
+        #[allow(unused_mut)]
+        let (mut tree, root) =
+            crate::commitment::commit_bit_reversed(columns, crate::commitment::ROWS_PER_LEAF)
+                .ok_or(ProvingError::EmptyCommitment)?;
+        #[cfg(feature = "disk-spill")]
+        Self::spill_tree(&mut tree, storage_mode, spill_label)?;
+        Ok(TableCommit::plain(tree, root))
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -1787,22 +1821,20 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        #[allow(unused_mut)]
-                        let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, crate::commitment::ROWS_PER_LEAF)
-                            .ok_or(ProvingError::EmptyCommitment)?;
+                        let commit = Self::commit_plain::<FieldExtension>(
+                            &columns,
+                            #[cfg(feature = "disk-spill")]
+                            storage_mode,
+                            #[cfg(feature = "disk-spill")]
+                            "aux Merkle tree",
+                        )?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
 
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            tree.spill_nodes_to_disk().map_err(|e| {
-                                ProvingError::DiskSpill(format!("aux Merkle tree: {e}"))
-                            })?;
-                        }
                         #[cfg(feature = "cuda")]
-                        return Ok((Some(TableCommit::plain(tree, root)), columns, None));
+                        return Ok((Some(commit), columns, None));
                         #[cfg(not(feature = "cuda"))]
-                        Ok((Some(TableCommit::plain(tree, root)), columns))
+                        Ok((Some(commit), columns))
                     } else {
                         #[cfg(feature = "cuda")]
                         return Ok((None, Vec::new(), None));
