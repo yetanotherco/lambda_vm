@@ -11,7 +11,7 @@ use math::fft::errors::FFTError;
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::spill_safe::SpillSafe;
-use math::traits::{AsBytes, ByteConversion};
+use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
     polynomial::Polynomial,
@@ -33,7 +33,10 @@ use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
-use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
+use super::config::{BatchedMerkleTree, Commitment};
+// `BatchedMerkleTreeBackend` is only named by the GPU leaf+tree builders.
+#[cfg(feature = "cuda")]
+use super::config::BatchedMerkleTreeBackend;
 use super::constraints::evaluator::ConstraintEvaluator;
 use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
@@ -431,7 +434,7 @@ pub trait IsStarkProver<
         let twiddles = LdeTwiddles::new(&domain);
         let evals =
             Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) = crate::commitment::commit_bit_reversed(&evals, 1)?;
+        let (_, commitment) = crate::commitment::commit_bit_reversed(&evals, 2)?;
         Some(commitment)
     }
 
@@ -585,7 +588,7 @@ pub trait IsStarkProver<
         let commit = match precomputed {
             None => {
                 #[allow(unused_mut)]
-                let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 1)
+                let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 2)
                     .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
@@ -597,11 +600,11 @@ pub trait IsStarkProver<
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
-                    crate::commitment::commit_bit_reversed(&columns[..num_cols], 1)
+                    crate::commitment::commit_bit_reversed(&columns[..num_cols], 2)
                         .ok_or(ProvingError::EmptyCommitment)?;
                 #[allow(unused_mut)]
                 let (mut mult_tree, mult_root) =
-                    crate::commitment::commit_bit_reversed(&columns[num_cols..], 1)
+                    crate::commitment::commit_bit_reversed(&columns[num_cols..], 2)
                         .ok_or(ProvingError::EmptyCommitment)?;
                 if precomputed_root != expected_precomputed_root {
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
@@ -1357,8 +1360,7 @@ pub trait IsStarkProver<
             .collect();
 
         PolynomialOpenings {
-            proof: proof.clone(),
-            proof_sym: proof,
+            proof,
             evaluations: lde_composition_poly_parts_evaluation
                 .clone()
                 .into_iter()
@@ -1388,13 +1390,13 @@ pub trait IsStarkProver<
         G: Fn(usize) -> Vec<FieldElement<C>>,
     {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
-        let index = challenge * 2;
-        let index_sym = challenge * 2 + 1;
+        // Rows `2·challenge` and `2·challenge+1` are committed together as the
+        // single leaf at position `challenge`; one Merkle path authenticates both
+        // the queried row and its symmetric counterpart.
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
-            evaluations: gather(reverse_index(index, domain_size)),
-            evaluations_sym: gather(reverse_index(index_sym, domain_size)),
+            proof: tree.get_proof_by_pos(challenge).unwrap(),
+            evaluations: gather(reverse_index(challenge * 2, domain_size)),
+            evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),
         }
     }
 
@@ -1816,7 +1818,7 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 1)
+                        let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 2)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());

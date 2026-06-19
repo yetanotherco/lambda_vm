@@ -61,7 +61,7 @@ where
         "num_rows must be a power of two for reverse_index"
     );
     debug_assert!(
-        rows_per_leaf >= 1 && num_rows % rows_per_leaf == 0,
+        rows_per_leaf >= 1 && num_rows.is_multiple_of(rows_per_leaf),
         "num_rows must be a multiple of rows_per_leaf"
     );
 
