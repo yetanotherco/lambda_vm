@@ -103,6 +103,7 @@ const MULTIPLICITY_SORT_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/multiplicity_sort.ptx"));
 const PAGE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/page_trace.ptx"));
 const DECODE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/decode_trace.ptx"));
+const BITWISE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/bitwise_trace.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -198,6 +199,9 @@ pub struct Backend {
     // decode_trace.ptx
     pub generate_decode_trace_rows: CudaFunction,
 
+    // bitwise_trace.ptx
+    pub generate_bitwise_trace_rows: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -223,6 +227,7 @@ impl Backend {
         let multiplicity_sort = ctx.load_module(Ptx::from_src(MULTIPLICITY_SORT_PTX))?;
         let page_trace = ctx.load_module(Ptx::from_src(PAGE_TRACE_PTX))?;
         let decode_trace = ctx.load_module(Ptx::from_src(DECODE_TRACE_PTX))?;
+        let bitwise_trace = ctx.load_module(Ptx::from_src(BITWISE_TRACE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -313,6 +318,8 @@ impl Backend {
             generate_page_trace_rows: page_trace.load_function("generate_page_trace_rows")?,
             generate_decode_trace_rows: decode_trace
                 .load_function("generate_decode_trace_rows")?,
+            generate_bitwise_trace_rows: bitwise_trace
+                .load_function("generate_bitwise_trace_rows")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

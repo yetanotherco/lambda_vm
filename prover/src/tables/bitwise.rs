@@ -357,6 +357,17 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// All output columns are precomputed. Multiplicity columns are initialized
 /// to zero and will be updated when other tables send lookups.
 pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    // GPU fast path: preprocessed table — every row is a fixed function
+    // of its index. Kernel produces the full 21-col row-major buffer.
+    // Falls back to the CPU loop below on any cudarc failure.
+    #[cfg(feature = "cuda")]
+    if let Some(raw) =
+        stark::gpu_lde::try_generate_bitwise_trace_gpu_raw(NUM_ROWS, cols::NUM_COLUMNS)
+    {
+        let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+        return TraceTable::new_main(data, cols::NUM_COLUMNS, 1);
+    }
+
     let mut data = vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS];
 
     for x in 0u32..256 {

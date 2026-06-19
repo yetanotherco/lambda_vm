@@ -76,6 +76,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_PAGE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_DECODE_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_BITWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -134,6 +135,25 @@ pub fn try_generate_decode_trace_gpu_raw(
     )
     .ok()?;
     GPU_DECODE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
+}
+
+/// BITWISE-table GPU dispatch counter.
+pub(crate) static GPU_BITWISE_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_bitwise_trace_calls() -> u64 {
+    GPU_BITWISE_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU BITWISE-trace generator. Preprocessed
+/// table — kernel produces the full 21-column row-major buffer with
+/// multiplicity columns at 0. Caller still runs `update_multiplicities`
+/// on the host TraceTable.
+pub fn try_generate_bitwise_trace_gpu_raw(
+    num_rows: usize,
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::bitwise_trace::generate_bitwise_trace_dev(num_rows, num_cols).ok()?;
+    GPU_BITWISE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(raw)
 }
 
@@ -1086,6 +1106,13 @@ pub fn schedule_page_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_decode_trace_fault(n_calls_until_err: i64) {
     math_cuda::decode_trace::FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_bitwise_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_bitwise_trace_fault(n_calls_until_err: i64) {
+    math_cuda::bitwise_trace::FAULT_BITWISE_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

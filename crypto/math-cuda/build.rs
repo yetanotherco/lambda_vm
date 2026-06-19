@@ -119,4 +119,5 @@ fn main() {
     compile_ptx("multiplicity_sort.cu", "multiplicity_sort.ptx", have_nvcc);
     compile_ptx("page_trace.cu", "page_trace.ptx", have_nvcc);
     compile_ptx("decode_trace.cu", "decode_trace.ptx", have_nvcc);
+    compile_ptx("bitwise_trace.cu", "bitwise_trace.ptx", have_nvcc);
 }
