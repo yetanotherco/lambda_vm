@@ -1,6 +1,6 @@
 use std::cell::RefCell;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
@@ -144,6 +144,9 @@ pub fn reset_all() {
     ROUND_SUB_OPS.with(|cell| {
         cell.borrow_mut().take();
     });
+    if let Ok(mut guard) = TRACE_BUILD_TIMINGS.lock() {
+        guard.clear();
+    }
 }
 
 pub fn store_r2_sub(constraints: Duration, fft: Duration, merkle: Duration) {
@@ -170,4 +173,31 @@ pub fn store_round_sub_ops(data: TableSubOps) {
 
 pub fn take_round_sub_ops() -> Option<TableSubOps> {
     ROUND_SUB_OPS.with(|cell| cell.borrow_mut().take())
+}
+
+// ============================================================================
+// Trace-build per-table timing (Tier 2 instrumentation).
+//
+// Each `generate_*_trace` call inside `prover/src/tables/trace_builder.rs`
+// records its wall-clock duration here. Storage is a `Mutex<Vec<...>>` so
+// parallel rayon workers can append safely; print_report merges entries with
+// the same base name (e.g. `MEMW[0]` + `MEMW[1]` → `MEMW`).
+// ============================================================================
+
+static TRACE_BUILD_TIMINGS: Mutex<Vec<(String, Duration)>> = Mutex::new(Vec::new());
+
+/// Append a per-table trace-build timing. Safe to call from any rayon worker.
+pub fn accum_trace_build_table(name: &str, dur: Duration) {
+    if let Ok(mut guard) = TRACE_BUILD_TIMINGS.lock() {
+        guard.push((name.to_string(), dur));
+    }
+}
+
+/// Drain accumulated per-table trace-build timings. Returns the raw
+/// per-call entries (unmerged); the report layer merges by base name.
+pub fn take_trace_build_table_timings() -> Vec<(String, Duration)> {
+    TRACE_BUILD_TIMINGS
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default()
 }

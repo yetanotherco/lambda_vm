@@ -68,6 +68,35 @@ pub fn print_report(
 
     row_top("Execute", execute, total);
     row_top("Trace build", trace_build, total);
+    // Per-table breakdown of "Trace build" (Tier-2 instrumentation).
+    // Merges split-chunk entries (CPU[0], CPU[1], ...) by base name, sorts by
+    // descending wall-time, and only prints tables above a 1% threshold so the
+    // report stays readable. Sum of printed rows usually matches `trace_build`
+    // within a few percent (rayon overhead, work done outside the timed calls).
+    let table_timings = stark::instruments::take_trace_build_table_timings();
+    if !table_timings.is_empty() {
+        let mut merged: BTreeMap<String, Duration> = BTreeMap::new();
+        for (name, dur) in table_timings {
+            let base = base_name(&name).to_string();
+            *merged.entry(base).or_insert(Duration::ZERO) += dur;
+        }
+        let mut sorted: Vec<_> = merged.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        let threshold = trace_build.as_secs_f64() * 0.01;
+        let mut others = Duration::ZERO;
+        let mut others_count = 0usize;
+        for (name, d) in &sorted {
+            if d.as_secs_f64() >= threshold {
+                row_sub(&format!("  {name}"), *d, total);
+            } else {
+                others += *d;
+                others_count += 1;
+            }
+        }
+        if others_count > 0 {
+            row_sub(&format!("  (others, {others_count} tables)"), others, total);
+        }
+    }
     row_top("AIR construction", air_construction, total);
 
     if let Some(ref mp) = mp {
@@ -181,10 +210,7 @@ pub fn print_report(
                 ("R4  queries & openings", total_queries),
             ];
             sub_ops.sort_by(|a, b| b.1.cmp(&a.1));
-            eprintln!(
-                "  {}",
-                "    \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}",
-            );
+            eprintln!("      \u{2500}\u{2500} sub-operation totals (all tables) \u{2500}\u{2500}");
             for (label, dur) in &sub_ops {
                 row_sub(&format!("    {label}"), *dur, total);
             }
