@@ -74,6 +74,38 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
+    GPU_PAGE_TRACE_CALLS.store(0, Ordering::Relaxed);
+}
+
+/// PAGE-table GPU dispatch counter. Incremented once per
+/// `generate_page_trace` call that successfully ran on GPU. Used by the
+/// trace-expansion integration tests to verify the GPU path fired.
+pub(crate) static GPU_PAGE_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_page_trace_calls() -> u64 {
+    GPU_PAGE_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU page-trace generator. Hides
+/// `math_cuda` from the prover so the prover crate doesn't need to
+/// declare it as a direct dependency. Returns `None` on any cudarc /
+/// backend failure so the caller's CPU loop runs unchanged.
+pub fn try_generate_page_trace_gpu_raw(
+    page_size: usize,
+    init_values: &[u64],
+    final_values: &[u64],
+    final_timestamps: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::page_trace::generate_page_trace_dev(
+        page_size,
+        init_values,
+        final_values,
+        final_timestamps,
+        num_cols,
+    )
+    .ok()?;
+    GPU_PAGE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);

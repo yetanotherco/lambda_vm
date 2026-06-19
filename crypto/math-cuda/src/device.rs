@@ -101,6 +101,7 @@ const TRACE_PRIMITIVES_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/trace_primitives.ptx"));
 const MULTIPLICITY_SORT_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/multiplicity_sort.ptx"));
+const PAGE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/page_trace.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -190,6 +191,9 @@ pub struct Backend {
     pub mark_boundaries: CudaFunction,
     pub compact_unique_and_counts: CudaFunction,
 
+    // page_trace.ptx
+    pub generate_page_trace_rows: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -213,6 +217,7 @@ impl Backend {
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let trace_primitives = ctx.load_module(Ptx::from_src(TRACE_PRIMITIVES_PTX))?;
         let multiplicity_sort = ctx.load_module(Ptx::from_src(MULTIPLICITY_SORT_PTX))?;
+        let page_trace = ctx.load_module(Ptx::from_src(PAGE_TRACE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -300,6 +305,7 @@ impl Backend {
             mark_boundaries: multiplicity_sort.load_function("mark_boundaries")?,
             compact_unique_and_counts: multiplicity_sort
                 .load_function("compact_unique_and_counts")?,
+            generate_page_trace_rows: page_trace.load_function("generate_page_trace_rows")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

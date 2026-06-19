@@ -176,6 +176,14 @@ pub fn generate_page_trace(
         "Page base must be page-aligned"
     );
 
+    // GPU fast path: flatten the HashMap into three parallel u64 arrays and
+    // run the row layout on device. Returns None on cudarc/backend failure,
+    // in which case we fall through to the CPU loop below.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_page_trace_gpu(config, final_state, page_size, page_base) {
+        return table;
+    }
+
     let num_rows = page_size; // One row per byte in the page
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
@@ -208,6 +216,50 @@ pub fn generate_page_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_page_trace`. Flattens the `FinalStateMap`
+/// HashMap into the three parallel u64 arrays the GPU kernel consumes, calls
+/// math-cuda, and rewraps the result into a `TraceTable`. Returns `None`
+/// on any cudarc/backend failure so the caller's CPU path runs unchanged.
+#[cfg(feature = "cuda")]
+fn try_generate_page_trace_gpu(
+    config: &PageConfig,
+    final_state: &FinalStateMap,
+    page_size: usize,
+    page_base: u64,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    // CPU-side flatten: O(page_size) work, dwarfed by the row layout kernel.
+    let mut init_values = vec![0u64; page_size];
+    if let Some(v) = config.init_values.as_ref() {
+        let n = v.len().min(page_size);
+        for (i, &b) in v[..n].iter().enumerate() {
+            init_values[i] = b as u64;
+        }
+    }
+    let mut final_values = init_values.clone();
+    let mut final_timestamps = vec![0u64; page_size];
+    for offset in 0..page_size {
+        let byte_addr = page_base + (offset as u64);
+        if let Some(state) = final_state.get(&byte_addr) {
+            final_values[offset] = state.value as u64;
+            final_timestamps[offset] = state.timestamp;
+        }
+    }
+
+    let raw = stark::gpu_lde::try_generate_page_trace_gpu_raw(
+        page_size,
+        &init_values,
+        &final_values,
+        &final_timestamps,
+        cols::NUM_COLUMNS,
+    )?;
+
+    // Reinterpret u64s as canonical FieldElement<GoldilocksField>. The
+    // values written by the kernel are already in canonical form (0..255
+    // for bytes, < 2^32 for the timestamp halves).
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

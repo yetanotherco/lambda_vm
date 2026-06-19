@@ -13,6 +13,7 @@ pub mod lde;
 pub mod merkle;
 pub mod multiplicity_sort;
 pub mod ntt;
+pub mod page_trace;
 pub mod trace_primitives;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
