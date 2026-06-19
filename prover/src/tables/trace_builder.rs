@@ -63,6 +63,7 @@ use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
+use super::limbs::{limbs_16, limbs_32};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -305,7 +306,8 @@ fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
 ///
 /// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
 fn pack_register_value(value: u64) -> [u64; 8] {
-    [value & 0xFFFF_FFFF, value >> 32, 0, 0, 0, 0, 0, 0]
+    let [lo, hi] = limbs_32(value);
+    [lo, hi, 0, 0, 0, 0, 0, 0]
 }
 
 // =============================================================================
@@ -1598,18 +1600,8 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 
         // C8: ZERO[overflow; overflow_sum]
         // overflow_sum = n[0]+n[1]+n[2]+n[3] - 32769*sign_n + 262141 - d[0]-d[1]-d[2]-d[3]
-        let n_halves: [u32; 4] = [
-            (op.n & 0xFFFF) as u32,
-            ((op.n >> 16) & 0xFFFF) as u32,
-            ((op.n >> 32) & 0xFFFF) as u32,
-            ((op.n >> 48) & 0xFFFF) as u32,
-        ];
-        let d_halves: [u32; 4] = [
-            (op.d & 0xFFFF) as u32,
-            ((op.d >> 16) & 0xFFFF) as u32,
-            ((op.d >> 32) & 0xFFFF) as u32,
-            ((op.d >> 48) & 0xFFFF) as u32,
-        ];
+        let n_halves: [u32; 4] = limbs_16(op.n).map(|l| l as u32);
+        let d_halves: [u32; 4] = limbs_16(op.d).map(|l| l as u32);
         let sign_n: u32 = if op.sign_n() { 1 } else { 0 };
         let overflow_sum = n_halves[0] + n_halves[1] + n_halves[2] + n_halves[3] + 262141
             - 32769 * sign_n
@@ -1667,12 +1659,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
             // C3: NEG for r (when sign_r = 1)
             if op.sign_r() {
                 let r = op.compute_remainder();
-                let r_halves: [u32; 4] = [
-                    (r & 0xFFFF) as u32,
-                    ((r >> 16) & 0xFFFF) as u32,
-                    ((r >> 32) & 0xFFFF) as u32,
-                    ((r >> 48) & 0xFFFF) as u32,
-                ];
+                let r_halves: [u32; 4] = limbs_16(r).map(|l| l as u32);
                 // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
                 bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
                 // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
@@ -1683,12 +1670,7 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 
             // C5: NEG for d (when sign_d = 1)
             if op.sign_d() {
-                let d_halves: [u32; 4] = [
-                    (op.d & 0xFFFF) as u32,
-                    ((op.d >> 16) & 0xFFFF) as u32,
-                    ((op.d >> 32) & 0xFFFF) as u32,
-                    ((op.d >> 48) & 0xFFFF) as u32,
-                ];
+                let d_halves: [u32; 4] = limbs_16(op.d).map(|l| l as u32);
                 // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
                 bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
                 // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
@@ -1984,10 +1966,7 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
         // Zero bus for end detection (mult = mu)
         // Input: (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3)
         // When count_decr = 0xFFFF_FFFF_FFFF_FFFF (count=0), sum = 0 → end=1
-        let cd_0 = (count_decr & 0xFFFF) as u32;
-        let cd_1 = ((count_decr >> 16) & 0xFFFF) as u32;
-        let cd_2 = ((count_decr >> 32) & 0xFFFF) as u32;
-        let cd_3 = ((count_decr >> 48) & 0xFFFF) as u32;
+        let [cd_0, cd_1, cd_2, cd_3] = limbs_16(count_decr).map(|l| l as u32);
         let zero_input = (65535 - cd_0) + (65535 - cd_1) + (65535 - cd_2) + (65535 - cd_3);
         lookups.push(BitwiseOperation::zero(zero_input));
     }
