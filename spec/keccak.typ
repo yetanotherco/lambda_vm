@@ -42,7 +42,7 @@ The chip therefore contributes the following interaction to the lookup-argument:
 #render_constraint_table(chip, config, groups: "output")
 
 The address containing the state to be permuted is passed in as argument `A0 = x10`.
-The following constraints describe that this address is read into `addr` (@keccak:c:read_addr), from which `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr); @keccak:c:range_addr and @keccak:c:range_state_ptr are included to satisfy @add:a:lhs respectively @add:a:sum.
+The following constraints describe that this address is read into `state_ptr[0][0]` (@keccak:c:read_state_ptr), from which full `state_ptr` --- the collection of pointers to all lanes of the state --- is derived (@keccak:c:state_ptr); @keccak:c:range_state_ptr is included to satisfy @add:a:lhs respectively @add:a:sum.
 The state is then read into `input_state`, while the `output_state` is written back to the indicated address (@keccak:c:load_store_state).
 #render_constraint_table(chip, config, groups: "mem")
 
@@ -103,7 +103,9 @@ Lastly, the round chip contributes the following interactions to the lookup:
 #render_constraint_table(round_chip, config, groups: "io")
 
 == Notes/potential optimizations
-- one does not have to repeat `addr` in `state_ptr`; this saves 4 columns and 4 `IS_HALF` checks.
+- one does not have to range check `state_ptr[0][0]` since it is read from memory.
+  Moreover, it could be represented as a `DWordWL`. 
+  All this would save 2 columns and 4 `IS_HALF` checks.
 - step $rho$ does not need to be applied to `state[0][0]`; its has a zero-shift. This saves 16 columns and 4 `HWSL` interactions.
 - when the output of `HWSL` are `Byte`s mapped as `Half`s, we find that out of every four output bytes, at least one is zero. 
   Since `rnc` is constant, @keccak:c:rho_rotation makes those zero-bytes show up in `rot_left` and `rot_right` at constant locations.
