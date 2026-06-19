@@ -33,6 +33,11 @@ use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 
 use crate::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 
+/// Number of consecutive (bit-reversed) rows packed into one Merkle leaf for the
+/// composition-polynomial commitment: the row-pair leaf packing the FRI openings
+/// rely on (leaf `i` hashes rows `2i` and `2i+1`).
+pub const ROWS_PER_LEAF: usize = 2;
+
 /// Computes the Keccak-256 leaf hashes for a bit-reversed, column-major commitment,
 /// grouping `rows_per_leaf` consecutive bit-reversed rows into each leaf.
 ///

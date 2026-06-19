@@ -733,8 +733,8 @@ where
 /// host-side ext3 LDE eval Vecs produced by
 /// [`try_evaluate_parts_on_lde_gpu_keep`] (or the CPU path). Uses the same
 /// row-pair leaf pattern as the CPU
-/// `commit_composition_polynomial`: each leaf hashes 2 consecutive
-/// bit-reversed rows.
+/// `commit_bit_reversed` (composition-polynomial commit path): each leaf hashes
+/// 2 consecutive bit-reversed rows.
 ///
 /// Returns `None` to fall through to the CPU path when the type or size
 /// conditions don't hold; returns `None` on a math-cuda `Err` so the caller
