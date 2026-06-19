@@ -67,25 +67,25 @@ desc = "$x_G^2$"
 pad = 0
 
 [[variables.auxiliary]]
-name = "q0"
+name = "q1"
 type = "U256BL"
 desc = "quotient for computing `x2`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "c0"
+name = "c1"
 type = ["BaseField", 64]
 desc = "carries for computing `x2`"
 pad = 0
 
 [[variables.auxiliary]]
-name = "q1"
+name = "q2"
 type = ["Byte", 33]
 desc = "quotient for computing `yG`"
 pad = "p"
 
 [[variables.auxiliary]]
-name = "c1"
+name = "c2"
 type = ["BaseField", 64]
 desc = "carries for computing `yG`"
 pad = 0
@@ -117,30 +117,30 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "c2"
+name = "c3"
 type = ["Bit", 8]
 desc = "carries for computing $#`P` + #`xG_sub_p`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_p", "U256WL"], "i"], ["idx", "c2", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
-]}
-
-[[variables.virtual]]
-name = "c3"
-type = ["Bit", 8]
-desc = "carries for computing $#`N` + #`k_sub_N`$"
-def = {polys=[
-    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xG_sub_p", "U256WL"], "i"], ["idx", "c3", ["-", "i", 1]]], ["idx", ["cast", "xG", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
 name = "c4"
 type = ["Bit", 8]
+desc = "carries for computing $#`N` + #`k_sub_N`$"
+def = {polys=[
+    {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "N", "U256WL"], "i"], ["idx", ["cast", "k_sub_N", "U256WL"], "i"], ["idx", "c4", ["-", "i", 1]]], ["idx", ["cast", "byte_k", "U256WL"], "i"]]]},
+]}
+
+[[variables.virtual]]
+name = "c5"
+type = ["Bit", 8]
 desc = "carries for computing $#`p` + #`xR_sub_p`$"
 def = {polys=[
     {iter=["i", 0], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
-    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c4", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
+    {iter=["i", 1, 7], poly=["*", ["^", 2, -32], ["-", ["+", ["idx", ["cast", "p", "U256WL"], "i"], ["idx", ["cast", "xR_sub_p", "U256WL"], "i"], ["idx", "c5", ["-", "i", 1]]], ["idx", ["cast", "xR", "U256WL"], "i"]]]},
 ]}
 
 [[variables.virtual]]
@@ -171,20 +171,20 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
-name = "Q0"
+name = "q1"
 type = ["Byte", 64]
 desc = "zero-extension of `q`"
 def = {polys=[
-    {iter=["i", 0, 31], poly=["idx", "q0", "i"]},
+    {iter=["i", 0, 31], poly=["idx", "q1", "i"]},
     {iter=["i", 32, 63], poly=0},
 ]}
 
 [[variables.virtual]]
-name = "Q1"
+name = "q2"
 type = ["Byte", 64]
-desc = "zero-extension of `q1`"
+desc = "zero-extension of `q2`"
 def = {polys=[
-    {iter=["i", 0, 32], poly=["idx", "q1", "i"]},
+    {iter=["i", 0, 32], poly=["idx", "q2", "i"]},
     {iter=["i", 33, 63], poly=0},
 ]}
 
@@ -223,8 +223,8 @@ desc = "Curve order"
 
 [[variables.constant]]
 name = "offsets"
-type = ["Half", 2]
-desc = "Offsets for the range of carries `c0` and `c1`."
+type = ["Half", 3]
+desc = "Offsets for the range of carries `c1` and `c2`."
 
 [[variables.multiplicity]]
 name = "μ"
@@ -316,15 +316,15 @@ ref = "ec:c:range_xG_sub_p"
 [[constraints.range_xG]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "c2", "i"]]
+input = [["idx", "c3", "i"]]
 iter = ["i", 0, 6]
 cond = "μ"
-ref = "ec:c:range_c2"
+ref = "ec:c:range_c3"
 
 [[constraints.range_xG]]
 kind = "arith"
-constraint = "$#`μ` => #`c2`_7 = 1$"
-poly = ["*", "μ", ["not", ["idx", "c2", 7]]]
+constraint = "$#`μ` => #`c3`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
 ref = "ec:c:xG_addition_overflows"
 
 # Computing xG^2
@@ -343,37 +343,37 @@ ref = "ec:c:range_x2"
 [[constraints.xG2]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "q0", "i"]]
+input = [["idx", "q1", "i"]]
 iter = ["i", 0, 31]
 cond = "μ"
-ref = "ec:c:range_q0"
+ref = "ec:c:range_q1"
 
 [[constraints.xG2]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_0 = #`XG`_0 dot #`XG`_0 - #`X2`_0 - #`Q0`_0 dot #`P`_0$"
-poly = ["-", ["*", ["idx", "XG", 0], ["idx", "XG", 0]], ["idx", "X2", 0], ["*", ["idx", "Q0", 0], ["idx", "P", 0]], ["*", ["^", 2, 8], ["idx", "c0", 0]]]
-ref = "ec:c:c0_0"
+constraint = "$2^8 dot #`c1`_0 = #`XG`_0 dot #`XG`_0 - #`X2`_0 - #`q1`_0 dot #`P`_0$"
+poly = ["-", ["*", ["idx", "XG", 0], ["idx", "XG", 0]], ["idx", "X2", 0], ["*", ["idx", "q1", 0], ["idx", "P", 0]], ["*", ["^", 2, 8], ["idx", "c1", 0]]]
+ref = "ec:c:c1_0"
 
 [[constraints.xG2]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) - #`X2`_i + sum_(j=0)^i #`XG`_j dot #`XG`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
-poly = ["+", ["-", ["idx", "c0", ["-", "i", 1]], ["*", ["^", 2, 8], ["idx", "c0", "i"]], ["idx", "X2", "i"]], ["sum", ["=", "j", 0], "i", ["-", ["*", ["idx", "XG", "j"], ["idx", "XG", ["-", "i", "j"]]], ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]]]]
+constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`X2`_i + sum_(j=0)^i #`XG`_j dot #`XG`_(i-j) - #`q1`_j dot #`P`_(i-j)$"
+poly = ["+", ["-", ["idx", "c1", ["-", "i", 1]], ["*", ["^", 2, 8], ["idx", "c1", "i"]], ["idx", "X2", "i"]], ["sum", ["=", "j", 0], "i", ["-", ["*", ["idx", "XG", "j"], ["idx", "XG", ["-", "i", "j"]]], ["*", ["idx", "q1", "j"], ["idx", "P", ["-", "i", "j"]]]]]]
 iter = ["i", 1, 63]
-ref = "ec:c:c0_i"
+ref = "ec:c:c1_i"
 
 [[constraints.xG2]]
 kind = "arith"
-constraint = "$#`c0`_63 = 0$"
-poly = ["idx", "c0", 63]
-ref = "ec:c:c0_63_is_zero"
+constraint = "$#`c1`_63 = 0$"
+poly = ["idx", "c1", 63]
+ref = "ec:c:c1_63_is_zero"
 
 [[constraints.xG2]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], ["idx", "offsets", 0]]]
+input = [["+", ["idx", "c1", "i"], ["idx", "offsets", 1]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
-ref = "ec:c:range_c0"
+ref = "ec:c:range_c1"
 
 
 # Computing yG
@@ -392,20 +392,20 @@ ref = "ec:c:range_yG"
 [[constraints.yG]]
 kind = "template"
 tag = "IS_BYTE"
-input = [["idx", "q1", "i"]]
+input = [["idx", "q2", "i"]]
 iter = ["i", 0, 31]
 cond = "μ"
-ref = "ec:c:range_q1"
+ref = "ec:c:range_q2"
 
 [[constraints.yG]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "q1", 32]]
-ref = "ec:c:q1_257"
+input = [["idx", "q2", 32]]
+ref = "ec:c:q2_257"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`P`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c2`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`P`_0 dot #`P`_0 - #`q2`_0 dot #`P`_0$"
 poly = ["-", 
     ["+", 
         ["*", ["idx", "YG", 0], ["idx", "YG", 0]], 
@@ -413,18 +413,18 @@ poly = ["-",
     ], 
     ["*", ["idx", "X2", 0], ["idx", "XG", 0]], 
     ["*", "μ", ["idx", "B", 0]], 
-    ["*", ["idx", "Q1", 0], ["idx", "P", 0]], 
-    ["*", ["^", 2, 8], ["idx", "c1", 0]]
+    ["*", ["idx", "q2", 0], ["idx", "P", 0]], 
+    ["*", ["^", 2, 8], ["idx", "c2", 0]]
 ]
-ref = "ec:c:c1_0"
+ref = "ec:c:c2_0"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`Q1`_j dot #`P`_(i-j))$"
+constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`q2`_j dot #`P`_(i-j))$"
 poly = ["+", 
     ["-", 
-        ["idx", "c1", ["-", "i", 1]], 
-        ["*", ["^", 2, 8], ["idx", "c1", "i"]],
+        ["idx", "c2", ["-", "i", 1]], 
+        ["*", ["^", 2, 8], ["idx", "c2", "i"]],
         ["*", "μ", ["idx", "B", "i"]]
     ], 
     ["sum", ["=", "j", 0], "i", 
@@ -434,26 +434,26 @@ poly = ["+",
                 ["*", ["idx", "P", "j"], ["idx", "P", ["-", "i", "j"]]]
             ], 
             ["*", ["idx", "X2", "j"], ["idx", "XG", ["-", "i", "j"]]], 
-            ["*", ["idx", "Q1", "j"], ["idx", "P", ["-", "i", "j"]]]
+            ["*", ["idx", "q2", "j"], ["idx", "P", ["-", "i", "j"]]]
         ]
     ]
 ]
 iter = ["i", 1, 63]
-ref = "ec:c:c1_i"
+ref = "ec:c:c2_i"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$#`c1`_63 = 0$"
-poly = ["idx", "c1", 63]
-ref = "ec:c:c1_63_is_zero"
+constraint = "$#`c2`_63 = 0$"
+poly = ["idx", "c2", 63]
+ref = "ec:c:c2_63_is_zero"
 
 [[constraints.yG]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], ["idx", "offsets", 1]]]
+input = [["+", ["idx", "c2", "i"], ["idx", "offsets", 2]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
-ref = "ec:c:range_c1"
+ref = "ec:c:range_c2"
 
 
 # Verifying k
@@ -542,15 +542,15 @@ ref = "ec:c:range_k_sub_N"
 [[constraints.verify_k]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "c3", "i"]]
+input = [["idx", "c4", "i"]]
 iter = ["i", 0, 6]
 cond = "μ"
-ref = "ec:c:range_c3"
+ref = "ec:c:range_c4"
 
 [[constraints.verify_k]]
 kind = "arith"
-constraint = "$#`μ` => #`c3`_7 = 1$"
-poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
+constraint = "$#`μ` => #`c4`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c4", 7]]]
 ref = "ec:c:k_lt_N"
 
 [[constraints.verify_k]]
@@ -610,15 +610,15 @@ ref = "ec:c:range_xR_sub_p"
 [[constraints.range_xR]]
 kind = "template"
 tag = "IS_BIT"
-input = [["idx", "c4", "i"]]
+input = [["idx", "c5", "i"]]
 iter = ["i", 0, 6]
 cond = "μ"
-ref = "ec:c:range_c4"
+ref = "ec:c:range_c5"
 
 [[constraints.range_xR]]
 kind = "arith"
-constraint = "$#`μ` => #`c4`_7 = 1$"
-poly = ["*", "μ", ["not", ["idx", "c4", 7]]]
+constraint = "$#`μ` => #`c5`_7 = 1$"
+poly = ["*", "μ", ["not", ["idx", "c5", 7]]]
 ref = "ec:c:xR_addition_overflows"
 
 
