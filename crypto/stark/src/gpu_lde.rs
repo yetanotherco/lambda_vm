@@ -80,6 +80,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_LOAD_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_STORE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_BYTEWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_SHIFT_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -256,6 +257,34 @@ pub fn try_generate_bytewise_trace_gpu_raw(
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// SHIFT-table GPU dispatch counter.
+pub(crate) static GPU_SHIFT_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_shift_trace_calls() -> u64 {
+    GPU_SHIFT_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU SHIFT-trace generator. Caller packs each
+/// row's `value`, `shift_amount`, and `flags` (bits 0..3 = direction|signed|
+/// word_instr|active) into three parallel arrays of length `num_rows`.
+pub fn try_generate_shift_trace_gpu_raw(
+    num_rows: usize,
+    in_values: &[u64],
+    shift_amounts: &[u64],
+    flags: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::shift_trace::generate_shift_trace_dev(
+        num_rows,
+        in_values,
+        shift_amounts,
+        flags,
+        num_cols,
+    )
+    .ok()?;
+    GPU_SHIFT_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 // ============================================================================
@@ -1230,6 +1259,13 @@ pub fn schedule_store_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_bytewise_trace_fault(n_calls_until_err: i64) {
     math_cuda::bytewise_trace::FAULT_BYTEWISE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_shift_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_shift_trace_fault(n_calls_until_err: i64) {
+    math_cuda::shift_trace::FAULT_SHIFT_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

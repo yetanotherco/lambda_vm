@@ -107,6 +107,7 @@ const BITWISE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/bitwise_
 const LOAD_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/load_trace.ptx"));
 const STORE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/store_trace.ptx"));
 const BYTEWISE_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/bytewise_trace.ptx"));
+const SHIFT_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/shift_trace.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -214,6 +215,9 @@ pub struct Backend {
     // bytewise_trace.ptx
     pub generate_bytewise_trace_rows: CudaFunction,
 
+    // shift_trace.ptx
+    pub generate_shift_trace_rows: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -243,6 +247,7 @@ impl Backend {
         let load_trace = ctx.load_module(Ptx::from_src(LOAD_TRACE_PTX))?;
         let store_trace = ctx.load_module(Ptx::from_src(STORE_TRACE_PTX))?;
         let bytewise_trace = ctx.load_module(Ptx::from_src(BYTEWISE_TRACE_PTX))?;
+        let shift_trace = ctx.load_module(Ptx::from_src(SHIFT_TRACE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -339,6 +344,7 @@ impl Backend {
             generate_store_trace_rows: store_trace.load_function("generate_store_trace_rows")?,
             generate_bytewise_trace_rows: bytewise_trace
                 .load_function("generate_bytewise_trace_rows")?,
+            generate_shift_trace_rows: shift_trace.load_function("generate_shift_trace_rows")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

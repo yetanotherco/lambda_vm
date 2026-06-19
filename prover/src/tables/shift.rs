@@ -359,6 +359,15 @@ pub fn generate_shift_trace(
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack each op into three parallel u64 arrays
+    // (value, shift_amount, flags) and let the kernel do compute_aux +
+    // row layout. Padding rows get only ZBS=1 on-device.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_shift_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -411,6 +420,49 @@ pub fn generate_shift_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_shift_trace`. Packs each op into three
+/// parallel u64 arrays (length `num_rows`, padded). Active-row flags use
+/// bits 0..3 = direction | signed | word_instr | mu(=1); inactive rows
+/// keep `flags = 0` so the kernel writes only ZBS=1 there.
+#[cfg(feature = "cuda")]
+fn try_generate_shift_trace_gpu(
+    operations: &[ShiftOperation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut in_values = vec![0u64; num_rows];
+    let mut shift_amounts = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+    for (i, op) in operations.iter().enumerate() {
+        in_values[i] = (op.in_halves[0] as u64)
+            | ((op.in_halves[1] as u64) << 16)
+            | ((op.in_halves[2] as u64) << 32)
+            | ((op.in_halves[3] as u64) << 48);
+        shift_amounts[i] = op.shift_amount;
+        let mut f: u64 = 0;
+        if op.direction {
+            f |= 1;
+        }
+        if op.signed {
+            f |= 1 << 1;
+        }
+        if op.word_instr {
+            f |= 1 << 2;
+        }
+        f |= 1 << 3; // active (mu = 1)
+        flags[i] = f;
+    }
+
+    let raw = stark::gpu_lde::try_generate_shift_trace_gpu_raw(
+        num_rows,
+        &in_values,
+        &shift_amounts,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

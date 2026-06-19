@@ -123,4 +123,5 @@ fn main() {
     compile_ptx("load_trace.cu", "load_trace.ptx", have_nvcc);
     compile_ptx("store_trace.cu", "store_trace.ptx", have_nvcc);
     compile_ptx("bytewise_trace.cu", "bytewise_trace.ptx", have_nvcc);
+    compile_ptx("shift_trace.cu", "shift_trace.ptx", have_nvcc);
 }
