@@ -12,6 +12,7 @@ pub mod inverse;
 pub mod lde;
 pub mod merkle;
 pub mod ntt;
+pub mod trace_primitives;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

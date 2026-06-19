@@ -97,6 +97,8 @@ const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx")
 const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
+const TRACE_PRIMITIVES_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/trace_primitives.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -169,6 +171,15 @@ pub struct Backend {
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
 
+    // trace_primitives.ptx
+    pub pad_to_pow2_u64: CudaFunction,
+    pub decompose_u64_to_bytes: CudaFunction,
+    pub decompose_u64_to_halfwords: CudaFunction,
+    pub fill_sequential_u64: CudaFunction,
+    pub range_check_column_u64: CudaFunction,
+    pub extract_bits_u64: CudaFunction,
+    pub multiplicity_count_by_index: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -190,6 +201,7 @@ impl Backend {
         let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
+        let trace_primitives = ctx.load_module(Ptx::from_src(TRACE_PRIMITIVES_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -259,6 +271,15 @@ impl Backend {
                 .load_function("block_inclusive_scan_rev_ext3")?,
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            pad_to_pow2_u64: trace_primitives.load_function("pad_to_pow2_u64")?,
+            decompose_u64_to_bytes: trace_primitives.load_function("decompose_u64_to_bytes")?,
+            decompose_u64_to_halfwords: trace_primitives
+                .load_function("decompose_u64_to_halfwords")?,
+            fill_sequential_u64: trace_primitives.load_function("fill_sequential_u64")?,
+            range_check_column_u64: trace_primitives.load_function("range_check_column_u64")?,
+            extract_bits_u64: trace_primitives.load_function("extract_bits_u64")?,
+            multiplicity_count_by_index: trace_primitives
+                .load_function("multiplicity_count_by_index")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
