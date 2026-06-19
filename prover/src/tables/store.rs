@@ -26,6 +26,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::set_limbs_32;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::new_is_bit_constraints;
 
@@ -103,10 +104,8 @@ pub fn generate_store_trace(
     for (row_idx, op) in operations.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
 
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::BASE_ADDRESS_0, op.base_address);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
         data[base + cols::WRITE2] = FE::from(op.write2 as u64);
         data[base + cols::WRITE4] = FE::from(op.write4 as u64);
         data[base + cols::WRITE8] = FE::from(op.write8 as u64);

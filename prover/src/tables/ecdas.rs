@@ -17,6 +17,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::set_limbs_32;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::IsBitConstraint;
 use crate::tables::ecsm::ecdas_tuple;
@@ -110,8 +111,7 @@ pub fn generate_ecdas_trace(
         let base = row_idx * cols::NUM_COLUMNS;
         let s = &op.step;
 
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
         write_bytes(&mut data, base, cols::XG, &s.x_g);
         write_bytes(&mut data, base, cols::YG, &s.y_g);
         write_bytes(&mut data, base, cols::XA, &s.x_a);

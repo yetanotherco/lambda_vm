@@ -45,6 +45,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::set_limbs_32;
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -119,8 +120,7 @@ pub fn generate_memw_register_trace(
         data[base + cols::ADDRESS] = FE::from(op.base_address / 2);
 
         // Timestamp split into lo/hi 32-bit words
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
 
         // Value: registers are DWordWL = 2 words
         data[base + cols::VAL_0] = FE::from(op.value[0]);

@@ -23,6 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::set_limbs_32;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
@@ -109,8 +110,7 @@ pub fn generate_keccak_trace(
         let base = row_idx * cols::NUM_COLUMNS;
 
         // Timestamp
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
 
         // Address as 8 bytes
         for b in 0..8 {

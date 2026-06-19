@@ -24,6 +24,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::{set_limbs_16, set_limbs_32};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, packed_decode_shrunk,
 };
@@ -204,10 +205,8 @@ pub fn generate_cpu32_trace(
         let aux = op.compute_aux();
 
         // Inputs
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
+        set_limbs_32(&mut data, base + cols::TIMESTAMP_0, op.timestamp);
+        set_limbs_32(&mut data, base + cols::PC_0, op.pc);
 
         // rv1 as DWordWHH: [Half, Half, Word]
         data[base + cols::RS1] = FE::from(op.rs1 as u64);
@@ -216,8 +215,7 @@ pub fn generate_cpu32_trace(
         data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF);
         data[base + cols::RV1_2] = FE::from(op.rv1 >> 32);
         data[base + cols::RV1_SIGN] = FE::from(aux.rv1_sign as u64);
-        data[base + cols::ARG1_0] = FE::from(aux.arg1 & 0xFFFF_FFFF);
-        data[base + cols::ARG1_1] = FE::from(aux.arg1 >> 32);
+        set_limbs_32(&mut data, base + cols::ARG1_0, aux.arg1);
 
         // rv2 as DWordWHH
         data[base + cols::RS2] = FE::from(op.rs2 as u64);
@@ -226,23 +224,17 @@ pub fn generate_cpu32_trace(
         data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF);
         data[base + cols::RV2_2] = FE::from(op.rv2 >> 32);
         data[base + cols::RV2_SIGN] = FE::from(aux.rv2_sign as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::ARG2_0] = FE::from(aux.arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(aux.arg2 >> 32);
+        set_limbs_32(&mut data, base + cols::IMM_0, op.imm);
+        set_limbs_32(&mut data, base + cols::ARG2_0, aux.arg2);
 
         // res as DWordHL: 4 halves
-        data[base + cols::RES_0] = FE::from(op.res & 0xFFFF);
-        data[base + cols::RES_1] = FE::from((op.res >> 16) & 0xFFFF);
-        data[base + cols::RES_2] = FE::from((op.res >> 32) & 0xFFFF);
-        data[base + cols::RES_3] = FE::from((op.res >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::RES_0, op.res);
         data[base + cols::RES_SIGN] = FE::from(aux.res_sign as u64);
 
         // rd write
         data[base + cols::RD] = FE::from(op.rd as u64);
         data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
-        data[base + cols::RVD_0] = FE::from(aux.rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(aux.rvd >> 32);
+        set_limbs_32(&mut data, base + cols::RVD_0, aux.rvd);
 
         // ALU control
         data[base + cols::ALU] = FE::from(op.alu as u64);

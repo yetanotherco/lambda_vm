@@ -28,6 +28,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::{set_limbs_16, set_limbs_32};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
 
@@ -135,20 +136,15 @@ pub fn generate_eq_trace(
         let base = row_idx * cols::NUM_COLUMNS;
 
         // a, b as DWordWL (2 words each)
-        data[base + cols::A_0] = FE::from(op.a & 0xFFFF_FFFF);
-        data[base + cols::A_1] = FE::from(op.a >> 32);
-        data[base + cols::B_0] = FE::from(op.b & 0xFFFF_FFFF);
-        data[base + cols::B_1] = FE::from(op.b >> 32);
+        set_limbs_32(&mut data, base + cols::A_0, op.a);
+        set_limbs_32(&mut data, base + cols::B_0, op.b);
 
         data[base + cols::INVERT] = FE::from(op.invert as u64);
         data[base + cols::RES] = FE::from(op.compute_res() as u64);
 
         // diff = a - b (wrapping) as DWordHL (4 halves)
         let diff = op.a.wrapping_sub(op.b);
-        data[base + cols::DIFF_0] = FE::from(diff & 0xFFFF);
-        data[base + cols::DIFF_1] = FE::from((diff >> 16) & 0xFFFF);
-        data[base + cols::DIFF_2] = FE::from((diff >> 32) & 0xFFFF);
-        data[base + cols::DIFF_3] = FE::from((diff >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::DIFF_0, diff);
 
         data[base + cols::EQ] = FE::from(op.compute_eq() as u64);
         data[base + cols::MU] = FE::from(*multiplicity);
