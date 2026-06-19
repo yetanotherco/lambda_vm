@@ -198,46 +198,67 @@ imbalance).
 ```
                        GlobalMemory   Memory     range +
                        (telescoping)  (bookend)  ordering
-   Design X:               MU            MU          MU      ← MU gates everything
-   Design Y (chosen):      MU           One         One      ← MU only where needed
+   Design X (SOUND):       MU            MU          MU      ← MU gates everything
+   Design Y (UNSOUND):     MU           One         One      ← MU only on GlobalMemory
 ```
 
-### Design X (earlier)
+**Conclusion up front: Design X is sound; Design Y is *not*.** We initially
+believed Y was a cleaner equivalent (and two adversarial reviews agreed). They
+were wrong — Y opens a chain-truncation attack. Below is X, then Y, then the
+attack and why X blocks it.
 
-`MU` gates **every** L2G interaction. This was the first cut — it matched the
-standard table pattern (LT/MUL/MEMW each gate all their interactions with one
-multiplicity column) and kept padding handling uniform.
+### Design X
 
-The drawback: only the GlobalMemory bus actually *needs* `MU`. On the Memory bus,
-all-zero padding still self-cancels (that token carries no epoch field); on the
-range-check buses, padding sends only valid lookups (`AreBytes[0,0]`,
-`IsHalfword[0]`, `IsB20[epoch_label-1]`). Gating those with `MU` was redundant —
-and gating the **ordering** check with `MU` is what made "could `MU=0` skip the
-ordering?" a question at all. In Design X the answer ("no") relies on a cross-bus
-argument (Statement S below).
+`MU` gates **every** L2G interaction (matches the standard table pattern —
+LT/MUL/MEMW each gate all their interactions with one multiplicity column).
 
-### Design Y (chosen)
+The crucial consequence — which we first mistook for redundancy — is that gating
+the **Memory bus bookend** with `MU` forces `MU = 1` on every *touched* cell:
+a touched cell's MEMW accesses need the L2G seed/fini on the Memory bus (PAGE is
+off), so `MU = 0` would dangle them → the epoch proof fails. This is **Statement
+S** below. Forcing `MU = 1` on every touched cell forces every touching epoch
+**into the global chain** — so the chain is **complete**, and cannot be truncated.
 
-`MU` gates **only the GlobalMemory bus** — the one place padding genuinely
-misbehaves. The Memory bus and the range/ordering checks use `Multiplicity::One`,
-so they fire on every row. Consequences:
+### Design Y (rejected — unsound)
 
-- The ordering check fires **unconditionally** → `MU` cannot gate or skip it.
-  The Design X concern disappears *by construction*, not by argument.
-- `MU`'s only job is GlobalMemory padding cancellation, where it is pinned by the
-  GlobalMemory bus balance + the boolean constraint.
-- The boolean constraint on `MU` must live in the **global** proof's AIR
-  (`l2g_global_air`), the only place `MU` is used. (Implementation guardrail: a
-  test that a row with `MU=2` fails to verify catches forgetting this.)
-- Padding rows now fire the range/ordering lookups, so `collect_bitwise_from_l2g`
-  emits the (valid, harmless) lookups for padding too.
+`MU` gates **only the GlobalMemory bus**; the Memory bus and range/ordering checks
+use `Multiplicity::One`. The intended win was that the ordering check then fires
+unconditionally so `MU` can't skip it. But decoupling the Memory bookend from `MU`
+**broke Statement S**: a touched cell's bookend now fires regardless of `MU`
+(`Multiplicity::One`), so the epoch proof passes even with `MU = 0`. Nothing then
+forces `MU = 1` on a *non-first-touch* row — and that is exploitable.
 
-Design Y is both more minimal and removes the only residual soundness concern.
+### The attack Design Y allows: orphan a touched epoch
 
-### Statement S (the Design X anchor, for reference)
+Cell A, touched by epochs e1 then e2. Honest: genesis `v0` → e1 writes `f1` →
+e2 writes `f2` → final `f2`. A cheating prover sets **`MU = 0` on e2's L2G row**
+and sets `global_memory`'s finalization for A to `f1`:
 
-The cross-bus argument Design X relied on, and which Design Y avoids needing for
-the ordering check:
+```
+   genesis(v0) ──► e1.init        ✓ (genesis must be consumed — forces e1 only)
+   e1.fini(f1) ──► FINAL(f1)      ✓ (prover-chosen finalization absorbs it)
+   e2.init / e2.fini              ✗ MU=0 — orphaned, don't fire
+```
+
+- The GlobalMemory bus **balances** (every fired token matched).
+- e2's **epoch proof still passes** — in Design Y its Memory bookend is
+  `Multiplicity::One`, so it fires regardless of `MU`; e2 ran internally-consistently.
+- **Nothing forces `MU_e2 = 1`:** e2 isn't first-touch (genesis went to e1), and
+  the finalization is a *prover column*, so it just absorbs whatever the last fired
+  fini was.
+
+Result: e2's write to A is silently dropped — A's final value is claimed `f1`
+when it's really `f2`. A false statement, proven. (For a *middle* epoch, reroute
+the later init to consume the earlier fini, skipping the middle one.)
+
+The root cause is the **input/output asymmetry** of the anchors: genesis is the
+*input* and is ELF-bound (fixed), but the finalization is the *output* — a prover
+column. The finalization is only trustworthy if the chain is **complete** so that
+the last fini is *forced* to be consumed by it. A complete chain pins the
+finalization; a truncatable chain leaves it free. Design X forces completeness
+(via `MU=1` on every touched cell); Design Y does not.
+
+### Statement S (why Design X is sound, and what Y broke)
 
 > In a continuation epoch, the only table that provides a RAM cell's seed (its
 > value at timestamp 0) on the Memory bus is L2G (PAGE is off). If a cell is
@@ -248,29 +269,60 @@ the ordering check:
 S rests on three checkable facts: (1) PAGE is off in continuation epochs;
 (2) MEMW enforces timestamp ordering, so a cell's access chain must bottom out at
 the seed; (3) no other table provides a RAM seed (REGISTER is registers only, a
-disjoint token subspace). It is the existing memory-soundness argument with L2G
-playing PAGE's seed-provider role. Design Y keeps S relevant only for `MU`'s
-GlobalMemory correctness, not for the ordering.
+disjoint token subspace).
+
+**S requires the Memory bookend to be `MU`-gated** — that is exactly what Design X
+has and Design Y removed. So the "redundant" `MU` on the Memory bus in Design X is
+in fact load-bearing: it's what forces every touched epoch into the chain, making
+the chain complete and the finalization trustworthy.
+
+### The anchoring chain (why a real access cannot be dropped at all)
+
+`MU = 1` being forced bottoms out at the program itself:
+
+```
+   ELF ─DECODE(preprocessed)─► each row's instruction (LOAD/STORE flags) is fixed
+   PC-continuity ───────────► every executed instruction is present, in order
+        │
+   ▼ a real load/store row has its flag = 1 (DECODE match + IsBit) ⟹ CPU sends Memw req
+   ▼ MEMW must receive it (MU_READ/MU_WRITE) — dropping it ⟹ Memw-bus imbalance
+   ▼ MEMW's bookend pairing needs the L2G seed/fini — in Design X (MU-gated) ⟹ MU=1
+   ▼ MU=1 ⟹ the cell is in the global chain ⟹ chain complete ⟹ finalization pinned
+```
+
+This is the VM's core execution soundness (DECODE + PC-continuity + IsBit flags,
+verified in `cpu.rs` / `constraints/cpu.rs`), extended one link at a time up to
+cross-epoch memory. Design X keeps every link; Design Y cut the MEMW→L2G link.
+
+### How `global_memory`'s finalization is constrained — and the parallel with `main`
+
+The finalization is **not** checked against an external value (it's the computed
+output, not a known input). It is pinned **internally** by the bus: it must consume
+the last fini of each cell's chain, which (with a complete chain) is the cell's
+real last-written value. This is exactly how **PAGE** works in the monolithic
+prover — PAGE's `fini` is pinned by the (single, complete) Memory bus to the last
+MEMW write. Design X is the faithful cross-epoch extension; Design Y silently
+dropped the "chain is complete" property both rely on.
 
 ---
 
 ## 5. Adversarial review summary
 
-Three independent adversarial reviews were run against these mechanisms; each
-tried to construct a forging prover and failed:
-
 1. **`MU` safety (Design X).** Could `MU=0` on a real row, or a non-boolean `MU`,
    skip the ordering or forge a balance? No — caught by the Memory bus (Statement
-   S) and the boolean constraint.
-2. **Design Y.** Is the narrow `MU` placement sound, and does it remove the
-   concern? Yes — padding stays harmless (self-cancels on Memory; valid lookups
-   elsewhere); the ordering becomes unconditional; the "ghost row" attack fails
-   on the GlobalMemory anchors. One mandatory guardrail: the `MU` boolean
-   constraint must be in `l2g_global_air`.
+   S) and the boolean constraint. **Holds.**
+2. **Design Y.** Two adversarial reviews concluded Y was sound (padding harmless,
+   ordering unconditional, "ghost row" attack defeated). **They were wrong.** Both
+   only tested *first-touch* `MU=0` (genesis dangles → caught) and added/forged
+   rows; neither tested **truncating the chain at a non-first-touch row** while
+   pointing the prover-controlled finalization at the truncation. That attack (§4)
+   makes Y unsound. Lesson: a review that misses an attack class proves nothing
+   about it — the truncation/orphan class was the gap.
 3. **`fini_epoch` as a constant.** Sound — strictly more so than a column. Labels
    are verifier-computed from epoch position (unforgeable); prove/verify use
    identical labels (no off-by-one); the free `init_epoch` column and
-   `global_memory`'s `FINI_EPOCH` column are both pinned by bus balance.
+   `global_memory`'s `FINI_EPOCH` column are pinned by bus balance **when the chain
+   is complete** (Design X). Independent of the X/Y choice.
 
 ---
 
@@ -278,9 +330,10 @@ tried to construct a forging prover and failed:
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
   ordering check (§3.3), the `MU` selector (§3.4).
-- The committed code currently wires `MU` as in **Design X**. **Design Y** is the
-  agreed wiring (§4); switching `MU` to GlobalMemory-only (and moving the `MU`
-  boolean constraint into `l2g_global_air`) is the next change.
+- **The committed code implements Design X** (`MU` gates every L2G interaction),
+  which is the sound design. Design Y was implemented briefly, then found unsound
+  (§4, the chain-truncation attack) and **reverted**. Do not re-introduce the
+  Design Y wiring: gating only the GlobalMemory bus reopens the orphan attack.
 - Known soundness gap, deferred: **cross-epoch register continuity** — epoch
   `i>0`'s register init is a prover-supplied snapshot, not yet bound to epoch
   `i-1`'s fini. This is independent of the memory work above.

@@ -47,24 +47,13 @@
 //! trace (the commitment binding compares their roots), so it inherits the same
 //! guarantee.
 //!
-//! ## Padding and the MU selector
+//! ## Padding
 //!
-//! `MU` (1 on real rows, 0 on power-of-two padding) gates **only the GlobalMemory
-//! bus**, where padding does not self-cancel (its constant `fini_epoch` differs
-//! from its zero `init_epoch`). Everything else — the epoch-local `Memory` bus and
-//! the range/ordering checks — uses `Multiplicity::One`, because:
-//! - all-zero padding self-cancels on the `Memory` bus (no epoch field in that
-//!   token), and
-//! - padding sends only valid range/ordering lookups (`AreBytes[0,0]`,
-//!   `IsHalfword[0]`, `IsB20[epoch_label-1]`), which are harmless.
-//!
-//! The payoff: since the ordering check is on `Multiplicity::One`, **it fires on
-//! every row unconditionally — `MU` cannot be used to skip it.** `MU` only ever
-//! affects the cross-epoch telescoping, where it is pinned by the GlobalMemory bus
-//! itself (`MU=0` on a real row → its genesis/fini link goes unconsumed →
-//! imbalance) and constrained boolean by the AIR. The boolean constraint lives on
-//! the epoch-local air; the global proof commits the identical trace (root-bound),
-//! so it inherits `MU ∈ {0,1}`.
+//! Real rows carry `MU = 1`; the power-of-two padding rows carry `MU = 0`. Every
+//! interaction uses `Multiplicity::Column(MU)`, so padding rows fire nothing —
+//! we never rely on token self-cancellation (this is the standard pattern used
+//! by every variable-length table). `MU` is self-enforced: dropping a real row
+//! (`MU = 0`) breaks its telescoping link → bus imbalance.
 
 use std::collections::HashMap;
 
@@ -390,19 +379,12 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 ///
 /// Address, fini timestamp and the values appear here, so MEMW range-checks them
 /// for us — they need no L2G range check (see [`range_check_interactions`]).
-///
-/// Multiplicity is `One` (not `MU`): all-zero padding rows self-cancel here (init
-/// token == fini token, and the `Memory` token carries no epoch field), so this
-/// bus doesn't need the selector. `MU` is reserved for the GlobalMemory bus, where
-/// the constant `fini_epoch` breaks that self-cancellation. Keeping this bus (and
-/// the range/ordering checks) on `One` means the ordering check fires on EVERY
-/// row unconditionally — `MU` cannot be used to skip it.
 pub fn memory_bus_interactions() -> Vec<BusInteraction> {
     vec![
         // init: receive the cell's initial token at the epoch-start seed (ts = 0).
         BusInteraction::receiver(
             BusId::Memory,
-            Multiplicity::One,
+            mu(),
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -415,7 +397,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
         // fini: send the cell's final token at the last access timestamp.
         BusInteraction::sender(
             BusId::Memory,
-            Multiplicity::One,
+            mu(),
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -429,35 +411,29 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// Range-check + ordering bus interactions for the columns nothing else
-/// constrains, all with `Multiplicity::One` (they fire on EVERY row — see below):
+/// constrains, all with multiplicity `MU` (so padding fires none):
 /// - one `AreBytes` for the two value bytes (the `init` value is a trusted source);
 /// - one `IsHalfword` per cross-epoch-only halfword column;
 /// - one `IsB20` proving `init_epoch < fini_epoch` (the ordering constraint), via
 ///   `fini_epoch − 1 − init_epoch` being a valid 20-bit value. With genesis epoch
 ///   `0` this also covers genesis cells (`0 < fini_epoch`) with no special case.
 ///
-/// These use `Multiplicity::One`, NOT `MU`, on purpose: padding rows are all-zero,
-/// so they send only valid lookups (`AreBytes[0,0]`, `IsHalfword[0]`,
-/// `IsB20[epoch_label-1]`) — harmless. Firing unconditionally means **the ordering
-/// check cannot be skipped via `MU`** (it isn't gated by the selector at all). The
-/// matching multiplicities for ALL rows (incl. padding) are emitted by
-/// [`collect_bitwise_from_l2g`]. Keep the two in sync.
-///
 /// Address and fini timestamp are NOT here — MEMW checks them on the Memory bus.
-/// These live only on the epoch-local table (`l2g_memory_air`), whose proof carries
-/// the BITWISE provider; the global proof commits the identical trace, so its
-/// columns inherit the same guarantee via the commitment binding.
+/// These are committed only on the epoch-local table (`l2g_memory_air`), whose
+/// proof carries the BITWISE provider; the global proof commits the identical
+/// trace, so its columns inherit the same guarantee via the commitment binding.
+/// Keep this in sync with [`collect_bitwise_from_l2g`].
 pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(2 + cols::RANGE_CHECKED_HALFWORDS.len());
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        Multiplicity::One,
+        mu(),
         vec![direct(cols::INIT_VALUE), direct(cols::FINI_VALUE)],
     ));
     for &column in &cols::RANGE_CHECKED_HALFWORDS {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            Multiplicity::One,
+            mu(),
             vec![direct(column)],
         ));
     }
@@ -465,7 +441,7 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     // init_epoch = INIT_EPOCH_0 + 2^16·INIT_EPOCH_1.
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        Multiplicity::One,
+        mu(),
         vec![BusValue::linear(vec![
             LinearTerm::Constant(epoch_label as i64 - 1),
             LinearTerm::Column {
@@ -482,35 +458,19 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 }
 
 /// The BITWISE lookups the L2G range checks + ordering check send, so the BITWISE
-/// table's multiplicities balance the [`range_check_interactions`] senders. Since
-/// those senders use `Multiplicity::One`, they fire on EVERY row — so this emits,
-/// per row, one `AreBytes`, one `IsHalfword` per cross-epoch halfword, and one
-/// `IsB20` for the ordering difference, for both real rows AND the all-zero
-/// power-of-two padding rows (`epoch_label` is the `fini_epoch` constant the bus
-/// uses). Keep in sync with [`range_check_interactions`].
-pub fn collect_bitwise_from_l2g(
-    boundaries: &[CellBoundary],
-    epoch_label: u64,
-) -> Vec<BitwiseOperation> {
-    let num_rows = boundaries.len().next_power_of_two().max(1);
+/// table's multiplicities balance the [`range_check_interactions`] senders. Emits,
+/// per real row, one `AreBytes`, one `IsHalfword` per cross-epoch halfword, and one
+/// `IsB20` for the ordering difference. Padding rows fire nothing (`MU = 0`), so
+/// none are emitted for them.
+pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOperation> {
     let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();
-    let mut ops = Vec::with_capacity(num_rows * per_row);
+    let mut ops = Vec::with_capacity(boundaries.len() * per_row);
 
     let push_halfword = |ops: &mut Vec<BitwiseOperation>, v16: u64| {
         ops.push(BitwiseOperation::halfword(
             BitwiseOperationType::IsHalf,
             (v16 & 0xFF) as u8,
             ((v16 >> 8) & 0xFF) as u8,
-        ));
-    };
-    // Ordering lookup value: the bus sends `epoch_label - 1 - init_epoch`.
-    let push_ordering = |ops: &mut Vec<BitwiseOperation>, init_epoch: u64| {
-        let diff = epoch_label - 1 - init_epoch;
-        debug_assert!(diff < (1 << 20), "epoch gap exceeds IsB20 range");
-        ops.push(BitwiseOperation::b20(
-            (diff & 0xFF) as u8,
-            ((diff >> 8) & 0xFF) as u8,
-            ((diff >> 16) & 0xF) as u8,
         ));
     };
 
@@ -528,22 +488,15 @@ pub fn collect_bitwise_from_l2g(
         for v in init_ts {
             push_halfword(&mut ops, v);
         }
-        push_ordering(&mut ops, b.init.originating_epoch);
-    }
-
-    // Padding rows are all-zero: AreBytes(0,0), IsHalfword(0) per halfword, and
-    // IsB20[epoch_label - 1] (init_epoch = 0). They fire because the range-check
-    // senders use Multiplicity::One.
-    for _ in boundaries.len()..num_rows {
-        ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::AreBytes,
-            0,
-            0,
+        // Ordering: IsB20[fini_epoch - 1 - init_epoch]. Honest rows have
+        // init_epoch < fini_epoch, so the difference is a small non-negative value.
+        let diff = b.fini.epoch - 1 - b.init.originating_epoch;
+        debug_assert!(diff < (1 << 20), "epoch gap exceeds IsB20 range");
+        ops.push(BitwiseOperation::b20(
+            (diff & 0xFF) as u8,
+            ((diff >> 8) & 0xFF) as u8,
+            ((diff >> 16) & 0xF) as u8,
         ));
-        for _ in 0..cols::RANGE_CHECKED_HALFWORDS.len() {
-            push_halfword(&mut ops, 0);
-        }
-        push_ordering(&mut ops, 0);
     }
 
     ops
@@ -813,21 +766,19 @@ mod tests {
     #[test]
     fn test_collect_bitwise_matches_sender_count() {
         // Per row: 1 AreBytes + one IsHalfword per cross-epoch halfword + 1 IsB20.
-        // The range checks fire on EVERY row (Multiplicity::One), so ops are emitted
-        // for the padding rows too — 3 boundaries pad up to 4 rows.
+        // No padding ops (padding has MU = 0 and fires nothing).
         let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
-        let ops = collect_bitwise_from_l2g(&boundaries, 1);
-        let num_rows = 4; // 3 padded to the next power of two
+        let ops = collect_bitwise_from_l2g(&boundaries);
         let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();
-        assert_eq!(ops.len(), num_rows * per_row);
+        assert_eq!(ops.len(), boundaries.len() * per_row);
 
         let count = |t: BitwiseOperationType| ops.iter().filter(|o| o.lookup_type == t).count();
-        assert_eq!(count(BitwiseOperationType::AreBytes), num_rows);
+        assert_eq!(count(BitwiseOperationType::AreBytes), boundaries.len());
         assert_eq!(
             count(BitwiseOperationType::IsHalf),
-            num_rows * cols::RANGE_CHECKED_HALFWORDS.len()
+            boundaries.len() * cols::RANGE_CHECKED_HALFWORDS.len()
         );
-        assert_eq!(count(BitwiseOperationType::IsB20), num_rows);
+        assert_eq!(count(BitwiseOperationType::IsB20), boundaries.len());
     }
 
     #[test]
@@ -849,8 +800,7 @@ mod tests {
             },
         };
         let trace = generate_local_to_global_trace(&[b]);
-        // epoch_label = b.fini.epoch (the per-table constant the bus uses).
-        let ops = collect_bitwise_from_l2g(&[b], b.fini.epoch);
+        let ops = collect_bitwise_from_l2g(&[b]);
 
         // The single AreBytes op carries the two value bytes.
         assert_eq!(ops[0].lookup_type, BitwiseOperationType::AreBytes);

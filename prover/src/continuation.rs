@@ -218,7 +218,7 @@ fn prove_verify_epoch(
     // committed L2G trace was built from.
     crate::tables::bitwise::update_multiplicities(
         &mut traces.bitwise,
-        &local_to_global::collect_bitwise_from_l2g(boundary, start.label),
+        &local_to_global::collect_bitwise_from_l2g(boundary),
     );
 
     let table_counts = traces.table_counts();
