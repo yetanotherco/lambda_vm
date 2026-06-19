@@ -24,6 +24,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::limbs_16;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
 
 // =========================================================================
@@ -133,12 +134,7 @@ impl ShiftOperation {
         word_instr: bool,
     ) -> Self {
         Self {
-            in_halves: [
-                (value & 0xFFFF) as u16,
-                ((value >> 16) & 0xFFFF) as u16,
-                ((value >> 32) & 0xFFFF) as u16,
-                ((value >> 48) & 0xFFFF) as u16,
-            ],
+            in_halves: limbs_16(value).map(|l| l as u16),
             shift: (shift_amount & 0xFF) as u8,
             shift_amount,
             direction,
