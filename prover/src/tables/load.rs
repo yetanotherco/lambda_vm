@@ -183,6 +183,14 @@ pub fn generate_load_trace(
     operations: &[LoadOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: build the four parallel u64 arrays the kernel
+    // consumes, lay out the table on device, rewrap as TraceTable.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_load_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -219,6 +227,56 @@ pub fn generate_load_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_load_trace`. Flattens per-op data into four
+/// parallel u64 arrays (padded to num_rows) and runs the row-layout kernel.
+#[cfg(feature = "cuda")]
+fn try_generate_load_trace_gpu(
+    operations: &[LoadOperation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut base_addresses = vec![0u64; num_rows];
+    let mut timestamps = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+    let mut res_bytes = vec![0u64; 8 * num_rows];
+
+    for (i, op) in operations.iter().enumerate() {
+        base_addresses[i] = op.base_address;
+        timestamps[i] = op.timestamp;
+        let (r2, r4, r8) = op.read_flags();
+        let sign_bit = op.compute_sign_bit() as u64;
+        let mut f = 0u64;
+        if r2 {
+            f |= 1 << 0;
+        }
+        if r4 {
+            f |= 1 << 1;
+        }
+        if r8 {
+            f |= 1 << 2;
+        }
+        if op.signed {
+            f |= 1 << 3;
+        }
+        f |= sign_bit << 4;
+        f |= 1 << 5; // MU = 1 for active rows
+        flags[i] = f;
+        for b in 0..8 {
+            res_bytes[i * 8 + b] = op.res[b];
+        }
+    }
+
+    let raw = stark::gpu_lde::try_generate_load_trace_gpu_raw(
+        num_rows,
+        &base_addresses,
+        &timestamps,
+        &flags,
+        &res_bytes,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

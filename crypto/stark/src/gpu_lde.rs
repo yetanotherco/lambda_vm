@@ -77,6 +77,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_PAGE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_DECODE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_BITWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_LOAD_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -154,6 +155,36 @@ pub fn try_generate_bitwise_trace_gpu_raw(
 ) -> Option<Vec<u64>> {
     let raw = math_cuda::bitwise_trace::generate_bitwise_trace_dev(num_rows, num_cols).ok()?;
     GPU_BITWISE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
+}
+
+/// LOAD-table GPU dispatch counter.
+pub(crate) static GPU_LOAD_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_load_trace_calls() -> u64 {
+    GPU_LOAD_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU LOAD-trace generator. `flags` is bit-
+/// packed per row: bit0=READ2 bit1=READ4 bit2=READ8 bit3=SIGNED
+/// bit4=SIGN_BIT bit5=MU. `res_bytes` is `8 * num_rows` interleaved.
+pub fn try_generate_load_trace_gpu_raw(
+    num_rows: usize,
+    base_addresses: &[u64],
+    timestamps: &[u64],
+    flags: &[u64],
+    res_bytes: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::load_trace::generate_load_trace_dev(
+        num_rows,
+        base_addresses,
+        timestamps,
+        flags,
+        res_bytes,
+        num_cols,
+    )
+    .ok()?;
+    GPU_LOAD_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(raw)
 }
 
@@ -1113,6 +1144,13 @@ pub fn schedule_decode_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_bitwise_trace_fault(n_calls_until_err: i64) {
     math_cuda::bitwise_trace::FAULT_BITWISE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_load_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_load_trace_fault(n_calls_until_err: i64) {
+    math_cuda::load_trace::FAULT_LOAD_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

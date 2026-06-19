@@ -13,6 +13,7 @@ pub mod lde;
 pub mod merkle;
 pub mod bitwise_trace;
 pub mod decode_trace;
+pub mod load_trace;
 pub mod multiplicity_sort;
 pub mod ntt;
 pub mod page_trace;
