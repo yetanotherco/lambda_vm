@@ -36,7 +36,7 @@ fn cpu_page_trace(
 fn run_parity(page_size: usize, seed: u64) {
     let mut rng = ChaCha8Rng::seed_from_u64(seed);
     // Init values are bytes (0..255 as u64).
-    let init_values: Vec<u64> = (0..page_size).map(|_| (rng.r#gen::<u8>() as u64)).collect();
+    let init_values: Vec<u64> = (0..page_size).map(|_| rng.r#gen::<u8>() as u64).collect();
     // Final values: simulate ~25% of bytes were written, the rest stayed at init.
     let mut final_values = init_values.clone();
     let mut final_timestamps = vec![0u64; page_size];

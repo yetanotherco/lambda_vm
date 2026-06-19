@@ -234,23 +234,18 @@ pub fn multiplicity_count_multifield_dev(
         a_is_input = !a_is_input;
     }
 
-    // After 128 passes the sorted keys are in whichever buffer last received
-    // the scatter output. If `a_is_input` was flipped 128 times (even count)
-    // we end up back where we started — so the SORTED data is in *_a.
-    // Wait: we flip after each scatter. 128 flips means final state is the
-    // SAME as initial (a_is_input == true). Each pass: read from "in",
-    // write to "out", then flip. After 128 passes, last write was to:
-    //   - pass 0: a→b, then a_is_input=false
-    //   - pass 1: b→a, then a_is_input=true
-    //   - pass 127 (odd): b→a, then a_is_input=false
-    //   - pass 127 (since starts at 0): bit=127, that's the 128th pass
-    //     (i = 0..=127, count = 128). Final flip: a_is_input was true at
-    //     start of pass 0, flipped 128 times → true at end. So the last
-    //     scatter wrote to `b` (when a_is_input was true going in).
-    // The sorted output is in *_b.
+    // Each pass reads from one buffer and writes to the other, then flips.
+    // With initial a_is_input = true:
+    //   even iter → in = a, out = b
+    //   odd  iter → in = b, out = a
+    // Iter 127 (odd) is the final pass: it writes to *_a. So the fully
+    // sorted output lives in *_a regardless of how many flips happened.
+    // (The flip count is 128 = even, so a_is_input ends back at `true`,
+    // which now means "the next read WOULD come from a" — i.e., a holds
+    // the latest data.)
     debug_assert!(a_is_input, "ping-pong invariant broken");
-    let sorted_hi = &hi_b;
-    let sorted_lo = &lo_b;
+    let sorted_hi = &hi_a;
+    let sorted_lo = &lo_a;
 
     // Stage B: segmented reduce.
     let mut is_first = unsafe { stream.alloc::<u64>(n) }?;

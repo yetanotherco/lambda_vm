@@ -107,6 +107,10 @@ fn gpu_batch_invert_fault_falls_back_to_cpu() {
 /// PAGE-trace CPU fallback: forcing `generate_page_trace_dev` to Err must
 /// make the prover-side wrapper return None and the CPU loop in
 /// `generate_page_trace` run to completion. Recovered proof must verify.
+///
+/// `fib_iterative_1M` only has a single memory page → one GPU page-trace
+/// call per prove. We schedule the single fault and check the counter
+/// drops to zero (one CPU fallback fired).
 #[test]
 #[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
 fn gpu_page_trace_fault_falls_back_to_cpu() {
@@ -116,21 +120,18 @@ fn gpu_page_trace_fault_falls_back_to_cpu() {
     let clean = gpu_page_trace_calls();
     assert!(clean > 0, "GPU page-trace never ran, cannot test fallback");
 
-    for n in 1..=3i64 {
-        stark::gpu_lde::schedule_page_trace_fault(n);
-        reset_all_gpu_call_counters();
-
-        let recovered = prove(&elf).expect("prove after fault");
-        assert_eq!(
-            gpu_page_trace_calls(),
-            clean - 1,
-            "expected exactly one GPU page-trace fallback (fault #{n})"
-        );
-        assert!(
-            verify(&recovered, &elf).expect("verify recovered"),
-            "post-fallback proof failed verification (page-trace fault #{n})"
-        );
-    }
+    stark::gpu_lde::schedule_page_trace_fault(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove after fault");
+    assert_eq!(
+        gpu_page_trace_calls(),
+        clean - 1,
+        "expected exactly one GPU page-trace fallback",
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "post-fallback proof failed verification (page-trace fault)",
+    );
 
     stark::gpu_lde::schedule_page_trace_fault(-1);
 }

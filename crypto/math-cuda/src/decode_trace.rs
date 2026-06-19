@@ -28,8 +28,10 @@ fn check_decode_trace_fault_injection() -> Result<()> {
     if v < 0 {
         return Ok(());
     }
-    let new = FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
-    if new == 0 {
+    // schedule(N) → fail Nth call. `fetch_sub` returns the OLD value;
+    // trigger when it was 1.
+    let prev = FAULT_DECODE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if prev == 1 {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
         ));

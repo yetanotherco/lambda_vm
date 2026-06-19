@@ -31,8 +31,11 @@ fn check_page_trace_fault_injection() -> Result<()> {
     if v < 0 {
         return Ok(());
     }
-    let new = FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
-    if new == 0 {
+    // `fetch_sub` returns the OLD value. We want schedule(N) to fail the
+    // Nth upcoming call, so we trigger when the old value is 1 (this is
+    // the call that takes the counter from 1 down to 0).
+    let prev = FAULT_PAGE_TRACE_REMAINING_UNTIL_ERR.fetch_sub(1, Ordering::Relaxed);
+    if prev == 1 {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_UNKNOWN,
         ));
