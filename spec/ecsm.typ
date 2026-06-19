@@ -51,7 +51,7 @@ When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2,
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 = Overview
-This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
+This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [2^240, 2^256)$ that induce curves of odd order.
 In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
 
 #attention("Variable space.")[
@@ -103,15 +103,15 @@ This chip is triggered by an `ECALL` with the opcode indicating this chip:
 #render_constraint_table(ecsm_chip, config, groups: "ecall")
 
 === Read `xG`
-Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently loads $x_G$ in (@ec:c:read_xG).
+Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (@ec:c:read_addr_xG) and subsequently loads $x_G$ into `raw_xG` (@ec:c:read_xG).
 #render_constraint_table(ecsm_chip, config, groups: "read_xG")
 
 === Range check `xG`
-Before continuing, it is verified that $x_G in [0, p)$.
-To this end, witness $#`xG_sub_p` := #`xG` - p mod 2^256$ is added to `p`; if the addition sums to `xG` and overflows $mod 2^256$, it must hold that $#`xG` < p$.
+Next, `raw_xG` is reduced $mod p$.
+To this end, we constrain $#`xG` = #`raw_xG` - #`q0` dot #`p`$ (@ec:c:c0_0, @ec:c:c0_i, @ec:c:c0_7), where prover-provided non-negative witness quotient `q0` indicates the multiple of `p` to be subtracted from `raw_xG` to arrive at $x_G mod p$.
+Moreover, we enforce $#`xG` <  p$ by asserting that the addition of $#`xG` - #`p`$ to `p` overflows $mod 2^256$.
 The addition is constrained by requiring that `c3` are bits (@ec:c:range_c3); an overflow occurs if and only if $#`c3[7]` = 1$ (@ec:c:xG_addition_overflows).
-
-#render_constraint_table(ecsm_chip, config, groups: "range_xG")
+#render_constraint_table(ecsm_chip, config, groups: "reduce_xG")
 
 === Constrain `yG`
 With $x_G$ read and range checked, we direct our attention to $y_G$.
@@ -175,7 +175,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 
 == Carry offset
 #et[Finish this]
-$#`offsets` = [8160, 16319]$
+$#`offsets` = [65535, 8160, 16319]$
 
 == Padding
 #render_chip_padding_table(ecsm_chip, config)
@@ -304,6 +304,7 @@ $#`carry_offsets` = (32636, 8161, 16320)$
 - To utilize the #ecsm / #ecdas chips for different curves, consider introducing a lookup table for the
   curve-constants $a$, $b$, $p$, $r$ and $N$, and look them up when a scalar multiplication selects them.
   The selection procedure could be done through the `ECALL` number; the #ecsm chip would accept multiple numbers, setting an internal "curve-selector" field accordingly.
+    - supporting smaller `p` can be achieved by selecting a larger `q0` and updating the carry constraints.
 - Transitioning from `U256BL`s to `U256HL`s would roughly halve the number of columns in both the #ecsm and #ecdas chips.
   This would likely require increasing the sizes of the carries from 16 to 24 bits.
   Since the carries need to be range checked, one would have to investigate whether
@@ -315,8 +316,8 @@ $#`carry_offsets` = (32636, 8161, 16320)$
   This modification saves 6 columns.
 - the design of these chip is generic, and makes no assumptions on the parameters $b$, $p$ and $N$.
   It might be possible to arrive at more compact design by making some assumptions on these values.
-- It is not entirely clear whether `ECSM` has to enforce $#`xG` < p$.
-  If this constraint can be removed, witness `xG_sub_P` can be scrapped, saving 16 columns.
+- At the cost of introducing a minor completeness gap, one may decide to _not_ reduce $#`xG` mod p$: the exceptional case `k=1` and $#`xG `> #`p`$ will be unprovable (for larger $k$, the prover can select a reduced $x_R$), while saving 41 columns and 65 interactions.
+  - If one foregoes the requirement that $x_R < p$, the completeness gap is again closed and an additional 24 columns and 16 interactions are saved.
 
 = Discussing the carries <ecsm-limb_carry>
 To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
