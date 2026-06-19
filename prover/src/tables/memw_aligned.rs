@@ -94,6 +94,14 @@ pub fn generate_memw_aligned_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack each op into six parallel arrays and run the
+    // row layout on-device.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_memw_aligned_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -139,6 +147,65 @@ pub fn generate_memw_aligned_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_memw_aligned_trace`. Packs six parallel
+/// host buffers; per-row scalar fields use `[u64; num_rows]` arrays, the
+/// `value[8]`/`old[8]` byte vectors use 8-stride interleaving.
+#[cfg(feature = "cuda")]
+fn try_generate_memw_aligned_trace_gpu(
+    operations: &[MemwOperation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut base_addresses = vec![0u64; num_rows];
+    let mut timestamps = vec![0u64; num_rows];
+    let mut old_timestamps = vec![0u64; num_rows];
+    let mut values = vec![0u64; num_rows * 8];
+    let mut olds = vec![0u64; num_rows * 8];
+    let mut flags = vec![0u64; num_rows];
+
+    for (i, op) in operations.iter().enumerate() {
+        base_addresses[i] = op.base_address;
+        timestamps[i] = op.timestamp;
+        old_timestamps[i] = op.old_timestamp[0];
+        let off = i * 8;
+        for j in 0..8 {
+            values[off + j] = op.value[j];
+            olds[off + j] = op.old[j];
+        }
+        let (w2, w4, w8) = op.write_flags();
+        let mut f: u64 = 0;
+        if op.is_register {
+            f |= 1;
+        }
+        if op.is_read {
+            f |= 1 << 1;
+        }
+        if w2 {
+            f |= 1 << 2;
+        }
+        if w4 {
+            f |= 1 << 3;
+        }
+        if w8 {
+            f |= 1 << 4;
+        }
+        f |= 1 << 5; // active
+        flags[i] = f;
+    }
+
+    let raw = stark::gpu_lde::try_generate_memw_aligned_trace_gpu_raw(
+        num_rows,
+        &base_addresses,
+        &timestamps,
+        &old_timestamps,
+        &values,
+        &olds,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

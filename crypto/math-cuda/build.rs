@@ -124,4 +124,9 @@ fn main() {
     compile_ptx("store_trace.cu", "store_trace.ptx", have_nvcc);
     compile_ptx("bytewise_trace.cu", "bytewise_trace.ptx", have_nvcc);
     compile_ptx("shift_trace.cu", "shift_trace.ptx", have_nvcc);
+    compile_ptx(
+        "memw_aligned_trace.cu",
+        "memw_aligned_trace.ptx",
+        have_nvcc,
+    );
 }

@@ -81,6 +81,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_STORE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_BYTEWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_SHIFT_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_MEMW_ALIGNED_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -263,6 +264,41 @@ pub fn gpu_extend_halves_calls() -> u64 {
 pub(crate) static GPU_SHIFT_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_shift_trace_calls() -> u64 {
     GPU_SHIFT_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// MEMW_A-table GPU dispatch counter.
+pub(crate) static GPU_MEMW_ALIGNED_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_memw_aligned_trace_calls() -> u64 {
+    GPU_MEMW_ALIGNED_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU MEMW_A trace generator. Caller packs
+/// each op's `value[8]`/`old[8]` into 8-stride interleaved arrays plus
+/// flat per-row arrays for the scalar fields.
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_memw_aligned_trace_gpu_raw(
+    num_rows: usize,
+    base_addresses: &[u64],
+    timestamps: &[u64],
+    old_timestamps: &[u64],
+    values: &[u64],
+    olds: &[u64],
+    flags: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::memw_aligned_trace::generate_memw_aligned_trace_dev(
+        num_rows,
+        base_addresses,
+        timestamps,
+        old_timestamps,
+        values,
+        olds,
+        flags,
+        num_cols,
+    )
+    .ok()?;
+    GPU_MEMW_ALIGNED_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 /// Prover-crate wrapper for the GPU SHIFT-trace generator. Caller packs each
@@ -1266,6 +1302,13 @@ pub fn schedule_bytewise_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_shift_trace_fault(n_calls_until_err: i64) {
     math_cuda::shift_trace::FAULT_SHIFT_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_memw_aligned_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_memw_aligned_trace_fault(n_calls_until_err: i64) {
+    math_cuda::memw_aligned_trace::FAULT_MEMW_ALIGNED_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

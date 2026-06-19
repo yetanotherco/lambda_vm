@@ -15,6 +15,7 @@ pub mod bitwise_trace;
 pub mod bytewise_trace;
 pub mod decode_trace;
 pub mod load_trace;
+pub mod memw_aligned_trace;
 pub mod multiplicity_sort;
 pub mod shift_trace;
 pub mod store_trace;
