@@ -1,0 +1,122 @@
+name = "STORE"
+
+# Input
+
+[[variables.input]]
+name = "base_address"
+type = "DWordWL"
+desc = "The base address to write to, gets offset by $[0, 7]$, depending on how big the access is"
+pad = 0
+
+[[variables.input]]
+name = "timestamp"
+type = "DWordWL"
+desc = "The timestamp at which this memory access is said to occur"
+pad = 0
+
+[[variables.input]]
+name = "write2"
+type = "Bit"
+desc = "Whether to write exactly 2 bytes"
+pad = 0
+
+[[variables.input]]
+name = "write4"
+type = "Bit"
+desc = "Whether to write exactly 4 bytes"
+pad = 0
+
+[[variables.input]]
+name = "write8"
+type = "Bit"
+desc = "Whether to write exactly 8 bytes"
+pad = 0
+
+[[variables.input]]
+name = "value"
+type = "DWordBL"
+desc = "The value to store"
+pad = 0
+
+# Virtual
+
+[[variables.virtual]]
+name = "write1"
+type = "Bit"
+desc = "Whether to write exactly 1 byte"
+def = ["-", "μ", "write2", "write4", "write8"]
+
+# Multiplicity
+
+[[variables.multiplicity]]
+name = "μ"
+type = "Bit"
+desc = ""
+pad = 0
+
+
+[[assumptions]]
+desc = "`IS_WORD[base_address[i]]`"
+iter = ["i", 0, 1]
+
+[[assumptions]]
+desc = "`IS_WORD[timestamp[i]]`"
+iter = ["i", 0, 1]
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["μ"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write2"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write4"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = ["write8"]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BIT"
+input = [["+", "write2", "write4", "write8"]]
+
+[[constraints.all]]
+kind = "arith"
+constraint = "$#`write2` + #`write4` + #`write8` => #`μ` = 1$"
+poly = ["*", ["+", "write2", "write4", "write8"], ["not", "μ"]]
+
+[[constraints.all]]
+kind = "template"
+tag = "IS_BYTE"
+input = [["idx", "value", "i"]]
+cond = "μ"
+iter = ["i", 0, 7]
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [0, "base_address", "value", "timestamp", "write2", "write4", "write8"]
+multiplicity = "μ"
+
+
+[[constraint_groups]]
+name = "output"
+
+[[constraints.output]]
+kind = "interaction"
+tag = "MEMOP"
+input = ["timestamp", "base_address", ["cast", "value", "DWordWL"], ["+", 1, ["*", 4, "write2"], ["*", 8, "write4"], ["*", 16, "write8"]]]
+output = ["cast", 0, "DWordWL"]
+multiplicity = ["-", "μ"]
