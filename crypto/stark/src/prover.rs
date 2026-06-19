@@ -1471,12 +1471,18 @@ pub trait IsStarkProver<
         iter.map(|i| {
             let mut result = FieldElement::<FieldExtension>::zero();
 
-            // H terms
+            // H terms: the denominator inverse `inv_h[i]` is the same for every
+            // part `j`, so combine the parts first and multiply by it once
+            // instead of once per part. Distributivity makes this exact, so the
+            // result is byte-identical. Saves (num_parts - 1) extension mults per
+            // row over the whole LDE.
+            let mut h_sum = FieldElement::<FieldExtension>::zero();
             for j in 0..num_parts {
                 let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
                 let h_j_ood = &h_ood[j];
-                result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
+                h_sum += &composition_poly_gammas[j] * (h_j_val - h_j_ood);
             }
+            result += h_sum * &inv_h[i];
 
             // Trace terms: for each eval point k, compute the column sum inline
             // and multiply by the denominator inverse in one pass.
