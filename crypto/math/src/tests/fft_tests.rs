@@ -1,7 +1,6 @@
 #[cfg(test)]
 mod fft_helpers_test {
-    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
-    use crate::fft::test_helpers::naive_matrix_dft_test;
+    use crate::fft::test_helpers::{get_powers_of_primitive_root, naive_matrix_dft_test};
     use crate::field::element::FieldElement;
     use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::field::traits::RootsConfig;
@@ -48,15 +47,31 @@ mod fft_helpers_test {
 mod fft_polynomial_tests {
     use crate::field::traits::IsField;
 
-    use crate::fft::roots_of_unity::{
-        get_powers_of_primitive_root, get_powers_of_primitive_root_coset,
-    };
+    use crate::fft::roots_of_unity::get_powers_of_primitive_root_coset;
+    use crate::fft::test_helpers::get_powers_of_primitive_root;
     use crate::field::element::FieldElement;
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
     use crate::field::traits::{IsFFTField, RootsConfig};
     use crate::polynomial::Polynomial;
-    use crate::polynomial::compose_fft;
     use proptest::{collection, prelude::*};
+
+    fn compose_fft<F, E>(
+        poly_1: &Polynomial<FieldElement<E>>,
+        poly_2: &Polynomial<FieldElement<E>>,
+    ) -> Polynomial<FieldElement<E>>
+    where
+        F: IsFFTField + crate::field::traits::IsSubFieldOf<E>,
+        E: IsField + Send + Sync,
+    {
+        let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
+
+        let values: Vec<_> = poly_2_evaluations
+            .iter()
+            .map(|value| poly_1.evaluate(value))
+            .collect();
+
+        Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
+    }
 
     /// Evaluates a polynomial at a slice of points
     fn evaluate_slice<F: IsFFTField + Send + Sync>(
@@ -266,7 +281,7 @@ mod fft_polynomial_tests {
 #[cfg(test)]
 mod roots_of_unity_tests {
     use crate::fft::bit_reversing::in_place_bit_reverse_permute;
-    use crate::fft::roots_of_unity::get_powers_of_primitive_root;
+    use crate::fft::test_helpers::get_powers_of_primitive_root;
     use crate::field::test_fields::u64_test_field::U64TestField;
     use crate::field::traits::RootsConfig;
     use proptest::prelude::*;
