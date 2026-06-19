@@ -11,6 +11,7 @@ use rustc_demangle::demangle as rustc_demangle;
 use crate::elf::SymbolTable;
 use crate::vm::execution::InstructionCache;
 use crate::vm::instruction::decoding::Instruction;
+use crate::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use crate::vm::logs::Log;
 
 /// Errors that can occur during flamegraph generation.
@@ -47,15 +48,25 @@ impl FlamegraphGenerator {
         instructions: &InstructionCache,
     ) -> Result<(), FlamegraphError> {
         for log in logs {
-            // Count this instruction under the current stack
-            let stack_key = self.format_stack();
-            *self.stack_counts.entry(stack_key).or_insert(0) += 1;
-
-            // Update call stack based on instruction type
             let instruction = instructions
                 .get(log.current_pc)
                 .copied()
                 .ok_or(FlamegraphError::InstructionNotFound)?;
+
+            // Count this instruction under the current stack. ECALLs (syscalls)
+            // are not Rust function calls and have no return semantics, so we
+            // attribute them to a synthetic leaf frame `ecall:<name>` appended
+            // under the current caller rather than pushing onto the call stack.
+            // This makes precompile syscalls (keccak, ecsm, commit) — which
+            // dominate verifier runs — visible instead of being folded into
+            // their caller.
+            let stack_key = match syscall_name(log, instruction) {
+                Some(name) => format!("{};{}", self.format_stack(), name),
+                None => self.format_stack(),
+            };
+            *self.stack_counts.entry(stack_key).or_insert(0) += 1;
+
+            // Update call stack based on instruction type
             self.update_stack(log, instruction);
         }
         Ok(())
@@ -149,6 +160,26 @@ impl FlamegraphGenerator {
     pub fn total_instructions(&self) -> u64 {
         self.stack_counts.values().sum()
     }
+}
+
+/// If `instruction` is an ECALL, return the synthetic flamegraph frame name for
+/// its syscall, e.g. `ecall:keccak_permute`. The syscall number is taken from
+/// `log.src1_val` (the guest's x17, as recorded by the executor for ECALLs).
+/// Returns `None` for every non-ECALL instruction.
+fn syscall_name(log: &Log, instruction: Instruction) -> Option<&'static str> {
+    if !matches!(instruction, Instruction::EcallEbreak) {
+        return None;
+    }
+    // This branch's executor has no ECSM syscall; an ECSM ecall (if any) falls
+    // through to "ecall:unknown".
+    Some(match log.src1_val {
+        v if v == KECCAK_SYSCALL_NUMBER => "ecall:keccak_permute",
+        64 => "ecall:commit",
+        93 => "ecall:halt",
+        1 => "ecall:print",
+        2 => "ecall:panic",
+        _ => "ecall:unknown",
+    })
 }
 
 /// Demangle a Rust symbol name using the official rustc-demangle crate.

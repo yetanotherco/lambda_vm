@@ -156,4 +156,8 @@ separate manual step and is not a dependency of the prover.
 - The flamegraph shows **instruction count** per function, not wall-clock time
 - Function names are demangled from Rust symbols
 - Inlined functions won't appear (they're merged into their caller)
-- Syscalls using `ecall` are not tracked as separate function calls
+- `ecall` syscalls appear as synthetic leaf frames under their caller
+  (`…;caller;ecall:keccak_permute`, `ecall:commit`, `ecall:halt`,
+  …). They are single-instruction events, so they are not pushed onto the call
+  stack — the instruction after the `ecall` returns to the same caller frame.
+  This surfaces precompile syscalls, which dominate verifier runs.

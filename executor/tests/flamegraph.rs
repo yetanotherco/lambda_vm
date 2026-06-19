@@ -2,7 +2,9 @@ use executor::{
     elf::{FunctionSymbol, SymbolTable},
     flamegraph::FlamegraphGenerator,
     vm::{
-        execution::InstructionCache, instruction::decoding::Instruction, logs::Log,
+        execution::InstructionCache,
+        instruction::{decoding::Instruction, execution::KECCAK_SYSCALL_NUMBER},
+        logs::Log,
         memory::U64HashMap,
     },
 };
@@ -496,4 +498,63 @@ fn test_flamegraph_instruction_not_found_error() {
 
     let result = generator.process_logs(&logs, &instructions);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_flamegraph_ecall_becomes_leaf_frame() {
+    // main runs one regular instruction, then issues a keccak ECALL, then one
+    // more regular instruction. The ECALL must appear as a synthetic leaf
+    // `main;ecall:keccak_permute` (count 1), not be folded into `main`, and
+    // must NOT push onto the call stack (so the following instruction is back
+    // under plain `main`).
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100)]);
+    let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
+
+    let instructions = make_instructions(vec![
+        (0x1000, nop_instruction()),
+        (0x1004, Instruction::EcallEbreak),
+        (0x1008, nop_instruction()),
+    ]);
+
+    let logs = vec![
+        Log {
+            current_pc: 0x1000,
+            next_pc: 0x1004,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1004,
+            next_pc: 0x1008,
+            src1_val: KECCAK_SYSCALL_NUMBER, // x17 syscall number
+            src2_val: 0,
+            dst_val: 0,
+        },
+        Log {
+            current_pc: 0x1008,
+            next_pc: 0x100c,
+            src1_val: 0,
+            src2_val: 0,
+            dst_val: 0,
+        },
+    ];
+
+    generator.process_logs(&logs, &instructions).unwrap();
+
+    let mut output = Vec::new();
+    generator.write_folded(&mut output).unwrap();
+    let output_str = String::from_utf8(output).unwrap();
+
+    // The ECALL is attributed to its own leaf frame...
+    assert!(
+        output_str.contains("main;ecall:keccak_permute 1"),
+        "expected keccak ecall leaf frame, got:\n{output_str}"
+    );
+    // ...and the two regular instructions stay under plain `main`.
+    assert!(
+        output_str.contains("main 2"),
+        "expected 2 plain-main instructions, got:\n{output_str}"
+    );
+    assert_eq!(generator.total_instructions(), 3);
 }
