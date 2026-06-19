@@ -51,8 +51,8 @@ When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2,
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 = Overview
-This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(0, b, p) without {#inf}$ with $p in [2^240, 2^256)$ that induce curves of odd order.
-In particular, the accelerator supports the curve $#`secp256k1` = E(0, 7, 2^256-2^32 - 977)$.
+This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [2^240, 2^256)$ that induce curves of odd order.
+In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 
 #attention("Variable space.")[
     This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
@@ -76,6 +76,7 @@ The accelerator comprises two chips:
 = ECSM <ecsm-sm>
 
 The #ecsm (Elliptic Curve Scalar Multiply) chip is generic over the constants
+- $a$, the first curve coefficient,
 - $b$, the second curve coefficient,
 - $p$, the prime field modulus, and
 - $N$, the order of the curve group.
@@ -119,22 +120,22 @@ Rather than reading it from memory, the prover provides it as a witness and prov
 In particular, the chip enforces the relations 
 $
   x_G^2 - #`x2` - q_1 dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - b + (p - q_2)p &= 0\
+  y_G^2 - x_G dot #`x2` - a dot x_G - b + (p - q_2)p &= 0\
 $
 where non-negative $q_1$ and $q_2$ are prover-provided witnesses.
 Note that these are equivalent to
 $
   #`x2` &equiv x_G^2 mod p,\
-  y_G^2 &equiv x_G dot #`x2` + b  mod p\
+  y_G^2 &equiv x_G dot #`x2` + a dot x_G + b  mod p\
 $
-which combine to $y_G^2 equiv x_G^3 + b mod p$.
+which combine to $y_G^2 equiv x_G^3 + a x_G + b mod p$.
 Rewriting the two relations, we get
 $
   q_1 &= (x_G^2 - #`x2`) dot p^(-1),\
-  q_2 &= (y_G^2 - x_G dot #`x2`-b) dot p^(-1) + p.
+  q_2 &= (y_G^2 - x_G dot #`x2` - a dot x_G - b) dot p^(-1) + 2p.
 $
-Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_1 in [0, p)$ and $q_2 in [0, 2p)$.
-We therefore restrict the choice of quotients to $q_1 in [0, 2^256)$ and $q_2 in [0, 2^257)$.
+Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_1 in [0, p)$ and $q_2 in [0, 3p)$.
+We must therefore support quotients $q_1 in [0, 2^256)$ and $q_2 in [0, 2^258)$.
 
 Below, we enforce the first of the two sub-relations.
 We emphasize here that @ec:c:c1_63_is_zero is required to ensure the sum evaluates to $0$, rather than just $0 mod 2^256$.
@@ -175,7 +176,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 
 == Carry offset
 #et[Finish this]
-$#`offsets` = [65535, 8160, 16319]$
+$#`offsets` = [65535, 8160, 24478]$
 
 == Padding
 #render_chip_padding_table(ecsm_chip, config)
@@ -235,13 +236,13 @@ First, the chips receives the input for this double/add step:
 The `op`-flag determines whether $R := 2A$ (0) or $R:= A+G$ (1).
 This chip introduces a set of three constraints that correctly constrains $R$ depending on this flag:
 $
-  #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0,\
+  #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2 - a) + (#`r` - q_0) p &= 0,\
   lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0,\
   lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0,
 $
 To see how, note that these relations reorder to
 $
-  2lambda y_A - 3x_A^2 + (#`r` - q_0) p = 0 &<==>& lambda &equiv (3x_A^2)/(2y_A) mod p,\
+  2lambda y_A - 3x_A^2 - a + (#`r` - q_0) p = 0 &<==>& lambda &equiv (3x_A^2 + a)/(2y_A) mod p,\
   lambda^2 - 2x_A - x_R + (#`r` - q_1) p = 0 &<==>& x_R &equiv lambda^2 - 2x_A mod p,\
   lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p = 0 &<==>& y_R &equiv lambda(x_A - x_R) - y_A mod p.
 $
@@ -266,7 +267,7 @@ Hence, this situation cannot occur either.
 === Constraining $lambda$
 We start by establishing the relation
 $
-  #`op` dot (lambda (x_G - x_A) - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0.\
+  #`op` dot (lambda (x_G - x_A) - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2 - a) + (#`r` - q_0) p &= 0.\
 $
 #render_constraint_table(ecdas_chip, config, groups: "lambda")
 

@@ -193,6 +193,15 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
+name = "A"
+type = ["Byte", 64]
+desc = "zero-extension of `A`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "a", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
 name = "P"
 type = "U512BL"
 desc = "zero-extension of `p`"
@@ -209,6 +218,11 @@ def = {polys=[
     {iter=["i", 0, 32], poly=["idx", "r", "i"]},
     {iter=["i", 33, 63], poly=0},
 ]}
+
+[[variables.constant]]
+name = "a"
+type = "U256BL"
+desc = "`a`-coefficient of the elliptic curve"
 
 [[variables.constant]]
 name = "p"
@@ -232,7 +246,7 @@ desc = ""
 pad = 0
 
 [[assumptions]]
-desc = "$E(0, b, p)$ has odd order."
+desc = "$E(a, b, p)$ has odd order."
 ref = "ecdas:a:curve_odd_order"
 
 [[assumptions]]
@@ -240,11 +254,11 @@ desc = "the $k$ served through `BIT`-interactions is smaller than the curve orde
 ref = "ecdas:a:k_lt_order"
 
 [[assumptions]]
-desc = "$(x_A, y_A)$ is a valid, non-$O$ point on the curve."
+desc = "$(x_A, y_A)$ is a valid, non-$cal(O)$ point on the curve."
 ref = "ecdas:a:A_is_valid"
 
 [[assumptions]]
-desc = "$(x_G, y_G)$ is a valid, non-$O$ point on the curve."
+desc = "$(x_G, y_G)$ is a valid, non-$cal(O)$ point on the curve."
 ref = "ecdas:a:G_is_valid"
 
 
@@ -297,7 +311,7 @@ ref = "ecdas:c:range_q0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0) + #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
+constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0 - #`A`_0) + #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
 poly = ["-",
     ["+", 
         ["*", ["^", 2, 8], ["idx", "c0", 0]],
@@ -316,7 +330,8 @@ poly = ["-",
     ["*", ["not", "op"],
         ["-", 
             ["*", 2, ["idx", "Λ", 0], ["idx", "YA", 0]],
-            ["*", 3, ["idx", "XA", 0], ["idx", "XA", 0]]
+            ["*", 3, ["idx", "XA", 0], ["idx", "XA", 0]],
+            ["idx", "A", 0],
         ]    
     ]
 ]
@@ -324,11 +339,12 @@ ref = "ecdas:c:c0_0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + (1-#`op`) dot a + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
 poly = ["-", 
     ["*", ["^", 2, 8], ["idx", "c0", "i"]],
     ["idx", "c0", ["-", "i", 1]],
     ["*", "op", ["-", ["idx", "YA", "i"], ["idx", "YG", "i"]]],
+    ["*", ["not", "op"], ["idx", "A", "i"]],
     ["sum", ["=", "j", 0], "i", ["+",
         ["*",
             "op", 

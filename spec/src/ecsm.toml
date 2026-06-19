@@ -207,6 +207,15 @@ def = {polys=[
 ]}
 
 [[variables.virtual]]
+name = "A"
+type = ["Byte", 64]
+desc = "zero-extension of `A`"
+def = {polys=[
+    {iter=["i", 0, 31], poly=["idx", "a", "i"]},
+    {iter=["i", 32, 63], poly=0},
+]}
+
+[[variables.virtual]]
 name = "B"
 type = ["Byte", 64]
 desc = "zero-extension of `b`"
@@ -223,6 +232,11 @@ def = {polys=[
     {iter=["i", 0, 31], poly=["idx", "p", "i"]},
     {iter=["i", 32, 63], poly=0},
 ]}
+
+[[variables.constant]]
+name = "a"
+type = "U256BL"
+desc = "`a`-coefficient of the elliptic curve"
 
 [[variables.constant]]
 name = "b"
@@ -453,25 +467,20 @@ ref = "ec:c:range_yG"
 kind = "template"
 tag = "IS_BYTE"
 input = [["idx", "q2", "i"]]
-iter = ["i", 0, 31]
+iter = ["i", 0, 32]
 cond = "μ"
 ref = "ec:c:range_q2"
 
 [[constraints.yG]]
-kind = "template"
-tag = "IS_BIT"
-input = [["idx", "q2", 32]]
-ref = "ec:c:q2_257"
-
-[[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`P`_0 dot #`P`_0 - #`q2`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c2`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`A`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`P`_0 dot #`P`_0 - #`q2`_0 dot #`P`_0$"
 poly = ["-", 
     ["+", 
         ["*", ["idx", "YG", 0], ["idx", "YG", 0]], 
         ["*", ["idx", "P", 0], ["idx", "P", 0]], 
     ], 
     ["*", ["idx", "X2", 0], ["idx", "XG", 0]], 
+    ["*", ["idx", "A", 0], ["idx", "XG", 0]], 
     ["*", "μ", ["idx", "B", 0]], 
     ["*", ["idx", "q2", 0], ["idx", "P", 0]], 
     ["*", ["^", 2, 8], ["idx", "c2", 0]]
@@ -480,7 +489,7 @@ ref = "ec:c:c2_0"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`q2`_j dot #`P`_(i-j))$"
+constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`A`_j dot #`XG`_(i-j) - #`q2`_j dot #`P`_(i-j))$"
 poly = ["+", 
     ["-", 
         ["idx", "c2", ["-", "i", 1]], 
@@ -494,6 +503,7 @@ poly = ["+",
                 ["*", ["idx", "P", "j"], ["idx", "P", ["-", "i", "j"]]]
             ], 
             ["*", ["idx", "X2", "j"], ["idx", "XG", ["-", "i", "j"]]], 
+            ["*", ["idx", "A", "j"], ["idx", "XG", ["-", "i", "j"]]], 
             ["*", ["idx", "q2", "j"], ["idx", "P", ["-", "i", "j"]]]
         ]
     ]
