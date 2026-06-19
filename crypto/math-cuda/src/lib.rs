@@ -11,6 +11,7 @@ pub mod fri;
 pub mod inverse;
 pub mod lde;
 pub mod merkle;
+pub mod multiplicity_sort;
 pub mod ntt;
 pub mod trace_primitives;
 

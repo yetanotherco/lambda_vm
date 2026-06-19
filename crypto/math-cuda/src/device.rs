@@ -99,6 +99,8 @@ const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const TRACE_PRIMITIVES_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/trace_primitives.ptx"));
+const MULTIPLICITY_SORT_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/multiplicity_sort.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -180,6 +182,14 @@ pub struct Backend {
     pub extract_bits_u64: CudaFunction,
     pub multiplicity_count_by_index: CudaFunction,
 
+    // multiplicity_sort.ptx
+    pub extract_bit_predicate: CudaFunction,
+    pub block_inclusive_scan_fwd_u64: CudaFunction,
+    pub apply_block_offsets_fwd_u64: CudaFunction,
+    pub scatter_by_bit: CudaFunction,
+    pub mark_boundaries: CudaFunction,
+    pub compact_unique_and_counts: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -202,6 +212,7 @@ impl Backend {
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let trace_primitives = ctx.load_module(Ptx::from_src(TRACE_PRIMITIVES_PTX))?;
+        let multiplicity_sort = ctx.load_module(Ptx::from_src(MULTIPLICITY_SORT_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -280,6 +291,15 @@ impl Backend {
             extract_bits_u64: trace_primitives.load_function("extract_bits_u64")?,
             multiplicity_count_by_index: trace_primitives
                 .load_function("multiplicity_count_by_index")?,
+            extract_bit_predicate: multiplicity_sort.load_function("extract_bit_predicate")?,
+            block_inclusive_scan_fwd_u64: multiplicity_sort
+                .load_function("block_inclusive_scan_fwd_u64")?,
+            apply_block_offsets_fwd_u64: multiplicity_sort
+                .load_function("apply_block_offsets_fwd_u64")?,
+            scatter_by_bit: multiplicity_sort.load_function("scatter_by_bit")?,
+            mark_boundaries: multiplicity_sort.load_function("mark_boundaries")?,
+            compact_unique_and_counts: multiplicity_sort
+                .load_function("compact_unique_and_counts")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
