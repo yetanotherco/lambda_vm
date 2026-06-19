@@ -42,6 +42,7 @@ use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16, alu_op,
 };
+use super::limbs::{set_limbs_16, set_limbs_32};
 
 // =========================================================================
 // Column indices for DVRM table
@@ -312,47 +313,23 @@ pub fn generate_dvrm_trace(
         let abs_r = op.abs_r();
         let abs_d = op.abs_d();
 
-        // Fill n as DWordHL (4 halfwords)
-        data[base + cols::N_0] = FE::from(op.n & 0xFFFF);
-        data[base + cols::N_1] = FE::from((op.n >> 16) & 0xFFFF);
-        data[base + cols::N_2] = FE::from((op.n >> 32) & 0xFFFF);
-        data[base + cols::N_3] = FE::from((op.n >> 48) & 0xFFFF);
-
-        // Fill d as DWordHL (4 halfwords)
-        data[base + cols::D_0] = FE::from(op.d & 0xFFFF);
-        data[base + cols::D_1] = FE::from((op.d >> 16) & 0xFFFF);
-        data[base + cols::D_2] = FE::from((op.d >> 32) & 0xFFFF);
-        data[base + cols::D_3] = FE::from((op.d >> 48) & 0xFFFF);
+        // Fill n/d/q/r as DWordHL (4 halfwords each)
+        set_limbs_16(&mut data, base + cols::N_0, op.n);
+        set_limbs_16(&mut data, base + cols::D_0, op.d);
 
         data[base + cols::SIGNED] = FE::from(op.signed as u64);
 
-        // Fill q as DWordHL (4 halfwords)
-        data[base + cols::Q_0] = FE::from(q & 0xFFFF);
-        data[base + cols::Q_1] = FE::from((q >> 16) & 0xFFFF);
-        data[base + cols::Q_2] = FE::from((q >> 32) & 0xFFFF);
-        data[base + cols::Q_3] = FE::from((q >> 48) & 0xFFFF);
-
-        // Fill r as DWordHL (4 halfwords)
-        data[base + cols::R_0] = FE::from(r & 0xFFFF);
-        data[base + cols::R_1] = FE::from((r >> 16) & 0xFFFF);
-        data[base + cols::R_2] = FE::from((r >> 32) & 0xFFFF);
-        data[base + cols::R_3] = FE::from((r >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::Q_0, q);
+        set_limbs_16(&mut data, base + cols::R_0, r);
 
         // Fill auxiliary columns
         data[base + cols::DIV_BY_ZERO] = FE::from(op.is_div_by_zero() as u64);
         data[base + cols::OVERFLOW] = FE::from(op.is_overflow() as u64);
 
-        data[base + cols::ABS_R_0] = FE::from(abs_r & 0xFFFF_FFFF);
-        data[base + cols::ABS_R_1] = FE::from(abs_r >> 32);
+        set_limbs_32(&mut data, base + cols::ABS_R_0, abs_r);
+        set_limbs_32(&mut data, base + cols::ABS_D_0, abs_d);
 
-        data[base + cols::ABS_D_0] = FE::from(abs_d & 0xFFFF_FFFF);
-        data[base + cols::ABS_D_1] = FE::from(abs_d >> 32);
-
-        // Fill n_sub_r as DWordHL (4 halfwords)
-        data[base + cols::N_SUB_R_0] = FE::from(n_sub_r & 0xFFFF);
-        data[base + cols::N_SUB_R_1] = FE::from((n_sub_r >> 16) & 0xFFFF);
-        data[base + cols::N_SUB_R_2] = FE::from((n_sub_r >> 32) & 0xFFFF);
-        data[base + cols::N_SUB_R_3] = FE::from((n_sub_r >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::N_SUB_R_0, n_sub_r);
 
         data[base + cols::SIGN_N_SUB_R] = FE::from(op.sign_n_sub_r() as u64);
         data[base + cols::SIGN_N] = FE::from(op.sign_n() as u64);

@@ -44,6 +44,7 @@ use super::types::{
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
 };
+use super::limbs::{limbs_16, set_limbs_16};
 
 /// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
 /// range-check sends so they fire once per row-instance.
@@ -222,31 +223,15 @@ impl MulOperation {
     /// lhs_ext[4..8] = 0xFFFF if negative, 0 otherwise
     pub fn lhs_extended(&self) -> [u64; 8] {
         let fill = if self.lhs_is_negative() { SIGN_FILL } else { 0 };
-        [
-            self.lhs & 0xFFFF,
-            (self.lhs >> 16) & 0xFFFF,
-            (self.lhs >> 32) & 0xFFFF,
-            (self.lhs >> 48) & 0xFFFF,
-            fill,
-            fill,
-            fill,
-            fill,
-        ]
+        let [l0, l1, l2, l3] = limbs_16(self.lhs);
+        [l0, l1, l2, l3, fill, fill, fill, fill]
     }
 
     /// Get sign-extended rhs as 8 halfwords.
     pub fn rhs_extended(&self) -> [u64; 8] {
         let fill = if self.rhs_is_negative() { SIGN_FILL } else { 0 };
-        [
-            self.rhs & 0xFFFF,
-            (self.rhs >> 16) & 0xFFFF,
-            (self.rhs >> 32) & 0xFFFF,
-            (self.rhs >> 48) & 0xFFFF,
-            fill,
-            fill,
-            fill,
-            fill,
-        ]
+        let [r0, r1, r2, r3] = limbs_16(self.rhs);
+        [r0, r1, r2, r3, fill, fill, fill, fill]
     }
 
     /// Compute the raw_product values (convolution intermediates).
@@ -317,31 +302,15 @@ pub fn generate_mul_trace(
         // Compute product
         let (lo, hi) = op.compute_product();
 
-        // Fill lhs as DWordHL (4 halfwords)
-        data[base + cols::LHS_0] = FE::from(op.lhs & 0xFFFF);
-        data[base + cols::LHS_1] = FE::from((op.lhs >> 16) & 0xFFFF);
-        data[base + cols::LHS_2] = FE::from((op.lhs >> 32) & 0xFFFF);
-        data[base + cols::LHS_3] = FE::from((op.lhs >> 48) & 0xFFFF);
+        // Fill lhs/rhs/lo/hi as DWordHL (4 halfwords each)
+        set_limbs_16(&mut data, base + cols::LHS_0, op.lhs);
         data[base + cols::LHS_SIGNED] = FE::from(op.lhs_signed as u64);
 
-        // Fill rhs as DWordHL (4 halfwords)
-        data[base + cols::RHS_0] = FE::from(op.rhs & 0xFFFF);
-        data[base + cols::RHS_1] = FE::from((op.rhs >> 16) & 0xFFFF);
-        data[base + cols::RHS_2] = FE::from((op.rhs >> 32) & 0xFFFF);
-        data[base + cols::RHS_3] = FE::from((op.rhs >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::RHS_0, op.rhs);
         data[base + cols::RHS_SIGNED] = FE::from(op.rhs_signed as u64);
 
-        // Fill lo as DWordHL (4 halfwords)
-        data[base + cols::LO_0] = FE::from(lo & 0xFFFF);
-        data[base + cols::LO_1] = FE::from((lo >> 16) & 0xFFFF);
-        data[base + cols::LO_2] = FE::from((lo >> 32) & 0xFFFF);
-        data[base + cols::LO_3] = FE::from((lo >> 48) & 0xFFFF);
-
-        // Fill hi as DWordHL (4 halfwords)
-        data[base + cols::HI_0] = FE::from(hi & 0xFFFF);
-        data[base + cols::HI_1] = FE::from((hi >> 16) & 0xFFFF);
-        data[base + cols::HI_2] = FE::from((hi >> 32) & 0xFFFF);
-        data[base + cols::HI_3] = FE::from((hi >> 48) & 0xFFFF);
+        set_limbs_16(&mut data, base + cols::LO_0, lo);
+        set_limbs_16(&mut data, base + cols::HI_0, hi);
 
         // Fill auxiliary columns
         data[base + cols::LHS_IS_NEGATIVE] = FE::from(op.lhs_is_negative() as u64);
