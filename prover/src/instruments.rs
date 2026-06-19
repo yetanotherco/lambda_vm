@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::time::Duration;
 
 fn fmt_rows(rows: usize) -> String {
@@ -60,9 +61,36 @@ pub fn print_report(
     heap_profile: &stark::instruments::ProveHeapProfile,
 ) {
     let mp = stark::instruments::take();
+    let trace_table_raw = stark::instruments::take_trace_build_table_timings();
+
+    // Optional JSON export for the profile-compare tooling: when this env var
+    // is set, a structured timing snapshot is written alongside the human
+    // stderr report. Manually formatted (no serde_json dep needed for a
+    // ~25-field schema), one line of best-effort I/O.
+    if let Ok(path) = std::env::var("LAMBDA_VM_PROFILE_JSON") {
+        let _ = std::fs::write(
+            &path,
+            render_json_report(
+                execute,
+                trace_build,
+                air_construction,
+                total,
+                mp.as_ref(),
+                &trace_table_raw,
+            ),
+        );
+    }
 
     eprintln!();
     eprintln!("=== PROVER TIMING ===");
+    eprintln!(
+        "  MODE: {}",
+        if cfg!(feature = "cuda") {
+            "cuda (GPU phases on GPU)"
+        } else {
+            "cpu only"
+        }
+    );
     eprintln!("  {:<36} {:>8}  {:>5}", "Phase", "Wall", "%",);
     eprintln!("  {}", "─".repeat(58));
 
@@ -73,12 +101,11 @@ pub fn print_report(
     // descending wall-time, and only prints tables above a 1% threshold so the
     // report stays readable. Sum of printed rows usually matches `trace_build`
     // within a few percent (rayon overhead, work done outside the timed calls).
-    let table_timings = stark::instruments::take_trace_build_table_timings();
-    if !table_timings.is_empty() {
+    if !trace_table_raw.is_empty() {
         let mut merged: BTreeMap<String, Duration> = BTreeMap::new();
-        for (name, dur) in table_timings {
-            let base = base_name(&name).to_string();
-            *merged.entry(base).or_insert(Duration::ZERO) += dur;
+        for (name, dur) in &trace_table_raw {
+            let base = base_name(name).to_string();
+            *merged.entry(base).or_insert(Duration::ZERO) += *dur;
         }
         let mut sorted: Vec<_> = merged.into_iter().collect();
         sorted.sort_by(|a, b| b.1.cmp(&a.1));
@@ -272,4 +299,111 @@ pub fn print_report(
         eprintln!("  {}", "─".repeat(56));
         eprintln!();
     }
+}
+
+/// Build a JSON snapshot of one prove run for the comparison tooling.
+/// Manual formatting — small fixed schema, avoids pulling in serde_json.
+/// Table names in this codebase contain only ASCII letters/digits and the
+/// `[N]` suffix, so no JSON escaping is required for them.
+fn render_json_report(
+    execute: Duration,
+    trace_build: Duration,
+    air_construction: Duration,
+    total: Duration,
+    mp: Option<&stark::instruments::MultiProveTiming>,
+    trace_table_raw: &[(String, Duration)],
+) -> String {
+    let mut s = String::with_capacity(8192);
+    s.push_str("{\n");
+    let _ = writeln!(
+        s,
+        "  \"mode\": \"{}\",",
+        if cfg!(feature = "cuda") { "cuda" } else { "cpu" }
+    );
+    let _ = writeln!(s, "  \"execute_s\": {},", execute.as_secs_f64());
+    let _ = writeln!(s, "  \"trace_build_s\": {},", trace_build.as_secs_f64());
+    let _ = writeln!(
+        s,
+        "  \"air_construction_s\": {},",
+        air_construction.as_secs_f64()
+    );
+    let _ = writeln!(s, "  \"total_s\": {},", total.as_secs_f64());
+
+    // Per-table trace-build breakdown (merged by base name).
+    let mut merged: BTreeMap<String, Duration> = BTreeMap::new();
+    for (name, dur) in trace_table_raw {
+        let base = base_name(name).to_string();
+        *merged.entry(base).or_insert(Duration::ZERO) += *dur;
+    }
+    s.push_str("  \"trace_build_tables\": {");
+    for (i, (name, dur)) in merged.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        let _ = write!(s, "\"{}\": {}", name, dur.as_secs_f64());
+    }
+    s.push_str("},\n");
+
+    if let Some(mp) = mp {
+        let _ = writeln!(s, "  \"pre_pass_s\": {},", mp.prepass.as_secs_f64());
+        let round1 = mp.main_commits + mp.aux_build + mp.aux_commit;
+        let _ = writeln!(s, "  \"round1_total_s\": {},", round1.as_secs_f64());
+        let _ = writeln!(
+            s,
+            "  \"round1_main_lde_s\": {},",
+            mp.round1_sub.main_lde.as_secs_f64()
+        );
+        let _ = writeln!(
+            s,
+            "  \"round1_main_merkle_s\": {},",
+            mp.round1_sub.main_merkle.as_secs_f64()
+        );
+        let _ = writeln!(
+            s,
+            "  \"round1_aux_lde_s\": {},",
+            mp.round1_sub.aux_lde.as_secs_f64()
+        );
+        let _ = writeln!(
+            s,
+            "  \"round1_aux_merkle_s\": {},",
+            mp.round1_sub.aux_merkle.as_secs_f64()
+        );
+        let _ = writeln!(s, "  \"rounds_2_4_s\": {},", mp.rounds_2_4.as_secs_f64());
+
+        // Per-table Round 2-4 sub-op breakdown.
+        s.push_str("  \"table_timings\": [");
+        for (i, (name, rows, dur, sub)) in mp.table_timings.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            let _ = write!(
+                s,
+                "{{\"name\": \"{}\", \"rows\": {}, \"total_s\": {}, \
+                 \"constraints_s\": {}, \"comp_decompose_s\": {}, \"comp_commit_s\": {}, \
+                 \"ood_s\": {}, \"deep_comp_s\": {}, \"deep_extend_s\": {}, \
+                 \"fri_commit_s\": {}, \"queries_s\": {}}}",
+                name,
+                rows,
+                dur.as_secs_f64(),
+                sub.constraints.as_secs_f64(),
+                sub.comp_decompose.as_secs_f64(),
+                sub.comp_commit.as_secs_f64(),
+                sub.ood.as_secs_f64(),
+                sub.deep_comp.as_secs_f64(),
+                sub.deep_extend.as_secs_f64(),
+                sub.fri_commit.as_secs_f64(),
+                sub.queries.as_secs_f64(),
+            );
+        }
+        s.push_str("]\n");
+    } else {
+        // No multi_prove data captured — emit empty placeholders so the
+        // schema stays consistent across runs.
+        s.push_str("  \"pre_pass_s\": 0, \"round1_total_s\": 0, \
+            \"round1_main_lde_s\": 0, \"round1_main_merkle_s\": 0, \
+            \"round1_aux_lde_s\": 0, \"round1_aux_merkle_s\": 0, \
+            \"rounds_2_4_s\": 0, \"table_timings\": []\n");
+    }
+    s.push_str("}\n");
+    s
 }
