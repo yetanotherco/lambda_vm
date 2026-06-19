@@ -468,7 +468,7 @@ input = [
     1, 
     ["cast", ["*", 2, 12], "DWordWL"],
     ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    "timestamp", 
+    ["+", "timestamp", ["cast", 1, "DWordWL"]],
     1, 0, 0]
 output = ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
@@ -514,7 +514,7 @@ input = [
         ["idx", "byte_k", ["+", ["*", 8, "i"], 6]],
         ["idx", "byte_k", ["+", ["*", 8, "i"], 7]],
     ],
-    "timestamp",
+    ["+", "timestamp", ["cast", 1, "DWordWL"]],
     0, 0, 1
 ]
 output = ["arr",
@@ -634,7 +634,7 @@ input = [
     1, 
     ["cast", ["*", 2, 10], "DWordWL"],
     ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    ["+", "timestamp", ["cast", 1, "DWordWL"]],
+    ["+", "timestamp", ["cast", 2, "DWordWL"]],
     1, 0, 0]
 output = ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
