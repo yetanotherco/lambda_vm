@@ -163,7 +163,10 @@ pub fn generate_lt_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use std::collections::HashMap;
 
-    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
+    // CPU-side dedup: HashMap merge with summed multiplicities. The LT
+    // key is (lhs:u64, rhs:u64, signed:bool, invert:bool) = 130 bits, so
+    // doesn't fit in the u128 multifield-multiplicity primitive. Keep
+    // dedup on CPU; offload row layout to GPU below.
     let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
@@ -171,6 +174,14 @@ pub fn generate_lt_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack the deduped (lhs, rhs, flags, mu) into four
+    // parallel u64 arrays; kernel recomputes lt/out + decomposes lhs/rhs/sub.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_lt_trace_gpu(&unique_ops, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
@@ -228,6 +239,45 @@ pub fn generate_lt_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_lt_trace`. Flattens the already-deduped
+/// unique ops into four parallel u64 arrays and runs the row-layout kernel.
+#[cfg(feature = "cuda")]
+fn try_generate_lt_trace_gpu(
+    unique_ops: &[(LtOperation, u64)],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut lhs_values = vec![0u64; num_rows];
+    let mut rhs_values = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+    let mut multiplicities = vec![0u64; num_rows];
+
+    for (i, (op, mu)) in unique_ops.iter().enumerate() {
+        lhs_values[i] = op.lhs;
+        rhs_values[i] = op.rhs;
+        let mut f: u64 = 0;
+        if op.signed {
+            f |= 1;
+        }
+        if op.invert {
+            f |= 1 << 1;
+        }
+        f |= 1 << 2; // active
+        flags[i] = f;
+        multiplicities[i] = *mu;
+    }
+
+    let raw = stark::gpu_lde::try_generate_lt_trace_gpu_raw(
+        num_rows,
+        &lhs_values,
+        &rhs_values,
+        &flags,
+        &multiplicities,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

@@ -134,4 +134,5 @@ fn main() {
         "memw_register_trace.ptx",
         have_nvcc,
     );
+    compile_ptx("lt_trace.cu", "lt_trace.ptx", have_nvcc);
 }
