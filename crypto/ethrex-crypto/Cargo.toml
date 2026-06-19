@@ -1,0 +1,31 @@
+[package]
+name = "lambda-vm-ethrex-crypto"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+# Detached workspace (like the guest): consumed by the ethrex guest as a path
+# dep, and not a member of the main lambda_vm workspace (it git-deps ethrex-*
+# and is riscv-oriented).
+[workspace]
+
+# LambdaVM-side crypto accelerators for ethrex's EVM, injected into the guest as
+# a `Crypto` impl. Keeping the logic here (not in the ethrex repo) means crypto
+# changes don't require an ethrex PR — the guest just constructs and injects
+# `LambdaVmEcsmCrypto`. See `crypto/ethrex-crypto` in the plan.
+
+[dependencies]
+# Defines the `Crypto` trait, `CryptoError`, and `keccak::keccak_hash`. Same rev
+# + `default-features = false` as the guest's ethrex-crypto, so feature
+# unification adds nothing to the guest build (no C secp256k1 / malachite / kzg).
+ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-crypto", default-features = false }
+# Pinned to the exact 0.13.4 ethrex uses so the guest resolves a single k256
+# (a version split would make `FieldElement`/`Scalar` incompatible types).
+# `expose-field` is required by the x-only reconstruction (Phase 1).
+k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic", "expose-field"] }
+
+# The ECSM / keccak ecalls only exist on the riscv64 guest target; on host the
+# crypto methods fall back to pure-Rust k256 / software keccak, so this dep
+# (which pulls riscv-only allocator crates that don't link on host) is gated out.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
