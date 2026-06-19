@@ -113,6 +113,7 @@ const MEMW_ALIGNED_TRACE_PTX: &str =
 const MEMW_REGISTER_TRACE_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/memw_register_trace.ptx"));
 const LT_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/lt_trace.ptx"));
+const MUL_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/mul_trace.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -232,6 +233,9 @@ pub struct Backend {
     // lt_trace.ptx
     pub generate_lt_trace_rows: CudaFunction,
 
+    // mul_trace.ptx
+    pub generate_mul_trace_rows: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -265,6 +269,7 @@ impl Backend {
         let memw_aligned_trace = ctx.load_module(Ptx::from_src(MEMW_ALIGNED_TRACE_PTX))?;
         let memw_register_trace = ctx.load_module(Ptx::from_src(MEMW_REGISTER_TRACE_PTX))?;
         let lt_trace = ctx.load_module(Ptx::from_src(LT_TRACE_PTX))?;
+        let mul_trace = ctx.load_module(Ptx::from_src(MUL_TRACE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -367,6 +372,7 @@ impl Backend {
             generate_memw_register_trace_rows: memw_register_trace
                 .load_function("generate_memw_register_trace_rows")?,
             generate_lt_trace_rows: lt_trace.load_function("generate_lt_trace_rows")?,
+            generate_mul_trace_rows: mul_trace.load_function("generate_mul_trace_rows")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

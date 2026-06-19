@@ -84,6 +84,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_MEMW_ALIGNED_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_MEMW_REGISTER_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_LT_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_MUL_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -284,6 +285,39 @@ pub fn gpu_memw_register_trace_calls() -> u64 {
 pub(crate) static GPU_LT_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_lt_trace_calls() -> u64 {
     GPU_LT_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// MUL-table GPU dispatch counter.
+pub(crate) static GPU_MUL_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_mul_trace_calls() -> u64 {
+    GPU_MUL_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU MUL trace generator. CPU has already
+/// deduped (4-field 130-bit key); caller packs each unique row's
+/// `(lhs, rhs, flags, mu_lo, mu_hi)`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_mul_trace_gpu_raw(
+    num_rows: usize,
+    lhs_values: &[u64],
+    rhs_values: &[u64],
+    flags: &[u64],
+    mu_lo: &[u64],
+    mu_hi: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::mul_trace::generate_mul_trace_dev(
+        num_rows,
+        lhs_values,
+        rhs_values,
+        flags,
+        mu_lo,
+        mu_hi,
+        num_cols,
+    )
+    .ok()?;
+    GPU_MUL_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 /// Prover-crate wrapper for the GPU LT trace generator. CPU has already
@@ -1390,6 +1424,13 @@ pub fn schedule_memw_register_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_lt_trace_fault(n_calls_until_err: i64) {
     math_cuda::lt_trace::FAULT_LT_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_mul_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_mul_trace_fault(n_calls_until_err: i64) {
+    math_cuda::mul_trace::FAULT_MUL_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 
