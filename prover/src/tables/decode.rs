@@ -102,7 +102,8 @@ pub type PcToRow = HashMap<u64, usize>;
 pub fn generate_decode_trace(
     instructions: &U64HashMap<Instruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
-    // Build entries and PC-to-row mapping
+    // Build entries and PC-to-row mapping (HashMap iteration order is
+    // stable within one run; tests/prover treat the order as opaque).
     let mut pc_to_row = HashMap::with_capacity(instructions.len());
     let entries: Vec<_> = instructions
         .iter()
@@ -119,15 +120,24 @@ pub fn generate_decode_trace(
     // update_multiplicities.
     let cpu_padding_row = entries.len();
     pc_to_row.insert(super::cpu::CPU_PADDING_PC, cpu_padding_row);
-    let cpu_padding_entry = DecodeEntry {
-        pc: super::cpu::CPU_PADDING_PC,
-        ..Default::default()
-    };
 
     // Pad to next power of 2, minimum 2
     // +1 for the CPU padding entry
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
+
+    // GPU fast path: build the three parallel u64 arrays (cheap O(num_rows)
+    // CPU work) and hand to the kernel. Falls back to the CPU loop below on
+    // any cudarc error.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_decode_trace_gpu(&entries, cpu_padding_row, num_rows) {
+        return (table, pc_to_row);
+    }
+
+    let cpu_padding_entry = DecodeEntry {
+        pc: super::cpu::CPU_PADDING_PC,
+        ..Default::default()
+    };
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     // Fill actual entries (MU = 0 initially)
@@ -173,6 +183,47 @@ pub fn generate_decode_trace(
     }
 
     (TraceTable::new_main(data, cols::NUM_COLUMNS, 1), pc_to_row)
+}
+
+/// CUDA fast path for `generate_decode_trace`. Builds the three parallel
+/// u64 arrays the GPU kernel consumes (instruction entries followed by
+/// the CPU-padding row and any trailing padding rows), runs the kernel,
+/// rewraps the result into a `TraceTable`. Returns `None` on any cudarc
+/// failure so the caller's CPU path runs unchanged.
+#[cfg(feature = "cuda")]
+fn try_generate_decode_trace_gpu(
+    entries: &[DecodeEntry],
+    cpu_padding_row: usize,
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut pcs = vec![0u64; num_rows];
+    let mut packed = vec![0u64; num_rows];
+    let mut imms = vec![0u64; num_rows];
+
+    for (i, entry) in entries.iter().enumerate() {
+        pcs[i] = entry.pc;
+        packed[i] = entry.packed_decode();
+        imms[i] = entry.imm;
+    }
+
+    // CPU-padding row: pc=CPU_PADDING_PC, all flags=0 → packed=0, imm=0.
+    pcs[cpu_padding_row] = super::cpu::CPU_PADDING_PC;
+
+    // Trailing padding rows: pc=padding_entry().pc, packed=0, imm=0.
+    let padding_pc = DecodeEntry::padding_entry().pc;
+    for slot in &mut pcs[(cpu_padding_row + 1)..num_rows] {
+        *slot = padding_pc;
+    }
+
+    let raw = stark::gpu_lde::try_generate_decode_trace_gpu_raw(
+        num_rows,
+        &pcs,
+        &packed,
+        &imms,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 /// Updates multiplicities in the DECODE trace table.

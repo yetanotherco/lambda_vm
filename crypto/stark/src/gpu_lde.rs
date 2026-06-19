@@ -75,6 +75,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_PAGE_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_DECODE_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -105,6 +106,34 @@ pub fn try_generate_page_trace_gpu_raw(
     )
     .ok()?;
     GPU_PAGE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
+}
+
+/// DECODE-table GPU dispatch counter. Bumped per successful
+/// `generate_decode_trace` GPU call.
+pub(crate) static GPU_DECODE_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_decode_trace_calls() -> u64 {
+    GPU_DECODE_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU DECODE-trace generator (same shape
+/// as `try_generate_page_trace_gpu_raw`).
+pub fn try_generate_decode_trace_gpu_raw(
+    num_rows: usize,
+    pcs: &[u64],
+    packed_decodes: &[u64],
+    imms: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::decode_trace::generate_decode_trace_dev(
+        num_rows,
+        pcs,
+        packed_decodes,
+        imms,
+        num_cols,
+    )
+    .ok()?;
+    GPU_DECODE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(raw)
 }
 
