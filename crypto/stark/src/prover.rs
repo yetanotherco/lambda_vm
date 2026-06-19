@@ -43,6 +43,8 @@ use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
+pub use crate::commitment::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
+
 /// A triple of (AIR, TraceTable, PublicInputs) for proving.
 type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -389,128 +391,6 @@ where
     }
 }
 
-/// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
-/// leaf per row, where each row is read at `reverse_index(row_idx)` and the
-/// columns are concatenated as big-endian bytes before hashing.
-///
-/// Returns `Vec<Commitment>` with the same length as `columns[0]`. Exposed
-/// (instead of being a closure inside `commit_columns_bit_reversed`) so
-/// parity tests in dependent crates can compare against the same code path
-/// the prover uses.
-pub fn keccak_leaves_bit_reversed<E>(columns: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
-where
-    E: IsField,
-    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
-{
-    if columns.is_empty() || columns[0].is_empty() {
-        return Vec::new();
-    }
-
-    let num_rows = columns[0].len();
-    let num_cols = columns.len();
-    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-
-    debug_assert!(
-        num_rows.is_power_of_two(),
-        "num_rows must be a power of two for reverse_index"
-    );
-
-    let total_bytes = num_cols * byte_len;
-
-    let hash_leaf = |buf: &mut [u8], row_idx: usize| -> Commitment {
-        let br_idx = reverse_index(row_idx, num_rows as u64);
-        for col_idx in 0..num_cols {
-            columns[col_idx][br_idx]
-                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-        }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
-    };
-
-    #[cfg(feature = "parallel")]
-    let iter = (0..num_rows).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let iter = 0..num_rows;
-
-    // Per-thread buffer reuse: map_init allocates one buffer per Rayon thread,
-    // eliminating millions of small heap allocations under parallel contention.
-    #[cfg(feature = "parallel")]
-    let result: Vec<Commitment> = iter
-        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf(buf, i))
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let result: Vec<Commitment> = {
-        let mut buf = vec![0u8; total_bytes];
-        iter.map(|i| hash_leaf(&mut buf, i)).collect()
-    };
-
-    result
-}
-
-/// Compute Keccak-256 leaf hashes for `commit_composition_polynomial`: one
-/// leaf per row-pair, where leaf `i` hashes the BE concatenation of
-/// `parts[..][br_0] ++ parts[..][br_1]` with
-/// `br_k = reverse_index(2*i + k, num_rows)`.
-///
-/// Returns `Vec<Commitment>` of length `parts[0].len() / 2`.
-pub fn keccak_leaves_row_pair_bit_reversed<E>(parts: &[Vec<FieldElement<E>>]) -> Vec<Commitment>
-where
-    E: IsField,
-    FieldElement<E>: AsBytes + Sync + Send + ByteConversion,
-{
-    let num_parts = parts.len();
-    if num_parts == 0 {
-        return Vec::new();
-    }
-    let num_rows = parts[0].len();
-    if num_rows == 0 {
-        return Vec::new();
-    }
-
-    let num_leaves = num_rows / 2;
-    debug_assert!(
-        num_rows.is_power_of_two(),
-        "num_rows must be a power of two for reverse_index"
-    );
-
-    let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-
-    let total_bytes = 2 * num_parts * byte_len;
-
-    let hash_leaf_pair = |buf: &mut [u8], leaf_idx: usize| -> Commitment {
-        let br_0 = reverse_index(2 * leaf_idx, num_rows as u64);
-        let br_1 = reverse_index(2 * leaf_idx + 1, num_rows as u64);
-        let mut offset = 0;
-        for part in parts.iter() {
-            part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
-            offset += byte_len;
-        }
-        for part in parts.iter() {
-            part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
-            offset += byte_len;
-        }
-        BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
-    };
-
-    #[cfg(feature = "parallel")]
-    let iter = (0..num_leaves).into_par_iter();
-    #[cfg(not(feature = "parallel"))]
-    let iter = 0..num_leaves;
-
-    #[cfg(feature = "parallel")]
-    let result: Vec<Commitment> = iter
-        .map_init(|| vec![0u8; total_bytes], |buf, i| hash_leaf_pair(buf, i))
-        .collect();
-
-    #[cfg(not(feature = "parallel"))]
-    let result: Vec<Commitment> = {
-        let mut buf = vec![0u8; total_bytes];
-        iter.map(|i| hash_leaf_pair(&mut buf, i)).collect()
-    };
-
-    result
-}
-
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -529,29 +409,6 @@ pub trait IsStarkProver<
     FieldElement<Field>: math::traits::ByteConversion,
     FieldElement<FieldExtension>: math::traits::ByteConversion,
 {
-    /// Builds a Merkle tree commitment from column-major LDE evaluations with
-    /// bit-reverse permutation, without cloning the full evaluation matrix.
-    ///
-    /// For each row index `i`, we hash `col_0[br(i)] || col_1[br(i)] || ...`
-    /// where `br(i)` is the bit-reversal of `i`. This produces the same Merkle
-    /// tree as the old clone + bit-reverse + columns2rows + batch_commit flow,
-    /// but avoids allocating the cloned and transposed matrices entirely.
-    fn commit_columns_bit_reversed<E>(
-        columns: &[Vec<FieldElement<E>>],
-    ) -> Option<(BatchedMerkleTree<E>, Commitment)>
-    where
-        FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
-        E: IsField,
-    {
-        if columns.is_empty() || columns[0].is_empty() {
-            return None;
-        }
-        let hashed_leaves = keccak_leaves_bit_reversed(columns);
-        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
-    }
-
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
     /// This helper computes the same commitment the prover generates internally,
@@ -574,7 +431,7 @@ pub trait IsStarkProver<
         let twiddles = LdeTwiddles::new(&domain);
         let evals =
             Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) = Self::commit_columns_bit_reversed(&evals)?;
+        let (_, commitment) = crate::commitment::commit_bit_reversed(&evals, 1)?;
         Some(commitment)
     }
 
@@ -728,7 +585,7 @@ pub trait IsStarkProver<
         let commit = match precomputed {
             None => {
                 #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 1)
                     .ok_or(ProvingError::EmptyCommitment)?;
                 #[cfg(feature = "disk-spill")]
                 if storage_mode == StorageMode::Disk {
@@ -740,11 +597,11 @@ pub trait IsStarkProver<
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_columns_bit_reversed(&columns[..num_cols])
+                    crate::commitment::commit_bit_reversed(&columns[..num_cols], 1)
                         .ok_or(ProvingError::EmptyCommitment)?;
                 #[allow(unused_mut)]
                 let (mut mult_tree, mult_root) =
-                    Self::commit_columns_bit_reversed(&columns[num_cols..])
+                    crate::commitment::commit_bit_reversed(&columns[num_cols..], 1)
                         .ok_or(ProvingError::EmptyCommitment)?;
                 if precomputed_root != expected_precomputed_root {
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
@@ -864,30 +721,6 @@ pub trait IsStarkProver<
                 round_1_result.bus_public_inputs.as_ref(),
             );
         }
-    }
-
-    /// Returns the Merkle tree and the commitment to the evaluations of the parts of the
-    /// composition polynomial.
-    fn commit_composition_polynomial(
-        lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
-    {
-        let num_parts = lde_composition_poly_parts_evaluations.len();
-        if num_parts == 0 {
-            return None;
-        }
-        let num_rows = lde_composition_poly_parts_evaluations[0].len();
-        if num_rows == 0 {
-            return None;
-        }
-        let hashed_leaves =
-            keccak_leaves_row_pair_bit_reversed(lde_composition_poly_parts_evaluations);
-        let tree = BatchedMerkleTree::<FieldExtension>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
     }
 
     /// Algebraically decompose H(x) = H₀(x²) + x·H₁(x²) on the LDE coset, then
@@ -1097,7 +930,7 @@ pub trait IsStarkProver<
                 let root = tree.root;
                 (tree, root)
             }
-            None => Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
+            None => crate::commitment::commit_bit_reversed(&lde_composition_poly_parts_evaluations, 2)
                 .ok_or(ProvingError::EmptyCommitment)?,
         };
         #[cfg(feature = "instruments")]
@@ -1983,7 +1816,7 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_columns_bit_reversed(&columns)
+                        let (mut tree, root) = crate::commitment::commit_bit_reversed(&columns, 1)
                             .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
