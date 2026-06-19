@@ -1576,26 +1576,32 @@ where
     }
     let trace_len = term_columns[0].len();
 
-    // Compute L = sum of all terms across all rows
+    // Single pass over the term columns: cache each row's column-sum and
+    // accumulate the total L = Σ terms from those row sums. The accumulated
+    // column below reuses the cached row sums, avoiding a second full pass over
+    // every term column.
+    let mut row_sums = Vec::with_capacity(trace_len);
     let mut table_contribution = FieldElement::<E>::zero();
-    for row in 0..trace_len {
-        for col in term_columns {
-            table_contribution = &table_contribution + &col[row];
-        }
-    }
-
-    // offset_per_row = L / N
-    let n = FieldElement::<E>::from(trace_len as u64);
-    let offset_per_row = &table_contribution * n.inv().unwrap();
-
-    // Build circular accumulated column
-    let mut accumulated = FieldElement::<E>::zero();
     for row in 0..trace_len {
         let mut row_sum = FieldElement::<E>::zero();
         for col in term_columns {
             row_sum = row_sum + &col[row];
         }
-        accumulated = &accumulated + &row_sum - &offset_per_row;
+        table_contribution = &table_contribution + &row_sum;
+        row_sums.push(row_sum);
+    }
+
+    // offset_per_row = L / N. N is a base-field value, so invert it in the base
+    // field (a base inversion, cheaper than the cubic-extension inversion) and
+    // multiply base × extension with the base operand on the left — the only
+    // mixed-field direction the math crate implements.
+    let n_inv = FieldElement::<F>::from(trace_len as u64).inv().unwrap();
+    let offset_per_row = n_inv * &table_contribution;
+
+    // Build the circular accumulated column from the cached row sums.
+    let mut accumulated = FieldElement::<E>::zero();
+    for (row, row_sum) in row_sums.iter().enumerate() {
+        accumulated = &accumulated + row_sum - &offset_per_row;
         trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
 
@@ -1898,8 +1904,12 @@ where
             // Use conditional negation instead of E×E sign multiplication where possible
             match absorbed.len() {
                 1 => {
-                    // (delta) · f - sign · m = 0
-                    // sign multiply also promotes m from base field A to extension B
+                    // (delta) · f - sign · m = 0, with sign ∈ {+1, -1}.
+                    // Conditionally negate m in the BASE field instead of an E×E
+                    // sign multiply (which also promotes m A→B), matching the
+                    // 2-interaction arm below. `signed_m + delta·f` compiles as
+                    // base + extension (base operand on the left) and equals
+                    // delta·f - m (sender) / delta·f + m (receiver).
                     let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
                     let f = compute_fingerprint_from_step(
                         second_step,
@@ -1908,12 +1918,8 @@ where
                         alpha_powers,
                         shifts,
                     );
-                    let sign: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f - m * sign
+                    let signed_m = if absorbed[0].is_sender { -m } else { m };
+                    signed_m + delta * &f
                 }
                 2 => {
                     // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
