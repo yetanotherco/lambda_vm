@@ -37,6 +37,7 @@ pub mod halt;
 pub mod keccak;
 pub mod keccak_rc;
 pub mod keccak_rnd;
+pub mod limbs;
 pub mod load;
 pub mod lt;
 pub mod memw;

@@ -41,6 +41,8 @@ pub mod eq_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
+pub mod limbs_tests;
+#[cfg(test)]
 pub mod load_tests;
 #[cfg(test)]
 pub mod lt_bus_tests;
