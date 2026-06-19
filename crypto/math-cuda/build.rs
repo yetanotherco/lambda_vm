@@ -129,4 +129,9 @@ fn main() {
         "memw_aligned_trace.ptx",
         have_nvcc,
     );
+    compile_ptx(
+        "memw_register_trace.cu",
+        "memw_register_trace.ptx",
+        have_nvcc,
+    );
 }

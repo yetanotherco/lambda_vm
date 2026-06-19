@@ -94,6 +94,14 @@ pub fn generate_memw_register_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack each op into six parallel arrays and run the
+    // row layout on-device.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_memw_register_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -139,6 +147,53 @@ pub fn generate_memw_register_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_memw_register_trace`. Six parallel host
+/// buffers; `values`/`olds` use 2-stride interleaving since registers are
+/// DWordWL (two words).
+#[cfg(feature = "cuda")]
+fn try_generate_memw_register_trace_gpu(
+    operations: &[MemwOperation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut base_addresses = vec![0u64; num_rows];
+    let mut timestamps = vec![0u64; num_rows];
+    let mut old_timestamps = vec![0u64; num_rows];
+    let mut values = vec![0u64; num_rows * 2];
+    let mut olds = vec![0u64; num_rows * 2];
+    let mut flags = vec![0u64; num_rows];
+
+    for (i, op) in operations.iter().enumerate() {
+        debug_assert_eq!(op.base_address % 2, 0);
+        debug_assert_eq!(op.old_timestamp[0], op.old_timestamp[1]);
+        base_addresses[i] = op.base_address;
+        timestamps[i] = op.timestamp;
+        old_timestamps[i] = op.old_timestamp[0];
+        values[i * 2] = op.value[0];
+        values[i * 2 + 1] = op.value[1];
+        olds[i * 2] = op.old[0];
+        olds[i * 2 + 1] = op.old[1];
+        let mut f: u64 = 0;
+        if op.is_read {
+            f |= 1;
+        }
+        f |= 1 << 1; // active
+        flags[i] = f;
+    }
+
+    let raw = stark::gpu_lde::try_generate_memw_register_trace_gpu_raw(
+        num_rows,
+        &base_addresses,
+        &timestamps,
+        &old_timestamps,
+        &values,
+        &olds,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================
