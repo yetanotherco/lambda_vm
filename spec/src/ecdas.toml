@@ -236,7 +236,7 @@ desc = "$E(0, b, p)$ has odd order."
 ref = "ecdas:a:curve_odd_order"
 
 [[assumptions]]
-desc = "the $k$ served by `EC_SCALAR` is smaller than the curve order $N$."
+desc = "the $k$ served through `BIT`-interactions is smaller than the curve order $N$."
 ref = "ecdas:a:k_lt_order"
 
 [[assumptions]]
