@@ -99,6 +99,12 @@ pub fn generate_bytewise_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     use std::collections::HashMap;
 
+    // CPU-side dedup: HashMap merge with summed multiplicities. The
+    // BYTEWISE key is (a:u64, b:u64, op:u8) = 136 bits → doesn't fit in
+    // the u128-keyed `multiplicity_count_multifield` primitive. We could
+    // hash + tie-break but for the small dedup sizes here the HashMap
+    // pass is already cheap; keep it on CPU and only run the row layout
+    // on device.
     let mut op_map: HashMap<BytewiseOperation, u64> = HashMap::new();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
@@ -106,6 +112,14 @@ pub fn generate_bytewise_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack the deduped (a, b, res, op, mu) into five
+    // parallel u64 arrays and kernel-byte-decompose into 26 columns.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_bytewise_trace_gpu(&unique_ops, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
@@ -122,6 +136,41 @@ pub fn generate_bytewise_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_bytewise_trace`. Flattens the already-deduped
+/// unique ops into five parallel u64 arrays (padded to num_rows) and runs
+/// the row-layout kernel.
+#[cfg(feature = "cuda")]
+fn try_generate_bytewise_trace_gpu(
+    unique_ops: &[(BytewiseOperation, u64)],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut a_values = vec![0u64; num_rows];
+    let mut b_values = vec![0u64; num_rows];
+    let mut res_values = vec![0u64; num_rows];
+    let mut ops = vec![0u64; num_rows];
+    let mut multiplicities = vec![0u64; num_rows];
+
+    for (i, (op, mu)) in unique_ops.iter().enumerate() {
+        a_values[i] = op.a;
+        b_values[i] = op.b;
+        res_values[i] = op.compute_res();
+        ops[i] = op.op as u64;
+        multiplicities[i] = *mu;
+    }
+
+    let raw = stark::gpu_lde::try_generate_bytewise_trace_gpu_raw(
+        num_rows,
+        &a_values,
+        &b_values,
+        &res_values,
+        &ops,
+        &multiplicities,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

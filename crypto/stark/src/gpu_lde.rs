@@ -79,6 +79,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_BITWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_LOAD_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_STORE_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_BYTEWISE_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -216,6 +217,39 @@ pub fn try_generate_store_trace_gpu_raw(
     )
     .ok()?;
     GPU_STORE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
+}
+
+/// BYTEWISE-table GPU dispatch counter.
+pub(crate) static GPU_BYTEWISE_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_bytewise_trace_calls() -> u64 {
+    GPU_BYTEWISE_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU BYTEWISE-trace generator. CPU side has
+/// already deduped (HashMap → summed multiplicities) and pre-computed
+/// `res = a OP b` for each unique row.
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_bytewise_trace_gpu_raw(
+    num_rows: usize,
+    a_values: &[u64],
+    b_values: &[u64],
+    res_values: &[u64],
+    ops: &[u64],
+    multiplicities: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::bytewise_trace::generate_bytewise_trace_dev(
+        num_rows,
+        a_values,
+        b_values,
+        res_values,
+        ops,
+        multiplicities,
+        num_cols,
+    )
+    .ok()?;
+    GPU_BYTEWISE_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
     Some(raw)
 }
 
@@ -1189,6 +1223,13 @@ pub fn schedule_load_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_store_trace_fault(n_calls_until_err: i64) {
     math_cuda::store_trace::FAULT_STORE_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_bytewise_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_bytewise_trace_fault(n_calls_until_err: i64) {
+    math_cuda::bytewise_trace::FAULT_BYTEWISE_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 
