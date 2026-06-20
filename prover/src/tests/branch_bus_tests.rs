@@ -346,7 +346,7 @@ fn prove_and_verify(ops: &[BranchOperation]) -> bool {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -436,7 +436,7 @@ fn prove_and_verify_custom(ops: &[BranchOperation], receiver_rows: &[CustomBranc
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    Verifier::multi_verify(
+    Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),

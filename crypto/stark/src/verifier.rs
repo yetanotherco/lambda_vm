@@ -99,17 +99,29 @@ pub trait IsStarkVerifier<
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
-    fn step_2_verify_claimed_composition_polynomial(
+    fn step_2_verify_claimed_composition_polynomial<'p, P>(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
+        proof: &P,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
-    ) -> bool {
-        let trace_length = proof.trace_length;
+    ) -> bool
+    where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
+        let trace_length = proof.trace_length();
+        let ood = proof.trace_ood_evaluations();
+        // Reconstruct an owned BusPublicInputs (just the table contribution L —
+        // one field element) from the borrowed view for the AIR boundary call.
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(|c| crate::lookup::BusPublicInputs::from_contribution(c.clone()));
         let boundary_constraints = air.boundary_constraints(
-            &proof.public_inputs,
+            proof.public_inputs(),
             &challenges.rap_challenges,
-            proof.bus_public_inputs.as_ref(),
+            bus_public_inputs.as_ref(),
             trace_length,
         );
         // Precompute g^step once per distinct step to avoid the prior O(B^2)
@@ -172,8 +184,7 @@ pub trait IsStarkVerifier<
             .map(|poly| poly.evaluate(&challenges.z))
             .collect::<Vec<FieldElement<FieldExtension>>>();
 
-        let num_main_trace_columns =
-            proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
+        let num_main_trace_columns = ood.width() - air.num_auxiliary_rap_columns();
 
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
@@ -185,19 +196,18 @@ pub trait IsStarkVerifier<
                 Vec::new()
             };
 
-        let logup_table_offset = match &proof.bus_public_inputs {
-            Some(bpi) => {
+        let logup_table_offset = match proof.bus_table_contribution() {
+            Some(table_contribution) => {
                 let n = FieldElement::<Field>::from(trace_length as u64);
                 match n.inv() {
-                    Ok(n_inv) => n_inv * &bpi.table_contribution,
+                    Ok(n_inv) => n_inv * table_contribution,
                     Err(_) => return false, // trace_length == 0 is invalid
                 }
             }
             None => FieldElement::zero(),
         };
 
-        let ood_frame =
-            (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
+        let ood_frame = ood.into_frame(num_main_trace_columns, air.step_size());
         let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
@@ -230,7 +240,7 @@ pub trait IsStarkVerifier<
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
 
         let composition_poly_claimed_ood_evaluation = proof
-            .composition_poly_parts_ood_evaluation
+            .composition_poly_parts_ood_evaluation()
             .iter()
             .rev()
             .fold(FieldElement::zero(), |acc, coeff| {
@@ -243,12 +253,16 @@ pub trait IsStarkVerifier<
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
     /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
-    fn step_3_verify_fri(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+    fn step_3_verify_fri<'p, P>(
+        proof: &P,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
@@ -271,10 +285,9 @@ pub trait IsStarkVerifier<
             return false;
         }
 
-        proof
-            .query_list
+        challenges
+            .iotas
             .iter()
-            .zip(&challenges.iotas)
             .zip(evaluation_point_inverse)
             .enumerate()
             .all(|(i, ((proof_s, iota_s), eval))| {
@@ -282,7 +295,7 @@ pub trait IsStarkVerifier<
                     proof,
                     &challenges.zetas,
                     *iota_s,
-                    proof_s,
+                    &query,
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
@@ -305,7 +318,7 @@ pub trait IsStarkVerifier<
 
     /// Verifies the validity of the opening proof.
     fn verify_opening<E>(
-        proof: &Proof<Commitment>,
+        merkle_path: &[Commitment],
         root: &Commitment,
         index: usize,
         value: &[FieldElement<E>],
@@ -316,7 +329,12 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_vec())
+        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<E>>(
+            merkle_path,
+            root,
+            index,
+            &value.to_vec(),
+        )
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
@@ -344,12 +362,16 @@ pub trait IsStarkVerifier<
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
-    fn verify_trace_openings(
-        proof: &StarkProof<Field, FieldExtension, PI>,
-        deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
+    fn verify_trace_openings<'p, P>(
+        proof: &P,
+        deep_poly_openings: &DeepPolynomialOpeningRef<'_, Field, FieldExtension>,
         iota: usize,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
@@ -390,7 +412,7 @@ pub trait IsStarkVerifier<
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_composition_poly_opening(
-        deep_poly_openings: &DeepPolynomialOpening<Field, FieldExtension>,
+        deep_poly_openings: &DeepPolynomialOpeningRef<'_, Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
         iota: &usize,
     ) -> bool
@@ -398,27 +420,29 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        let mut value = deep_poly_openings.composition_poly.evaluations.clone();
-        value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
+        let mut value = deep_poly_openings.composition_poly.evaluations.to_vec();
+        value.extend_from_slice(deep_poly_openings.composition_poly.evaluations_sym);
 
-        deep_poly_openings
-            .composition_poly
-            .proof
-            .verify::<BatchedMerkleTreeBackend<FieldExtension>>(
-                composition_poly_merkle_root,
-                *iota,
-                &value,
-            )
+        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+            deep_poly_openings.composition_poly.proof,
+            composition_poly_merkle_root,
+            *iota,
+            &value,
+        )
     }
 
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
     /// parts at the domain elements and their symmetric counterparts corresponding to all the FRI query
     /// index challenges.
-    fn step_4_verify_trace_and_composition_openings(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+    fn step_4_verify_trace_and_composition_openings<'p, P>(
+        proof: &P,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
@@ -438,7 +462,7 @@ pub trait IsStarkVerifier<
     /// Verifies the openings of a fold polynomial of an inner layer of FRI.
     fn verify_fri_layer_openings(
         merkle_root: &Commitment,
-        auth_path_sym: &Proof<Commitment>,
+        auth_path_sym: &[Commitment],
         evaluation: &FieldElement<FieldExtension>,
         evaluation_sym: &FieldElement<FieldExtension>,
         iota: usize,
@@ -453,7 +477,8 @@ pub trait IsStarkVerifier<
             vec![evaluation.clone(), evaluation_sym.clone()]
         };
 
-        auth_path_sym.verify::<BatchedMerkleTreeBackend<FieldExtension>>(
+        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+            auth_path_sym,
             merkle_root,
             iota >> 1,
             &evaluations,
@@ -468,20 +493,25 @@ pub trait IsStarkVerifier<
     /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
     /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
     /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
-    fn verify_query_and_sym_openings(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+    fn verify_query_and_sym_openings<'p, P>(
+        proof: &P,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
-        fri_decommitment: &FriDecommitment<FieldExtension>,
+        fri_decommitment: &FriDecommitmentRef<'_, FieldExtension>,
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
+        let fri_layers_merkle_roots = proof.fri_layers_merkle_roots();
+        let fri_last_value = proof.fri_last_value();
         let evaluation_point_vec: Vec<FieldElement<Field>> =
             core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
                 Some(evaluation_point.square())
@@ -501,8 +531,10 @@ pub trait IsStarkVerifier<
         // In this case, the fold loop below doesn't iterate, so we need to verify
         // the final value directly here.
         if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
+            return v == *fri_last_value;
         }
+
+        let num_layer_evals = fri_decommitment.layers_evaluations_sym.len();
 
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
         // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
@@ -510,16 +542,12 @@ pub trait IsStarkVerifier<
         fri_layers_merkle_roots
             .iter()
             .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
+            .zip(fri_decommitment.layers_evaluations_sym)
             .zip(evaluation_point_vec)
             .fold(
                 true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
+                |result, (((i, merkle_root), evaluation_sym), evaluation_point_inv)| {
+                    let auth_path_sym = fri_decommitment.layer_auth_path(i);
                     // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
                     // `v` is pᵢ(𝜐^(2ⁱ)).
                     // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
@@ -532,24 +560,25 @@ pub trait IsStarkVerifier<
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+                    v = (&v + evaluation_sym)
+                        + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
 
                     // Update index for next iteration. The index of the squares in the next layer
                     // is obtained by halving the current index. This is due to the bit-reverse
                     // ordering of the elements in the Merkle tree.
                     index >>= 1;
 
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
+                    if i < num_layer_evals - 1 {
                         result & openings_ok
                     } else {
                         // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
+                        result & (v == *fri_last_value) & openings_ok
                     }
                 },
             )
     }
 
-    fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
+    fn reconstruct_deep_composition_poly_evaluations_for_all_queries<'p, P>(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
@@ -618,8 +647,8 @@ pub trait IsStarkVerifier<
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
     }
 
-    fn reconstruct_deep_composition_poly_evaluation(
-        proof: &StarkProof<Field, FieldExtension, PI>,
+    fn reconstruct_deep_composition_poly_evaluation<'p, P>(
+        proof: &P,
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -696,6 +725,28 @@ pub trait IsStarkVerifier<
         Some(trace_term + h_terms)
     }
 
+    /// Convenience wrapper over [`multi_verify`](Self::multi_verify) that takes an
+    /// owned [`MultiProof`] (reads each sub-proof by reference). Equivalent to
+    /// the generic form with `get_proof = |i| &multi_proof.proofs[i]`.
+    fn multi_verify_owned(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
+    {
+        Self::multi_verify(
+            airs,
+            multi_proof.proofs.len(),
+            |i| &multi_proof.proofs[i],
+            transcript,
+            expected_bus_balance,
+        )
+    }
+
     /// Verifies one or more STARK proofs with their corresponding AIRs.
     ///
     /// # Multi-Table Verification with LogUp
@@ -715,21 +766,26 @@ pub trait IsStarkVerifier<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     /// The AIRs must be in the same order as the proofs in the MultiProof.
-    fn multi_verify(
+    fn multi_verify<'p, P>(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        multi_proof: &MultiProof<Field, FieldExtension, PI>,
+        num_proofs: usize,
+        get_proof: impl Fn(usize) -> P,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        if airs.len() != multi_proof.proofs.len() {
+        if airs.len() != num_proofs {
             error!(
                 "AIR count ({}) does not match proof count ({})",
                 airs.len(),
-                multi_proof.proofs.len()
+                num_proofs
             );
             return false;
         }
@@ -759,7 +815,7 @@ pub trait IsStarkVerifier<
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
                 let expected_precomputed = air.precomputed_commitment();
-                match &proof.lde_trace_precomputed_merkle_root {
+                match proof.lde_trace_precomputed_merkle_root() {
                     Some(actual) if *actual == expected_precomputed => {
                         // OK - commitment matches hardcoded
                     }
@@ -780,10 +836,10 @@ pub trait IsStarkVerifier<
                 // Precomputed commitment binds challenges to correct precomputed values.
                 // Multiplicities commitment binds challenges to actual lookups made.
                 transcript.append_bytes(&expected_precomputed);
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+                transcript.append_bytes(proof.lde_trace_main_merkle_root());
             } else {
                 // Normal table: use commitment from proof
-                transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+                transcript.append_bytes(proof.lde_trace_main_merkle_root());
             }
         }
 
@@ -808,14 +864,15 @@ pub trait IsStarkVerifier<
         // boundary constraints on LogUp columns, so the bus balance check is
         // the only cross-table validation.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            if air.has_trace_interaction() && proof.bus_public_inputs.is_none() {
+        for (idx, air) in airs.iter().enumerate() {
+            let proof = get_proof(idx);
+            if air.has_trace_interaction() && !proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
                 );
                 return false;
             }
-            if !air.has_trace_interaction() && proof.bus_public_inputs.is_some() {
+            if !air.has_trace_interaction() && proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has no LogUp interactions but proof contains bus_public_inputs"
                 );
@@ -830,7 +887,8 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+        for (idx, air) in airs.iter().enumerate() {
+            let proof = get_proof(idx);
             // Must match prover: fork with domain separator for multi-table,
             // use original transcript directly for single-table.
             let num_tables = airs.len();
@@ -840,19 +898,19 @@ pub trait IsStarkVerifier<
             }
 
             // Phase C: replay aux commitment
-            if let Some(root) = proof.lde_trace_aux_merkle_root {
-                table_transcript.append_bytes(&root);
+            if let Some(root) = proof.lde_trace_aux_merkle_root() {
+                table_transcript.append_bytes(root);
             }
 
             // Bind table_contribution (L) to transcript, matching prover.
-            if let Some(ref bpi) = proof.bus_public_inputs {
-                table_transcript.append_field_element(&bpi.table_contribution);
+            if let Some(table_contribution) = proof.bus_table_contribution() {
+                table_transcript.append_field_element(table_contribution);
             }
 
             // Rounds 2-4: verify
             if !Self::verify_rounds_2_to_4(
                 *air,
-                proof,
+                &proof,
                 &mut table_transcript,
                 lookup_challenges.clone(),
             ) {
@@ -878,11 +936,12 @@ pub trait IsStarkVerifier<
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+            for (idx, air) in airs.iter().enumerate() {
+                let proof = get_proof(idx);
                 if air.has_trace_interaction()
-                    && let Some(interaction) = &proof.bus_public_inputs
+                    && let Some(table_contribution) = proof.bus_table_contribution()
                 {
-                    total = total + &interaction.table_contribution;
+                    total = total + table_contribution;
                 }
             }
 
@@ -913,22 +972,23 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
         PI: Clone,
     {
-        let multi_proof = MultiProof {
-            proofs: vec![proof.clone()],
-        };
-        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
+        Self::multi_verify(&[air], 1, |_| proof, transcript, &FieldElement::zero())
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
     /// already been replayed and the RAP challenges are known.
-    fn replay_rounds_after_round_1(
+    fn replay_rounds_after_round_1<'p, P>(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
+        proof: &P,
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> Challenges<FieldExtension>
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
@@ -938,12 +998,15 @@ pub trait IsStarkVerifier<
 
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
-        let trace_length = proof.trace_length;
+        let trace_length = proof.trace_length();
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(|c| crate::lookup::BusPublicInputs::from_contribution(c.clone()));
         let num_boundary_constraints = air
             .boundary_constraints(
-                &proof.public_inputs,
+                proof.public_inputs(),
                 &rap_challenges,
-                proof.bus_public_inputs.as_ref(),
+                bus_public_inputs.as_ref(),
                 trace_length,
             )
             .constraints
@@ -958,7 +1021,7 @@ pub trait IsStarkVerifier<
         let boundary_coeffs = coefficients;
 
         // <<<< Receive commitments: [H₁], [H₂]
-        transcript.append_bytes(&proof.composition_poly_root);
+        transcript.append_bytes(proof.composition_poly_root());
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -972,14 +1035,17 @@ pub trait IsStarkVerifier<
         );
 
         // <<<< Receive values: tⱼ(zgᵏ)
-        let trace_ood_evaluations_columns = proof.trace_ood_evaluations.columns();
-        for col in trace_ood_evaluations_columns.iter() {
-            for elem in col.iter() {
-                transcript.append_field_element(elem);
+        // Column-major append (matches `Table::columns()` order) without
+        // materializing the transposed columns.
+        let ood = proof.trace_ood_evaluations();
+        for col_idx in 0..ood.width() {
+            for row_idx in 0..ood.height() {
+                transcript.append_field_element(&ood.get_row(row_idx)[col_idx]);
             }
         }
         // <<<< Receive value: Hᵢ(z^N)
-        for element in proof.composition_poly_parts_ood_evaluation.iter() {
+        let composition_poly_parts_ood = proof.composition_poly_parts_ood_evaluation();
+        for element in composition_poly_parts_ood.iter() {
             transcript.append_field_element(element);
         }
 
@@ -987,7 +1053,7 @@ pub trait IsStarkVerifier<
         // ==========|   Round 4   |==========
         // ===================================
 
-        let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
+        let num_terms_composition_poly = composition_poly_parts_ood.len();
         let num_terms_trace =
             air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
         let gamma = transcript.sample_field_element();
@@ -1009,7 +1075,7 @@ pub trait IsStarkVerifier<
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
-        let merkle_roots = &proof.fri_layers_merkle_roots;
+        let merkle_roots = proof.fri_layers_merkle_roots();
         let mut zetas = merkle_roots
             .iter()
             .map(|root| {
@@ -1025,13 +1091,13 @@ pub trait IsStarkVerifier<
         zetas.push(transcript.sample_field_element());
 
         // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        transcript.append_field_element(proof.fri_last_value());
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
         let mut grinding_seed = [0u8; 32];
         if security_bits > 0
-            && let Some(nonce_value) = proof.nonce
+            && let Some(nonce_value) = proof.nonce()
         {
             grinding_seed = transcript.state();
             transcript.append_bytes(&nonce_value.to_be_bytes());
@@ -1056,20 +1122,24 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies a single table after round 1 has been replayed.
-    fn verify_rounds_2_to_4(
+    fn verify_rounds_2_to_4<'p, P>(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
+        proof: &P,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> bool
     where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        let domain = new_verifier_domain(air, proof.trace_length);
+        let domain = new_verifier_domain(air, proof.trace_length());
 
         // Verify there are enough queries
-        if proof.query_list.len() < air.options().fri_number_of_queries {
+        if proof.query_list_len() < air.options().fri_number_of_queries {
             return false;
         }
 
@@ -1084,7 +1154,7 @@ pub trait IsStarkVerifier<
         // verify grinding
         let security_bits = air.context().proof_options.grinding_factor;
         if security_bits > 0 {
-            let nonce_is_valid = proof.nonce.is_some_and(|nonce_value| {
+            let nonce_is_valid = proof.nonce().is_some_and(|nonce_value| {
                 grinding::is_valid_nonce(&challenges.grinding_seed, nonce_value, security_bits)
             });
 

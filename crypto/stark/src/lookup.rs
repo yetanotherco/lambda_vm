@@ -1389,7 +1389,10 @@ impl BusInteraction {
 /// that makes the accumulated column wrap to zero at row N-1.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct BusPublicInputs<E>
 where
     E: IsField,
@@ -1409,6 +1412,26 @@ where
     /// Table name for debug output
     #[cfg(feature = "debug-checks")]
     pub table_name: String,
+}
+
+impl<E: IsField> BusPublicInputs<E> {
+    /// Build a `BusPublicInputs` carrying just the table contribution `L`.
+    /// The debug-only per-bus aggregation fields are defaulted (empty). Used by
+    /// the zero-copy verifier, which reads only `table_contribution` from the
+    /// archived proof.
+    pub fn from_contribution(table_contribution: FieldElement<E>) -> Self {
+        Self {
+            table_contribution,
+            #[cfg(feature = "debug-checks")]
+            per_bus_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_sender_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_receiver_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            table_name: String::new(),
+        }
+    }
 }
 
 /// Trait representing boundary constraint building behaviour.

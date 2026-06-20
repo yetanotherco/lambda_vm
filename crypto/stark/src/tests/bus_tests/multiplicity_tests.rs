@@ -119,7 +119,7 @@ fn test_multiplicity_one() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -229,7 +229,7 @@ fn test_multiplicity_sum() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -337,7 +337,7 @@ fn test_multiplicity_negated() {
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

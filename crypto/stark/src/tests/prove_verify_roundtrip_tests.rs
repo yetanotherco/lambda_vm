@@ -168,7 +168,7 @@ fn test_verify_serialized_multi_table_proofs() {
         vec![&cpu_air, &add_air, &mul_air];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::multi_verify_owned(
             &airs,
             &received_proofs,
             &mut DefaultTranscript::<E>::new(&[]),

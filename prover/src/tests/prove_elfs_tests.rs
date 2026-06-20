@@ -83,7 +83,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
     .expect("fingerprint collision in test");
 
     // Verify using centralized air_refs() which includes all tables
-    Verifier::multi_verify(
+    Verifier::multi_verify_owned(
         &airs.air_refs(),
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -217,7 +217,7 @@ fn test_cpu_only_no_bus() {
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&cpu_air];
     assert!(
-        Verifier::multi_verify(
+        Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -1367,7 +1367,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_owned(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -2117,7 +2117,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_owned(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -2183,7 +2183,7 @@ fn test_deep_stack_missing_pages_rejected() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_owned(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -2284,7 +2284,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
     )
     .expect("fingerprint collision in test");
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_owned(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -2455,7 +2455,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
 
     assert_eq!(proof.proofs.len(), 2);
 
-    let verified = Verifier::multi_verify(
+    let verified = Verifier::multi_verify_owned(
         &verifier_air_refs,
         &proof,
         &mut DefaultTranscript::<E>::new(&[]),

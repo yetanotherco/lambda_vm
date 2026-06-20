@@ -296,7 +296,23 @@ fn test_verify_recursion_blob_roundtrip() {
     assert_eq!(misaligned.len(), blob.len());
     let ok_mis = crate::verify_recursion_blob(misaligned)
         .expect("verify_recursion_blob errored on misaligned buffer");
-    assert!(ok_mis, "rkyv path must accept the proof from a misaligned buffer");
+    assert!(
+        ok_mis,
+        "rkyv path must accept the proof from a misaligned buffer"
+    );
+
+    // Soundness: a single-byte tamper in the proof region must make the
+    // zero-copy verifier reject (Fiat-Shamir / Merkle openings stop matching).
+    // Flip a byte near the end of the blob (inside the proof payload, past the
+    // small header) and confirm verification fails rather than passing.
+    let mut tampered = blob.to_vec();
+    let tamper_idx = tampered.len() - 64;
+    tampered[tamper_idx] ^= 0x01;
+    let tampered_result = crate::verify_recursion_blob(&tampered);
+    assert!(
+        !matches!(tampered_result, Ok(true)),
+        "zero-copy verifier must NOT accept a tampered proof (got {tampered_result:?})"
+    );
 }
 
 /// Diagnostic: build the inner proof + recursion guest input, then **execute

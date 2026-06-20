@@ -127,7 +127,7 @@ fn test_multi_table_proof() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -190,7 +190,7 @@ fn test_all_padding() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -253,7 +253,7 @@ fn test_single_operation() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -316,7 +316,7 @@ fn test_duplicate_operations() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -384,7 +384,7 @@ fn test_serialization_roundtrip() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &deserialized,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -524,7 +524,7 @@ fn test_bus_value_features() {
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),

@@ -411,7 +411,7 @@ fn test_multi_prove_fib_3_tables() {
         >,
     > = vec![&air_1, &air_2, &air_3];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<F>::new(&[]),
@@ -515,7 +515,7 @@ fn test_multi_prove_2_tables_small_field() {
         >,
     > = vec![&air_1, &air_2];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[]),
@@ -545,7 +545,7 @@ fn test_multi_prove_different_airs() {
         &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksField, PublicInputs = ()>,
     > = vec![&air_1, &air_2];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::multi_verify_owned(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<F>::new(&[]),

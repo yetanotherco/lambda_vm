@@ -633,7 +633,7 @@ mod soundness_tests {
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -681,7 +681,7 @@ mod soundness_tests {
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = Verifier::multi_verify_owned(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -752,7 +752,7 @@ mod soundness_tests {
         let verifier_airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &verifier_receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = Verifier::multi_verify_owned(
             &verifier_airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

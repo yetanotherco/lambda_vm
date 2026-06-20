@@ -82,7 +82,10 @@ use stark::proof::stark::MultiProof;
 /// Represents `count` contiguous pages starting at `base`, used for
 /// runtime-allocated memory (stack, heap) not covered by ELF segments.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct RuntimePageRange {
     /// Base address of the first page (4KB-aligned).
     pub base: u64,
@@ -98,7 +101,10 @@ pub const FIXED_TABLE_COUNT: usize = 11;
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
@@ -188,7 +194,10 @@ pub struct RecursionInput {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
@@ -635,7 +644,7 @@ impl VmAirs {
 /// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
 /// trace commitments in the same order as the prover, then samples two
 /// challenge elements.
-pub(crate) fn replay_transcript_phase_a(
+pub(crate) fn replay_transcript_phase_a<'p, P>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
     transcript: &mut DefaultTranscript<E>,
@@ -701,7 +710,21 @@ pub(crate) fn compute_commit_bus_offset(
 /// Replays Phase A of the transcript to recover (z, alpha), then computes
 /// the offset from the given public output bytes. Call this after `multi_prove`
 /// and before `multi_verify`.
-pub(crate) fn compute_expected_commit_bus_balance(
+pub(crate) fn compute_expected_commit_bus_balance<'p, P>(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    num_proofs: usize,
+    get_proof: impl Fn(usize) -> P,
+    public_output_bytes: &[u8],
+) -> Option<FieldElement<E>>
+where
+    P: stark::proof::zerocopy::StarkProofRef<'p, F, E, ()>,
+{
+    let (z, alpha) = replay_transcript_phase_a(airs, num_proofs, get_proof);
+    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+}
+
+/// Owned-proof convenience wrapper over [`compute_expected_commit_bus_balance`].
+pub(crate) fn compute_expected_commit_bus_balance_owned(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
@@ -1008,16 +1031,117 @@ pub fn verify_recursion_blob(blob: &[u8]) -> Result<bool, Error> {
     // fail (the proof is checked cryptographically), not unsoundness here.
     let archived = unsafe { rkyv::access_unchecked::<ArchivedRecursionInput>(blob) };
 
-    let vm_proof: VmProof = rkyv::deserialize::<VmProof, RkyvError>(&archived.vm_proof)
-        .map_err(|e| Error::Execution(format!("rkyv deserialize proof failed: {e}")))?;
+    // The big STARK proof (the nested FieldElement Vecs) is read IN PLACE from
+    // the archived buffer — never deserialized to owned, which would trigger a
+    // catastrophic allocation storm in the guest's bump allocator. Only the
+    // small metadata is materialized: deserializing these is a handful of tiny
+    // allocations, not the per-field-element storm.
     let options: ProofOptions = rkyv::deserialize::<ProofOptions, RkyvError>(&archived.options)
         .map_err(|e| Error::Execution(format!("rkyv deserialize options failed: {e}")))?;
     let vkey: VmVerifyingKey = rkyv::deserialize::<VmVerifyingKey, RkyvError>(&archived.vkey)
         .map_err(|e| Error::Execution(format!("rkyv deserialize vkey failed: {e}")))?;
-    // ELF bytes are read straight from the archived buffer (zero-copy).
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.vm_proof.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: alloc::vec::Vec<RuntimePageRange> =
+        rkyv::deserialize::<alloc::vec::Vec<RuntimePageRange>, RkyvError>(
+            &archived.vm_proof.runtime_page_ranges,
+        )
+        .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    // Bytes read straight from the archived buffer (zero-copy).
     let inner_elf: &[u8] = archived.inner_elf.as_ref();
+    let public_output: &[u8] = archived.vm_proof.public_output.as_ref();
+    let num_private_input_pages = archived.vm_proof.num_private_input_pages.to_native() as usize;
 
-    verify_with_options_with_vkey(&vm_proof, inner_elf, &options, Some(&vkey))
+    // The archived MultiProof, read in place.
+    let archived_proofs = archived.vm_proof.proof.proofs.as_slice();
+
+    verify_archived_with_vkey(
+        archived_proofs,
+        &table_counts,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        inner_elf,
+        &options,
+        &vkey,
+    )
+}
+
+/// Verify a STARK proof whose sub-proofs are read in place from an rkyv-archived
+/// buffer (zero-copy: no per-field-element deserialization or allocation).
+/// Mirrors [`verify_with_options_with_vkey`] but takes the already-extracted
+/// metadata plus a slice of archived sub-proofs.
+#[cfg(feature = "rkyv")]
+#[allow(clippy::too_many_arguments)]
+fn verify_archived_with_vkey(
+    archived_proofs: &[<stark::proof::stark::StarkProof<F, E, ()> as rkyv::Archive>::Archived],
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    num_private_input_pages: usize,
+    public_output: &[u8],
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    vkey: &VmVerifyingKey,
+) -> Result<bool, Error> {
+    table_counts.validate()?;
+
+    {
+        use crate::tables::page::DEFAULT_PAGE_SIZE;
+        use executor::constants::MAX_PRIVATE_INPUT_SIZE;
+        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
+        if num_private_input_pages > max_pages {
+            return Err(Error::InvalidTableCounts(format!(
+                "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",
+            )));
+        }
+    }
+
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        runtime_page_ranges,
+        num_private_input_pages,
+    );
+
+    let expected_proof_count = table_counts.total() + 8 + page_configs.len();
+    if expected_proof_count != archived_proofs.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "table_counts total ({}) + 8 fixed + {} pages = {expected_proof_count}, but proof contains {} sub-proofs",
+            table_counts.total(),
+            page_configs.len(),
+            archived_proofs.len(),
+        )));
+    }
+
+    let airs = VmAirs::new_with_vkey(
+        &program,
+        proof_options,
+        false,
+        &page_configs,
+        table_counts,
+        Some(vkey),
+    );
+
+    let air_refs = airs.air_refs();
+    let get_proof = |i: usize| &archived_proofs[i];
+    let expected_bus_balance = match compute_expected_commit_bus_balance(
+        &air_refs,
+        archived_proofs.len(),
+        get_proof,
+        public_output,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
+
+    Ok(Verifier::multi_verify(
+        &air_refs,
+        archived_proofs.len(),
+        get_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &expected_bus_balance,
+    ))
 }
 
 /// Same as [`verify_with_options`] but accepts a precomputed
@@ -1105,7 +1229,8 @@ pub fn verify_with_options_with_vkey(
     let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance(
         &air_refs,
-        &vm_proof.proof,
+        vm_proof.proof.proofs.len(),
+        |i| &vm_proof.proof.proofs[i],
         &vm_proof.public_output,
         &mut transcript_for_replay,
     ) {
