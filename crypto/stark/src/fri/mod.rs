@@ -40,8 +40,8 @@ pub fn commit_phase_from_evaluations<
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
-    FieldElement<F>: AsBytes + Sync + Send,
-    FieldElement<E>: AsBytes + Sync + Send,
+    FieldElement<F>: AsBytes + math::traits::ByteConversion + Sync + Send,
+    FieldElement<E>: AsBytes + math::traits::ByteConversion + Sync + Send,
 {
     // GPU fast path: drives the entire commit phase device-side (per-layer
     // fold + Keccak leaves + pair-hash tree, only D2H'ing each layer's root
@@ -117,7 +117,7 @@ pub fn query_phase<F: IsField>(
     iotas: &[usize],
 ) -> Vec<FriDecommitment<F>>
 where
-    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<F>: AsBytes + math::traits::ByteConversion + Sync + Send,
 {
     if !fri_layers.is_empty() {
         let num_layers = fri_layers.len();

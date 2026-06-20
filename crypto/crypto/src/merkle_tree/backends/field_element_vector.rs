@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 use digest::{Digest, Output};
 use math::{
     field::{element::FieldElement, traits::IsField},
-    traits::AsBytes,
+    traits::ByteConversion,
 };
 
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
@@ -31,7 +31,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementPairBackend<F, D, NUM_BYTES>
 where
     F: IsField,
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: ByteConversion,
     [u8; NUM_BYTES]: From<Output<D>>,
 {
     type Node = [u8; NUM_BYTES];
@@ -39,8 +39,9 @@ where
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input[0].as_bytes());
-        hasher.update(input[1].as_bytes());
+        // Hash BE bytes from the fixed-size arrays directly (no allocation).
+        hasher.update(input[0].to_bytes_be().as_ref());
+        hasher.update(input[1].to_bytes_be().as_ref());
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -92,7 +93,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where
     F: IsField,
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: ByteConversion,
     [u8; NUM_BYTES]: From<Output<D>>,
     Vec<FieldElement<F>>: Sync + Send,
 {
@@ -102,7 +103,8 @@ where
     fn hash_data(input: &Vec<FieldElement<F>>) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         for element in input.iter() {
-            hasher.update(element.as_bytes());
+            // BE bytes from the fixed-size array, no per-element allocation.
+            hasher.update(element.to_bytes_be().as_ref());
         }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());

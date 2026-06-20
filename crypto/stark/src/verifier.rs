@@ -249,8 +249,8 @@ pub trait IsStarkVerifier<
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -311,8 +311,8 @@ pub trait IsStarkVerifier<
         value: &[FieldElement<E>],
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<E>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<E>: AsBytes + math::traits::ByteConversion + Sync + Send,
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
@@ -350,8 +350,8 @@ pub trait IsStarkVerifier<
         iota: usize,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         // Main trace (multiplicities for preprocessed, full trace for normal).
         let mut ok = Self::verify_opening_pair::<Field>(
@@ -395,8 +395,8 @@ pub trait IsStarkVerifier<
         iota: &usize,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let mut value = deep_poly_openings.composition_poly.evaluations.clone();
         value.extend_from_slice(&deep_poly_openings.composition_poly.evaluations_sym);
@@ -419,8 +419,8 @@ pub trait IsStarkVerifier<
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         challenges
             .iotas
@@ -444,8 +444,8 @@ pub trait IsStarkVerifier<
         iota: usize,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let evaluations = if iota % 2 == 1 {
             vec![evaluation_sym.clone(), evaluation.clone()]
@@ -478,8 +478,8 @@ pub trait IsStarkVerifier<
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
         let evaluation_point_vec: Vec<FieldElement<Field>> =
@@ -722,8 +722,8 @@ pub trait IsStarkVerifier<
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         if airs.len() != multi_proof.proofs.len() {
             error!(
@@ -909,8 +909,8 @@ pub trait IsStarkVerifier<
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
         PI: Clone,
     {
         let multi_proof = MultiProof {
@@ -929,8 +929,8 @@ pub trait IsStarkVerifier<
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> Challenges<FieldExtension>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         // ===================================
         // ==========|   Round 2   |==========
@@ -1063,8 +1063,8 @@ pub trait IsStarkVerifier<
         rap_challenges: Vec<FieldElement<FieldExtension>>,
     ) -> bool
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let domain = new_verifier_domain(air, proof.trace_length);
 

@@ -6,13 +6,19 @@ pub trait ByteConversion {
     /// Byte length of the big-endian representation.
     const BYTE_LEN: usize;
 
+    /// Fixed-length byte buffer returned by [`to_bytes_be`](Self::to_bytes_be)
+    /// and [`to_bytes_le`](Self::to_bytes_le). For field elements this is a
+    /// `[u8; BYTE_LEN]`, so serialization allocates nothing — a hot path in the
+    /// Fiat-Shamir transcript and Merkle hashing. Borrow the bytes with
+    /// `.as_ref()`; collect with `.as_ref().to_vec()` only when a `Vec` is
+    /// actually required.
+    type FixedBytes: AsRef<[u8]>;
+
     /// Returns the byte representation of the element in big-endian order.
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8>;
+    fn to_bytes_be(&self) -> Self::FixedBytes;
 
     /// Returns the byte representation of the element in little-endian order.
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8>;
+    fn to_bytes_le(&self) -> Self::FixedBytes;
 
     /// Returns the element from its byte representation in big-endian order.
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, ByteConversionError>
@@ -26,10 +32,10 @@ pub trait ByteConversion {
 
     /// Write big-endian bytes into `buf[..BYTE_LEN]`.
     /// Override for zero-allocation performance in hot paths.
-    #[cfg(feature = "alloc")]
     fn write_bytes_be(&self, buf: &mut [u8]) {
         let bytes = self.to_bytes_be();
-        buf[..bytes.len()].copy_from_slice(&bytes);
+        let bytes = bytes.as_ref();
+        buf[..bytes.len()].copy_from_slice(bytes);
     }
 }
 
@@ -58,14 +64,14 @@ impl AsBytes for u64 {
 impl ByteConversion for u64 {
     const BYTE_LEN: usize = 8;
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        self.to_be_bytes().to_vec()
+    type FixedBytes = [u8; 8];
+
+    fn to_bytes_be(&self) -> [u8; 8] {
+        self.to_be_bytes()
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        self.to_le_bytes().to_vec()
+    fn to_bytes_le(&self) -> [u8; 8] {
+        self.to_le_bytes()
     }
 
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, ByteConversionError>

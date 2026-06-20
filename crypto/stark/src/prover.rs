@@ -164,8 +164,8 @@ pub(crate) struct Round1<Field, FieldExtension>
 where
     Field: IsSubFieldOf<FieldExtension> + IsFFTField,
     FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+    FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
 {
     /// The table of evaluations over the LDE of the main and auxiliary trace tables.
     pub(crate) lde_trace: LDETraceTable<Field, FieldExtension>,
@@ -197,8 +197,8 @@ pub(crate) struct Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension>,
     FieldExtension: IsField,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+    FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
 {
     main: TableCommit<Field>,
     aux: Option<TableCommit<FieldExtension>>,
@@ -226,8 +226,8 @@ impl<Field, FieldExtension> Round1Commitments<Field, FieldExtension>
 where
     Field: IsFFTField + IsSubFieldOf<FieldExtension> + Send + Sync,
     FieldExtension: IsField + Send + Sync,
-    FieldElement<Field>: AsBytes,
-    FieldElement<FieldExtension>: AsBytes,
+    FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+    FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
 {
     /// Build a `Round1` by consuming a `Lde` and borrowing commitment data.
     /// The `TableCommit::share` calls are cheap — only bump Arc refcounts.
@@ -330,7 +330,7 @@ pub fn table_parallelism() -> usize {
 pub(crate) struct Round2<F>
 where
     F: IsField,
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: AsBytes + math::traits::ByteConversion,
 {
     /// Evaluations of the composition polynomial parts over the LDE domain.
     pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
@@ -568,8 +568,8 @@ pub trait IsStarkProver<
         num_precomputed_cols: usize,
     ) -> Option<Commitment>
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let domain = Domain::new(air, trace.num_rows());
         let columns = trace.columns_main();
@@ -683,8 +683,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainCommitTuple<Field>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
@@ -793,8 +793,8 @@ pub trait IsStarkProver<
         twiddles: &LdeTwiddles<Field>,
     ) -> Result<Round1<Field, FieldExtension>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut main = trace.extract_columns_main(lde_size);
@@ -831,8 +831,8 @@ pub trait IsStarkProver<
         domains: &[Arc<Domain<Field>>],
         twiddle_caches: &[Arc<LdeTwiddles<Field>>],
     ) where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
         PI: Send + Sync + Clone,
     {
         let mut temp_results: Vec<Round1<Field, FieldExtension>> =
@@ -875,7 +875,7 @@ pub trait IsStarkProver<
         lde_composition_poly_parts_evaluations: &[Vec<FieldElement<FieldExtension>>],
     ) -> Option<(BatchedMerkleTree<FieldExtension>, Commitment)>
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send + math::traits::ByteConversion,
     {
         let num_parts = lde_composition_poly_parts_evaluations.len();
@@ -909,8 +909,8 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let two_n = constraint_evaluations.len();
         let n = two_n / 2;
@@ -966,8 +966,8 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         // iFFT on the N-point squared coset to get coefficients
         let poly = Polynomial::interpolate_offset_fft(half_evals, squared_offset)
@@ -992,8 +992,8 @@ pub trait IsStarkProver<
         boundary_coefficients: &[FieldElement<FieldExtension>],
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         // Compute the evaluations of the composition polynomial on the LDE domain.
         let trace_length = domain.interpolation_domain_size;
@@ -1128,8 +1128,8 @@ pub trait IsStarkProver<
         z: &FieldElement<FieldExtension>,
     ) -> Round3<FieldExtension>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts);
@@ -1190,8 +1190,8 @@ pub trait IsStarkProver<
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
     ) -> Round4<Field, FieldExtension>
     where
-        FieldElement<FieldExtension>: AsBytes,
-        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
     {
         let coset_offset_u64 = air.context().proof_options.coset_offset;
         let coset_offset = FieldElement::<Field>::from(coset_offset_u64);
@@ -1329,8 +1329,8 @@ pub trait IsStarkProver<
         trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
     ) -> Vec<FieldElement<FieldExtension>>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         let num_parts = round_2_result.lde_composition_poly_evaluations.len();
         let z_power = z.pow(num_parts); // pole for H terms
@@ -1510,8 +1510,8 @@ pub trait IsStarkProver<
         index: usize,
     ) -> PolynomialOpenings<FieldExtension>
     where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let proof = composition_poly_merkle_tree
             .get_proof_by_pos(index)
@@ -1577,8 +1577,8 @@ pub trait IsStarkProver<
         indexes_to_open: &[usize],
     ) -> DeepPolynomialOpenings<Field, FieldExtension>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
     {
         let mut openings = Vec::with_capacity(indexes_to_open.len());
 
@@ -1657,8 +1657,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
@@ -2204,8 +2204,8 @@ pub trait IsStarkProver<
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
@@ -2233,8 +2233,8 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
         PI: Send + Sync + Clone,
     {
         info!("Started proof generation...");

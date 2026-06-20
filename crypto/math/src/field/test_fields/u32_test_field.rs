@@ -13,13 +13,13 @@ pub struct U32Field<const MODULUS: u32>;
 impl ByteConversion for u32 {
     const BYTE_LEN: usize = 4;
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+    type FixedBytes = [u8; 4];
+
+    fn to_bytes_be(&self) -> [u8; 4] {
         unimplemented!()
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+    fn to_bytes_le(&self) -> [u8; 4] {
         unimplemented!()
     }
 

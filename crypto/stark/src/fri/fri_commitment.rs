@@ -9,7 +9,7 @@ use math::{
 pub struct FriLayer<F, B>
 where
     F: IsField,
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: AsBytes + math::traits::ByteConversion,
     B: IsMerkleTreeBackend,
 {
     pub evaluation: Vec<FieldElement<F>>,
@@ -19,7 +19,7 @@ where
 impl<F, B> FriLayer<F, B>
 where
     F: IsField,
-    FieldElement<F>: AsBytes,
+    FieldElement<F>: AsBytes + math::traits::ByteConversion,
     B: IsMerkleTreeBackend,
 {
     pub fn new(evaluation: &[FieldElement<F>], merkle_tree: MerkleTree<B>) -> Self {

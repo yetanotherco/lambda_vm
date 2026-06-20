@@ -14,13 +14,13 @@ use crate::traits::{AsBytes, ByteConversion};
 impl ByteConversion for [FpE; 2] {
     const BYTE_LEN: usize = 16;
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
+    type FixedBytes = [u8; 16];
+
+    fn to_bytes_be(&self) -> [u8; 16] {
         unimplemented!()
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
+    fn to_bytes_le(&self) -> [u8; 16] {
         unimplemented!()
     }
 
@@ -42,19 +42,23 @@ impl ByteConversion for [FpE; 2] {
 impl ByteConversion for [FpE; 3] {
     const BYTE_LEN: usize = 24;
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut bytes = ByteConversion::to_bytes_be(&self[2]);
-        bytes.extend(ByteConversion::to_bytes_be(&self[1]));
-        bytes.extend(ByteConversion::to_bytes_be(&self[0]));
+    type FixedBytes = [u8; 24];
+
+    fn to_bytes_be(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        // Byte order preserved from the previous Vec impl: components in
+        // reverse index order (self[2], self[1], self[0]).
+        bytes[0..8].copy_from_slice(&self[2].to_bytes_be());
+        bytes[8..16].copy_from_slice(&self[1].to_bytes_be());
+        bytes[16..24].copy_from_slice(&self[0].to_bytes_be());
         bytes
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        let mut bytes = ByteConversion::to_bytes_le(&self[0]);
-        bytes.extend(ByteConversion::to_bytes_le(&self[1]));
-        bytes.extend(ByteConversion::to_bytes_le(&self[2]));
+    fn to_bytes_le(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        bytes[0..8].copy_from_slice(&self[0].to_bytes_le());
+        bytes[8..16].copy_from_slice(&self[1].to_bytes_le());
+        bytes[16..24].copy_from_slice(&self[2].to_bytes_le());
         bytes
     }
 
@@ -476,6 +480,8 @@ impl Fp3E {
 impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
     const BYTE_LEN: usize = 24;
 
+    type FixedBytes = [u8; 24];
+
     #[inline(always)]
     fn write_bytes_be(&self, buf: &mut [u8]) {
         debug_assert!(buf.len() >= 24);
@@ -485,20 +491,24 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         components[2].write_bytes_be(&mut buf[16..24]);
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_be(&self.value()[0]);
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[1]));
-        byte_slice.extend(ByteConversion::to_bytes_be(&self.value()[2]));
-        byte_slice
+    #[inline(always)]
+    fn to_bytes_be(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        let components = self.value();
+        bytes[0..8].copy_from_slice(&components[0].to_bytes_be());
+        bytes[8..16].copy_from_slice(&components[1].to_bytes_be());
+        bytes[16..24].copy_from_slice(&components[2].to_bytes_be());
+        bytes
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        let mut byte_slice = ByteConversion::to_bytes_le(&self.value()[0]);
-        byte_slice.extend(ByteConversion::to_bytes_le(&self.value()[1]));
-        byte_slice.extend(ByteConversion::to_bytes_le(&self.value()[2]));
-        byte_slice
+    #[inline(always)]
+    fn to_bytes_le(&self) -> [u8; 24] {
+        let mut bytes = [0u8; 24];
+        let components = self.value();
+        bytes[0..8].copy_from_slice(&components[0].to_bytes_le());
+        bytes[8..16].copy_from_slice(&components[1].to_bytes_le());
+        bytes[16..24].copy_from_slice(&components[2].to_bytes_le());
+        bytes
     }
 
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
@@ -535,7 +545,7 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
 #[cfg(feature = "alloc")]
 impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
-        self.to_bytes_be()
+        self.to_bytes_be().to_vec()
     }
 }
 

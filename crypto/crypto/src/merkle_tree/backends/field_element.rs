@@ -4,7 +4,7 @@ use core::marker::PhantomData;
 use digest::{Digest, Output};
 use math::{
     field::{element::FieldElement, traits::IsField},
-    traits::AsBytes,
+    traits::ByteConversion,
 };
 
 #[derive(Clone)]
@@ -26,7 +26,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementBackend<F, D, NUM_BYTES>
 where
     F: IsField,
-    FieldElement<F>: AsBytes + Sync + Send,
+    FieldElement<F>: ByteConversion + Sync + Send,
     [u8; NUM_BYTES]: From<Output<D>>,
 {
     type Node = [u8; NUM_BYTES];
@@ -34,7 +34,9 @@ where
 
     fn hash_data(input: &FieldElement<F>) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input.as_bytes());
+        // Hash the big-endian bytes directly from the fixed-size array (no
+        // allocation). Same bytes as the previous `as_bytes()` (= to_bytes_be).
+        hasher.update(input.to_bytes_be().as_ref());
         hasher.finalize().into()
     }
 

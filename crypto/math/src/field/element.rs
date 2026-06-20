@@ -615,7 +615,7 @@ where
     where
         Self: ByteConversion,
     {
-        BigUint::from_bytes_be(&self.to_bytes_be())
+        BigUint::from_bytes_be(self.to_bytes_be().as_ref())
     }
 
     #[cfg(feature = "alloc")]
@@ -698,8 +698,12 @@ where
         S: Serializer,
     {
         let mut state = serializer.serialize_struct("FieldElement", 1)?;
+        // `to_bytes_be` returns a fixed-size array; serde encodes `[u8; N]` as
+        // the same byte sequence as the previous `Vec<u8>`, so the wire format
+        // is unchanged and the deserializer (which reads a `Vec<u8>`) still
+        // round-trips — with no allocation.
         let data = self.value().to_bytes_be();
-        state.serialize_field("value", &data)?;
+        state.serialize_field("value", data.as_ref())?;
         state.end()
     }
 }

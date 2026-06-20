@@ -436,20 +436,22 @@ impl GoldilocksElement {
 impl ByteConversion for FieldElement<GoldilocksField> {
     const BYTE_LEN: usize = 8;
 
+    type FixedBytes = [u8; 8];
+
     #[inline(always)]
     fn write_bytes_be(&self, buf: &mut [u8]) {
         debug_assert!(buf.len() >= 8);
         buf[..8].copy_from_slice(&self.canonical_u64().to_be_bytes());
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_be(&self) -> alloc::vec::Vec<u8> {
-        self.canonical_u64().to_be_bytes().to_vec()
+    #[inline(always)]
+    fn to_bytes_be(&self) -> [u8; 8] {
+        self.canonical_u64().to_be_bytes()
     }
 
-    #[cfg(feature = "alloc")]
-    fn to_bytes_le(&self) -> alloc::vec::Vec<u8> {
-        self.canonical_u64().to_le_bytes().to_vec()
+    #[inline(always)]
+    fn to_bytes_le(&self) -> [u8; 8] {
+        self.canonical_u64().to_le_bytes()
     }
 
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
@@ -486,7 +488,7 @@ impl ByteConversion for FieldElement<GoldilocksField> {
 #[cfg(feature = "alloc")]
 impl AsBytes for FieldElement<GoldilocksField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
-        ByteConversion::to_bytes_be(self)
+        ByteConversion::to_bytes_be(self).to_vec()
     }
 }
 
