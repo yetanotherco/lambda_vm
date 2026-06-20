@@ -82,6 +82,7 @@ use stark::proof::stark::MultiProof;
 /// Represents `count` contiguous pages starting at `base`, used for
 /// runtime-allocated memory (stack, heap) not covered by ELF segments.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
 pub struct RuntimePageRange {
     /// Base address of the first page (4KB-aligned).
     pub base: u64,
@@ -97,6 +98,7 @@ pub const FIXED_TABLE_COUNT: usize = 11;
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
 pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
@@ -168,7 +170,25 @@ impl TableCounts {
 
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
+/// The private-input bundle the recursion verifier guest consumes: an inner
+/// proof plus everything needed to verify it (inner ELF, the inner prover's
+/// options, and the host-derived verifying key).
+///
+/// Grouping these in one rkyv-archivable struct lets the guest `rkyv::access`
+/// the whole blob and read each field straight from the input buffer with no
+/// deserialization pass — the previous `postcard::from_bytes` of the same tuple
+/// was ~23% of the verifier's RISC-V cycles.
+#[cfg(feature = "rkyv")]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct RecursionInput {
+    pub vm_proof: VmProof,
+    pub inner_elf: alloc::vec::Vec<u8>,
+    pub options: ProofOptions,
+    pub vkey: VmVerifyingKey,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
@@ -969,6 +989,35 @@ pub fn verify_with_options(
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
     verify_with_options_with_vkey(vm_proof, elf_bytes, proof_options, None)
+}
+
+/// Verify a recursion-input blob produced by `rkyv::to_bytes::<RecursionInput>`.
+///
+/// `rkyv::access` validates and views the blob in place (no deserialization),
+/// then we materialize the proof/options/vkey via rkyv's structural
+/// deserialize — a pointer-following + memcpy traversal with no format parsing,
+/// which replaces the postcard varint parse that dominated verifier cycles.
+///
+/// The `elf` is read directly from the archived bytes (`&[u8]`, zero-copy).
+#[cfg(feature = "rkyv")]
+pub fn verify_recursion_blob(blob: &[u8]) -> Result<bool, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    // SAFETY: the blob is produced by our own `rkyv::to_bytes::<RecursionInput>`
+    // in the trusted host path. A corrupted blob can only cause verification to
+    // fail (the proof is checked cryptographically), not unsoundness here.
+    let archived = unsafe { rkyv::access_unchecked::<ArchivedRecursionInput>(blob) };
+
+    let vm_proof: VmProof = rkyv::deserialize::<VmProof, RkyvError>(&archived.vm_proof)
+        .map_err(|e| Error::Execution(format!("rkyv deserialize proof failed: {e}")))?;
+    let options: ProofOptions = rkyv::deserialize::<ProofOptions, RkyvError>(&archived.options)
+        .map_err(|e| Error::Execution(format!("rkyv deserialize options failed: {e}")))?;
+    let vkey: VmVerifyingKey = rkyv::deserialize::<VmVerifyingKey, RkyvError>(&archived.vkey)
+        .map_err(|e| Error::Execution(format!("rkyv deserialize vkey failed: {e}")))?;
+    // ELF bytes are read straight from the archived buffer (zero-copy).
+    let inner_elf: &[u8] = archived.inner_elf.as_ref();
+
+    verify_with_options_with_vkey(&vm_proof, inner_elf, &options, Some(&vkey))
 }
 
 /// Same as [`verify_with_options`] but accepts a precomputed

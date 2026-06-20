@@ -53,6 +53,7 @@ const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
 /// Cached preprocessed-table commitments the verifier would otherwise
 /// recompute on every call.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
 pub struct VmVerifyingKey {
     /// Layout version. See [`VKEY_VERSION`].
     pub version: u32,

@@ -20,6 +20,10 @@ serde = { version = "1.0", default-features = false, features = ["derive", "allo
 itertools = { version = "0.11.0", default-features = false, features = ["use_alloc"] }
 hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
 libm = "0.2"
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "unaligned",
+], optional = true }
 
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
@@ -59,6 +63,7 @@ test_fiat_shamir = []
 instruments = ["std"]                                                # This enables timing prints in prover and verifier
 debug-checks = ["std"]                                               # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel", "math/parallel", "std"]
+rkyv = ["dep:rkyv", "math/rkyv", "crypto/rkyv"]
 cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys", "std"]

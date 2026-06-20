@@ -210,13 +210,93 @@ fn test_dump_recursion_input() {
         &inner_proof_options,
         &page_configs,
     );
-    let blob =
-        postcard::to_allocvec(&(&inner_proof, &empty_elf_bytes, &inner_proof_options, &vkey))
-            .expect("postcard encode failed");
+    // rkyv-archive the bundle so the guest can read it zero-copy via
+    // `verify_recursion_blob` (replaces the old postcard tuple).
+    let input = crate::RecursionInput {
+        vm_proof: inner_proof,
+        inner_elf: empty_elf_bytes.clone(),
+        options: inner_proof_options.clone(),
+        vkey,
+    };
+    let blob = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("rkyv encode failed");
 
     let path = "/tmp/recursion_input.bin";
     std::fs::write(path, &blob).expect("write blob");
     eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
+}
+
+/// Host round-trip of the rkyv recursion path: build a `RecursionInput`, archive
+/// it with `rkyv::to_bytes`, then verify it via `verify_recursion_blob` exactly
+/// as the guest does. Catches archive/deserialize bugs on the host (fast) before
+/// paying the guest build + multi-minute in-VM execution.
+#[test]
+fn test_verify_recursion_blob_roundtrip() {
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
+
+    // Sanity: the conventional path verifies this proof.
+    assert!(
+        crate::verify_with_options_with_vkey(
+            &inner_proof,
+            &empty_elf_bytes,
+            &inner_proof_options,
+            Some(&vkey),
+        )
+        .expect("conventional verify errored"),
+        "conventional verify should accept the proof"
+    );
+
+    let input = crate::RecursionInput {
+        vm_proof: inner_proof,
+        inner_elf: empty_elf_bytes.clone(),
+        options: inner_proof_options.clone(),
+        vkey,
+    };
+    let blob = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("rkyv encode failed");
+
+    let ok = crate::verify_recursion_blob(&blob).expect("verify_recursion_blob errored");
+    assert!(ok, "rkyv zero-copy path must accept the same proof");
+
+    // Reproduce the guest's read conditions: the guest reads the blob from a
+    // 4-byte-offset address (`PRIVATE_INPUT_START + 4`), so the buffer is only
+    // 4-aligned. Verify the path still works from a deliberately misaligned
+    // slice (the `unaligned` rkyv feature must make this sound).
+    let mut padded: Vec<u8> = Vec::with_capacity(blob.len() + 4);
+    padded.extend_from_slice(&[0u8; 4]);
+    padded.extend_from_slice(&blob);
+    let misaligned = &padded[4..];
+    assert_eq!(misaligned.len(), blob.len());
+    let ok_mis = crate::verify_recursion_blob(misaligned)
+        .expect("verify_recursion_blob errored on misaligned buffer");
+    assert!(ok_mis, "rkyv path must accept the proof from a misaligned buffer");
 }
 
 /// Diagnostic: build the inner proof + recursion guest input, then **execute

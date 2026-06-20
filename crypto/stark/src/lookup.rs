@@ -1389,6 +1389,7 @@ impl BusInteraction {
 /// that makes the accumulated column wrap to zero at row N-1.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
+#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
 pub struct BusPublicInputs<E>
 where
     E: IsField,

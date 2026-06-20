@@ -311,9 +311,24 @@ fn run_and_profile(
     });
     let mut histogram = opts.histogram.then(InstrHistogram::new);
 
+    // Optional progress trace for very long runs (e.g. the recursion verifier):
+    // set LAMBDA_VM_PROGRESS=1 to print a cycle count every ~5M cycles. Helps
+    // distinguish "slow" from "stuck".
+    let progress = std::env::var("LAMBDA_VM_PROGRESS").is_ok();
+    let progress_start = std::time::Instant::now();
+    let mut next_progress: u64 = 5_000_000;
+
     let mut cycle_count: u64 = 0;
     while let Some(logs) = executor.resume().map_err(|e| format!("{e:?}"))? {
         cycle_count += logs.len() as u64;
+        if progress && cycle_count >= next_progress {
+            eprintln!(
+                "[progress] {} cycles, {:.1}s elapsed",
+                cycle_count,
+                progress_start.elapsed().as_secs_f64()
+            );
+            next_progress = cycle_count + 5_000_000;
+        }
         if generator.is_some() || histogram.is_some() {
             let logs: Vec<_> = logs.to_vec();
             if let Some(ref mut fg) = generator {

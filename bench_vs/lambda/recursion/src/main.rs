@@ -3,12 +3,10 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use core::arch::asm;
 use core::panic::PanicInfo;
 
 use embedded_alloc::TlsfHeap as Heap;
-use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
 // Required to pull in the riscv crate's critical-section implementation.
 use riscv as _;
 
@@ -66,24 +64,22 @@ fn halt() -> ! {
     }
 }
 
-/// Private input layout (postcard-encoded):
-///   (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)
-/// where the `Vec<u8>` holds the inner program's ELF bytes, the
-/// `ProofOptions` specifies the parameters the inner prover used, and the
-/// `VmVerifyingKey` carries the host-derived bitwise preprocessed commitment
-/// so the guest can skip the ~87% of verifier cycles that would otherwise be
-/// spent recomputing it from scratch.
+/// Private input layout: an rkyv-archived `lambda_vm_prover::RecursionInput`
+/// `{ vm_proof, inner_elf, options, vkey }`. `inner_elf` holds the inner
+/// program's ELF bytes, `options` the parameters the inner prover used, and
+/// `vkey` the host-derived bitwise preprocessed commitment so the guest can
+/// skip the ~87% of verifier cycles that would otherwise be spent recomputing
+/// it from scratch. The blob is read zero-copy via `verify_recursion_blob`.
 #[unsafe(no_mangle)]
 pub fn main() -> ! {
     init_allocator();
 
     let blob = read_private_input();
-    let (vm_proof, inner_elf, options, vkey): (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey) =
-        postcard::from_bytes(blob).expect("failed to deserialize recursion input");
-
-    let ok =
-        lambda_vm_prover::verify_with_options_with_vkey(&vm_proof, &inner_elf, &options, Some(&vkey))
-            .expect("verify errored");
+    // Zero-copy read of the proof bundle: `rkyv::access_unchecked` views the
+    // blob in place and we materialize only via rkyv's structural deserialize
+    // (no format parsing), replacing the postcard varint parse that was ~23% of
+    // verifier cycles.
+    let ok = lambda_vm_prover::verify_recursion_blob(blob).expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
     commit(&[1u8]);

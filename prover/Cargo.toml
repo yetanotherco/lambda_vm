@@ -13,7 +13,12 @@ cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks", "std"]
 instruments = ["stark/instruments", "std"]
-disk-spill = ["stark/disk-spill"]
+# Zero-copy proof reading for the recursion verifier (rkyv Archive on the proof
+# type graph). Independent of `prove`; the verifier-only guest enables this.
+rkyv = ["dep:rkyv", "stark/rkyv", "math/rkyv", "crypto/rkyv"]
+# disk-spill uses sysinfo (no no_std support) and mmap-backed storage, so it
+# requires std. The no_std guest never proves, so it never needs this feature.
+disk-spill = ["stark/disk-spill", "std", "dep:sysinfo", "dep:log"]
 
 [dependencies]
 stark = { path = "../crypto/stark", default-features = false }
@@ -24,10 +29,14 @@ ecsm = { path = "../crypto/ecsm" }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
 rayon = { version = "1.8.0", optional = true }
-sysinfo = { version = "0.31", default-features = false, features = ["system"] }
-log = "0.4"
+sysinfo = { version = "0.31", default-features = false, features = ["system"], optional = true }
+log = { version = "0.4", optional = true }
 sha3 = { version = "0.10.8", default-features = false }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "unaligned",
+], optional = true }
 
 [dev-dependencies]
 env_logger = "*"

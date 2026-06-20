@@ -46,6 +46,10 @@ impl std::fmt::Debug for TableMmapBacking {
     not(feature = "disk-spill"),
     derive(serde::Serialize, Clone, PartialEq, Eq)
 )]
+#[cfg_attr(
+    all(feature = "rkyv", not(feature = "disk-spill")),
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
     /// Row-major backing store. Crate-private: external callers must go through
