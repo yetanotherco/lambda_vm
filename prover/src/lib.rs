@@ -1222,6 +1222,18 @@ fn verify_archived_with_vkey(
         Some(vkey),
     );
 
+    // In the recursion guest the process verifies a single proof and then halts,
+    // so the heap is reclaimed wholesale on exit — running `drop(VmAirs)` walks
+    // ~9.3k tiny Vec/Box deallocations (the per-interaction `Vec<BusValue>`,
+    // `Vec<LinearTerm>`, and boxed constraints) for nothing (~7% of guest verify
+    // cycles in the profile). Suppress teardown so those deallocations never run.
+    // `ManuallyDrop` adds no allocation (unlike `Box::leak`); the AIRs simply live
+    // for the rest of the (single-shot) process. Guarded to the guest target only;
+    // the host (long-lived prover process) keeps normal drop semantics so
+    // verifying in a loop does not leak.
+    #[cfg(target_arch = "riscv64")]
+    let airs = core::mem::ManuallyDrop::new(airs);
+
     let air_refs = airs.air_refs();
     let get_proof = |i: usize| &archived_proofs[i];
     let expected_bus_balance = match compute_expected_commit_bus_balance(
