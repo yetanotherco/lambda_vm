@@ -51,6 +51,45 @@ where
     root_hash == &hashed_value
 }
 
+/// Like [`verify_merkle_path`], but takes the leaf value as a borrowed slice of
+/// field elements hashed via [`FieldElementVectorBackend::hash_data_slice`],
+/// producing the identical root to the `Vec`-leaf path. Lets the verifier hash
+/// openings straight from borrowed (e.g. zero-copy archived) slices without
+/// materializing a `Vec` per opening.
+pub fn verify_merkle_path_fe_slice<F, D, const NUM_BYTES: usize>(
+    merkle_path: &[[u8; NUM_BYTES]],
+    root_hash: &[u8; NUM_BYTES],
+    mut index: usize,
+    value: &[math::field::element::FieldElement<F>],
+) -> bool
+where
+    F: math::field::traits::IsField,
+    D: digest::Digest,
+    math::field::element::FieldElement<F>: math::traits::ByteConversion,
+    [u8; NUM_BYTES]: From<digest::Output<D>>,
+{
+    use super::backends::field_element_vector::FieldElementVectorBackend;
+    let mut hashed_value = FieldElementVectorBackend::<F, D, NUM_BYTES>::hash_data_slice(value);
+
+    for sibling_node in merkle_path.iter() {
+        if index.is_multiple_of(2) {
+            hashed_value = FieldElementVectorBackend::<F, D, NUM_BYTES>::hash_new_parent(
+                &hashed_value,
+                sibling_node,
+            );
+        } else {
+            hashed_value = FieldElementVectorBackend::<F, D, NUM_BYTES>::hash_new_parent(
+                sibling_node,
+                &hashed_value,
+            );
+        }
+
+        index >>= 1;
+    }
+
+    root_hash == &hashed_value
+}
+
 impl<T: PartialEq + Eq> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
     pub fn verify<B>(&self, root_hash: &B::Node, index: usize, value: &B::Data) -> bool

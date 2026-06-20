@@ -87,6 +87,25 @@ where
         result.copy_from_slice(&hasher.finalize());
         result
     }
+
+    /// Hash a leaf given directly as a borrowed slice of field elements, producing
+    /// the identical node to [`hash_data`](IsMerkleTreeBackend::hash_data) on the
+    /// equivalent `Vec`. Lets the verifier hash openings read straight from a
+    /// borrowed (e.g. zero-copy archived) slice without materializing a `Vec`.
+    pub fn hash_data_slice(input: &[FieldElement<F>]) -> [u8; NUM_BYTES]
+    where
+        F: IsField,
+        FieldElement<F>: ByteConversion,
+    {
+        let mut hasher = D::new();
+        for element in input.iter() {
+            // BE bytes from the fixed-size array, no per-element allocation.
+            hasher.update(element.to_bytes_be().as_ref());
+        }
+        let mut result_hash = [0_u8; NUM_BYTES];
+        result_hash.copy_from_slice(&hasher.finalize());
+        result_hash
+    }
 }
 
 impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend

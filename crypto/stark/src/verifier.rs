@@ -1,5 +1,4 @@
 use super::{
-    config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
     fri::fri_decommit::FriDecommitment,
     grinding,
@@ -329,12 +328,7 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<E>>(
-            merkle_path,
-            root,
-            index,
-            &value.to_vec(),
-        )
+        crate::config::verify_batched_merkle_path_slice::<E>(merkle_path, root, index, value)
     }
 
     /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
@@ -415,19 +409,24 @@ pub trait IsStarkVerifier<
         deep_poly_openings: &DeepPolynomialOpeningRef<'_, Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
         iota: &usize,
+        value: &mut Vec<FieldElement<FieldExtension>>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        let mut value = deep_poly_openings.composition_poly.evaluations.to_vec();
+        // The composition-poly leaf is `evaluations` followed by `evaluations_sym`.
+        // `value` is a caller-owned scratch buffer reused across queries: clear it
+        // and refill from the two borrowed slices, hashing without a fresh `Vec`.
+        value.clear();
+        value.extend_from_slice(deep_poly_openings.composition_poly.evaluations);
         value.extend_from_slice(deep_poly_openings.composition_poly.evaluations_sym);
 
-        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        crate::config::verify_batched_merkle_path_slice::<FieldExtension>(
             deep_poly_openings.composition_poly.proof,
             composition_poly_merkle_root,
             *iota,
-            &value,
+            value,
         )
     }
 
@@ -471,13 +470,16 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
+        // Two-element leaf, ordered by parity of `iota`. Built on the stack as a
+        // fixed-size array and hashed straight from the borrowed slice — no heap
+        // allocation per FRI layer per query.
+        let evaluations: [FieldElement<FieldExtension>; 2] = if iota % 2 == 1 {
+            [evaluation_sym.clone(), evaluation.clone()]
         } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
+            [evaluation.clone(), evaluation_sym.clone()]
         };
 
-        crypto::merkle_tree::proof::verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        crate::config::verify_batched_merkle_path_slice::<FieldExtension>(
             auth_path_sym,
             merkle_root,
             iota >> 1,
@@ -676,7 +678,9 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
+        // `denoms_trace` is a caller-owned scratch buffer reused across queries;
+        // refill it from scratch each call rather than allocating a fresh `Vec`.
+        denoms_trace.clear();
         let mut current_z = challenges.z.clone();
         for _ in 0..ood_evaluations_table_height {
             denoms_trace.push(evaluation_point - &current_z);
