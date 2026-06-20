@@ -35,6 +35,7 @@ fn branch_hint() {
         target_arch = "arm",
         target_arch = "x86",
         target_arch = "x86_64",
+        target_arch = "riscv64",
     ))]
     unsafe {
         core::arch::asm!("", options(nomem, nostack, preserves_flags));
