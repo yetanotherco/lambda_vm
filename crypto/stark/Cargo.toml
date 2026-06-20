@@ -22,7 +22,6 @@ hashbrown = { version = "0.14", default-features = false, features = ["inline-mo
 libm = "0.2"
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
-    "unaligned",
 ], optional = true }
 
 # Parallelization crates

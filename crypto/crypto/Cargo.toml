@@ -24,7 +24,6 @@ tempfile = { version = "3", optional = true }
 libc = { version = "0.2", optional = true }
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
-    "unaligned",
 ], optional = true }
 
 [dev-dependencies]

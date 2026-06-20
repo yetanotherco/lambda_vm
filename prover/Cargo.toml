@@ -35,7 +35,6 @@ sha3 = { version = "0.10.8", default-features = false }
 postcard = { version = "1.0", default-features = false, features = ["alloc"] }
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
-    "unaligned",
 ], optional = true }
 
 [dev-dependencies]

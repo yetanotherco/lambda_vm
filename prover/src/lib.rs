@@ -193,6 +193,94 @@ pub struct RecursionInput {
     pub vkey: VmVerifyingKey,
 }
 
+// ============================================================================
+// Recursion-input wire format: aligning magic prefix + rkyv archive
+// ============================================================================
+//
+// rkyv reads the archive in place and issues naturally-aligned loads (the
+// archived field element is `rend::u64_le`, alignment 8; we play it safe and
+// require 16). The lambda-vm executor *traps* unaligned doubleword loads, so the
+// archive's first byte must sit at a 16-aligned guest address.
+//
+// The executor maps the private input as `[u32 len][payload...]` with the
+// payload starting at `PRIVATE_INPUT_START_INDEX + 4`. That base is 4-aligned,
+// not 16. We prepend a fixed prefix to the payload so the archive that follows
+// lands on a 16-aligned address, and make the prefix a magic + version so the
+// guest can reject a wrong-format/version blob *before* the unsafe access.
+//
+// Prefix length is chosen so `(PRIVATE_INPUT_START_INDEX + 4) + PREFIX_LEN` is a
+// multiple of 16:
+//   (16 - ((0xFF000004) mod 16)) mod 16 = (16 - 4) mod 16 = 12.
+
+/// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
+#[cfg(feature = "rkyv")]
+pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
+
+/// Wire-format version of the recursion input blob.
+#[cfg(feature = "rkyv")]
+pub const RECURSION_INPUT_VERSION: u32 = 1;
+
+/// Required alignment (bytes) of the archive's first byte in guest memory.
+#[cfg(feature = "rkyv")]
+pub const RECURSION_INPUT_ALIGN: usize = 16;
+
+/// Aligning prefix length: `magic(4) + version(4) + reserved(4) = 12` bytes,
+/// chosen so the archive starts 16-aligned given the executor's
+/// `PRIVATE_INPUT_START_INDEX + 4` payload base. Asserted below.
+#[cfg(feature = "rkyv")]
+pub const RECURSION_INPUT_PREFIX_LEN: usize = 12;
+
+#[cfg(feature = "rkyv")]
+const _: () = {
+    let payload_base = (executor::constants::PRIVATE_INPUT_START_INDEX as usize) + 4;
+    let pad =
+        (RECURSION_INPUT_ALIGN - (payload_base % RECURSION_INPUT_ALIGN)) % RECURSION_INPUT_ALIGN;
+    assert!(
+        RECURSION_INPUT_PREFIX_LEN == pad,
+        "prefix length must align the archive to RECURSION_INPUT_ALIGN given the private-input payload base",
+    );
+    assert!(
+        (payload_base + RECURSION_INPUT_PREFIX_LEN) % RECURSION_INPUT_ALIGN == 0,
+        "archive must start at a RECURSION_INPUT_ALIGN-aligned guest address",
+    );
+};
+
+/// Encode a [`RecursionInput`] into the on-wire blob: a 12-byte
+/// `magic + version + reserved` prefix followed by the rkyv archive. The prefix
+/// both aligns the archive (so the guest's in-place reads don't trap) and tags
+/// the format/version so the guest can validate before the unsafe access.
+#[cfg(all(feature = "rkyv", feature = "prove"))]
+pub fn encode_recursion_input(input: &RecursionInput) -> Result<alloc::vec::Vec<u8>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+    let archive = rkyv::to_bytes::<RkyvError>(input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = alloc::vec::Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
+/// Validate the wire prefix and return the archive bytes (zero-copy slice).
+/// Returns `None` if the magic or version doesn't match — the caller should
+/// halt cleanly rather than proceed into an `access_unchecked`.
+#[cfg(feature = "rkyv")]
+pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
+    if blob.len() < RECURSION_INPUT_PREFIX_LEN {
+        return None;
+    }
+    if blob[0..4] != RECURSION_INPUT_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+    if version != RECURSION_INPUT_VERSION {
+        return None;
+    }
+    Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(
     feature = "rkyv",
@@ -1026,10 +1114,21 @@ pub fn verify_with_options(
 pub fn verify_recursion_blob(blob: &[u8]) -> Result<bool, Error> {
     use rkyv::rancor::Error as RkyvError;
 
-    // SAFETY: the blob is produced by our own `rkyv::to_bytes::<RecursionInput>`
-    // in the trusted host path. A corrupted blob can only cause verification to
-    // fail (the proof is checked cryptographically), not unsoundness here.
-    let archived = unsafe { rkyv::access_unchecked::<ArchivedRecursionInput>(blob) };
+    // Validate + strip the aligning magic/version prefix. The returned slice
+    // starts at the 16-aligned archive base (the prefix exists precisely so the
+    // archive lands aligned at `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the
+    // in-place doubleword loads below do not trap.
+    let archive_bytes = recursion_archive_bytes(blob).ok_or_else(|| {
+        Error::Execution(alloc::string::String::from(
+            "recursion blob: bad magic or version",
+        ))
+    })?;
+
+    // SAFETY: `archive_bytes` is produced by our own `encode_recursion_input`
+    // in the trusted host path and is 16-aligned (prefix-aligned). A corrupted
+    // blob can only cause verification to fail (the proof is checked
+    // cryptographically), not unsoundness here.
+    let archived = unsafe { rkyv::access_unchecked::<ArchivedRecursionInput>(archive_bytes) };
 
     // The big STARK proof (the nested FieldElement Vecs) is read IN PLACE from
     // the archived buffer — never deserialized to owned, which would trigger a

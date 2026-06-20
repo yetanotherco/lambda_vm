@@ -218,7 +218,7 @@ fn test_dump_recursion_input() {
         options: inner_proof_options.clone(),
         vkey,
     };
-    let blob = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("rkyv encode failed");
+    let blob = crate::encode_recursion_input(&input).expect("encode recursion input");
 
     let path = "/tmp/recursion_input.bin";
     std::fs::write(path, &blob).expect("write blob");
@@ -280,7 +280,7 @@ fn test_verify_recursion_blob_roundtrip() {
         options: inner_proof_options.clone(),
         vkey,
     };
-    let blob = rkyv::to_bytes::<rkyv::rancor::Error>(&input).expect("rkyv encode failed");
+    let blob = crate::encode_recursion_input(&input).expect("encode recursion input");
 
     let ok = crate::verify_recursion_blob(&blob).expect("verify_recursion_blob errored");
     assert!(ok, "rkyv zero-copy path must accept the same proof");

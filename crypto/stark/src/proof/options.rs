@@ -40,7 +40,10 @@ impl fmt::Display for ProofOptionsError {
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "rkyv", derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize))]
+#[cfg_attr(
+    feature = "rkyv",
+    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
+)]
 pub struct ProofOptions {
     pub blowup_factor: u8,
     pub fri_number_of_queries: usize,

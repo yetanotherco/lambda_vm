@@ -27,7 +27,6 @@ num-traits = { version = "0.2.19", default-features = false }
 # read a proof straight from its byte buffer with no deserialization pass.
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
-    "unaligned",
 ], optional = true }
 
 [dev-dependencies]
