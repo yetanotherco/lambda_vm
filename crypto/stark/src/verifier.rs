@@ -11,7 +11,6 @@ use crate::{
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
-use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -76,6 +75,38 @@ where
 
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
 
+/// Reusable scratch buffers threaded through the per-table verification loop so
+/// the work each table does in `step_2_verify_claimed_composition_polynomial`
+/// allocates once (on the first table) and reuses the same backing storage for
+/// every subsequent table, rather than allocating a fresh `Vec` per table.
+///
+/// Public only because it appears in the signatures of the `pub` trait methods
+/// `verify_rounds_2_to_4` / `step_2_verify_claimed_composition_polynomial`; it
+/// is an internal implementation detail and not part of the stable API.
+#[doc(hidden)]
+pub struct VerifyScratch<FieldExtension>
+where
+    FieldExtension: Send + Sync + IsField,
+{
+    /// Transition-constraint evaluations at the OOD point (length =
+    /// `num_transition_constraints`), filled by `compute_transition_into`.
+    transition_evals: Vec<FieldElement<FieldExtension>>,
+    /// Per-constraint zerofier denominators (same length as `transition_evals`).
+    denominators: Vec<FieldElement<FieldExtension>>,
+}
+
+impl<FieldExtension> VerifyScratch<FieldExtension>
+where
+    FieldExtension: Send + Sync + IsField,
+{
+    fn new() -> Self {
+        Self {
+            transition_evals: Vec::new(),
+            denominators: Vec::new(),
+        }
+    }
+}
+
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 pub trait IsStarkVerifier<
@@ -103,6 +134,7 @@ pub trait IsStarkVerifier<
         proof: &P,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        scratch: &mut VerifyScratch<FieldExtension>,
     ) -> bool
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -216,20 +248,31 @@ pub trait IsStarkVerifier<
             &logup_table_offset,
             &packing_shifts,
         );
-        let transition_ood_frame_evaluations =
-            air.compute_transition(&transition_evaluation_context);
+        // Reuse the caller-owned scratch buffers across tables: size them to this
+        // table's constraint count, then fill in place (`compute_transition_into`
+        // zeroes the buffer itself, so a `resize` is enough to set the length).
+        let num_transition_constraints = air.num_transition_constraints();
+        scratch
+            .transition_evals
+            .resize(num_transition_constraints, FieldElement::zero());
+        air.compute_transition_into(
+            &transition_evaluation_context,
+            &mut scratch.transition_evals,
+        );
 
-        let mut denominators =
-            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        // The zerofier value depends only on the OOD point `z`, the trace
-        // primitive root, the trace length, and the constraint's "shape" (its
-        // period / offset / exemption parameters) — not on its index. Many
-        // constraints in a table share the same shape (e.g. every plain
-        // every-row constraint), so `evaluate_zerofier` otherwise recomputes the
-        // same `(z^(n/period) - g^…)⁻¹ · P_exempt(z)` — an extension-field `pow`,
-        // a field inversion, and an `end_exemptions_poly` allocation — once per
-        // constraint. Memoize per distinct shape (a short linear scan; the
+        // Reuse the caller-owned scratch buffer for zerofier denominators, and
+        // memoize by constraint "shape". The zerofier value depends only on the
+        // OOD point `z`, the trace primitive root, the trace length, and the
+        // constraint's shape (period / offset / exemption parameters) — not on
+        // its index. Many constraints in a table share the same shape (e.g. every
+        // plain every-row constraint), so `evaluate_zerofier` otherwise recomputes
+        // the same `(z^(n/period) - g^…)⁻¹ · P_exempt(z)` — an extension-field
+        // `pow`, a field inversion, and an `end_exemptions_poly` allocation — once
+        // per constraint. Memoize per distinct shape (a short linear scan; the
         // number of shapes is tiny) so the heavy work runs once per shape.
+        scratch
+            .denominators
+            .resize(num_transition_constraints, FieldElement::zero());
         type ZerofierShape = (usize, usize, Option<usize>, Option<usize>, usize);
         let mut zerofier_cache: Vec<(ZerofierShape, FieldElement<FieldExtension>)> = Vec::new();
         air.transition_constraints().iter().for_each(|c| {
@@ -252,16 +295,16 @@ pub trait IsStarkVerifier<
                     value
                 }
             };
-            denominators[c.constraint_idx()] = zerofier;
+            scratch.denominators[c.constraint_idx()] = zerofier;
         });
 
         let transition_c_i_evaluations_sum = itertools::izip!(
-            transition_ood_frame_evaluations,
+            &scratch.transition_evals,
             &challenges.transition_coeffs,
-            denominators
+            &scratch.denominators
         )
         .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-            acc + beta * eval * &denominator
+            acc + beta * eval * denominator
         });
 
         let composition_poly_ood_evaluation =
@@ -920,6 +963,11 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
+        // Scratch buffers reused across every table's step-2 evaluation. They are
+        // resized (never shrunk) per table, so after the first table the backing
+        // storage is reused with no further allocation.
+        let mut verify_scratch = VerifyScratch::<FieldExtension>::new();
+
         for (idx, air) in airs.iter().enumerate() {
             let proof = get_proof(idx);
             // Must match prover: fork with domain separator for multi-table,
@@ -946,6 +994,7 @@ pub trait IsStarkVerifier<
                 &proof,
                 &mut table_transcript,
                 lookup_challenges.clone(),
+                &mut verify_scratch,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1097,14 +1146,20 @@ pub trait IsStarkVerifier<
                 .take(num_terms_composition_poly + num_terms_trace)
                 .collect();
 
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
-            .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
+        // Split the contiguous coefficient buffer in place: the trace terms are
+        // the first `num_terms_trace`, the composition-poly gammas are the rest.
+        // Chunk the trace prefix directly off the borrowed slice (no intermediate
+        // `Vec` from a `drain().collect()`), then keep the suffix as `gammas`.
+        let chunk_len = air.context().transition_offsets.len() * air.step_size();
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients[..num_terms_trace]
+            .chunks(chunk_len)
             .map(|chunk| chunk.to_vec())
             .collect();
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
+        // Drop the trace-term prefix in place, leaving only the composition-poly
+        // gammas as the (reused) backing storage.
+        deep_composition_coefficients.drain(..num_terms_trace);
         let gammas = deep_composition_coefficients;
 
         // FRI commit phase
@@ -1160,6 +1215,7 @@ pub trait IsStarkVerifier<
         proof: &P,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        scratch: &mut VerifyScratch<FieldExtension>,
     ) -> bool
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -1208,7 +1264,13 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer2 = Instant::now();
 
-        if !Self::step_2_verify_claimed_composition_polynomial(air, proof, &domain, &challenges) {
+        if !Self::step_2_verify_claimed_composition_polynomial(
+            air,
+            proof,
+            &domain,
+            &challenges,
+            scratch,
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
             return false;

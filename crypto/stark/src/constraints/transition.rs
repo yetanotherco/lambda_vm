@@ -290,7 +290,7 @@ where
                 acc * -(root.clone() - z.clone())
             });
 
-        if let Some(exemptions_period) = self.exemptions_period() {
+        let base = if let Some(exemptions_period) = self.exemptions_period() {
             debug_assert!(exemptions_period.is_multiple_of(self.period()));
 
             debug_assert!(self.periodic_exemptions_offset().is_some());
