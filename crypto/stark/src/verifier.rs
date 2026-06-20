@@ -221,9 +221,38 @@ pub trait IsStarkVerifier<
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
+        // The zerofier value depends only on the OOD point `z`, the trace
+        // primitive root, the trace length, and the constraint's "shape" (its
+        // period / offset / exemption parameters) — not on its index. Many
+        // constraints in a table share the same shape (e.g. every plain
+        // every-row constraint), so `evaluate_zerofier` otherwise recomputes the
+        // same `(z^(n/period) - g^…)⁻¹ · P_exempt(z)` — an extension-field `pow`,
+        // a field inversion, and an `end_exemptions_poly` allocation — once per
+        // constraint. Memoize per distinct shape (a short linear scan; the
+        // number of shapes is tiny) so the heavy work runs once per shape.
+        type ZerofierShape = (usize, usize, Option<usize>, Option<usize>, usize);
+        let mut zerofier_cache: Vec<(ZerofierShape, FieldElement<FieldExtension>)> = Vec::new();
         air.transition_constraints().iter().for_each(|c| {
-            denominators[c.constraint_idx()] =
-                c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
+            let shape: ZerofierShape = (
+                c.period(),
+                c.offset(),
+                c.exemptions_period(),
+                c.periodic_exemptions_offset(),
+                c.end_exemptions(),
+            );
+            let zerofier = match zerofier_cache.iter().find(|(s, _)| *s == shape) {
+                Some((_, value)) => value.clone(),
+                None => {
+                    let value = c.evaluate_zerofier(
+                        &challenges.z,
+                        &domain.trace_primitive_root,
+                        trace_length,
+                    );
+                    zerofier_cache.push((shape, value.clone()));
+                    value
+                }
+            };
+            denominators[c.constraint_idx()] = zerofier;
         });
 
         let transition_c_i_evaluations_sum = itertools::izip!(
