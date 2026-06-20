@@ -20,25 +20,41 @@ pub struct Proof<T: PartialEq + Eq> {
     pub merkle_path: Vec<T>,
 }
 
+/// Verifies a Merkle inclusion proof given the authentication path as a borrowed
+/// slice. Shared by [`Proof::verify`] (owned) and the zero-copy verifier (which
+/// reads the path straight from an rkyv-archived proof buffer) so both compute
+/// the identical root.
+pub fn verify_merkle_path<B>(
+    merkle_path: &[B::Node],
+    root_hash: &B::Node,
+    mut index: usize,
+    value: &B::Data,
+) -> bool
+where
+    B: IsMerkleTreeBackend,
+{
+    let mut hashed_value = B::hash_data(value);
+
+    for sibling_node in merkle_path.iter() {
+        if index.is_multiple_of(2) {
+            hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
+        } else {
+            hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
+        }
+
+        index >>= 1;
+    }
+
+    root_hash == &hashed_value
+}
+
 impl<T: PartialEq + Eq> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
-    pub fn verify<B>(&self, root_hash: &B::Node, mut index: usize, value: &B::Data) -> bool
+    pub fn verify<B>(&self, root_hash: &B::Node, index: usize, value: &B::Data) -> bool
     where
         B: IsMerkleTreeBackend<Node = T>,
     {
-        let mut hashed_value = B::hash_data(value);
-
-        for sibling_node in self.merkle_path.iter() {
-            if index.is_multiple_of(2) {
-                hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
-            } else {
-                hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
-            }
-
-            index >>= 1;
-        }
-
-        root_hash == &hashed_value
+        verify_merkle_path::<B>(&self.merkle_path, root_hash, index, value)
     }
 }
 

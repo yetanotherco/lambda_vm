@@ -228,6 +228,13 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
+    /// Borrow the flat row-major element buffer. Used by the zero-copy verifier
+    /// to build an `OodTableRef` over the owned table's data.
+    #[cfg(not(feature = "disk-spill"))]
+    pub fn data_slice(&self) -> &[FieldElement<F>] {
+        &self.data
+    }
+
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -350,26 +357,47 @@ impl<F: IsField> Table<F> {
     /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
     pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
         debug_assert!(self.height.is_multiple_of(step_size));
-        let steps = (0..self.height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
+        frame_from_rows(self.height, step_size, main_trace_columns, |row_idx| {
+            self.get_row(row_idx)
+        })
     }
+}
+
+/// Build a [`Frame`] from `height` rows accessed via `get_row`, splitting each
+/// row at `main_trace_columns` into main/aux. Shared by [`Table::into_frame`]
+/// and the zero-copy `OodTableRef::into_frame` so both produce identical frames.
+///
+/// Only the small out-of-domain frame is materialized here (bounded by
+/// `step_size × width`), never the full trace.
+pub fn frame_from_rows<'a, F: IsSubFieldOf<F> + IsField>(
+    height: usize,
+    step_size: usize,
+    main_trace_columns: usize,
+    get_row: impl Fn(usize) -> &'a [FieldElement<F>],
+) -> Frame<F, F>
+where
+    F: 'a,
+{
+    debug_assert!(height.is_multiple_of(step_size));
+    let steps = (0..height)
+        .step_by(step_size)
+        .map(|initial_row_idx| {
+            let end_row_idx = initial_row_idx + step_size;
+
+            let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+            let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+
+            (initial_row_idx..end_row_idx).for_each(|row_idx| {
+                let row = get_row(row_idx);
+                step_main_data.push(row[..main_trace_columns].to_vec());
+                step_aux_data.push(row[main_trace_columns..].to_vec());
+            });
+
+            TableView::new(step_main_data, step_aux_data)
+        })
+        .collect();
+
+    Frame::new(steps)
 }
 
 /// A view of a contiguous subset of rows of a table.
