@@ -730,6 +730,39 @@ pub trait IsStarkVerifier<
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
     }
 
+    /// Precompute the query-invariant per-row term
+    /// `b_terms[row] = Σ_col ood[row][col]·coeff[col][row]`, where `ood` is the
+    /// committed trace OOD-evaluations table and `coeff` is the (flat,
+    /// column-major) deep-composition trace coefficients. Neither depends on the
+    /// FRI query, so this is computed once and reused for every query (and for the
+    /// symmetric point) by [`reconstruct_deep_composition_poly_evaluation`].
+    fn precompute_ood_coeff_terms<'p, P>(
+        proof: &P,
+        challenges: &Challenges<FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
+        let ood = proof.trace_ood_evaluations();
+        let height = ood.height();
+        let width = ood.width();
+        let trace_term_coeffs = &challenges.trace_term_coeffs;
+        let chunk_len = challenges.trace_term_chunk_len;
+        let mut b_terms = Vec::with_capacity(height);
+        for row_idx in 0..height {
+            let ood_row = ood.get_row(row_idx);
+            let mut b = FieldElement::zero();
+            for col_idx in 0..width {
+                b += ood_row[col_idx].clone() * &trace_term_coeffs[col_idx * chunk_len + row_idx];
+            }
+            b_terms.push(b);
+        }
+        b_terms
+    }
+
     fn reconstruct_deep_composition_poly_evaluation<'p, P>(
         proof: &P,
         evaluation_point: &FieldElement<Field>,
