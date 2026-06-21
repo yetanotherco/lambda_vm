@@ -584,6 +584,27 @@ impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
         }
         FieldElement::<Self>::new(coeffs)
     }
+
+    fn sample_field_element_from_squeeze(
+        mut squeeze: impl FnMut() -> [u8; 32],
+    ) -> FieldElement<Self> {
+        // Three limbs = 24 bytes, which fit in a single 32-byte squeeze block, so
+        // the common (no-rejection) path costs exactly one squeeze. Each limb takes
+        // its big-endian 8-byte slice of that block; a limb that lands out of range
+        // (~1-in-4-billion) is re-drawn from a fresh squeeze block (first 8 bytes),
+        // which is deterministic and identical on prover and verifier.
+        let block = squeeze();
+        let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
+        for (i, coeff) in coeffs.iter_mut().enumerate() {
+            let mut int_sample = u64::from_be_bytes(block[i * 8..i * 8 + 8].try_into().unwrap());
+            while int_sample >= GOLDILOCKS_PRIME {
+                let resampled = squeeze();
+                int_sample = u64::from_be_bytes(resampled[..8].try_into().unwrap());
+            }
+            *coeff = FpE::from(int_sample);
+        }
+        FieldElement::<Self>::new(coeffs)
+    }
 }
 
 // =====================================================

@@ -553,4 +553,19 @@ impl HasDefaultTranscript for GoldilocksField {
             }
         }
     }
+
+    fn sample_field_element_from_squeeze(
+        mut squeeze: impl FnMut() -> [u8; 32],
+    ) -> FieldElement<Self> {
+        // One limb: take the first 8 big-endian bytes of a squeeze block (matching
+        // the historical `from_be_bytes` convention). Rejection-resample with a
+        // fresh squeeze only on the ~1-in-4-billion out-of-range draw.
+        loop {
+            let block = squeeze();
+            let int_sample = u64::from_be_bytes(block[..8].try_into().unwrap());
+            if int_sample < GOLDILOCKS_PRIME {
+                return FieldElement::from(int_sample);
+            }
+        }
+    }
 }

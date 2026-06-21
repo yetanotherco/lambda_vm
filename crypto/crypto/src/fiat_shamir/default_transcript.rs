@@ -8,7 +8,6 @@ use math::{
     },
     traits::ByteConversion,
 };
-use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 use sha3::{Digest, Keccak256};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {
@@ -77,8 +76,13 @@ where
     }
 
     fn sample_field_element(&mut self) -> FieldElement<F> {
-        let mut rng = <ChaCha20Rng as SeedableRng>::from_seed(self.sample());
-        F::get_random_field_element_from_rng(&mut rng)
+        // Squeeze field-element entropy directly from the transcript's Keccak
+        // sponge instead of seeding a per-call ChaCha20 PRG. Each `self.sample()`
+        // returns a fresh 32-byte squeeze block; the field type pulls the limbs it
+        // needs from one block (rejection-resampling only on the ~1-in-4-billion
+        // out-of-range draw). This reuses the Keccak permutation precompile already
+        // backing the transcript and drops the `rand_chacha` dependency.
+        F::sample_field_element_from_squeeze(|| self.sample())
     }
 
     fn sample_u64(&mut self, upper_bound: u64) -> u64 {

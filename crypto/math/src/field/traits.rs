@@ -301,4 +301,13 @@ pub trait HasDefaultTranscript: IsField {
     /// This function should truncates the sampled bits to the quantity required to represent the order of the base field
     /// and returns a field element.
     fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self>;
+
+    /// Sample a uniform field element directly from a transcript squeeze, with no
+    /// intermediate PRG. `squeeze` returns a fresh 32-byte block from the
+    /// Fiat-Shamir sponge on each call; the implementation consumes the limbs it
+    /// needs (one for a prime field, three for a degree-3 extension) from a single
+    /// block and rejection-resamples by calling `squeeze` again only on the
+    /// astronomically rare out-of-range draw. Reuses the transcript's Keccak
+    /// sponge instead of seeding a ChaCha PRG per element.
+    fn sample_field_element_from_squeeze(squeeze: impl FnMut() -> [u8; 32]) -> FieldElement<Self>;
 }
