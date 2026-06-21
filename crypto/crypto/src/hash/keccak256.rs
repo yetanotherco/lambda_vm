@@ -101,6 +101,104 @@ fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
     }
 }
 
+/// Streaming Keccak256 hasher, byte-identical to `sha3::Keccak256` but built on a
+/// direct `keccak::f1600` (the `KeccakPermute` precompile on the guest) and a
+/// fixed-rate buffer, skipping `sha3`'s generic `block_buffer`/`Digest` machinery.
+///
+/// Drop-in for the transcript's incremental absorb (`update`) + squeeze
+/// (`finalize` / `finalize_reset`) usage. `update` XORs bytes into the rate and
+/// permutes on each completed 136-byte block; `finalize` applies pad10*1 to the
+/// partial block, permutes once, and returns the first 32 squeezed bytes.
+#[derive(Clone)]
+pub struct Keccak256Hasher {
+    /// Sponge state.
+    state: [u64; 25],
+    /// Pending rate bytes not yet absorbed+permuted (length `< RATE`).
+    buf: [u8; RATE],
+    /// Number of valid bytes in `buf`.
+    buf_len: usize,
+}
+
+impl Default for Keccak256Hasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Keccak256Hasher {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            state: [0u64; 25],
+            buf: [0u8; RATE],
+            buf_len: 0,
+        }
+    }
+
+    /// Absorb `input`, permuting once per completed rate block. Equivalent to
+    /// `sha3::Keccak256::update`.
+    #[inline]
+    pub fn update(&mut self, mut input: &[u8]) {
+        // Fill the partial buffer first.
+        if self.buf_len > 0 {
+            let take = core::cmp::min(RATE - self.buf_len, input.len());
+            self.buf[self.buf_len..self.buf_len + take].copy_from_slice(&input[..take]);
+            self.buf_len += take;
+            input = &input[take..];
+            if self.buf_len == RATE {
+                let block = self.buf;
+                absorb_block(&mut self.state, &block);
+                keccak::f1600(&mut self.state);
+                self.buf_len = 0;
+            } else {
+                // Partial buffer still not full and the input is exhausted; the
+                // already-buffered bytes must be kept (do NOT fall through to the
+                // remainder stash, which would clobber `buf_len`).
+                debug_assert!(input.is_empty());
+                return;
+            }
+        }
+        // At this point the buffer is empty. Absorb whole blocks straight from the
+        // input, then stash the trailing partial block.
+        let mut chunks = input.chunks_exact(RATE);
+        for block in chunks.by_ref() {
+            absorb_block(&mut self.state, block);
+            keccak::f1600(&mut self.state);
+        }
+        let rem = chunks.remainder();
+        self.buf[..rem.len()].copy_from_slice(rem);
+        self.buf_len = rem.len();
+    }
+
+    /// Pad and squeeze the 32-byte digest WITHOUT consuming `self` — equivalent to
+    /// `sha3::Keccak256::clone().finalize()`. Used by the transcript's `state()`.
+    #[inline]
+    pub fn finalize(&self) -> [u8; OUTPUT_LEN] {
+        let mut state = self.state;
+        let mut last = [0u8; RATE];
+        last[..self.buf_len].copy_from_slice(&self.buf[..self.buf_len]);
+        last[self.buf_len] ^= 0x01;
+        last[RATE - 1] ^= 0x80;
+        absorb_block(&mut state, &last);
+        keccak::f1600(&mut state);
+
+        let mut out = [0u8; OUTPUT_LEN];
+        for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+            chunk.copy_from_slice(&lane.to_le_bytes());
+        }
+        out
+    }
+
+    /// Squeeze the digest and reset to a fresh state — equivalent to
+    /// `sha3::Keccak256::finalize_reset`.
+    #[inline]
+    pub fn finalize_reset(&mut self) -> [u8; OUTPUT_LEN] {
+        let out = self.finalize();
+        *self = Self::new();
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,6 +235,45 @@ mod tests {
                 "mismatch at len {len}"
             );
         }
+    }
+
+    #[test]
+    fn streaming_hasher_matches_sha3_incremental() {
+        // Mirror the transcript's usage: a sequence of variably-sized updates
+        // (spanning rate-block boundaries) interleaved with finalize_reset and a
+        // non-consuming finalize, checked against sha3::Keccak256 step for step.
+        let updates: &[&[u8]] = &[
+            &[],
+            &[0xAB],
+            &[1u8; 32],
+            &[2u8; 135],
+            &[3u8; 136],
+            &[4u8; 137],
+            &[5u8; 300],
+            &[6u8; 8],
+        ];
+
+        let mut mine = Keccak256Hasher::new();
+        let mut theirs = Keccak256::new();
+        for (i, u) in updates.iter().enumerate() {
+            mine.update(u);
+            theirs.update(u);
+            // Non-consuming digest must match clone().finalize().
+            assert_eq!(
+                mine.finalize(),
+                <[u8; 32]>::from(theirs.clone().finalize()),
+                "finalize mismatch after update {i}"
+            );
+        }
+        // Consuming reset must match finalize_reset, and the fresh state must keep
+        // agreeing afterwards.
+        assert_eq!(
+            mine.finalize_reset(),
+            <[u8; 32]>::from(theirs.finalize_reset())
+        );
+        mine.update(&[7u8; 50]);
+        theirs.update(&[7u8; 50]);
+        assert_eq!(mine.finalize(), <[u8; 32]>::from(theirs.clone().finalize()));
     }
 
     #[test]

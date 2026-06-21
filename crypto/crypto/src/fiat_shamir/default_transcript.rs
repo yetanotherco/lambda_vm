@@ -1,4 +1,5 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
+use crate::hash::keccak256::Keccak256Hasher;
 
 use core::marker::PhantomData;
 use math::{
@@ -8,10 +9,11 @@ use math::{
     },
     traits::ByteConversion,
 };
-use sha3::{Digest, Keccak256};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {
-    hasher: Keccak256,
+    // Streaming Keccak256 built on the `keccak::f1600` precompile, byte-identical
+    // to `sha3::Keccak256` but without the generic `sha3` block-buffer wrapper.
+    hasher: Keccak256Hasher,
     phantom: PhantomData<F>,
 }
 
@@ -31,7 +33,7 @@ where
 {
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
-            hasher: Keccak256::new(),
+            hasher: Keccak256Hasher::new(),
             phantom: PhantomData,
         };
         res.append_bytes(data);
@@ -41,7 +43,7 @@ where
     pub fn sample(&mut self) -> [u8; 32] {
         let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
         result_hash.reverse();
-        self.hasher.update(result_hash);
+        self.hasher.update(&result_hash);
         result_hash
     }
 }
@@ -72,7 +74,9 @@ where
     }
 
     fn state(&self) -> [u8; 32] {
-        self.hasher.clone().finalize().into()
+        // Non-consuming digest of everything absorbed so far (matches the old
+        // `sha3` `clone().finalize()`).
+        self.hasher.finalize()
     }
 
     fn sample_field_element(&mut self) -> FieldElement<F> {
