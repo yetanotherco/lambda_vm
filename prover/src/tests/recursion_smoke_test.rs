@@ -110,11 +110,20 @@ fn run_recursion_pipeline_with_options(
     );
 }
 
-/// Convenience wrapper using `blowup=8` for the inner proof — the default for
-/// the existing smoke tests, chosen to keep outer-prove memory tractable.
+/// Convenience wrapper using `blowup=32` for the inner proof.
+///
+/// Recursion is asymmetric: the inner proof is generated natively (cheap) but
+/// VERIFIED inside the VM (expensive, in guest cycles). A higher blowup buys more
+/// security per FRI query, so the verifier samples fewer queries — and since the
+/// FRI fold-chain length depends only on `trace_length` (not blowup), the higher
+/// blowup adds no verifier FRI layers. Measured: bumping the inner blowup from 8
+/// (73 queries) to 32 (44 queries) cuts the in-VM verification ~37% (360M -> 226M
+/// guest cycles for the empty inner program) at 128-bit security. The cost is a
+/// 4x larger inner-proof LDE (prover memory/time) — the intended trade for
+/// recursion. blowup 64 (37 queries) measured no better than 32.
 fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_input: &[u8]) {
-    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8)
-        .expect("blowup=8 is always valid");
+    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(32)
+        .expect("blowup=32 is always valid");
     run_recursion_pipeline_with_options(
         label,
         inner_elf_bytes,
@@ -183,11 +192,27 @@ fn test_dump_recursion_input() {
     build_elfs(&root);
     let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
 
-    let inner_proof_options = stark::proof::options::ProofOptions {
-        blowup_factor: 2,
-        fri_number_of_queries: 1,
-        coset_offset: 3,
-        grinding_factor: 1,
+    // Inner proof options. By default use the degenerate 1-query smoke config for
+    // fast iteration; set DUMP_BLOWUP=<n> to dump a realistic 128-bit-secure proof
+    // at that blowup (queries derived by the JBR formula) for measuring the FRI
+    // query/blowup trade-off in the guest.
+    let inner_proof_options = match std::env::var("DUMP_BLOWUP") {
+        Ok(b) => {
+            let blowup: u8 = b.parse().expect("DUMP_BLOWUP must be a u8");
+            let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(blowup)
+                .expect("valid blowup");
+            eprintln!(
+                "[dump-input] DUMP_BLOWUP={blowup} -> {} queries (128-bit)",
+                opts.fri_number_of_queries
+            );
+            opts
+        }
+        Err(_) => stark::proof::options::ProofOptions {
+            blowup_factor: 2,
+            fri_number_of_queries: 1,
+            coset_offset: 3,
+            grinding_factor: 1,
+        },
     };
 
     eprintln!("[dump-input] proving inner ...");
