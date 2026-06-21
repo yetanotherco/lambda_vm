@@ -560,7 +560,7 @@ pub trait IsStarkVerifier<
             [evaluation.clone(), evaluation_sym.clone()]
         };
 
-        crate::config::verify_batched_merkle_path_slice::<FieldExtension>(
+        crate::config::verify_fri_merkle_path_slice::<FieldExtension>(
             auth_path_sym,
             merkle_root,
             iota >> 1,

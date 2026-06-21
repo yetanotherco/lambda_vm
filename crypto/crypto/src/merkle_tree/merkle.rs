@@ -177,13 +177,16 @@ where
             return None;
         }
 
-        //The leaf must be a power of 2 set
-        let hashed_leaves = complete_until_power_of_two(hashed_leaves);
+        // The leaf count must be a power of the tree arity.
+        let hashed_leaves = complete_until_power_of_arity(hashed_leaves, B::ARITY);
         let leaves_len = hashed_leaves.len();
 
-        //The length of leaves minus one inner node in the merkle tree
-        //The first elements are overwritten by build function, it doesn't matter what it's there
-        let mut nodes = vec![hashed_leaves[0].clone(); leaves_len - 1];
+        // Number of inner nodes in an `arity`-ary complete tree with `leaves_len`
+        // leaves is (leaves_len - 1) / (arity - 1). They precede the leaves in the
+        // flat node array and are overwritten by `build`, so their initial value
+        // is irrelevant.
+        let inner_count = (leaves_len - 1) / (B::ARITY - 1);
+        let mut nodes = vec![hashed_leaves[0].clone(); inner_count];
         nodes.extend(hashed_leaves);
 
         //Build the inner nodes of the tree
@@ -195,6 +198,21 @@ where
             #[cfg(feature = "disk-spill")]
             mmap_backing: None,
         })
+    }
+
+    /// First flat-array index of the leaf level (== number of inner nodes).
+    /// For a tree with `T` total nodes and arity `a`, leaves number
+    /// `L = T·(a−1)/a + 1/a`… equivalently the inner count is `(T − 1)/a` since
+    /// `T = I + L` and `I = (L−1)/(a−1)` gives `I = (T−1)/a`.
+    #[inline]
+    fn leaf_offset(&self) -> usize {
+        (self.node_count() - 1) / B::ARITY
+    }
+
+    /// Number of leaves in the tree.
+    #[inline]
+    fn num_leaves(&self) -> usize {
+        self.node_count() - self.leaf_offset()
     }
 
     /// Total number of nodes in the tree (inner + leaves).
@@ -241,7 +259,7 @@ where
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        let pos = pos + self.node_count() / 2;
+        let pos = pos + self.leaf_offset();
         let Ok(merkle_path) = self.build_merkle_path(pos) else {
             return None;
         };
@@ -254,21 +272,26 @@ where
         Some(Proof { merkle_path })
     }
 
-    /// Returns the Merkle path for the element/s for the leaf at position pos
+    /// Returns the Merkle path for the leaf at flat index `pos`.
+    ///
+    /// For arity `a` the path stores, at each level from the leaf up to (but not
+    /// including) the root, the `a - 1` sibling nodes of the current node in
+    /// ascending index order. The verifier reconstructs each parent by inserting
+    /// the running hash into its slot among those siblings.
     fn build_merkle_path(&self, pos: usize) -> Result<Vec<B::Node>, Error> {
-        // Pre-allocate based on tree depth (log2 of tree size)
-        let tree_depth = (self.node_count() + 1).ilog2() as usize;
-        let mut merkle_path = Vec::with_capacity(tree_depth);
+        let arity = B::ARITY;
+        let mut merkle_path = Vec::new();
         let mut pos = pos;
 
         while pos != ROOT {
-            let Some(node) = self.node_get(sibling_index(pos)) else {
-                // out of bounds, exit returning the current merkle_path
-                return Err(Error::OutOfBounds);
-            };
-            merkle_path.push(node.clone());
-
-            pos = parent_index(pos);
+            for sibling in sibling_indices(pos, arity) {
+                let Some(node) = self.node_get(sibling) else {
+                    // out of bounds, exit returning the current merkle_path
+                    return Err(Error::OutOfBounds);
+                };
+                merkle_path.push(node.clone());
+            }
+            pos = parent_index_arity(pos, arity);
         }
 
         Ok(merkle_path)
@@ -293,11 +316,14 @@ where
     /// - `Error::EmptyPositionList` if `pos_list` is empty
     /// - `Error::OutOfBounds` if any position in `pos_list` is >= number of leaves
     pub fn get_batch_proof(&self, pos_list: &[usize]) -> Result<BatchProof<B::Node>, Error> {
+        // Batch proofs are only implemented for binary trees. (They are unused by
+        // the STARK prover/verifier, which open leaves individually.)
+        assert_eq!(B::ARITY, 2, "get_batch_proof requires a binary tree");
         if pos_list.is_empty() {
             return Err(Error::EmptyPositionList);
         }
 
-        let num_leaves = (self.node_count() + 1).div_ceil(2);
+        let num_leaves = self.num_leaves();
 
         // Validate all positions are within bounds
         for &pos in pos_list {
@@ -310,7 +336,7 @@ where
         // of the leaves.
         let leaf_positions = pos_list
             .iter()
-            .map(|pos| pos + self.node_count() / 2)
+            .map(|pos| pos + self.leaf_offset())
             .collect::<Vec<usize>>();
         // We get the positions of the nodes for the batch proof.
         let batch_auth_path_positions = self.get_batch_auth_path_positions(&leaf_positions);
@@ -347,7 +373,7 @@ where
         let mut auth_path_set = BTreeSet::<usize>::new();
         let mut obtainable: BTreeSet<usize> = leaf_positions.iter().cloned().collect();
 
-        // Number of levels in tree
+        // Number of levels in tree (binary-only path; ARITY == 2 asserted by caller).
         let num_levels = (self.node_count() + 1).ilog2();
 
         // Iter lefevel-by-level from leaves to root.
@@ -356,7 +382,7 @@ where
 
             for &pos in &obtainable {
                 // Check sibling (None only for root, which shouldn't appear here)
-                if let Some(sibling_pos) = get_sibling_pos(pos) {
+                for sibling_pos in sibling_indices(pos, 2) {
                     // If sibling not obtainable, include it in the proof
                     let sibling_is_obtainable =
                         obtainable.contains(&sibling_pos) || auth_path_set.contains(&sibling_pos);
@@ -367,7 +393,7 @@ where
                 }
 
                 // Parent becomes obtainable (computable from both children)
-                next_obtainable.insert(get_parent_pos(pos));
+                next_obtainable.insert(get_parent_pos_arity(pos, 2));
             }
 
             obtainable = next_obtainable;

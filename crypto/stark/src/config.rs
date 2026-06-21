@@ -45,7 +45,43 @@ where
     F: IsField,
     FieldElement<F>: ByteConversion,
 {
-    crypto::merkle_tree::proof::verify_merkle_path_keccak256::<F>(
+    // ARITY must match `BatchedMerkleTreeBackend`'s tree arity (the trees this
+    // verifies against were committed with that backend). Asserted below so a
+    // future arity change to the backend trips this rather than silently
+    // mismatching the commitment.
+    const ARITY: usize = 4;
+    const _: () = assert!(
+        ARITY
+            == <BatchedMerkleTreeBackend<math::field::goldilocks::GoldilocksField> as crypto::merkle_tree::traits::IsMerkleTreeBackend>::ARITY
+    );
+    crypto::merkle_tree::proof::verify_merkle_path_keccak256::<F, ARITY>(
+        merkle_path,
+        root_hash,
+        index,
+        value,
+    )
+}
+
+/// Like [`verify_batched_merkle_path_slice`] but for the FRI-layer commitment,
+/// which uses the **binary** [`FriLayerMerkleTreeBackend`] (a `PairKeccak256`
+/// tree). The FRI trees stay binary; only the trace/composition trees are
+/// quaternary, so this opening must walk an arity-2 path.
+pub fn verify_fri_merkle_path_slice<F>(
+    merkle_path: &[Commitment],
+    root_hash: &Commitment,
+    index: usize,
+    value: &[FieldElement<F>],
+) -> bool
+where
+    F: IsField,
+    FieldElement<F>: ByteConversion,
+{
+    const ARITY: usize = 2;
+    const _: () = assert!(
+        ARITY
+            == <FriLayerMerkleTreeBackend<math::field::goldilocks::GoldilocksField> as crypto::merkle_tree::traits::IsMerkleTreeBackend>::ARITY
+    );
+    crypto::merkle_tree::proof::verify_merkle_path_keccak256::<F, ARITY>(
         merkle_path,
         root_hash,
         index,

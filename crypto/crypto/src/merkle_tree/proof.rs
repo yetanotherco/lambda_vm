@@ -5,7 +5,7 @@ use math::{errors::DeserializationError, traits::Deserializable};
 
 use super::{
     traits::IsMerkleTreeBackend,
-    utils::{get_parent_pos, get_sibling_pos},
+    utils::{get_parent_pos_arity, sibling_indices},
 };
 
 /// Stores a merkle path to some leaf.
@@ -36,16 +36,29 @@ pub fn verify_merkle_path<B>(
 where
     B: IsMerkleTreeBackend,
 {
+    let arity = B::ARITY;
     let mut hashed_value = B::hash_data(value);
 
-    for sibling_node in merkle_path.iter() {
-        if index.is_multiple_of(2) {
-            hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
-        } else {
-            hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
+    // The path stores `arity - 1` siblings per level, in ascending sibling-index
+    // order (as produced by `build_merkle_path`). At each level the running hash
+    // occupies slot `index % arity` among its `arity` siblings; rebuild that slot
+    // group and hash all `arity` children into the parent.
+    let mut group: Vec<B::Node> = Vec::with_capacity(arity);
+    for level_siblings in merkle_path.chunks(arity - 1) {
+        let slot = index % arity;
+        group.clear();
+        let mut sib = level_siblings.iter();
+        for s in 0..arity {
+            if s == slot {
+                group.push(hashed_value.clone());
+            } else {
+                // `level_siblings` are in ascending index order, i.e. the children
+                // other than `slot` taken left to right — exactly the fill order.
+                group.push(sib.next().expect("path has arity-1 siblings").clone());
+            }
         }
-
-        index >>= 1;
+        hashed_value = B::hash_children(&group);
+        index /= arity;
     }
 
     root_hash == &hashed_value
@@ -97,9 +110,16 @@ where
 /// parent hash skip `sha3`'s `block_buffer` and run the permutation as a single
 /// `keccak::f1600` (the `KeccakPermute` precompile on the guest).
 ///
+/// `ARITY` is the tree branching factor (matching the backend). Each internal
+/// node concatenates its `ARITY` children's 32-byte hashes (running hash inserted
+/// at its `index % ARITY` slot, the rest filled from `merkle_path` in order) and
+/// hashes them; for `ARITY <= 4` that concatenation is `<= 128` bytes, a single
+/// keccak block. The path stores `ARITY - 1` siblings per level in ascending slot
+/// order, matching `build_merkle_path`.
+///
 /// `value` is the leaf's field elements (serialized big-endian, matching the
 /// backend's `hash_data_slice`); `merkle_path` are the 32-byte sibling nodes.
-pub fn verify_merkle_path_keccak256<F>(
+pub fn verify_merkle_path_keccak256<F, const ARITY: usize>(
     merkle_path: &[[u8; 32]],
     root_hash: &[u8; 32],
     mut index: usize,
@@ -123,19 +143,26 @@ where
     }
     let mut hashed_value = keccak256(&leaf_bytes);
 
-    // Each internal node hashes the 64-byte concatenation of the two children —
-    // always a single rate block, so the fast single-block path is exact.
-    let mut pair = [0u8; 64];
-    for sibling_node in merkle_path.iter() {
-        if index.is_multiple_of(2) {
-            pair[..32].copy_from_slice(&hashed_value);
-            pair[32..].copy_from_slice(sibling_node);
-        } else {
-            pair[..32].copy_from_slice(sibling_node);
-            pair[32..].copy_from_slice(&hashed_value);
+    // Each internal node hashes the concatenation of its `ARITY` children's
+    // 32-byte hashes (`ARITY * 32 <= 128` bytes for ARITY <= 4 — a single keccak
+    // block). The running hash sits at slot `index % ARITY`; the other slots are
+    // filled left-to-right from this level's `ARITY - 1` path siblings.
+    let mut concat = [0u8; 4 * 32];
+    debug_assert!(ARITY <= 4, "single-block node hashing supports ARITY <= 4");
+    let node_bytes = ARITY * 32;
+    for level_siblings in merkle_path.chunks(ARITY - 1) {
+        let slot = index % ARITY;
+        let mut sib = level_siblings.iter();
+        for s in 0..ARITY {
+            let src = if s == slot {
+                &hashed_value
+            } else {
+                sib.next().expect("path has ARITY-1 siblings per level")
+            };
+            concat[s * 32..(s + 1) * 32].copy_from_slice(src);
         }
-        hashed_value = keccak256_single_block(&pair);
-        index >>= 1;
+        hashed_value = keccak256_single_block(&concat[..node_bytes]);
+        index /= ARITY;
     }
 
     root_hash == &hashed_value
@@ -254,7 +281,8 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
             // Process each known node from right to left to match the order of the proof.
             // Since in `current_level_known_nodes` the nodes are ordered from left to right we take `.rev()`.
             for (pos, value) in current_level_known_nodes.iter().rev() {
-                let parent_pos = get_parent_pos(*pos);
+                // Batch verification is binary-only (mirrors `get_batch_proof`).
+                let parent_pos = get_parent_pos_arity(*pos, 2);
 
                 // Skip if parent was already computed (i.e. sibling was processed first).
                 if next_level_known_nodes.contains_key(&parent_pos) {
@@ -262,7 +290,7 @@ impl<T: PartialEq + Eq + Clone> BatchProof<T> {
                 }
 
                 // Get sibling position (None only for root, which shouldn't appear here)
-                let Some(sibling_pos) = get_sibling_pos(*pos) else {
+                let Some(sibling_pos) = sibling_indices(*pos, 2).into_iter().next() else {
                     continue;
                 };
 
