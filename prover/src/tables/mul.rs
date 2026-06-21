@@ -37,6 +37,7 @@ use std::collections::HashMap;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -387,7 +388,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::LHS_SIGNED),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::LHS_3,
                 packing: Packing::Direct,
@@ -403,7 +404,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::RHS_SIGNED),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::RHS_3,
                 packing: Packing::Direct,

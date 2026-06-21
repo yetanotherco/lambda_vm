@@ -25,6 +25,7 @@ use std::collections::HashMap;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
+use smallvec::smallvec;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
@@ -278,7 +279,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
-            vec![
+            smallvec![
                 // is_register = 1 (registers, not memory)
                 BusValue::constant(1),
                 // address_lo = offset
@@ -301,7 +302,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memory,
             Multiplicity::One,
-            vec![
+            smallvec![
                 // is_register = 1
                 BusValue::constant(1),
                 // address_lo = offset

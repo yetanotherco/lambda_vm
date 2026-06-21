@@ -30,6 +30,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -252,7 +253,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Msb16,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::LHS_2,
                     packing: Packing::Direct,
@@ -267,7 +268,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Msb16,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::RHS_2,
                     packing: Packing::Direct,
@@ -282,7 +283,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_0,
                 packing: Packing::Direct,
             }],
@@ -291,7 +292,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_1,
                 packing: Packing::Direct,
             }],
@@ -300,7 +301,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_2,
                 packing: Packing::Direct,
             }],
@@ -309,7 +310,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::LHS_SUB_RHS_3,
                 packing: Packing::Direct,
             }],
@@ -318,7 +319,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::LHS_1,
                 packing: Packing::Direct,
             }],
@@ -327,7 +328,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::RHS_1,
                 packing: Packing::Direct,
             }],

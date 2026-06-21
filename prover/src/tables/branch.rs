@@ -30,6 +30,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -244,7 +245,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::NEXT_PC_LOW_1,
                     packing: Packing::Direct,
@@ -274,7 +275,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::NEXT_PC_HIGH_0,
                 packing: Packing::Direct,
             }],
@@ -283,7 +284,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::NEXT_PC_HIGH_1,
                 packing: Packing::Direct,
             }],
@@ -292,7 +293,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::NEXT_PC_HIGH_2,
                 packing: Packing::Direct,
             }],
@@ -302,7 +303,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Branch,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 // next_pc as DWordWL (2 words)
                 // next_pc[0] = 2^16 * next_pc_high[0] + 2^8 * next_pc_low[1] + next_pc_low[0]
                 // next_pc[1] = 2^16 * next_pc_high[2] + next_pc_high[1]

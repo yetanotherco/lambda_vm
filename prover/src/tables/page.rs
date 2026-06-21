@@ -39,6 +39,7 @@ use std::sync::OnceLock;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
+use smallvec::smallvec;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
@@ -401,7 +402,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::AreBytes,
             Multiplicity::One,
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::INIT,
                     packing: Packing::Direct,
@@ -416,7 +417,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::One,
-            vec![
+            smallvec![
                 // is_register = 0
                 BusValue::constant(0),
                 // address_lo = page_base_lo + offset
@@ -438,7 +439,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memory,
             Multiplicity::One,
-            vec![
+            smallvec![
                 // is_register = 0
                 BusValue::constant(0),
                 // address_lo = page_base_lo + offset

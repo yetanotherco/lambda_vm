@@ -38,6 +38,7 @@ use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
+use smallvec::smallvec;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
@@ -208,7 +209,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Decode,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 // pc as DWordWL (2 bus elements)
                 BusValue::Packed {
                     start_column: cols::PC_0,

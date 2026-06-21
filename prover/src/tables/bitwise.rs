@@ -32,6 +32,7 @@ use std::sync::OnceLock;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
+use smallvec::smallvec;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
@@ -615,7 +616,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Msb8,
             Multiplicity::Column(cols::MU_MSB8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::X,
                     packing: Packing::Direct,
@@ -632,7 +633,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Msb16,
             Multiplicity::Column(cols::MU_MSB16),
-            vec![
+            smallvec![
                 // X + 256*Y as linear combination
                 BusValue::linear(vec![
                     stark::lookup::LinearTerm::Column {
@@ -654,7 +655,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Zero,
             Multiplicity::Column(cols::MU_ZERO),
-            vec![
+            smallvec![
                 BusValue::linear(vec![
                     stark::lookup::LinearTerm::Column {
                         coefficient: 1,
@@ -695,7 +696,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU_IS_HALF),
-            vec![BusValue::linear(vec![
+            smallvec![BusValue::linear(vec![
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
                     column: cols::X,
@@ -710,7 +711,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::IsB20,
             Multiplicity::Column(cols::MU_IS_B20),
-            vec![BusValue::linear(vec![
+            smallvec![BusValue::linear(vec![
                 stark::lookup::LinearTerm::Column {
                     coefficient: 1,
                     column: cols::X,
@@ -729,7 +730,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Hwsl,
             Multiplicity::Column(cols::MU_HWSL),
-            vec![
+            smallvec![
                 BusValue::linear(vec![
                     stark::lookup::LinearTerm::Column {
                         coefficient: 1,

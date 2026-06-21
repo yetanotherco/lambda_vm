@@ -21,6 +21,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -427,7 +428,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
-        vec![
+        smallvec![
             // in[3] as halfword: x + 256*y (in[3] is stored as single Half column)
             BusValue::Packed {
                 start_column: cols::IN_3,
@@ -494,7 +495,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::MU),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::BIT_SHIFT,
                 packing: Packing::Direct,

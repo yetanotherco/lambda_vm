@@ -22,6 +22,7 @@ use alloc::vec::Vec;
 use executor::constants::KECCAK_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -186,7 +187,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::Column(cols::MU),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::Direct,
@@ -348,7 +349,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             interactions.push(BusInteraction::sender(
                 BusId::IsHalfword,
                 Multiplicity::Column(cols::MU),
-                vec![BusValue::Packed {
+                smallvec![BusValue::Packed {
                     start_column: cols::state_ptr(lane_idx, hw),
                     packing: Packing::Direct,
                 }],

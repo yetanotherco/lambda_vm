@@ -34,6 +34,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -266,7 +267,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
@@ -298,7 +299,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
@@ -355,7 +356,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
@@ -381,7 +382,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
                 packing: Packing::Direct,
@@ -432,7 +433,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
@@ -458,7 +459,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
@@ -510,7 +511,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
@@ -536,7 +537,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::receiver(
             BusId::Memory,
             Multiplicity::Column(cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::IS_REGISTER,
                     packing: Packing::Direct,
@@ -565,7 +566,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
         Multiplicity::Column(cols::MU_READ),
-        vec![
+        smallvec![
             // old[8]
             BusValue::Packed {
                 start_column: cols::OLD[0],
@@ -677,7 +678,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Memw,
         Multiplicity::Column(cols::MU_WRITE),
-        vec![
+        smallvec![
             // is_register
             BusValue::Packed {
                 start_column: cols::IS_REGISTER,
@@ -761,7 +762,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Alu,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::old_timestamp(0)[0],
                 packing: Packing::DWordWL,
@@ -780,7 +781,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Alu,
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::old_timestamp(1)[0],
                 packing: Packing::DWordWL,
@@ -800,7 +801,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::Alu,
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::old_timestamp(i)[0],
                     packing: Packing::DWordWL,
@@ -821,7 +822,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::Alu,
             Multiplicity::Column(cols::WRITE8),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::old_timestamp(i)[0],
                     packing: Packing::DWordWL,

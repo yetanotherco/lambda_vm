@@ -48,6 +48,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -258,7 +259,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::receiver(
             BusId::Ecall,
             Multiplicity::Column(cols::FIRST),
-            vec![
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::TIMESTAMP_0,
                     packing: Packing::Direct,
@@ -346,7 +347,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::COUNT_DECR_0,
                 packing: Packing::Direct,
             }],
@@ -354,7 +355,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::COUNT_DECR_1,
                 packing: Packing::Direct,
             }],
@@ -362,7 +363,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::COUNT_DECR_2,
                 packing: Packing::Direct,
             }],
@@ -370,7 +371,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::COUNT_DECR_3,
                 packing: Packing::Direct,
             }],
@@ -379,7 +380,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::ADDRESS_INCR_0,
                 packing: Packing::Direct,
             }],
@@ -387,7 +388,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::ADDRESS_INCR_1,
                 packing: Packing::Direct,
             }],
@@ -395,7 +396,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::ADDRESS_INCR_2,
                 packing: Packing::Direct,
             }],
@@ -403,7 +404,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Column(cols::MU),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: cols::ADDRESS_INCR_3,
                 packing: Packing::Direct,
             }],
@@ -414,7 +415,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Zero,
             Multiplicity::Column(cols::MU),
-            vec![
+            smallvec![
                 BusValue::linear(vec![
                     LinearTerm::Constant(4 * 65535),
                     LinearTerm::Column {
@@ -446,7 +447,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
-            vec![
+            smallvec![
                 // old[0..7] = [1, 0, 0, 0, 0, 0, 0, 0]
                 BusValue::constant(1),
                 BusValue::constant(0),
@@ -495,7 +496,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
-            vec![
+            smallvec![
                 // old[0..7] = [ADDRESS_0, ADDRESS_1, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
                     start_column: cols::ADDRESS_0,
@@ -550,7 +551,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
-            vec![
+            smallvec![
                 // old[0..7] = [COUNT_0, COUNT_1, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
                     start_column: cols::COUNT_0,
@@ -606,7 +607,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusInteraction::sender(
             BusId::Memw,
             Multiplicity::Column(cols::FIRST),
-            vec![
+            smallvec![
                 // old[0..7] = [INDEX, 0, 0, 0, 0, 0, 0, 0]
                 BusValue::Packed {
                     start_column: cols::INDEX,

@@ -169,7 +169,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::One,
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::Direct,

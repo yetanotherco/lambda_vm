@@ -36,6 +36,7 @@ use executor::vm::{
     logs::Log,
     memory::U64HashMap,
 };
+use smallvec::smallvec;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -694,7 +695,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Cpu32,
         Multiplicity::Column(cols::WORD_INSTR),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
@@ -963,7 +964,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Ecall,
         Multiplicity::Column(cols::ECALL),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,

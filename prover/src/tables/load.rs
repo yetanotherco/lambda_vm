@@ -28,6 +28,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -248,7 +249,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
-        vec![
+        smallvec![
             // old[0..7] = 8 individual bytes (Direct elements)
             // For reads, old == value (same data read back)
             BusValue::Packed {
@@ -399,7 +400,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb8,
         Multiplicity::Column(cols::READ2),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::RES[1],
                 packing: Packing::Direct,
@@ -415,7 +416,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb8,
         Multiplicity::Column(cols::READ4),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::RES[3],
                 packing: Packing::Direct,

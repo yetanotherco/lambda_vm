@@ -36,6 +36,7 @@ use std::collections::HashMap;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use smallvec::smallvec;
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -424,7 +425,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
             }],
@@ -443,7 +444,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
             }],
@@ -457,7 +458,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
+            smallvec![BusValue::Packed {
                 start_column: col,
                 packing: Packing::Direct,
             }],
@@ -472,7 +473,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::N_3,
                 packing: Packing::Direct,
@@ -490,7 +491,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::R_3,
                 packing: Packing::Direct,
@@ -508,7 +509,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Msb16,
         Multiplicity::Column(cols::SIGNED),
-        vec![
+        smallvec![
             BusValue::Packed {
                 start_column: cols::D_3,
                 packing: Packing::Direct,
@@ -530,7 +531,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Alu,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
+        smallvec![
             // abs_r as DWordWL (2 words → 2 elements)
             BusValue::Packed {
                 start_column: cols::ABS_R_0,
@@ -653,7 +654,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::SIGN_R),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -687,7 +688,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::SIGN_R),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -748,7 +749,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::SIGN_D),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -782,7 +783,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Column(cols::SIGN_D),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -841,7 +842,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -895,7 +896,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::sender(
         BusId::Zero,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
+        smallvec![
             BusValue::linear(vec![
                 LinearTerm::Column {
                     coefficient: 1,
@@ -928,7 +929,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
         Multiplicity::Column(cols::MU_Q),
-        vec![
+        smallvec![
             // n as DWordHL (4 halfwords → 2 words)
             BusValue::Packed {
                 start_column: cols::N_0,
@@ -962,7 +963,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions.push(BusInteraction::receiver(
         BusId::Alu,
         Multiplicity::Column(cols::MU_R),
-        vec![
+        smallvec![
             // n as DWordHL
             BusValue::Packed {
                 start_column: cols::N_0,
