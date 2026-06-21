@@ -1300,6 +1300,15 @@ impl Multiplicity {
 ///
 /// BusInteraction::sender(BusId::Add, Multiplicity::Column(0), Packing::Direct.columns(&[1, 2, 3]))
 /// ```
+/// Inline-capable container for a [`BusInteraction`]'s bus values. Most
+/// interactions carry only a handful of values (1–4), so a `SmallVec` keeps them
+/// inline and avoids a heap allocation per interaction — the dominant cost of
+/// building the per-table AIRs (e.g. `keccak_rnd` alone constructs ~1,380
+/// interactions). The few wide interactions (e.g. the 200-byte keccak state)
+/// spill to the heap as before. The inline capacity (4) is chosen to cover the
+/// common small interactions while keeping the struct compact.
+pub type BusValues = smallvec::SmallVec<[BusValue; 4]>;
+
 #[derive(Clone)]
 pub struct BusInteraction {
     /// Bus identifier. Senders and receivers on the same bus must use the same ID.
@@ -1310,7 +1319,7 @@ pub struct BusInteraction {
     pub multiplicity: Multiplicity,
     /// Bus values that make up this interaction.
     /// Each BusValue produces one or more bus elements for the fingerprint.
-    pub values: Vec<BusValue>,
+    pub values: BusValues,
     /// Whether this side of the interaction is a sender (true) or receiver (false).
     /// Senders contribute positive values to the bus sum, receivers contribute negative.
     /// For bus balance: Σ sender_values - Σ receiver_values = 0
@@ -1323,18 +1332,20 @@ impl BusInteraction {
     /// # Arguments
     /// * `bus_id` - Unique identifier for the bus. Can be a raw `u64` or an enum with `Into<u64>`
     /// * `multiplicity` - How to compute the multiplicity for this interaction
-    /// * `values` - Typed values that make up this interaction
+    /// * `values` - Typed values that make up this interaction. Accepts either a
+    ///   `smallvec![...]` (inline, no allocation for small lists) or a `vec![...]`
+    ///   via `Into` (the latter keeps its existing heap allocation).
     /// * `is_sender` - true for sender, false for receiver
     pub fn new(
         bus_id: impl Into<u64>,
         multiplicity: Multiplicity,
-        values: Vec<BusValue>,
+        values: impl Into<BusValues>,
         is_sender: bool,
     ) -> Self {
         Self {
             bus_id: bus_id.into(),
             multiplicity,
-            values,
+            values: values.into(),
             is_sender,
         }
     }
@@ -1348,7 +1359,7 @@ impl BusInteraction {
     pub fn sender(
         bus_id: impl Into<u64>,
         multiplicity: Multiplicity,
-        values: Vec<BusValue>,
+        values: impl Into<BusValues>,
     ) -> Self {
         Self::new(bus_id, multiplicity, values, true)
     }
@@ -1362,7 +1373,7 @@ impl BusInteraction {
     pub fn receiver(
         bus_id: impl Into<u64>,
         multiplicity: Multiplicity,
-        values: Vec<BusValue>,
+        values: impl Into<BusValues>,
     ) -> Self {
         Self::new(bus_id, multiplicity, values, false)
     }

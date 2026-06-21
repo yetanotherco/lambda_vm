@@ -23,6 +23,7 @@ disk-spill = ["stark/disk-spill", "std", "dep:sysinfo", "dep:log"]
 [dependencies]
 stark = { path = "../crypto/stark", default-features = false }
 crypto = { path = "../crypto/crypto", default-features = false, features = ["serde"] }
+smallvec = { version = "1.13", default-features = false, features = ["union", "const_generics"] }
 math = { path = "../crypto/math", default-features = false, features = ["alloc", "lambdaworks-serde-binary"] }
 executor = { path = "../executor", default-features = false }
 ecsm = { path = "../crypto/ecsm" }

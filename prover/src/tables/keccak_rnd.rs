@@ -32,6 +32,7 @@ use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
 use executor::constants::{KECCAK_RC, KECCAK_RHO};
+use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -608,7 +609,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             interactions.push(BusInteraction::sender(
                 BusId::Hwsl,
                 Multiplicity::Column(cols::MU),
-                vec![
+                smallvec![
                     // Input halfword: Cxz[x][3][hw*2] + 256 * Cxz[x][3][hw*2+1]
                     BusValue::linear(vec![
                         LinearTerm::Column {
@@ -740,7 +741,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 interactions.push(BusInteraction::sender(
                     BusId::Hwsl,
                     Multiplicity::Column(cols::MU),
-                    vec![
+                    smallvec![
                         BusValue::linear(vec![
                             LinearTerm::Column {
                                 coefficient: 1,

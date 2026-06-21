@@ -19,6 +19,7 @@ sha3 = { version = "0.10.8", default-features = false }
 serde = { version = "1.0", default-features = false, features = ["derive", "alloc"] }
 itertools = { version = "0.11.0", default-features = false, features = ["use_alloc"] }
 hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
+smallvec = { version = "1.13", default-features = false, features = ["union", "const_generics"] }
 libm = "0.2"
 rkyv = { version = "0.8.10", default-features = false, features = [
     "alloc",
