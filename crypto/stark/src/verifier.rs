@@ -59,8 +59,17 @@ where
     pub boundary_coeffs: Vec<FieldElement<FieldExtension>>,
     /// The composition polynomial coefficients corresponding to the transition constraints terms.
     pub transition_coeffs: Vec<FieldElement<FieldExtension>>,
-    /// The deep composition polynomial coefficients corresponding to the trace polynomial terms.
-    pub trace_term_coeffs: Vec<Vec<FieldElement<FieldExtension>>>,
+    /// The deep composition polynomial coefficients corresponding to the trace
+    /// polynomial terms, stored **flat** in column-major order: the coefficient
+    /// for trace column `col` and OOD row `row` is at index
+    /// `col * trace_term_chunk_len + row`. Flattening the former
+    /// `Vec<Vec<FieldElement>>` (one inner `Vec` per column) into a single buffer
+    /// removes the per-column heap allocations that dominated the verifier's
+    /// per-table allocation cost, and gives the deep-composition reconstruction
+    /// a contiguous slice to index.
+    pub trace_term_coeffs: Vec<FieldElement<FieldExtension>>,
+    /// Stride (number of OOD rows) of each column's run in `trace_term_coeffs`.
+    pub trace_term_chunk_len: usize,
     /// The deep composition polynomial coefficients corresponding to the composition polynomial parts terms.
     pub gammas: Vec<FieldElement<FieldExtension>>,
     /// The list of FRI commit phase folding challenges.
@@ -1146,21 +1155,16 @@ pub trait IsStarkVerifier<
                 .take(num_terms_composition_poly + num_terms_trace)
                 .collect();
 
-        // Split the contiguous coefficient buffer in place: the trace terms are
-        // the first `num_terms_trace`, the composition-poly gammas are the rest.
-        // Chunk the trace prefix directly off the borrowed slice (no intermediate
-        // `Vec` from a `drain().collect()`), then keep the suffix as `gammas`.
+        // Split the contiguous coefficient buffer: the trace terms are the first
+        // `num_terms_trace` (kept flat, column-major with stride `chunk_len`), the
+        // composition-poly gammas are the rest. `split_off(num_terms_trace)` hands
+        // the suffix to `gammas` and leaves the (already contiguous) trace prefix
+        // as `trace_term_coeffs` — no per-column `Vec` allocation, no copy.
         let chunk_len = air.context().transition_offsets.len() * air.step_size();
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients[..num_terms_trace]
-            .chunks(chunk_len)
-            .map(|chunk| chunk.to_vec())
-            .collect();
-
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
-        // Drop the trace-term prefix in place, leaving only the composition-poly
-        // gammas as the (reused) backing storage.
-        deep_composition_coefficients.drain(..num_terms_trace);
-        let gammas = deep_composition_coefficients;
+        let gammas = deep_composition_coefficients.split_off(num_terms_trace);
+        let trace_term_coeffs = deep_composition_coefficients;
+        let trace_term_chunk_len = chunk_len;
 
         // FRI commit phase
         let merkle_roots = proof.fri_layers_merkle_roots();
@@ -1201,6 +1205,7 @@ pub trait IsStarkVerifier<
             boundary_coeffs,
             transition_coeffs,
             trace_term_coeffs,
+            trace_term_chunk_len,
             gammas,
             zetas,
             iotas,
