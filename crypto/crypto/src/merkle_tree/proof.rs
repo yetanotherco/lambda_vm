@@ -90,6 +90,57 @@ where
     root_hash == &hashed_value
 }
 
+/// Keccak256-specialized form of [`verify_merkle_path_fe_slice`] that hashes via
+/// the single-block [`keccak256_single_block`](crate::hash::keccak256::keccak256_single_block)
+/// sponge instead of the generic `sha3` streaming wrapper. Produces the identical
+/// Keccak256 root — a transparent implementation swap — but the leaf and each
+/// parent hash skip `sha3`'s `block_buffer` and run the permutation as a single
+/// `keccak::f1600` (the `KeccakPermute` precompile on the guest).
+///
+/// `value` is the leaf's field elements (serialized big-endian, matching the
+/// backend's `hash_data_slice`); `merkle_path` are the 32-byte sibling nodes.
+pub fn verify_merkle_path_keccak256<F>(
+    merkle_path: &[[u8; 32]],
+    root_hash: &[u8; 32],
+    mut index: usize,
+    value: &[math::field::element::FieldElement<F>],
+) -> bool
+where
+    F: math::field::traits::IsField,
+    math::field::element::FieldElement<F>: math::traits::ByteConversion,
+{
+    use crate::hash::keccak256::{keccak256, keccak256_single_block};
+    use alloc::vec::Vec;
+    use math::traits::ByteConversion;
+
+    // Leaf: serialize the field elements big-endian (matching
+    // `FieldElementVectorBackend::hash_data_slice`) and hash. The leaf can be wide
+    // (e.g. a 1480-column trace row), so use the multi-block sponge here. This is
+    // hashed once per path; the per-level parent hashing below dominates.
+    let mut leaf_bytes: Vec<u8> = Vec::new();
+    for element in value.iter() {
+        leaf_bytes.extend_from_slice(element.to_bytes_be().as_ref());
+    }
+    let mut hashed_value = keccak256(&leaf_bytes);
+
+    // Each internal node hashes the 64-byte concatenation of the two children —
+    // always a single rate block, so the fast single-block path is exact.
+    let mut pair = [0u8; 64];
+    for sibling_node in merkle_path.iter() {
+        if index.is_multiple_of(2) {
+            pair[..32].copy_from_slice(&hashed_value);
+            pair[32..].copy_from_slice(sibling_node);
+        } else {
+            pair[..32].copy_from_slice(sibling_node);
+            pair[32..].copy_from_slice(&hashed_value);
+        }
+        hashed_value = keccak256_single_block(&pair);
+        index >>= 1;
+    }
+
+    root_hash == &hashed_value
+}
+
 impl<T: PartialEq + Eq> Proof<T> {
     /// Verifies a Merkle inclusion proof for the value contained at leaf index.
     pub fn verify<B>(&self, root_hash: &B::Node, index: usize, value: &B::Data) -> bool

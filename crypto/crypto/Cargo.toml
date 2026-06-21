@@ -11,6 +11,12 @@ license.workspace = true
 math = { path = "../math", default-features = false, features = ["alloc"] }
 digest = "0.10.7"
 sha3 = { version = "0.10.8", default-features = false }
+# Direct Keccak-f[1600] permutation. On the guest this resolves (via the
+# recursion crate's `[patch.crates-io] keccak`) to the KeccakPermute precompile;
+# on the host it is the upstream software permutation. Lets the Merkle backend
+# run a specialized single-block Keccak256 sponge that reuses the precompile and
+# skips the generic `sha3` block-buffer wrapper.
+keccak = "0.1.5"
 # Optional
 serde = { version = "1.0", default-features = false, features = [
     "derive",
