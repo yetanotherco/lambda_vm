@@ -9,8 +9,9 @@ edition = "2024"
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [
     "rkyv",
 ] }
-embedded-alloc = "0.6"
-riscv = { version = "0.15", features = ["critical-section-single-hart"] }
+# The guest uses a trivial in-tree bump allocator (see `src/main.rs`); no heap
+# crate is needed. It never frees, so there is no critical-section consumer
+# either — `embedded-alloc` + `riscv` (its critical-section provider) are gone.
 
 # Route Keccak-f[1600] through the lambda-vm precompile syscall on the
 # riscv64 guest. On host this patch is irrelevant — the host build comes
