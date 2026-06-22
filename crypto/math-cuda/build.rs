@@ -142,4 +142,5 @@ fn main() {
     compile_ptx("dvrm_trace.cu", "dvrm_trace.ptx", have_nvcc);
     compile_ptx("memw_trace.cu", "memw_trace.ptx", have_nvcc);
     compile_ptx("keccak_trace.cu", "keccak_trace.ptx", have_nvcc);
+    compile_ptx("ecsm_trace.cu", "ecsm_trace.ptx", have_nvcc);
 }

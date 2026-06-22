@@ -161,6 +161,15 @@ pub fn generate_ecsm_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
+
+    // GPU fast path: pre-format the witness data (incl. signed→field
+    // conversion of c0/c1 and the padding-row q1 = P_BYTES contract) and
+    // let the kernel do the 427-column splay.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_ecsm_trace_gpu(ops, n, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in ops.iter().enumerate() {
@@ -203,6 +212,104 @@ pub fn generate_ecsm_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_ecsm_trace`. Packs the witness data into
+/// three flat blobs (bytes / halfwords / carries) and runs the column
+/// splay kernel. Signed `c0`/`c1` entries get pre-converted to the
+/// Goldilocks field representation matching `FE::zero() - FE::from(|c|)`.
+#[cfg(feature = "cuda")]
+fn try_generate_ecsm_trace_gpu(
+    ops: &[EcsmOperation],
+    n: usize,
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    // Goldilocks prime, used for the i64 → field rep mapping on c0/c1.
+    const GOLDILOCKS_P: u64 = 18446744069414584321;
+
+    let mut timestamps = vec![0u64; num_rows];
+    let mut addr_xgs = vec![0u64; num_rows];
+    let mut addr_ks = vec![0u64; num_rows];
+    let mut addr_xrs = vec![0u64; num_rows];
+    let mut flags_len_k = vec![0u64; num_rows];
+    let mut byte_blob = vec![0u64; num_rows * 257];
+    let mut hw_blob = vec![0u64; num_rows * 32];
+    let mut c_blob = vec![0u64; num_rows * 128];
+
+    let c_to_field = |c: i64| -> u64 {
+        if c >= 0 {
+            c as u64
+        } else {
+            GOLDILOCKS_P - ((-c) as u64)
+        }
+    };
+
+    for (i, op) in ops.iter().enumerate() {
+        let w = &op.witness;
+        timestamps[i] = op.timestamp;
+        addr_xgs[i] = op.addr_xg;
+        addr_ks[i] = op.addr_k;
+        addr_xrs[i] = op.addr_xr;
+        flags_len_k[i] = (w.len_k as u64) | (1u64 << 8); // active
+
+        let off = i * 257;
+        // 8 contiguous 32-byte slots (x_r, y_r, k, x_g, y_g, x2, q0) +
+        // the 33-byte q1.
+        let copy_bytes = |dst: &mut [u64], src: &[u8]| {
+            for (j, &b) in src.iter().enumerate() {
+                dst[j] = b as u64;
+            }
+        };
+        copy_bytes(&mut byte_blob[off..off + 32], &w.x_r);
+        copy_bytes(&mut byte_blob[off + 32..off + 64], &w.y_r);
+        copy_bytes(&mut byte_blob[off + 64..off + 96], &w.k);
+        copy_bytes(&mut byte_blob[off + 96..off + 128], &w.x_g);
+        copy_bytes(&mut byte_blob[off + 128..off + 160], &w.y_g);
+        copy_bytes(&mut byte_blob[off + 160..off + 192], &w.x2);
+        copy_bytes(&mut byte_blob[off + 192..off + 224], &w.q0);
+        copy_bytes(&mut byte_blob[off + 224..off + 257], &w.q1);
+
+        // k_sub_n / x_r_sub_p: 32 bytes -> 16 halfwords each.
+        let hw_off = i * 32;
+        for j in 0..16 {
+            let hw = w.k_sub_n[2 * j] as u64 + ((w.k_sub_n[2 * j + 1] as u64) << 8);
+            hw_blob[hw_off + j] = hw;
+        }
+        for j in 0..16 {
+            let hw = w.x_r_sub_p[2 * j] as u64 + ((w.x_r_sub_p[2 * j + 1] as u64) << 8);
+            hw_blob[hw_off + 16 + j] = hw;
+        }
+
+        let c_off = i * 128;
+        for j in 0..64 {
+            c_blob[c_off + j] = c_to_field(w.c0[j]);
+            c_blob[c_off + 64 + j] = c_to_field(w.c1[j]);
+        }
+    }
+
+    // Padding rows: mu = 0, all bytes zero except q1 = P_BYTES (offset 224..256;
+    // byte 32 of q1 stays 0). Other blobs already zero.
+    for row_idx in n..num_rows {
+        let off = row_idx * 257;
+        for (j, &b) in P_BYTES.iter().enumerate() {
+            byte_blob[off + 224 + j] = b as u64;
+        }
+    }
+
+    let raw = stark::gpu_lde::try_generate_ecsm_trace_gpu_raw(
+        num_rows,
+        &timestamps,
+        &addr_xgs,
+        &addr_ks,
+        &addr_xrs,
+        &flags_len_k,
+        &byte_blob,
+        &hw_blob,
+        &c_blob,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

@@ -91,6 +91,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DVRM_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_MEMW_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_KECCAK_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_ECSM_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -333,6 +334,46 @@ pub fn gpu_memw_trace_calls() -> u64 {
 pub(crate) static GPU_KECCAK_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_keccak_trace_calls() -> u64 {
     GPU_KECCAK_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// ECSM-table GPU dispatch counter.
+pub(crate) static GPU_ECSM_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_ecsm_trace_calls() -> u64 {
+    GPU_ECSM_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU ECSM trace generator. Caller has
+/// already formatted the witness data into three flat blobs (byte/halfword/
+/// carry), respecting the padding-row contract (q1 = P_BYTES, all other
+/// bytes zero for inactive rows).
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_ecsm_trace_gpu_raw(
+    num_rows: usize,
+    timestamps: &[u64],
+    addr_xgs: &[u64],
+    addr_ks: &[u64],
+    addr_xrs: &[u64],
+    flags_len_k: &[u64],
+    byte_blob: &[u64],
+    hw_blob: &[u64],
+    c_blob: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::ecsm_trace::generate_ecsm_trace_dev(
+        num_rows,
+        timestamps,
+        addr_xgs,
+        addr_ks,
+        addr_xrs,
+        flags_len_k,
+        byte_blob,
+        hw_blob,
+        c_blob,
+        num_cols,
+    )
+    .ok()?;
+    GPU_ECSM_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 /// Prover-crate wrapper for the GPU KECCAK trace generator. Caller packs
@@ -1685,6 +1726,13 @@ pub fn schedule_memw_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_keccak_trace_fault(n_calls_until_err: i64) {
     math_cuda::keccak_trace::FAULT_KECCAK_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_ecsm_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_ecsm_trace_fault(n_calls_until_err: i64) {
+    math_cuda::ecsm_trace::FAULT_ECSM_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

@@ -18,6 +18,7 @@ pub mod cpu32_trace;
 pub mod cpu_trace;
 pub mod decode_trace;
 pub mod dvrm_trace;
+pub mod ecsm_trace;
 pub mod keccak_trace;
 pub mod load_trace;
 pub mod lt_trace;
