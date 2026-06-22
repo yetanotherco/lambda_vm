@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/bytewise.toml", config)
-
-#show: book-page(chip.name)
 #let bytewise = raw(chip.name)
 
 The #bytewise chip is an ALU chip that decomposes the input `DWordWL` values into bytes and

@@ -1,4 +1,3 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -12,9 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/mul.toml", config)
-
-#show: book-page(chip.name)
-
 #let mul = raw(chip.name)
 
 The #mul chip constrains multiplication, both signed and unsigned,

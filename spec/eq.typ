@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/eq.toml", config)
-
-#show: book-page(chip.name)
 #let eq = raw(chip.name)
 
 The #eq chip is an ALU chip that compares two values and outputs a bit indicating whether they are equal or not.

@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -13,7 +12,6 @@
 #let config = load_config()
 #let chip = load_chip("src/cpu.toml", config)
 
-#show: book-page(chip.name)
 #let cpu = raw(chip.name)
 
 The #cpu chip coordinates memory accesses and dispatches to other chips for arithmetic and logical operations.

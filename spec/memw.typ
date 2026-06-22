@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,9 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/memw.toml", config)
-
-#show: book-page(chip.name)
-
 #let memw = raw(chip.name)
 
 The #memw chip is used to read and write memory locations (both RAM and registers)

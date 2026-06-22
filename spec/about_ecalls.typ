@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, aside
+#import "/meta.typ": aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -10,8 +10,6 @@
 )
 
 #let config = load_config()
-
-#show: book-page("about_ecalls.typ")
 
 ECALLs provide system-level functionalities to the guest program.
 

@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/load.toml", config)
-
-#show: book-page(chip.name)
 #let load = raw(chip.name)
 
 The #load chip provides functionality to read values from memory and sign-extend them where appropriate.

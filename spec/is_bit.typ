@@ -1,11 +1,8 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_variable_table, render_constraint_table, set_nr_interactions, total_nr_variables
 
 #let config = load_config()
 #let chip = load_chip("src/is_bit.toml", config)
-
-#show: book-page(chip.name)
 
 #set_nr_interactions(chip)
 #let nr_variables = total_nr_variables(chip)

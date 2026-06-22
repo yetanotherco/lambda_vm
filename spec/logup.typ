@@ -1,6 +1,5 @@
-#import "/book.typ": book-page, aside, cdsg
+#import "/meta.typ": aside, cdsg
 
-#show: book-page("logup")
 #show link: underline
 
 #show "constraint choice": link(<constraint_choices>)[constraint choice]

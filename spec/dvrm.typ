@@ -1,4 +1,3 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -12,9 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/dvrm.toml", config)
-
-#show: book-page(chip.name)
-
 #let dvrm = raw(chip.name)
 
 The #dvrm chip provides division and remainder functionality, both signed and unsigned.

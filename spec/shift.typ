@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, et
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -12,10 +11,7 @@
 
 #let config = load_config()
 #let chip = load_chip("src/shift.toml", config)
-
 #let shift = raw(chip.name)
-
-#show: book-page(chip.name)
 
 The #shift chip is designed to constrain that 
 $ 

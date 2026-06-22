@@ -1,4 +1,3 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   compute_nr_interactions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/keccak.toml", config)
-
-#show: book-page(chip.name)
 #let keccak = raw(chip.name)
 
 The #keccak chip applies the keccak permutation $kappa$ to a given memory range;

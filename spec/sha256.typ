@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, aside, rj
+#import "/meta.typ": aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -10,8 +10,6 @@
 )
 
 #let config = load_config()
-
-#show: book-page("sha256.typ")
 
 #let sha256chip = load_chip("src/sha256.toml", config)
 #let sha256msgschedchip = load_chip("src/sha256msgsched.toml", config)

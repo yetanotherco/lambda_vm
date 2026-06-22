@@ -51,11 +51,6 @@
 // store it as metadata under the `<interaction_count>` label
 // with tag `chip.name`. This tag is overwritten by `name` when specified.
 #let set_nr_interactions(chip, name: none) = {
-  // Skip when building shiroa, since the web/chapter structure fails to converge properly
-  import "book.typ": is-shiroa
-  if is-shiroa {
-    return
-  }
   if name == none {
     name = chip.name
   }

@@ -1,11 +1,8 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": render_chip_variable_table, render_constraint_table, compute_nr_interactions, total_nr_variables, total_nr_instantiated_columns
 
 #let config = load_config()
 #let chip = load_chip("src/is_byte.toml", config)
-
-#show: book-page(chip.name)
 #let is_byte = raw(chip.name)
 
 #is_byte is a constraint template that is used to assert that a variable lies in the range $[0, 255]$ under the condition that `cond` is non-zero. Note: when `cond` is omitted, it defaults to $1$.

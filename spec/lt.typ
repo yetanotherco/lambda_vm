@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/lt.toml", config)
-
-#show: book-page(chip.name)
 #let lt = raw(chip.name)
 
 The #lt chip constrains an indicator bit for the less-than relation, signed or unsigned.

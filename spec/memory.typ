@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, rj, aside, xref
+#import "/meta.typ": rj, aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -11,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/page.toml", config)
-
-#show: book-page("memory.typ")
 
 As part of fully proving the correct execution of a RISC-V program,
 the VM must ensure that memory reads and writes are consistent.

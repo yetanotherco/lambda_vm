@@ -1,4 +1,4 @@
-#import "/book.typ": meta, common-formatting
+#import "/meta.typ": meta, common-formatting
 
 #set document(author: meta.authors, title: meta.title)
 
@@ -39,6 +39,6 @@
     pagebreak(weak: true)
     [#heading(level: 2, supplement: [Section], sec_title)#ref]
     set heading(offset: 2)
-    include sec
+    include sec + ".typ"
   }
 }

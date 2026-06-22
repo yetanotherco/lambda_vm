@@ -1,7 +1,4 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_config
-
-#show: book-page("variables.typ")
 
 #let config = load_config()
 

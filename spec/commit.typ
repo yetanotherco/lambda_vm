@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, aside
+#import "/meta.typ": aside
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -9,8 +9,6 @@
   render_chip_assumptions,
   render_chip_padding_table,
 )
-
-#show: book-page("commit.typ")
 
 #let config = load_config()
 #let chip = load_chip("src/commit.toml", config)

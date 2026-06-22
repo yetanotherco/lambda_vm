@@ -1,8 +1,5 @@
-#import "/book.typ": book-page
 #import "/src.typ": load_signatures, load_config
 #import "/expr.typ": type_to_code
-
-#show: book-page("signatures.typ")
 
 #let config = load_config()
 #let signatures = load_signatures(config)

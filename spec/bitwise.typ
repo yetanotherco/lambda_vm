@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 #let chip = load_chip("src/bitwise.toml", config)
 
 #let bitwise = raw(chip.name)
-
-#show: book-page(chip.name)
 #let bitwise = raw(chip.name)
 
 The #bitwise chips deal with precomputed lookup tables for bitwise boolean operations

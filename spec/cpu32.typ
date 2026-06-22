@@ -1,4 +1,3 @@
-#import "/book.typ": book-page, rj
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_assumptions,
@@ -12,8 +11,6 @@
 
 #let config = load_config()
 #let chip = load_chip("src/cpu32.toml", config)
-
-#show: book-page(chip.name)
 #let cpu32 = raw(chip.name)
 
 The #cpu32 chip is used to delegate the 32-bit instructions of the RV64I instruction set
