@@ -440,7 +440,8 @@ pub trait IsStarkProver<
         let twiddles = LdeTwiddles::new(&domain);
         let evals =
             Self::compute_lde_from_columns_cached::<Field>(&precomputed, &domain, &twiddles);
-        let (_, commitment) = crate::commitment::commit_bit_reversed(&evals, crate::commitment::ROWS_PER_LEAF)?;
+        let (_, commitment) =
+            crate::commitment::commit_bit_reversed(&evals, crate::commitment::ROWS_PER_LEAF)?;
         Some(commitment)
     }
 
@@ -591,18 +592,27 @@ pub trait IsStarkProver<
             Some((expected_precomputed_root, num_cols)) => {
                 #[allow(unused_mut)]
                 let (mut precomputed_tree, precomputed_root) =
-                    crate::commitment::commit_bit_reversed(&columns[..num_cols], crate::commitment::ROWS_PER_LEAF)
-                        .ok_or(ProvingError::EmptyCommitment)?;
+                    crate::commitment::commit_bit_reversed(
+                        &columns[..num_cols],
+                        crate::commitment::ROWS_PER_LEAF,
+                    )
+                    .ok_or(ProvingError::EmptyCommitment)?;
                 #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) =
-                    crate::commitment::commit_bit_reversed(&columns[num_cols..], crate::commitment::ROWS_PER_LEAF)
-                        .ok_or(ProvingError::EmptyCommitment)?;
+                let (mut mult_tree, mult_root) = crate::commitment::commit_bit_reversed(
+                    &columns[num_cols..],
+                    crate::commitment::ROWS_PER_LEAF,
+                )
+                .ok_or(ProvingError::EmptyCommitment)?;
                 if precomputed_root != expected_precomputed_root {
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
                 }
                 #[cfg(feature = "disk-spill")]
                 {
-                    Self::spill_tree(&mut precomputed_tree, storage_mode, "precomputed Merkle tree")?;
+                    Self::spill_tree(
+                        &mut precomputed_tree,
+                        storage_mode,
+                        "precomputed Merkle tree",
+                    )?;
                     Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 }
                 TableCommit::preprocessed(
@@ -961,8 +971,11 @@ pub trait IsStarkProver<
                 let root = tree.root;
                 (tree, root)
             }
-            None => crate::commitment::commit_bit_reversed(&lde_composition_poly_parts_evaluations, crate::commitment::ROWS_PER_LEAF)
-                .ok_or(ProvingError::EmptyCommitment)?,
+            None => crate::commitment::commit_bit_reversed(
+                &lde_composition_poly_parts_evaluations,
+                crate::commitment::ROWS_PER_LEAF,
+            )
+            .ok_or(ProvingError::EmptyCommitment)?,
         };
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
@@ -1416,7 +1429,8 @@ pub trait IsStarkProver<
         // single leaf at position `challenge`; one Merkle path authenticates both
         // the queried row and its symmetric counterpart.
         PolynomialOpenings {
-            proof: tree.get_proof_by_pos(challenge)
+            proof: tree
+                .get_proof_by_pos(challenge)
                 .expect("FRI query index in bounds"),
             evaluations: gather(reverse_index(challenge * 2, domain_size)),
             evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),

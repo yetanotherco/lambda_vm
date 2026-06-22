@@ -20,13 +20,13 @@
 
 use std::collections::HashMap;
 
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 use super::page::STACK_TOP;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -219,7 +219,7 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, entry_point: u64) 
 
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
@@ -227,14 +227,9 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, entry_point: u64) 
         })
         .collect();
 
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    let lde_rows = columns2rows(lde_columns);
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
         .expect("Failed to build Merkle tree for register LDE");
-    tree.root
+    root
 }
 
 /// Returns the preprocessed commitment for the REGISTER table.
