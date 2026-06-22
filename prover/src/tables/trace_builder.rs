@@ -53,6 +53,7 @@ use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
+use super::limbs::{limbs_16, limbs_32};
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -63,7 +64,6 @@ use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
 use super::store;
-use super::limbs::{limbs_16, limbs_32};
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 

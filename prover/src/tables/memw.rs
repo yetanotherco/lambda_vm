@@ -36,8 +36,8 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use super::limbs::set_limbs_32;
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW table chunk.

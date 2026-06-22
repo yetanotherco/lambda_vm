@@ -39,12 +39,12 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::{limbs_16, set_limbs_16};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
 };
-use super::limbs::{limbs_16, set_limbs_16};
 
 /// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
 /// range-check sends so they fire once per row-instance.

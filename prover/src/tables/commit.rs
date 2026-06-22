@@ -52,8 +52,8 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use super::limbs::{set_limbs_16, set_limbs_32};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Column indices for COMMIT table

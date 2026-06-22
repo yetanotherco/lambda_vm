@@ -38,11 +38,11 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use super::limbs::{set_limbs_16, set_limbs_32};
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
     NEG_INV_2_64, SHIFT_16, alu_op,
 };
-use super::limbs::{set_limbs_16, set_limbs_32};
 
 // =========================================================================
 // Column indices for DVRM table

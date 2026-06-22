@@ -24,8 +24,8 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use super::limbs::set_limbs_32;
+use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},

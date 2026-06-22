@@ -30,8 +30,8 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use super::limbs::set_limbs_32;
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Column indices for LOAD table

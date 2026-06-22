@@ -28,9 +28,9 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+use super::limbs::set_limbs_32;
 use super::page::STACK_TOP;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
-use super::limbs::set_limbs_32;
 
 // =========================================================================
 // Constants
