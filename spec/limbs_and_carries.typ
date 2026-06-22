@@ -2,9 +2,10 @@
 #import "@preview/ctheorems:1.1.3": *
 #import "@preview/equate:0.3.2": equate
 
+
 // Theorem/lemma formatting
 #show: thmrules.with(qed-symbol: $square$)
-#let lemma = thmbox("lemma", "Lemma", fill: rgb("#eee"))
+#let lemma = thmbox("lemma", "Lemma", fill: rgb("#eee"),base_level: 0)
 #let proof = thmproof("proof", "Proof")
 
 // Equation formatting
@@ -26,19 +27,16 @@ Let $S := L^n in NN$ be an upper bound on the integers we want to represent,
 where $L in NN without {0, 1}$ is the number of values a limb can represent 
 and $n in N$ denotes the number of limbs.
 
-Observe that for all $x in [S]$, there exists a unique series of integers 
-$(x_0, x_1, x_2, ...) in [L]^*$ such that
+Observe that for all $x in [S]$, there exists a unique tuple of integers 
+$(x_0, x_1, x_2, x_(n-1)) in [L]^(n)$ such that
 $
   x 
-  = sum_(i=0)^oo x_i dot L^i.
+  = sum_(i=0)^(n-1) x_i dot L^i.
 $ #<eq:decomposition>
+To simplify future notation, we let $x_i = 0$ for all $i >= n$.
 
-Note that $x_i = 0$ for all $i >= n$, since $L^i >= L^n = S > x$.
-As a result, the sum's range can be lowered from $oo$ to $n-1$.
-In practice, we often include $x_i$ with $i >= n$ in equations to simplify notation.
-
-Let us define the multi-linear function $f_(alpha, mu) (x, y, z) := mu dot x dot y + alpha dot z$, 
-over variables $x, y, z in [S]$ and constants $alpha, mu in [L/2-1]$.
+Let us define the family of multi-linear functions $f_(alpha, mu) (x, y, z) := mu dot x dot y + alpha dot z$, 
+over variables $x, y, z in [S]$ and parameters $alpha, mu in NN$.
 Working towards the limb-decomposition of $f_(alpha, mu)$, we rewrite
 $
   f_(alpha, mu) (x, y, z) 
@@ -66,31 +64,33 @@ Note that these $c_i$ effectively move the "overflow" from one limb to the next 
 they're commonly referred to as the _carry_ values.
 
 #lemma[
-    Given $alpha, mu in [L/2-1]$ and $x, y, z in [S]$, $(w_0, w_1, ..., w_(2n-1), 0, 0, ...) in [L]^*$ 
-    for previously defined series $w_i$ is the unique limb decomposition of $f_(alpha, mu)(x, y, z)$
-    if and only if $c_(2n-1) = 0$.
+    For all $g >= 2n$, 
+    $(w_0, w_1, ..., w_(g-1)) in [L]^(g)$ 
+    is the unique $g$-limb decomposition of $f_(alpha, mu)$
+    if and only if $c_(g-1) = 0$.
 ]<lm:wi_decomp_f>
 #proof[
-    Rewriting the definition of $c_i$, we find the equality $w_i = overline(w)_i + c_(i-1) - c_i dot L$.
+    Reordering the definition of $c_i$, we find the equality $w_i = overline(w)_i + c_(i-1) - c_i dot L$.
     Leveraging this, we see that
     $  
-    sum_(r=0)^(2n-1) w_r dot L^r
-    &= sum_(r=0)^(2n-1) (overline(w)_r + c_(r-1) - c_r dot L) dot L^r\
-    &= (sum_(r=0)^(2n-1) overline(w)_r dot L^r) + (sum_(s=0)^(2n-1) c_(s-1) dot L^s) - (sum_(t=0)^(2n-1) c_t dot L^(t+1))\
-    &= (sum_(r=0)^(2n-1) overline(w)_r dot L^r) + (sum_(s=-1)^(2n-2) c_(s) dot L^(s+1)) - (sum_(t=0)^(2n-1) c_t dot L^(t+1))\
-    &= (sum_(r=0)^(2n-1) overline(w)_r dot L^r) + c_(-1) - c_(2n-1) dot L^(2n-1+1)\
-    &= (sum_(r=0)^(2n-1) overline(w)_r dot L^r) - c_(2n-1) dot L^(2n),\
-    &= (sum_(r=0)^(2(n-1)) overline(w)_r dot L^r) - c_(2n-1) dot L^(2n),\
-    &= f_(alpha, mu)(x, y, z),\
+    sum_(r=0)^(g-1) w_r dot L^r
+    &= sum_(r=0)^(g-1) (overline(w)_r + c_(r-1) - c_r dot L) dot L^r\
+    &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) + (sum_(s=0)^(g-1) c_(s-1) dot L^s) - (sum_(t=0)^(g-1) c_t dot L^(t+1))\
+    &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) + (sum_(s=-1)^(g-2) c_(s) dot L^(s+1)) - (sum_(t=0)^(g-1) c_t dot L^(t+1))\
+    &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) + c_(-1) - c_(g-1) dot L^(g-1+1)\
+    &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) - c_(g-1) dot L^(g),\
+    &= (sum_(r=0)^(2(n-1)) overline(w)_r dot L^r) - c_(g-1) dot L^(g),\
+    &= f_(alpha, mu)(x, y, z) + c_(g-1) dot L^(g),\
     $
-    where the second-to-last step follows from the observation that $overline(w)_(2n-1) = 0$.
+    where the second-to-last step follows from the observation that $overline(w)_j = 0$ for $j >= 2n-1$.
+    This limb decomposition is proper if and only if $c_(g-1) = 0$.
 ]
 
 = Upper bounding the carry
-To find the conditions under which $c_(2n-1) = 0$, we prove an upperbound for $c_i$.
+To find the conditions under which $c_(g-1) = 0$, we prove an upperbound for $c_i$.
 
 #lemma("Carry upper bound [part 1]")[
-  Given the definition above, it holds that
+  For $alpha, mu in [L]$, it holds that
   $
   c_i <= mu (i+1) (L-1) + alpha - mu - delta_(mu < alpha)
   $
@@ -109,6 +109,7 @@ To find the conditions under which $c_(2n-1) = 0$, we prove an upperbound for $c
   &overline(w)_0
   &=& alpha dot z_0 + mu dot sum_(j=0)^0 x_(0-j) dot y_j\
   &&<=& alpha (L-1) + mu (L - 1)^2 \
+  &&=& (alpha - delta) L + delta L - alpha + mu (L^2 - 2L) + mu\
   &&=& (alpha - delta) L + mu (L^2 - 2L) + delta L + mu - alpha,\
   text("and hence") &c_0 
   &<=& floor.l ((alpha - delta) L + mu (L - 2)L + delta L + mu - alpha) dot L^(-1) floor.r\
@@ -134,7 +135,7 @@ Since $x_i = y_i = z_i = 0$ for $i >= n$, the upper bound for $overline(w)_i$ is
 We therefore introduce a second lemma:
 
 #lemma("Carry upper bound [part 2]")[
-  Given $c_i$'s earlier definition, it holds that
+  For $alpha in [L], mu in [L/2]$, it holds that
   $
     c_(n+k) <= mu (n - k - 1)(L-2) + mu (n-k) - delta_(alpha < 2mu + delta)
   $
@@ -179,13 +180,15 @@ Again, we note that this upper bound is tight;
 $c_(n+k)$ achieves the bound for all $k in [0, n)$ when $x = y = z = S-1$.
 This includes $k = n-1$, which yields $c_(n+(n-1)) = c_(2n-1) <= mu - delta'$.
 Moreover, $c_(2n) <= floor.l (mu - delta') dot L^(-1) floor.r = 0$ since $mu in [L]$ and thus $c_(2n + i) = 0$ for all $i >= 0$.
-Applying this to @lm:wi_decomp_f, we conclude that $(w_0, w_1, ..., w_(2n-1), 0, 0, ...) in [L]^*$ is the unique limb decomposition
+Applying this to @lm:wi_decomp_f, we conclude that $(w_0, w_1, ..., w_(2n-1)) in [L]^(2n)$ is the unique limb decomposition
 of $f_(alpha, mu) (x, y, z)$ when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$.
 
-Now, observe that 
+Combining both bounds, we find that
 $
-  &max_(i in [2n]) min(mu (i+1) (L-1) + alpha - mu - delta, mu (2n-i-1)(L-2) + mu (2n-i) - delta')\
-  =& mu n (L-1) + alpha - mu - delta
+&max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
+  &max_(k in [n]) #h(1em) mu (2n-k-1)(L-2) + mu (2n-k) - delta')\
+&= max(& mu n (L-1) + alpha - mu - delta, mu (2n-1)(L-2) + 2 mu n - delta')\
+&= mu n (L-1) + alpha - mu - delta
 $
 acts as an upper bound on all carry elements.
 
