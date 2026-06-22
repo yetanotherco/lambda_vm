@@ -252,6 +252,16 @@ fn decode_commitment_compile_time_const_accepts() {
     let vm_proof = prove(&elf_bytes).expect("prove failed");
     let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
 
+    // TEMP(ci-regen): surface the actual row-pair decode commitment computed from
+    // CI's sub.elf so SUB_DECODE_COMMITMENT_BLOWUP_2 can be regenerated. Remove.
+    {
+        let elf = Elf::load(&elf_bytes).expect("ELF load");
+        eprintln!(
+            "ACTUAL_SUB_DECODE_COMMITMENT_BLOWUP_2 = {:02x?}",
+            commitment_from_elf(&elf, &options).expect("decode commitment")
+        );
+    }
+
     // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
     // workflow where the value lives in the caller's compiled binary.
     let result = verify_with_options(
