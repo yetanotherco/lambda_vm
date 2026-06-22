@@ -223,8 +223,7 @@ pub fn update_multiplicities(
 ) {
     let mu = FieldElement::from(num_keccak_ops as u64);
     for round in 0..NUM_REAL_ROWS {
-        let base = round * cols::NUM_COLUMNS;
-        trace.main_table.data[base + cols::MU] = mu;
+        trace.set_main(round, cols::MU, mu);
     }
 }
 
