@@ -28,6 +28,7 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
+#[cfg(test)]
 use executor::vm::registers::Registers;
 
 use super::page::STACK_TOP;
@@ -50,10 +51,20 @@ pub const WORDS_PER_REGISTER: usize = 2;
 /// -1 because x254 is single-word (1 address instead of 2).
 pub const NUM_REGISTER_ADDRESSES: usize = NUM_REGISTERS * WORDS_PER_REGISTER - 1;
 
-/// Number of preprocessed columns (OFFSET, INIT).
+/// Number of preprocessed columns (OFFSET, INIT) for the monolithic prover.
 /// OFFSET encodes the Word address, INIT holds the initial value.
 /// Program-dependent: x255 init = ELF entry point.
 pub const NUM_PREPROCESSED_COLS: usize = 2;
+
+/// Number of preprocessed columns (OFFSET, INIT, FINI) for continuation epochs.
+/// A continuation epoch additionally preprocesses FINI so the epoch's final
+/// register file becomes a verifier-known public value (`R_{i+1}`): the verifier
+/// recomputes the commitment from it, the REG-C2 Memory-bus token forces it to
+/// equal the true final registers, and the next epoch reuses the same `R_{i+1}`
+/// as its preprocessed INIT — binding `init(epoch i+1) == fini(epoch i)` with no
+/// extra bus. The monolithic prover keeps FINI as a main-trace column (it has no
+/// verifier-known final state), using `NUM_PREPROCESSED_COLS` instead.
+pub const NUM_PREPROCESSED_COLS_WITH_FINI: usize = 3;
 
 // =========================================================================
 // Column indices for REGISTER table
@@ -150,8 +161,11 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> HashMap<u64, u
 /// executor `Registers` (x1-x31, including SP) plus the program counter (x255).
 /// x0 and the synthetic commit index (x254) are zero in the naive version.
 ///
-/// Used by the continuation prover to start a non-first epoch from the previous
-/// epoch's boundary register snapshot.
+/// Used by tests that build a single epoch from a boundary snapshot. The
+/// continuation prover no longer uses this for chaining: epoch i+1's register
+/// init comes from epoch i's *bound* fini (`fini_from_trace`, carried as the next
+/// epoch's preprocessed INIT), not a trusted executor snapshot.
+#[cfg(test)]
 pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> HashMap<u64, u32> {
     let mut init = HashMap::new();
     for reg in 0u8..32 {
@@ -230,6 +244,30 @@ pub fn generate_register_trace(
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
 
+/// Extract the per-register final values (`R_{i+1}`) from a committed REGISTER
+/// trace: reads `FINI` on the real rows (the first `NUM_REGISTER_ADDRESSES`) into
+/// a vector in `register_word_address_list` order — entry `i` is the final value
+/// of the register at `register_word_address_list()[i]`. This is the epoch's final
+/// register file; the continuation builds this epoch's preprocessed FINI
+/// commitment from it and reuses it as the next epoch's preprocessed INIT.
+pub fn fini_from_trace(trace: &TraceTable<GoldilocksField, GoldilocksExtension>) -> Vec<u32> {
+    (0..NUM_REGISTER_ADDRESSES)
+        .map(|row| trace.main_table.get(row, cols::FINI).to_raw() as u32)
+        .collect()
+}
+
+/// Expand a fini vector (the 67 final values in `register_word_address_list`
+/// order, as produced by `fini_from_trace`) into the address-keyed register-init
+/// map the trace builder consumes. Used to chain the previous epoch's fini into
+/// the next epoch's init — the register analog of `register_init_from_entry_point`.
+pub(crate) fn register_init_from_fini(fini: &[u32]) -> HashMap<u64, u32> {
+    register_word_address_list()
+        .iter()
+        .zip(fini)
+        .map(|(&addr, &value)| (addr, value))
+        .collect()
+}
+
 // =========================================================================
 // Preprocessed commitment
 // =========================================================================
@@ -255,8 +293,44 @@ pub fn compute_precomputed_commitment(
         init_col[i] = FE::from(init.get(&word_addr).copied().unwrap_or(0) as u64);
     }
 
-    let columns = [offset_col, init_col];
+    commit_register_columns(options, vec![offset_col, init_col])
+}
 
+/// Continuation variant: commits OFFSET + INIT + FINI, so the verifier recomputes
+/// the commitment from the public `init` (`R_i`) and `fini` (`R_{i+1}`) and the
+/// proof's FINI column is locked to `R_{i+1}`. `fini` is the vector produced by
+/// `fini_from_trace` (entry `i` = the register at `register_word_address_list()[i]`).
+/// Used by continuation epochs with `NUM_PREPROCESSED_COLS_WITH_FINI`; must match
+/// the column order of the REGISTER trace (OFFSET, INIT, FINI), and FINI on padding
+/// rows is 0 (as the trace builds it).
+pub fn compute_precomputed_commitment_with_fini(
+    options: &ProofOptions,
+    init: &HashMap<u64, u32>,
+    fini: &[u32],
+) -> Commitment {
+    debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
+    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+    let addr_list = register_word_address_list();
+
+    let mut offset_col = vec![FE::zero(); num_rows];
+    let mut init_col = vec![FE::zero(); num_rows];
+    let mut fini_col = vec![FE::zero(); num_rows];
+
+    for i in 0..NUM_REGISTER_ADDRESSES {
+        let word_addr = addr_list[i];
+        offset_col[i] = FE::from(word_addr);
+        init_col[i] = FE::from(init.get(&word_addr).copied().unwrap_or(0) as u64);
+        fini_col[i] = FE::from(fini[i] as u64);
+    }
+
+    commit_register_columns(options, vec![offset_col, init_col, fini_col])
+}
+
+/// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
+/// order). Shared by the monolithic (OFFSET, INIT) and continuation
+/// (OFFSET, INIT, FINI) preprocessed commitments.
+fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Commitment {
+    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let polys: Vec<Polynomial<FE>> = columns
         .iter()
         .map(|col| {

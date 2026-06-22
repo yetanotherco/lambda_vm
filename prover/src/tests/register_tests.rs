@@ -1,5 +1,7 @@
 //! Tests for the REGISTER table.
 
+use stark::proof::options::ProofOptions;
+
 use crate::tables::register::*;
 use crate::tables::types::*;
 
@@ -82,4 +84,52 @@ fn test_generate_register_trace_with_access() {
 fn test_bus_interactions() {
     let interactions = bus_interactions();
     assert_eq!(interactions.len(), 2); // C1, C2
+}
+
+#[test]
+fn test_fini_from_trace_reads_every_register() {
+    let mut final_state = FinalRegisterStateMap::new();
+    final_state.insert(
+        register_base_address(5), // addr 10
+        FinalRegisterWordState {
+            timestamp: 100,
+            value: 0x42,
+        },
+    );
+    let trace = generate_register_trace(&final_state, &register_init_from_entry_point(0x1000));
+
+    let fini = fini_from_trace(&trace);
+    // One entry per real register Word address, in register_word_address_list order
+    // (positions 0..63 are addresses 0..63, so addr a is at index a for a < 64).
+    assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
+    // Accessed register reflects its written value; PC (x255, addr 510 = index 65)
+    // reflects entry point; x0 (addr 0 = index 0) ends at 0.
+    assert_eq!(fini[10], 0x42);
+    assert_eq!(fini[65], 0x1000);
+    assert_eq!(fini[0], 0);
+}
+
+#[test]
+fn test_precomputed_commitment_with_fini_binds_fini() {
+    let opts = ProofOptions::default_test_options();
+    let init = register_init_from_entry_point(0x1000);
+    // Fini vectors in register_word_address_list order (index = address for a < 64).
+    let mut fini_a = vec![0u32; NUM_REGISTER_ADDRESSES];
+    fini_a[10] = 0x42;
+    fini_a[12] = 7;
+    let mut fini_b = fini_a.clone();
+    fini_b[10] = 0x43; // a different final value at one address
+
+    let root_a = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
+    let root_a2 = compute_precomputed_commitment_with_fini(&opts, &init, &fini_a);
+    let root_b = compute_precomputed_commitment_with_fini(&opts, &init, &fini_b);
+
+    // Deterministic, and sensitive to every fini value: a tampered R_{i+1} yields a
+    // different preprocessed root, so a trace whose FINI != the committed R_{i+1}
+    // fails the verifier's preprocessed-root check.
+    assert_eq!(root_a, root_a2);
+    assert_ne!(root_a, root_b);
+
+    // The 3-column (with-fini) commitment differs from the 2-column monolithic one.
+    assert_ne!(root_a, compute_precomputed_commitment(&opts, &init));
 }

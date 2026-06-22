@@ -17,9 +17,14 @@
 //! The global proof commits the identical trace, so it inherits the guarantee
 //! via the commitment binding.
 //!
-//! This is a FIRST implementation and is NOT yet fully sound: cross-epoch
-//! registers are not bound (epoch `i`'s register init is a prover-supplied
-//! snapshot, unlinked to epoch `i-1`'s fini). That is deferred.
+//! Cross-epoch registers are bound the same way: each continuation epoch
+//! preprocesses its REGISTER `FINI` column to the epoch's final register file
+//! `R_{i+1}` (alongside `INIT = R_i`), and the driver reuses the same `R_{i+1}`
+//! as the next epoch's preprocessed `INIT` — so `init(epoch i+1) == fini(epoch i)`
+//! by construction, with the REG-C2 Memory bus binding `FINI` to the true final
+//! registers. No extra bus. Still deferred: statement/Fiat-Shamir binding of the
+//! per-epoch transcripts (only needed for a split prover/verifier) and the x254
+//! commit-index across epoch boundaries.
 
 use std::collections::HashMap;
 
@@ -181,9 +186,20 @@ struct EpochStart<'a> {
     label: u64,
 }
 
+/// A successful epoch proof's outputs:
+/// - the L2G commitment root the global proof binds against (cross-epoch memory), and
+/// - the epoch's final register file `R_{i+1}`: the 67 final register values in
+///   `register_word_address_list` order (read from the committed REGISTER trace).
+///
+/// The driver feeds `R_{i+1}` to the next epoch as its preprocessed INIT — that,
+/// plus this epoch's preprocessed FINI commitment over the same `R_{i+1}`, binds
+/// `init(epoch i+1) == fini(epoch i)`.
+type EpochOutput = (Commitment, Vec<u32>);
+
 /// Prove and verify one epoch, committing its local-to-global table (built from
-/// `boundary`) on the epoch-local Memory bus. Returns the L2G commitment root if
-/// the epoch verifies, or `None` if it does not.
+/// `boundary`) on the epoch-local Memory bus, and its REGISTER table with FINI
+/// preprocessed to the epoch's final register file. Returns the L2G commitment
+/// root and that final register file if the epoch verifies, or `None` if not.
 fn prove_verify_epoch(
     elf: &Elf,
     start: &EpochStart,
@@ -192,7 +208,7 @@ fn prove_verify_epoch(
     boundary: &[CellBoundary],
     private_inputs: &[u8],
     opts: &ProofOptions,
-) -> Result<Option<Commitment>, Error> {
+) -> Result<Option<EpochOutput>, Error> {
     let mut traces = Traces::from_image_and_logs(
         elf,
         start.image,
@@ -221,13 +237,17 @@ fn prove_verify_epoch(
         &local_to_global::collect_bitwise_from_l2g(boundary),
     );
 
+    // The epoch's final register file R_{i+1}, read from the committed REGISTER
+    // trace (its FINI column, which the Memory bus binds to the true last write).
+    let reg_fini = register::fini_from_trace(&traces.register);
+
     let table_counts = traces.table_counts();
     let register_init_arg = if start.is_first {
         None
     } else {
         Some(&start.register_init)
     };
-    let airs = VmAirs::new(
+    let mut airs = VmAirs::new(
         elf,
         opts,
         false,
@@ -237,6 +257,17 @@ fn prove_verify_epoch(
         is_final,
         register_init_arg,
         None,
+    );
+
+    // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so
+    // the epoch's final register file is a verifier-known public value bound by the
+    // REG-C2 Memory-bus token. The driver reuses this same R_{i+1} as the next
+    // epoch's preprocessed INIT, binding init(epoch i+1) == fini(epoch i) with no
+    // extra bus. Built from the same (R_i, R_{i+1}) the REGISTER trace holds, so it
+    // matches the committed preprocessed columns.
+    airs.register = crate::test_utils::create_register_air(opts).with_preprocessed(
+        register::compute_precomputed_commitment_with_fini(opts, &start.register_init, &reg_fini),
+        register::NUM_PREPROCESSED_COLS_WITH_FINI,
     );
 
     let l2g_air = l2g_memory_air(opts, start.label);
@@ -274,9 +305,10 @@ fn prove_verify_epoch(
     ) {
         return Ok(None);
     }
-    Ok(Some(
+    Ok(Some((
         proof.proofs.last().unwrap().lde_trace_main_merkle_root,
-    ))
+        reg_fini,
+    )))
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -402,6 +434,13 @@ pub fn prove_and_verify_continuation(
     let mut provenance = local_to_global::genesis_provenance(&initial_memory);
     let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
     let mut epoch_roots: Vec<Commitment> = Vec::new();
+    // The previous epoch's bound final register file (its REGISTER FINI, read back
+    // via `fini_from_trace` as the 67 values in `register_word_address_list` order).
+    // Epoch i+1's register init is sourced from it — and its preprocessed INIT
+    // commitment is built from it — rather than from a trusted executor snapshot.
+    // This is the cross-epoch register binding: the same R_{i+1} is epoch i's
+    // preprocessed FINI and epoch i+1's preprocessed INIT.
+    let mut prev_fini: Option<Vec<u32>> = None;
     let opts = ProofOptions::default_test_options();
 
     let mut index: u64 = 0;
@@ -413,7 +452,13 @@ pub fn prove_and_verify_continuation(
         let register_init = if index == 0 {
             register::register_init_from_entry_point(elf.entry_point)
         } else {
-            register::register_init_from_snapshot(executor.registers(), start_pc)
+            // Expand the previous epoch's bound fini vector into the address-keyed
+            // init map the trace builder consumes (same R_{i+1} bytes).
+            register::register_init_from_fini(
+                prev_fini
+                    .as_ref()
+                    .expect("prev_fini is set after the first epoch"),
+            )
         };
 
         // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
@@ -448,7 +493,10 @@ pub fn prove_and_verify_continuation(
             private_inputs,
             &opts,
         )? {
-            Some(root) => epoch_roots.push(root),
+            Some((root, reg_fini)) => {
+                epoch_roots.push(root);
+                prev_fini = Some(reg_fini);
+            }
             None => return Ok(false),
         }
 
