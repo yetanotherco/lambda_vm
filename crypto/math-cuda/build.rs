@@ -141,4 +141,5 @@ fn main() {
     compile_ptx("cpu32_trace.cu", "cpu32_trace.ptx", have_nvcc);
     compile_ptx("dvrm_trace.cu", "dvrm_trace.ptx", have_nvcc);
     compile_ptx("memw_trace.cu", "memw_trace.ptx", have_nvcc);
+    compile_ptx("keccak_trace.cu", "keccak_trace.ptx", have_nvcc);
 }

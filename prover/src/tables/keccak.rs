@@ -103,6 +103,14 @@ pub fn generate_keccak_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
+
+    // GPU fast path: pack each op's lanes into 25-stride interleaved
+    // arrays; kernel does byte/halfword decomposition + padding init.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_keccak_trace_gpu(ops, n, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in ops.iter().enumerate() {
@@ -165,6 +173,49 @@ pub fn generate_keccak_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_keccak_trace`. Packs each op's 25 input
+/// and 25 output lanes into 25-stride interleaved u64 arrays; kernel
+/// handles byte decomposition, state_ptr computation, and the padding
+/// `state_ptr[lane][0] = 8*lane_idx` write.
+#[cfg(feature = "cuda")]
+fn try_generate_keccak_trace_gpu(
+    ops: &[KeccakOperation],
+    n: usize,
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut timestamps = vec![0u64; num_rows];
+    let mut state_addrs = vec![0u64; num_rows];
+    let mut inputs = vec![0u64; num_rows * 25];
+    let mut outputs = vec![0u64; num_rows * 25];
+    let mut flags = vec![0u64; num_rows];
+
+    for (i, op) in ops.iter().enumerate() {
+        timestamps[i] = op.timestamp;
+        state_addrs[i] = op.state_addr;
+        let off = i * 25;
+        for lane in 0..25 {
+            inputs[off + lane] = op.input[lane];
+            outputs[off + lane] = op.output[lane];
+        }
+        flags[i] = 1; // active
+    }
+    for i in n..num_rows {
+        flags[i] = 0; // padding row
+    }
+
+    let raw = stark::gpu_lde::try_generate_keccak_trace_gpu_raw(
+        num_rows,
+        &timestamps,
+        &state_addrs,
+        &inputs,
+        &outputs,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================
