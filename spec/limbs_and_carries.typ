@@ -179,9 +179,9 @@ We therefore introduce a second lemma:
 Again, we note that this upper bound is tight; 
 $c_(n+k)$ achieves the bound for all $k in [0, n)$ when $x = y = z = S-1$.
 This includes $k = n-1$, which yields $c_(n+(n-1)) = c_(2n-1) <= mu - delta'$.
-Moreover, $c_(2n) <= floor.l (mu - delta') dot L^(-1) floor.r = 0$ since $mu in [L]$ and thus $c_(2n + i) = 0$ for all $i >= 0$.
+Moreover, $c_(2n) <= floor.l (mu - delta') dot L^(-1) floor.r = 0$ since $mu in [L/2]$ and thus $c_(2n + i) = 0$ for all $i >= 0$.
 Applying this to @lm:wi_decomp_f, we conclude that $(w_0, w_1, ..., w_(2n-1)) in [L]^(2n)$ is the unique limb decomposition
-of $f_(alpha, mu) (x, y, z)$ when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$.
+of $f_(alpha, mu) (x, y, z)$ when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$; for larger values of $mu$, an extra limb $w_(2n) := c_(2n)$ must be included.
 
 Combining both bounds, we find that
 $
@@ -190,7 +190,7 @@ $
 &= max(& mu n (L-1) + alpha - mu - delta, mu (2n-1)(L-2) + 2 mu n - delta')\
 &= mu n (L-1) + alpha - mu - delta
 $
-acts as an upper bound on all carry elements.
+acts as an upper bound on all carry elements when $alpha in [L]$ and $mu in [L/2]$.
 
 
 = Proof of Correctness
