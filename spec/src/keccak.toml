@@ -7,12 +7,6 @@ desc = "timestamp at which the permutation is performed"
 pad = 0
 
 [[variables.input]]
-name = "addr"
-type = "DWordBL"
-desc = "memory address storing the first bit of the state"
-pad = 0
-
-[[variables.input]]
 name = "input_state"
 type = [[["Byte", 8], 5], 5]
 desc = "state at the start of executing the permutation"
@@ -54,18 +48,19 @@ multiplicity = ["-", "μ"]
 [[constraint_groups]]
 name = "mem"
 
+
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], "addr", "timestamp", 1, 0, 0]
-output = "addr"
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 0], ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+output = ["arr", ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 0], ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
-ref = "keccak:c:read_addr"
+ref = "keccak:c:read_state_ptr"
 
 [[constraints.mem]]
 kind = "template"
 tag = "ADD"
-input = [["cast", "addr", "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
+input = [["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], ["cast", ["*", 8, ["+", ["*", 5, "y"], "x"]], "DWordWL"]]
 output = ["cast", ["idx", ["idx", "state_ptr", "x"], "y"], "DWordWL"]
 iters = [["x", 0, 4], ["y", 0, 4]]
 ref = "keccak:c:state_ptr"
@@ -76,6 +71,7 @@ tag = "IS_HALF"
 input = [["idx", ["idx", ["idx", "state_ptr", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
 multiplicity = "μ"
+ref = "keccak:c:range_state_ptr"
 
 [[constraints.mem]]
 kind = "interaction"
