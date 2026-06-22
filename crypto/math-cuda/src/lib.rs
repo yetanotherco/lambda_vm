@@ -22,6 +22,7 @@ pub mod load_trace;
 pub mod lt_trace;
 pub mod memw_aligned_trace;
 pub mod memw_register_trace;
+pub mod memw_trace;
 pub mod mul_trace;
 pub mod multiplicity_sort;
 pub mod shift_trace;

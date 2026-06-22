@@ -118,6 +118,7 @@ const CPU_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cpu_trace.pt
 const BRANCH_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/branch_trace.ptx"));
 const CPU32_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/cpu32_trace.ptx"));
 const DVRM_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/dvrm_trace.ptx"));
+const MEMW_TRACE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/memw_trace.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -252,6 +253,9 @@ pub struct Backend {
     // dvrm_trace.ptx
     pub generate_dvrm_trace_rows: CudaFunction,
 
+    // memw_trace.ptx
+    pub generate_memw_trace_rows: CudaFunction,
+
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -290,6 +294,7 @@ impl Backend {
         let branch_trace = ctx.load_module(Ptx::from_src(BRANCH_TRACE_PTX))?;
         let cpu32_trace = ctx.load_module(Ptx::from_src(CPU32_TRACE_PTX))?;
         let dvrm_trace = ctx.load_module(Ptx::from_src(DVRM_TRACE_PTX))?;
+        let memw_trace = ctx.load_module(Ptx::from_src(MEMW_TRACE_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -398,6 +403,7 @@ impl Backend {
                 .load_function("generate_branch_trace_rows")?,
             generate_cpu32_trace_rows: cpu32_trace.load_function("generate_cpu32_trace_rows")?,
             generate_dvrm_trace_rows: dvrm_trace.load_function("generate_dvrm_trace_rows")?,
+            generate_memw_trace_rows: memw_trace.load_function("generate_memw_trace_rows")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
