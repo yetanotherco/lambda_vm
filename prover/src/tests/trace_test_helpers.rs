@@ -14,10 +14,10 @@ use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 
 use crate::Error;
+use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise::cols;
 use crate::tables::trace_builder::Traces;
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
-use crate::tables::MaxRowsConfig;
 
 /// Removes rows where all multiplicity columns are zero (TEST ONLY).
 ///
