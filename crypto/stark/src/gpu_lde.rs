@@ -88,6 +88,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_CPU_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_BRANCH_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_CPU32_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_DVRM_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -312,6 +313,32 @@ pub fn gpu_branch_trace_calls() -> u64 {
 pub(crate) static GPU_CPU32_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_cpu32_trace_calls() -> u64 {
     GPU_CPU32_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// DVRM-table GPU dispatch counter.
+pub(crate) static GPU_DVRM_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_dvrm_trace_calls() -> u64 {
+    GPU_DVRM_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU DVRM trace generator. CPU has
+/// already deduped (3-field 129-bit key); caller packs each unique row's
+/// `(n, d, flags, mu_q, mu_r)`.
+pub fn try_generate_dvrm_trace_gpu_raw(
+    num_rows: usize,
+    ns: &[u64],
+    ds: &[u64],
+    flags: &[u64],
+    mu_qs: &[u64],
+    mu_rs: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::dvrm_trace::generate_dvrm_trace_dev(
+        num_rows, ns, ds, flags, mu_qs, mu_rs, num_cols,
+    )
+    .ok()?;
+    GPU_DVRM_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 /// Prover-crate wrapper for the GPU CPU32 trace generator. Caller packs
@@ -1567,6 +1594,13 @@ pub fn schedule_branch_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_cpu32_trace_fault(n_calls_until_err: i64) {
     math_cuda::cpu32_trace::FAULT_CPU32_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_dvrm_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_dvrm_trace_fault(n_calls_until_err: i64) {
+    math_cuda::dvrm_trace::FAULT_DVRM_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 

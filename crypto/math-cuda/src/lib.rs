@@ -17,6 +17,7 @@ pub mod bytewise_trace;
 pub mod cpu32_trace;
 pub mod cpu_trace;
 pub mod decode_trace;
+pub mod dvrm_trace;
 pub mod load_trace;
 pub mod lt_trace;
 pub mod memw_aligned_trace;
