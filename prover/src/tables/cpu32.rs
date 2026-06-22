@@ -197,6 +197,15 @@ pub fn generate_cpu32_trace(
     operations: &[Cpu32Operation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack each op's scalars and bit-packed flags into
+    // seven parallel u64 arrays; kernel computes signs/arg1/arg2/rvd +
+    // row layout.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_cpu32_trace_gpu(operations, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -256,6 +265,62 @@ pub fn generate_cpu32_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_cpu32_trace`. Bit-packs each op's
+/// rs1/rs2/rd/half_il + alu_flags + 6 control bits into a single u64
+/// alongside the scalar values, and lets the kernel compute the
+/// signed/sign-extension aux columns.
+#[cfg(feature = "cuda")]
+fn try_generate_cpu32_trace_gpu(
+    operations: &[Cpu32Operation],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut timestamps = vec![0u64; num_rows];
+    let mut pcs = vec![0u64; num_rows];
+    let mut rv1s = vec![0u64; num_rows];
+    let mut rv2s = vec![0u64; num_rows];
+    let mut imms = vec![0u64; num_rows];
+    let mut ress = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+
+    for (i, op) in operations.iter().enumerate() {
+        timestamps[i] = op.timestamp;
+        pcs[i] = op.pc;
+        rv1s[i] = op.rv1;
+        rv2s[i] = op.rv2;
+        imms[i] = op.imm;
+        ress[i] = op.res;
+
+        let mut f: u64 = 0;
+        f |= (op.rs1 as u64) & 0xFF;
+        f |= ((op.rs2 as u64) & 0xFF) << 8;
+        f |= ((op.rd as u64) & 0xFF) << 16;
+        f |= ((op.half_instruction_length as u64) & 0xFF) << 24;
+        f |= ((op.alu_flags as u64) & 0xFF) << 32;
+        f |= (op.read_register1 as u64) << 40;
+        f |= (op.read_register2 as u64) << 41;
+        f |= (op.write_register as u64) << 42;
+        f |= (op.alu as u64) << 43;
+        f |= (op.add as u64) << 44;
+        f |= (op.sub as u64) << 45;
+        f |= 1u64 << 46; // active
+        flags[i] = f;
+    }
+
+    let raw = stark::gpu_lde::try_generate_cpu32_trace_gpu_raw(
+        num_rows,
+        &timestamps,
+        &pcs,
+        &rv1s,
+        &rv2s,
+        &imms,
+        &ress,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================

@@ -14,6 +14,7 @@ pub mod merkle;
 pub mod bitwise_trace;
 pub mod branch_trace;
 pub mod bytewise_trace;
+pub mod cpu32_trace;
 pub mod cpu_trace;
 pub mod decode_trace;
 pub mod load_trace;
