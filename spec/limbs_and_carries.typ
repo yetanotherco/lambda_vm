@@ -6,6 +6,7 @@
 // Theorem/lemma formatting
 #show: thmrules.with(qed-symbol: $square$)
 #let lemma = thmbox("lemma", "Lemma", fill: rgb("#eee"),base_level: 0)
+#let corollary = thmbox("lemma", "Corrollary", fill: rgb("#eee"), base_level: 0)
 #let proof = thmproof("proof", "Proof")
 
 // Equation formatting
@@ -183,14 +184,16 @@ Moreover, $c_(2n) <= floor.l (mu - delta') dot L^(-1) floor.r = 0$ since $mu in 
 Applying this to @lm:wi_decomp_f, we conclude that $(w_0, w_1, ..., w_(2n-1)) in [L]^(2n)$ is the unique limb decomposition
 of $f_(alpha, mu) (x, y, z)$ when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$; for larger values of $mu$, an extra limb $w_(2n) := c_(2n)$ must be included.
 
-Combining both bounds, we find that
+#corollary[
+Combining both bounds, we find that for $alpha in [L]$ and $mu in [L/2]$,
 $
-&max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
+c_i <= &max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
   &max_(k in [n]) #h(1em) mu (2n-k-1)(L-2) + mu (2n-k) - delta')\
 &= max(& mu n (L-1) + alpha - mu - delta, mu (2n-1)(L-2) + 2 mu n - delta')\
 &= mu n (L-1) + alpha - mu - delta
 $
-acts as an upper bound on all carry elements when $alpha in [L]$ and $mu in [L/2]$.
+for all $i <= 2n$.
+]
 
 
 = Proof of Correctness
