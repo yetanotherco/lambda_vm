@@ -10,8 +10,8 @@ use crate::{
     prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
     test_utils::multi_prove_ram,
     tests::domain_cache_stats,
-    trace::{LDETraceTable, get_trace_evaluations_from_lde},
     tests::trace_test_helpers::get_trace_evaluations,
+    trace::{LDETraceTable, get_trace_evaluations_from_lde},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
 };

@@ -54,8 +54,9 @@ fn test_table_spill_empty_is_noop() {
 
 #[test]
 fn test_table_spill_idempotent() {
-    let data: Vec<math::field::element::FieldElement<F>> =
-        (0..16).map(|i| math::field::element::FieldElement::<F>::from(i as u64)).collect();
+    let data: Vec<math::field::element::FieldElement<F>> = (0..16)
+        .map(|i| math::field::element::FieldElement::<F>::from(i as u64))
+        .collect();
     let mut table = Table::new(data, 4);
 
     table.spill_to_disk().expect("first spill failed");
@@ -65,8 +66,14 @@ fn test_table_spill_idempotent() {
     assert!(table.mmap_backing.is_some());
 
     // Still readable
-    assert_eq!(table.get(0, 0), &math::field::element::FieldElement::<F>::from(0u64));
-    assert_eq!(table.get(3, 3), &math::field::element::FieldElement::<F>::from(15u64));
+    assert_eq!(
+        table.get(0, 0),
+        &math::field::element::FieldElement::<F>::from(0u64)
+    );
+    assert_eq!(
+        table.get(3, 3),
+        &math::field::element::FieldElement::<F>::from(15u64)
+    );
 }
 
 #[test]

@@ -1,5 +1,5 @@
 use crate::table::Table;
-use crate::trace::{compute_frame_evaluation_points, TraceTable};
+use crate::trace::{TraceTable, compute_frame_evaluation_points};
 use itertools::Itertools;
 use math::field::{
     element::FieldElement,
@@ -8,7 +8,7 @@ use math::field::{
 use math::polynomial::Polynomial;
 
 #[cfg(feature = "parallel")]
-use rayon::prelude::IntoParallelRefIterator;
+use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
 /// Reference Horner-based trace-evaluation used as an oracle by the prover
 /// tests (`tests::prover_tests`). The production prover uses the LDE-based

@@ -396,4 +396,3 @@ where
         &self.aux_data[row][col]
     }
 }
-
