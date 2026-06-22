@@ -7,7 +7,7 @@ use crate::{
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     },
     proof::options::ProofOptions,
-    prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
+    prover::{IsStarkProver, LdeTwiddles, Prover, evaluate_polynomial_on_lde_domain},
     test_utils::multi_prove_ram,
     tests::domain_cache_stats,
     trace::{LDETraceTable, get_trace_evaluations, get_trace_evaluations_from_lde},
@@ -20,6 +20,42 @@ use math::{
 };
 
 type Felt = FieldElement<GoldilocksField>;
+
+/// The fused composition half-extension (`extend_half_to_lde`) must produce exactly
+/// the same g-coset evaluations as the reference it replaces: iFFT on the g²-coset →
+/// coefficients → evaluate on the g-coset LDE. Both yield the unique degree-`<n`
+/// polynomial evaluated on the g-coset of size `2n`, so they must be byte-identical.
+#[test]
+fn composition_extend_half_fused_matches_reference() {
+    use math::fft::bowers_fft::LayerTwiddles;
+    type F = GoldilocksField;
+
+    let g = Felt::from(3); // any non-zero coset offset
+    let g2 = &g * &g;
+
+    for n in [4usize, 8, 16, 32] {
+        let half: Vec<Felt> = (0..n).map(|i| Felt::from((i as u64) * 7 + 1)).collect();
+
+        // Reference: iFFT(g²) → coeffs → evaluate on the g-coset of size 2n.
+        let poly = Polynomial::interpolate_offset_fft(&half, &g2).unwrap();
+        let reference = evaluate_polynomial_on_lde_domain(&poly, 2, n, &g).unwrap();
+
+        // Fused: coset_lde_full with weights wⱼ = g⁻ʲ / n.
+        let n_inv = Felt::from(n as u64).inv().unwrap();
+        let g_inv = g.inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut w = n_inv;
+        for _ in 0..n {
+            weights.push(w.clone());
+            w = &w * &g_inv;
+        }
+        let inv = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd = LayerTwiddles::<F>::new((2 * n).trailing_zeros() as u64).unwrap();
+        let fused = Polynomial::coset_lde_full::<F>(&half, 2, &weights, &inv, &fwd).unwrap();
+
+        assert_eq!(reference, fused, "mismatch at n={n}");
+    }
+}
 
 #[test]
 fn test_domain_constructor() {
@@ -234,6 +270,7 @@ fn test_decompose_and_extend_d2_matches_original() {
     let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
         &constraint_evaluations,
         &domain,
+        &LdeTwiddles::new(&domain),
     );
 
     assert_eq!(new_result.len(), 2);
