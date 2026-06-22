@@ -242,8 +242,8 @@ fn decode_commitment_zero_bytes_rejects() {
 /// AIR or FFT pipeline changes, this drifts and the test fails —
 /// regenerate via the `print_decode_commitment_for_sub` helper below.
 const SUB_DECODE_COMMITMENT_BLOWUP_2: [u8; 32] = [
-    0x9b, 0x94, 0x41, 0x2d, 0xf0, 0x7f, 0xde, 0x2a, 0x0c, 0x31, 0x99, 0x79, 0x43, 0xef, 0x8b, 0xc1,
-    0x57, 0x05, 0x5f, 0xc6, 0x34, 0x22, 0x06, 0x06, 0x7c, 0x31, 0x73, 0xa0, 0x3b, 0xd8, 0xe3, 0x95,
+    0xe9, 0x71, 0x68, 0xd6, 0x2e, 0xb1, 0xf6, 0x56, 0x61, 0x9d, 0x04, 0x6e, 0x65, 0xed, 0x63, 0x4a,
+    0x27, 0xa3, 0x4d, 0xcb, 0x6c, 0x02, 0x11, 0xd7, 0x65, 0xc9, 0xc9, 0xfd, 0x59, 0x34, 0x41, 0x5f,
 ];
 
 #[test]
@@ -251,16 +251,6 @@ fn decode_commitment_compile_time_const_accepts() {
     let elf_bytes = asm_elf_bytes("sub");
     let vm_proof = prove(&elf_bytes).expect("prove failed");
     let options = GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 valid");
-
-    // TEMP(ci-regen): surface the actual row-pair decode commitment computed from
-    // CI's sub.elf so SUB_DECODE_COMMITMENT_BLOWUP_2 can be regenerated. Remove.
-    {
-        let elf = Elf::load(&elf_bytes).expect("ELF load");
-        eprintln!(
-            "ACTUAL_SUB_DECODE_COMMITMENT_BLOWUP_2 = {:02x?}",
-            commitment_from_elf(&elf, &options).expect("decode commitment")
-        );
-    }
 
     // Pass the OFFLINE-COMPUTED const directly — mimics the recursion guest's
     // workflow where the value lives in the caller's compiled binary.
