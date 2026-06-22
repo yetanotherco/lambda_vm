@@ -4,6 +4,7 @@ import sys
 import tomllib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Never, Optional, Self
 
@@ -1040,26 +1041,33 @@ class Chip:
             with reporter.context(repr(c)):
                 yield from c.typecheck(env)
 
+    def padding_assignment(self) -> dict[str, Type]:
+        env = Environment(self.config, {}, {})
+        res = {}
+        for v in self.variables:
+            if not isinstance(v, VirtualVariable):
+                t = v.type
+                if isinstance(t, list) and len(t) == 1:
+                    t = t[0]
+                res[v.name] = CastExpr(v.pad, t).typecheck(env)
+        return res
+
     def check_assignment(
         self,
-        template_checkers: dict[str, "TemplateChecker"],
-        values: Optional[dict[str, Type]] = None,
+        chip_and_assigner_for_tag: dict[str, tuple[Self, "SigAssigner"]],
+        values: dict[str, Type],
     ):
+        reporter.asserts(
+            set(values.keys()) <= set(v.name for v in self.variables if not isinstance(v, VirtualVariable)),
+            f"Passing unrecognized variable to `check_assignment` of chip {self.name!r}",
+        )
         env = Environment(self.config, {}, {})
-        if values is None:
-            for v in self.variables:
-                if not isinstance(v, VirtualVariable):
-                    t = v.type
-                    if isinstance(t, list) and len(t) == 1:
-                        t = t[0]
-                    env.valmap[v.name] = CastExpr(v.pad, t).typecheck(env)
-        else:
-            for v in self.variables:
-                if not isinstance(v, VirtualVariable):
-                    if v.name not in values:
-                        reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
-                        return
-                    env.valmap[v.name] = values[v.name]
+        for v in self.variables:
+            if not isinstance(v, VirtualVariable):
+                if v.name not in values:
+                    reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
+                    return
+                env.valmap[v.name] = values[v.name]
         for v in self.variables:
             if isinstance(v, VirtualVariable):
                 v.populate_env(env)
@@ -1067,9 +1075,10 @@ class Chip:
         for c in self.constraints:
             for sig in c.typecheck(env):
                 # Recurse on templates
-                if isinstance(sig, TemplateSignature) and sig.tag in template_checkers:
+                if isinstance(sig, TemplateSignature) and sig.tag in chip_and_assigner_for_tag:
                     with reporter.context(repr(c)):
-                        template_checkers[sig.tag](template_checkers, sig.condition, sig.input, sig.output)
+                        template, assigner = chip_and_assigner_for_tag[sig.tag]
+                        template.check_assignment(chip_and_assigner_for_tag, assigner(sig))
 
 
 def build_signature(config: Config, data: dict) -> Signature:
@@ -1110,33 +1119,30 @@ def check_signatures(found: Iterable[Signature], expected: list[Signature]):
         reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
 
 
-# A Function taking a mapping of available templates (for recursive expansion),
-# an optional condition variable, a list of inputs and an output,
-# and checks that it satisfies the template the checker represents.
-type TemplateChecker = Callable[[dict[str, TemplateChecker], Optional[Type], list[Type], Optional[Type]], None]
+type SigAssigner = Callable[[Signature], dict[str, Type]]
 
-def build_template_checker(chip: Chip) -> TemplateChecker:
-    def check(template_checkers: dict[str, TemplateChecker], cond: Optional[Type], input: list[Type], output: Optional[Type]) -> None:
-        input = input[:]
-        values = {}
-        for v in chip.variables:
-            match v.category:
-                case "input":
-                    values[v.name] = input.pop(0)
-                case "output":
-                    if output is None:
-                        reporter.error(f"No output available for template output variable {v.name!r}")
-                        return
-                    values[v.name] = output
-                case "condition":
-                    values[v.name] = cond if cond else Range.const(1)
-                case "virtual":
-                    pass
-                case other:
-                    reporter.error(f"Cannot check template with variable of category {other!r}")
-        chip.check_assignment(template_checkers, values)
 
-    return check
+def sig_to_assignment(sig: Signature, chip: Chip) -> dict[str, Type]:
+    input = sig.input[:]
+    output = sig.output
+    cond = sig.condition
+    values = {}
+    for v in chip.variables:
+        match v.category:
+            case "input":
+                values[v.name] = input.pop(0)
+            case "output":
+                if output is None:
+                    reporter.error(f"No output available for template output variable {v.name!r}")
+                    return {}
+                values[v.name] = output
+            case "condition":
+                values[v.name] = cond if cond else Range.const(1)
+            case "virtual":
+                pass
+            case other:
+                reporter.error(f"Cannot check template with variable of category {other!r}")
+    return values
 
 
 if __name__ == "__main__":
@@ -1147,19 +1153,25 @@ if __name__ == "__main__":
 
     reported = False
     chips: list[Chip] = []
-    template_checkers: dict[str, TemplateChecker] = {}
+    chip_and_assigner_for_tag: dict[str, tuple[Chip, SigAssigner]] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
         chip = Chip.from_file(config, file)
         chips.append(chip)
-        template_checkers[chip.name] = build_template_checker(chip)
+        chip_and_assigner_for_tag[chip.name] = (chip, partial(sig_to_assignment, chip=chip))
         reported |= reporter.reported
     if reported:
         sys.exit(1)
 
-    if "ADD" in template_checkers:
-        template_checkers["SUB"] = lambda checkers, cond, input, output: checkers["ADD"](checkers, cond, [output, input[1]], input[0])
+    if "ADD" in chip_and_assigner_for_tag:
+        add, add_assigner = chip_and_assigner_for_tag["ADD"]
+        chip_and_assigner_for_tag["SUB"] = (
+            add,
+            lambda sig: add_assigner(
+                TemplateSignature(sig.tag, sig.condition, [sig.input[0], sig.output], sig.input[1])
+            ),
+        )
 
     for chip in chips:
         reporter.update_location(f"Chip {chip.name}")
@@ -1167,7 +1179,7 @@ if __name__ == "__main__":
         reported |= reporter.reported
     for chip in chips:
         reporter.update_location(f"Padding {chip.name}")
-        chip.check_assignment(template_checkers)
+        chip.check_assignment(chip_and_assigner_for_tag, chip.padding_assignment())
         reported |= reporter.reported
     if reported:
         sys.exit(1)
