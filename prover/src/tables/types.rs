@@ -32,6 +32,28 @@ pub type FE = FieldElement<GoldilocksField>;
 /// Field element in the Goldilocks extension field
 pub type FEE = FieldElement<GoldilocksExtension>;
 
+/// Decompose a `u64` into its two little-endian 32-bit limbs as field elements:
+/// `[x[0..32], x[32..64]]` (the `DWordWL` column encoding).
+///
+/// Lives in the prover (not the generic `Table`) because the decomposition is
+/// field-size-specific: a 32-bit limb only fits because Goldilocks is ~64-bit.
+#[inline]
+pub fn dword_wl(x: u64) -> [FE; 2] {
+    [FE::from(x & 0xFFFF_FFFF), FE::from(x >> 32)]
+}
+
+/// Decompose a `u64` into its four little-endian 16-bit limbs as field elements:
+/// `[x[0..16], x[16..32], x[32..48], x[48..64]]` (the `DWordHL` column encoding).
+#[inline]
+pub fn dword_hl(x: u64) -> [FE; 4] {
+    [
+        FE::from(x & 0xFFFF),
+        FE::from((x >> 16) & 0xFFFF),
+        FE::from((x >> 32) & 0xFFFF),
+        FE::from((x >> 48) & 0xFFFF),
+    ]
+}
+
 /// Bus identifiers for LogUp interactions between tables.
 ///
 /// Each bus connects senders (tables that produce values) with receivers

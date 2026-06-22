@@ -29,7 +29,7 @@ use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
 use super::page::STACK_TOP;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 
 // =========================================================================
 // Constants
@@ -170,8 +170,9 @@ pub fn generate_register_trace(
         };
 
         data[base + cols::FINI] = FE::from(fini_value as u64);
-        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+        let [ts_lo, ts_hi] = dword_wl(timestamp);
+        data[base + cols::TIMESTAMP_LO] = ts_lo;
+        data[base + cols::TIMESTAMP_HI] = ts_hi;
     }
 
     // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES): set TIMESTAMP_LO=1 so

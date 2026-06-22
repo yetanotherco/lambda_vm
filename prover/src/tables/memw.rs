@@ -36,7 +36,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_wl};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW table chunk.
@@ -185,8 +185,9 @@ pub fn generate_memw_trace(
 
         // base_address as DWordWL (2 words)
         let base_addr_lo = op.base_address & 0xFFFF_FFFF;
-        data[base + cols::BASE_ADDRESS_0] = FE::from(base_addr_lo);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+        let [ba0, ba1] = dword_wl(op.base_address);
+        data[base + cols::BASE_ADDRESS_0] = ba0;
+        data[base + cols::BASE_ADDRESS_1] = ba1;
 
         // value[8]
         for i in 0..8 {
@@ -194,8 +195,9 @@ pub fn generate_memw_trace(
         }
 
         // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
 
         // write flags
         let (w2, w4, w8) = op.write_flags();

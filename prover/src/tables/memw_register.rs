@@ -46,7 +46,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::memw::MemwOperation;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 
 // =========================================================================
 // Column indices (10 columns)
@@ -119,8 +119,9 @@ pub fn generate_memw_register_trace(
         data[base + cols::ADDRESS] = FE::from(op.base_address / 2);
 
         // Timestamp split into lo/hi 32-bit words
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
 
         // Value: registers are DWordWL = 2 words
         data[base + cols::VAL_0] = FE::from(op.value[0]);

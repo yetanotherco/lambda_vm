@@ -25,7 +25,8 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, packed_decode_shrunk,
+    BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, dword_hl, dword_wl,
+    packed_decode_shrunk,
 };
 use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
 
@@ -204,10 +205,12 @@ pub fn generate_cpu32_trace(
         let aux = op.compute_aux();
 
         // Inputs
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
+        let [pc0, pc1] = dword_wl(op.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
 
         // rv1 as DWordWHH: [Half, Half, Word]
         data[base + cols::RS1] = FE::from(op.rs1 as u64);
@@ -216,8 +219,9 @@ pub fn generate_cpu32_trace(
         data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF);
         data[base + cols::RV1_2] = FE::from(op.rv1 >> 32);
         data[base + cols::RV1_SIGN] = FE::from(aux.rv1_sign as u64);
-        data[base + cols::ARG1_0] = FE::from(aux.arg1 & 0xFFFF_FFFF);
-        data[base + cols::ARG1_1] = FE::from(aux.arg1 >> 32);
+        let [arg1_0, arg1_1] = dword_wl(aux.arg1);
+        data[base + cols::ARG1_0] = arg1_0;
+        data[base + cols::ARG1_1] = arg1_1;
 
         // rv2 as DWordWHH
         data[base + cols::RS2] = FE::from(op.rs2 as u64);
@@ -226,23 +230,27 @@ pub fn generate_cpu32_trace(
         data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF);
         data[base + cols::RV2_2] = FE::from(op.rv2 >> 32);
         data[base + cols::RV2_SIGN] = FE::from(aux.rv2_sign as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::ARG2_0] = FE::from(aux.arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(aux.arg2 >> 32);
+        let [imm0, imm1] = dword_wl(op.imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
+        let [arg2_0, arg2_1] = dword_wl(aux.arg2);
+        data[base + cols::ARG2_0] = arg2_0;
+        data[base + cols::ARG2_1] = arg2_1;
 
         // res as DWordHL: 4 halves
-        data[base + cols::RES_0] = FE::from(op.res & 0xFFFF);
-        data[base + cols::RES_1] = FE::from((op.res >> 16) & 0xFFFF);
-        data[base + cols::RES_2] = FE::from((op.res >> 32) & 0xFFFF);
-        data[base + cols::RES_3] = FE::from((op.res >> 48) & 0xFFFF);
+        let [res0, res1, res2, res3] = dword_hl(op.res);
+        data[base + cols::RES_0] = res0;
+        data[base + cols::RES_1] = res1;
+        data[base + cols::RES_2] = res2;
+        data[base + cols::RES_3] = res3;
         data[base + cols::RES_SIGN] = FE::from(aux.res_sign as u64);
 
         // rd write
         data[base + cols::RD] = FE::from(op.rd as u64);
         data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
-        data[base + cols::RVD_0] = FE::from(aux.rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(aux.rvd >> 32);
+        let [rvd0, rvd1] = dword_wl(aux.rvd);
+        data[base + cols::RVD_0] = rvd0;
+        data[base + cols::RVD_1] = rvd1;
 
         // ALU control
         data[base + cols::ALU] = FE::from(op.alu as u64);

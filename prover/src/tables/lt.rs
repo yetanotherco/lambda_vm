@@ -33,7 +33,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, dword_hl};
 
 // =========================================================================
 // Column indices for LT table
@@ -204,14 +204,11 @@ pub fn generate_lt_trace(
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
 
         // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
-        let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
-        let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
-        let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
-        let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
-        data[base + cols::LHS_SUB_RHS_0] = FE::from(sub_0 as u64);
-        data[base + cols::LHS_SUB_RHS_1] = FE::from(sub_1 as u64);
-        data[base + cols::LHS_SUB_RHS_2] = FE::from(sub_2 as u64);
-        data[base + cols::LHS_SUB_RHS_3] = FE::from(sub_3 as u64);
+        let [sub0, sub1, sub2, sub3] = dword_hl(lhs_sub_rhs);
+        data[base + cols::LHS_SUB_RHS_0] = sub0;
+        data[base + cols::LHS_SUB_RHS_1] = sub1;
+        data[base + cols::LHS_SUB_RHS_2] = sub2;
+        data[base + cols::LHS_SUB_RHS_3] = sub3;
 
         // Compute MSBs (bit 63 of each value)
         let lhs_msb = (op.lhs >> 63) & 1;

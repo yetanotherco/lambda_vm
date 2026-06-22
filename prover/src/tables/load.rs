@@ -30,7 +30,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 
 // =========================================================================
 // Column indices for LOAD table
@@ -190,12 +190,14 @@ pub fn generate_load_trace(
 
         // Input columns
         // base_address as DWordWL (2 words)
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+        let [ba0, ba1] = dword_wl(op.base_address);
+        data[base + cols::BASE_ADDRESS_0] = ba0;
+        data[base + cols::BASE_ADDRESS_1] = ba1;
 
         // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
 
         // read flags
         let (r2, r4, r8) = op.read_flags();

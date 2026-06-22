@@ -23,7 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_hl, dword_wl};
 use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
 // =========================================================================
@@ -109,8 +109,9 @@ pub fn generate_keccak_trace(
         let base = row_idx * cols::NUM_COLUMNS;
 
         // Timestamp
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
 
         // Address as 8 bytes
         for b in 0..8 {
@@ -143,10 +144,11 @@ pub fn generate_keccak_trace(
                 .state_addr
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
-            data[base + cols::state_ptr(lane_idx, 0)] = FE::from(ptr & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 1)] = FE::from((ptr >> 16) & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 2)] = FE::from((ptr >> 32) & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 3)] = FE::from((ptr >> 48) & 0xFFFF);
+            let [p0, p1, p2, p3] = dword_hl(ptr);
+            data[base + cols::state_ptr(lane_idx, 0)] = p0;
+            data[base + cols::state_ptr(lane_idx, 1)] = p1;
+            data[base + cols::state_ptr(lane_idx, 2)] = p2;
+            data[base + cols::state_ptr(lane_idx, 3)] = p3;
         }
 
         // mu = 1 (real row)

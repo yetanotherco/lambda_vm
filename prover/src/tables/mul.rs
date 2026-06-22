@@ -42,7 +42,7 @@ use stark::trace::TraceTable;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op, dword_hl,
 };
 
 /// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
@@ -318,30 +318,34 @@ pub fn generate_mul_trace(
         let (lo, hi) = op.compute_product();
 
         // Fill lhs as DWordHL (4 halfwords)
-        data[base + cols::LHS_0] = FE::from(op.lhs & 0xFFFF);
-        data[base + cols::LHS_1] = FE::from((op.lhs >> 16) & 0xFFFF);
-        data[base + cols::LHS_2] = FE::from((op.lhs >> 32) & 0xFFFF);
-        data[base + cols::LHS_3] = FE::from((op.lhs >> 48) & 0xFFFF);
+        let [lhs0, lhs1, lhs2, lhs3] = dword_hl(op.lhs);
+        data[base + cols::LHS_0] = lhs0;
+        data[base + cols::LHS_1] = lhs1;
+        data[base + cols::LHS_2] = lhs2;
+        data[base + cols::LHS_3] = lhs3;
         data[base + cols::LHS_SIGNED] = FE::from(op.lhs_signed as u64);
 
         // Fill rhs as DWordHL (4 halfwords)
-        data[base + cols::RHS_0] = FE::from(op.rhs & 0xFFFF);
-        data[base + cols::RHS_1] = FE::from((op.rhs >> 16) & 0xFFFF);
-        data[base + cols::RHS_2] = FE::from((op.rhs >> 32) & 0xFFFF);
-        data[base + cols::RHS_3] = FE::from((op.rhs >> 48) & 0xFFFF);
+        let [rhs0, rhs1, rhs2, rhs3] = dword_hl(op.rhs);
+        data[base + cols::RHS_0] = rhs0;
+        data[base + cols::RHS_1] = rhs1;
+        data[base + cols::RHS_2] = rhs2;
+        data[base + cols::RHS_3] = rhs3;
         data[base + cols::RHS_SIGNED] = FE::from(op.rhs_signed as u64);
 
         // Fill lo as DWordHL (4 halfwords)
-        data[base + cols::LO_0] = FE::from(lo & 0xFFFF);
-        data[base + cols::LO_1] = FE::from((lo >> 16) & 0xFFFF);
-        data[base + cols::LO_2] = FE::from((lo >> 32) & 0xFFFF);
-        data[base + cols::LO_3] = FE::from((lo >> 48) & 0xFFFF);
+        let [lo0, lo1, lo2, lo3] = dword_hl(lo);
+        data[base + cols::LO_0] = lo0;
+        data[base + cols::LO_1] = lo1;
+        data[base + cols::LO_2] = lo2;
+        data[base + cols::LO_3] = lo3;
 
         // Fill hi as DWordHL (4 halfwords)
-        data[base + cols::HI_0] = FE::from(hi & 0xFFFF);
-        data[base + cols::HI_1] = FE::from((hi >> 16) & 0xFFFF);
-        data[base + cols::HI_2] = FE::from((hi >> 32) & 0xFFFF);
-        data[base + cols::HI_3] = FE::from((hi >> 48) & 0xFFFF);
+        let [hi0, hi1, hi2, hi3] = dword_hl(hi);
+        data[base + cols::HI_0] = hi0;
+        data[base + cols::HI_1] = hi1;
+        data[base + cols::HI_2] = hi2;
+        data[base + cols::HI_3] = hi3;
 
         // Fill auxiliary columns
         data[base + cols::LHS_IS_NEGATIVE] = FE::from(op.lhs_is_negative() as u64);

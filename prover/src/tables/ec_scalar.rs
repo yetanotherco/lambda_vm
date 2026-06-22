@@ -23,7 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 use crate::constraints::templates::new_is_bit_constraints;
 
 // =========================================================================
@@ -91,10 +91,12 @@ pub fn generate_ec_scalar_trace(
 
     for (row_idx, op) in ops.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::PTR_0] = FE::from(op.ptr & 0xFFFF_FFFF);
-        data[base + cols::PTR_1] = FE::from(op.ptr >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
+        let [p0, p1] = dword_wl(op.ptr);
+        data[base + cols::PTR_0] = p0;
+        data[base + cols::PTR_1] = p1;
         data[base + cols::OFFSET] = FE::from(op.offset as u64);
         for i in 0..8 {
             data[base + cols::limb_bit(i)] = FE::from(((op.limb >> i) & 1) as u64);

@@ -42,7 +42,7 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 
 // Re-export DecodeEntry from types for backwards compatibility
 pub use super::types::DecodeEntry;
@@ -135,15 +135,17 @@ pub fn generate_decode_trace(
         let base = row_idx * cols::NUM_COLUMNS;
 
         // PC as DWordWL
-        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
+        let [pc0, pc1] = dword_wl(entry.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
 
         // packed_decode
         data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
 
         // imm as DWordWL
-        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+        let [imm0, imm1] = dword_wl(entry.imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
 
         // MU = 0 (already zero from vec initialization)
     }
@@ -151,24 +153,28 @@ pub fn generate_decode_trace(
     // Write CPU padding entry (pc=1, all flags=0)
     {
         let base = cpu_padding_row * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        let [pc0, pc1] = dword_wl(cpu_padding_entry.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
         data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+        let [imm0, imm1] = dword_wl(cpu_padding_entry.imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
     }
 
     // Fill padding rows with the DECODE padding pattern: odd pc=1, all flags 0
     // (unprovable as a fetch target; same row the CPU pads to).
     let padding_entry = DecodeEntry::padding_entry();
+    let [pad_pc0, pad_pc1] = dword_wl(padding_entry.pc);
+    let [pad_imm0, pad_imm1] = dword_wl(padding_entry.imm);
     for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
 
-        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
+        data[base + cols::PC_0] = pad_pc0;
+        data[base + cols::PC_1] = pad_pc1;
         data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+        data[base + cols::IMM_0] = pad_imm0;
+        data[base + cols::IMM_1] = pad_imm1;
         // MU = 0 for padding rows (already zero from vec initialization)
     }
 
@@ -407,32 +413,38 @@ fn build_decode_table(
     // Fill actual entries
     for (row_idx, entry) in entries.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
+        let [pc0, pc1] = dword_wl(entry.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
         data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+        let [imm0, imm1] = dword_wl(entry.imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
     }
 
     // Write CPU padding entry
     {
         let base = cpu_padding_row * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
+        let [pc0, pc1] = dword_wl(cpu_padding_entry.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
         data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+        let [imm0, imm1] = dword_wl(cpu_padding_entry.imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
     }
 
     // Fill padding rows with DECODE padding pattern
     let padding_entry = DecodeEntry::padding_entry();
+    let [pad_pc0, pad_pc1] = dword_wl(padding_entry.pc);
+    let [pad_imm0, pad_imm1] = dword_wl(padding_entry.imm);
     for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
+        data[base + cols::PC_0] = pad_pc0;
+        data[base + cols::PC_1] = pad_pc1;
         data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+        data[base + cols::IMM_0] = pad_imm0;
+        data[base + cols::IMM_1] = pad_imm1;
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)

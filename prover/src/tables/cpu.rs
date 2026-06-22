@@ -24,7 +24,9 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{
+    BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_wl,
+};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -451,8 +453,9 @@ pub fn generate_cpu_trace(
         let effective = |flag: bool| (!word && flag) as u64;
 
         data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.decode.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.decode.pc >> 32);
+        let [pc0, pc1] = dword_wl(op.decode.pc);
+        data[base + cols::PC_0] = pc0;
+        data[base + cols::PC_1] = pc1;
 
         // rs1/rs2/rd and read/write flags are only present on non-word rows.
         let (rs1, rs2, rd) = if word {
@@ -480,8 +483,9 @@ pub fn generate_cpu_trace(
             (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
         };
 
-        data[base + cols::IMM_0] = FE::from(imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(imm >> 32);
+        let [imm0, imm1] = dword_wl(imm);
+        data[base + cols::IMM_0] = imm0;
+        data[base + cols::IMM_1] = imm1;
 
         data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(f.half_instruction_length as u64);
         data[base + cols::WORD_INSTR] = FE::from(word as u64);
@@ -495,19 +499,24 @@ pub fn generate_cpu_trace(
         data[base + cols::BRANCH] = FE::from(effective(f.branch));
         data[base + cols::ECALL] = FE::from(effective(f.ecall));
 
-        data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
-        data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
+        let [npc0, npc1] = dword_wl(op.next_pc);
+        data[base + cols::NEXT_PC_0] = npc0;
+        data[base + cols::NEXT_PC_1] = npc1;
 
-        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(rvd >> 32);
+        let [rvd0, rvd1] = dword_wl(rvd);
+        data[base + cols::RVD_0] = rvd0;
+        data[base + cols::RVD_1] = rvd1;
 
         // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
-        data[base + cols::RV1_0] = FE::from(rv1 & 0xFFFF_FFFF);
-        data[base + cols::RV1_1] = FE::from(rv1 >> 32);
-        data[base + cols::RV2_0] = FE::from(rv2 & 0xFFFF_FFFF);
-        data[base + cols::RV2_1] = FE::from(rv2 >> 32);
-        data[base + cols::ARG2_0] = FE::from(arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(arg2 >> 32);
+        let [rv1_0, rv1_1] = dword_wl(rv1);
+        data[base + cols::RV1_0] = rv1_0;
+        data[base + cols::RV1_1] = rv1_1;
+        let [rv2_0, rv2_1] = dword_wl(rv2);
+        data[base + cols::RV2_0] = rv2_0;
+        data[base + cols::RV2_1] = rv2_1;
+        let [arg2_0, arg2_1] = dword_wl(arg2);
+        data[base + cols::ARG2_0] = arg2_0;
+        data[base + cols::ARG2_1] = arg2_1;
 
         // res as DWordHL (4 × 16-bit halves).
         for i in 0..4 {

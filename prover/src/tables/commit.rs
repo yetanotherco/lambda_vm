@@ -52,7 +52,7 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_hl, dword_wl};
 
 // =========================================================================
 // Column indices for COMMIT table
@@ -170,26 +170,30 @@ pub fn generate_commit_trace(
         let base = row_idx * cols::NUM_COLUMNS;
 
         // Timestamp (DWordWL)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        let [ts0, ts1] = dword_wl(op.timestamp);
+        data[base + cols::TIMESTAMP_0] = ts0;
+        data[base + cols::TIMESTAMP_1] = ts1;
 
         // Index (BaseField)
         data[base + cols::INDEX] = FE::from(op.index);
 
         // Address (DWordWL)
-        data[base + cols::ADDRESS_0] = FE::from(op.address & 0xFFFF_FFFF);
-        data[base + cols::ADDRESS_1] = FE::from(op.address >> 32);
+        let [addr0, addr1] = dword_wl(op.address);
+        data[base + cols::ADDRESS_0] = addr0;
+        data[base + cols::ADDRESS_1] = addr1;
 
         // address_incr = address + 1 (DWordHL: 4 halfwords)
         let address_incr = op.address.wrapping_add(1);
-        data[base + cols::ADDRESS_INCR_0] = FE::from(address_incr & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_1] = FE::from((address_incr >> 16) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_2] = FE::from((address_incr >> 32) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_3] = FE::from((address_incr >> 48) & 0xFFFF);
+        let [ai0, ai1, ai2, ai3] = dword_hl(address_incr);
+        data[base + cols::ADDRESS_INCR_0] = ai0;
+        data[base + cols::ADDRESS_INCR_1] = ai1;
+        data[base + cols::ADDRESS_INCR_2] = ai2;
+        data[base + cols::ADDRESS_INCR_3] = ai3;
 
         // Count (DWordWL)
-        data[base + cols::COUNT_0] = FE::from(op.count & 0xFFFF_FFFF);
-        data[base + cols::COUNT_1] = FE::from(op.count >> 32);
+        let [cnt0, cnt1] = dword_wl(op.count);
+        data[base + cols::COUNT_0] = cnt0;
+        data[base + cols::COUNT_1] = cnt1;
 
         // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
         let count_decr = if op.count == 0 {
@@ -197,10 +201,11 @@ pub fn generate_commit_trace(
         } else {
             op.count - 1
         };
-        data[base + cols::COUNT_DECR_0] = FE::from(count_decr & 0xFFFF);
-        data[base + cols::COUNT_DECR_1] = FE::from((count_decr >> 16) & 0xFFFF);
-        data[base + cols::COUNT_DECR_2] = FE::from((count_decr >> 32) & 0xFFFF);
-        data[base + cols::COUNT_DECR_3] = FE::from((count_decr >> 48) & 0xFFFF);
+        let [cd0, cd1, cd2, cd3] = dword_hl(count_decr);
+        data[base + cols::COUNT_DECR_0] = cd0;
+        data[base + cols::COUNT_DECR_1] = cd1;
+        data[base + cols::COUNT_DECR_2] = cd2;
+        data[base + cols::COUNT_DECR_3] = cd3;
 
         // Control bits
         data[base + cols::FIRST] = FE::from(op.first as u64);

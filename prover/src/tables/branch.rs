@@ -33,7 +33,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, dword_wl};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -173,17 +173,10 @@ pub fn generate_branch_trace(
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
         let base = row_idx * cols::NUM_COLUMNS;
 
-        // Extract pc as DWordWL: [Word, Word]
-        let pc_0 = (op.pc & 0xFFFF_FFFF) as u32;
-        let pc_1 = (op.pc >> 32) as u32;
-
-        // Extract offset as DWordWL: [Word, Word]
-        let offset_0 = (op.offset & 0xFFFF_FFFF) as u32;
-        let offset_1 = (op.offset >> 32) as u32;
-
-        // Extract register as DWordWL: [Word, Word]
-        let register_0 = (op.register & 0xFFFF_FFFF) as u32;
-        let register_1 = (op.register >> 32) as u32;
+        // Extract pc, offset, register as DWordWL: [Word, Word]
+        let [pc_0, pc_1] = dword_wl(op.pc);
+        let [offset_0, offset_1] = dword_wl(op.offset);
+        let [register_0, register_1] = dword_wl(op.register);
 
         // Compute next_pc
         let next_pc_unmasked = op.compute_next_pc_unmasked();
@@ -203,12 +196,12 @@ pub fn generate_branch_trace(
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
         // Store columns
-        data[base + cols::PC_0] = FE::from(pc_0 as u64);
-        data[base + cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + cols::OFFSET_0] = FE::from(offset_0 as u64);
-        data[base + cols::OFFSET_1] = FE::from(offset_1 as u64);
-        data[base + cols::REGISTER_0] = FE::from(register_0 as u64);
-        data[base + cols::REGISTER_1] = FE::from(register_1 as u64);
+        data[base + cols::PC_0] = pc_0;
+        data[base + cols::PC_1] = pc_1;
+        data[base + cols::OFFSET_0] = offset_0;
+        data[base + cols::OFFSET_1] = offset_1;
+        data[base + cols::REGISTER_0] = register_0;
+        data[base + cols::REGISTER_1] = register_1;
         data[base + cols::JALR] = FE::from(if op.jalr { 1u64 } else { 0u64 });
         data[base + cols::NEXT_PC_HIGH_0] = FE::from(next_pc_high_0 as u64);
         data[base + cols::NEXT_PC_HIGH_1] = FE::from(next_pc_high_1 as u64);

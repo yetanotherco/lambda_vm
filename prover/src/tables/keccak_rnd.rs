@@ -33,7 +33,7 @@ use stark::constraints::transition::{TransitionConstraint, TransitionConstraintE
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_wl};
 
 // =========================================================================
 // Column indices
@@ -254,8 +254,9 @@ pub fn generate_keccak_rnd_trace(
             let base = row_idx * cols::NUM_COLUMNS;
 
             // Timestamp & round
-            data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-            data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+            let [ts0, ts1] = dword_wl(op.timestamp);
+            data[base + cols::TIMESTAMP_0] = ts0;
+            data[base + cols::TIMESTAMP_1] = ts1;
             data[base + cols::ROUND] = FE::from(round as u64);
 
             // start = current state as bytes
