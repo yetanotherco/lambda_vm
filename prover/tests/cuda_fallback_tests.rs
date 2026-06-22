@@ -15,8 +15,12 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_batch_invert_calls, gpu_decode_trace_calls, gpu_fri_calls, gpu_page_trace_calls,
-    reset_all_gpu_call_counters,
+    gpu_batch_invert_calls, gpu_bitwise_trace_calls, gpu_branch_trace_calls,
+    gpu_bytewise_trace_calls, gpu_cpu32_trace_calls, gpu_cpu_trace_calls, gpu_decode_trace_calls,
+    gpu_dvrm_trace_calls, gpu_fri_calls, gpu_keccak_trace_calls, gpu_load_trace_calls,
+    gpu_lt_trace_calls, gpu_memw_aligned_trace_calls, gpu_memw_register_trace_calls,
+    gpu_memw_trace_calls, gpu_mul_trace_calls, gpu_page_trace_calls, gpu_shift_trace_calls,
+    gpu_store_trace_calls, reset_all_gpu_call_counters,
 };
 
 /// FRI commit-phase CPU fallback: when the GPU dispatch errors after the
@@ -163,4 +167,230 @@ fn gpu_decode_trace_fault_falls_back_to_cpu() {
     );
 
     stark::gpu_lde::schedule_decode_trace_fault(-1);
+}
+
+// =============================================================================
+// PR-6 trace-expansion fallback tests (one per ported table).
+//
+// Every kernel-side wrapper in `stark::gpu_lde` returns Option<…>, and the
+// prover's `try_generate_X_trace_gpu` helper propagates None on cudarc errors
+// so the existing CPU loop runs. These tests force that path: schedule a
+// single Err from the math-cuda dispatch and assert the table's GPU counter
+// drops by exactly one (one row built on CPU) while the recovered proof
+// still verifies.
+//
+// Tables that didn't fire on the chosen ELF print a "skipping" message and
+// pass — the harness can't fault-inject what never ran. Pick an ELF that
+// exercises the target table to extend coverage. Known gaps:
+//   - ECSM has no test ELF on disk (`test_ecsm.elf` is referenced by src
+//     but the artifact is missing — same pre-existing gap as `heap_alloc`).
+// =============================================================================
+
+/// Shared fallback-test driver. Runs a clean prove, captures the table's
+/// dispatch count, then schedules a single GPU error for that table and
+/// re-proves. Asserts:
+///   1. The counter dropped by exactly 1 (one CPU fallback for that table).
+///   2. The recovered proof verifies.
+///
+/// Skips (returns OK) when the table never fires on the chosen ELF —
+/// callers can swap in a different ELF to extend coverage.
+fn fallback_for(
+    elf_name: &str,
+    table_label: &str,
+    count_fn: fn() -> u64,
+    schedule_fault: fn(i64),
+) {
+    let elf = asm_elf_bytes(elf_name);
+    reset_all_gpu_call_counters();
+    let _ = prove(&elf).expect("warm-up prove");
+    let clean = count_fn();
+    if clean == 0 {
+        eprintln!(
+            "[{table_label}] table never fired on `{elf_name}`; skipping fallback test"
+        );
+        return;
+    }
+
+    schedule_fault(1);
+    reset_all_gpu_call_counters();
+    let recovered = prove(&elf).expect("prove after fault");
+    assert_eq!(
+        count_fn(),
+        clean - 1,
+        "[{table_label}] expected exactly one GPU fallback (counter dropped by 1)",
+    );
+    assert!(
+        verify(&recovered, &elf).expect("verify recovered"),
+        "[{table_label}] post-fallback proof failed verification",
+    );
+
+    schedule_fault(-1);
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_bitwise_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "bitwise",
+        gpu_bitwise_trace_calls,
+        stark::gpu_lde::schedule_bitwise_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_load_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "load",
+        gpu_load_trace_calls,
+        stark::gpu_lde::schedule_load_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_store_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "store",
+        gpu_store_trace_calls,
+        stark::gpu_lde::schedule_store_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_bytewise_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "bytewise",
+        gpu_bytewise_trace_calls,
+        stark::gpu_lde::schedule_bytewise_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_shift_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "shift",
+        gpu_shift_trace_calls,
+        stark::gpu_lde::schedule_shift_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_memw_aligned_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "memw_aligned",
+        gpu_memw_aligned_trace_calls,
+        stark::gpu_lde::schedule_memw_aligned_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_memw_register_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "memw_register",
+        gpu_memw_register_trace_calls,
+        stark::gpu_lde::schedule_memw_register_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_lt_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "lt",
+        gpu_lt_trace_calls,
+        stark::gpu_lde::schedule_lt_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_mul_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "mul",
+        gpu_mul_trace_calls,
+        stark::gpu_lde::schedule_mul_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_cpu_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "cpu",
+        gpu_cpu_trace_calls,
+        stark::gpu_lde::schedule_cpu_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_branch_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "branch",
+        gpu_branch_trace_calls,
+        stark::gpu_lde::schedule_branch_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_cpu32_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "cpu32",
+        gpu_cpu32_trace_calls,
+        stark::gpu_lde::schedule_cpu32_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_dvrm_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "dvrm",
+        gpu_dvrm_trace_calls,
+        stark::gpu_lde::schedule_dvrm_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_memw_trace_fault_falls_back_to_cpu() {
+    fallback_for(
+        "all_instructions_64",
+        "memw",
+        gpu_memw_trace_calls,
+        stark::gpu_lde::schedule_memw_trace_fault,
+    );
+}
+
+#[test]
+#[ignore = "requires GPU + test-cuda-faults; run with --ignored --nocapture"]
+fn gpu_keccak_trace_fault_falls_back_to_cpu() {
+    // Keccak only fires when the ECALL=Keccak syscall is invoked. `test_keccak`
+    // calls keccak_permute once, so the counter starts at 1 and the fault
+    // drops it to 0.
+    fallback_for(
+        "test_keccak",
+        "keccak",
+        gpu_keccak_trace_calls,
+        stark::gpu_lde::schedule_keccak_trace_fault,
+    );
 }

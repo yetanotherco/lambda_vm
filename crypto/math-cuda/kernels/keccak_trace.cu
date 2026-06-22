@@ -82,7 +82,13 @@ extern "C" __global__ void generate_keccak_trace_rows(
         }
     }
 
-    // state_ptr[lane] = addr + 8*lane as DWordHL (4 halfwords)
+    // state_ptr[lane] = addr + 8*lane as DWordHL (4 halfwords). Wraps
+    // silently on u64 overflow, where the CPU path (`checked_add().expect()`)
+    // would panic. The executor's keccak-syscall handler rejects addresses
+    // near u64::MAX before the witness reaches the prover, so the
+    // precondition `addr + 8*24 <= u64::MAX` holds and the two paths agree.
+    // If that contract is ever broken, this kernel produces wrapped (wrong)
+    // bus tokens silently — surface the precondition explicitly there.
     #pragma unroll
     for (int lane = 0; lane < 25; ++lane) {
         uint64_t ptr = addr + (uint64_t)(lane * 8);

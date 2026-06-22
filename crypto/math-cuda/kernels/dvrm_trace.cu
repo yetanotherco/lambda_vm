@@ -36,13 +36,13 @@
 #define INT64_MIN_U  ((uint64_t)0x8000000000000000ULL)
 #define UINT64_MAX_U ((uint64_t)0xFFFFFFFFFFFFFFFFULL)
 
-// abs_value: if is_negative != 0 return (-(int64)v) as u64, else v
+// abs_value: if is_negative != 0 returns |signed(v)| as u64, else v.
+// Uses unsigned two's-complement negation `(~v) + 1`, which is defined for
+// every u64 (no signed-overflow UB on INT64_MIN, where the signed form
+// `-(int64_t)INT64_MIN` would be undefined). For INT64_MIN, ~v+1 returns
+// 2^63 — matches Rust's `(v as i64).unsigned_abs()`.
 __device__ static inline uint64_t abs_value(uint64_t v, int is_negative) {
-    if (is_negative) {
-        // Two's-complement absolute value: works for INT64_MIN too (returns 2^63).
-        return (uint64_t)(-(int64_t)v);
-    }
-    return v;
+    return is_negative ? (~v) + 1ULL : v;
 }
 
 extern "C" __global__ void generate_dvrm_trace_rows(
