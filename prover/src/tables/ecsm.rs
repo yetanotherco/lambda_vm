@@ -25,7 +25,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, dword_wl};
 use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
@@ -138,8 +138,9 @@ fn fe_from_i64(c: i64) -> FE {
 }
 
 fn write_dword_wl(data: &mut [FE], base: usize, lo_col: usize, value: u64) {
-    data[base + lo_col] = FE::from(value & 0xFFFF_FFFF);
-    data[base + lo_col + 1] = FE::from(value >> 32);
+    let [lo, hi] = dword_wl(value);
+    data[base + lo_col] = lo;
+    data[base + lo_col + 1] = hi;
 }
 
 fn write_bytes(data: &mut [FE], base: usize, col: usize, bytes: &[u8]) {

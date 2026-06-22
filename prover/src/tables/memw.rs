@@ -220,8 +220,9 @@ pub fn generate_memw_trace(
         // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
         for i in 0..8 {
             let cols_i = cols::old_timestamp(i);
-            data[base + cols_i[0]] = FE::from(op.old_timestamp[i] & 0xFFFF_FFFF);
-            data[base + cols_i[1]] = FE::from(op.old_timestamp[i] >> 32);
+            let [lo, hi] = dword_wl(op.old_timestamp[i]);
+            data[base + cols_i[0]] = lo;
+            data[base + cols_i[1]] = hi;
         }
 
         // Multiplicity

@@ -25,7 +25,7 @@
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
 use super::types::{
-    BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_wl,
+    BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op, dword_hl, dword_wl,
 };
 use crate::Error;
 use executor::vm::{
@@ -519,8 +519,8 @@ pub fn generate_cpu_trace(
         data[base + cols::ARG2_1] = arg2_1;
 
         // res as DWordHL (4 × 16-bit halves).
-        for i in 0..4 {
-            data[base + cols::RES[i]] = FE::from((res >> (i * 16)) & 0xFFFF);
+        for (&col, limb) in cols::RES.iter().zip(dword_hl(res)) {
+            data[base + col] = limb;
         }
 
         data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
