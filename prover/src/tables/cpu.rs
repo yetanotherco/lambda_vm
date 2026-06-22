@@ -439,6 +439,14 @@ pub fn generate_cpu_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
     let num_rows = n.next_power_of_two().max(4);
+
+    // GPU fast path: pack each op's pre-masked scalars into ten parallel
+    // u64 arrays; kernel does the 38-column split.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_cpu_trace_gpu(operations, n, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, op) in operations.iter().enumerate() {
@@ -546,6 +554,108 @@ pub fn generate_cpu_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_cpu_trace`. Mirrors the CPU pre-masking
+/// logic (word_instr/padding rows zero the operational columns) and packs
+/// each row into ten parallel u64 arrays. The kernel does the 38-column
+/// split with no branching.
+#[cfg(feature = "cuda")]
+fn try_generate_cpu_trace_gpu(
+    operations: &[CpuOperation],
+    n: usize,
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut timestamps = vec![0u64; num_rows];
+    let mut pcs = vec![0u64; num_rows];
+    let mut next_pcs = vec![0u64; num_rows];
+    let mut imms = vec![0u64; num_rows];
+    let mut rvds = vec![0u64; num_rows];
+    let mut rv1s = vec![0u64; num_rows];
+    let mut rv2s = vec![0u64; num_rows];
+    let mut arg2s = vec![0u64; num_rows];
+    let mut ress = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+
+    for (row_idx, op) in operations.iter().enumerate() {
+        let f = &op.decode.fields;
+        let word = f.word_instr;
+        let effective = |flag: bool| (!word && flag) as u64;
+
+        let (rs1, rs2, rd) = if word { (0u8, 0u8, 0u8) } else { (f.rs1, f.rs2, f.rd) };
+        let (imm, rvd, rv1, rv2, arg2, res) = if word {
+            (0u64, 0u64, 0u64, 0u64, 0u64, 0u64)
+        } else {
+            (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
+        };
+        let alu_flags_v = if word { 0u64 } else { f.alu_flags as u64 };
+        let mem_flags_v = if word { 0u64 } else { f.mem_flags as u64 };
+
+        timestamps[row_idx] = op.timestamp;
+        pcs[row_idx] = op.decode.pc;
+        next_pcs[row_idx] = op.next_pc;
+        imms[row_idx] = imm;
+        rvds[row_idx] = rvd;
+        rv1s[row_idx] = rv1;
+        rv2s[row_idx] = rv2;
+        arg2s[row_idx] = arg2;
+        ress[row_idx] = res;
+
+        // Inline-PC coordination columns (match the scalar logic above).
+        let pc_double_read = (!word && f.read_register1 && f.rs1 == 255) as u64;
+        let ts_lo = op.timestamp & 0xFFFF_FFFF;
+        let prev_pc_ts_borrow = if pc_double_read == 0 && ts_lo < 3 { 1 } else { 0 };
+
+        let mut packed: u64 = 0;
+        packed |= (rs1 as u64) & 0xFF;
+        packed |= ((rs2 as u64) & 0xFF) << 8;
+        packed |= ((rd as u64) & 0xFF) << 16;
+        packed |= ((f.half_instruction_length as u64) & 0xFF) << 24;
+        packed |= (alu_flags_v & 0xFF) << 32;
+        packed |= (mem_flags_v & 0xFF) << 40;
+        packed |= (word as u64) << 48;
+        packed |= effective(f.alu) << 49;
+        packed |= effective(f.add) << 50;
+        packed |= effective(f.sub) << 51;
+        packed |= effective(f.memory) << 52;
+        packed |= effective(f.branch) << 53;
+        packed |= effective(f.ecall) << 54;
+        packed |= effective(f.read_register1 && f.rs1 != 0) << 55;
+        packed |= effective(f.read_register2 && f.rs2 != 0) << 56;
+        packed |= effective(f.write_register && f.rd != 0) << 57;
+        packed |= (op.branch_cond as u64) << 58;
+        packed |= pc_double_read << 59;
+        packed |= prev_pc_ts_borrow << 60;
+        packed |= 1u64 << 61; // active
+        flags[row_idx] = packed;
+    }
+
+    // Padding rows: pc = next_pc = CPU_PADDING_PC, timestamps continue the
+    // +4 cadence from the last real row, everything else 0.
+    let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
+    for row_idx in n..num_rows {
+        let j = (row_idx - n + 1) as u64;
+        timestamps[row_idx] = last_ts + 4 * j;
+        pcs[row_idx] = CPU_PADDING_PC;
+        next_pcs[row_idx] = CPU_PADDING_PC;
+    }
+
+    let raw = stark::gpu_lde::try_generate_cpu_trace_gpu_raw(
+        num_rows,
+        &timestamps,
+        &pcs,
+        &next_pcs,
+        &imms,
+        &rvds,
+        &rv1s,
+        &rv2s,
+        &arg2s,
+        &ress,
+        &flags,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 /// Generates the CPU trace table directly from executor logs.

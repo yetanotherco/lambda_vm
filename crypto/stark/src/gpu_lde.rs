@@ -85,6 +85,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_MEMW_REGISTER_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_LT_TRACE_CALLS.store(0, Ordering::Relaxed);
     GPU_MUL_TRACE_CALLS.store(0, Ordering::Relaxed);
+    GPU_CPU_TRACE_CALLS.store(0, Ordering::Relaxed);
 }
 
 /// PAGE-table GPU dispatch counter. Incremented once per
@@ -291,6 +292,49 @@ pub fn gpu_lt_trace_calls() -> u64 {
 pub(crate) static GPU_MUL_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_mul_trace_calls() -> u64 {
     GPU_MUL_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// CPU-table GPU dispatch counter.
+pub(crate) static GPU_CPU_TRACE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_cpu_trace_calls() -> u64 {
+    GPU_CPU_TRACE_CALLS.load(Ordering::Relaxed)
+}
+
+/// Prover-crate wrapper for the GPU CPU-trace generator. Caller pre-masks
+/// word/padding overrides for the operational columns (CPU did all per-op
+/// branching already), then packs ten parallel u64 arrays.
+#[allow(clippy::too_many_arguments)]
+pub fn try_generate_cpu_trace_gpu_raw(
+    num_rows: usize,
+    timestamps: &[u64],
+    pcs: &[u64],
+    next_pcs: &[u64],
+    imms: &[u64],
+    rvds: &[u64],
+    rv1s: &[u64],
+    rv2s: &[u64],
+    arg2s: &[u64],
+    ress: &[u64],
+    flags: &[u64],
+    num_cols: usize,
+) -> Option<Vec<u64>> {
+    let raw = math_cuda::cpu_trace::generate_cpu_trace_dev(
+        num_rows,
+        timestamps,
+        pcs,
+        next_pcs,
+        imms,
+        rvds,
+        rv1s,
+        rv2s,
+        arg2s,
+        ress,
+        flags,
+        num_cols,
+    )
+    .ok()?;
+    GPU_CPU_TRACE_CALLS.fetch_add(1, Ordering::Relaxed);
+    Some(raw)
 }
 
 /// Prover-crate wrapper for the GPU MUL trace generator. CPU has already
@@ -1431,6 +1475,13 @@ pub fn schedule_lt_trace_fault(n_calls_until_err: i64) {
 #[cfg(feature = "test-cuda-faults")]
 pub fn schedule_mul_trace_fault(n_calls_until_err: i64) {
     math_cuda::mul_trace::FAULT_MUL_TRACE_REMAINING_UNTIL_ERR
+        .store(n_calls_until_err, Ordering::Relaxed);
+}
+
+/// Test-only: schedule the Nth upcoming `generate_cpu_trace_dev` call to Err.
+#[cfg(feature = "test-cuda-faults")]
+pub fn schedule_cpu_trace_fault(n_calls_until_err: i64) {
+    math_cuda::cpu_trace::FAULT_CPU_TRACE_REMAINING_UNTIL_ERR
         .store(n_calls_until_err, Ordering::Relaxed);
 }
 
