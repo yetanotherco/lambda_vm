@@ -1061,7 +1061,7 @@ class Chip:
 
     def check_assignment(
         self,
-        chip_and_assigner_for_tag: dict[str, tuple[Self, "SigAssigner"]],
+        chip_for_tag: dict[str, Self],
         values: dict[str, Type],
     ):
         reporter.asserts(
@@ -1084,11 +1084,11 @@ class Chip:
                 for sig in c.typecheck(env):
                     # Recurse on templates
                     if isinstance(sig, TemplateSignature):
-                        if sig.tag not in chip_and_assigner_for_tag:
+                        if sig.tag not in chip_for_tag:
                             reporter.warn(f"Template {sig.tag!r} unavailable, skipping check.")
                             continue
-                        template, assigner = chip_and_assigner_for_tag[sig.tag]
-                        template.check_assignment(chip_and_assigner_for_tag, assigner(sig))
+                        template = chip_for_tag[sig.tag]
+                        template.check_assignment(chip_for_tag, sig_to_assignment(sig, template))
 
 
 def build_signature(config: Config, data: dict) -> Signature:
@@ -1129,9 +1129,6 @@ def check_signatures(found: Iterable[Signature], expected: list[Signature]):
         reporter.asserts(any(sig.matches(exp) for exp in expected), f"Unexpected signature: {sig}")
 
 
-type SigAssigner = Callable[[Signature], dict[str, Type]]
-
-
 def sig_to_assignment(sig: Signature, chip: Chip) -> dict[str, Type]:
     input = sig.input[:]
     output = sig.output
@@ -1163,25 +1160,16 @@ if __name__ == "__main__":
 
     reported = False
     chips: list[Chip] = []
-    chip_and_assigner_for_tag: dict[str, tuple[Chip, SigAssigner]] = {}
+    chip_for_tag: dict[str, Chip] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
         chip = Chip.from_file(config, file)
         chips.append(chip)
-        chip_and_assigner_for_tag[chip.name] = (chip, partial(sig_to_assignment, chip=chip))
+        chip_for_tag[chip.name] = chip
         reported |= reporter.reported
     if reported:
         sys.exit(1)
-
-    if "ADD" in chip_and_assigner_for_tag:
-        add, add_assigner = chip_and_assigner_for_tag["ADD"]
-        chip_and_assigner_for_tag["SUB"] = (
-            add,
-            lambda sig: add_assigner(
-                TemplateSignature(sig.tag, sig.condition, [sig.input[0], sig.output], sig.input[1])
-            ),
-        )
 
     for chip in chips:
         reporter.update_location(f"Chip {chip.name}")
@@ -1189,7 +1177,7 @@ if __name__ == "__main__":
         reported |= reporter.reported
     for chip in chips:
         reporter.update_location(f"Padding {chip.name}")
-        chip.check_assignment(chip_and_assigner_for_tag, chip.padding_assignment())
+        chip.check_assignment(chip_for_tag, chip.padding_assignment())
         reported |= reporter.reported
     if reported:
         sys.exit(1)
