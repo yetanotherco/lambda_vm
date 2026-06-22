@@ -18,6 +18,22 @@ build_one() {
     echo "[recursion-elfs] building $name ..."
     (
         cd "$dir"
+        # Pin each guest's target dir to its OWN local `target/` (read_guest_elf
+        # in the smoke test reads from `bench_vs/lambda/<name>/target/...`).
+        #
+        # We must set this EXPLICITLY rather than rely on the inherited value or
+        # on unsetting it:
+        #   * When spawned from `cargo test`, the inherited CARGO_TARGET_DIR
+        #     points at the host workspace's build cache. That cache is shared
+        #     across git worktrees that all build crates named
+        #     `math`/`stark`/`crypto`/`lambda-vm-prover`, so build-std artifacts
+        #     from a sibling worktree leak in, giving bogus "multiple different
+        #     versions of crate `math`" errors that reference another worktree.
+        #   * Merely unsetting it makes cargo walk up to discover a workspace
+        #     root, which can resolve to the wrong worktree's path-dep cache.
+        # An explicit, worktree-local path avoids both: the path is anchored
+        # under THIS guest dir (and therefore THIS worktree), fully isolating it.
+        export CARGO_TARGET_DIR="$dir/target"
         # Recursion/deserialize-only guests pull in lambda-vm-prover and its
         # serde stack; pin serde to 1.0.219 (pre-`serde_core` split) so
         # `-Z build-std=core,alloc` works.

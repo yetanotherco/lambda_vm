@@ -1235,6 +1235,115 @@ fn collect_keccak_memw_ops(
     memw_ops
 }
 
+/// Collect MEMW operations for a Fp3Mul ECALL and build the `Fp3MulOperation`.
+///
+/// Generates (in this order, all at `op.timestamp`):
+///   - 3 register reads: x10 (result_ptr), x11 (lhs_ptr), x12 (rhs_ptr)
+///   - 6 memory reads (width 8): lhs[0..2] and rhs[0..2]
+///   - 3 memory writes (width 8): result[0..2]
+///
+/// All `MemwOperation`s are appended to `memw_ops`; the matching senders live in
+/// `fp3_mul::bus_interactions`. The function recomputes the Fp3 product with the
+/// executor's helpers so the bytes written here are bit-identical to what the
+/// executor stored, and updates `memory_state` / `register_state` accordingly.
+#[cfg(feature = "prove")]
+fn collect_fp3_mul_memw_ops(
+    op: &CpuOperation,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    memw_ops: &mut Vec<MemwOperation>,
+) -> Fp3MulOperation {
+    let ts = op.timestamp;
+    let result_ptr = op.fp3_mul_result_ptr;
+
+    // --- register reads: x10 = result_ptr, x11 = lhs_ptr, x12 = rhs_ptr ---
+    // x10's value is carried in the Log (result_ptr); x11/x12 are read from the
+    // register model (the CPU does not surface them in the Log for ECALLs).
+    let lhs_ptr = register_state.read(11).0;
+    let rhs_ptr = register_state.read(12).0;
+    for (reg, val) in [(10u64, result_ptr), (11, lhs_ptr), (12, rhs_ptr)] {
+        let reg_value = pack_register_value(val);
+        let reg_addr = 2 * reg;
+        let (_old_val, old_ts) = register_state.read(reg as u8);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+            .with_old(reg_value, old_timestamps);
+        memw_ops.push(memw_op);
+        register_state.write(reg as u8, val, ts);
+    }
+
+    // --- memory reads: lhs[0..2] at lhs_ptr+8i, rhs[0..2] at rhs_ptr+8i ---
+    let mut lhs = [0u64; 3];
+    let mut rhs = [0u64; 3];
+    for (ptr, out) in [(lhs_ptr, &mut lhs), (rhs_ptr, &mut rhs)] {
+        for (i, slot) in out.iter_mut().enumerate() {
+            let addr = ptr
+                .checked_add(i as u64 * 8)
+                .expect("fp3 operand address range must be validated by the executor");
+            let (value_bytes, old_timestamps) = memory_state.read_bytes(addr, 8);
+            let mut val = 0u64;
+            for (b, &byte) in value_bytes.iter().enumerate() {
+                val |= byte << (b * 8);
+            }
+            *slot = val;
+            // Pure read: old == value.
+            let memw_op = MemwOperation::new(false, addr, value_bytes, ts, 8, true)
+                .with_old(value_bytes, old_timestamps);
+            memw_ops.push(memw_op);
+        }
+    }
+
+    // --- compute result with the executor's helpers (bit-identical) ---
+    let result = [
+        executor::vm::instruction::execution::goldilocks_fp3_mul_c0(lhs, rhs),
+        executor::vm::instruction::execution::goldilocks_fp3_mul_c1(lhs, rhs),
+        executor::vm::instruction::execution::goldilocks_fp3_mul_c2(lhs, rhs),
+    ];
+
+    // --- memory writes: result[0..2] at result_ptr+8i ---
+    let mut result_old = [0u64; 3];
+    for (i, &c) in result.iter().enumerate() {
+        let addr = result_ptr
+            .checked_add(i as u64 * 8)
+            .expect("fp3 result address range must be validated by the executor");
+        let (old_bytes, old_timestamps) = memory_state.read_bytes(addr, 8);
+        let mut old_val = 0u64;
+        for (b, &byte) in old_bytes.iter().enumerate() {
+            old_val |= byte << (b * 8);
+        }
+        result_old[i] = old_val;
+
+        let mut value_bytes = [0u64; 8];
+        for (b, slot) in value_bytes.iter_mut().enumerate() {
+            *slot = (c >> (b * 8)) & 0xFF;
+        }
+        // Modelled exactly as keccak's combined read+write lane: read-format op
+        // (is_read = true) carrying old = prior memory, value = new bytes.
+        let memw_op = MemwOperation::new(false, addr, value_bytes, ts, 8, true)
+            .with_old(old_bytes, old_timestamps);
+        memw_ops.push(memw_op);
+
+        // Commit the write to the memory model.
+        for (b, &byte) in value_bytes.iter().enumerate() {
+            let byte_addr = addr
+                .checked_add(b as u64)
+                .expect("fp3 result address range must be validated by the executor");
+            memory_state.write_byte(byte_addr, byte as u8, ts);
+        }
+    }
+
+    Fp3MulOperation {
+        timestamp: ts,
+        result_ptr,
+        lhs_ptr,
+        rhs_ptr,
+        lhs,
+        rhs,
+        result,
+        result_old,
+    }
+}
+
 ///
 /// From spec memw.md:
 /// - MEMW-C4 through MEMW-C7: old_timestamp[i] < timestamp (based on width)
@@ -3641,6 +3750,7 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
+        use super::fp3_mul::cols::NUM_COLUMNS as FP3_MUL_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -3826,6 +3936,13 @@ impl Traces {
             &self.keccak_rc,
             KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED,
             aux_cols(super::keccak_rc::bus_interactions().len()),
+        );
+        push_one(
+            &mut reports,
+            "FP3_MUL",
+            &self.fp3_mul,
+            FP3_MUL_COLS,
+            aux_cols(super::fp3_mul::bus_interactions().len()),
         );
 
         reports

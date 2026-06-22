@@ -20,6 +20,10 @@ pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 /// Syscall number for the Keccak-f[1600] precompile.
 pub const KECCAK_SYSCALL_NUMBER: u64 = u64::MAX - 1;
 
+/// Syscall number for the Goldilocks Fp3 multiply precompile.
+/// Multiplies two cubic extension field elements (x³ - 2) over Goldilocks in O(1) VM cycles.
+pub const FP3_MUL_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+
 /// Round constants for Keccak-f[1600] (24 rounds).
 pub const KECCAK_RC: [u64; 24] = [
     0x0000000000000001,

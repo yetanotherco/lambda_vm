@@ -5,6 +5,8 @@ use crate::vm::{
     registers::Registers,
 };
 
+use crate::constants::FP3_MUL_SYSCALL_NUMBER;
+
 const REGULAR_PC_UPDATE: u64 = 4;
 
 pub enum SyscallNumbers {
@@ -611,6 +613,82 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
+}
+
+// =============================================================================
+// Goldilocks Fp3 multiply helpers
+// =============================================================================
+
+/// Reduce a u128 value modulo the Goldilocks prime p = 2^64 - 2^32 + 1.
+///
+/// Uses the identity 2^64 ≡ 2^32 - 1 (mod p):
+///   x = lo + 2^64 * hi ≡ lo + (2^32 - 1) * hi (mod p)
+///
+/// Correct Goldilocks reduction matching crypto/math/src/field/goldilocks.rs::reduce128.
+/// Splits hi into hi_hi (upper 32 bits) and hi_lo (lower 32 bits) and uses the identities:
+///   2^96 ≡ -1 (mod p)   →  hi_hi * 2^96 ≡ -hi_hi
+///   2^64 ≡ EPSILON (mod p)  →  hi_lo * 2^64 ≡ hi_lo * EPSILON = (hi_lo<<32) - hi_lo
+#[inline(always)]
+fn goldilocks_reduce(x: u128) -> u64 {
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    const EPSILON: u64 = 0xFFFF_FFFF; // 2^32 - 1
+
+    let lo = x as u64;
+    let hi = (x >> 64) as u64;
+    let hi_hi = hi >> 32;
+    let hi_lo = hi & EPSILON;
+
+    // lo - hi_hi, borrowing if necessary
+    let (mut t0, borrow) = lo.overflowing_sub(hi_hi);
+    if borrow {
+        t0 = t0.wrapping_sub(EPSILON);
+    }
+
+    // hi_lo * EPSILON = (hi_lo << 32) - hi_lo
+    let t1 = (hi_lo << 32).wrapping_sub(hi_lo);
+
+    // t0 + t1, with one conditional reduction
+    let (r, carry) = t0.overflowing_add(t1);
+    if carry || r >= P { r.wrapping_sub(P) } else { r }
+}
+
+/// Goldilocks field multiply: (a * b) mod p
+#[inline(always)]
+fn goldilocks_mul(a: u64, b: u64) -> u64 {
+    goldilocks_reduce((a as u128) * (b as u128))
+}
+
+/// Goldilocks field add: (a + b) mod p
+#[inline(always)]
+fn goldilocks_add(a: u64, b: u64) -> u64 {
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+    let (r, carry) = a.overflowing_add(b);
+    if carry || r >= P { r.wrapping_sub(P) } else { r }
+}
+
+/// Compute c0 of Fp3 multiply: c0 = a0*b0 + 2*a1*b2 + 2*a2*b1
+pub fn goldilocks_fp3_mul_c0(a: [u64; 3], b: [u64; 3]) -> u64 {
+    // 2*x mod p is handled by doubling after reduction to avoid u128 overflow
+    let t0 = goldilocks_mul(a[0], b[0]);
+    let t1 = goldilocks_add(goldilocks_mul(a[1], b[2]), goldilocks_mul(a[1], b[2]));
+    let t2 = goldilocks_add(goldilocks_mul(a[2], b[1]), goldilocks_mul(a[2], b[1]));
+    goldilocks_add(goldilocks_add(t0, t1), t2)
+}
+
+/// Compute c1 of Fp3 multiply: c1 = a0*b1 + a1*b0 + 2*a2*b2
+pub fn goldilocks_fp3_mul_c1(a: [u64; 3], b: [u64; 3]) -> u64 {
+    let t0 = goldilocks_mul(a[0], b[1]);
+    let t1 = goldilocks_mul(a[1], b[0]);
+    let t2 = goldilocks_add(goldilocks_mul(a[2], b[2]), goldilocks_mul(a[2], b[2]));
+    goldilocks_add(goldilocks_add(t0, t1), t2)
+}
+
+/// Compute c2 of Fp3 multiply: c2 = a0*b2 + a1*b1 + a2*b0
+pub fn goldilocks_fp3_mul_c2(a: [u64; 3], b: [u64; 3]) -> u64 {
+    let t0 = goldilocks_mul(a[0], b[2]);
+    let t1 = goldilocks_mul(a[1], b[1]);
+    let t2 = goldilocks_mul(a[2], b[0]);
+    goldilocks_add(goldilocks_add(t0, t1), t2)
 }
 
 // =============================================================================

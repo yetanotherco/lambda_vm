@@ -627,6 +627,7 @@ impl VmAirs {
         let keccak_rc_commitment = vkey
             .map(|vk| vk.keccak_rc)
             .unwrap_or_else(|| tables::keccak_rc::preprocessed_commitment(proof_options));
+        let fp3_mul = create_fp3_mul_air(proof_options);
         let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
             keccak_rc_commitment,
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
@@ -1203,10 +1204,10 @@ fn verify_archived_with_vkey(
         num_private_input_pages,
     );
 
-    let expected_proof_count = table_counts.total() + 8 + page_configs.len();
+    let expected_proof_count = table_counts.total() + 9 + page_configs.len();
     if expected_proof_count != archived_proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 8 fixed + {} pages = {expected_proof_count}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + 9 fixed + {} pages = {expected_proof_count}, but proof contains {} sub-proofs",
             table_counts.total(),
             page_configs.len(),
             archived_proofs.len(),

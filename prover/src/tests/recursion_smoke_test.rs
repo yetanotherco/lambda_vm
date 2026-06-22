@@ -442,6 +442,82 @@ fn test_recursion_cycle_count() {
     eprintln!("============================================================");
 }
 
+/// Diagnostic: build a known-good inner proof, hand it to the recursion guest
+/// through the **rkyv** pipeline (exactly as the smoke test does), then run the
+/// guest in the **executor only** (no STARK proving) and assert the committed
+/// public output is `[1u8]`.
+///
+/// This isolates *guest correctness* (does the in-VM verifier — including the
+/// Fp3Mul precompile ecall — accept the proof?) from *prover trace soundness*
+/// (does the outer STARK proof verify?). If this passes but the full smoke test
+/// fails at "outer proof must verify on host", the bug is in the prover's trace
+/// generation / AIR for the recursion guest, not in the guest's computation.
+#[test]
+#[ignore = "diagnostic: executes the recursion guest via rkyv, asserts output == [1]"]
+fn test_recursion_executor_only_output() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let root = workspace_root();
+    build_elfs(&root);
+    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+
+    let inner_proof_options = stark::proof::options::ProofOptions {
+        blowup_factor: 2,
+        fri_number_of_queries: 1,
+        coset_offset: 3,
+        grinding_factor: 1,
+    };
+
+    let inner_proof = crate::prove_with_options_and_inputs(
+        &empty_elf_bytes,
+        &[],
+        &inner_proof_options,
+        &crate::MaxRowsConfig::default(),
+    )
+    .expect("inner prove should succeed");
+
+    let elf_for_vkey = executor::elf::Elf::load(&empty_elf_bytes).expect("ELF load failed");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey = crate::VmVerifyingKey::from_elf_and_options(
+        &elf_for_vkey,
+        &inner_proof_options,
+        &page_configs,
+    );
+
+    // Sanity: the host accepts this inner proof through the rkyv zero-copy path.
+    let input = crate::RecursionInput {
+        vm_proof: inner_proof,
+        inner_elf: empty_elf_bytes.clone(),
+        options: inner_proof_options.clone(),
+        vkey,
+    };
+    let blob = crate::encode_recursion_input(&input).expect("encode recursion input");
+    assert!(
+        crate::verify_recursion_blob(&blob).expect("host verify_recursion_blob errored"),
+        "host rkyv path must accept the inner proof before we run the guest"
+    );
+
+    // Execute (NOT prove) the recursion guest on the same blob.
+    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
+    let executor = Executor::new(&program, blob).expect("Executor::new failed");
+    let result = executor.run().expect("executor run failed");
+    let output = result.return_values.memory_values;
+
+    eprintln!("[executor-only] committed public output = {output:?}");
+    assert_eq!(
+        output,
+        vec![1u8],
+        "recursion guest must commit the success marker [1] when executed; \
+         got {output:?} (empty => in-VM verifier rejected the proof / Fp3 wrong)"
+    );
+}
+
 /// Diagnostic: count the distinct 4 KB memory pages the recursion guest
 /// touches when verifying a small inner proof.
 ///

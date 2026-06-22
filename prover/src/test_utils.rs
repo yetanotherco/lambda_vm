@@ -76,6 +76,10 @@ use crate::tables::ecdas::{bus_interactions as ecdas_bus_interactions, cols as e
 use crate::tables::ecsm::{bus_interactions as ecsm_bus_interactions, cols as ecsm_cols};
 use crate::tables::eq::{bus_interactions as eq_bus_interactions, cols as eq_cols, eq_constraints};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::fp3_mul::{
+    bus_interactions as fp3_mul_bus_interactions, cols as fp3_mul_cols,
+    create_constraints as fp3_mul_constraints,
+};
 use crate::tables::keccak::{bus_interactions as keccak_bus_interactions, cols as keccak_cols};
 use crate::tables::keccak_rc::{
     bus_interactions as keccak_rc_bus_interactions, cols as keccak_rc_cols,
@@ -1010,6 +1014,25 @@ pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("REGISTER")
+}
+
+/// Create FP3_MUL AIR with the three multiply constraints and bus interactions.
+pub fn create_fp3_mul_air(proof_options: &ProofOptions) -> VmAir {
+    let (constraints, _) = fp3_mul_constraints(0);
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = constraints;
+
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
+        interactions: fp3_mul_bus_interactions(),
+    };
+
+    AirWithBuses::new(
+        fp3_mul_cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        proof_options,
+        1,
+        transition_constraints,
+    )
+    .with_name("FP3_MUL")
 }
 
 /// Create KECCAK core AIR with ADD constraints and bus interactions.

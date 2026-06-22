@@ -299,21 +299,58 @@ impl IsField for Degree3GoldilocksExtensionField {
     /// add/sub). The reduction savings outweigh the extra multiplications.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
-        let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
+        #[cfg(target_arch = "riscv64")]
+        {
+            // Route through the lambda-vm Fp3Mul precompile syscall.
+            // ABI: a7=FP3_MUL_SYSCALL_NUMBER, a0=result_ptr, a1=lhs_ptr, a2=rhs_ptr
+            // Each pointer references a [u64; 3] (8-byte aligned).
+            const FP3_MUL_SYSCALL: u64 = u64::MAX - 2;
+            let mut result = [0u64; 3];
+            let lhs: [u64; 3] = [*a[0].value(), *a[1].value(), *a[2].value()];
+            let rhs: [u64; 3] = [*b[0].value(), *b[1].value(), *b[2].value()];
+            unsafe {
+                // The ecall writes the 3-limb product through `a0`. We must pass the
+                // buffers as real pointer operands (NOT `ptr as u64`): casting to an
+                // integer strips provenance, so LLVM concludes the `result` alloca never
+                // escapes and is free to hoist the reads of `result[..]` to *before* the
+                // ecall — yielding the stale zero-initialized values. Passing pointer
+                // operands keeps the addresses escaped; dropping `options(nostack)` keeps
+                // the default memory clobber so the ecall is modeled as writing memory.
+                core::arch::asm!(
+                    "ecall",
+                    in("a0") result.as_mut_ptr(),
+                    in("a1") lhs.as_ptr(),
+                    in("a2") rhs.as_ptr(),
+                    in("a7") FP3_MUL_SYSCALL,
+                );
+                // Belt-and-suspenders barrier: forbid the compiler from reordering the
+                // result reads across the ecall even if the clobber model is relaxed.
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
+            [
+                FpE::from_raw(result[0]),
+                FpE::from_raw(result[1]),
+                FpE::from_raw(result[2]),
+            ]
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
+            let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
 
-        // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
-        let b1_2 = GoldilocksField::double(&b1);
-        let b2_2 = GoldilocksField::double(&b2);
+            // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
+            let b1_2 = GoldilocksField::double(&b1);
+            let b2_2 = GoldilocksField::double(&b2);
 
-        // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
-        let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
-        // c1 = a0*b1 + a1*b0 + a2*(2*b2)
-        let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
-        // c2 = a0*b2 + a1*b1 + a2*b0
-        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
+            // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
+            let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
+            // c1 = a0*b1 + a1*b0 + a2*(2*b2)
+            let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
+            // c2 = a0*b2 + a1*b1 + a2*b0
+            let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
 
-        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+            [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+        }
     }
 
     /// Squaring using fused dot products.
