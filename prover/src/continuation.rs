@@ -43,6 +43,7 @@ use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
 use crate::paged_mem::PagedMem;
+use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
@@ -52,7 +53,10 @@ use crate::tables::trace_builder::{
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
-use crate::{Error, VmAirs, compute_expected_commit_bus_balance, verify_l2g_commitment_binding};
+use crate::{
+    Error, RuntimePageRange, TableCounts, VmAirs, compute_expected_commit_bus_balance,
+    verify_l2g_commitment_binding,
+};
 
 type F = GoldilocksField;
 type E = GoldilocksExtension;
@@ -61,6 +65,39 @@ type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 fn empty_constraints()
 -> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
     vec![]
+}
+
+/// Fresh transcript seeded with the epoch's statement (ELF, public output, table
+/// layout) and `epoch_label` (its position). The epoch's prove, verify, and
+/// bus-balance replay all seed via this so their challenges match; the seeding
+/// pins each epoch proof to its program and position (replay protection).
+fn epoch_transcript(
+    elf_bytes: &[u8],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    epoch_label: u64,
+) -> DefaultTranscript<E> {
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::ContinuationEpoch { epoch_label },
+        elf_bytes,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+    );
+    transcript
+}
+
+/// Fresh transcript seeded with the global proof's statement (ELF + epoch count).
+/// `prove_global` and `verify_global` both seed via this so their challenges match.
+fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E> {
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_continuation_global_statement(&mut transcript, elf_bytes, num_epochs);
+    transcript
 }
 
 /// The L2G table's AIR constraint: the `MU` selector column is boolean.
@@ -200,8 +237,10 @@ type EpochOutput = (Commitment, Vec<u32>);
 /// `boundary`) on the epoch-local Memory bus, and its REGISTER table with FINI
 /// preprocessed to the epoch's final register file. Returns the L2G commitment
 /// root and that final register file if the epoch verifies, or `None` if not.
+#[allow(clippy::too_many_arguments)]
 fn prove_verify_epoch(
     elf: &Elf,
+    elf_bytes: &[u8],
     start: &EpochStart,
     logs: &[Log],
     is_final: bool,
@@ -270,6 +309,28 @@ fn prove_verify_epoch(
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     );
 
+    // Statement bound into this epoch's transcript before Phase A (prove, replay,
+    // and verify must seed identically). Captured as owned locals so they don't
+    // re-borrow `traces` once `air_trace_pairs` takes it mutably below.
+    let public_output = traces.public_output_bytes.clone();
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+    let epoch_label = start.label;
+    let seed = || {
+        epoch_transcript(
+            elf_bytes,
+            &public_output,
+            &table_counts,
+            num_private_input_pages,
+            &runtime_page_ranges,
+            epoch_label,
+        )
+    };
+
     let l2g_air = l2g_memory_air(opts, start.label);
     let mut l2g_trace = std::mem::replace(
         &mut traces.local_to_global,
@@ -280,7 +341,7 @@ fn prove_verify_epoch(
     pairs.push((&l2g_air, &mut l2g_trace, &()));
     let proof = Prover::multi_prove(
         pairs,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut seed(),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -288,21 +349,10 @@ fn prove_verify_epoch(
 
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
-    let mut replay = DefaultTranscript::<E>::new(&[]);
-    let expected = compute_expected_commit_bus_balance(
-        &refs,
-        &proof,
-        &traces.public_output_bytes,
-        &mut replay,
-    )
-    .ok_or_else(|| Error::Prover("commit bus fingerprint collision".into()))?;
+    let expected = compute_expected_commit_bus_balance(&refs, &proof, &public_output, &mut seed())
+        .ok_or_else(|| Error::Prover("commit bus fingerprint collision".into()))?;
 
-    if !Verifier::multi_verify(
-        &refs,
-        &proof,
-        &mut DefaultTranscript::<E>::new(&[]),
-        &expected,
-    ) {
+    if !Verifier::multi_verify(&refs, &proof, &mut seed(), &expected) {
         return Ok(None);
     }
     Ok(Some((
@@ -319,6 +369,7 @@ fn prove_verify_epoch(
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
     elf: &Elf,
+    elf_bytes: &[u8],
     private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
@@ -368,7 +419,7 @@ fn prove_global(
 
     Prover::multi_prove(
         pairs,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut global_transcript(elf_bytes, boundaries.len()),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -379,6 +430,7 @@ fn verify_global(
     boundaries: &[Vec<CellBoundary>],
     proof: &MultiProof<F, E, ()>,
     elf: &Elf,
+    elf_bytes: &[u8],
     private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> bool {
@@ -404,7 +456,7 @@ fn verify_global(
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut DefaultTranscript::<E>::new(&[]),
+        &mut global_transcript(elf_bytes, boundaries.len()),
         &FieldElement::zero(),
     )
 }
@@ -486,6 +538,7 @@ pub fn prove_and_verify_continuation(
         };
         match prove_verify_epoch(
             &elf,
+            elf_bytes,
             &start,
             &logs,
             is_final,
@@ -514,8 +567,15 @@ pub fn prove_and_verify_continuation(
     }
 
     // One global LogUp over all the (kept) local-to-global tables.
-    let global_proof = prove_global(&all_boundaries, &elf, private_inputs, &opts)?;
-    if !verify_global(&all_boundaries, &global_proof, &elf, private_inputs, &opts) {
+    let global_proof = prove_global(&all_boundaries, &elf, elf_bytes, private_inputs, &opts)?;
+    if !verify_global(
+        &all_boundaries,
+        &global_proof,
+        &elf,
+        elf_bytes,
+        private_inputs,
+        &opts,
+    ) {
         return Ok(false);
     }
 

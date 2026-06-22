@@ -39,7 +39,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::absorb_statement;
+use crate::statement::{StatementKind, absorb_statement};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -763,6 +763,7 @@ pub fn prove_with_options_and_inputs(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
+        StatementKind::Monolithic,
         elf_bytes,
         &traces.public_output_bytes,
         &table_counts,
@@ -915,6 +916,7 @@ pub fn verify_with_options(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
+        StatementKind::Monolithic,
         elf_bytes,
         &vm_proof.public_output,
         &vm_proof.table_counts,

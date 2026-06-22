@@ -3,7 +3,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 
-use crate::statement::absorb_statement;
+use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
 use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
@@ -43,7 +43,15 @@ fn state_after_absorb(
     ranges: &[RuntimePageRange],
 ) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(&mut t, elf, out, counts, priv_pages, ranges);
+    absorb_statement(
+        &mut t,
+        StatementKind::Monolithic,
+        elf,
+        out,
+        counts,
+        priv_pages,
+        ranges,
+    );
     t.state()
 }
 
@@ -115,4 +123,52 @@ fn public_output_length_prefix_prevents_collision() {
         state_after_absorb(b"elf", b"", &counts_a, 0, &[]),
         state_after_absorb(b"elf", b"\x41", &counts_b, 0, &[]),
     );
+}
+
+fn epoch_state(elf: &[u8], label: u64) -> [u8; 32] {
+    let mut t = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut t,
+        StatementKind::ContinuationEpoch { epoch_label: label },
+        elf,
+        b"out",
+        &sample_counts(),
+        1,
+        &sample_ranges(),
+    );
+    t.state()
+}
+
+#[test]
+fn continuation_epoch_state_binds_label_and_program() {
+    let baseline = epoch_state(b"elf", 1);
+    // Deterministic.
+    assert_eq!(baseline, epoch_state(b"elf", 1));
+    // Pinned to the epoch's position: a different label diverges (replay across
+    // positions is rejected).
+    assert_ne!(baseline, epoch_state(b"elf", 2), "must bind epoch_label");
+    // Pinned to the program.
+    assert_ne!(baseline, epoch_state(b"other-elf", 1), "must bind the ELF");
+}
+
+#[test]
+fn continuation_epoch_differs_from_monolithic_statement() {
+    // A monolithic proof and a continuation epoch proof must never share a
+    // transcript seed, even with the same base statement.
+    let monolithic = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges());
+    assert_ne!(monolithic, epoch_state(b"elf", 1));
+}
+
+fn global_state(elf: &[u8], num_epochs: usize) -> [u8; 32] {
+    let mut t = DefaultTranscript::<E>::new(&[]);
+    absorb_continuation_global_statement(&mut t, elf, num_epochs);
+    t.state()
+}
+
+#[test]
+fn continuation_global_state_binds_program_and_epoch_count() {
+    let baseline = global_state(b"elf", 3);
+    assert_eq!(baseline, global_state(b"elf", 3)); // deterministic
+    assert_ne!(baseline, global_state(b"elf", 4), "must bind epoch count");
+    assert_ne!(baseline, global_state(b"other-elf", 3), "must bind the ELF");
 }
