@@ -168,6 +168,14 @@ pub fn generate_branch_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
+
+    // GPU fast path: pack the deduped ops into five parallel u64 arrays
+    // and let the kernel compute next_pc + decomposition.
+    #[cfg(feature = "cuda")]
+    if let Some(table) = try_generate_branch_trace_gpu(&unique_ops, num_rows) {
+        return table;
+    }
+
     let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
@@ -220,6 +228,45 @@ pub fn generate_branch_trace(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+/// CUDA fast path for `generate_branch_trace`. Flattens the already-deduped
+/// unique ops into five parallel u64 arrays and runs the row-layout kernel.
+#[cfg(feature = "cuda")]
+fn try_generate_branch_trace_gpu(
+    unique_ops: &[(BranchOperation, u64)],
+    num_rows: usize,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut pcs = vec![0u64; num_rows];
+    let mut offsets = vec![0u64; num_rows];
+    let mut registers = vec![0u64; num_rows];
+    let mut flags = vec![0u64; num_rows];
+    let mut multiplicities = vec![0u64; num_rows];
+
+    for (i, (op, mu)) in unique_ops.iter().enumerate() {
+        pcs[i] = op.pc;
+        offsets[i] = op.offset;
+        registers[i] = op.register;
+        let mut f: u64 = 0;
+        if op.jalr {
+            f |= 1;
+        }
+        f |= 1 << 1; // active
+        flags[i] = f;
+        multiplicities[i] = *mu;
+    }
+
+    let raw = stark::gpu_lde::try_generate_branch_trace_gpu_raw(
+        num_rows,
+        &pcs,
+        &offsets,
+        &registers,
+        &flags,
+        &multiplicities,
+        cols::NUM_COLUMNS,
+    )?;
+    let data: Vec<FE> = raw.into_iter().map(FE::from).collect();
+    Some(TraceTable::new_main(data, cols::NUM_COLUMNS, 1))
 }
 
 // =========================================================================
