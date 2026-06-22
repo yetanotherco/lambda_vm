@@ -1,9 +1,12 @@
-# Continuations (Approach 2) — Local-to-Global memory design
+# Continuations (Approach 2) — design
 
-This document describes how cross-epoch memory consistency works in the
-"continuations" prover (Approach 2, "prove-epoch" from the streaming spec), the
-soundness mechanisms that make it safe, and the design decision (Design Y vs the
-earlier Design X) for how the per-row selector is wired.
+This is the single design document for the "continuations" prover (Approach 2,
+"prove-epoch" from the streaming spec). It covers the three things a continuation
+must carry across epoch boundaries — **memory** (the bulk of the doc: §1–§5,
+including the cross-epoch local-to-global table and the Design X vs Design Y
+decision), **registers** (§6), and the **Fiat-Shamir statement binding** (§7) that
+ties each epoch proof to its program and position — plus the soundness mechanisms
+that make each safe.
 
 It is written to be read by a human picking this up cold.
 
@@ -178,9 +181,16 @@ Traces are padded with blank rows to a power of two (an FFT requirement). Those
 padding rows must not disturb any bus.
 
 Originally padding was harmless because a blank row's `init` and `fini` tokens
-were identical and self-cancelled. But §3.2 (constant `fini_epoch`) broke that on
-the GlobalMemory bus: a padding row's `fini` now carries `epoch = the constant`
-while its `init` carries `epoch = 0`, so the tokens differ and no longer cancel.
+were identical and self-cancelled. **Two** of the changes above broke that, each
+on its own:
+
+- §3.2 (constant `fini_epoch`): a padding row's `fini` now carries
+  `epoch = the constant` while its `init` carries `epoch = 0`, so the tokens
+  differ and no longer cancel.
+- §3.3 (the ordering check): a padding row has `init_epoch == fini_epoch` (both
+  `0`), which fails the strict `<` check.
+
+So `MU` is required by *either* change.
 
 Fix: a selector column `MU` (1 on real rows, 0 on padding). Interactions gated by
 `Multiplicity::Column(MU)` contribute nothing on padding rows.
@@ -326,28 +336,107 @@ dropped the "chain is complete" property both rely on.
 
 ---
 
-## 6. Status and open items
+## 6. Registers (cross-epoch)
+
+Registers must also carry across epochs: epoch *i+1* must start from epoch *i*'s
+final register file. Unlike memory, the register file is **small and fixed** (34
+registers / 67 word-addresses, all present every epoch), so it needs no L2G /
+global telescoping — we bind the whole snapshot directly.
+
+**Mechanism (no new bus).** The REGISTER table is the register analog of PAGE — it
+already puts each register's init/fini tokens on the epoch-local Memory bus
+(REG-C1 init, REG-C2 fini, matched against MEMW). For continuation epochs we
+**also preprocess the FINI column** = the epoch's final register file `R_{i+1}`
+(on top of the already-preprocessed INIT = `R_i`). "Preprocessed" means
+*verifier-known*: the verifier recomputes the column's commitment, so the prover
+cannot choose it. The verifier reuses the **same** `R_{i+1}` as epoch *i*'s FINI
+and epoch *i+1*'s INIT, so `init(i+1) == fini(i)` **by construction** — no equality
+check and no bus. Genesis is epoch 0's INIT = the ELF entry-point registers
+(verifier-derived).
+
+```
+   epoch i REGISTER              epoch i+1 REGISTER
+     INIT = R_i      (pre)         INIT = R_{i+1}   (pre)   ← same R_{i+1}
+     FINI = R_{i+1}  (pre) ────────┘                          reused both sides
+```
+
+### Register soundness (two locks)
+
+For `R_{i+1}` to be the *real* final registers (not a free prover claim), two
+locks compose:
+
+1. **Preprocessing** pins the trace's FINI column = the public `R_{i+1}` (the
+   verifier recomputes the commitment; the proof's FINI openings must authenticate
+   against it, so the prover can't deviate).
+2. **REG-C2 on the Memory bus** pins that FINI column = MEMW's true last write to
+   each register (or the Memory bus doesn't balance).
+
+Compose them: public `R_{i+1}` = trace FINI = real last write. So the value handed
+to the next epoch is pinned to real execution.
+
+The **monolithic prover is unchanged**: it keeps FINI as a main-trace column (it
+has no verifier-known final state) and preprocesses 2 columns, not 3.
+
+---
+
+## 7. Fiat-Shamir statement binding
+
+Each epoch proof and the global proof seed their Fiat-Shamir transcript with a
+**statement** before the challenges are drawn (they previously started empty). The
+seeding only *adds* input to the transcript, so it can strengthen binding but never
+weaken soundness — and it pins every proof to its program and position, so a proof
+can't be replayed elsewhere:
+
+- Each **epoch** absorbs: a domain tag, the ELF digest, the public output, the
+  table layout, and the **epoch label** (its position).
+- The **global** proof absorbs: a (distinct) domain tag, the ELF digest, and the
+  **epoch count**.
+
+The monolithic encoding is unchanged (same function, monolithic tag, no label).
+The genesis / register / memory anchor values are *additionally* bound via the
+preprocessed commitments absorbed during proving.
+
+Note: this is sound for the **integrated** prove+verify path (one process). A
+standalone *split* verifier must carry these statement fields in the proof and
+take the epoch label / count from a trusted enumeration — deferred (§8).
+
+---
+
+## 8. Status and open items
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
-  ordering check (§3.3), the `MU` selector (§3.4).
+  ordering check (§3.3), the `MU` selector (§3.4), **cross-epoch registers** (§6),
+  and the **Fiat-Shamir statement binding** (§7).
 - **The committed code implements Design X** (`MU` gates every L2G interaction),
   which is the sound design. Design Y was implemented briefly, then found unsound
   (§4, the chain-truncation attack) and **reverted**. Do not re-introduce the
   Design Y wiring: gating only the GlobalMemory bus reopens the orphan attack.
-- Known soundness gap, deferred: **cross-epoch register continuity** — epoch
-  `i>0`'s register init is a prover-supplied snapshot, not yet bound to epoch
-  `i-1`'s fini. This is independent of the memory work above.
+- Deferred (independent of the memory work):
+  - **A standalone (split) continuation verifier.** Today prove and verify run in
+    one integrated function, so the statement/boundary values are reused from the
+    prover's in-memory state. A split verifier must carry them in the proof and
+    re-bind them (and supply the epoch label / count from a trusted enumeration),
+    and the global proof must also commit to the boundary *content*, not just the
+    ELF + epoch count.
+  - **x254 (commit index) across an epoch boundary.** Its value is now carried by
+    the register binding (§6), but the COMMIT machinery across a boundary is not
+    yet tested.
 
 ---
 
-## 7. Where the code lives
+## 9. Where the code lives
 
 - `prover/src/tables/local_to_global.rs` — L2G columns, trace generation, the
   Memory/GlobalMemory bus interactions, range checks, the ordering lookup, and
   the per-row selector.
 - `prover/src/tables/global_memory.rs` — the genesis (ELF-bound) and
   finalization anchors.
+- `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
+  tokens, the preprocessed FINI commitment (`compute_precomputed_commitment_with_fini`,
+  `NUM_PREPROCESSED_COLS_WITH_FINI`), and `fini_from_trace`.
+- `prover/src/statement.rs` — the Fiat-Shamir statement absorbers
+  (`absorb_statement` with `StatementKind`, `absorb_continuation_global_statement`).
 - `prover/src/continuation.rs` — the epoch loop, per-epoch proofs
   (`prove_verify_epoch`), the global proof (`prove_global` / `verify_global`),
-  the per-epoch AIRs (`l2g_memory_air` / `l2g_global_air`), and the
-  commitment binding.
+  the per-epoch AIRs (`l2g_memory_air` / `l2g_global_air`), the register-FINI
+  preprocessing, the transcript seeding, and the commitment binding.
