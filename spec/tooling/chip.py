@@ -27,9 +27,16 @@ class ErrorReporter:
         yield
         self.location.pop()
 
+    def _report(self, level: str, message: str, failure: bool = False):
+        if failure:
+            self.reported = True
+        print(f"{level} {'/'.join(self.location)}: {message}", file=sys.stderr)
+
+    def warn(self, message: str):
+        self._report("WARNING", message)
+
     def error(self, message: str):
-        self.reported = True
-        print(f"ERROR {'/'.join(self.location)}: {message}", file=sys.stderr)
+        self._report("ERROR", message, True)
 
     def asserts(self, condition: bool, message: str):
         if not condition:
@@ -1073,10 +1080,13 @@ class Chip:
                 v.populate_env(env)
 
         for c in self.constraints:
-            for sig in c.typecheck(env):
-                # Recurse on templates
-                if isinstance(sig, TemplateSignature) and sig.tag in chip_and_assigner_for_tag:
-                    with reporter.context(repr(c)):
+            with reporter.context(repr(c)):
+                for sig in c.typecheck(env):
+                    # Recurse on templates
+                    if isinstance(sig, TemplateSignature):
+                        if sig.tag not in chip_and_assigner_for_tag:
+                            reporter.warn(f"Template {sig.tag!r} unavailable, skipping check.")
+                            continue
                         template, assigner = chip_and_assigner_for_tag[sig.tag]
                         template.check_assignment(chip_and_assigner_for_tag, assigner(sig))
 
