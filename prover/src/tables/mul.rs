@@ -42,7 +42,7 @@ use stark::trace::TraceTable;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
-    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, alu_op,
+    NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
 
 /// Total row multiplicity (`ALU` bus, lo + hi), used by the internal
@@ -309,57 +309,48 @@ pub fn generate_mul_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Compute product
         let (lo, hi) = op.compute_product();
 
         // Fill lhs as DWordHL (4 halfwords)
-        data[base + cols::LHS_0] = FE::from(op.lhs & 0xFFFF);
-        data[base + cols::LHS_1] = FE::from((op.lhs >> 16) & 0xFFFF);
-        data[base + cols::LHS_2] = FE::from((op.lhs >> 32) & 0xFFFF);
-        data[base + cols::LHS_3] = FE::from((op.lhs >> 48) & 0xFFFF);
-        data[base + cols::LHS_SIGNED] = FE::from(op.lhs_signed as u64);
+        table.set_dword_hl(row_idx, cols::LHS_0, op.lhs);
+        table.set_bool(row_idx, cols::LHS_SIGNED, op.lhs_signed);
 
         // Fill rhs as DWordHL (4 halfwords)
-        data[base + cols::RHS_0] = FE::from(op.rhs & 0xFFFF);
-        data[base + cols::RHS_1] = FE::from((op.rhs >> 16) & 0xFFFF);
-        data[base + cols::RHS_2] = FE::from((op.rhs >> 32) & 0xFFFF);
-        data[base + cols::RHS_3] = FE::from((op.rhs >> 48) & 0xFFFF);
-        data[base + cols::RHS_SIGNED] = FE::from(op.rhs_signed as u64);
+        table.set_dword_hl(row_idx, cols::RHS_0, op.rhs);
+        table.set_bool(row_idx, cols::RHS_SIGNED, op.rhs_signed);
 
         // Fill lo as DWordHL (4 halfwords)
-        data[base + cols::LO_0] = FE::from(lo & 0xFFFF);
-        data[base + cols::LO_1] = FE::from((lo >> 16) & 0xFFFF);
-        data[base + cols::LO_2] = FE::from((lo >> 32) & 0xFFFF);
-        data[base + cols::LO_3] = FE::from((lo >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::LO_0, lo);
 
         // Fill hi as DWordHL (4 halfwords)
-        data[base + cols::HI_0] = FE::from(hi & 0xFFFF);
-        data[base + cols::HI_1] = FE::from((hi >> 16) & 0xFFFF);
-        data[base + cols::HI_2] = FE::from((hi >> 32) & 0xFFFF);
-        data[base + cols::HI_3] = FE::from((hi >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::HI_0, hi);
 
         // Fill auxiliary columns
-        data[base + cols::LHS_IS_NEGATIVE] = FE::from(op.lhs_is_negative() as u64);
-        data[base + cols::RHS_IS_NEGATIVE] = FE::from(op.rhs_is_negative() as u64);
+        table.set_bool(row_idx, cols::LHS_IS_NEGATIVE, op.lhs_is_negative());
+        table.set_bool(row_idx, cols::RHS_IS_NEGATIVE, op.rhs_is_negative());
 
         // Fill raw_product columns
         let raw = op.compute_raw_products();
-        data[base + cols::RAW_PRODUCT_0] = FE::from(raw[0]);
-        data[base + cols::RAW_PRODUCT_1] = FE::from(raw[1]);
-        data[base + cols::RAW_PRODUCT_2] = FE::from(raw[2]);
-        data[base + cols::RAW_PRODUCT_3] = FE::from(raw[3]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_0, raw[0]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_1, raw[1]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_2, raw[2]);
+        table.set_u64(row_idx, cols::RAW_PRODUCT_3, raw[3]);
 
         // Fill multiplicities (ALU bus, lo/hi)
-        data[base + cols::MU_LO] = FE::from(multiplicities.mu_lo);
-        data[base + cols::MU_HI] = FE::from(multiplicities.mu_hi);
+        table.set_u64(row_idx, cols::MU_LO, multiplicities.mu_lo);
+        table.set_u64(row_idx, cols::MU_HI, multiplicities.mu_hi);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
