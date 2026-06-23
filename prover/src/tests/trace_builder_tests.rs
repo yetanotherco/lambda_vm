@@ -670,7 +670,6 @@ mod keccak_tests {
             }
             ref_state[0] ^= rc;
 
-            let base = round * rnd_cols::NUM_COLUMNS;
             for (lane, &lane_val) in ref_state.iter().enumerate() {
                 let x = lane % 5;
                 let y = lane / 5;
@@ -681,7 +680,7 @@ mod keccak_tests {
                     } else {
                         rnd_cols::chi(x, y, byte_idx)
                     };
-                    let trace_val = &rnd_trace.main_table.data[base + col];
+                    let trace_val = rnd_trace.get_main(round, col);
                     assert_eq!(
                         &expected, trace_val,
                         "Round {round} lane ({x},{y}) byte {byte_idx}"
@@ -701,23 +700,22 @@ mod keccak_tests {
         for x in 0..5 {
             for y in 0..5 {
                 for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
-                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
+                    let core_val = core_trace.get_main(0, core_cols::input_state(x, y, b));
+                    let rnd_val = rnd_trace.get_main(0, rnd_cols::start(x, y, b));
                     assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
                 }
             }
         }
 
         // Round 23 out == core output_state
-        let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
         for x in 0..5 {
             for y in 0..5 {
                 for b in 0..8 {
-                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
+                    let core_val = core_trace.get_main(0, core_cols::output_state(x, y, b));
                     let rnd_val = if x == 0 && y == 0 {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
+                        rnd_trace.get_main(23, rnd_cols::iota(b))
                     } else {
-                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
+                        rnd_trace.get_main(23, rnd_cols::chi(x, y, b))
                     };
                     assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
                 }
