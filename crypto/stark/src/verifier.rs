@@ -606,19 +606,13 @@ pub trait IsStarkVerifier<
     {
         let fri_layers_merkle_roots = proof.fri_layers_merkle_roots();
         let fri_last_value = proof.fri_last_value();
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
 
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
         // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
+        let mut v = (p0_eval + p0_eval_sym)
+            + evaluation_point_inv.clone() * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
         // Handle case with 0 FRI layers (trace_length <= 2)
@@ -630,6 +624,13 @@ pub trait IsStarkVerifier<
 
         let num_layer_evals = fri_decommitment.layers_evaluations_sym.len();
 
+        // Lazy squaring iterator for the evaluation point powers — avoids
+        // allocating a Vec per query by computing each power on demand.
+        let evaluation_point_iter =
+            core::iter::successors(Some(evaluation_point_inv.square()), |ep| {
+                Some(ep.square())
+            });
+
         // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
         // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
         // Finally, check that the final value coincides with the given by the prover.
@@ -637,7 +638,7 @@ pub trait IsStarkVerifier<
             .iter()
             .enumerate()
             .zip(fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
+            .zip(evaluation_point_iter)
             .fold(
                 true,
                 |result, (((i, merkle_root), evaluation_sym), evaluation_point_inv)| {
