@@ -748,8 +748,10 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def is_review_command(body: str) -> bool:
-    # Any /ai-review comment (with or without a legacy standard|critical argument).
-    return bool(re.search(r"(?im)^\s*/ai-review\b", body))
+    # Any /ai-review (or its easy-to-misremember alias /review-ai) comment, with or
+    # without a legacy standard|critical argument. Keep this in sync with the
+    # `contains(...)` gates in pr_ai_review.yaml (prepare `if:` and concurrency).
+    return bool(re.search(r"(?im)^\s*/(ai-review|review-ai)\b", body))
 
 
 def is_review_label(name: str) -> bool:
