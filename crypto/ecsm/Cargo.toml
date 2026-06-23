@@ -6,8 +6,8 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
-num-bigint = "0.4.6"
-num-traits = "0.2.19"
+num-bigint = { version = "0.4.6", default-features = false }
+num-traits = { version = "0.2.19", default-features = false }
 # Audited secp256k1 arithmetic (host-side witness generation only; never in the
 # constraint system). Used for executor scalar multiplication and for the projective
 # double-and-add replay + batch inversion that builds ECDAS step witnesses efficiently.

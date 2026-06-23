@@ -10,21 +10,25 @@
 //! - `imm`: DWordWL (2 cols) - fully extended 64-bit immediate
 //! - `μ`: BaseField (1 col) - multiplicity
 //!
-//! ## packed_decode Format
-//!
-//! A single base-field element packing the control flags, register indices, and
-//! the `alu_flags`/`mem_flags` bytes. The authoritative bit layout lives in
-//! `packed_decode_shrunk` and is produced by `ShrunkDecode::pack` (both in
-//! `tables/types.rs`) — consult those for the exact bit position of every field.
-//! Summary (low → high bits):
+//! ## packed_decode Format (51 bits)
 //!
 //! ```text
-//! Bits [0..10]:  read_register1, read_register2, write_register, word_instr,
-//!                ALU, ADD, SUB, MEMORY, BRANCH, ECALL (one bit each)
-//! Bits [10..34]: rs1, rs2, rd (8 bits each)
-//! Bits [34..42]: half_instruction_length (Byte: byte length / 2)
-//! Bits [42..50]: alu_flags (Byte: alu_op in bits 0-4, then signed / signed2|invert / muldiv)
-//! Bits [50..58]: mem_flags (Byte: JALR|memory_op, signed, 2B, 4B, 8B)
+//! Bits [0]:     read_register1
+//! Bits [1]:     read_register2
+//! Bits [2]:     write_register
+//! Bits [3]:     memory_2bytes
+//! Bits [4]:     memory_4bytes
+//! Bits [5]:     memory_8bytes
+//! Bits [6]:     c_type
+//! Bits [7]:     signed
+//! Bits [8]:     mp_selector
+//! Bits [9]:     muldiv_selector
+//! Bits [10]:    word_instr
+//! Bits [11-26]: ALU flags (ADD, SUB, SLT, AND, OR, XOR, SHIFT, JALR,
+//!               BEQ, BLT, LOAD, STORE, MUL, DIVREM, ECALL, EBREAK)
+//! Bits [27:35]: rs1 (8 bits)
+//! Bits [35:43]: rs2 (8 bits)
+//! Bits [43:51]: rd (8 bits)
 //! ```
 //!
 //! ## Bus Interactions
@@ -112,8 +116,7 @@ pub fn generate_decode_trace(
         .enumerate()
         .map(|(row_idx, (&pc, &instr))| {
             pc_to_row.insert(pc, row_idx);
-            // instruction_length = 4 (RV64C compressed decode is a separate workstream).
-            DecodeEntry::from_instruction(pc, instr, 4)
+            DecodeEntry::from_instruction(pc, instr)
         })
         .collect();
 
@@ -161,8 +164,7 @@ pub fn generate_decode_trace(
         data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
     }
 
-    // Fill padding rows with the DECODE padding pattern: odd pc=1, all flags 0
-    // (unprovable as a fetch target; same row the CPU pads to).
+    // Fill padding rows with DECODE padding pattern: pc=7, EBREAK=1
     let padding_entry = DecodeEntry::padding_entry();
     for row_idx in num_entries..num_rows {
         let base = row_idx * cols::NUM_COLUMNS;
@@ -240,20 +242,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// columns (PC_0, PC_1, PACKED_DECODE, IMM_0, IMM_1), matching exactly how the prover
 /// commits to traces.
 ///
-/// Used by both prover (sanity check) and verifier (soundness check). Pure
-/// library function — no caching, no side effects. Callers manage their own
-/// caching, hardcoding, or recomputation policy as needed:
-///
-/// * **Always recompute**: call this function (or [`commitment_from_elf`])
-///   on every verify. Simple and slow.
-/// * **Cache once per process**: wrap the call in a `OnceLock` /
-///   `HashMap<elf_hash, Commitment>` at the caller site. Useful for native
-///   verifiers that check many proofs of the same ELF in one process.
-/// * **Compile-time constant**: call this function once offline (e.g. from
-///   a one-off test in the consumer crate that prints the result), then
-///   store the resulting bytes as a `const [u8; 32]` in the caller's
-///   source. Useful for the recursion guest where in-VM recomputation is
-///   too expensive.
+/// Used by both prover (sanity check) and verifier (soundness check). The verifier
+/// computes this from the program and checks that the proof's commitment matches.
 ///
 /// ## Arguments
 /// * `instructions` - The program's instruction map (PC → Instruction)
@@ -334,12 +324,7 @@ pub fn instructions_from_elf(elf: &Elf) -> Result<U64HashMap<Instruction>, Instr
 
 /// Compute DECODE commitment directly from an ELF.
 ///
-/// Thin convenience wrapper around [`instructions_from_elf`] + [`compute_precomputed_commitment`].
-/// Pure library function — no caching, always recomputes. Callers that need
-/// caching, hardcoding, or a different policy should wrap this call at their
-/// site (see [`compute_precomputed_commitment`] for the policy options).
-///
-/// This is what the verifier uses — no executor needed.
+/// This is what the verifier uses - no executor needed.
 pub fn commitment_from_elf(
     elf: &Elf,
     options: &ProofOptions,
@@ -381,7 +366,7 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
                 let addr = segment.base_addr + (i as u64 * 4);
                 let instruction = Instruction::parse(word)?;
                 pc_to_row.insert(addr, decode_entries.len());
-                decode_entries.push(DecodeEntry::from_instruction(addr, instruction, 4));
+                decode_entries.push(DecodeEntry::from_instruction(addr, instruction));
             }
         }
     }
@@ -443,4 +428,83 @@ fn build_decode_table(
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "prove")]
+    use executor::elf::Segment;
+
+    #[test]
+    fn test_tables_from_elf_single_executable_segment() {
+        // ADDI x1, x0, 42  (opcode: 0x02a00093)
+        // ADDI x2, x1, 10  (opcode: 0x00a08113)
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![Segment {
+                base_addr: 0x1000,
+                values: vec![0x02a00093, 0x00a08113],
+                is_executable: true,
+            }],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // Check DECODE table
+        assert_eq!(tables.pc_to_row.len(), 3); // 2 instructions + CPU padding
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(tables.pc_to_row.contains_key(&0x1004));
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
+    }
+
+    #[test]
+    fn test_tables_from_elf_mixed_segments() {
+        // Executable segment with instructions
+        // Data segment with data (not included in DECODE)
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![
+                Segment {
+                    base_addr: 0x1000,
+                    values: vec![0x02a00093], // ADDI instruction
+                    is_executable: true,
+                },
+                Segment {
+                    base_addr: 0x2000,
+                    values: vec![0xDEADBEEF, 0xCAFEBABE], // Data
+                    is_executable: false,
+                },
+            ],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only executable segment (1 instruction + CPU padding)
+        assert_eq!(tables.pc_to_row.len(), 2);
+        assert!(tables.pc_to_row.contains_key(&0x1000));
+        assert!(!tables.pc_to_row.contains_key(&0x2000)); // Data not in decode
+    }
+
+    #[test]
+    fn test_tables_from_elf_empty() {
+        let elf = Elf {
+            entry_point: 0x1000,
+            data: vec![],
+        };
+
+        let tables = tables_from_elf(&elf).unwrap();
+
+        // DECODE: only CPU padding entry
+        assert_eq!(tables.pc_to_row.len(), 1);
+        assert!(
+            tables
+                .pc_to_row
+                .contains_key(&super::super::cpu::CPU_PADDING_PC)
+        );
+    }
 }

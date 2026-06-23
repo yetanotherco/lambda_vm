@@ -17,26 +17,23 @@ use stark::constraints::transition::TransitionConstraint;
 fn test_branch_constraint_degree() {
     let (constraints, _) = branch_constraints(0);
 
-    // The 4 conditional carry IS_BIT constraints have degree 3:
-    //   cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1)
-    // and the IS_BIT<JALR> constraint has degree 2: JALR * (1 - JALR).
-    for c in &constraints[..4] {
+    // All 4 conditional carry IS_BIT constraints have degree 3:
+    // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1)
+    for c in &constraints {
         assert_eq!(c.degree(), 3);
     }
-    assert_eq!(constraints[4].degree(), 2);
 }
 
 #[test]
 fn test_branch_constraint_indices_unique() {
     let (constraints, next_idx) = branch_constraints(0);
 
-    assert_eq!(constraints.len(), 5);
+    assert_eq!(constraints.len(), 4);
     assert_eq!(constraints[0].constraint_idx(), 0);
     assert_eq!(constraints[1].constraint_idx(), 1);
     assert_eq!(constraints[2].constraint_idx(), 2);
     assert_eq!(constraints[3].constraint_idx(), 3);
-    assert_eq!(constraints[4].constraint_idx(), 4);
-    assert_eq!(next_idx, 5);
+    assert_eq!(next_idx, 4);
 }
 
 #[test]
@@ -47,8 +44,7 @@ fn test_branch_constraint_indices_with_offset() {
     assert_eq!(constraints[1].constraint_idx(), 11);
     assert_eq!(constraints[2].constraint_idx(), 12);
     assert_eq!(constraints[3].constraint_idx(), 13);
-    assert_eq!(constraints[4].constraint_idx(), 14);
-    assert_eq!(next_idx, 15);
+    assert_eq!(next_idx, 14);
 }
 
 // =========================================================================

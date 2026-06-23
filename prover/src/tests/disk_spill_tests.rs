@@ -25,14 +25,14 @@ fn test_disk_spill_prove_verify_and_roundtrip_small() {
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::default())
         .expect("prove failed");
     assert!(
-        crate::verify_with_options(&proof, &elf_bytes, &opts, None, None).expect("verify failed"),
+        crate::verify_with_options(&proof, &elf_bytes, &opts).expect("verify failed"),
         "verification returned false"
     );
 
     let bytes = bincode::serialize(&proof).expect("serialize failed");
     let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
     assert!(
-        crate::verify_with_options(&proof2, &elf_bytes, &opts, None, None).expect("verify failed"),
+        crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed"),
         "verification failed after serialization roundtrip"
     );
 }
@@ -45,14 +45,14 @@ fn test_disk_spill_prove_verify_and_roundtrip_chunked() {
     let proof = crate::prove_with_options(&elf_bytes, &opts, &MaxRowsConfig::small())
         .expect("prove failed");
     assert!(
-        crate::verify_with_options(&proof, &elf_bytes, &opts, None, None).expect("verify failed"),
+        crate::verify_with_options(&proof, &elf_bytes, &opts).expect("verify failed"),
         "verification returned false"
     );
 
     let bytes = bincode::serialize(&proof).expect("serialize failed");
     let proof2: VmProof = bincode::deserialize(&bytes).expect("deserialize failed");
     assert!(
-        crate::verify_with_options(&proof2, &elf_bytes, &opts, None, None).expect("verify failed"),
+        crate::verify_with_options(&proof2, &elf_bytes, &opts).expect("verify failed"),
         "verification failed after serialization roundtrip (chunked)"
     );
 }

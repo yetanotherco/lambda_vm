@@ -1,4 +1,5 @@
 use crate::frame::Frame;
+use alloc::vec::Vec;
 #[cfg(feature = "disk-spill")]
 use crypto::mmap_util::spill_slice_to_mmap;
 use math::field::{
@@ -52,10 +53,7 @@ impl std::fmt::Debug for TableMmapBacking {
 )]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
-    /// Row-major backing store. Crate-private: external callers must go through
-    /// the spill-safe accessors (`get`/`get_row`/`set`) rather than indexing the
-    /// raw buffer, which bypasses the disk-spill mmap backing.
-    pub(crate) data: Vec<FieldElement<F>>,
+    pub data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
     #[cfg(feature = "disk-spill")]
@@ -408,7 +406,7 @@ where
 pub struct TableView<F, E>
 where
     E: IsField,
-    F: IsSubFieldOf<E>,
+    F: IsSubFieldOf<F>,
 {
     pub data: Vec<Vec<FieldElement<F>>>,
     pub aux_data: Vec<Vec<FieldElement<E>>>,
@@ -417,7 +415,7 @@ where
 impl<F, E> TableView<F, E>
 where
     E: IsField,
-    F: IsSubFieldOf<E>,
+    F: IsSubFieldOf<F>,
 {
     pub fn new(data: Vec<Vec<FieldElement<F>>>, aux_data: Vec<Vec<FieldElement<E>>>) -> Self {
         Self { data, aux_data }

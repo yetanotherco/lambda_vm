@@ -20,7 +20,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use crate::tables::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::test_utils::multi_prove_ram;
 
 type F = GoldilocksField;
@@ -60,10 +60,9 @@ fn new_sender_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
-            BusId::ByteAlu,
+            BusId::AndByte,
             Multiplicity::Column(sender_cols::AND),
             vec![
-                BusValue::constant(alu_op::AND as u64),
                 BusValue::Packed {
                     start_column: sender_cols::X,
                     packing: Packing::Direct,
@@ -96,10 +95,9 @@ fn new_receiver_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            BusId::ByteAlu,
+            BusId::AndByte,
             Multiplicity::Column(receiver_cols::MU_AND),
             vec![
-                BusValue::constant(alu_op::AND as u64),
                 BusValue::Packed {
                     start_column: receiver_cols::X,
                     packing: Packing::Direct,
@@ -218,8 +216,8 @@ fn prove_and_verify(sender_lookups: &[(u8, u8, u8)]) -> bool {
 // =============================================================================
 
 #[test]
-fn test_completeness_byte_alu_and_simple() {
-    // Sender: BYTE_ALU[AND, 5, 3] = 1 (correct: 5 & 3 = 1)
+fn test_completeness_and_byte_simple() {
+    // Sender: AND_BYTE[5, 3] = 1 (correct: 5 & 3 = 1)
     // Receiver: precomputed table has row (5, 3) with AND = 1, multiplicity = 1
     let sender = vec![(5u8, 3u8, 1u8)];
 
@@ -227,7 +225,7 @@ fn test_completeness_byte_alu_and_simple() {
 }
 
 #[test]
-fn test_completeness_byte_alu_and_zero_result() {
+fn test_completeness_and_byte_zero_result() {
     // 0xAA & 0x55 = 0 (alternating bits)
     let sender = vec![(0xAAu8, 0x55u8, 0x00u8)];
 
@@ -235,7 +233,7 @@ fn test_completeness_byte_alu_and_zero_result() {
 }
 
 #[test]
-fn test_completeness_byte_alu_and_max() {
+fn test_completeness_and_byte_max() {
     // 0xFF & 0xFF = 0xFF
     let sender = vec![(0xFFu8, 0xFFu8, 0xFFu8)];
 
@@ -325,7 +323,7 @@ fn prove_and_verify_custom(
 
 #[test]
 fn test_soundness_wrong_result() {
-    // Sender claims BYTE_ALU[AND, 5, 3] = 99 (WRONG! Should be 1)
+    // Sender claims AND_BYTE[5, 3] = 99 (WRONG! Should be 1)
     // Receiver has precomputed correct value 1, so verification should fail
     let sender = vec![(5u8, 3u8, 99u8)];
 
@@ -334,7 +332,7 @@ fn test_soundness_wrong_result() {
 
 #[test]
 fn test_soundness_off_by_one() {
-    // Sender claims BYTE_ALU[AND, 0xFF, 0xFF] = 0xFE (WRONG! Should be 0xFF)
+    // Sender claims AND_BYTE[0xFF, 0xFF] = 0xFE (WRONG! Should be 0xFF)
     let sender = vec![(0xFFu8, 0xFFu8, 0xFEu8)];
 
     assert!(!prove_and_verify(&sender));
@@ -365,7 +363,7 @@ fn test_soundness_missing_receiver_row() {
 
 #[test]
 fn test_soundness_swapped_inputs() {
-    // Sender: BYTE_ALU[AND, 3, 5] = 1
+    // Sender: AND_BYTE[3, 5] = 1
     // Receiver: has (5, 3) not (3, 5) - order matters!
     let sender = vec![(3u8, 5u8, 1u8)]; // Note: X=3, Y=5
     // Custom receiver with swapped inputs

@@ -22,10 +22,10 @@
 //! - `sign_n`, `sign_d`, `sign_q`, `sign_r`: Bit - sign bits
 //!
 //! ## Bus Interactions
-//! - Sender: IS_HALF (×20: n, d, r, n_sub_r, q)
+//! - Sender: IS_HALF (×16: n, d, r, n_sub_r, q)
 //! - Sender: MSB16 (×3 for sign extraction: n, d, r)
-//! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
-//!   ×2 MUL-flavored for `n - r = d * q` lo/hi)
+//! - Sender: LT (×1 for abs_r < abs_d)
+//! - Sender: MUL (×2 for n_sub_r = d * q verification)
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
 //! - Receiver: DVRM (×2 for quotient and remainder results)
 
@@ -44,7 +44,7 @@ use stark::trace::TraceTable;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
-    NEG_INV_2_64, SHIFT_16, alu_op,
+    NEG_INV_2_64, SHIFT_16,
 };
 
 // =========================================================================
@@ -389,34 +389,9 @@ pub fn generate_dvrm_trace(
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::new();
 
-    // -------------------------------------------------------------------------
-    // DVRM-A1.i: IS_HALF[n[i]] (×4) and DVRM-A2.i: IS_HALF[d[i]] (×4),
-    // multiplicity: μ_q + μ_r.
-    // The bus binds only the packed 32-bit words (DWordHL/DWordBL emit two
-    // words, not the four halves), so without these the input halves are free:
-    // a prover could supply non-canonical halves that re-pack to the same word
-    // yet sum to 0 in the field, forging div_by_zero (DVRM-C17 keys on the
-    // half-sum) for a nonzero denominator. Range-checking each half closes that.
-    // -------------------------------------------------------------------------
-    for col in [
-        cols::N_0,
-        cols::N_1,
-        cols::N_2,
-        cols::N_3,
-        cols::D_0,
-        cols::D_1,
-        cols::D_2,
-        cols::D_3,
-    ] {
-        interactions.push(BusInteraction::sender(
-            BusId::IsHalfword,
-            Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-            vec![BusValue::Packed {
-                start_column: col,
-                packing: Packing::Direct,
-            }],
-        ));
-    }
+    // DVRM-A1.i (IS_HALF[n[i]]) and DVRM-A2.i (IS_HALF[d[i]]) are assumptions:
+    // the CPU (sender) is responsible for range-checking n and d before sending
+    // to DVRM. The DVRM table does NOT send these IS_HALF lookups.
 
     // -------------------------------------------------------------------------
     // DVRM-C13.i: IS_HALF[r[i]] (×4), multiplicity: μ_q + μ_r
@@ -522,14 +497,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C2: ALU[abs_r, abs_d, opsel(LT), 1-div_by_zero, 0]
-    // Verify |r| < |d| when d != 0 (the ALU output is 1 iff abs_r < abs_d).
-    // This lookup is dispatched on the unified ALU bus with signed=0/invert=0
-    // (there is no dedicated `Lt` bus).
+    // DVRM-C2: LT[1-div_by_zero; abs_r, abs_d, 0]
+    // Verify |r| < |d| when d != 0
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::Alu,
+        BusId::Lt,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
         smallvec![
             // abs_r as DWordWL (2 words → 2 elements)
@@ -542,9 +515,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::ABS_D_0,
                 packing: Packing::DWordWL,
             },
-            // flags = opsel(LT) (signed=0, invert=0)
-            BusValue::constant(alu_op::LT as u64),
-            // out_lo = 1 - div_by_zero (LT result fits in the low word)
+            // signed = 0 (unsigned comparison of absolute values)
+            BusValue::constant(0),
+            // lt_result = 1 - div_by_zero
             BusValue::linear(vec![
                 LinearTerm::Constant(1),
                 LinearTerm::Column {
@@ -552,81 +525,81 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     column: cols::DIV_BY_ZERO,
                 },
             ]),
-            // out_hi = 0
+        ],
+    ));
+
+    // -------------------------------------------------------------------------
+    // DVRM-C9: MUL[n_sub_r::DWordWL; d, signed, q, sign_q, 0]
+    // Verify n - r = d * q (lower 64 bits)
+    // multiplicity: μ_q + μ_r
+    // -------------------------------------------------------------------------
+    interactions.push(BusInteraction::sender(
+        BusId::Mul,
+        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
+        smallvec![
+            // d as DWordHL (lhs)
+            BusValue::Packed {
+                start_column: cols::D_0,
+                packing: Packing::DWordHL,
+            },
+            // lhs_signed = signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // q as DWordHL (rhs)
+            BusValue::Packed {
+                start_column: cols::Q_0,
+                packing: Packing::DWordHL,
+            },
+            // rhs_signed = sign_q
+            BusValue::Packed {
+                start_column: cols::SIGN_Q,
+                packing: Packing::Direct,
+            },
+            // result: n_sub_r as DWordHL (lower 64 bits of d*q)
+            BusValue::Packed {
+                start_column: cols::N_SUB_R_0,
+                packing: Packing::DWordHL,
+            },
+            // muldiv_selector = 0 (lo)
             BusValue::constant(0),
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C9: ALU[d, q, opsel(MUL)+32*signed+64*sign_q, n_sub_r]
-    // Verify n - r = d * q (lower 64 bits). The lookup is dispatched on the
-    // unified ALU bus with the lo selector (flags `+0`); there is no dedicated
-    // `Mul` bus.
+    // DVRM-C10: MUL[extension_n_sub_r::DWordWL; d, signed, q, sign_q, 1]
+    // Verify upper 64 bits of d * q = sign extension of n_sub_r
     // multiplicity: μ_q + μ_r
     // -------------------------------------------------------------------------
-    let mul_flags = |hi: i64| {
-        BusValue::linear(vec![
-            LinearTerm::Constant(alu_op::MUL as i64 + hi),
-            LinearTerm::Column {
-                coefficient: 32,
-                column: cols::SIGNED,
-            },
-            LinearTerm::Column {
-                coefficient: 64,
-                column: cols::SIGN_Q,
-            },
-        ])
-    };
     interactions.push(BusInteraction::sender(
-        BusId::Alu,
+        BusId::Mul,
         Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
-            // lhs = d as DWordHL
+        smallvec![
+            // d as DWordHL (lhs)
             BusValue::Packed {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // rhs = q as DWordHL
+            // lhs_signed = signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
+            // q as DWordHL (rhs)
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
-            // flags = opsel(MUL) + 32*signed + 64*sign_q (lo half)
-            mul_flags(0),
-            // result = n_sub_r as DWordHL (lower 64 bits of d*q)
+            // rhs_signed = sign_q
             BusValue::Packed {
-                start_column: cols::N_SUB_R_0,
-                packing: Packing::DWordHL,
+                start_column: cols::SIGN_Q,
+                packing: Packing::Direct,
             },
-        ],
-    ));
-
-    // -------------------------------------------------------------------------
-    // DVRM-C10: ALU[d, q, opsel(MUL)+32*signed+64*sign_q+128, sign_ext(n_sub_r)]
-    // Verify upper 64 bits of d * q = sign extension of n_sub_r.
-    // Dispatched on the unified ALU bus with the hi selector (flags `+128`).
-    // multiplicity: μ_q + μ_r
-    // -------------------------------------------------------------------------
-    interactions.push(BusInteraction::sender(
-        BusId::Alu,
-        Multiplicity::Sum(cols::MU_Q, cols::MU_R),
-        vec![
-            // lhs = d as DWordHL
-            BusValue::Packed {
-                start_column: cols::D_0,
-                packing: Packing::DWordHL,
-            },
-            // rhs = q as DWordHL
-            BusValue::Packed {
-                start_column: cols::Q_0,
-                packing: Packing::DWordHL,
-            },
-            // flags = opsel(MUL) + 32*signed + 64*sign_q + 128 (hi half)
-            mul_flags(128),
-            // result: sign extension of n_sub_r.
-            // The MUL Alu receiver consumes the result as `Packed{HI_0, DWordHL}`
-            // → 2 elements `[HI_0 + 2^16*HI_1, HI_2 + 2^16*HI_3]`. Both equal
-            // SIGN_N_SUB_R * 0xFFFFFFFF (each halfword is SIGN_FILL when negative).
+            // result: sign extension of n_sub_r as DWordHL
+            // Each halfword = sign_n_sub_r * 65535
+            // lo32 = sign_n_sub_r * (65535 + 65535 * 2^16) = sign_n_sub_r * 0xFFFFFFFF
+            // hi32 = same
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
                 column: cols::SIGN_N_SUB_R,
@@ -635,6 +608,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 coefficient: (SIGN_FILL + SIGN_FILL * SHIFT_16) as i64,
                 column: cols::SIGN_N_SUB_R,
             }]),
+            // muldiv_selector = 1 (hi)
+            BusValue::constant(1),
         ],
     ));
 
@@ -923,11 +898,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C21: Quotient result on the unified ALU bus.
-    // ALU[q::DWordWL; n, d, opsel(DIVREM) + 32*signed] | μ_q  (muldiv bit 7 = 0)
+    // DVRM-C21: Receiver for quotient result
+    // DVRM[q::DWordWL; n, d, signed, 0] with multiplicity -μ_q
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Alu,
+        BusId::Dvrm,
         Multiplicity::Column(cols::MU_Q),
         smallvec![
             // n as DWordHL (4 halfwords → 2 words)
@@ -940,28 +915,27 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // flags = DIVREM + 32*signed (quotient: muldiv selector = 0)
-            BusValue::linear(vec![
-                LinearTerm::Constant(alu_op::DIVREM as i64),
-                LinearTerm::Column {
-                    coefficient: 32,
-                    column: cols::SIGNED,
-                },
-            ]),
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
             // q as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::Q_0,
                 packing: Packing::DWordHL,
             },
+            // muldiv_selector = 0 (quotient)
+            BusValue::constant(0),
         ],
     ));
 
     // -------------------------------------------------------------------------
-    // DVRM-C22: Remainder result on the unified ALU bus.
-    // ALU[r::DWordWL; n, d, opsel(DIVREM) + 32*signed + 128] | μ_r  (muldiv bit 7 = 1)
+    // DVRM-C22: Receiver for remainder result
+    // DVRM[r::DWordWL; n, d, signed, 1] with multiplicity -μ_r
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::receiver(
-        BusId::Alu,
+        BusId::Dvrm,
         Multiplicity::Column(cols::MU_R),
         smallvec![
             // n as DWordHL
@@ -974,19 +948,18 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::D_0,
                 packing: Packing::DWordHL,
             },
-            // flags = DIVREM + 32*signed + 128 (remainder: muldiv selector = 1)
-            BusValue::linear(vec![
-                LinearTerm::Constant(alu_op::DIVREM as i64 + 128),
-                LinearTerm::Column {
-                    coefficient: 32,
-                    column: cols::SIGNED,
-                },
-            ]),
+            // signed
+            BusValue::Packed {
+                start_column: cols::SIGNED,
+                packing: Packing::Direct,
+            },
             // r as DWordHL (result)
             BusValue::Packed {
                 start_column: cols::R_0,
                 packing: Packing::DWordHL,
             },
+            // muldiv_selector = 1 (remainder)
+            BusValue::constant(1),
         ],
     ));
 

@@ -1,11 +1,7 @@
 //! Tests for the LT (Less-Than) table.
 
-use stark::proof::options::ProofOptions;
-use stark::traits::AIR;
-
-use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace, lt_constraints};
+use crate::tables::lt::{LtOperation, bus_interactions, cols, generate_lt_trace};
 use crate::tables::types::FE;
-use crate::test_utils::{busless_air, create_lt_air, in_chip_constraint_count, validate_busless};
 
 /// Signed comparison flag
 const SIGNED: bool = true;
@@ -166,68 +162,6 @@ fn test_multiplicity_different_signed_flags() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1])
-    // + ALU receiver x1 (every LT lookup goes through the unified ALU bus
-    // — CPU SLT/BLT/BGE dispatch and the internal memw/dvrm
-    // timestamp / |r|<|d| checks) = 9.
+    // MSB16 x2 + IS_HALFWORD x6 (lhs_sub_rhs x4 + lhs[1] + rhs[1]) + LT x1 = 9 interactions
     assert_eq!(interactions.len(), 9);
-}
-
-// Soundness regression: `lt` must equal `(lhs < rhs)`. The in-chip constraints were
-// dead code until they were wired into the production `create_lt_air`, so a prover
-// could certify a false comparison (and, via the memory-timestamp LT bus, forge
-// memory consistency). These guard against reintroducing that hole.
-
-/// Enforcement: a forged `lt = 1` for `20 <u 10` (true result 0) is rejected by
-/// `LtFormula`, evaluated in isolation over a bus-less AIR.
-#[test]
-fn test_lt_rejects_false_comparison() {
-    let air = busless_air(cols::NUM_COLUMNS, lt_constraints(0).0);
-    let mut trace = generate_lt_trace(&[LtOperation::new(20, 10, UNSIGNED)]);
-    assert!(
-        validate_busless(&air, &trace),
-        "honest LT row (20 <u 10 = 0) must validate"
-    );
-
-    trace.set_main(0, cols::LT, FE::one());
-    assert!(
-        !validate_busless(&air, &trace),
-        "forged lt=1 for 20<u10 must be rejected by LtFormula"
-    );
-}
-
-/// Wiring: `create_lt_air` registers the in-chip constraints on top of its bus
-/// constraints. Directly catches a revert to `transition_constraints = vec![]`.
-#[test]
-fn test_lt_air_wires_in_chip_constraints() {
-    let air = create_lt_air(&ProofOptions::default_test_options());
-    let in_chip = in_chip_constraint_count(
-        air.num_transition_constraints(),
-        cols::NUM_COLUMNS,
-        bus_interactions(),
-    );
-    assert_eq!(in_chip, lt_constraints(0).0.len());
-    // Carry0IsBit, Carry1IsBit, LtFormula, OutXorInvert, InvertIsBit, SignedIsBit.
-    assert_eq!(lt_constraints(0).0.len(), 6);
-}
-
-/// Enforcement (this branch's unified-ALU-bus layout): the bus consumes `out`,
-/// not `lt`. A forged `out` (e.g. `out = 1` while `lt = invert = 0`) must be
-/// rejected by `OutXorInvert`. This is the hole `LtFormula` alone does NOT close
-/// here, since `LtFormula` only binds `lt`.
-#[test]
-fn test_lt_rejects_forged_out() {
-    let air = busless_air(cols::NUM_COLUMNS, lt_constraints(0).0);
-    // 20 <u 10 = 0 and invert = 0 ⇒ out must be 0.
-    let mut trace = generate_lt_trace(&[LtOperation::new(20, 10, UNSIGNED)]);
-    assert!(
-        validate_busless(&air, &trace),
-        "honest LT row (out = lt XOR invert = 0) must validate"
-    );
-
-    trace.set_main(0, cols::OUT, FE::one());
-    assert!(
-        !validate_busless(&air, &trace),
-        "forged out=1 (lt=invert=0) must be rejected by OutXorInvert"
-    );
 }

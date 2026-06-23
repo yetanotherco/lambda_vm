@@ -71,7 +71,7 @@ fn new_sender_air(
 
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
-            BusId::Alu,
+            BusId::Lt,
             Multiplicity::Column(sender_cols::MU),
             vec![
                 BusValue::Packed {
@@ -127,7 +127,7 @@ fn new_receiver_air(
     // Use the same bus interaction as the LT table
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
-            BusId::Alu,
+            BusId::Lt,
             Multiplicity::Column(cols::MU),
             vec![
                 BusValue::Packed {

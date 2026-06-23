@@ -8,7 +8,8 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
-    proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
+    proof::stark::MultiProof,
+    proof::zerocopy::{DeepPolynomialOpeningRef, FriDecommitmentRef, StarkProofRef},
 };
 use alloc::vec::Vec;
 use core::marker::PhantomData;
@@ -25,7 +26,6 @@ use math::{
     },
     traits::AsBytes,
 };
-use hashbrown::HashMap;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
@@ -134,6 +134,165 @@ pub trait IsStarkVerifier<
             .collect::<Vec<usize>>()
     }
 
+    /// Returns the list of challenges sent to the prover.
+    fn step_1_replay_rounds_and_recover_challenges<'p, P>(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: &P,
+        domain: &VerifierDomain<Field>,
+        transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
+    ) -> Challenges<FieldExtension>
+    where
+        P: crate::proof::zerocopy::StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + math::traits::ByteConversion,
+        FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion,
+    {
+        // ===================================
+        // ==========|   Round 1   |==========
+        // ===================================
+
+        // <<<< Receive commitments:[tⱼ]
+        transcript.append_bytes(proof.lde_trace_main_merkle_root());
+
+        let rap_challenges = air.build_rap_challenges(transcript);
+
+        if let Some(root) = proof.lde_trace_aux_merkle_root() {
+            transcript.append_bytes(root);
+        }
+
+        // ===================================
+        // ==========|   Round 2   |==========
+        // ===================================
+
+        // <<<< Receive challenge: 𝛽
+        let beta = transcript.sample_field_element();
+        let trace_length = proof.trace_length();
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(|c| crate::lookup::BusPublicInputs::from_contribution(c.clone()));
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                proof.public_inputs(),
+                &rap_challenges,
+                bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+
+        let num_transition_constraints = air.context().num_transition_constraints;
+
+        let mut coefficients =
+            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
+
+        let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coeffs = coefficients;
+
+        // <<<< Receive commitments: [H₁], [H₂]
+        transcript.append_bytes(proof.composition_poly_root());
+
+        // ===================================
+        // ==========|   Round 3   |==========
+        // ===================================
+
+        // >>>> Send challenge: z
+        let z = transcript.sample_z_ood_with_domain_params(
+            domain.trace_length,
+            domain.lde_length,
+            &domain.coset_offset,
+        );
+
+        // <<<< Receive values: tⱼ(zgᵏ)
+        // Column-major append (matches `Table::columns()` order) without
+        // materializing the transposed columns.
+        let ood = proof.trace_ood_evaluations();
+        for col_idx in 0..ood.width() {
+            for row_idx in 0..ood.height() {
+                transcript.append_field_element(&ood.get_row(row_idx)[col_idx]);
+            }
+        }
+        // <<<< Receive value: Hᵢ(z^N)
+        let composition_poly_parts_ood = proof.composition_poly_parts_ood_evaluation();
+        for element in composition_poly_parts_ood.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // ===================================
+        // ==========|   Round 4   |==========
+        // ===================================
+
+        let num_terms_composition_poly = composition_poly_parts_ood.len();
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let gamma = transcript.sample_field_element();
+
+        // <<<< Receive challenges: 𝛾, 𝛾'
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                .take(num_terms_composition_poly + num_terms_trace)
+                .collect();
+
+        // Split the contiguous coefficient buffer: the trace terms are the first
+        // `num_terms_trace` (kept flat, column-major with stride `chunk_len`), the
+        // composition-poly gammas are the rest. `split_off(num_terms_trace)` hands
+        // the suffix to `gammas` and leaves the (already contiguous) trace prefix
+        // as `trace_term_coeffs` — no per-column `Vec` allocation, no copy.
+        let chunk_len = air.context().transition_offsets.len() * air.step_size();
+        // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
+        let gammas = deep_composition_coefficients.split_off(num_terms_trace);
+        let trace_term_coeffs = deep_composition_coefficients;
+        let trace_term_chunk_len = chunk_len;
+
+        // FRI commit phase
+        let merkle_roots = proof.fri_layers_merkle_roots();
+        let mut zetas = merkle_roots
+            .iter()
+            .map(|root| {
+                // >>>> Send challenge 𝜁ₖ
+                let element = transcript.sample_field_element();
+                // <<<< Receive commitment: [pₖ] (the first one is [p₀])
+                transcript.append_bytes(root);
+                element
+            })
+            .collect::<Vec<FieldElement<FieldExtension>>>();
+
+        // >>>> Send challenge 𝜁ₙ₋₁
+        zetas.push(transcript.sample_field_element());
+
+        // <<<< Receive value: pₙ
+        transcript.append_field_element(proof.fri_last_value());
+
+        // Receive grinding value
+        let security_bits = air.context().proof_options.grinding_factor;
+        let mut grinding_seed = [0u8; 32];
+        if security_bits > 0
+            && let Some(nonce_value) = proof.nonce()
+        {
+            grinding_seed = transcript.state();
+            transcript.append_bytes(&nonce_value.to_be_bytes());
+        }
+
+        // FRI query phase
+        // <<<< Send challenges 𝜄ₛ (iota_s)
+        let number_of_queries = air.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
+
+        Challenges {
+            z,
+            boundary_coeffs,
+            transition_coeffs,
+            trace_term_coeffs,
+            trace_term_chunk_len,
+            gammas,
+            zetas,
+            iotas,
+            rap_challenges,
+            grinding_seed,
+        }
+    }
+
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
@@ -163,51 +322,48 @@ pub trait IsStarkVerifier<
             bus_public_inputs.as_ref(),
             trace_length,
         );
-        // Precompute g^step once per distinct step to avoid the prior O(B^2)
-        // linear scan. A single pass populates a memo and resolves each
-        // constraint's step to its point in O(1) amortized.
-        let mut step_to_point: HashMap<usize, FieldElement<Field>> = HashMap::new();
-        let boundary_points: Vec<FieldElement<Field>> = boundary_constraints
-            .constraints
-            .iter()
-            .map(|c| {
-                step_to_point
-                    .entry(c.step)
-                    .or_insert_with(|| domain.trace_primitive_root.pow(c.step as u64))
-                    .clone()
-            })
-            .collect();
+        let number_of_b_constraints = boundary_constraints.constraints.len();
 
-        let main_trace_width = air.trace_layout().0;
-        let ood_row = proof.trace_ood_evaluations.get_row(0);
+        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
 
+        #[allow(clippy::type_complexity)]
         let (boundary_c_i_evaluations_num, mut boundary_c_i_evaluations_den): (
             Vec<FieldElement<FieldExtension>>,
             Vec<FieldElement<FieldExtension>>,
-        ) = boundary_constraints
-            .constraints
-            .iter()
-            .zip(&boundary_points)
-            .map(|(c, point)| {
-                let column_idx = if c.is_aux {
-                    main_trace_width + c.col
-                } else {
-                    c.col
+        ) = (0..number_of_b_constraints)
+            .map(|index| {
+                let step = boundary_constraints.constraints[index].step;
+                let is_aux = boundary_constraints.constraints[index].is_aux;
+                let point = match boundary_step_points.iter().find(|(s, _)| *s == step) {
+                    Some((_, p)) => p.clone(),
+                    None => {
+                        let p = domain.trace_primitive_root.pow(step as u64);
+                        boundary_step_points.push((step, p.clone()));
+                        p
+                    }
                 };
-                let trace_evaluation = &ood_row[column_idx];
+                let column_idx = boundary_constraints.constraints[index].col;
+                let trace_evaluation = if is_aux {
+                    let column_idx = air.trace_layout().0 + column_idx;
+                    &ood.get_row(0)[column_idx]
+                } else {
+                    &ood.get_row(0)[column_idx]
+                };
                 let boundary_zerofier_challenges_z_den = -point + &challenges.z;
-                let boundary_quotient_ood_evaluation_num = -&c.value + trace_evaluation;
+
+                let boundary_quotient_ood_evaluation_num =
+                    -&boundary_constraints.constraints[index].value + trace_evaluation;
+
                 (
                     boundary_quotient_ood_evaluation_num,
                     boundary_zerofier_challenges_z_den,
                 )
             })
+            .collect::<Vec<_>>()
+            .into_iter()
             .unzip();
 
-        // A malformed proof can land `z` on a boundary step, making a denominator zero.
-        if FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).is_err() {
-            return false;
-        }
+        FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).unwrap();
 
         let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
             boundary_c_i_evaluations_num
@@ -346,23 +502,17 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
-            match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
+            Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges, domain, proof,
-            ) {
-                Some(pair) => pair,
-                None => return false,
-            };
+            );
 
         // verify FRI
         let mut evaluation_point_inverse = challenges
             .iotas
             .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
             .collect::<Vec<FieldElement<Field>>>();
-        // Any zero evaluation point means a malformed query index, reject.
-        if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
-            return false;
-        }
+        FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).unwrap();
 
         let mut leaf_scratch: Vec<u8> = Vec::new();
         challenges
@@ -370,8 +520,9 @@ pub trait IsStarkVerifier<
             .iter()
             .zip(evaluation_point_inverse)
             .enumerate()
-            .all(|(i, ((proof_s, iota_s), eval))| {
-                Self::verify_query_and_sym_openings(
+            .fold(true, |mut result, (i, (iota_s, eval))| {
+                let query = proof.query(i);
+                result &= Self::verify_query_and_sym_openings(
                     proof,
                     &challenges.zetas,
                     *iota_s,
@@ -379,60 +530,28 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
-                )
+                    &mut leaf_scratch,
+                );
+                result
             })
     }
 
     /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
-    /// Returns the LDE-coset element for FRI query challenge `iota`. The
-    /// `sym` flag picks the symmetric counterpart (`iota*2+1`) instead of the
-    /// primary index (`iota*2`).
     fn query_challenge_to_evaluation_point(
         iota: usize,
-        sym: bool,
         domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        let raw = iota * 2 + if sym { 1 } else { 0 };
-        domain.lde_coset_element(reverse_index(raw, domain.lde_length as u64))
+        let index = reverse_index(iota * 2, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
-    /// Verifies the validity of the opening proof.
-    fn verify_opening<E>(
-        merkle_path: &[Commitment],
-        root: &Commitment,
-        index: usize,
-        value: &[FieldElement<E>],
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
-        FieldElement<E>: AsBytes + math::traits::ByteConversion + Sync + Send,
-        E: IsField,
-        Field: IsSubFieldOf<E>,
-    {
-        crate::config::verify_batched_merkle_path_slice::<E>(merkle_path, root, index, value)
-    }
-
-    /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
-    /// of a `PolynomialOpenings` against the given `root` at iota positions
-    /// `iota*2` and `iota*2 + 1`.
-    fn verify_opening_pair<E>(
-        opening: &PolynomialOpenings<E>,
-        root: &Commitment,
+    /// Returns the symmetric field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
+    fn query_challenge_to_evaluation_point_sym(
         iota: usize,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<E>: AsBytes + Sync + Send,
-        E: IsField,
-        Field: IsSubFieldOf<E>,
-    {
-        Self::verify_opening::<E>(&opening.proof, root, iota * 2, &opening.evaluations)
-            && Self::verify_opening::<E>(
-                &opening.proof_sym,
-                root,
-                iota * 2 + 1,
-                &opening.evaluations_sym,
-            )
+        domain: &VerifierDomain<Field>,
+    ) -> FieldElement<Field> {
+        let index = reverse_index(iota * 2 + 1, domain.lde_length as u64);
+        domain.lde_coset_element(index)
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
@@ -456,38 +575,67 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
-        // Main trace (multiplicities for preprocessed, full trace for normal).
-        let mut ok = Self::verify_opening_pair::<Field>(
-            &deep_poly_openings.main_trace_polys,
-            &proof.lde_trace_main_merkle_root,
-            iota,
+        // index = iota*2, index_sym = iota*2+1 are always in the same ARITY=4
+        // level-0 group — use the paired variant to walk the ancestor path once.
+        let index = iota * 2;
+        let mut result = true;
+
+        let main_root = proof.lde_trace_main_merkle_root();
+
+        // Main trace: both proof and proof_sym paths share the same level-0 group.
+        // verify_paired_batched_openings hashes both leaves and walks ancestors once.
+        result &= crate::config::verify_paired_batched_openings::<Field>(
+            deep_poly_openings.main_trace_polys.proof,
+            main_root,
+            index,
+            deep_poly_openings.main_trace_polys.evaluations,
+            deep_poly_openings.main_trace_polys.evaluations_sym,
+            leaf_scratch,
         );
 
-        // Precomputed trace (preprocessed tables only). Mismatched presence is
-        // unreachable in practice (multi_verify rejects such proofs upstream),
-        // but a defensive check keeps this function self-contained.
-        ok &= match (
-            &proof.lde_trace_precomputed_merkle_root,
+        // Verify precomputed trace (for preprocessed tables only)
+        match (
+            proof.lde_trace_precomputed_merkle_root(),
             &deep_poly_openings.precomputed_trace_polys,
         ) {
-            (Some(root), Some(opening)) => Self::verify_opening_pair::<Field>(opening, root, iota),
-            (None, None) => true,
-            _ => false,
-        };
+            // Unreachable: multi_verify() already rejected proofs with None root for preprocessed AIRs,
+            // and non-preprocessed AIRs never have openings. No valid execution path reaches here.
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(precomputed_root), Some(precomputed_opening)) => {
+                result &= crate::config::verify_paired_batched_openings::<Field>(
+                    precomputed_opening.proof,
+                    precomputed_root,
+                    index,
+                    precomputed_opening.evaluations,
+                    precomputed_opening.evaluations_sym,
+                    leaf_scratch,
+                );
+            }
+            _ => {}
+        }
 
-        // Auxiliary trace.
-        ok &= match (
-            proof.lde_trace_aux_merkle_root,
+        // Verify auxiliary trace
+        match (
+            proof.lde_trace_aux_merkle_root(),
             &deep_poly_openings.aux_trace_polys,
         ) {
-            (Some(root), Some(opening)) => {
-                Self::verify_opening_pair::<FieldExtension>(opening, &root, iota)
+            (None, Some(_)) => result = false,
+            (Some(_), None) => result = false,
+            (Some(aux_root), Some(aux_trace_polys_opening)) => {
+                result &= crate::config::verify_paired_batched_openings::<FieldExtension>(
+                    aux_trace_polys_opening.proof,
+                    aux_root,
+                    index,
+                    aux_trace_polys_opening.evaluations,
+                    aux_trace_polys_opening.evaluations_sym,
+                    leaf_scratch,
+                );
             }
-            (None, None) => true,
-            _ => false,
-        };
+            _ => {}
+        }
 
-        ok
+        result
     }
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
@@ -534,16 +682,32 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + math::traits::ByteConversion + Sync + Send,
     {
+        let composition_poly_root = proof.composition_poly_root();
+        // Scratch buffers reused across every query to avoid per-query allocation.
+        let mut composition_leaf: Vec<FieldElement<FieldExtension>> = Vec::new();
+        // `leaf_scratch` holds serialized field-element bytes for Merkle leaf hashing.
+        let mut leaf_scratch: Vec<u8> = Vec::new();
         challenges
             .iotas
             .iter()
-            .zip(&proof.deep_poly_openings)
-            .all(|(iota_n, deep_poly_opening)| {
-                Self::verify_composition_poly_opening(
-                    deep_poly_opening,
-                    &proof.composition_poly_root,
+            .enumerate()
+            .fold(true, |mut result, (i, iota_n)| {
+                let deep_poly_opening = proof.deep_poly_opening(i);
+                result &= Self::verify_composition_poly_opening(
+                    &deep_poly_opening,
+                    composition_poly_root,
                     iota_n,
-                ) && Self::verify_trace_openings(proof, deep_poly_opening, *iota_n)
+                    &mut composition_leaf,
+                    &mut leaf_scratch,
+                );
+
+                result &= Self::verify_trace_openings(
+                    proof,
+                    &deep_poly_opening,
+                    *iota_n,
+                    &mut leaf_scratch,
+                );
+                result
             })
     }
 
@@ -677,70 +841,116 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries<'p, P>(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
-        proof: &StarkProof<Field, FieldExtension, PI>,
-    ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
+        proof: &P,
+    ) -> DeepPolynomialEvaluations<FieldExtension>
+    where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
         let num_queries = challenges.iotas.len();
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+        // Scratch buffers reused across every query iteration: the per-row trace
+        // evaluations gathered for the regular and symmetric points, plus the
+        // batch-inverse denominator buffer threaded into the reconstruction. They
+        // are `clear()`ed and refilled each query, so the hot loop performs no
+        // heap allocation after the first iteration.
+        let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
+        let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+        let mut denoms_trace: Vec<FieldElement<FieldExtension>> = Vec::new();
 
-        // Build the base-field LDE evaluations as concatenated slice (precomputed + main)
-        // without lifting to the extension field. The helper now subtracts directly via
-        // the F: IsSubFieldOf<E> Sub impl, so we avoid a per-query base->extension lift.
-        let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
-            .expect("verifier domain root_order is a valid power of two");
-
+        // Precompute the query-INVARIANT half of the deep-trace term, once for all
+        // queries. The trace term is
+        //   Σ_row denom_q[row] · Σ_col (lde_q[col] − ood[row][col])·coeff[col][row]
+        // and only `lde_q` (the per-query opening) and `denom_q` (per-query point)
+        // vary with the query. Splitting the column sum,
+        //   Σ_col ood[row][col]·coeff[col][row]   =: b_terms[row]
+        // depends only on the OOD table and the deep-composition coefficients —
+        // both fixed across queries — so it is computed here once instead of being
+        // recomputed inside every query (×num_queries, ×2 for the symmetric point).
+        // On a realistic proof this function is ~56% of guest cycles and this term
+        // was its dominant repeated work.
+        let b_terms = Self::precompute_ood_coeff_terms(proof, challenges);
+        // Hoist the primitive root computation out of the per-query loop — it is
+        // the same value for every query (depends only on the domain order).
+        let primitive_root =
+            &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
         for (i, iota) in challenges.iotas.iter().enumerate() {
-            let opening = &proof.deep_poly_openings[i];
+            let opening = proof.deep_poly_opening(i);
 
-            // Base-field portion: precomputed columns FIRST, then main trace columns.
-            let mut lde_base: Vec<FieldElement<Field>> = Vec::new();
-            if let Some(p) = &opening.precomputed_trace_polys {
-                lde_base.extend_from_slice(&p.evaluations);
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            evaluations.clear();
+            if let Some(precomputed_polys) = &opening.precomputed_trace_polys {
+                evaluations.extend(
+                    precomputed_polys
+                        .evaluations
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
             }
-            lde_base.extend_from_slice(&opening.main_trace_polys.evaluations);
+            evaluations.extend(
+                opening
+                    .main_trace_polys
+                    .evaluations
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
+            if let Some(aux_trace_polys) = &opening.aux_trace_polys {
+                evaluations.extend_from_slice(aux_trace_polys.evaluations);
+            }
 
-            let lde_aux: &[FieldElement<FieldExtension>] = opening
-                .aux_trace_polys
-                .as_ref()
-                .map(|a| a.evaluations.as_slice())
-                .unwrap_or(&[]);
-
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
+            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &lde_base,
-                lde_aux,
-                &opening.composition_poly.evaluations,
-            )?);
+                &evaluations,
+                opening.composition_poly.evaluations,
+                &b_terms,
+                &mut denoms_trace,
+            ));
 
-            // Mirror for the symmetric query point.
-            let mut lde_base_sym: Vec<FieldElement<Field>> = Vec::new();
-            if let Some(p) = &opening.precomputed_trace_polys {
-                lde_base_sym.extend_from_slice(&p.evaluations_sym);
+            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
+            evaluations_sym.clear();
+            if let Some(precomputed_polys) = &opening.precomputed_trace_polys {
+                evaluations_sym.extend(
+                    precomputed_polys
+                        .evaluations_sym
+                        .iter()
+                        .cloned()
+                        .map(|x| x.to_extension()),
+                );
             }
-            lde_base_sym.extend_from_slice(&opening.main_trace_polys.evaluations_sym);
+            evaluations_sym.extend(
+                opening
+                    .main_trace_polys
+                    .evaluations_sym
+                    .iter()
+                    .cloned()
+                    .map(|x| x.to_extension()),
+            );
+            if let Some(aux_trace_polys) = &opening.aux_trace_polys {
+                evaluations_sym.extend_from_slice(aux_trace_polys.evaluations_sym);
+            }
 
-            let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
-                .aux_trace_polys
-                .as_ref()
-                .map(|a| a.evaluations_sym.as_slice())
-                .unwrap_or(&[]);
-
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, true, domain);
+            let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &lde_base_sym,
-                lde_aux_sym,
-                &opening.composition_poly.evaluations_sym,
-            )?);
+                &evaluations_sym,
+                opening.composition_poly.evaluations_sym,
+                &b_terms,
+                &mut denoms_trace,
+            ));
         }
-        Some((deep_poly_evaluations, deep_poly_evaluations_sym))
+        (deep_poly_evaluations, deep_poly_evaluations_sym)
     }
 
     /// Precompute the query-invariant per-row term
@@ -781,29 +991,31 @@ pub trait IsStarkVerifier<
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
-        lde_trace_base_evaluations: &[FieldElement<Field>],
-        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
+        lde_trace_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
-    ) -> Option<FieldElement<FieldExtension>> {
-        let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
-        let ood_evaluations_table_width = proof.trace_ood_evaluations.width;
+        b_terms: &[FieldElement<FieldExtension>],
+        denoms_trace: &mut Vec<FieldElement<FieldExtension>>,
+    ) -> FieldElement<FieldExtension>
+    where
+        P: StarkProofRef<'p, Field, FieldExtension, PI>,
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+    {
+        let ood = proof.trace_ood_evaluations();
+        let ood_evaluations_table_height = ood.height();
+        let ood_evaluations_table_width = ood.width();
+        let composition_poly_parts_ood = proof.composition_poly_parts_ood_evaluation();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
-
-        // Runtime guard: a malformed proof may supply opening evaluations whose
-        // column count does not match the OOD table width, or whose composition
-        // poly parts count does not match the proof's `composition_poly_parts_ood_evaluation`.
-        // Without these checks the indexing below would panic in release builds.
-        if lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len()
-            != ood_evaluations_table_width
-        {
-            return None;
-        }
-        if trace_term_coeffs.is_empty()
-            || trace_term_coeffs.len() * trace_term_coeffs[0].len()
-                != ood_evaluations_table_height * ood_evaluations_table_width
-        {
-            return None;
-        }
+        let trace_term_chunk_len = challenges.trace_term_chunk_len;
+        debug_assert_eq!(
+            ood_evaluations_table_height * ood_evaluations_table_width,
+            trace_term_coeffs.len()
+        );
+        // Each column's run has length `trace_term_chunk_len`, which equals the
+        // number of OOD rows; the column-major index below relies on this.
+        debug_assert_eq!(trace_term_chunk_len, ood_evaluations_table_height);
+        debug_assert_eq!(b_terms.len(), ood_evaluations_table_height);
 
         // `denoms_trace` is a caller-owned scratch buffer reused across queries;
         // refill it from scratch each call rather than allocating a fresh `Vec`.
@@ -813,47 +1025,43 @@ pub trait IsStarkVerifier<
             denoms_trace.push(evaluation_point - &current_z);
             current_z = primitive_root * &current_z;
         }
-        // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
-        FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
+        FieldElement::inplace_batch_inverse(denoms_trace).unwrap();
 
-        let num_base = lde_trace_base_evaluations.len();
-        let trace_term = (0..ood_evaluations_table_width)
-            .zip(&challenges.trace_term_coeffs)
-            .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
-                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
-                    FieldElement::zero(),
-                    |trace_t, (row_idx, coeff)| {
-                        let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
-                        // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
-                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            &lde_trace_base_evaluations[col_idx] - ood_val
-                        } else {
-                            &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
-                        };
-                        let poly_evaluation = diff * &denoms_trace[row_idx];
-                        trace_t + &poly_evaluation * coeff
-                    },
-                );
-                trace_terms + trace_i
-            });
+        // Deep-trace term, with the query-invariant OOD·coeff half lifted out:
+        //
+        //   Σ_row denom[row] · Σ_col (lde[col] − ood[row][col])·coeff[col][row]
+        // = Σ_row denom[row] · ( (Σ_col lde[col]·coeff[col][row]) − b_terms[row] )
+        //
+        // where `b_terms[row] = Σ_col ood[row][col]·coeff[col][row]` is precomputed
+        // once across all queries (see `precompute_ood_coeff_terms`). The remaining
+        // per-query work is one `lde[col]·coeff` multiply per cell (the `lde`
+        // opening is query-specific), one subtraction of the precomputed `b`, and
+        // one `·denom[row]` per row.
+        let mut trace_term = FieldElement::zero();
+        for (row_idx, denom) in denoms_trace.iter().enumerate() {
+            let mut row_acc = FieldElement::zero();
+            for col_idx in 0..ood_evaluations_table_width {
+                // Flat column-major index: column `col_idx`'s run starts at
+                // `col_idx * trace_term_chunk_len`, row `row_idx` within it.
+                row_acc += lde_trace_evaluations[col_idx].clone()
+                    * &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx];
+            }
+            trace_term += (row_acc - &b_terms[row_idx]) * denom;
+        }
 
         let number_of_parts = lde_composition_poly_parts_evaluation.len();
         let z_pow = &challenges.z.pow(number_of_parts);
 
-        // A malformed proof can make evaluation_point == z^N, reject.
-        let denom_composition = (evaluation_point - z_pow).inv().ok()?;
+        let denom_composition = (evaluation_point - z_pow).inv().unwrap();
         let mut h_terms = FieldElement::zero();
         for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
-            // Bounds-check via `.get(j)?`: a malformed opening may have more
-            // parts than the proof header advertises.
-            let h_i_zpower = proof.composition_poly_parts_ood_evaluation.get(j)?;
-            let gamma = challenges.gammas.get(j)?;
-            let h_i_term = (h_i_upsilon - h_i_zpower) * gamma;
+            let h_i_zpower = &composition_poly_parts_ood[j];
+            let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
             h_terms += h_i_term;
         }
         h_terms *= denom_composition;
 
-        Some(trace_term + h_terms)
+        trace_term + h_terms
     }
 
     /// Convenience wrapper over [`multi_verify`](Self::multi_verify) that takes an
@@ -930,18 +1138,8 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
-            // Soundness: the number of composition-poly parts is fixed by the AIR's
-            // degree bound, NOT chosen by the prover. Deriving it from the proof would
-            // let a malicious prover inflate the part count, widening the composition
-            // polynomial's degree space and weakening the low-degree test. Reject any
-            // proof whose advertised part count disagrees with the AIR.
-            if proof.trace_length == 0
-                || proof.composition_poly_parts_ood_evaluation.len()
-                    != air.composition_poly_degree_bound(proof.trace_length) / proof.trace_length
-            {
-                return false;
-            }
+        for (idx, air) in airs.iter().enumerate() {
+            let proof = get_proof(idx);
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
@@ -1054,7 +1252,7 @@ pub trait IsStarkVerifier<
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
                     idx,
-                    air.context().num_transition_constraints,
+                    air.context().num_transition_constraints(),
                     air.context().trace_columns
                 );
                 return false;

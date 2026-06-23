@@ -488,8 +488,10 @@ fn test_padding_rows_have_zero_multiplicity() {
     let trace = generate_branch_trace(&ops);
 
     // Check that padding rows have mu = 0
+    let data = &trace.main_table.data;
     for row_idx in 1..4 {
-        assert_eq!(*trace.get_main(row_idx, cols::MU), FE::zero());
+        let base = row_idx * cols::NUM_COLUMNS;
+        assert_eq!(data[base + cols::MU], FE::zero());
     }
 }
 

@@ -236,6 +236,23 @@ pub trait AIR: Send + Sync {
         evaluations
     }
 
+    /// Evaluate all transition constraints into a caller-provided buffer.
+    ///
+    /// Same as `compute_transition` but reuses a pre-allocated buffer, avoiding
+    /// a `Vec` allocation per LDE domain point in the prover's hot loop.
+    fn compute_transition_into(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        evaluations: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        for e in evaluations.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        self.transition_constraints()
+            .iter()
+            .for_each(|c| c.evaluate_verifier(evaluation_context, evaluations));
+    }
+
     /// Number of constraints that evaluate in the base field F.
     ///
     /// These constraints use the cheaper F×E accumulation path (3 base-field muls
@@ -286,6 +303,20 @@ pub trait AIR: Send + Sync {
         &self.context().proof_options
     }
 
+    fn blowup_factor(&self) -> u8 {
+        self.options().blowup_factor
+    }
+
+    fn coset_offset(&self) -> FieldElement<Self::Field> {
+        FieldElement::from(self.options().coset_offset)
+    }
+
+    fn trace_primitive_root(&self, trace_length: usize) -> FieldElement<Self::Field> {
+        let root_of_unity_order = u64::from(trace_length.trailing_zeros());
+
+        Self::Field::get_primitive_root_of_unity(root_of_unity_order).unwrap()
+    }
+
     fn num_transition_constraints(&self) -> usize {
         self.context().num_transition_constraints
     }
@@ -318,11 +349,49 @@ pub trait AIR: Send + Sync {
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
 
+    fn transition_zerofier_evaluations(
+        &self,
+        domain: &Domain<Self::Field>,
+    ) -> Vec<Vec<FieldElement<Self::Field>>> {
+        let mut evals = vec![Vec::new(); self.num_transition_constraints()];
+
+        let mut zerofier_groups: HashMap<ZerofierGroupKey, Vec<FieldElement<Self::Field>>> =
+            HashMap::new();
+
+        self.transition_constraints().iter().for_each(|c| {
+            let period = c.period();
+            let offset = c.offset();
+            let exemptions_period = c.exemptions_period();
+            let periodic_exemptions_offset = c.periodic_exemptions_offset();
+            let end_exemptions = c.end_exemptions();
+
+            // This hashmap is used to avoid recomputing with an fft the same zerofier evaluation
+            // If there are multiple domain and subdomains it can be further optimized
+            // as to share computation between them
+
+            let zerofier_group_key = ZerofierGroupKey {
+                period,
+                offset,
+                exemptions_period,
+                periodic_exemptions_offset,
+                end_exemptions,
+            };
+            zerofier_groups
+                .entry(zerofier_group_key)
+                .or_insert_with(|| c.zerofier_evaluations_on_extended_domain(domain));
+
+            let zerofier_evaluations = zerofier_groups.get(&zerofier_group_key).unwrap();
+            evals[c.constraint_idx()] = zerofier_evaluations.clone();
+        });
+
+        evals
+    }
+
     /// Compute zerofier evaluations as deduplicated groups with index mapping.
     ///
-    /// Each unique zerofier (keyed by period/offset/exemption parameters) is
-    /// computed once and constraints map to group indices, avoiding the
-    /// per-constraint Vec clone that an unindexed layout would require.
+    /// This replaces `transition_zerofier_evaluations` for the prover's constraint
+    /// evaluation loop. Instead of cloning `Vec<FieldElement<F>>` per constraint,
+    /// each unique zerofier is computed once and constraints map to group indices.
     fn transition_zerofier_evaluations_grouped(
         &self,
         domain: &Domain<Self::Field>,

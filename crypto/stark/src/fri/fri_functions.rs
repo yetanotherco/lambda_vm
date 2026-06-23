@@ -13,7 +13,7 @@ use math::field::{
 ///
 /// After folding, the N/2 results are evaluations on the squared coset
 /// in bit-reversed order, preserving conjugate pairing for the next fold.
-pub(crate) fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
+pub fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
     evals: &mut Vec<FieldElement<E>>,
     zeta: &FieldElement<E>,
     inv_twiddles: &[FieldElement<F>],
@@ -35,7 +35,7 @@ pub(crate) fn fold_evaluations_in_place<F: IsSubFieldOf<E>, E: IsField>(
 /// x_j are the coset points at even bit-reversed positions. Specifically:
 /// generate g·w^i for i=0..N/2 (half the coset points), bit-reverse with
 /// (logN-1) bits, then batch-invert.
-pub(crate) fn compute_coset_twiddles_inv<F: IsFFTField>(
+pub fn compute_coset_twiddles_inv<F: IsFFTField>(
     coset_offset: &FieldElement<F>,
     domain_size: usize,
 ) -> Vec<FieldElement<F>> {
@@ -51,7 +51,7 @@ pub(crate) fn compute_coset_twiddles_inv<F: IsFFTField>(
 ///
 /// Between levels: new_tw[j'] = tw[2j']² (take even-indexed, square).
 /// This corresponds to the squared coset offset and halved domain.
-pub(crate) fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>) {
+pub fn update_twiddles_in_place<F: IsField>(twiddles: &mut Vec<FieldElement<F>>) {
     let new_len = twiddles.len() / 2;
     for j in 0..new_len {
         twiddles[j] = twiddles[2 * j].square();

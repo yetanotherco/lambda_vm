@@ -27,8 +27,9 @@
 
 use alloc::format;
 use alloc::vec;
-#[cfg(feature = "prove")]
-use std::collections::HashMap;
+use alloc::vec::Vec;
+
+use hashbrown::HashMap;
 #[cfg(feature = "disk-spill")]
 use std::collections::HashSet;
 
@@ -45,16 +46,11 @@ use stark::trace::TraceTable;
 
 use super::bitwise::{self, BitwiseOperation, BitwiseOperationType};
 use super::branch::{self, BranchOperation};
-use super::bytewise;
 use super::commit::{self, CommitOperation};
 use super::cpu::{self, CpuOperation};
-use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
-use super::ec_scalar;
-use super::ecdas;
-use super::ecsm;
-use super::eq;
+use super::fp3_mul::{self, Fp3MulOperation};
 use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
@@ -72,7 +68,6 @@ use super::page::{FinalByteState, FinalStateMap};
 use super::register::FinalRegisterStateMap;
 use super::register::{self, FinalRegisterWordState};
 use super::shift::{self, ShiftOperation};
-use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
 
@@ -141,7 +136,7 @@ impl MemoryState {
             return;
         }
         #[cfg(feature = "prove")]
-        use executor::constants::PRIVATE_INPUT_START_INDEX;
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let start = PRIVATE_INPUT_START_INDEX;
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             self.cells.insert(start + i as u64, (b, 0));
@@ -313,8 +308,16 @@ impl RegisterState {
 /// Get byte count and signed flag from CpuOperation memory flags.
 #[cfg(feature = "prove")]
 fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
-    let f = &op.decode.fields;
-    (f.mem_bytes(), f.mem_signed())
+    let byte_count = if op.decode.memory_8bytes {
+        8
+    } else if op.decode.memory_4bytes {
+        4
+    } else if op.decode.memory_2bytes {
+        2
+    } else {
+        1
+    };
+    (byte_count, op.decode.signed)
 }
 
 /// Pack a 64-bit register value into the MEMW value format.
@@ -371,8 +374,7 @@ fn collect_cpu_ops(
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
-/// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
+/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops, fp3_mul_ops)
 #[allow(clippy::type_complexity)]
 #[cfg(feature = "prove")]
 fn collect_ops_from_cpu(
@@ -387,10 +389,7 @@ fn collect_ops_from_cpu(
     Vec<BitwiseOperation>,
     Vec<CommitOperation>,
     Vec<KeccakOperation>,
-    Vec<cpu32::Cpu32Operation>,
-    Vec<ecsm::EcsmOperation>,
-    Vec<ec_scalar::EcScalarOperation>,
-    Vec<ecdas::EcdasOperation>,
+    Vec<Fp3MulOperation>,
 ) {
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -399,30 +398,20 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
-    let mut cpu32_ops = Vec::new();
-    let mut ecsm_ops = Vec::new();
-    let mut ec_scalar_ops = Vec::new();
-    let mut ecdas_ops = Vec::new();
+    let mut fp3_mul_ops = Vec::new();
     let mut current_commit_index = 0u32;
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
-        // Word (`*W`) instructions delegate to the CPU32 table (built in program
-        // order; its register accesses are still emitted via the shared register
-        // collector below so the MEMW table balances).
-        if op.decode.fields.word_instr {
-            cpu32_ops.push(build_cpu32_op(op));
-        }
-
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
         // Collect memory operations for Load/Store instructions
-        if op.decode.fields.is_load() {
+        if op.decode.op_load {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
-        } else if op.decode.fields.is_store() {
+        } else if op.decode.op_store {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw_ops.push(memw_op);
         }
@@ -484,47 +473,38 @@ fn collect_ops_from_cpu(
             });
         }
 
-        // Collect ECSM ecall operations (memory I/O + the three table row sets)
-        if op.ecall_ecsm {
-            let (ecsm_memw, ecsm_op, ec_scalar_rows, ecdas_rows) =
-                collect_ecsm_ops(op, memory_state, register_state);
-            memw_ops.extend(ecsm_memw);
-            ecsm_ops.push(ecsm_op);
-            ec_scalar_ops.extend(ec_scalar_rows);
-            ecdas_ops.extend(ecdas_rows);
+        // Collect Fp3Mul ECALL operations
+        if op.ecall_fp3_mul {
+            let fp3_op = collect_fp3_mul_memw_ops(op, memory_state, register_state, &mut memw_ops);
+            fp3_mul_ops.push(fp3_op);
         }
 
-        // --- ALU chip dispatch (no state tracking) ---
-        // Word (`*W`) instructions are delegated to CPU32 (which itself drives
-        // the ALU chips); the main CPU does not send the ALU bus for them, so we
-        // must not emit chip ops here. CPU32 op-generation is B5b.
-        let f = op.decode.fields;
-        if !f.word_instr {
-            // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
-            // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
-            if f.is_lt() {
-                lt_ops.push(LtOperation::new_with_invert(
-                    op.rv1,
-                    op.arg2,
-                    f.alu_signed(),
-                    f.alu_signed2_or_invert(),
-                ));
-            }
-            // SHIFT: SLL/SRL/SRA. direction = invert bit (0 = left, 1 = right).
-            // The full arg2 goes on the ALU bus as in2; the chip uses its low
-            // byte for the (mod 32/64) computation.
-            if f.is_shift() {
-                shift_ops.push(ShiftOperation::new(
-                    op.rv1,
-                    op.arg2,
-                    f.alu_signed2_or_invert(),
-                    f.alu_signed(),
-                    f.word_instr,
-                ));
-            }
+        // --- LT, SHIFT, and Bitwise (no state tracking needed) ---
+
+        // Collect LT operations from SLT/BLT instructions
+        if op.decode.op_slt || op.decode.op_blt {
+            let arg1 = op.compute_arg1();
+            let arg2 = op.compute_arg2();
+            lt_ops.push(LtOperation::new(arg1, arg2, op.decode.signed));
         }
 
-        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
+        // Collect SHIFT operations
+        if op.decode.op_shift {
+            let input = op.compute_arg1();
+            let shift_amount = (op.compute_arg2() & 0xFF) as u8;
+            let direction = op.decode.mp_selector; // 0=left, 1=right
+            let signed = op.decode.signed;
+            let word_instr = op.decode.word_instr;
+            shift_ops.push(ShiftOperation::new(
+                input,
+                shift_amount,
+                direction,
+                signed,
+                word_instr,
+            ));
+        }
+
+        // Collect bitwise lookups
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
@@ -543,10 +523,7 @@ fn collect_ops_from_cpu(
         bitwise_ops,
         commit_ops,
         keccak_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ec_scalar_ops,
-        ecdas_ops,
+        fp3_mul_ops,
     )
 }
 
@@ -637,145 +614,21 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
         *byte = (store_value >> (j * 8)) & 0xFF;
     }
 
-    // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
-    // the old inline M7). It uses the base timestamp — the same the CPU sends on
-    // the MEMORY bus — per spec store.toml.
+    // Create MEMW operation (write) - M7 uses timestamp+1
     let memw_op = MemwOperation::new(
         false, // is_register = false
         base_address,
         value_bytes,
-        op.timestamp,
+        op.timestamp + 1,
         byte_count as u8,
         false, // is_read = false (write)
     )
     .with_old(old_values, old_timestamps);
 
-    // Update memory state at the base timestamp (matches the STORE MEMW write).
-    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp);
+    // Update memory state (using timestamp+1 to match M7)
+    memory_state.write_bytes(base_address, store_value, byte_count, op.timestamp + 1);
 
     memw_op
-}
-
-/// Collects all MEMW ops and the ECSM / EC_SCALAR / ECDAS table ops for one ECSM ecall.
-///
-/// Timestamp scheme (within the instruction's 4-wide budget): the `x11`/`x12` register reads
-/// and the `xG`/`k` memory reads happen at `T`; the `x10` register read and the EC_SCALAR
-/// byte reads at `T + 1`; the `xR` memory writes at `T + 2`. Every read advances
-/// `memory_state` / `register_state` (the offline read-old + write-new model), so later
-/// accesses always observe a strictly smaller old timestamp.
-#[allow(clippy::needless_range_loop)]
-fn collect_ecsm_ops(
-    op: &CpuOperation,
-    memory_state: &mut MemoryState,
-    register_state: &mut RegisterState,
-) -> (
-    Vec<MemwOperation>,
-    ecsm::EcsmOperation,
-    Vec<ec_scalar::EcScalarOperation>,
-    Vec<ecdas::EcdasOperation>,
-) {
-    let t = op.timestamp;
-    let addr_xr = register_state.read(10).0;
-    let addr_xg = register_state.read(11).0;
-    let addr_k = register_state.read(12).0;
-
-    // Read the xG and k operands (32 little-endian bytes each) from memory.
-    let mut xg = [0u8; 32];
-    let mut k = [0u8; 32];
-    for i in 0..32 {
-        xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
-        k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
-    }
-
-    let witness = ::ecsm::compute_witness(&k, &xg)
-        .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
-
-    let mut memw_ops = Vec::with_capacity(47);
-
-    // x11 -> addr_xG, x12 -> addr_k (register reads at T).
-    for reg in [11u8, 12u8] {
-        let (val, old_ts) = register_state.read(reg);
-        let value = pack_register_value(val);
-        memw_ops.push(
-            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
-                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
-        );
-        register_state.write(reg, val, t);
-    }
-
-    // xG and k: 4 doubleword reads each at T.
-    for (base, bytes) in [(addr_xg, &witness.x_g), (addr_k, &witness.k)] {
-        for i in 0..4 {
-            let addr = base.wrapping_add((8 * i) as u64);
-            let mut value = [0u64; 8];
-            let mut dword = 0u64;
-            for j in 0..8 {
-                value[j] = bytes[8 * i + j] as u64;
-                dword |= (bytes[8 * i + j] as u64) << (8 * j);
-            }
-            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
-            memw_ops
-                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
-            memory_state.write_bytes(addr, dword, 8, t);
-        }
-    }
-
-    // x10 -> addr_xR (register read at T + 1).
-    {
-        let (val, old_ts) = register_state.read(10);
-        let value = pack_register_value(val);
-        memw_ops.push(
-            MemwOperation::new(true, 2 * 10, value, t + 1, 2, true)
-                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
-        );
-        register_state.write(10, val, t + 1);
-    }
-
-    // EC_SCALAR byte reads of k at T + 1 (one per scalar byte).
-    for offset in 0..32u64 {
-        let addr = addr_k.wrapping_add(offset);
-        let byte = k[offset as usize];
-        let value = [byte as u64, 0, 0, 0, 0, 0, 0, 0];
-        let (_v, old_ts) = memory_state.read_byte(addr);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 1, 1, true)
-                .with_old(value, [old_ts, 0, 0, 0, 0, 0, 0, 0]),
-        );
-        memory_state.write_byte(addr, byte, t + 1);
-    }
-
-    // xR writes at T + 2 (4 doublewords).
-    for i in 0..4 {
-        let addr = addr_xr.wrapping_add((8 * i) as u64);
-        let mut value = [0u64; 8];
-        let mut dword = 0u64;
-        for j in 0..8 {
-            value[j] = witness.x_r[8 * i + j] as u64;
-            dword |= (witness.x_r[8 * i + j] as u64) << (8 * j);
-        }
-        let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 2, 8, false).with_old(old_vals, old_ts),
-        );
-        memory_state.write_bytes(addr, dword, 8, t + 2);
-    }
-
-    let ec_scalar_ops = ec_scalar::rows_for_scalar(t, addr_k, &witness.k);
-    let ecdas_ops = witness
-        .steps
-        .iter()
-        .cloned()
-        .map(|step| ecdas::EcdasOperation { timestamp: t, step })
-        .collect();
-    let ecsm_op = ecsm::EcsmOperation {
-        timestamp: t,
-        addr_xg,
-        addr_k,
-        addr_xr,
-        witness,
-    };
-
-    (memw_ops, ecsm_op, ec_scalar_ops, ecdas_ops)
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation.
@@ -787,11 +640,7 @@ fn collect_register_ops_from_cpu(
     register_state: &mut RegisterState,
 ) -> Vec<MemwOperation> {
     let mut memw_ops = Vec::with_capacity(4);
-    let d = &op.decode.fields;
-    // These register accesses happen for every real instruction. For non-word
-    // rows the main CPU sends the MEMW lookups; for word (`*W`) rows the CPU32
-    // table sends them. Either way the MEMW *table* receives the same record, so
-    // we generate it here (in program order, for register-state timestamps).
+    let d = &op.decode;
 
     // M1: Read rs1 register at timestamp+0
     // Skip x0 (hardwired zero). x255 (the register where the pc is stored) is handled
@@ -851,156 +700,6 @@ fn collect_register_ops_from_cpu(
     register_state.write_pc(op.next_pc, op.timestamp + 1);
 
     memw_ops
-}
-
-// =============================================================================
-// CPU32 (word `*W` instruction) op-generation
-// =============================================================================
-
-/// The raw ALU result `res` for a CPU32 row, matching what the dispatched chip
-/// (or the ADD/SUB fast-path) computes from the sign-extended `arg1`/`arg2`.
-fn cpu32_res(c: &cpu32::Cpu32Operation, arg1: u64, arg2: u64) -> u64 {
-    use crate::tables::types::alu_op;
-    if c.add {
-        return arg1.wrapping_add(arg2);
-    }
-    if c.sub {
-        return arg1.wrapping_sub(arg2);
-    }
-    if !c.alu {
-        return 0;
-    }
-    let op = c.alu_flags & 0x1F;
-    let signed = (c.alu_flags >> 5) & 1 == 1;
-    let s2_or_inv = (c.alu_flags >> 6) & 1 == 1;
-    let muldiv = (c.alu_flags >> 7) & 1 == 1;
-    if op == alu_op::SHIFT || op == alu_op::SHIFTW {
-        // The ALU bus carries the chip's raw OUT (not the sign-extended value);
-        // CPU32 sign-extends it to rvd.
-        ShiftOperation::new(arg1, arg2, s2_or_inv, signed, true).compute_out()
-    } else if op == alu_op::MUL {
-        MulOperation::new(arg1, signed, arg2, s2_or_inv)
-            .compute_product()
-            .0
-    } else if op == alu_op::DIVREM {
-        let d = DvrmOperation::new(arg1, arg2, signed);
-        if muldiv {
-            d.compute_remainder()
-        } else {
-            d.compute_quotient()
-        }
-    } else {
-        0
-    }
-}
-
-/// Builds the CPU32 row for a word (`*W`) instruction. `op.rv1/rv2/rvd` carry the
-/// real register values (the main CPU delegate row zeroes its own columns).
-fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
-    let f = &op.decode.fields;
-    let mut c = cpu32::Cpu32Operation {
-        timestamp: op.timestamp,
-        pc: op.decode.pc,
-        rs1: f.rs1,
-        read_register1: f.read_register1,
-        rv1: op.rv1,
-        rs2: f.rs2,
-        read_register2: f.read_register2,
-        rv2: op.rv2,
-        imm: op.decode.imm,
-        res: 0,
-        rd: f.rd,
-        write_register: f.write_register,
-        alu: f.alu,
-        alu_flags: f.alu_flags,
-        add: f.add,
-        sub: f.sub,
-        half_instruction_length: f.half_instruction_length,
-    };
-    let aux = c.compute_aux();
-    c.res = cpu32_res(&c, aux.arg1, aux.arg2);
-    c
-}
-
-/// The BITWISE-table lookups a CPU32 row sends: 5×ARE_BYTES (byte fields),
-/// 8×IS_HALF (rv1/rv2 low-word halves + the 4 res halves), 1×BYTE_ALU (extracts
-/// the signed bit from `alu_flags`), and the MSB16 sign bits: `res` always, plus
-/// `rv1`/`rv2` only when `signed` (their MSB16 is gated by the `signed` column).
-fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
-    let mut ops = Vec::with_capacity(17);
-    let half = |v: u64, sh: u32| ((v >> sh) & 0xFFFF) as u16;
-    let push_half = |ops: &mut Vec<BitwiseOperation>, kind, h: u16| {
-        ops.push(BitwiseOperation::halfword(
-            kind,
-            (h & 0xFF) as u8,
-            (h >> 8) as u8,
-        ));
-    };
-
-    for b in [c.half_instruction_length, c.alu_flags, c.rs1, c.rs2, c.rd] {
-        ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
-            b,
-        ));
-    }
-    // IS_HALF: rv1[0],rv1[1],rv2[0],rv2[1],res[0..3]
-    let rv1_h0 = half(c.rv1, 0);
-    let rv1_h1 = half(c.rv1, 16);
-    let rv2_h0 = half(c.rv2, 0);
-    let rv2_h1 = half(c.rv2, 16);
-    for h in [rv1_h0, rv1_h1, rv2_h0, rv2_h1] {
-        push_half(&mut ops, BitwiseOperationType::IsHalf, h);
-    }
-    for i in 0..4 {
-        push_half(&mut ops, BitwiseOperationType::IsHalf, half(c.res, i * 16));
-    }
-    // BYTE_ALU[AND, X=32, Y=alu_flags] -> 32*signed (extract signed bit).
-    ops.push(BitwiseOperation::byte_op(
-        BitwiseOperationType::ByteAluAnd,
-        32,
-        c.alu_flags,
-    ));
-    // MSB16 on the high half of each low word. `rv1`/`rv2` are gated by `signed`
-    // (the SIGN template's `signed` multiplicity — no lookup when zero-extending);
-    // `res` is always sent (μ), since the `*W` result is always sign-extended.
-    if c.signed() {
-        push_half(&mut ops, BitwiseOperationType::Msb16, rv1_h1);
-        push_half(&mut ops, BitwiseOperationType::Msb16, rv2_h1);
-    }
-    push_half(&mut ops, BitwiseOperationType::Msb16, half(c.res, 16));
-    ops
-}
-
-/// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
-/// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
-#[allow(clippy::type_complexity)]
-fn cpu32_chip_op(
-    c: &cpu32::Cpu32Operation,
-    shift_ops: &mut Vec<ShiftOperation>,
-    mul_ops: &mut Vec<(MulOperation, bool)>,
-    dvrm_ops: &mut Vec<(DvrmOperation, bool)>,
-) {
-    use crate::tables::types::alu_op;
-    if c.add || c.sub || !c.alu {
-        return;
-    }
-    let aux = c.compute_aux();
-    let op = c.alu_flags & 0x1F;
-    let signed = aux.signed;
-    let s2_or_inv = (c.alu_flags >> 6) & 1 == 1;
-    let muldiv = (c.alu_flags >> 7) & 1 == 1;
-    if op == alu_op::SHIFT || op == alu_op::SHIFTW {
-        shift_ops.push(ShiftOperation::new(
-            aux.arg1, aux.arg2, s2_or_inv, signed, true,
-        ));
-    } else if op == alu_op::MUL {
-        mul_ops.push((
-            MulOperation::new(aux.arg1, signed, aux.arg2, s2_or_inv),
-            muldiv,
-        ));
-    } else if op == alu_op::DIVREM {
-        dvrm_ops.push((DvrmOperation::new(aux.arg1, aux.arg2, signed), muldiv));
-    }
 }
 
 /// Collects MEMW operations for a COMMIT ECALL from CpuOperation.
@@ -1106,15 +805,12 @@ fn collect_commit_memw_ops(
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
 ///
-/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes the GP registers:
+/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes every register:
 /// - x1-x9, x11-x31: write 0 (zeroize)
 /// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
+/// - x255 (PC): write 1 (halted sentinel)
 ///
-/// The PC (x255) is NOT finalized here — it is handled on the inline-PC `memory`
-/// bus by the HALT chip's consume_pc/emit_pc plus the CPU padding chain (its
-/// REGISTER final token is set separately by the caller, at the last padding
-/// timestamp). Also updates `register_state` so `to_final_state_map()` reflects
-/// the finalized GP register values.
+/// Also updates `register_state` so `to_final_state_map()` reflects the finalized values.
 #[cfg(feature = "prove")]
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
@@ -1155,9 +851,16 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         register_state.write(i, 0, ts);
     }
 
-    // x255 (PC) is finalized via the inline-PC `memory` bus + REGISTER table, not
-    // via a MEMW write at 2^64-1. See `collect_halt_ops` doc and the PC finalization
-    // in the caller.
+    // x255 (PC): write 1
+    {
+        let (old_val, old_ts) = register_state.read_pc();
+        let old_value = pack_register_value(old_val);
+        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+        let memw_op = MemwOperation::new(true, 510, pack_register_value(1), ts, 2, false)
+            .with_old(old_value, old_timestamps);
+        ops.push(memw_op);
+        register_state.write_pc(1, ts);
+    }
 
     ops
 }
@@ -1490,7 +1193,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
 #[cfg(feature = "prove")]
-pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
+fn is_register_op(op: &MemwOperation) -> bool {
     if !op.is_register || op.width != 2 {
         return false;
     }
@@ -1590,30 +1293,16 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// Collects bitwise lookups from MUL operations (MSB16 for sign bits).
 ///
 /// MUL sends MSB16 lookups when signed=1 to extract sign bits,
-/// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
-/// and IS_B20 lookups for carry range checks.
+/// IS_HALF lookups for lo/hi range checks, and IS_B20 lookups for carry range checks.
 ///
 /// Returns: Vec of bitwise lookups
 #[cfg(feature = "prove")]
 fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 20);
+    let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 14);
 
     // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
     for (op, _wants_hi) in mul_ops {
         let (lo, hi) = op.compute_product();
-
-        // IS_HALF for lhs/rhs INPUT halfwords (matches the lhs/rhs IS_HALF senders
-        // in mul::bus_interactions).
-        for word in [op.lhs, op.rhs] {
-            for shift in [0, 16, 32, 48] {
-                let half = ((word >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
 
         // IS_HALF for lo halfwords
         for shift in [0, 16, 32, 48] {
@@ -1677,33 +1366,17 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 
 /// Collects bitwise lookups from DVRM operations.
 ///
-/// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
-/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op.
+/// Generates: IS_HALF (×12), MSB16 (×3), ZERO (×2 per raw op + up to ×4 per unique signed op).
 ///
-/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
-/// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
-/// are collected here alongside the constraint-level ones.
+/// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are assumptions enforced by the CPU sender,
+/// not by the DVRM table. Only constraint-level IS_HALF lookups are generated here.
 ///
 /// Returns: Vec of bitwise lookups
 #[cfg(feature = "prove")]
 fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
-    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
+    let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 16);
 
     for (op, _wants_remainder) in dvrm_ops {
-        // IS_HALF for n[0..4] and d[0..4] (DVRM-A1/A2): range-check the input
-        // half-limbs so a prover cannot supply non-canonical halves (matches the
-        // n/d IS_HALF senders in dvrm::bus_interactions).
-        for word in [op.n, op.d] {
-            for shift in [0, 16, 32, 48] {
-                let half = ((word >> shift) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::IsHalf,
-                    (half & 0xFF) as u8,
-                    (half >> 8) as u8,
-                ));
-            }
-        }
-
         // IS_HALF for r[0..4] (DVRM-C13)
         let r = op.compute_remainder();
         for shift in [0, 16, 32, 48] {
@@ -1848,8 +1521,8 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
-/// - ARE_BYTES[next_pc_low[1], 0] - range check bits 8-15
-/// - BYTE_ALU[AND, unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
+/// - IS_BYTE[next_pc_low[1], 0] - range check bits 8-15
+/// - AND_BYTE[unmasked_low_byte, 254, next_pc_low[0]] - LSB masking
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
 /// Returns: Vec of bitwise lookups
@@ -1869,16 +1542,16 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
         let unmasked_low_byte = (next_pc_unmasked & 0xFF) as u8;
 
-        // ARE_BYTES[next_pc_low[1], 0] - range check for byte value
+        // IS_BYTE[next_pc_low[1], 0] - range check for byte value
         bitwise_ops.push(BitwiseOperation::single_byte(
-            BitwiseOperationType::AreBytes,
+            BitwiseOperationType::IsByte,
             next_pc_low_1,
         ));
 
-        // BYTE_ALU[AND, unmasked_low_byte, 254] → next_pc_low[0]
+        // AND_BYTE[unmasked_low_byte, 254] → next_pc_low[0]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         bitwise_ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::ByteAluAnd,
+            BitwiseOperationType::AndByte,
             unmasked_low_byte,
             254, // 0xFE mask
         ));
@@ -1908,14 +1581,14 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
     bitwise_ops
 }
 
-/// Generates ARE_BYTES ops for CPU padding rows.
+/// Generates IS_BYTE ops for CPU padding rows.
 ///
 /// CPU padding rows have all byte columns = 0 (RS1=0, RS2=0, RD=0, etc.).
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 AreBytes(0,0) for RS1+RS2, 1 AreBytes(0) for RD, and
-/// 12 AreBytes(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// Per padding row: 1 IsByte(0,0) for RS1+RS2, 1 IsByte(0) for RD, and
+/// 12 IsByte(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
 #[cfg(feature = "prove")]
 fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
     if num_padding_rows == 0 {
@@ -1924,19 +1597,21 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 
     let mut ops = Vec::with_capacity(num_padding_rows * 14);
     for _ in 0..num_padding_rows {
-        // The shrunk CPU sends, per row (incl. padding where all values are 0):
-        // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
-        // 4× IS_HALF (the four `res` halves).
-        for _ in 0..3 {
+        // IS_BYTE[RS1, RS2] pair (both zero in padding)
+        ops.push(BitwiseOperation::byte_op(
+            BitwiseOperationType::IsByte,
+            0,
+            0,
+        ));
+        // IS_BYTE[RD, 0] single (zero in padding)
+        ops.push(BitwiseOperation::single_byte(
+            BitwiseOperationType::IsByte,
+            0,
+        ));
+        // 12 IS_BYTE lookups for ARG1/ARG2/RES byte pairs (all zero in padding)
+        for _ in 0..12 {
             ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
-                0,
-                0,
-            ));
-        }
-        for _ in 0..4 {
-            ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
+                BitwiseOperationType::IsByte,
                 0,
                 0,
             ));
@@ -1945,10 +1620,10 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
     ops
 }
 
-/// Collects ARE_BYTES lookups from PAGE data (init and fini values).
+/// Collects IS_BYTE lookups from PAGE data (init and fini values).
 ///
-/// Each PAGE row generates 1 batched ARE_BYTES lookup:
-/// - C1+C2: ARE_BYTES[init, fini] — range-checks both bytes in one interaction
+/// Each PAGE row generates 1 batched IS_BYTE lookup:
+/// - C1+C2: IS_BYTE[init, fini] — range-checks both bytes in one interaction
 ///
 /// This must be called BEFORE bitwise multiplicities are updated.
 ///
@@ -1973,8 +1648,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> hashbrown::HashMap<u
             for byte_offset in 0..4u64 {
                 let byte_addr = word_addr + byte_offset;
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                let page_base = page::page_base_for_address(byte_addr);
-                let offset = page::offset_in_page(byte_addr);
+                let page_base = page::page_base_for_address(byte_addr, page_size);
+                let offset = page::offset_in_page(byte_addr, page_size);
                 let page_data = init_page_data
                     .entry(page_base)
                     .or_insert_with(|| vec![0u8; page_size]);
@@ -1985,8 +1660,8 @@ fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> hashbrown::HashMap<u
     if !private_input.is_empty() {
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
             let addr = PRIVATE_INPUT_START_INDEX + i as u64;
-            let page_base = page::page_base_for_address(addr);
-            let offset = page::offset_in_page(addr);
+            let page_base = page::page_base_for_address(addr, page_size);
+            let offset = page::offset_in_page(addr, page_size);
             let page_data = init_page_data
                 .entry(page_base)
                 .or_insert_with(|| vec![0u8; page_size]);
@@ -2013,7 +1688,7 @@ fn collect_bitwise_from_page(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
+        page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
     // Build final state map from memory_state
@@ -2023,23 +1698,22 @@ fn collect_bitwise_from_page(
         .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
-    // For each page and each byte, add ARE_BYTES lookups for init and fini
+    // For each page and each byte, add IS_BYTE lookups for init and fini
     for &page_base in &page_bases {
         let init_data = elf_page_data.get(&page_base);
 
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
 
-            // Get init value (from ELF or 0). `.get().unwrap_or(0)` to match the
-            // relaxed `init_values` contract: a shorter vec reads as trailing zeros.
-            let init = init_data.map_or(0u8, |data| data.get(offset).copied().unwrap_or(0));
+            // Get init value (from ELF or 0)
+            let init = init_data.map_or(0u8, |data| data[offset]);
 
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes
+            // C1+C2: IS_BYTE[init, fini] — batched range check for both bytes
             bitwise_ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
+                BitwiseOperationType::IsByte,
                 init,
                 fini,
             ));
@@ -2097,7 +1771,7 @@ fn expand_commit_operations_for_ecall(
 /// - IsHalfword for address_incr halfwords (4 per real row, mult = mu)
 /// - Zero for end detection (1 per real row, mult = mu)
 ///
-/// Note: AreBytes for value is intentionally omitted per spec.
+/// Note: IsByte for value is intentionally omitted per spec.
 #[cfg(feature = "prove")]
 fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOperation> {
     let mut lookups = Vec::new();
@@ -2151,89 +1825,14 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 /// Generates PAGE tables for memory initialization and finalization.
 ///
 /// Derives all page bases from `memory_state.cells.keys()` — this includes
-/// IS_HALF lookup for a value `v ∈ [0, 2^16)` (split into low/high bytes).
-fn is_half_op(v: u16) -> BitwiseOperation {
-    BitwiseOperation::halfword(
-        BitwiseOperationType::IsHalf,
-        (v & 0xFF) as u8,
-        (v >> 8) as u8,
-    )
-}
-
-/// IS_BYTE lookup for a single byte (sent as `AreBytes[byte, 0]`).
-fn is_byte_op(b: u8) -> BitwiseOperation {
-    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, b, 0)
-}
-
-/// BITWISE lookups sent by the ECSM core table (range checks + the `k != 0` ZERO check),
-/// so the BITWISE receiver multiplicities account for them.
-#[allow(clippy::needless_range_loop)]
-pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<BitwiseOperation> {
-    let mut out = Vec::new();
-    for op in ops {
-        let w = &op.witness;
-        // IS_BYTE on x2, q0, yG, q1[0..31].
-        for i in 0..32 {
-            out.push(is_byte_op(w.x2[i]));
-            out.push(is_byte_op(w.q0[i]));
-            out.push(is_byte_op(w.y_g[i]));
-            out.push(is_byte_op(w.q1[i]));
-        }
-        // IS_HALF on the shifted carries (i = 0..62).
-        for i in 0..63 {
-            out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
-            out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
-        }
-        // IS_HALF on the U256HL limbs of k_sub_N and xR_sub_p.
-        for i in 0..16 {
-            out.push(is_half_op(
-                w.k_sub_n[2 * i] as u16 + ((w.k_sub_n[2 * i + 1] as u16) << 8),
-            ));
-            out.push(is_half_op(
-                w.x_r_sub_p[2 * i] as u16 + ((w.x_r_sub_p[2 * i + 1] as u16) << 8),
-            ));
-        }
-        // ZERO: assert k != 0 (sum of k's bytes).
-        let sum: u32 = w.k.iter().map(|&b| b as u32).sum();
-        out.push(BitwiseOperation::zero(sum));
-    }
-    out
-}
-
-/// BITWISE lookups sent by every ECDAS row (range checks on the byte limbs + carries).
-#[allow(clippy::needless_range_loop)]
-pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<BitwiseOperation> {
-    let mut out = Vec::new();
-    for op in ops {
-        let s = &op.step;
-        out.push(is_byte_op(s.round));
-        for i in 0..32 {
-            out.push(is_byte_op(s.lambda[i]));
-            out.push(is_byte_op(s.x_r[i]));
-            out.push(is_byte_op(s.y_r[i]));
-        }
-        for i in 0..33 {
-            out.push(is_byte_op(s.q0[i]));
-            out.push(is_byte_op(s.q1[i]));
-            out.push(is_byte_op(s.q2[i]));
-        }
-        for i in 0..63 {
-            out.push(is_half_op((s.c0[i] + ecdas::CARRY_OFFSET_LAMBDA) as u16));
-            out.push(is_half_op((s.c1[i] + ecdas::CARRY_OFFSET_XR) as u16));
-            out.push(is_half_op((s.c2[i] + ecdas::CARRY_OFFSET_YR) as u16));
-        }
-    }
-    out
-}
-
 /// Collect BITWISE lookups generated by the keccak chips.
 ///
-/// The keccak round chip sends BYTE_ALU, HWSL, and ARE_BYTES
+/// The keccak round chip sends XOR_BYTE, AND_BYTE, HWSL, and IS_BYTE
 /// interactions; the keccak core chip sends IS_HALF interactions.
 /// All of these must be registered so the BITWISE table's multiplicities are correct.
 #[allow(clippy::needless_range_loop)]
-pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
-    #[cfg(feature = "prove")]
+#[cfg(feature = "prove")]
+fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec<BitwiseOperation> {
     use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 
     let mut ops = Vec::new();
@@ -2242,22 +1841,19 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         let state_addr = kop.state_addr;
 
         ops.push(BitwiseOperation::byte_op(
-            BitwiseOperationType::ByteAluAnd,
+            BitwiseOperationType::AndByte,
             (state_addr & 0xFF) as u8,
             7,
         ));
 
-        // Range-check addr bytes (paired with the ARE_BYTES sends in
+        // Range-check addr bytes (paired with the IS_BYTE sends in
         // keccak::bus_interactions): without this the field-element value of
         // the addr_lo / addr_hi linear combinations is unconstrained per byte.
-        // 4 paired ops matching the (addr[2i], addr[2i+1]) sender pairing.
-        for i in 0..4 {
-            let lo = ((state_addr >> (2 * i * 8)) & 0xFF) as u8;
-            let hi = ((state_addr >> ((2 * i + 1) * 8)) & 0xFF) as u8;
-            ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
-                lo,
-                hi,
+        for b in 0..8 {
+            let byte = ((state_addr >> (b * 8)) & 0xFF) as u8;
+            ops.push(BitwiseOperation::single_byte(
+                BitwiseOperationType::IsByte,
+                byte,
             ));
         }
 
@@ -2279,7 +1875,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
         // Replay keccak round computation to extract bitwise lookups
         let mut state = kop.input;
         for round in 0..24 {
-            // --- theta: Cxz chain BYTE_ALU[XOR] (160) ---
+            // --- theta: Cxz chain XOR_BYTE (160) ---
             let mut cxz = [[[0u8; 8]; 4]; 5];
             for x in 0..5 {
                 for b in 0..8 {
@@ -2287,7 +1883,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let v1 = ((state[x + 5] >> (b * 8)) & 0xFF) as u8;
                     cxz[x][0][b] = v0 ^ v1;
                     ops.push(BitwiseOperation::byte_op(
-                        BitwiseOperationType::ByteAluXor,
+                        BitwiseOperationType::XorByte,
                         v0,
                         v1,
                     ));
@@ -2299,7 +1895,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         let sv = ((state[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         cxz[x][stage][b] = prev ^ sv;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::ByteAluXor,
+                            BitwiseOperationType::XorByte,
                             prev,
                             sv,
                         ));
@@ -2307,7 +1903,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // theta: HWSL for rotated C (20) + ARE_BYTES on Cxz_left (20 pairs).
+            // theta: HWSL for rotated C (20) + IS_BYTE on Cxz_left (40).
             // Cxz_right is range-checked via IS_BIT polynomial constraints
             // on the keccak_rnd chip, not via lookups (spec d75944ee).
             let mut rotated_c = [[0u8; 8]; 5];
@@ -2322,11 +1918,13 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         ((halfword >> 8) & 0xFF) as u8,
                         1,
                     ));
-                    // ARE_BYTES for cxz_left bytes: paired (low, high) of the halfword,
-                    // matching `(cxz_left[x][2i], cxz_left[x][2i+1])` sender pairing.
-                    ops.push(BitwiseOperation::byte_op(
-                        BitwiseOperationType::AreBytes,
+                    // IS_BYTE for cxz_left bytes
+                    ops.push(BitwiseOperation::single_byte(
+                        BitwiseOperationType::IsByte,
                         (shifted & 0xFF) as u8,
+                    ));
+                    ops.push(BitwiseOperation::single_byte(
+                        BitwiseOperationType::IsByte,
                         ((shifted >> 8) & 0xFF) as u8,
                     ));
                 }
@@ -2350,7 +1948,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // theta: Dxz BYTE_ALU[XOR] (40)
+            // theta: Dxz XOR_BYTE (40)
             let mut d_bytes = [[0u8; 8]; 5];
             for x in 0..5 {
                 for b in 0..8 {
@@ -2358,14 +1956,14 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     let rb = rotated_c[(x + 1) % 5][b];
                     d_bytes[x][b] = a ^ rb;
                     ops.push(BitwiseOperation::byte_op(
-                        BitwiseOperationType::ByteAluXor,
+                        BitwiseOperationType::XorByte,
                         a,
                         rb,
                     ));
                 }
             }
 
-            // theta final: BYTE_ALU[XOR] (200)
+            // theta final: XOR_BYTE (200)
             let mut theta_lanes = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
@@ -2378,7 +1976,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                     for b in 0..8 {
                         let s = ((lane >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::ByteAluXor,
+                            BitwiseOperationType::XorByte,
                             s,
                             d_bytes[x][b],
                         ));
@@ -2386,7 +1984,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // rho: HWSL (100) + ARE_BYTES (200 pairs)
+            // rho: HWSL (100) + IS_BYTE (400)
             for x in 0..5 {
                 for y in 0..5 {
                     let rho_offset = KECCAK_RHO[x][y] as usize;
@@ -2405,17 +2003,22 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                             ((halfword >> 8) & 0xFF) as u8,
                             rnc_val,
                         ));
-                        // ARE_BYTES paired as (rot_left[b], rot_right[b]) for
-                        // each byte of the halfword, matching the sender pairing
-                        // in keccak_rnd::bus_interactions.
-                        ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::AreBytes,
+                        // IS_BYTE for rot_left
+                        ops.push(BitwiseOperation::single_byte(
+                            BitwiseOperationType::IsByte,
                             (shifted & 0xFF) as u8,
+                        ));
+                        ops.push(BitwiseOperation::single_byte(
+                            BitwiseOperationType::IsByte,
+                            ((shifted >> 8) & 0xFF) as u8,
+                        ));
+                        // IS_BYTE for rot_right
+                        ops.push(BitwiseOperation::single_byte(
+                            BitwiseOperationType::IsByte,
                             (carry & 0xFF) as u8,
                         ));
-                        ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::AreBytes,
-                            ((shifted >> 8) & 0xFF) as u8,
+                        ops.push(BitwiseOperation::single_byte(
+                            BitwiseOperationType::IsByte,
                             ((carry >> 8) & 0xFF) as u8,
                         ));
                     }
@@ -2433,7 +2036,7 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // chi: BYTE_ALU[AND] (200) + BYTE_ALU[XOR] (200)
+            // chi: AND_BYTE (200) + XOR_BYTE (200)
             let mut chi_lanes = [0u64; 25];
             for x in 0..5 {
                 for y in 0..5 {
@@ -2445,14 +2048,14 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                         let not_byte = ((not_next >> (b * 8)) & 0xFF) as u8;
                         let n2_byte = ((next2 >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::ByteAluAnd,
+                            BitwiseOperationType::AndByte,
                             not_byte,
                             n2_byte,
                         ));
                         let pi_byte = ((pi_lanes[x + 5 * y] >> (b * 8)) & 0xFF) as u8;
                         let and_byte = ((and_val >> (b * 8)) & 0xFF) as u8;
                         ops.push(BitwiseOperation::byte_op(
-                            BitwiseOperationType::ByteAluXor,
+                            BitwiseOperationType::XorByte,
                             pi_byte,
                             and_byte,
                         ));
@@ -2460,13 +2063,13 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
                 }
             }
 
-            // iota: BYTE_ALU[XOR] (8)
+            // iota: XOR_BYTE (8)
             let rc_val = KECCAK_RC[round];
             for b in 0..8 {
                 let chi_byte = ((chi_lanes[0] >> (b * 8)) & 0xFF) as u8;
                 let rc_byte = ((rc_val >> (b * 8)) & 0xFF) as u8;
                 ops.push(BitwiseOperation::byte_op(
-                    BitwiseOperationType::ByteAluXor,
+                    BitwiseOperationType::XorByte,
                     chi_byte,
                     rc_byte,
                 ));
@@ -2495,13 +2098,15 @@ fn generate_page_tables(
     #[cfg(feature = "prove")]
     use std::collections::BTreeSet;
 
+    let page_size = page::DEFAULT_PAGE_SIZE;
+
     // Collect init data from ELF segments + private input region
     let init_page_data = build_init_page_data(elf, private_input);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let mut page_bases: BTreeSet<u64> = BTreeSet::new();
     for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
+        page_bases.insert(page::page_base_for_address(addr, page_size));
     }
 
     // Build final state map from memory_state
@@ -2518,10 +2123,10 @@ fn generate_page_tables(
     // Determine which page bases hold private input data.
     let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
         #[cfg(feature = "prove")]
-        use executor::constants::PRIVATE_INPUT_START_INDEX;
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         let total_bytes = 4 + private_input.len(); // length prefix + data
         (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
+            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64, page_size))
             .collect()
     } else {
         std::collections::BTreeSet::new()
@@ -2530,11 +2135,11 @@ fn generate_page_tables(
     for &page_base in &page_bases {
         let config = if private_input_page_bases.contains(&page_base) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
-            PageConfig::with_private_input(page_base, init_data)
+            PageConfig::with_private_input(page_base, page_size, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
-            PageConfig::with_data(page_base, init_data.clone())
+            PageConfig::with_data(page_base, page_size, init_data.clone())
         } else {
-            PageConfig::zero_init(page_base)
+            PageConfig::zero_init(page_base, page_size)
         };
 
         let trace = page::generate_page_trace(&config, &final_state);
@@ -2646,22 +2251,11 @@ pub struct Traces {
     /// KECCAK_RC precomputed round constant table (32 rows)
     pub keccak_rc: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// ECSM core table (one row per scalar-multiplication ecall)
-    pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
-
-    /// EC_SCALAR table (32 rows per ecall)
-    pub ec_scalar: TraceTable<GoldilocksField, GoldilocksExtension>,
-
-    /// ECDAS double/add table (variable rows per ecall)
-    pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// FP3_MUL table (one row per Fp3Mul precompile call)
+    pub fp3_mul: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
-    pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub stores: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    pub cpu32s: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
 }
 
 /// Intermediate state from Phase 2: all ops collected from CPU, ready for
@@ -2680,15 +2274,7 @@ struct CollectedOps {
     dvrm_ops: Vec<(DvrmOperation, bool)>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
-    // Auxiliary ALU / memory / CPU32 dispatch chips (driven by the CPU ALU/MEMORY dispatch).
-    eq_ops: Vec<eq::EqOperation>,
-    bytewise_ops: Vec<bytewise::BytewiseOperation>,
-    store_ops: Vec<store::StoreOperation>,
-    cpu32_ops: Vec<cpu32::Cpu32Operation>,
-    // EC scalar-multiplication accelerator chips.
-    ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
-    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    fp3_mul_ops: Vec<Fp3MulOperation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -2731,14 +2317,11 @@ fn collect_all_ops(
     mut memw_ops: Vec<MemwOperation>,
     load_ops: Vec<LoadOperation>,
     mut lt_ops: Vec<LtOperation>,
-    mut shift_ops: Vec<ShiftOperation>,
-    mut bitwise_ops: Vec<BitwiseOperation>,
+    shift_ops: Vec<ShiftOperation>,
+    bitwise_ops: Vec<BitwiseOperation>,
     commit_ops: Vec<CommitOperation>,
     keccak_ops: Vec<KeccakOperation>,
-    cpu32_ops: Vec<cpu32::Cpu32Operation>,
-    ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
-    ecdas_ops: Vec<ecdas::EcdasOperation>,
+    fp3_mul_ops: Vec<Fp3MulOperation>,
     register_state: &mut RegisterState,
 ) -> CollectedOps {
     // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
@@ -2761,80 +2344,43 @@ fn collect_all_ops(
             BranchOperation::new(
                 op.decode.pc,
                 op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
+                op.compute_arg1(), // register value must match CPU's arg1 for bus signature
+                op.decode.op_jalr,
             )
         })
         .collect();
 
-    // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
-    // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
+    // Collect MUL operations from CPU ops where op_mul = true
     let mut mul_ops: Vec<(MulOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_mul())
+        .filter(|op| op.decode.op_mul)
         .map(|op| {
-            let f = op.decode.fields;
+            let lhs = op.compute_arg1();
+            let lhs_signed = op.decode.signed;
+            // rhs_signed = mp_selector per spec CPU-CA44:
+            // MUL/MULH have mp_selector=1 (both signed), MULHU/MULHSU have mp_selector=0 (rhs unsigned)
+            let rhs_signed = op.decode.mp_selector;
+            let rhs = op.compute_arg2();
+            let wants_hi = op.decode.muldiv_selector;
             (
-                MulOperation::new(op.rv1, f.alu_signed(), op.arg2, f.alu_signed2_or_invert()),
-                f.alu_muldiv(),
+                MulOperation::new(lhs, lhs_signed, rhs, rhs_signed),
+                wants_hi,
             )
         })
         .collect();
 
-    // Collect DVRM operations from non-word DIV/REM instructions.
-    let mut dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
+    // Collect DVRM operations from CPU ops where op_divrem = true
+    let dvrm_ops: Vec<(DvrmOperation, bool)> = cpu_ops
         .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_divrem())
+        .filter(|op| op.decode.op_divrem)
         .map(|op| {
-            let f = op.decode.fields;
-            (
-                DvrmOperation::new(op.rv1, op.arg2, f.alu_signed()),
-                f.alu_muldiv(),
-            )
+            let n = op.compute_arg1();
+            let d = op.compute_arg2();
+            let signed = op.decode.signed;
+            let wants_remainder = op.decode.muldiv_selector;
+            (DvrmOperation::new(n, d, signed), wants_remainder)
         })
         .collect();
-
-    // Collect the ALU/MEMORY chip ops (non-word rows).
-    // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
-        .collect();
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
-        .filter(|op| {
-            let f = &op.decode.fields;
-            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
-        })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
-        .collect();
-    // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
-    // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
-    // table row).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            // The MEMORY bus and the STORE chip's MEMW write share the base
-            // timestamp (spec store.toml uses one `timestamp` for both).
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
-            )
-        })
-        .collect();
-
-    // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
-    // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
-    // word DVRM ops are added before the DVRM→LT/MUL loops so they get their own
-    // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
-    for c in &cpu32_ops {
-        cpu32_chip_op(c, &mut shift_ops, &mut mul_ops, &mut dvrm_ops);
-        bitwise_ops.extend(collect_cpu32_bitwise(c));
-    }
 
     // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
     for (op, _wants_remainder) in &dvrm_ops {
@@ -2866,13 +2412,7 @@ fn collect_all_ops(
         dvrm_ops,
         commit_ops,
         keccak_ops,
-        eq_ops,
-        bytewise_ops,
-        store_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ec_scalar_ops,
-        ecdas_ops,
+        fp3_mul_ops,
     }
 }
 
@@ -2889,7 +2429,7 @@ fn build_traces(
     entry_point: u64,
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
-    mut register_state: RegisterState,
+    register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
@@ -2908,13 +2448,7 @@ fn build_traces(
         dvrm_ops,
         commit_ops,
         keccak_ops,
-        eq_ops,
-        bytewise_ops,
-        store_ops,
-        cpu32_ops,
-        ecsm_ops,
-        ec_scalar_ops,
-        ecdas_ops,
+        fp3_mul_ops,
     } = ops;
 
     // =====================================================================
@@ -2931,20 +2465,10 @@ fn build_traces(
     bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-    // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
-    for op in &bytewise_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &eq_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &store_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
     // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
+    // PAGE tables do a batched IS_BYTE[init, fini] lookup per row (C1+C2)
     if let Some(elf) = elf {
         bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
     }
@@ -2954,14 +2478,12 @@ fn build_traces(
         .filter(|op| !op.end)
         .map(|op| op.value)
         .collect();
-    // COMMIT table sends AreBytes and IsHalfword lookups
+    // COMMIT table sends IsByte and IsHalfword lookups
     bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
+    // KECCAK_RND sends XOR/AND/IS_BYTE/HWSL; KECCAK core sends IS_HALF
     bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecsm(&ecsm_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecdas(&ecdas_ops));
 
-    // CPU padding rows send ARE_BYTES with all-zero values.
+    // CPU padding rows send IS_BYTE with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
     let num_padding_rows: usize = cpu_ops
         .chunks(max_rows.cpu)
@@ -2977,18 +2499,9 @@ fn build_traces(
     let halt_op = cpu_ops
         .iter()
         .rev()
-        .find(|op| op.decode.fields.ecall)
+        .find(|op| op.decode.op_ecall)
         .ok_or(Error::MissingHaltEcall)?;
     let halt_timestamp = halt_op.timestamp;
-    let halt_next_pc = halt_op.next_pc;
-
-    // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
-    // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
-    // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
-    // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
-    // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
-    // must match that last write to balance the memory argument.
-    register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
 
     let cpus = chunk_and_generate(
         &cpu_ops,
@@ -3061,36 +2574,6 @@ fn build_traces(
         storage_mode,
     )?;
 
-    // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
-    let eqs = chunk_and_generate::<eq::EqOperation>(
-        &eq_ops,
-        max_rows.eq,
-        eq::generate_eq_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
-        &bytewise_ops,
-        max_rows.bytewise,
-        bytewise::generate_bytewise_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let stores = chunk_and_generate::<store::StoreOperation>(
-        &store_ops,
-        max_rows.store,
-        store::generate_store_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
-        &cpu32_ops,
-        max_rows.cpu32,
-        cpu32::generate_cpu32_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-
     let mut bitwise = bitwise::generate_bitwise_trace();
     bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
 
@@ -3125,10 +2608,8 @@ fn build_traces(
     let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
     keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
 
-    // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
-    let ecsm_trace = ecsm::generate_ecsm_trace(&ecsm_ops);
-    let ec_scalar_trace = ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops);
-    let ecdas_trace = ecdas::generate_ecdas_trace(&ecdas_ops);
+    // Generate the FP3_MUL trace (one row per Fp3Mul precompile call).
+    let fp3_mul_trace = fp3_mul::generate_fp3_mul_trace(&fp3_mul_ops);
 
     #[allow(unused_mut)]
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
@@ -3144,7 +2625,7 @@ fn build_traces(
                     || register::generate_register_trace(&register_final_state, entry_point),
                 )
             },
-            || halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+            || halt::generate_halt_trace(halt_timestamp),
         );
         let (pages_v, page_configs_v) = pages_val;
         pages = pages_v;
@@ -3166,7 +2647,7 @@ fn build_traces(
             }
         }
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+        halt_trace = halt::generate_halt_trace(halt_timestamp);
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3221,14 +2702,8 @@ fn build_traces(
         keccak: keccak_trace,
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
-        ecsm: ecsm_trace,
-        ec_scalar: ec_scalar_trace,
-        ecdas: ecdas_trace,
+        fp3_mul: fp3_mul_trace,
         memw_registers,
-        eqs,
-        bytewises,
-        stores,
-        cpu32s,
     })
 }
 
@@ -3337,7 +2812,7 @@ pub fn count_table_lengths(
         cpu_count += 1;
 
         // Memory ops from load/store
-        if cpu_op.decode.fields.is_load() {
+        if cpu_op.decode.op_load {
             let (memw_op, _load_op, _bitwise) =
                 collect_load_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
@@ -3347,7 +2822,7 @@ pub fn count_table_lengths(
                 &mut memw_register_count,
             );
             load_count += 1;
-        } else if cpu_op.decode.fields.is_store() {
+        } else if cpu_op.decode.op_store {
             let memw_op = collect_store_op_from_cpu(&cpu_op, &mut memory_state);
             partition_memw(
                 &memw_op,
@@ -3392,18 +2867,17 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
-        // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
-        let f = &cpu_op.decode.fields;
-        if !f.word_instr && f.is_lt() {
+        // CPU-side per-instruction-kind counters
+        if cpu_op.decode.op_slt || cpu_op.decode.op_blt {
             lt_count += 1;
         }
-        if !f.word_instr && f.is_shift() {
+        if cpu_op.decode.op_shift {
             shift_count += 1;
         }
-        if !f.word_instr && f.is_mul() {
+        if cpu_op.decode.op_mul {
             mul_count += 1;
         }
-        if !f.word_instr && f.is_divrem() {
+        if cpu_op.decode.op_divrem {
             dvrm_count += 1;
         }
         if cpu_op.branch_cond {
@@ -3470,17 +2944,12 @@ impl Traces {
         use super::bitwise::NUM_PRECOMPUTED_COLS as BITWISE_PRECOMPUTED;
         use super::bitwise::cols::NUM_COLUMNS as BITWISE_COLS;
         use super::branch::cols::NUM_COLUMNS as BRANCH_COLS;
-        use super::bytewise::cols::NUM_COLUMNS as BYTEWISE_COLS;
         use super::commit::cols::NUM_COLUMNS as COMMIT_COLS;
         use super::cpu::cols::NUM_COLUMNS as CPU_COLS;
-        use super::cpu32::cols::NUM_COLUMNS as CPU32_COLS;
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::ec_scalar::cols::NUM_COLUMNS as EC_SCALAR_COLS;
-        use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
-        use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
-        use super::eq::cols::NUM_COLUMNS as EQ_COLS;
+        use super::fp3_mul::cols::NUM_COLUMNS as FP3_MUL_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -3497,7 +2966,6 @@ impl Traces {
         use super::register::NUM_PREPROCESSED_COLS as REGISTER_PREPROCESSED;
         use super::register::cols::NUM_COLUMNS as REGISTER_COLS;
         use super::shift::cols::NUM_COLUMNS as SHIFT_COLS;
-        use super::store::cols::NUM_COLUMNS as STORE_COLS;
 
         let Traces {
             cpus,
@@ -3518,14 +2986,8 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
-            ecsm,
-            ec_scalar,
-            ecdas,
+            fp3_mul,
             memw_registers,
-            eqs,
-            bytewises,
-            stores,
-            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -3572,21 +3034,7 @@ impl Traces {
         total += (keccak.num_rows() * KECCAK_COLS) as u64;
         total += (keccak_rnd.num_rows() * KECCAK_RND_COLS) as u64;
         total += (keccak_rc.num_rows() * (KECCAK_RC_COLS - KECCAK_RC_PRECOMPUTED)) as u64;
-        for t in eqs {
-            total += (t.num_rows() * EQ_COLS) as u64;
-        }
-        for t in bytewises {
-            total += (t.num_rows() * BYTEWISE_COLS) as u64;
-        }
-        for t in stores {
-            total += (t.num_rows() * STORE_COLS) as u64;
-        }
-        for t in cpu32s {
-            total += (t.num_rows() * CPU32_COLS) as u64;
-        }
-        total += (ecsm.num_rows() * ECSM_COLS) as u64;
-        total += (ec_scalar.num_rows() * EC_SCALAR_COLS) as u64;
-        total += (ecdas.num_rows() * ECDAS_COLS) as u64;
+        total += (fp3_mul.num_rows() * FP3_MUL_COLS) as u64;
         total
     }
 
@@ -3622,13 +3070,7 @@ impl Traces {
         let n_keccak = aux_cols(super::keccak::bus_interactions().len());
         let n_keccak_rnd = aux_cols(super::keccak_rnd::bus_interactions().len());
         let n_keccak_rc = aux_cols(super::keccak_rc::bus_interactions().len());
-        let n_eq = aux_cols(super::eq::bus_interactions().len());
-        let n_bytewise = aux_cols(super::bytewise::bus_interactions().len());
-        let n_store = aux_cols(super::store::bus_interactions().len());
-        let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
-        let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
-        let n_ec_scalar = aux_cols(super::ec_scalar::bus_interactions().len());
-        let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
+        let n_fp3_mul = aux_cols(super::fp3_mul::bus_interactions().len());
 
         let Traces {
             cpus,
@@ -3649,14 +3091,8 @@ impl Traces {
             keccak,
             keccak_rnd,
             keccak_rc,
-            ecsm,
-            ec_scalar,
-            ecdas,
+            fp3_mul,
             memw_registers,
-            eqs,
-            bytewises,
-            stores,
-            cpu32s,
             page_configs: _,
             public_output_bytes: _,
         } = self;
@@ -3703,21 +3139,7 @@ impl Traces {
         total += (keccak.num_rows() * n_keccak) as u64;
         total += (keccak_rnd.num_rows() * n_keccak_rnd) as u64;
         total += (keccak_rc.num_rows() * n_keccak_rc) as u64;
-        for t in eqs {
-            total += (t.num_rows() * n_eq) as u64;
-        }
-        for t in bytewises {
-            total += (t.num_rows() * n_bytewise) as u64;
-        }
-        for t in stores {
-            total += (t.num_rows() * n_store) as u64;
-        }
-        for t in cpu32s {
-            total += (t.num_rows() * n_cpu32) as u64;
-        }
-        total += (ecsm.num_rows() * n_ecsm) as u64;
-        total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
-        total += (ecdas.num_rows() * n_ecdas) as u64;
+        total += (fp3_mul.num_rows() * n_fp3_mul) as u64;
         total
     }
 
@@ -3961,10 +3383,6 @@ impl Traces {
             shift: self.shifts.len(),
             branch: self.branches.len(),
             memw_register: self.memw_registers.len(),
-            eq: self.eqs.len(),
-            bytewise: self.bytewises.len(),
-            store: self.stores.len(),
-            cpu32: self.cpu32s.len(),
         }
     }
 
@@ -3976,6 +3394,7 @@ impl Traces {
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use alloc::collections::BTreeSet;
 
+        let page_size = page::DEFAULT_PAGE_SIZE;
         let init_page_data = build_init_page_data(elf, &[]);
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
@@ -3984,9 +3403,9 @@ impl Traces {
             .into_iter()
             .map(|base| {
                 if let Some(init_data) = init_page_data.get(&base) {
-                    PageConfig::with_data(base, init_data.clone())
+                    PageConfig::with_data(base, page_size, init_data.clone())
                 } else {
-                    PageConfig::zero_init(base)
+                    PageConfig::zero_init(base, page_size)
                 }
             })
             .collect()
@@ -4011,18 +3430,21 @@ impl Traces {
         for r in runtime_page_ranges {
             let (base, count) = (r.base, r.count);
             for i in 0..count {
-                configs.push(PageConfig::zero_init(base + i * page_size as u64));
+                configs.push(PageConfig::zero_init(
+                    base + i * page_size as u64,
+                    page_size,
+                ));
             }
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
         if num_private_input_pages > 0 {
-            #[cfg(feature = "prove")]
             use executor::constants::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
+            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX, page_size);
             for i in 0..num_private_input_pages {
                 configs.push(PageConfig {
                     page_base: first_page_base + i as u64 * page_size as u64,
+                    page_size,
                     init_values: None, // Verifier doesn't know these
                     is_private_input: true,
                 });
@@ -4105,19 +3527,8 @@ impl Traces {
         let mut memory_state = MemoryState::from_elf(elf);
         memory_state.add_private_input(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
-        let (
-            memw_ops,
-            load_ops,
-            lt_ops,
-            shift_ops,
-            bitwise_ops,
-            commit_ops,
-            keccak_ops,
-            cpu32_ops,
-            ecsm_ops,
-            ec_scalar_ops,
-            ecdas_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops, fp3_mul_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
             cpu_ops,
@@ -4128,10 +3539,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
-            cpu32_ops,
-            ecsm_ops,
-            ec_scalar_ops,
-            ecdas_ops,
+            fp3_mul_ops,
             &mut register_state,
         );
 
@@ -4170,19 +3578,8 @@ impl Traces {
         let mut memory_state = MemoryState::new();
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
         let mut register_state = RegisterState::new(entry_point);
-        let (
-            memw_ops,
-            load_ops,
-            lt_ops,
-            shift_ops,
-            bitwise_ops,
-            commit_ops,
-            keccak_ops,
-            cpu32_ops,
-            ecsm_ops,
-            ec_scalar_ops,
-            ecdas_ops,
-        ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        let (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops, fp3_mul_ops) =
+            collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
         let ops = collect_all_ops(
             cpu_ops,
@@ -4193,10 +3590,7 @@ impl Traces {
             bitwise_ops,
             commit_ops,
             keccak_ops,
-            cpu32_ops,
-            ecsm_ops,
-            ec_scalar_ops,
-            ecdas_ops,
+            fp3_mul_ops,
             &mut register_state,
         );
 
@@ -4288,5 +3682,256 @@ impl Traces {
         )?;
         traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
         Ok(traces)
+    }
+}
+
+#[cfg(test)]
+mod keccak_tests {
+    use super::*;
+    use crate::tables::keccak::cols as core_cols;
+    use crate::tables::keccak_rnd::cols as rnd_cols;
+    use crate::tables::types::FE;
+    #[cfg(feature = "prove")]
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    fn make_keccak_ops() -> (KeccakOperation, KeccakRoundOperation) {
+        let input = [0u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let kop = KeccakOperation {
+            timestamp: 42,
+            state_addr: 0x1000,
+            input,
+            output,
+        };
+        let rop = KeccakRoundOperation {
+            timestamp: 42,
+            input,
+            output,
+        };
+        (kop, rop)
+    }
+
+    #[test]
+    fn test_keccak_bitwise_ops_count() {
+        let (kop, _) = make_keccak_ops();
+        let ops = collect_bitwise_from_keccak(&[kop]);
+
+        let xor = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::XorByte)
+            .count();
+        let and = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::AndByte)
+            .count();
+        let is_byte = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::IsByte)
+            .count();
+        let hwsl = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::Hwsl)
+            .count();
+        let is_half = ops
+            .iter()
+            .filter(|o| o.lookup_type == BitwiseOperationType::IsHalf)
+            .count();
+
+        assert_eq!(xor, 24 * 608, "XorByte count");
+        assert_eq!(and, 24 * 200, "AndByte count");
+        // Cxz_right Byte→Bit (spec d75944ee): drops 40 IS_BYTE per round.
+        assert_eq!(is_byte, 24 * 440, "IsByte count");
+        assert_eq!(hwsl, 24 * 120, "Hwsl count");
+        assert_eq!(is_half, 100, "IsHalf count");
+        assert_eq!(ops.len(), 100 + 24 * 1368, "Total bitwise ops");
+    }
+
+    #[test]
+    fn test_keccak_round_trace_matches_f1600() {
+        let (_, rop) = make_keccak_ops();
+        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
+
+        let mut ref_state = [0u64; 25];
+        for round in 0..24 {
+            let rc = executor::constants::KECCAK_RC[round];
+            let mut c = [0u64; 5];
+            for x in 0..5 {
+                c[x] = ref_state[x]
+                    ^ ref_state[x + 5]
+                    ^ ref_state[x + 10]
+                    ^ ref_state[x + 15]
+                    ^ ref_state[x + 20];
+            }
+            let mut d = [0u64; 5];
+            for x in 0..5 {
+                d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+            }
+            for i in 0..25 {
+                ref_state[i] ^= d[i % 5];
+            }
+            let mut b = [0u64; 25];
+            for x in 0..5 {
+                for y in 0..5 {
+                    b[y + 5 * ((2 * x + 3 * y) % 5)] =
+                        ref_state[x + 5 * y].rotate_left(executor::constants::KECCAK_RHO[x][y]);
+                }
+            }
+            for x in 0..5 {
+                for y in 0..5 {
+                    ref_state[x + 5 * y] =
+                        b[x + 5 * y] ^ (!b[(x + 1) % 5 + 5 * y] & b[(x + 2) % 5 + 5 * y]);
+                }
+            }
+            ref_state[0] ^= rc;
+
+            let base = round * rnd_cols::NUM_COLUMNS;
+            for (lane, &lane_val) in ref_state.iter().enumerate() {
+                let x = lane % 5;
+                let y = lane / 5;
+                for byte_idx in 0..8 {
+                    let expected = FE::from((lane_val >> (byte_idx * 8)) & 0xFF);
+                    let col = if x == 0 && y == 0 {
+                        rnd_cols::iota(byte_idx)
+                    } else {
+                        rnd_cols::chi(x, y, byte_idx)
+                    };
+                    let trace_val = &rnd_trace.main_table.data[base + col];
+                    assert_eq!(
+                        &expected, trace_val,
+                        "Round {round} lane ({x},{y}) byte {byte_idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_keccak_core_round_state_consistency() {
+        let (kop, rop) = make_keccak_ops();
+        let core_trace = keccak::generate_keccak_trace(&[kop]);
+        let rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&[rop]);
+
+        // Round 0 start == core input_state
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    let core_val = &core_trace.main_table.data[core_cols::input_state(x, y, b)];
+                    let rnd_val = &rnd_trace.main_table.data[rnd_cols::start(x, y, b)];
+                    assert_eq!(core_val, rnd_val, "Round 0 start mismatch at ({x},{y},{b})");
+                }
+            }
+        }
+
+        // Round 23 out == core output_state
+        let rnd_base_23 = 23 * rnd_cols::NUM_COLUMNS;
+        for x in 0..5 {
+            for y in 0..5 {
+                for b in 0..8 {
+                    let core_val = &core_trace.main_table.data[core_cols::output_state(x, y, b)];
+                    let rnd_val = if x == 0 && y == 0 {
+                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::iota(b)]
+                    } else {
+                        &rnd_trace.main_table.data[rnd_base_23 + rnd_cols::chi(x, y, b)]
+                    };
+                    assert_eq!(core_val, rnd_val, "Round 23 out mismatch at ({x},{y},{b})");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_keccak_bus_interaction_counts() {
+        assert_eq!(
+            keccak::bus_interactions().len(),
+            129,
+            "KECCAK core: 1 ECALL + 1 MEMW read_addr + 25 MEMW lanes + 100 IS_HALF + 1 Keccak send + 1 Keccak recv"
+        );
+        assert_eq!(
+            keccak_rnd::bus_interactions().len(),
+            1371,
+            "KECCAK_RND: 3 IO + 460 theta + 500 rho + 400 chi + 8 iota \
+             (Cxz_right Byte→Bit drops 40 IS_BYTE per spec d75944ee)"
+        );
+        assert_eq!(
+            keccak_rc::bus_interactions().len(),
+            1,
+            "KECCAK_RC: 1 receiver"
+        );
+    }
+
+    #[test]
+    fn test_keccak_column_counts() {
+        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(
+            rnd_cols::NUM_COLUMNS,
+            1480,
+            "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
+        );
+        assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");
+    }
+
+    #[test]
+    fn test_keccak_constraint_counts() {
+        let (core_constraints, _) = keccak::create_constraints(0);
+        assert_eq!(core_constraints.len(), 50, "KECCAK core: 25 ADD pairs");
+
+        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
+        assert_eq!(
+            rnd_constraints.len(),
+            20,
+            "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
+        );
+    }
+}
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+
+    fn make_register_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
+        MemwOperation::new(true, 2, [1, 0, 0, 0, 0, 0, 0, 0], timestamp, 2, false)
+            .with_old([0; 8], [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0])
+    }
+
+    #[test]
+    fn test_is_register_op_delta_at_boundary_routes_in() {
+        // delta = 0x10000 = 2^16: spec allows this (IS_HALF[0xFFFF] is valid)
+        let op = make_register_op(0x10000, 0);
+        assert!(is_register_op(&op), "delta = 2^16 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_above_boundary_falls_back() {
+        // delta = 0x10001: one above the IS_HALF range, must fall back to MEMW_A
+        let op = make_register_op(0x10001, 0);
+        assert!(
+            !is_register_op(&op),
+            "delta = 2^16 + 1 should fall back to MEMW_A"
+        );
+    }
+
+    #[test]
+    fn test_is_register_op_delta_one_routes_in() {
+        // delta = 1: minimum allowed value
+        let op = make_register_op(1, 0);
+        assert!(is_register_op(&op), "delta = 1 should route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_delta_zero_falls_back() {
+        // delta = 0: ts[0] not strictly greater than old_ts[0]
+        let op = make_register_op(5, 5);
+        assert!(!is_register_op(&op), "delta = 0 should not route to MEMW_R");
+    }
+
+    #[test]
+    fn test_is_register_op_upper_limb_mismatch_falls_back() {
+        // ts_hi != old_ts_hi: shared upper limb assumption violated
+        let op = make_register_op(0x1_0000_0001, 0x0_0000_0000);
+        assert!(
+            !is_register_op(&op),
+            "different upper limbs should fall back to MEMW_A"
+        );
     }
 }

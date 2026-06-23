@@ -760,12 +760,14 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "digest",
+ "keccak",
  "libc",
  "math",
  "memmap2",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
+ "rkyv",
  "serde",
  "sha2",
  "sha3",
@@ -1693,8 +1695,10 @@ dependencies = [
  "math",
  "postcard",
  "rayon",
+ "rkyv",
  "serde",
  "sha3",
+ "smallvec",
  "stark",
  "sysinfo",
  "tikv-jemalloc-ctl",
@@ -1855,6 +1859,7 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
+ "rkyv",
  "serde",
  "serde_json",
 ]
@@ -2742,6 +2747,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
+name = "smallvec"
+version = "1.15.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2785,9 +2796,11 @@ dependencies = [
  "rand 0.8.5",
  "rand_chacha 0.3.1",
  "rayon",
+ "rkyv",
  "serde",
  "serde-wasm-bindgen",
  "sha3",
+ "smallvec",
  "tempfile",
  "test-log",
  "wasm-bindgen",

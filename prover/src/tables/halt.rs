@@ -5,23 +5,17 @@
 //!
 //! ## Columns
 //! - `timestamp`: DWordWL (2 columns) - timestamp at which to halt the program
-//! - `pc`: DWordWL (2 columns) - the `next_pc` the CPU wrote during the halting
-//!   instruction (consumed off the `memory` bus and replaced by the padding PC=1)
 //!
 //! ## Bus Interactions
 //! - **Receiver**: ECALL bus - receives `[timestamp, cast(rv1, DWordWL)]` from CPU
 //!   when the ECALL flag is set (rv1 must be 93 = sys_exit)
-//! - **Sender**: MEMW bus - 31 register finalization interactions at `ts = 2^64-1`:
+//! - **Sender**: MEMW bus - 32 register finalization interactions at `ts = 2^64-1`:
 //!   - x1-x9: write 0 (zeroize lo GPRs)
 //!   - x10: read with old=0 (enforce exit_code=0; non-zero → bus imbalance → proof failure)
 //!   - x11-x31: write 0 (zeroize hi GPRs)
-//! - **`memory` bus (PC finalization, per spec halt:c:consume_pc/emit_pc)**: at
-//!   `ts = timestamp + 1` the chip *consumes* the real `next_pc` the CPU wrote for
-//!   the halting instruction and *re-emits* `pc = 1`. This bridges the last real PC
-//!   write to the CPU padding rows (which all carry PC=1); the padding chain then
-//!   carries PC=1 to the REGISTER table's final token. x255 is therefore NOT
-//!   finalized via MEMW at `2^64-1` anymore.
+//!   - x255: write 1 (PC halted sentinel)
 //!
+//! All MEMW interactions use constant values only (no additional columns needed).
 //! Corresponding MEMW table rows are generated in trace_builder.
 //!
 //! ## Padding
@@ -29,7 +23,8 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use smallvec::smallvec;
+use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
@@ -45,13 +40,8 @@ pub mod cols {
     /// timestamp[1]: Word (upper 32 bits of halt timestamp)
     pub const TIMESTAMP_1: usize = 1;
 
-    /// pc[0]: Word (lower 32 bits of the halting instruction's next_pc)
-    pub const PC_0: usize = 2;
-    /// pc[1]: Word (upper 32 bits of the halting instruction's next_pc)
-    pub const PC_1: usize = 3;
-
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 4;
+    pub const NUM_COLUMNS: usize = 2;
 }
 
 // =========================================================================
@@ -65,10 +55,7 @@ pub mod cols {
 /// first ECALL, so a valid trace always contains exactly one. If a program had multiple
 /// ECALLs, the CPU would send multiple bus interactions but HALT only receives one,
 /// causing a bus imbalance and proof failure.
-pub fn generate_halt_trace(
-    timestamp: u64,
-    next_pc: u64,
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+pub fn generate_halt_trace(timestamp: u64) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // CPU timestamps must fit in u32 (timestamp_hi should be 0)
     debug_assert!(
         timestamp <= u32::MAX as u64,
@@ -77,12 +64,7 @@ pub fn generate_halt_trace(
     let timestamp_lo = timestamp & 0xFFFF_FFFF;
     let timestamp_hi = timestamp >> 32;
 
-    let data = vec![
-        FE::from(timestamp_lo),
-        FE::from(timestamp_hi),
-        FE::from(next_pc & 0xFFFF_FFFF),
-        FE::from(next_pc >> 32),
-    ];
+    let data = vec![FE::from(timestamp_lo), FE::from(timestamp_hi)];
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
 }
@@ -155,14 +137,13 @@ fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
 /// Creates all bus interactions for the HALT table.
 ///
 /// - **ECALL receiver**: receives `[timestamp, cast(rv1, DWordWL)]` from CPU
-/// - **MEMW senders** (31 total): register finalization at `ts = 2^64-1`
+/// - **MEMW senders** (32 total): register finalization at `ts = 2^64-1`
 ///   - x1-x9: write 0 (zeroize lo GPRs)
 ///   - x10: read with old=0 (enforce exit_code=0)
 ///   - x11-x31: write 0 (zeroize hi GPRs)
-/// - **`memory` bus (4 total)**: consume_pc (x2) + emit_pc (x2) at `ts = timestamp+1`,
-///   bridging the last real PC write to the PC=1 padding chain.
+///   - x255: write 1 (PC halted sentinel)
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(36);
+    let mut interactions = Vec::with_capacity(33);
 
     // ECALL receiver: receives [timestamp, cast(rv1, DWordWL)] from CPU
     // rv1 must be 93 (sys_exit) for bus to balance; otherwise proof fails.
@@ -210,58 +191,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // PC finalization on the low-level `memory` token bus at ts = timestamp + 1
-    // (per spec halt:c:consume_pc / halt:c:emit_pc). The CPU's halting row wrote
-    // its real `next_pc` to x255 (addresses 510/511) at this same timestamp; we
-    // consume it (sender, +1) and re-emit pc=1 (receiver, -1) so the CPU padding
-    // rows — which all carry pc=1 — chain cleanly to the REGISTER final token.
-    // `value` layout on the bus: [is_register, addr_lo, addr_hi, ts_lo, ts_hi, value].
-    let ts_plus_one_lo = || {
-        BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::TIMESTAMP_0,
-            },
-            LinearTerm::Constant(1),
-        ])
-    };
-    let ts_hi = || BusValue::Packed {
-        start_column: cols::TIMESTAMP_1,
-        packing: Packing::Direct,
-    };
-    for (addr, pc_col) in [(510u64, cols::PC_0), (511u64, cols::PC_1)] {
-        // consume_pc (sender, +1): consume the real next_pc the CPU wrote.
-        interactions.push(BusInteraction::sender(
-            BusId::Memory,
-            Multiplicity::One,
-            vec![
-                BusValue::constant(1),
-                BusValue::constant(addr),
-                BusValue::constant(0),
-                ts_plus_one_lo(),
-                ts_hi(),
-                BusValue::Packed {
-                    start_column: pc_col,
-                    packing: Packing::Direct,
-                },
-            ],
-        ));
-    }
-    for (addr, value) in [(510u64, 1u64), (511u64, 0u64)] {
-        // emit_pc (receiver, -1): re-emit pc = 1 (value [1, 0]).
-        interactions.push(BusInteraction::receiver(
-            BusId::Memory,
-            Multiplicity::One,
-            vec![
-                BusValue::constant(1),
-                BusValue::constant(addr),
-                BusValue::constant(0),
-                ts_plus_one_lo(),
-                ts_hi(),
-                BusValue::constant(value),
-            ],
-        ));
-    }
+    // x255 (PC): write 1 at ts=2^64-1 (halted sentinel)
+    interactions.push(BusInteraction::sender(
+        BusId::Memw,
+        Multiplicity::One,
+        halt_write_bus_values(510, 1),
+    ));
 
     interactions
 }

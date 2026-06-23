@@ -1,7 +1,7 @@
 //! KECCAK_RND: Round chip for Keccak-f[1600] permutation.
 //!
 //! One row per round (24 rows per keccak call). All bitwise operations are
-//! delegated to BITWISE lookup tables (BYTE_ALU, HWSL, ARE_BYTES).
+//! delegated to BITWISE lookup tables (XOR_BYTE, AND_BYTE, HWSL, IS_BYTE).
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -31,13 +31,14 @@
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
+
 use executor::constants::{KECCAK_RC, KECCAK_RHO};
 use smallvec::smallvec;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
 // Column indices
@@ -45,6 +46,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
 
 pub mod cols {
     use executor::constants::KECCAK_RHO;
+
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
     pub const ROUND: usize = 2;
@@ -443,12 +445,12 @@ pub fn generate_keccak_rnd_trace(
 }
 
 // =========================================================================
-// Bus interactions (1,371 total)
+// Bus interactions (approx 1,371 total)
 // =========================================================================
 
 #[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1371);
+    let mut interactions = Vec::with_capacity(1380);
 
     // --- IO group (3) ---
 
@@ -548,15 +550,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // --- Theta: Cxz chain BYTE_ALU[XOR] (160) ---
+    // --- Theta: Cxz chain XOR_BYTE (160) ---
     // Stage 0: XOR(start[x,0,z], start[x,1,z]) → Cxz[x,0,z]
     for x in 0..5 {
         for b in 0..8 {
             interactions.push(BusInteraction::sender(
-                BusId::ByteAlu,
+                BusId::XorByte,
                 Multiplicity::Column(cols::MU),
-                vec![
-                    BusValue::constant(alu_op::XOR as u64),
+                smallvec![
                     BusValue::Packed {
                         start_column: cols::start(x, 0, b),
                         packing: Packing::Direct,
@@ -579,10 +580,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             let y = stage + 1;
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
-                    BusId::ByteAlu,
+                    BusId::XorByte,
                     Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::constant(alu_op::XOR as u64),
+                    smallvec![
                         BusValue::Packed {
                             start_column: cols::cxz(x, stage - 1, b),
                             packing: Packing::Direct,
@@ -644,31 +644,22 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Theta: ARE_BYTES range checks on Cxz_left (20 pairs) ---
-    // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
-    // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
-    // implementation guidance in spec/is_byte.typ.
+    // --- Theta: IS_BYTE range checks on Cxz_left (40) ---
     // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
     for x in 0..5 {
-        for i in 0..4 {
+        for b in 0..8 {
             interactions.push(BusInteraction::sender(
-                BusId::AreBytes,
+                BusId::IsByte,
                 Multiplicity::Column(cols::MU),
-                vec![
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i),
-                        packing: Packing::Direct,
-                    },
-                    BusValue::Packed {
-                        start_column: cols::cxz_left(x, 2 * i + 1),
-                        packing: Packing::Direct,
-                    },
-                ],
+                smallvec![BusValue::Packed {
+                    start_column: cols::cxz_left(x, b),
+                    packing: Packing::Direct,
+                }],
             ));
         }
     }
 
-    // --- Theta: Dxz BYTE_ALU[XOR] (40) ---
+    // --- Theta: Dxz XOR_BYTE (40) ---
     // D[x][b] = C[(x-1)%5][b] XOR rotated_C[(x+1)%5][b]
     // rotated_C[x'][b] = Cxz_left[x'][b] + (1 - b%2) * Cxz_right[x'][(b/2 - 1)%4]
     // (spec d75944ee/9143370f). For odd b only Cxz_left contributes.
@@ -685,10 +676,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 });
             }
             interactions.push(BusInteraction::sender(
-                BusId::ByteAlu,
+                BusId::XorByte,
                 Multiplicity::Column(cols::MU),
-                vec![
-                    BusValue::constant(alu_op::XOR as u64),
+                smallvec![
                     BusValue::Packed {
                         start_column: cols::cxz((x + 4) % 5, 3, b),
                         packing: Packing::Direct,
@@ -703,16 +693,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Theta final: BYTE_ALU[XOR] (200) ---
+    // --- Theta final: XOR_BYTE (200) ---
     // theta[x][y][b] = start[x][y][b] XOR D[x][b]
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
-                    BusId::ByteAlu,
+                    BusId::XorByte,
                     Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::constant(alu_op::XOR as u64),
+                    smallvec![
                         BusValue::Packed {
                             start_column: cols::start(x, y, b),
                             packing: Packing::Direct,
@@ -779,31 +768,31 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs) ---
-    // Spec emits 400 IS_BYTE templates (200 per side); we merge each
-    // (rot_left[x][y][b], rot_right[x][y][b]) into one ARE_BYTES interaction.
+    // --- Rho: IS_BYTE range checks on rot_left + rot_right (400) ---
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 interactions.push(BusInteraction::sender(
-                    BusId::AreBytes,
+                    BusId::IsByte,
                     Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::Packed {
-                            start_column: cols::rot_left(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                        BusValue::Packed {
-                            start_column: cols::rot_right(x, y, b),
-                            packing: Packing::Direct,
-                        },
-                    ],
+                    smallvec![BusValue::Packed {
+                        start_column: cols::rot_left(x, y, b),
+                        packing: Packing::Direct,
+                    }],
+                ));
+                interactions.push(BusInteraction::sender(
+                    BusId::IsByte,
+                    Multiplicity::Column(cols::MU),
+                    smallvec![BusValue::Packed {
+                        start_column: cols::rot_right(x, y, b),
+                        packing: Packing::Direct,
+                    }],
                 ));
             }
         }
     }
 
-    // --- Chi: BYTE_ALU[AND] (200) ---
+    // --- Chi: AND_BYTE (200) ---
     // chi_ands[x][y][b] = (255 - pi[(x+1)%5][y][b]) AND pi[(x+2)%5][y][b]
     // pi is virtual: pi[x][y][z] = rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]
     // with src lane (sx,sy) = ((x+3y)%5, x) and byte offsets from KECCAK_RHO.
@@ -813,10 +802,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 let (p1_l, p1_r) = cols::pi_src_cols((x + 1) % 5, y, b);
                 let (p2_l, p2_r) = cols::pi_src_cols((x + 2) % 5, y, b);
                 interactions.push(BusInteraction::sender(
-                    BusId::ByteAlu,
+                    BusId::AndByte,
                     Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::constant(alu_op::AND as u64),
+                    smallvec![
                         BusValue::linear(vec![
                             LinearTerm::Constant(255),
                             LinearTerm::Column {
@@ -848,17 +836,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Chi: BYTE_ALU[XOR] (200) ---
+    // --- Chi: XOR_BYTE (200) ---
     // chi[x][y][b] = pi[x][y][b] XOR chi_ands[x][y][b] (pi virtual).
     for x in 0..5 {
         for y in 0..5 {
             for b in 0..8 {
                 let (p_l, p_r) = cols::pi_src_cols(x, y, b);
                 interactions.push(BusInteraction::sender(
-                    BusId::ByteAlu,
+                    BusId::XorByte,
                     Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::constant(alu_op::XOR as u64),
+                    smallvec![
                         BusValue::linear(vec![
                             LinearTerm::Column {
                                 coefficient: 1,
@@ -883,14 +870,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Iota: BYTE_ALU[XOR] (8) ---
+    // --- Iota: XOR_BYTE (8) ---
     // iota[b] = chi[0][0][b] XOR rc[b]
     for b in 0..8 {
         interactions.push(BusInteraction::sender(
-            BusId::ByteAlu,
+            BusId::XorByte,
             Multiplicity::Column(cols::MU),
-            vec![
-                BusValue::constant(alu_op::XOR as u64),
+            smallvec![
                 BusValue::Packed {
                     start_column: cols::chi(0, 0, b),
                     packing: Packing::Direct,
@@ -923,7 +909,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
 /// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
 ///
-/// All other checks (XOR, AND, HWSL, ARE_BYTES, IS_HALF, KECCAK, KECCAK_RC) are
+/// All other checks (XOR, AND, HWSL, IS_BYTE, IS_HALF, KECCAK, KECCAK_RC) are
 /// enforced via bus interactions against the BITWISE/KECCAK_RC chips.
 pub fn create_constraints(
     constraint_idx_start: usize,
@@ -945,4 +931,64 @@ pub fn create_constraints(
         }
     }
     (constraints, idx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(feature = "prove")]
+    use executor::vm::instruction::execution::keccak_f1600;
+
+    /// pi is a spec virtual variable. Verify the inlined expression
+    /// (rot_left[sx,sy,l_byte] + rot_right[sx,sy,r_byte]) matches the byte of
+    /// rho(theta) for a non-trivial state. Uses mu=0 padding rows as a trivial
+    /// sanity check (all zeros), then a non-zero-input round as the real test.
+    #[test]
+    fn test_pi_virtual_matches_rotate() {
+        // Use a non-zero input so theta_lanes are non-trivial.
+        let input = [0x0102030405060708u64; 25];
+        let mut output = input;
+        keccak_f1600(&mut output);
+        let op = KeccakRoundOperation {
+            timestamp: 42,
+            input,
+            output,
+        };
+        let trace = generate_keccak_rnd_trace(&[op]);
+        let base = 0;
+
+        // Recompute theta for round 0 in u64 to compare against virtual pi.
+        let mut c = [0u64; 5];
+        for x in 0..5 {
+            c[x] = input[x] ^ input[x + 5] ^ input[x + 10] ^ input[x + 15] ^ input[x + 20];
+        }
+        let mut d = [0u64; 5];
+        for x in 0..5 {
+            d[x] = c[(x + 4) % 5] ^ c[(x + 1) % 5].rotate_left(1);
+        }
+        let mut theta_lanes = [0u64; 25];
+        for x in 0..5 {
+            for y in 0..5 {
+                theta_lanes[x + 5 * y] = input[x + 5 * y] ^ d[x];
+            }
+        }
+
+        for x in 0..5 {
+            for y in 0..5 {
+                let sx = (x + 3 * y) % 5;
+                let sy = x;
+                let rotated = theta_lanes[sx + 5 * sy].rotate_left(KECCAK_RHO[sx][sy]);
+                for z in 0..8 {
+                    let (l_col, r_col) = cols::pi_src_cols(x, y, z);
+                    let virtual_pi =
+                        &trace.main_table.data[base + l_col] + &trace.main_table.data[base + r_col];
+                    let expected = FE::from((rotated >> (z * 8)) & 0xFF);
+                    assert_eq!(
+                        virtual_pi, expected,
+                        "virtual pi mismatch at ({x},{y},{z}): sx={sx}, sy={sy}"
+                    );
+                }
+            }
+        }
+    }
 }

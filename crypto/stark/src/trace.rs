@@ -1,22 +1,19 @@
-use alloc::vec;
-use alloc::vec::Vec;
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
+use alloc::vec;
+use alloc::vec::Vec;
 use itertools::Itertools;
-#[cfg(test)]
 use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::field::{element::FieldElement, traits::IsFFTField};
-#[cfg(test)]
-use math::polynomial::Polynomial;
 use math::polynomial::barycentric_inv_denoms;
 #[cfg(feature = "disk-spill")]
 use math::spill_safe::SpillSafe;
+use math::{
+    field::{element::FieldElement, traits::IsFFTField},
+    polynomial::Polynomial,
+};
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-// `par_iter()` is only used by the test-only `compute_trace_polys_main`.
-#[cfg(all(test, feature = "parallel"))]
-use rayon::prelude::IntoParallelRefIterator;
+use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -174,7 +171,6 @@ where
         self.aux_table.spill_to_disk()
     }
 
-    #[cfg(test)]
     pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
     where
         S: IsFFTField + IsSubFieldOf<F>,
@@ -221,17 +217,6 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// If the main trace was LDE'd on the GPU via the fused pipeline,
-    /// the device buffer is retained here so downstream GPU rounds can
-    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
-    /// for this table (below the size threshold or any CPU fallback:
-    /// preprocessed main, non-Goldilocks, or GPU error).
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
-    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
-    /// layout on device).
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -254,35 +239,7 @@ where
             aux_columns,
             lde_step_size,
             blowup_factor,
-            #[cfg(feature = "cuda")]
-            gpu_main: None,
-            #[cfg(feature = "cuda")]
-            gpu_aux: None,
         }
-    }
-
-    /// Attach an already-populated device LDE handle for the main columns.
-    /// Only set when the GPU fused pipeline produced the LDE. Callers that
-    /// ran the CPU path should leave this alone.
-    #[cfg(feature = "cuda")]
-    pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
-        self.gpu_main = Some(h);
-    }
-
-    /// Attach an already-populated device LDE handle for the aux columns.
-    #[cfg(feature = "cuda")]
-    pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
-        self.gpu_aux = Some(h);
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
-        self.gpu_main.as_ref()
-    }
-
-    #[cfg(feature = "cuda")]
-    pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
-        self.gpu_aux.as_ref()
     }
 
     /// Consume self and return the owned column vectors.
@@ -358,12 +315,13 @@ where
     }
 }
 
-/// Reference Horner-based trace-evaluation used as an oracle by the prover
-/// tests (`tests::prover_tests`). The production prover uses the LDE-based
-/// barycentric `get_trace_evaluations_from_lde` below; the two are
-/// cross-checked in tests.
-#[cfg(test)]
-pub(crate) fn get_trace_evaluations<F, E>(
+/// Given a slice of trace polynomials, an evaluation point `x`, the frame offsets
+/// corresponding to the computation of the transitions, and a primitive root,
+/// outputs the trace evaluations of each trace polynomial over the values used to
+/// compute a transition.
+/// Example: For a simple Fibonacci computation, if t(x) is the trace polynomial of
+/// the computation, this will output evaluations t(x), t(g * x), t(g^2 * z).
+pub fn get_trace_evaluations<F, E>(
     main_trace_polys: &[Polynomial<FieldElement<F>>],
     aux_trace_polys: &[Polynomial<FieldElement<E>>],
     x: &FieldElement<E>,
@@ -437,8 +395,8 @@ pub fn get_trace_evaluations_from_lde<F, E>(
     dc: &DomainConstants<F>,
 ) -> Table<E>
 where
-    F: IsSubFieldOf<E> + IsFFTField + 'static,
-    E: IsField + 'static,
+    F: IsSubFieldOf<E> + IsFFTField,
+    E: IsField,
 {
     let n = domain.interpolation_domain_size;
     let bf = domain.blowup_factor;
@@ -461,23 +419,7 @@ where
 
     let mut table_data = Vec::with_capacity(evaluation_points.len() * table_width);
 
-    // GPU fast path for R3 OOD: bundle the inverted inv_denoms (all
-    // eval points in one buffer) and the trace-size coset_points upload
-    // into a single device context. The barycentric kernels below read
-    // both via offset, with no per-eval-point or per-{main,aux} H2D.
-    #[cfg(feature = "cuda")]
-    let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
-        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(&dc.points, &evaluation_points);
-    #[allow(unused_variables)]
-    #[cfg(not(feature = "cuda"))]
-    let r3_ctx: Option<()> = None;
-
-    #[cfg_attr(not(feature = "cuda"), allow(clippy::unused_enumerate_index))]
-    for (eval_point_idx, eval_point) in evaluation_points.iter().enumerate() {
-        // Silence unused warning under non-cuda where eval_point_idx is
-        // only read inside the cuda-only block below.
-        #[cfg(not(feature = "cuda"))]
-        let _ = eval_point_idx;
+    for eval_point in &evaluation_points {
         // z_pow_n for this evaluation point
         let z_pow_n = eval_point.pow(n);
 
@@ -485,134 +427,58 @@ where
         let vanishing = z_pow_n.sub_subfield(&dc.offset_pow_n);
         let vanishing_factor = &n_inv_g_n_inv * &vanishing;
 
-        // CPU inv_denoms = 1/(eval_point - coset_point_i). Materialised
-        // eagerly only when the GPU dispatcher will need to H2D it (no
-        // device-side inv_denoms buffer available). On the all-GPU happy
-        // path it stays None and the `barycentric_inv_denoms` call is
-        // skipped entirely (the GPU buffer covers every eval point).
-        #[cfg(feature = "cuda")]
-        let mut inv_denoms: Option<Vec<FieldElement<E>>> = if r3_ctx.is_some() {
-            None
-        } else {
-            Some(barycentric_inv_denoms(eval_point, &dc.points))
-        };
-        #[cfg(not(feature = "cuda"))]
-        let mut inv_denoms: Option<Vec<FieldElement<E>>> =
-            Some(barycentric_inv_denoms(eval_point, &dc.points));
+        // Precompute inv_denoms = 1/(eval_point - coset_point_i) — shared across all columns
+        let inv_denoms = barycentric_inv_denoms(eval_point, &dc.points);
 
-        // col_scale[i] = point[i] * inv_denom[i], shared across ALL CPU column
-        // loops below. Computed lazily on first CPU-fallback use so the all-GPU
-        // path pays nothing, while the all-CPU and mixed paths only pay once.
-        let mut col_scale: Option<Vec<FieldElement<E>>> = None;
+        // Precompute col_scale[i] = point[i] * inv_denom[i] — shared across ALL columns.
+        // This eliminates N redundant F×E multiplies per column.
+        let col_scale: Vec<FieldElement<E>> = dc
+            .points
+            .iter()
+            .zip(inv_denoms.iter())
+            .map(|(point, inv_d)| point * inv_d)
+            .collect();
 
-        // GPU fast path: batched strided barycentric over the main-trace LDE
-        // already on device. Returns `None` when the GPU R1 path didn't run
-        // for this table (handle absent), the size is below threshold, types
-        // don't match, or the math-cuda call errored. Caller falls through
-        // to the existing rayon CPU loop.
-        // Per-eval-point block offset into the GPU inv_denoms buffer:
-        // block k starts at u64 index k * 3 * n.
-        #[cfg(feature = "cuda")]
-        let r3_arg = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
-        #[cfg(feature = "cuda")]
-        let main_gpu = crate::gpu_lde::try_barycentric_base_on_handle::<F, E>(
-            lde_trace,
-            bf,
-            &dc.points,
-            &dc.offset_pow_n,
-            &dc.size_inv,
-            &dc.offset_pow_n_inv,
-            &z_pow_n,
-            inv_denoms.as_deref().unwrap_or(&[]),
-            r3_arg,
-        );
-        #[cfg(not(feature = "cuda"))]
-        let main_gpu: Option<Vec<FieldElement<E>>> = None;
-
-        let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
-            v
-        } else {
-            let inv_denoms_v =
-                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
-            let col_scale = col_scale.get_or_insert_with(|| {
-                dc.points
+        // Evaluate all main columns directly from LDE (no extraction copy).
+        // For main columns (base field F): sum = Σ col_scale[i] * lde_col[i*bf]
+        // lde_col[i*bf] is F, col_scale[i] is E; use F×E → E mixed arithmetic.
+        #[cfg(feature = "parallel")]
+        let main_iter = (0..num_main_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let main_iter = 0..num_main_cols;
+        let main_evals: Vec<FieldElement<E>> = main_iter
+            .map(|col_idx| {
+                let lde_col = &lde_trace.main_columns[col_idx];
+                let sum = col_scale
                     .iter()
-                    .zip(inv_denoms_v.iter())
-                    .map(|(point, inv_d)| point * inv_d)
-                    .collect()
-            });
-            // Evaluate all main columns directly from LDE (no extraction copy).
-            // For main columns (base field F): sum = sum over i of col_scale[i] * lde_col[i*bf].
-            // lde_col[i*bf] is F, col_scale[i] is E; use F*E -> E mixed arithmetic.
-            #[cfg(feature = "parallel")]
-            let main_iter = (0..num_main_cols).into_par_iter();
-            #[cfg(not(feature = "parallel"))]
-            let main_iter = 0..num_main_cols;
-            main_iter
-                .map(|col_idx| {
-                    let lde_col = &lde_trace.main_columns[col_idx];
-                    let sum = col_scale
-                        .iter()
-                        .enumerate()
-                        .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                            acc + &lde_col[i * bf] * scale
-                        });
-                    &vanishing_factor * &sum
-                })
-                .collect()
-        };
+                    .enumerate()
+                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                        acc + &lde_col[i * bf] * scale
+                    });
+                &vanishing_factor * &sum
+            })
+            .collect();
         table_data.extend(main_evals);
 
-        // GPU fast path for aux columns reading the de-interleaved ext3 LDE handle.
-        #[cfg(feature = "cuda")]
-        let r3_arg_aux = r3_ctx.as_ref().map(|ctx| (ctx, eval_point_idx * 3 * n));
-        #[cfg(feature = "cuda")]
-        let aux_gpu = crate::gpu_lde::try_barycentric_ext3_on_handle::<F, E>(
-            lde_trace,
-            bf,
-            &dc.points,
-            &dc.offset_pow_n,
-            &dc.size_inv,
-            &dc.offset_pow_n_inv,
-            &z_pow_n,
-            inv_denoms.as_deref().unwrap_or(&[]),
-            r3_arg_aux,
-        );
-        #[cfg(not(feature = "cuda"))]
-        let aux_gpu: Option<Vec<FieldElement<E>>> = None;
-
-        let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
-            v
-        } else {
-            let inv_denoms_v =
-                inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
-            let col_scale = col_scale.get_or_insert_with(|| {
-                dc.points
+        // Evaluate all aux columns directly from LDE (no extraction copy).
+        // For aux columns (extension field E): sum = Σ col_scale[i] * lde_col[i*bf]
+        // Both col_scale and lde_col are in E, so each multiply is E×E → E.
+        #[cfg(feature = "parallel")]
+        let aux_iter = (0..num_aux_cols).into_par_iter();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = 0..num_aux_cols;
+        let aux_evals: Vec<FieldElement<E>> = aux_iter
+            .map(|col_idx| {
+                let lde_col = &lde_trace.aux_columns[col_idx];
+                let sum = col_scale
                     .iter()
-                    .zip(inv_denoms_v.iter())
-                    .map(|(point, inv_d)| point * inv_d)
-                    .collect()
-            });
-            // Evaluate all aux columns directly from LDE (no extraction copy).
-            // For aux columns (extension field E): sum = sum over i of col_scale[i] * lde_col[i*bf].
-            // Both col_scale and lde_col are in E, so each multiply is E*E -> E.
-            #[cfg(feature = "parallel")]
-            let aux_iter = (0..num_aux_cols).into_par_iter();
-            #[cfg(not(feature = "parallel"))]
-            let aux_iter = 0..num_aux_cols;
-            aux_iter
-                .map(|col_idx| {
-                    let lde_col = &lde_trace.aux_columns[col_idx];
-                    let sum = col_scale
-                        .iter()
-                        .enumerate()
-                        .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                            acc + scale * &lde_col[i * bf]
-                        });
-                    &vanishing_factor * &sum
-                })
-                .collect()
-        };
+                    .enumerate()
+                    .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
+                        acc + scale * &lde_col[i * bf]
+                    });
+                &vanishing_factor * &sum
+            })
+            .collect();
         table_data.extend(aux_evals);
     }
 

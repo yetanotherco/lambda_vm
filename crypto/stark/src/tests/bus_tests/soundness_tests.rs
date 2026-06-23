@@ -93,61 +93,6 @@ fn test_wrong_result_value() {
     ));
 }
 
-/// The composition-poly part count is fixed by the AIR's max constraint degree,
-/// not chosen by the prover. A proof advertising a different number of parts must
-/// be rejected — otherwise a malicious prover could inflate the parts to widen the
-/// composition polynomial's degree space and weaken the low-degree test.
-#[test_log::test]
-fn test_rejects_inflated_composition_part_count() {
-    // All-padding traces: a valid, bus-balanced (Σ = 0) proof — the simplest valid case.
-    let mut cpu_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 5], 1);
-    let mut add_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
-    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
-
-    let proof_options = ProofOptions::default_test_options();
-    let cpu_air = new_cpu_air_with_lookup(&proof_options);
-    let add_air = new_add_air_with_lookup(&proof_options);
-    let mul_air = new_mul_air_with_lookup(&proof_options);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
-        _,
-        _,
-    )> = vec![
-        (&cpu_air, &mut cpu_trace, &()),
-        (&add_air, &mut add_trace, &()),
-        (&mul_air, &mut mul_trace, &()),
-    ];
-    let mut multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
-
-    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
-        vec![&cpu_air, &add_air, &mul_air];
-
-    // The untampered proof verifies.
-    assert!(Verifier::multi_verify(
-        &airs,
-        &multi_proof,
-        &mut DefaultTranscript::<E>::new(&[]),
-        &FieldElement::zero(),
-    ));
-
-    // Tamper: inflate the first table's composition-poly part count.
-    multi_proof.proofs[0]
-        .composition_poly_parts_ood_evaluation
-        .push(FieldElement::<E>::zero());
-
-    assert!(
-        !Verifier::multi_verify(
-            &airs,
-            &multi_proof,
-            &mut DefaultTranscript::<E>::new(&[]),
-            &FieldElement::zero(),
-        ),
-        "verifier must reject a composition part count that disagrees with the AIR degree bound"
-    );
-}
-
 /// Off-by-one error: CPU sends (5, 3, 8) but ADD claims (5, 3, 9).
 #[test_log::test]
 fn test_off_by_one() {

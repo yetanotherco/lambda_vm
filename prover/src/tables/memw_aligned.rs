@@ -20,7 +20,7 @@
 //!
 //! ## Bus Interactions (20)
 //! - 1 IS_HALF[base_address[0] + mask] (range check: address span fits in 16 bits)
-//! - 1 ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts
+//! - 1 LT[old_timestamp, timestamp, 0] → 1
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
 //!
@@ -46,7 +46,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::memw::MemwOperation;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW_A table chunk.
@@ -184,12 +184,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // ALU[old_timestamp, timestamp, opsel(LT), 1, 0] → asserts old_ts < ts.
-    // (Every LT lookup goes through the unified ALU bus with
-    // signed=0/invert=0; there is no dedicated `Lt` bus.)
+    // LT[old_timestamp, timestamp, 0] → 1 with μ_sum
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
-        BusId::Alu,
+        BusId::Lt,
         mu_sum.clone(),
         vec![
             BusValue::Packed {
@@ -200,9 +198,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::constant(alu_op::LT as u64),
-            BusValue::constant(1),
             BusValue::constant(0),
+            BusValue::constant(1),
         ],
     ));
 
@@ -672,8 +669,6 @@ pub enum MemwAlignedConstraintKind {
     MuSumIsBit,
     /// w2 => μ_sum: if accessing 2+ bytes, must be active row
     W2ImpliesMuSum,
-    /// IS_BIT<write2 + write4 + write8>: the width-sum is 0 or 1 (spec assumption).
-    WidthSumIsBit,
 }
 
 pub struct MemwAlignedConstraint {
@@ -708,13 +703,6 @@ impl MemwAlignedConstraint {
                 let w2 = write2 + write4 + write8;
                 &w2 * (&one - &mu_sum)
             }
-            MemwAlignedConstraintKind::WidthSumIsBit => {
-                let write2 = step.get_main_evaluation_element(0, cols::WRITE2).clone();
-                let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-                let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-                let w2 = write2 + write4 + write8;
-                &w2 * (&one - &w2)
-            }
         }
     }
 }
@@ -737,8 +725,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedC
     }
 }
 
-/// Creates all constraints for the MEMW_A table (8 total). The last four are the
-/// spec's defense-in-depth width-flag assumptions.
+/// Creates all constraints for the MEMW_A table (4 total).
 pub fn constraints()
 -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     vec![
@@ -746,9 +733,35 @@ pub fn constraints()
         MemwAlignedConstraint::new(MemwAlignedConstraintKind::W2ImpliesMuSum, 1).boxed(),
         IsBitConstraint::unconditional(cols::MU_READ, 2).boxed(),
         IsBitConstraint::unconditional(cols::MU_WRITE, 3).boxed(),
-        IsBitConstraint::unconditional(cols::WRITE2, 4).boxed(),
-        IsBitConstraint::unconditional(cols::WRITE4, 5).boxed(),
-        IsBitConstraint::unconditional(cols::WRITE8, 6).boxed(),
-        MemwAlignedConstraint::new(MemwAlignedConstraintKind::WidthSumIsBit, 7).boxed(),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_memw_aligned_trace_generation() {
+        let ops = vec![
+            MemwOperation::new(true, 4, [42, 0, 0, 0, 0, 0, 0, 0], 100, 2, true)
+                .with_old([42, 0, 0, 0, 0, 0, 0, 0], [50, 50, 0, 0, 0, 0, 0, 0]),
+            MemwOperation::new(false, 0x1000, [1, 2, 3, 4, 0, 0, 0, 0], 200, 4, false)
+                .with_old([0; 8], [100; 8]),
+        ];
+
+        let trace = generate_memw_aligned_trace(&ops);
+        assert_eq!(trace.num_cols(), cols::NUM_COLUMNS);
+        assert!(trace.num_rows() >= 2);
+
+        // Check address decomposition for op[1]: addr = 0x1000
+        // base_address[0] (low half)  = 0x1000
+        // base_address[1] (mid half)  = 0
+        // base_address[2] (high word) = 0
+        assert_eq!(
+            *trace.get_main(1, cols::BASE_ADDRESS[0]),
+            FE::from(0x1000u64)
+        );
+        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS[1]), FE::from(0u64));
+        assert_eq!(*trace.get_main(1, cols::BASE_ADDRESS[2]), FE::from(0u64));
+    }
 }
