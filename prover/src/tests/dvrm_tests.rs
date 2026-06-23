@@ -476,7 +476,6 @@ fn test_dvrm_air_wires_in_chip_constraints() {
 #[test]
 fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
     use crate::tables::bitwise::BitwiseOperationType;
-    use crate::tables::dvrm::generate_dvrm_trace;
     use crate::tables::trace_builder::collect_bitwise_from_dvrm;
 
     let chunk = 4usize;

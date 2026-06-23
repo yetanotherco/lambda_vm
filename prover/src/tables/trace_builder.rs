@@ -1452,6 +1452,10 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
 /// and IS_B20 lookups for carry range checks.
 ///
+/// IS_HALF and IS_B20 are emitted once per raw op. MSB16 is deduplicated
+/// per `max_rows_mul` chunk, mirroring `chunk_and_generate` — a unique signed
+/// op that spans two instances is sent twice and must be tallied twice.
+///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_mul(
     mul_ops: &[(MulOperation, bool)],
@@ -1539,11 +1543,15 @@ pub(crate) fn collect_bitwise_from_mul(
 /// Collects bitwise lookups from DVRM operations.
 ///
 /// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
-/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op.
+/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op per chunk.
 ///
 /// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
 /// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
 /// are collected here alongside the constraint-level ones.
+///
+/// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16 and the
+/// NEG-template ZERO lookups (C3/C5) are deduplicated per `max_rows_dvrm`
+/// chunk, mirroring `chunk_and_generate`.
 ///
 /// Returns: Vec of bitwise lookups
 pub(crate) fn collect_bitwise_from_dvrm(
