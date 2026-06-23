@@ -62,6 +62,67 @@ pub fn keccak256_single_block(input: &[u8]) -> [u8; OUTPUT_LEN] {
     out
 }
 
+/// Keccak256 of exactly 64 bytes (two 32-byte Merkle node hashes concatenated).
+///
+/// Builds the keccak state directly as u64 lanes — no intermediate byte buffer.
+/// pad10*1: byte 64 → lane 8 byte 0 (XOR 0x01); byte 135 → lane 16 byte 7 (XOR 0x80).
+///
+/// This is the hot path for the binary (ARITY=2) FRI-layer Merkle trees, where
+/// every internal node hashes exactly two 32-byte children.
+#[inline]
+pub fn keccak256_two_nodes(left: &[u8; 32], right: &[u8; 32]) -> [u8; OUTPUT_LEN] {
+    let mut state = [0u64; 25];
+    // Load left child (bytes 0..32 = lanes 0..4).
+    for (i, chunk) in left.chunks_exact(8).enumerate() {
+        state[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    // Load right child (bytes 32..64 = lanes 4..8).
+    for (i, chunk) in right.chunks_exact(8).enumerate() {
+        state[4 + i] = u64::from_le_bytes(chunk.try_into().unwrap());
+    }
+    // pad10*1 for a 64-byte message in a 136-byte rate block:
+    //   byte 64  = lane 8,  byte offset 0 → XOR 0x01
+    //   byte 135 = lane 16, byte offset 7 → XOR 0x80
+    state[8] ^= 0x01;
+    state[16] ^= 0x80u64 << 56;
+    keccak::f1600(&mut state);
+    let mut out = [0u8; OUTPUT_LEN];
+    for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
+/// Keccak256 of exactly 128 bytes (four 32-byte Merkle node hashes concatenated).
+///
+/// Builds the keccak state directly as u64 lanes — no intermediate byte buffer.
+/// pad10*1: byte 128 → lane 16 byte 0 (XOR 0x01); byte 135 → lane 16 byte 7 (XOR 0x80).
+/// Combined: state[16] ^= 0x8000_0000_0000_0001 (little-endian: 0x01 at byte 0, 0x80 at byte 7).
+///
+/// This is the hot path for the quaternary (ARITY=4) trace/composition Merkle
+/// trees, where every internal node hashes exactly four 32-byte children.
+#[inline]
+pub fn keccak256_four_nodes(children: &[[u8; 32]; 4]) -> [u8; OUTPUT_LEN] {
+    let mut state = [0u64; 25];
+    // Load all four children (128 bytes = 16 lanes).
+    for (child_idx, child) in children.iter().enumerate() {
+        for (byte_idx, chunk) in child.chunks_exact(8).enumerate() {
+            state[child_idx * 4 + byte_idx] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+    }
+    // pad10*1 for a 128-byte message in a 136-byte rate block:
+    //   byte 128 = lane 16, byte offset 0 → XOR 0x01
+    //   byte 135 = lane 16, byte offset 7 → XOR 0x80
+    // Combined (LE ordering): 0x80 at the high byte (offset 7) and 0x01 at low (offset 0).
+    state[16] ^= 0x8000_0000_0000_0001u64;
+    keccak::f1600(&mut state);
+    let mut out = [0u8; OUTPUT_LEN];
+    for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
 /// Keccak256 over an arbitrary-length byte slice, absorbing block by block and
 /// running each permutation via `keccak::f1600` (the `KeccakPermute` precompile
 /// on the guest). Byte-identical to `sha3::Keccak256`, but skips `sha3`'s
@@ -219,6 +280,49 @@ mod tests {
                 *b = seed.wrapping_mul(31).wrapping_add(i as u8);
             }
             assert_eq!(keccak256_single_block(&input), reference(&input));
+        }
+    }
+
+    #[test]
+    fn two_nodes_matches_keccak256_single_block() {
+        for seed in 0u8..32 {
+            let mut left = [0u8; 32];
+            let mut right = [0u8; 32];
+            for (i, b) in left.iter_mut().enumerate() {
+                *b = seed.wrapping_add(i as u8);
+            }
+            for (i, b) in right.iter_mut().enumerate() {
+                *b = seed.wrapping_add(32 + i as u8);
+            }
+            let mut input = [0u8; 64];
+            input[..32].copy_from_slice(&left);
+            input[32..].copy_from_slice(&right);
+            assert_eq!(
+                keccak256_two_nodes(&left, &right),
+                reference(&input),
+                "keccak256_two_nodes mismatch at seed={seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn four_nodes_matches_keccak256_single_block() {
+        for seed in 0u8..32 {
+            let mut children = [[0u8; 32]; 4];
+            for (c, child) in children.iter_mut().enumerate() {
+                for (i, b) in child.iter_mut().enumerate() {
+                    *b = seed.wrapping_add((c * 32 + i) as u8);
+                }
+            }
+            let mut input = [0u8; 128];
+            for (c, child) in children.iter().enumerate() {
+                input[c * 32..(c + 1) * 32].copy_from_slice(child);
+            }
+            assert_eq!(
+                keccak256_four_nodes(&children),
+                reference(&input),
+                "keccak256_four_nodes mismatch at seed={seed}"
+            );
         }
     }
 

@@ -154,25 +154,34 @@ where
     F: math::field::traits::IsField,
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
-    use crate::hash::keccak256::{keccak256, keccak256_single_block};
+    use crate::hash::keccak256::{
+        keccak256, keccak256_four_nodes, keccak256_single_block, keccak256_two_nodes,
+    };
     use math::traits::ByteConversion;
+    // Keccak-256 rate in bytes.
+    const RATE: usize = 136;
 
-    // Leaf: serialize the field elements big-endian (matching
-    // `FieldElementVectorBackend::hash_data_slice`) and hash. The leaf can be wide
-    // (e.g. a 1480-column trace row), so use the multi-block sponge here.
+    // Leaf: serialize field elements big-endian into `leaf_scratch`, then hash.
+    // If the serialized leaf fits in a single keccak rate block (< 136 bytes),
+    // use the single-block path (one permutation, no sponge bookkeeping).
+    // Otherwise fall back to the multi-block sponge.
     leaf_scratch.clear();
     for element in value.iter() {
         leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
     }
-    let mut hashed_value = keccak256(leaf_scratch);
+    let mut hashed_value = if leaf_scratch.len() < RATE {
+        keccak256_single_block(leaf_scratch)
+    } else {
+        keccak256(leaf_scratch)
+    };
 
-    // Each internal node hashes the concatenation of its `ARITY` children's
-    // 32-byte hashes (`ARITY * 32 <= 128` bytes for ARITY <= 4 — a single keccak
-    // block). The running hash sits at slot `index % ARITY`; the other slots are
-    // filled left-to-right from this level's `ARITY - 1` path siblings.
-    let mut concat = [0u8; 4 * 32];
+    // Each internal node hashes ARITY×32 bytes (≤ 128 for ARITY≤4 = one keccak
+    // block). Collect children into a stack array, then dispatch to the
+    // specialized no-buffer hash function that builds the keccak state directly
+    // from lanes — no intermediate 136-byte copy.
     debug_assert!(ARITY <= 4, "single-block node hashing supports ARITY <= 4");
-    let node_bytes = ARITY * 32;
+    let mut children = [[0u8; 32]; 4];
+
     for level_siblings in merkle_path.chunks(ARITY - 1) {
         let slot = index % ARITY;
         let mut sib = level_siblings.iter();
@@ -182,9 +191,13 @@ where
             } else {
                 sib.next().expect("path has ARITY-1 siblings per level")
             };
-            concat[s * 32..(s + 1) * 32].copy_from_slice(src);
+            children[s] = *src;
         }
-        hashed_value = keccak256_single_block(&concat[..node_bytes]);
+        hashed_value = if ARITY == 2 {
+            keccak256_two_nodes(&children[0], &children[1])
+        } else {
+            keccak256_four_nodes(&children)
+        };
         index /= ARITY;
     }
 
@@ -225,7 +238,9 @@ where
     F: math::field::traits::IsField,
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
-    use crate::hash::keccak256::{keccak256, keccak256_single_block};
+    use crate::hash::keccak256::{
+        keccak256, keccak256_four_nodes, keccak256_single_block, keccak256_two_nodes,
+    };
     use math::traits::ByteConversion;
 
     debug_assert_eq!(index % 2, 0, "index must be even for paired opening");
@@ -233,19 +248,30 @@ where
     // Both leaves must be in the same level-0 group.
     debug_assert_eq!(index / ARITY, (index + 1) / ARITY);
 
+    // Keccak rate for 256-bit output.
+    const RATE: usize = 136;
+
     // Hash leaf A (at `index`).
     leaf_scratch.clear();
     for element in value_a.iter() {
         leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
     }
-    let hash_a = keccak256(leaf_scratch);
+    let hash_a = if leaf_scratch.len() < RATE {
+        keccak256_single_block(leaf_scratch)
+    } else {
+        keccak256(leaf_scratch)
+    };
 
     // Hash leaf B (at `index + 1`).
     leaf_scratch.clear();
     for element in value_b.iter() {
         leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
     }
-    let hash_b = keccak256(leaf_scratch);
+    let hash_b = if leaf_scratch.len() < RATE {
+        keccak256_single_block(leaf_scratch)
+    } else {
+        keccak256(leaf_scratch)
+    };
 
     // Assemble the level-0 group of ARITY children.
     //
@@ -272,33 +298,39 @@ where
     // appears at rank `slot_b - 1`.
     let slot_b_path_rank = slot_b - 1; // slot_a positions before slot_b is just slot_a itself
 
-    let node_bytes = ARITY * 32;
-    let mut concat = [0u8; 4 * 32];
+    // Collect ARITY children into a fixed-size array for dispatch to specialized hash.
+    let mut children = [[0u8; 32]; 4];
+
+    // Level-0: assemble the group from hash_a, hash_b, and ARITY-2 path siblings.
     {
-        // Level-0 path entries: `ARITY-1` siblings, ascending order, skip slot_a.
         let level0_path = &merkle_path[..ARITY - 1];
-        let mut path_pos = 0usize; // index into level0_path, skipping slot_b_path_rank
+        let mut path_pos = 0usize;
         for s in 0..ARITY {
             let src: &[u8; 32] = if s == slot_a {
                 &hash_a
             } else if s == slot_b {
                 &hash_b
             } else {
-                // Skip the path entry at `slot_b_path_rank`.
                 if path_pos == slot_b_path_rank {
-                    path_pos += 1; // skip slot_b's own entry
+                    path_pos += 1;
                 }
                 let entry = &level0_path[path_pos];
                 path_pos += 1;
                 entry
             };
-            concat[s * 32..(s + 1) * 32].copy_from_slice(src);
+            children[s] = *src;
         }
     }
-    let mut hashed_value = keccak256_single_block(&concat[..node_bytes]);
+
+    // Hash using no-buffer specialized function.
+    let mut hashed_value = if ARITY == 2 {
+        keccak256_two_nodes(&children[0], &children[1])
+    } else {
+        keccak256_four_nodes(&children)
+    };
     let mut ancestor_index = index / ARITY;
 
-    // Walk ancestor path (depth 1 and above), consuming `ARITY-1` siblings per level.
+    // Walk ancestor path (depth 1 and above).
     for level_siblings in merkle_path[ARITY - 1..].chunks(ARITY - 1) {
         let slot = ancestor_index % ARITY;
         let mut sib = level_siblings.iter();
@@ -308,9 +340,13 @@ where
             } else {
                 sib.next().expect("path has ARITY-1 siblings per level")
             };
-            concat[s * 32..(s + 1) * 32].copy_from_slice(src);
+            children[s] = *src;
         }
-        hashed_value = keccak256_single_block(&concat[..node_bytes]);
+        hashed_value = if ARITY == 2 {
+            keccak256_two_nodes(&children[0], &children[1])
+        } else {
+            keccak256_four_nodes(&children)
+        };
         ancestor_index /= ARITY;
     }
 
