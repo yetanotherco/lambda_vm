@@ -463,3 +463,94 @@ fn test_dvrm_air_wires_in_chip_constraints() {
     );
     assert_eq!(in_chip, dvrm_constraints(0).0.len());
 }
+
+/// Regression test for the `Msb16` LogUp over-send bug.
+///
+/// DVRM is split into chip instances of `max_rows.dvrm` raw ops (`chunk_and_generate`)
+/// and each instance deduplicates only its own chunk, sending its three MSB16 sign
+/// lookups once per unique signed op *per instance* (multiplicity = the `SIGNED` bit).
+/// So `collect_bitwise_from_dvrm`, which feeds the BITWISE MSB16 multiplicity, must use
+/// the *same* per-chunk dedup: a unique signed op spanning two instances is sent twice
+/// but, with a single global dedup, would be tallied once — leaving the `Msb16` bus
+/// unbalanced and verification failing for any block large enough to split DVRM.
+#[test]
+fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::dvrm::generate_dvrm_trace;
+    use crate::tables::trace_builder::collect_bitwise_from_dvrm;
+
+    let chunk = 4usize;
+    // One unique signed div op repeated so it spans two `chunk`-sized instances.
+    let op = DvrmOperation::new(0x0123_4567_89ab_cdef, 0x0000_0000_0001_0001, true);
+    let ops: Vec<(DvrmOperation, bool)> = std::iter::repeat_n((op, false), 6).collect();
+    assert!(
+        ops.len() > chunk,
+        "scenario must split DVRM into >1 instance"
+    );
+
+    // The DVRM AIR sends three MSB16 lookups (n[3], r[3], d[3]) each with multiplicity
+    // Column(SIGNED) per row, so total sends = Σ rows (SIGNED) × 3.
+    let mut sends = 0usize;
+    for c in ops.chunks(chunk) {
+        let trace = generate_dvrm_trace(c);
+        for row in 0..trace.num_rows() {
+            if *trace.get_main(row, cols::SIGNED) == FE::one() {
+                sends += 3;
+            }
+        }
+    }
+    assert_eq!(sends, 6, "sanity: 2 instances × 3 MSB16 sends");
+
+    let tallied = collect_bitwise_from_dvrm(&ops, chunk)
+        .iter()
+        .filter(|b| matches!(b.lookup_type, BitwiseOperationType::Msb16))
+        .count();
+    assert_eq!(
+        tallied, sends,
+        "BITWISE MSB16 multiplicity ({tallied}) must equal total DVRM-instance MSB16 \
+         sends ({sends}); a mismatch leaves the Msb16 bus unbalanced"
+    );
+}
+
+/// Regression test for the DVRM NEG-template ZERO lookups — the *other* per-unique
+/// bit-gated loop the same fix converted to per-chunk dedup (the MSB16 test above
+/// covers the first one). C3/C5 emit ZERO lookups gated by the `SIGN_R`/`SIGN_D` bits,
+/// once per unique signed op, so they must deduplicate PER CHIP INSTANCE just like MSB16.
+#[test]
+fn neg_template_zero_lookups_dedup_per_chip_instance() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::trace_builder::collect_bitwise_from_dvrm;
+
+    // Signed op with negative remainder AND negative divisor -> sign_r = sign_d = 1, so the
+    // NEG template (C3/C5) emits per-unique ZERO lookups gated by those bits.
+    let op = DvrmOperation::new((-20i64) as u64, (-3i64) as u64, SIGNED);
+    assert!(
+        op.sign_r() && op.sign_d(),
+        "scenario needs sign_r = sign_d = 1"
+    );
+    let ops: Vec<(DvrmOperation, bool)> = std::iter::repeat_n((op, false), 6).collect();
+
+    let zero_lookups = |chunk: usize| {
+        collect_bitwise_from_dvrm(&ops, chunk)
+            .iter()
+            .filter(|b| matches!(b.lookup_type, BitwiseOperationType::Zero))
+            .count()
+    };
+
+    // The per-raw ZERO lookups (C8/C20) are identical regardless of chunking; only the
+    // per-unique NEG-template ZEROs differ. A global dedup emits them once for the whole
+    // list, so the count would NOT change with chunk size; the per-instance fix emits them
+    // once per instance, so two instances must produce strictly more ZERO lookups than one.
+    // (Without the fix these are equal and this assertion fails.)
+    let one_instance = zero_lookups(ops.len()); // chunks(6) -> 1 chunk
+    let two_instances = zero_lookups(4); // chunks(4) -> [4],[2] -> 2 chunks
+    assert!(
+        one_instance > 0,
+        "expected NEG-template ZERO lookups to be emitted"
+    );
+    assert!(
+        two_instances > one_instance,
+        "per-instance dedup of NEG-template ZERO lookups regressed: \
+         {two_instances} (2 instances) must exceed {one_instance} (1 instance)"
+    );
+}
