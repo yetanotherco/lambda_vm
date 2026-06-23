@@ -297,16 +297,15 @@ class ModExpr:
         if isinstance(modulus, list) or not modulus.is_const():
             reporter.error(f"Invalid non-constant modulus: {self.modulus!r}")
             return Range.const(0)
-        modulus = modulus.get_const()
-        if modulus <= 0:
+        modulus_val = modulus.get_const()
+        if modulus_val <= 0:
             reporter.error(f"Invalid non-positive modulus: {self.modulus!r}")
             return Range.const(0)
 
-        if elt.is_const():
-            elt = elt.get_const()
-            return Range.const(elt % modulus)
+        if isinstance(elt, Range) and elt.is_const():
+            return Range.const(elt.get_const() % modulus_val)
         else:
-            return Range(0, modulus - 1)
+            return Range(0, modulus_val - 1)
 
 
 @dataclass
