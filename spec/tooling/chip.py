@@ -4,7 +4,6 @@ import sys
 import tomllib
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from functools import partial
 from pathlib import Path
 from typing import Never, Optional, Self
 
@@ -1030,6 +1029,14 @@ class Chip:
         reporter.update_location("<string>")
         return cls(config, tomllib.loads(s))
 
+    @property
+    def virtual_vars(self) -> Iterable[VirtualVariable]:
+        return (v for v in self.variables if isinstance(v, VirtualVariable))
+
+    @property
+    def concrete_vars(self) -> Iterable[Variable]:
+        return (v for v in self.variables if not isinstance(v, VirtualVariable))
+
     def typecheck(self) -> Iterable[Signature]:
         typemap = {}
         for v in self.variables:
@@ -1040,10 +1047,9 @@ class Chip:
             typemap[v.name] = t
 
         env = Environment(self.config, {}, typemap)
-        for v in self.variables:
-            if isinstance(v, VirtualVariable):
-                with reporter.context(v.name):
-                    v.typecheck(env)
+        for v in self.virtual_vars:
+            with reporter.context(v.name):
+                v.typecheck(env)
         for c in self.constraints:
             with reporter.context(repr(c)):
                 yield from c.typecheck(env)
@@ -1051,12 +1057,11 @@ class Chip:
     def padding_assignment(self) -> dict[str, Type]:
         env = Environment(self.config, {}, {})
         res = {}
-        for v in self.variables:
-            if not isinstance(v, VirtualVariable):
-                t = v.type
-                if isinstance(t, list) and len(t) == 1:
-                    t = t[0]
-                res[v.name] = CastExpr(v.pad, t).typecheck(env)
+        for v in self.concrete_vars:
+            t = v.type
+            if isinstance(t, list) and len(t) == 1:
+                t = t[0]
+            res[v.name] = CastExpr(v.pad, t).typecheck(env)
         return res
 
     def check_assignment(
@@ -1065,30 +1070,29 @@ class Chip:
         values: dict[str, Type],
     ):
         reporter.asserts(
-            set(values.keys()) <= set(v.name for v in self.variables if not isinstance(v, VirtualVariable)),
+            set(values.keys()) <= set(v.name for v in self.concrete_vars),
             f"Passing unrecognized variable to `check_assignment` of chip {self.name!r}",
         )
         env = Environment(self.config, {}, {})
-        for v in self.variables:
-            if not isinstance(v, VirtualVariable):
-                if v.name not in values:
-                    reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
-                    return
-                env.valmap[v.name] = values[v.name]
-        for v in self.variables:
-            if isinstance(v, VirtualVariable):
-                v.populate_env(env)
+        for v in self.concrete_vars:
+            if v.name not in values:
+                reporter.error(f"Unable to find variable name {v.name!r} when checking assignment")
+                return
+            env.valmap[v.name] = values[v.name]
+        for v in self.virtual_vars:
+            v.populate_env(env)
 
         for c in self.constraints:
             with reporter.context(repr(c)):
                 for sig in c.typecheck(env):
                     # Recurse on templates
-                    if isinstance(sig, TemplateSignature):
-                        if sig.tag not in chip_for_tag:
-                            reporter.warn(f"Template {sig.tag!r} unavailable, skipping check.")
-                            continue
-                        template = chip_for_tag[sig.tag]
-                        template.check_assignment(chip_for_tag, sig_to_assignment(sig, template))
+                    if not isinstance(sig, TemplateSignature):
+                        continue
+                    if sig.tag not in chip_for_tag:
+                        reporter.warn(f"Template {sig.tag!r} unavailable, skipping check.")
+                        continue
+                    template = chip_for_tag[sig.tag]
+                    template.check_assignment(chip_for_tag, sig_to_assignment(sig, template))
 
 
 def build_signature(config: Config, data: dict) -> Signature:
@@ -1159,25 +1163,23 @@ if __name__ == "__main__":
         sys.exit(1)
 
     reported = False
-    chips: list[Chip] = []
-    chip_for_tag: dict[str, Chip] = {}
+    chips: dict[str, Chip] = {}
     for file in sys.argv[3:]:
         if file in sys.argv[1:3]:
             continue
         chip = Chip.from_file(config, file)
-        chips.append(chip)
-        chip_for_tag[chip.name] = chip
+        chips[chip.name] = chip
         reported |= reporter.reported
     if reported:
         sys.exit(1)
 
-    for chip in chips:
+    for chip in chips.values():
         reporter.update_location(f"Chip {chip.name}")
         check_signatures(chip.typecheck(), signatures)
         reported |= reporter.reported
-    for chip in chips:
+    for chip in chips.values():
         reporter.update_location(f"Padding {chip.name}")
-        chip.check_assignment(chip_for_tag, chip.padding_assignment())
+        chip.check_assignment(chips, chip.padding_assignment())
         reported |= reporter.reported
     if reported:
         sys.exit(1)
