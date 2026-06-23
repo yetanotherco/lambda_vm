@@ -10,6 +10,6 @@
 pub mod reference;
 pub mod reference_field;
 
-pub mod curve_tests;
-pub mod lib_tests;
-pub mod witness_tests;
+mod curve_tests;
+mod lib_tests;
+mod witness_tests;

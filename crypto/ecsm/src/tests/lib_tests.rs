@@ -6,7 +6,7 @@ use crate::{B, EcsmError, n, p, recover_y_canonical, scalar_mul_x, to_le_32};
 
 /// Parses a big-endian hex string into a `BigUint`.
 fn be_hex(s: &str) -> BigUint {
-    BigUint::parse_bytes(s.as_bytes(), 16).unwrap()
+    BigUint::parse_bytes(s.as_bytes(), 16).expect("valid hex literal")
 }
 
 // secp256k1 generator G.
@@ -70,7 +70,7 @@ fn recover_y_handles_residues_and_non_residues() {
 fn scalar_mul_one_is_identity() {
     let k = to_le_32(&BigUint::from(1u8));
     let xg = to_le_32(&gx());
-    assert_eq!(scalar_mul_x(&k, &xg).unwrap(), xg);
+    assert_eq!(scalar_mul_x(&k, &xg).expect("1·G is valid"), xg);
 }
 
 #[test]
@@ -79,7 +79,10 @@ fn scalar_mul_two_matches_known_2g() {
     let expected = be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5");
     let k = to_le_32(&BigUint::from(2u8));
     let xg = to_le_32(&gx());
-    assert_eq!(scalar_mul_x(&k, &xg).unwrap(), to_le_32(&expected));
+    assert_eq!(
+        scalar_mul_x(&k, &xg).expect("2·G is valid"),
+        to_le_32(&expected)
+    );
 }
 
 #[test]
@@ -87,7 +90,10 @@ fn scalar_mul_three_matches_known_3g() {
     let expected = be_hex("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9");
     let k = to_le_32(&BigUint::from(3u8));
     let xg = to_le_32(&gx());
-    assert_eq!(scalar_mul_x(&k, &xg).unwrap(), to_le_32(&expected));
+    assert_eq!(
+        scalar_mul_x(&k, &xg).expect("3·G is valid"),
+        to_le_32(&expected)
+    );
 }
 
 #[test]
@@ -95,7 +101,7 @@ fn scalar_mul_n_minus_one_shares_x_with_g() {
     // (N-1)·G = -G, which has the same x-coordinate as G.
     let k = to_le_32(&(n() - BigUint::from(1u8)));
     let xg = to_le_32(&gx());
-    assert_eq!(scalar_mul_x(&k, &xg).unwrap(), xg);
+    assert_eq!(scalar_mul_x(&k, &xg).expect("(N-1)·G is valid"), xg);
 }
 
 #[test]
