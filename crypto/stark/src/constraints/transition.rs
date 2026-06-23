@@ -376,10 +376,7 @@ where
         None
     }
 
-    /// Wrap into a boxed `TransitionConstraintEvaluator` for the evaluator.
-    ///
-    /// The adapter auto-generates `evaluate_verifier()` and `evaluate_prover()`
-    /// from the generic `evaluate()`.
+    /// Wrap into a boxed `TransitionConstraintEvaluator` for use in dynamic dispatch.
     fn boxed(self) -> Box<dyn TransitionConstraintEvaluator<F, E>>
     where
         Self: Sized + 'static,

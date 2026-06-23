@@ -1,6 +1,5 @@
 use super::{
     domain::VerifierDomain,
-    fri::fri_decommit::FriDecommitment,
     grinding,
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
@@ -13,7 +12,7 @@ use crate::{
 };
 use alloc::vec::Vec;
 use core::marker::PhantomData;
-use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
+use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -365,6 +364,7 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        let mut leaf_scratch: Vec<u8> = Vec::new();
         challenges
             .iotas
             .iter()
@@ -437,10 +437,16 @@ pub trait IsStarkVerifier<
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
+    ///
+    /// Uses the paired opening variant for the (index, index_sym) = (iota*2, iota*2+1) pairs:
+    /// since both indices are always in the same quaternary (ARITY=4) level-0 group, the
+    /// level-0 parent and all ancestors are shared, so each commitment root is verified with
+    /// one ancestor-path walk instead of two independent ones.
     fn verify_trace_openings<'p, P>(
         proof: &P,
         deep_poly_openings: &DeepPolynomialOpeningRef<'_, Field, FieldExtension>,
         iota: usize,
+        leaf_scratch: &mut Vec<u8>,
     ) -> bool
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -491,6 +497,7 @@ pub trait IsStarkVerifier<
         composition_poly_merkle_root: &Commitment,
         iota: &usize,
         value: &mut Vec<FieldElement<FieldExtension>>,
+        leaf_scratch: &mut Vec<u8>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
@@ -503,11 +510,12 @@ pub trait IsStarkVerifier<
         value.extend_from_slice(deep_poly_openings.composition_poly.evaluations);
         value.extend_from_slice(deep_poly_openings.composition_poly.evaluations_sym);
 
-        crate::config::verify_batched_merkle_path_slice::<FieldExtension>(
+        crate::config::verify_batched_merkle_path_slice_with_scratch::<FieldExtension>(
             deep_poly_openings.composition_poly.proof,
             composition_poly_merkle_root,
             *iota,
             value,
+            leaf_scratch,
         )
     }
 
@@ -546,6 +554,7 @@ pub trait IsStarkVerifier<
         evaluation: &FieldElement<FieldExtension>,
         evaluation_sym: &FieldElement<FieldExtension>,
         iota: usize,
+        leaf_scratch: &mut Vec<u8>,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + math::traits::ByteConversion + Sync + Send,
@@ -560,11 +569,12 @@ pub trait IsStarkVerifier<
             [evaluation.clone(), evaluation_sym.clone()]
         };
 
-        crate::config::verify_fri_merkle_path_slice::<FieldExtension>(
+        crate::config::verify_fri_merkle_path_slice_with_scratch::<FieldExtension>(
             auth_path_sym,
             merkle_root,
             iota >> 1,
             &evaluations,
+            leaf_scratch,
         )
     }
 
@@ -584,6 +594,7 @@ pub trait IsStarkVerifier<
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+        leaf_scratch: &mut Vec<u8>,
     ) -> bool
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -640,6 +651,7 @@ pub trait IsStarkVerifier<
                         &v,
                         evaluation_sym,
                         index,
+                        leaf_scratch,
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).

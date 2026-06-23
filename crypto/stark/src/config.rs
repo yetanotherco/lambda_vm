@@ -62,6 +62,63 @@ where
     )
 }
 
+/// Like [`verify_batched_merkle_path_slice`] but takes a caller-owned
+/// `leaf_scratch` byte buffer reused across calls to eliminate the per-call
+/// `Vec<u8>` allocation inside leaf serialization.
+pub fn verify_batched_merkle_path_slice_with_scratch<F>(
+    merkle_path: &[Commitment],
+    root_hash: &Commitment,
+    index: usize,
+    value: &[FieldElement<F>],
+    leaf_scratch: &mut alloc::vec::Vec<u8>,
+) -> bool
+where
+    F: IsField,
+    FieldElement<F>: ByteConversion,
+{
+    const ARITY: usize = 4;
+    crypto::merkle_tree::proof::verify_merkle_path_keccak256_with_scratch::<F, ARITY>(
+        merkle_path,
+        root_hash,
+        index,
+        value,
+        leaf_scratch,
+    )
+}
+
+/// Verify TWO trace openings at `(iota*2, iota*2+1)` against the same root in a
+/// single pass. For ARITY=4 trees both leaf indices are always in the same
+/// level-0 quaternary group, so the level-0 parent and all ancestor hashes are
+/// shared — this saves one full ancestor-path traversal per (iota, iota_sym) pair.
+///
+/// See [`crypto::merkle_tree::proof::verify_paired_keccak256_openings`] for details.
+pub fn verify_paired_batched_openings<F>(
+    merkle_path: &[Commitment],
+    root_hash: &Commitment,
+    index: usize,
+    value_a: &[FieldElement<F>],
+    value_b: &[FieldElement<F>],
+    leaf_scratch: &mut alloc::vec::Vec<u8>,
+) -> bool
+where
+    F: IsField,
+    FieldElement<F>: ByteConversion,
+{
+    const ARITY: usize = 4;
+    const _: () = assert!(
+        ARITY
+            == <BatchedMerkleTreeBackend<math::field::goldilocks::GoldilocksField> as crypto::merkle_tree::traits::IsMerkleTreeBackend>::ARITY
+    );
+    crypto::merkle_tree::proof::verify_paired_keccak256_openings::<F, ARITY>(
+        merkle_path,
+        root_hash,
+        index,
+        value_a,
+        value_b,
+        leaf_scratch,
+    )
+}
+
 /// Like [`verify_batched_merkle_path_slice`] but for the FRI-layer commitment,
 /// which uses the **binary** [`FriLayerMerkleTreeBackend`] (a `PairKeccak256`
 /// tree). The FRI trees stay binary; only the trace/composition trees are
@@ -76,15 +133,33 @@ where
     F: IsField,
     FieldElement<F>: ByteConversion,
 {
+    let mut scratch = alloc::vec::Vec::new();
+    verify_fri_merkle_path_slice_with_scratch(merkle_path, root_hash, index, value, &mut scratch)
+}
+
+/// Like [`verify_fri_merkle_path_slice`] but takes a caller-owned `leaf_scratch`
+/// byte buffer reused across calls to avoid per-call allocation.
+pub fn verify_fri_merkle_path_slice_with_scratch<F>(
+    merkle_path: &[Commitment],
+    root_hash: &Commitment,
+    index: usize,
+    value: &[FieldElement<F>],
+    leaf_scratch: &mut alloc::vec::Vec<u8>,
+) -> bool
+where
+    F: IsField,
+    FieldElement<F>: ByteConversion,
+{
     const ARITY: usize = 2;
     const _: () = assert!(
         ARITY
             == <FriLayerMerkleTreeBackend<math::field::goldilocks::GoldilocksField> as crypto::merkle_tree::traits::IsMerkleTreeBackend>::ARITY
     );
-    crypto::merkle_tree::proof::verify_merkle_path_keccak256::<F, ARITY>(
+    crypto::merkle_tree::proof::verify_merkle_path_keccak256_with_scratch::<F, ARITY>(
         merkle_path,
         root_hash,
         index,
         value,
+        leaf_scratch,
     )
 }
