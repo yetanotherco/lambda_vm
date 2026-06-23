@@ -19,6 +19,7 @@ use executor::vm::instruction::decoding::{ArithOp, Comparison, Instruction, Load
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField as GoldilocksBaseField;
+use stark::table::Table;
 
 /// Base field type: Goldilocks prime field (p = 2^64 - 2^32 + 1)
 pub type GoldilocksField = GoldilocksBaseField;
@@ -31,6 +32,172 @@ pub type FE = FieldElement<GoldilocksField>;
 
 /// Field element in the Goldilocks extension field
 pub type FEE = FieldElement<GoldilocksExtension>;
+
+/// Decompose a `u64` into its two little-endian 32-bit limbs as field elements:
+/// `[x[0..32], x[32..64]]` (the `DWordWL` column encoding).
+///
+/// Lives in the prover (not the generic `Table`) because the decomposition is
+/// field-size-specific: a 32-bit limb only fits because Goldilocks is ~64-bit.
+#[inline]
+pub fn dword_wl(x: u64) -> [FE; 2] {
+    [FE::from(x & 0xFFFF_FFFF), FE::from(x >> 32)]
+}
+
+/// Decompose a `u64` into its four little-endian 16-bit limbs as field elements:
+/// `[x[0..16], x[16..32], x[32..48], x[48..64]]` (the `DWordHL` column encoding).
+#[inline]
+pub fn dword_hl(x: u64) -> [FE; 4] {
+    [
+        FE::from(x & 0xFFFF),
+        FE::from((x >> 16) & 0xFFFF),
+        FE::from((x >> 32) & 0xFFFF),
+        FE::from((x >> 48) & 0xFFFF),
+    ]
+}
+
+/// VM-specific trace writes for Goldilocks-backed tables.
+///
+/// These helpers live at the VM prover layer because encodings like `DWordWL`
+/// assume field elements can faithfully represent the corresponding limbs.
+///
+/// Width names follow the VM table specs:
+/// - `Byte`: 8 bits.
+/// - `Half`: 16 bits.
+/// - `Word`: 32 bits.
+/// - `DWord`: 64 bits.
+///
+/// Trace columns are written in little-endian order: `start_col` always receives
+/// the least-significant chunk. For homogeneous encodings like `DWordWL`,
+/// `DWordHL`, and `DWordBL`, the final `L` means "little-endian limbs". Mixed
+/// encodings like `DWordWHH` and `DWordHHW` keep the spec's packing name, while
+/// still storing the low chunk first in the trace.
+pub trait VmTable {
+    /// Write an already-constructed field element into one trace cell.
+    fn set_fe(&mut self, row: usize, col: usize, value: FE);
+
+    /// Convert `value` with `FE::from` and write it into one trace cell.
+    #[inline]
+    fn set_u64(&mut self, row: usize, col: usize, value: u64) {
+        self.set_fe(row, col, FE::from(value));
+    }
+
+    /// Write a bit column as `0` or `1`.
+    #[inline]
+    fn set_bool(&mut self, row: usize, col: usize, value: bool) {
+        self.set_u64(row, col, u64::from(value));
+    }
+
+    /// Write an 8-bit VM `Byte` column.
+    #[inline]
+    fn set_byte(&mut self, row: usize, col: usize, value: u8) {
+        self.set_u64(row, col, u64::from(value));
+    }
+
+    /// Write a 16-bit VM `Half` column.
+    #[inline]
+    fn set_half(&mut self, row: usize, col: usize, value: u16) {
+        self.set_u64(row, col, u64::from(value));
+    }
+
+    /// Write a 32-bit VM `Word` column.
+    #[inline]
+    fn set_word(&mut self, row: usize, col: usize, value: u32) {
+        self.set_u64(row, col, u64::from(value));
+    }
+
+    /// Write contiguous `Byte` columns starting at `start_col`.
+    #[inline]
+    fn set_bytes(&mut self, row: usize, start_col: usize, values: &[u8]) {
+        for (offset, &value) in values.iter().enumerate() {
+            self.set_byte(row, start_col + offset, value);
+        }
+    }
+
+    /// Write contiguous `Half` columns starting at `start_col`.
+    #[inline]
+    fn set_halves(&mut self, row: usize, start_col: usize, values: &[u16]) {
+        for (offset, &value) in values.iter().enumerate() {
+            self.set_half(row, start_col + offset, value);
+        }
+    }
+
+    /// Write contiguous `Word` columns starting at `start_col`.
+    #[inline]
+    fn set_words(&mut self, row: usize, start_col: usize, values: &[u32]) {
+        for (offset, &value) in values.iter().enumerate() {
+            self.set_word(row, start_col + offset, value);
+        }
+    }
+
+    /// Write a `DWordBL`: eight little-endian bytes of a 64-bit value.
+    ///
+    /// Columns receive bits `[0..8]`, `[8..16]`, ..., `[56..64]`.
+    #[inline]
+    fn set_dword_bl(&mut self, row: usize, start_col: usize, value: u64) {
+        self.set_bytes(row, start_col, &value.to_le_bytes());
+    }
+
+    /// Write a `DWordWL`: two little-endian 32-bit words of a 64-bit value.
+    ///
+    /// Columns receive bits `[0..32]` and `[32..64]`.
+    #[inline]
+    fn set_dword_wl(&mut self, row: usize, start_col: usize, value: u64) {
+        let [lo, hi] = dword_wl(value);
+        self.set_fe(row, start_col, lo);
+        self.set_fe(row, start_col + 1, hi);
+    }
+
+    /// Write a `DWordHL`: four little-endian 16-bit halves of a 64-bit value.
+    ///
+    /// Columns receive bits `[0..16]`, `[16..32]`, `[32..48]`, and `[48..64]`.
+    #[inline]
+    fn set_dword_hl(&mut self, row: usize, start_col: usize, value: u64) {
+        let [h0, h1, h2, h3] = dword_hl(value);
+        self.set_fe(row, start_col, h0);
+        self.set_fe(row, start_col + 1, h1);
+        self.set_fe(row, start_col + 2, h2);
+        self.set_fe(row, start_col + 3, h3);
+    }
+
+    /// Write a mixed `DWordWHH` layout.
+    ///
+    /// The spec name describes a 64-bit value split as a high `Word` followed by
+    /// two lower `Half`s. Trace columns are still low-first, so they receive bits
+    /// `[0..16]`, `[16..32]`, and `[32..64]`.
+    #[inline]
+    fn set_dword_whh(&mut self, row: usize, start_col: usize, value: u64) {
+        let low_half = (value & 0xFFFF) as u16;
+        let mid_half = ((value >> 16) & 0xFFFF) as u16;
+        let high_word = ((value >> 32) & 0xFFFF_FFFF) as u32;
+
+        self.set_half(row, start_col, low_half);
+        self.set_half(row, start_col + 1, mid_half);
+        self.set_word(row, start_col + 2, high_word);
+    }
+
+    /// Write a mixed `DWordHHW` layout.
+    ///
+    /// The spec name describes a 64-bit value split as two high `Half`s followed
+    /// by a low `Word`. Trace columns are still low-first, so they receive bits
+    /// `[0..32]`, `[32..48]`, and `[48..64]`.
+    #[inline]
+    fn set_dword_hhw(&mut self, row: usize, start_col: usize, value: u64) {
+        let low_word = (value & 0xFFFF_FFFF) as u32;
+        let mid_half = ((value >> 32) & 0xFFFF) as u16;
+        let high_half = ((value >> 48) & 0xFFFF) as u16;
+
+        self.set_word(row, start_col, low_word);
+        self.set_half(row, start_col + 1, mid_half);
+        self.set_half(row, start_col + 2, high_half);
+    }
+}
+
+impl VmTable for Table<GoldilocksField> {
+    #[inline]
+    fn set_fe(&mut self, row: usize, col: usize, value: FE) {
+        self.set(row, col, value);
+    }
+}
 
 /// Bus identifiers for LogUp interactions between tables.
 ///

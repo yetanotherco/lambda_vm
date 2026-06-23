@@ -24,7 +24,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
 // Column indices
@@ -359,58 +359,62 @@ pub fn generate_shift_trace(
     // No deduplication: each operation gets its own row with μ=1.
     // Spec declares μ: Bit.
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let aux = op.compute_aux();
 
         // Input columns
-        for i in 0..4 {
-            data[base + cols::IN[i]] = FE::from(op.in_halves[i] as u64);
-        }
-        data[base + cols::SHIFT_AMOUNT] = FE::from(op.shift as u64);
+        table.set_halves(row_idx, cols::IN_0, &op.in_halves);
+        table.set_byte(row_idx, cols::SHIFT_AMOUNT, op.shift);
         // High bits of the full shift amount (for the ALU bus in2 = arg2).
-        data[base + cols::SHIFT_B1] = FE::from((op.shift_amount >> 8) & 0xFF);
-        data[base + cols::SHIFT_H1] = FE::from((op.shift_amount >> 16) & 0xFFFF);
-        data[base + cols::SHIFT_HIGH] = FE::from(op.shift_amount >> 32);
-        data[base + cols::DIRECTION] = FE::from(op.direction as u64);
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
-        data[base + cols::WORD_INSTR] = FE::from(op.word_instr as u64);
+        table.set_byte(
+            row_idx,
+            cols::SHIFT_B1,
+            ((op.shift_amount >> 8) & 0xFF) as u8,
+        );
+        table.set_half(
+            row_idx,
+            cols::SHIFT_H1,
+            ((op.shift_amount >> 16) & 0xFFFF) as u16,
+        );
+        table.set_word(row_idx, cols::SHIFT_HIGH, (op.shift_amount >> 32) as u32);
+        table.set_bool(row_idx, cols::DIRECTION, op.direction);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
+        table.set_bool(row_idx, cols::WORD_INSTR, op.word_instr);
 
         // Output columns
-        data[base + cols::OUT_0] = FE::from(aux.out[0] as u64);
-        data[base + cols::OUT_1] = FE::from(aux.out[1] as u64);
+        table.set_words(row_idx, cols::OUT_0, &aux.out);
 
         // Auxiliary columns
-        data[base + cols::IS_NEGATIVE] = FE::from(aux.is_negative as u64);
-        data[base + cols::BIT_SHIFT] = FE::from(aux.bit_shift as u64);
-        data[base + cols::ZBS] = FE::from(aux.zbs as u64);
+        table.set_bool(row_idx, cols::IS_NEGATIVE, aux.is_negative);
+        table.set_byte(row_idx, cols::BIT_SHIFT, aux.bit_shift);
+        table.set_bool(row_idx, cols::ZBS, aux.zbs);
 
-        for i in 0..5 {
-            data[base + cols::X[i]] = FE::from(aux.x[i] as u64);
-        }
-        for i in 0..4 {
-            data[base + cols::Y[i]] = FE::from(aux.y[i] as u64);
-        }
+        table.set_halves(row_idx, cols::X_0, &aux.x);
+        table.set_halves(row_idx, cols::Y_0, &aux.y);
         for i in 0..3 {
-            data[base + cols::LIMB_SHIFT_RAW[i]] = FE::from(aux.limb_shift[i] as u64);
+            table.set_bool(row_idx, cols::LIMB_SHIFT_RAW[i], aux.limb_shift[i]);
         }
         // limb_shift[3] is virtual: not stored in the trace
 
         // μ = 1 for all active rows (Bit)
-        data[base + cols::MU] = FE::one();
+        table.set_bool(row_idx, cols::MU, true);
     }
 
     // Padding rows: set ZBS=1 per spec. All other columns remain 0.
     // μ=0 so C13 (limb_shift encoding) is inactive. left=right=0 so shifted=0,
     // making C14 (out=shifted) trivially satisfied regardless of limb_shift.
     for row_idx in operations.len()..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::ZBS] = FE::one();
+        table.set_bool(row_idx, cols::ZBS, true);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

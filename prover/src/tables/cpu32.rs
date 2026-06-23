@@ -25,7 +25,8 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op, packed_decode_shrunk,
+    BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
+    packed_decode_shrunk,
 };
 use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
 
@@ -197,65 +198,60 @@ pub fn generate_cpu32_trace(
     operations: &[Cpu32Operation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let aux = op.compute_aux();
 
         // Inputs
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::PC_0] = FE::from(op.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.pc >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_dword_wl(row_idx, cols::PC_0, op.pc);
 
         // rv1 as DWordWHH: [Half, Half, Word]
-        data[base + cols::RS1] = FE::from(op.rs1 as u64);
-        data[base + cols::READ_REGISTER1] = FE::from(op.read_register1 as u64);
-        data[base + cols::RV1_0] = FE::from(op.rv1 & 0xFFFF);
-        data[base + cols::RV1_1] = FE::from((op.rv1 >> 16) & 0xFFFF);
-        data[base + cols::RV1_2] = FE::from(op.rv1 >> 32);
-        data[base + cols::RV1_SIGN] = FE::from(aux.rv1_sign as u64);
-        data[base + cols::ARG1_0] = FE::from(aux.arg1 & 0xFFFF_FFFF);
-        data[base + cols::ARG1_1] = FE::from(aux.arg1 >> 32);
+        table.set_byte(row_idx, cols::RS1, op.rs1);
+        table.set_bool(row_idx, cols::READ_REGISTER1, op.read_register1);
+        table.set_dword_whh(row_idx, cols::RV1_0, op.rv1);
+        table.set_bool(row_idx, cols::RV1_SIGN, aux.rv1_sign);
+        table.set_dword_wl(row_idx, cols::ARG1_0, aux.arg1);
 
         // rv2 as DWordWHH
-        data[base + cols::RS2] = FE::from(op.rs2 as u64);
-        data[base + cols::READ_REGISTER2] = FE::from(op.read_register2 as u64);
-        data[base + cols::RV2_0] = FE::from(op.rv2 & 0xFFFF);
-        data[base + cols::RV2_1] = FE::from((op.rv2 >> 16) & 0xFFFF);
-        data[base + cols::RV2_2] = FE::from(op.rv2 >> 32);
-        data[base + cols::RV2_SIGN] = FE::from(aux.rv2_sign as u64);
-        data[base + cols::IMM_0] = FE::from(op.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(op.imm >> 32);
-        data[base + cols::ARG2_0] = FE::from(aux.arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(aux.arg2 >> 32);
+        table.set_byte(row_idx, cols::RS2, op.rs2);
+        table.set_bool(row_idx, cols::READ_REGISTER2, op.read_register2);
+        table.set_dword_whh(row_idx, cols::RV2_0, op.rv2);
+        table.set_bool(row_idx, cols::RV2_SIGN, aux.rv2_sign);
+        table.set_dword_wl(row_idx, cols::IMM_0, op.imm);
+        table.set_dword_wl(row_idx, cols::ARG2_0, aux.arg2);
 
         // res as DWordHL: 4 halves
-        data[base + cols::RES_0] = FE::from(op.res & 0xFFFF);
-        data[base + cols::RES_1] = FE::from((op.res >> 16) & 0xFFFF);
-        data[base + cols::RES_2] = FE::from((op.res >> 32) & 0xFFFF);
-        data[base + cols::RES_3] = FE::from((op.res >> 48) & 0xFFFF);
-        data[base + cols::RES_SIGN] = FE::from(aux.res_sign as u64);
+        table.set_dword_hl(row_idx, cols::RES_0, op.res);
+        table.set_bool(row_idx, cols::RES_SIGN, aux.res_sign);
 
         // rd write
-        data[base + cols::RD] = FE::from(op.rd as u64);
-        data[base + cols::WRITE_REGISTER] = FE::from(op.write_register as u64);
-        data[base + cols::RVD_0] = FE::from(aux.rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(aux.rvd >> 32);
+        table.set_byte(row_idx, cols::RD, op.rd);
+        table.set_bool(row_idx, cols::WRITE_REGISTER, op.write_register);
+        table.set_dword_wl(row_idx, cols::RVD_0, aux.rvd);
 
         // ALU control
-        data[base + cols::ALU] = FE::from(op.alu as u64);
-        data[base + cols::ALU_FLAGS] = FE::from(op.alu_flags as u64);
-        data[base + cols::ADD] = FE::from(op.add as u64);
-        data[base + cols::SUB] = FE::from(op.sub as u64);
-        data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(op.half_instruction_length as u64);
-        data[base + cols::SIGNED] = FE::from(aux.signed as u64);
+        table.set_bool(row_idx, cols::ALU, op.alu);
+        table.set_byte(row_idx, cols::ALU_FLAGS, op.alu_flags);
+        table.set_bool(row_idx, cols::ADD, op.add);
+        table.set_bool(row_idx, cols::SUB, op.sub);
+        table.set_byte(
+            row_idx,
+            cols::HALF_INSTRUCTION_LENGTH,
+            op.half_instruction_length,
+        );
+        table.set_bool(row_idx, cols::SIGNED, aux.signed);
 
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
