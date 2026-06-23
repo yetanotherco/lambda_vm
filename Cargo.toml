@@ -8,6 +8,7 @@ members = [
   "crypto/math",
   "crypto/math-cuda",
   "bin/cli",
+  "bench_vs/multiquery_bench",
 ]
 
 resolver = "2"

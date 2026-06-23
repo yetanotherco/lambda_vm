@@ -18,6 +18,9 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // FP3_MUL_SYSCALL_NUMBER (u64::MAX - 2) cannot be an enum discriminant because
+    // it exceeds isize::MAX; handled via TryFrom<u64> like KeccakPermute.
+    Fp3Mul,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -47,6 +50,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == FP3_MUL_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Mul),
             _ => Err(()),
         }
     }
@@ -430,6 +434,31 @@ impl Instruction {
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;
                         dst_val = addr_k;
+                    }
+                    SyscallNumbers::Fp3Mul => {
+                        // Goldilocks Fp3 multiply: x³ - 2 over p = 2^64 - 2^32 + 1
+                        // x10 = ptr to result (3 × u64), x11 = ptr to lhs, x12 = ptr to rhs
+                        let addr_res = registers.read(10)?;
+                        let addr_lhs = registers.read(11)?;
+                        let addr_rhs = registers.read(12)?;
+                        let lhs = [
+                            memory.load_doubleword(addr_lhs)?,
+                            memory.load_doubleword(addr_lhs + 8)?,
+                            memory.load_doubleword(addr_lhs + 16)?,
+                        ];
+                        let rhs = [
+                            memory.load_doubleword(addr_rhs)?,
+                            memory.load_doubleword(addr_rhs + 8)?,
+                            memory.load_doubleword(addr_rhs + 16)?,
+                        ];
+                        let c0 = goldilocks_fp3_mul_c0(lhs, rhs);
+                        let c1 = goldilocks_fp3_mul_c1(lhs, rhs);
+                        let c2 = goldilocks_fp3_mul_c2(lhs, rhs);
+                        memory.store_doubleword(addr_res, c0)?;
+                        memory.store_doubleword(addr_res + 8, c1)?;
+                        memory.store_doubleword(addr_res + 16, c2)?;
+                        src2_val = addr_lhs;
+                        dst_val = addr_rhs;
                     }
                     SyscallNumbers::Halt => {
                         // halt

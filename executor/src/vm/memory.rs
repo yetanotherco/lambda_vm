@@ -43,13 +43,7 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
-/// Maximum size of the private input memory region (in bytes).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
-/// Fixed high address where private input is mapped. Guest programs can read
-/// directly from this address (ZisK-style memory-mapped input).
-/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
-/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
-pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+pub use crate::constants::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
 
 #[derive(Default, Debug)]
 pub struct Memory {
