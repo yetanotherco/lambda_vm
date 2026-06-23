@@ -68,7 +68,7 @@ This is only performed when we have not yet reached the `end` of the commit sequ
 #render_constraint_table(chip, config, groups: "commit")
 
 In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed after committing this byte.
-@commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @add:a:rhs.
+@commit:c:range_address_incr and @commit:c:range_count_decr are included to satisfy @add:a:sum respectively @sub:a:diff.
 #render_constraint_table(chip, config, groups: "incr_decr")
 
 When `count` hits $0$, we should stop performing further recursive calls.
