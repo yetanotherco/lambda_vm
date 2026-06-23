@@ -46,7 +46,7 @@ fn composition_extend_half_fused_matches_reference() {
         let mut weights = Vec::with_capacity(n);
         let mut w = n_inv;
         for _ in 0..n {
-            weights.push(w.clone());
+            weights.push(w);
             w = &w * &g_inv;
         }
         let inv = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
