@@ -269,7 +269,7 @@
 
 #let render_chip_assumptions(chip, config) = {
   let tag(assumption) = {
-    let code = if "code" in chip {chip.code} else {chip.name}
+    let code = chip.at("code", default: chip.name)
     let index = (("",) + iters_of(assumption).map(it => it.at(0))).join(`.`)
     let lbl(idx) = raw(code + "-A" + str(idx))
 
@@ -314,7 +314,7 @@
     
     let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
 
-    let pad-width() = calc.max(calc.ceil(calc.log(counter(figure.where(kind: counter-kind)).final().at(0))), 2)
+    let pad-width() = calc.max(calc.ceil(calc.log(counter(figure.where(kind: counter-kind)).final().at(0) + 1)), 2)
     let z-pad(s) = context "0" * calc.max(pad-width() - s.len(), 0) + s
     let ref-tag(i) = raw(tag) + sub("/" + z-pad(str(i)))
     return (

@@ -128,34 +128,22 @@
   let prime = (0x000001B3, 0x00000100)
 
   // hash := FNV_offset_basis = 0xCBF29CE484222325
-  let hash = (0x84222325, 0xCBF29CE4)
+  let (lo, hi) = (0x84222325, 0xCBF29CE4)
   for b in bytes {
     // hash := hash XOR byte_of_data
-    hash.at(0) = hash.at(0).bit-xor(b)
+    lo = lo.bit-xor(b)
 
     // hash := hash × FNV_prime
-    let lo = hash.at(0) * prime.at(0)
-    let hi = hash.at(0) * prime.at(1) + hash.at(1) * prime.at(0)
+    lo = lo * prime.at(0)
+    hi = lo * prime.at(1) + hi * prime.at(0)
     
     // Carry result
     let carry = lo.bit-rshift(32)
-    let lo = lo.bit-and(0xFFFFFFFF)
-    let hi = (hi + carry).bit-and(0xFFFFFFFF)
-    hash = (lo, hi)
+    lo = lo.bit-and(0xFFFFFFFF)
+    hi = (hi + carry).bit-and(0xFFFFFFFF)
   }
 
-  hash.map(int.to-bytes).join()
-}
-
-/// Converts a byte array to a hexadecimal string
-#let bytes-to-hex(bytes) = {
-  /// Pads a string with 0s on the left to reach a certain length
-  let z-fill(str) = "0" * calc.max(2 - str.len(), 0) + str
-
-  array(bytes)
-    .map(b => str(b, base: 16))
-    .map(z-fill)
-    .sum()
+  (lo + hi.bit-lshift(32)).to-bytes()
 }
 
 /// Tag constraints with an identifier
@@ -164,82 +152,90 @@
   /// A NON-CRYPTOGRAPHIC hash function.
   let nchf(str) = FNV-1a(bytes(str))
   
-  // number of characters in constraint ID
-  let CONSTRAINT_ID_CHAR_COUNT = 4;
+  // ID settings
+  let ID_CHAR_LEN = 4;
+  let ID_CHAR_SET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
 
+  // Constants
+  let LOG_ID_RADIX = 5
+  let RADIX = calc.pow(2, LOG_ID_RADIX)
+  assert(ID_CHAR_SET.len() == RADIX, message: "ID_CHAR_SET <> RADIX mismatch")
+  assert(ID_CHAR_LEN * LOG_ID_RADIX <= 64, message: "ID_CHAR_LEN and RADIX incompatible")
+  
   // Map hash digest to ID
-  let digest_to_id(hash_bytes) = {
-    // Character set used to represent ID
-    let CHARS = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
-    assert(CHARS.len() == 32, message: "invalid CHARS length")
-
-    let min_bytes_len = 2 * CONSTRAINT_ID_CHAR_COUNT
+  let MIN_DIGEST_BYTES = calc.ceil((LOG_ID_RADIX * ID_CHAR_LEN) / 8)
+  let digest_to_id(digest) = {
     assert(
-      hash_bytes.len() >= min_bytes_len, 
-      message: "too few bytes to digest: " + repr(hash_bytes) + " has " + str(hash_bytes.len()) + " where " + str(min_bytes_len) + " is required."
+      digest.len() >= MIN_DIGEST_BYTES, 
+      message: "too few bytes to digest: " + str(digest.len()) + "<" + str(MIN_DIGEST_BYTES)
     )
 
-    let int = int.from-bytes(hash_bytes.slice(0, count: min_bytes_len))
-    for _ in range(CONSTRAINT_ID_CHAR_COUNT) {
+    let int = int.from-bytes(digest.slice(0, count: MIN_DIGEST_BYTES))
+    for _ in range(ID_CHAR_LEN) {
       let idx = int.bit-and(31)
       int = int.bit-rshift(5)
-      (CHARS.at(idx), )
+      (ID_CHAR_SET.at(idx), )
     }.sum()
+  }
+
+  // Recursively flatten nested object
+  let flatten(obj, terminator: str, braces: ("(", ")"), sep: ",") = {
+    if type(obj) == dictionary {
+      obj = obj.keys().sorted().map(k => ((k), ":", obj.at(k)))
+    }
+    if type(obj) == array {
+      braces.at(0) + obj.map(a => flatten(a, terminator: terminator, braces: braces, sep: sep)).join(sep) + braces.at(1)
+    } else {
+      terminator(obj)
+    }
+  }
+
+  /// Converts a byte array to a hexadecimal string
+  let bytes-to-hex(bytes) = {
+    /// Pads a string with 0s on the left to reach a certain length
+    let z-fill(str) = "0" * calc.max(2 - str.len(), 0) + str
+
+    (("0x",) + array(bytes)
+      .map(b => upper(str(b, base: 16)))
+      .map(z-fill))
+      .sum()
   }
 
   /// Digests a variable based on its location and type.
   let digest_variable(chip, group, idx, var) = {
-    /// Flatten the type of a variable into a string
-    let flatten_vartype(typ) = {
-      if type(typ) == array {
-        "(" + typ.map(flatten_vartype).join(",") + ")"
-      } else {
-        str(typ)
-      }
-    }
-    
-    let flattened_type = lower(flatten_vartype(var.type))    
-    let input = (chip, group, str(idx), flattened_type).join("\x00")
-    digest_to_id(nchf(input))
+    let input = (chip, group, str(idx), flatten(var.type)).join("\x00")
+    bytes-to-hex(nchf(input))
   }
 
-  // Map variables to their ID
-  let variable_to_ID = chip
+  // Assign variables an ID
+  let variable_IDs = chip
     .variables
     .pairs()
-    .map(((group, variables)) => {
-      variables
-        .enumerate()
-        .map(((idx, var)) => {
-          (var.name: digest_variable(chip.name, group, idx, var))
-        }).sum(default: (:))
-    }).sum(default: (:))
+    .map(((group, variables)) => variables
+      .enumerate()
+      .map(((idx, var)) => (var.name: digest_variable(chip.name, group, idx, var)))
+      .sum(default: (:))
+    ).sum(default: (:))
 
-  // replace variable with ID in LISP
-  let replace_variable_with_ID(lisp) = {
-    if type(lisp) == array {
-      "(" + lisp.map(replace_variable_with_ID).join(",") + ")"
-    } else {
-      variable_to_ID.at(str(lisp), default: str(lisp))
-    }
-  }
-
-  // Replace variable names with their ID 
-  let digestable_constraint(c) = { 
-    let CONSTRAINT_CAT_TO_SCOPE = (
-      "interaction": ("tag", "iter", "input", "output", "multiplicity"),
-      "template": ("tag", "iter", "input", "output", "cond"),
-      "arith": ("iter", "poly")
-    )
-
-    assert(c.kind in CONSTRAINT_CAT_TO_SCOPE)
-    let id_tagged = CONSTRAINT_CAT_TO_SCOPE
-      .at(c.kind)
-      .filter(cat => cat in c.keys())
-      .map(cat => (str(cat): replace_variable_with_ID(c.at(cat))))
+  // Replace variable names with their ID
+  let EXCLUDED_LABELS = ("desc", "ref", "constraint")
+  let digestable_constraint(c) = {
+    // filter out excluded fields
+    let filtered = c
+      .pairs()
+      .filter(((label, value)) => label not in EXCLUDED_LABELS)
+      .map(((label, value)) => ((label): value))
       .sum(default: (:))
 
-    repr(id_tagged)
+    // replace iter variables with stub
+    let var_map = c.at("iters", default: if "iter" in c {(c.iter,)} else {()})
+      .enumerate()
+      .map(((idx, iter)) => ((iter.at(0)): "iter" + str(idx)))
+      .sum(default: (:))
+
+    let terminator(x) = variable_IDs.at(str(x), default: var_map.at(str(x), default: str(x)))
+
+    flatten(filtered, terminator: terminator)
       .replace("\n", "")
       .replace(" ", "")
   }
@@ -249,7 +245,7 @@
     .pairs()
     .map(((group, constraints)) => {
       (
-        str(group):
+        (group):
         constraints
           .map(c => {
             c.id = digest_to_id(nchf(digestable_constraint(c)))
