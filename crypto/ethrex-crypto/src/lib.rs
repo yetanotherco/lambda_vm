@@ -72,8 +72,8 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-    let r_bytes = FieldBytes::from_slice(&sig[..32]);
-    let s_bytes = FieldBytes::from_slice(&sig[32..]);
+    let r_bytes = <&FieldBytes>::from(&sig[..32]);
+    let s_bytes = <&FieldBytes>::from(&sig[32..]);
 
     // Parse r and s as scalars, rejecting values >= the curve order.
     let r: Option<Scalar> = Scalar::from_repr(*r_bytes).into();
@@ -97,7 +97,7 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32],
     };
     let r_proj = ProjectivePoint::from(r_point);
 
-    let z = <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(msg));
+    let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*msg));
     let r_inv: Option<Scalar> = r.invert_vartime().into();
     let Some(r_inv) = r_inv else {
         return Err(CryptoError::RecoveryFailed);
@@ -146,11 +146,13 @@ fn ecsm_lincomb2(
     None
 }
 
-/// x-only scalar-mul oracle backed by the ECSM precompile. `x` must be the
-/// x-coordinate of a curve point and `k` in `(0, n)` — guaranteed by the guards
-/// in [`lincomb2_with_oracle`]. Values cross the ABI as 32-byte little-endian;
-/// `xg` and `k` are distinct stack arrays so the executor's
-/// `|addr_xG − addr_k| ≥ 32` assumption holds by construction.
+/// x-only scalar-mul oracle backed by the ECSM precompile: computes `x(k·P)`
+/// for the curve point P whose x-coordinate is passed in. `x` must be the
+/// x-coordinate of a curve point and `k` in `(0, N)` (N = curve order) —
+/// guaranteed by the guards in [`lincomb2_with_oracle`]. Values cross the ABI
+/// as 32-byte little-endian; `x_le` and `k_le` are distinct stack arrays so
+/// the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
+/// construction.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
     let x_be = x.to_bytes();
@@ -232,8 +234,10 @@ where
     let xq = (lq.square() - xa - xb).normalize();
     let yq = (lq * (xa - xq) - ya).normalize();
 
-    // `point_from_xy` re-validates the result is on the curve (rejecting →
-    // software fallback), so no separate curve-equation assertion is needed.
+    // `point_from_xy` checks the result is on the curve as a cheap backstop:
+    // it rejects gross off-curve garbage and falls back to software, but
+    // correctness rests on the algebra above — an on-curve-but-wrong point
+    // would still pass this check.
     point_from_xy(&xq, &yq)
 }
 
@@ -290,14 +294,17 @@ fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<ProjectivePoint> 
 
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
 
-/// Keccak-256 as a sponge over LambdaVM's `keccak_permute` syscall.
+/// Keccak-256 sponge with an injected permutation function.
 ///
 /// Keccak-f[1600], rate 1088 bits (136 bytes), capacity 512 bits.
 /// Padding: `0x01 ... 0x80` (multi-rate, last bit set). The state is a
 /// 25-element u64 array; bytes are absorbed into the state via little-endian
 /// XOR (matching the standard Keccak byte-to-lane mapping).
-#[cfg(target_arch = "riscv64")]
-fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
+///
+/// Gated to `riscv64 | test` so the generic function is available to the host
+/// unit tests without being dead code in the non-test host build.
+#[cfg(any(target_arch = "riscv64", test))]
+fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F) -> [u8; 32] {
     const RATE: usize = 136;
 
     let mut state = [0u64; 25];
@@ -305,7 +312,7 @@ fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
 
     while input.len().saturating_sub(offset) >= RATE {
         absorb_block(&mut state, &input[offset..offset + RATE]);
-        lambda_vm_syscalls::syscalls::keccak_permute(&mut state);
+        permute(&mut state);
         offset = offset.saturating_add(RATE);
     }
 
@@ -324,7 +331,7 @@ fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
         *b ^= 0x80;
     }
     absorb_block(&mut state, &last);
-    lambda_vm_syscalls::syscalls::keccak_permute(&mut state);
+    permute(&mut state);
 
     // Squeeze the first 32 bytes (four lanes) as little-endian.
     let mut output = [0u8; 32];
@@ -338,8 +345,14 @@ fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
     output
 }
 
-/// XOR one rate-sized block of bytes into the state lanes (little-endian).
+/// Keccak-256 via LambdaVM's `keccak_permute` syscall (riscv64 guest only).
 #[cfg(target_arch = "riscv64")]
+fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
+    keccak256_with_permute(input, |s| lambda_vm_syscalls::syscalls::keccak_permute(s))
+}
+
+/// XOR one rate-sized block of bytes into the state lanes (little-endian).
+#[cfg(any(target_arch = "riscv64", test))]
 fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
     for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
         let mut buf = [0u8; 8];
@@ -430,5 +443,157 @@ mod tests {
         // A = B (doubling chord) and A = −B (Q = O): both share x(A) = x(B).
         assert!(lincomb2_with_oracle(&p, &k, &p, &k, soft_oracle).is_none());
         assert!(lincomb2_with_oracle(&p, &k, &(-p), &k, soft_oracle).is_none());
+    }
+
+    // ── Issue 1: known-answer tests for the full ecsm_ecrecover path ─────────
+
+    /// Build a valid ECDSA/secp256k1 signature from (d, kk, msg) using only the
+    /// k256 primitives already imported and return `(sig, recid, expected_addr)`.
+    ///
+    /// `expected_addr` = keccak(X‖Y) of the uncompressed public key, exactly as
+    /// `ecsm_ecrecover` computes it.
+    fn make_ecdsa_fixture(
+        d: Scalar,
+        kk: Scalar,
+        msg: [u8; 32],
+    ) -> ([u8; 64], u8, [u8; 32]) {
+        assert!(!bool::from(d.is_zero()), "private key must be nonzero");
+        assert!(!bool::from(kk.is_zero()), "nonce must be nonzero");
+
+        // Public key Q = d·G.
+        let q = (ProjectivePoint::GENERATOR * d).to_affine();
+        let q_uncompressed = q.to_encoded_point(false);
+        let expected = keccak_hash(&q_uncompressed.as_bytes()[1..65]);
+
+        // R = kk·G; r = reduce(Rx); assert r ≠ 0.
+        let r_point = (ProjectivePoint::GENERATOR * kk).to_affine();
+        let (rx, ry) = affine_xy(&r_point).expect("R is not identity");
+        let r = <Scalar as Reduce<U256>>::reduce_bytes(&rx.to_bytes());
+        assert!(!bool::from(r.is_zero()), "r must be nonzero");
+
+        // recid parity: low bit of Ry (big-endian, byte 31).
+        let recid = ry.normalize().to_bytes()[31] & 1;
+
+        // z = reduce(msg).
+        let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(msg));
+
+        // s = kk⁻¹ · (z + r·d).
+        let s = kk.invert_vartime().expect("kk is nonzero") * (z + r * d);
+        assert!(!bool::from(s.is_zero()), "s must be nonzero");
+
+        // sig = r (BE, 32 bytes) ‖ s (BE, 32 bytes).
+        let mut sig = [0u8; 64];
+        sig[..32].copy_from_slice(&r.to_bytes());
+        sig[32..].copy_from_slice(&s.to_bytes());
+
+        (sig, recid, expected)
+    }
+
+    #[test]
+    fn ecrecover_known_answer_three_tuples() {
+        // Three distinct (d, kk, msg) tuples — deterministic, no RNG.
+        let tuples: &[(u64, u64, [u8; 32])] = &[
+            (
+                0x0000_0000_0000_0001u64,
+                0x0000_0000_dead_beefu64,
+                {
+                    let mut m = [0u8; 32];
+                    m[31] = 0x42;
+                    m
+                },
+            ),
+            (
+                0x00c0_ffee_dead_beef_u64,
+                0x0123_4567_89ab_cdef_u64,
+                {
+                    let mut m = [0u8; 32];
+                    m[0] = 0xff;
+                    m[31] = 0x01;
+                    m
+                },
+            ),
+            (
+                0x0bad_f00d_1337_cafe,
+                0xfeed_face_0000_0001,
+                {
+                    let mut m = [0u8; 32];
+                    for (i, b) in m.iter_mut().enumerate() {
+                        *b = i as u8;
+                    }
+                    m
+                },
+            ),
+        ];
+
+        for &(d_u64, kk_u64, msg) in tuples {
+            let d = Scalar::from(d_u64);
+            let kk = Scalar::from(kk_u64);
+            let (sig, recid, expected) = make_ecdsa_fixture(d, kk, msg);
+            match ecsm_ecrecover(&sig, recid, &msg) {
+                Ok(got) => assert_eq!(
+                    got, expected,
+                    "ecrecover returned wrong address for d={d_u64:#x} kk={kk_u64:#x}"
+                ),
+                Err(e) => panic!(
+                    "ecrecover failed for d={d_u64:#x} kk={kk_u64:#x}: {e:?}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn ecrecover_rejects_zero_s() {
+        // sig = valid r ‖ 0x00..00 (s = 0) must return InvalidSignature.
+        let mut sig = [0u8; 64];
+        // r = 1 (nonzero, but s = 0 in the second half).
+        sig[31] = 0x01;
+        let msg = [0u8; 32];
+        assert!(
+            matches!(ecsm_ecrecover(&sig, 0, &msg), Err(CryptoError::InvalidSignature)),
+            "expected InvalidSignature for zero s"
+        );
+    }
+
+    #[test]
+    fn ecrecover_rejects_zero_r() {
+        // sig = 0x00..00 ‖ valid s must return InvalidSignature.
+        let mut sig = [0u8; 64];
+        sig[63] = 0x01; // s = 1, r = 0
+        let msg = [0u8; 32];
+        assert!(
+            matches!(ecsm_ecrecover(&sig, 0, &msg), Err(CryptoError::InvalidSignature)),
+            "expected InvalidSignature for zero r"
+        );
+    }
+
+    // ── Issue 2: host-side Keccak sponge tests via injected permutation ───────
+
+    /// Cross-check our sponge body against the trusted `keccak` crate's f1600.
+    fn check_keccak(input: &[u8]) {
+        let got = keccak256_with_permute(input, keccak::f1600);
+        let want = keccak_hash(input);
+        assert_eq!(
+            got, want,
+            "keccak256 mismatch for {}-byte input",
+            input.len()
+        );
+    }
+
+    #[test]
+    fn keccak_sponge_matches_trusted_permutation() {
+        // Empty input.
+        check_keccak(&[]);
+        // One byte.
+        check_keccak(&[0xab]);
+        // 135 bytes — RATE-1: padding lands on byte 135 (0x01) and byte 135 is
+        // also the last byte (0x80), so both bits land on the same byte: 0x81.
+        check_keccak(&[0x5a; 135]);
+        // Exactly RATE (136): fills one full block, final block is all-padding.
+        check_keccak(&[0x3c; 136]);
+        // RATE+1: one full block + one-byte remainder.
+        check_keccak(&[0x7e; 137]);
+        // Multi-block: ~1.5 × RATE (200 bytes), deterministic pattern.
+        let long: Vec<u8> = (0u8..200).collect();
+        check_keccak(&long);
     }
 }

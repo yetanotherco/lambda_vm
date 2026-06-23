@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 # LambdaVM-side crypto accelerators for ethrex's EVM, injected into the guest as
 # a `Crypto` impl. Keeping the logic here (not in the ethrex repo) means crypto
 # changes don't require an ethrex PR — the guest just constructs and injects
-# `LambdaVmEcsmCrypto`. See `crypto/ethrex-crypto` in the plan.
+# `LambdaVmEcsmCrypto`.
 
 [dependencies]
 # Defines the `Crypto` trait, `CryptoError`, and `keccak::keccak_hash`. Same rev
@@ -21,7 +21,7 @@ license = "MIT OR Apache-2.0"
 ethrex-crypto = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-crypto", default-features = false }
 # Pinned to the exact 0.13.4 ethrex uses so the guest resolves a single k256
 # (a version split would make `FieldElement`/`Scalar` incompatible types).
-# `expose-field` is required by the x-only reconstruction (Phase 1).
+# `expose-field` is required by the x-only reconstruction.
 k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic", "expose-field"] }
 
 # The ECSM / keccak ecalls only exist on the riscv64 guest target; on host the
@@ -29,3 +29,7 @@ k256 = { version = "=0.13.4", default-features = false, features = ["arithmetic"
 # (which pulls riscv-only allocator crates that don't link on host) is gated out.
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 lambda-vm-syscalls = { path = "../../syscalls" }
+
+[dev-dependencies]
+# Trusted software Keccak-f[1600] used to cross-check keccak256_with_permute in tests.
+keccak = "0.1"
