@@ -1,0 +1,23 @@
+name: AI Review Tests
+
+# Run the ai_review.py unit tests when the review tooling changes, so parser/dedup/
+# path/verifier logic stays covered (the suite was previously not wired into CI).
+on:
+  pull_request:
+    paths:
+      - ".github/scripts/ai_review.py"
+      - ".github/scripts/test_ai_review.py"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run AI review unit tests
+        run: python3 .github/scripts/test_ai_review.py

@@ -18,6 +18,7 @@ stark = { path = "../crypto/stark" }
 crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
+ecsm = { path = "../crypto/ecsm" }
 serde = { version = "1.0", features = ["derive"] }
 rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }

@@ -7,16 +7,20 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "a9de3e8b405dbf406cac31b930fd1ffdc216a429", package="guest_program", default-features = false, features=["c-kzg"] }
-rkyv = { version = "0.8.10", features = ["std", "unaligned"] }
-c-kzg = { version = "2.1.1", features = ["eip-7594"] }
+# Pinned by immutable `rev` to a commit on the open LambdaVM-backend PR branch
+# (feat/lambdavm-prover-backend) of ethrex; re-pin to the merge commit once it
+# lands on ethrex `main`. The `lambdavm` feature provides
+# `crypto::lambdavm::LambdaVmCrypto` (keccak via our precompile syscall; ECDSA
+# and BN254 via pure-Rust crates). KZG is NOT linked under this feature (no
+# kzg-rs/c-kzg in the guest Cargo.lock), so the point-evaluation precompile
+# (0x0a) is unsupported — see src/main.rs.
+ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
+# Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the
+# executor test reader so the rkyv ProgramInput layout stays consistent.
+rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 
-[patch.crates-io]
-c-kzg = { git = "https://github.com/risc0/c-kzg-4844", tag = "c-kzg/v2.1.1-risczero.0" }
-
-# Route ethrex's crypto through the lambda-vm keccak precompile (riscv64).
-# Replaces the upstream ethrex-crypto crate (whose keccak is tiny-keccak/software)
-# with a local copy whose keccak module calls the keccak_permute syscall on the
-# guest target; native builds keep the vendored asm. See patches/ethrex-crypto/.
-[patch."https://github.com/lambdaclass/ethrex.git"]
-ethrex-crypto = { path = "patches/ethrex-crypto" }
+# `ethrex-guest-program`'s `lambdavm` feature pins `lambda-vm-syscalls` to an
+# older commit. Override it with our working-tree copy so the guest links our
+# current syscalls (keccak_permute + the Print-ecall no-op fix).
+[patch."https://github.com/yetanotherco/lambda_vm.git"]
+lambda-vm-syscalls = { path = "../../../../syscalls" }

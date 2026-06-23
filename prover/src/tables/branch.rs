@@ -22,7 +22,7 @@
 //!
 //! ## Bus Interactions
 //! - Sender: ARE_BYTES (×1 for `[next_pc_low[1], 0]`, spec template `IS_BYTE<next_pc_low[1]>`)
-//! - Sender: AND_BYTE (×1 for masking LSB)
+//! - Sender: BYTE_ALU[AND] (×1 for masking LSB)
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
 
@@ -33,7 +33,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -168,23 +168,14 @@ pub fn generate_branch_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
-        // Extract pc as DWordWL: [Word, Word]
-        let pc_0 = (op.pc & 0xFFFF_FFFF) as u32;
-        let pc_1 = (op.pc >> 32) as u32;
-
-        // Extract offset as DWordWL: [Word, Word]
-        let offset_0 = (op.offset & 0xFFFF_FFFF) as u32;
-        let offset_1 = (op.offset >> 32) as u32;
-
-        // Extract register as DWordWL: [Word, Word]
-        let register_0 = (op.register & 0xFFFF_FFFF) as u32;
-        let register_1 = (op.register >> 32) as u32;
-
         // Compute next_pc
         let next_pc_unmasked = op.compute_next_pc_unmasked();
         let next_pc = op.compute_next_pc();
@@ -203,23 +194,25 @@ pub fn generate_branch_trace(
         let next_pc_high_2 = ((next_pc >> 48) & 0xFFFF) as u16;
 
         // Store columns
-        data[base + cols::PC_0] = FE::from(pc_0 as u64);
-        data[base + cols::PC_1] = FE::from(pc_1 as u64);
-        data[base + cols::OFFSET_0] = FE::from(offset_0 as u64);
-        data[base + cols::OFFSET_1] = FE::from(offset_1 as u64);
-        data[base + cols::REGISTER_0] = FE::from(register_0 as u64);
-        data[base + cols::REGISTER_1] = FE::from(register_1 as u64);
-        data[base + cols::JALR] = FE::from(if op.jalr { 1u64 } else { 0u64 });
-        data[base + cols::NEXT_PC_HIGH_0] = FE::from(next_pc_high_0 as u64);
-        data[base + cols::NEXT_PC_HIGH_1] = FE::from(next_pc_high_1 as u64);
-        data[base + cols::NEXT_PC_HIGH_2] = FE::from(next_pc_high_2 as u64);
-        data[base + cols::NEXT_PC_LOW_0] = FE::from(next_pc_low_0 as u64);
-        data[base + cols::NEXT_PC_LOW_1] = FE::from(next_pc_low_1 as u64);
-        data[base + cols::UNMASKED_LOW_BYTE] = FE::from(unmasked_low_byte as u64);
-        data[base + cols::MU] = FE::from(*multiplicity);
+        table.set_dword_wl(row_idx, cols::PC_0, op.pc);
+        table.set_dword_wl(row_idx, cols::OFFSET_0, op.offset);
+        table.set_dword_wl(row_idx, cols::REGISTER_0, op.register);
+        table.set_bool(row_idx, cols::JALR, op.jalr);
+        table.set_halves(
+            row_idx,
+            cols::NEXT_PC_HIGH_0,
+            &[next_pc_high_0, next_pc_high_1, next_pc_high_2],
+        );
+        table.set_bytes(
+            row_idx,
+            cols::NEXT_PC_LOW_0,
+            &[next_pc_low_0, next_pc_low_1],
+        );
+        table.set_byte(row_idx, cols::UNMASKED_LOW_BYTE, unmasked_low_byte);
+        table.set_u64(row_idx, cols::MU, *multiplicity);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -230,7 +223,8 @@ pub fn generate_branch_trace(
 ///
 /// The BRANCH table:
 /// - **Sends** ARE_BYTES lookup for next_pc_low[1] range check (Y=0)
-/// - **Sends** AND_BYTE lookup for LSB masking (next_pc_low[0] = unmasked_low_byte & 254)
+/// - **Sends** BYTE_ALU[AND] lookup for LSB masking
+///   (next_pc_low[0] = unmasked_low_byte & 254)
 /// - **Sends** IS_HALFWORD lookups for next_pc_high[0..3] range checks
 /// - **Receives** BRANCH lookups from CPU table
 pub fn bus_interactions() -> Vec<BusInteraction> {
@@ -247,12 +241,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // AND_BYTE[next_pc_low[0]; unmasked_low_byte, 254]
+        // BYTE_ALU[next_pc_low[0]; AND, unmasked_low_byte, 254]
         // Verifies: next_pc_low[0] = unmasked_low_byte & 0xFE
         BusInteraction::sender(
-            BusId::AndByte,
+            BusId::ByteAlu,
             Multiplicity::Column(cols::MU),
             vec![
+                BusValue::constant(alu_op::AND as u64),
                 BusValue::Packed {
                     start_column: cols::UNMASKED_LOW_BYTE,
                     packing: Packing::Direct,
@@ -395,6 +390,8 @@ pub enum BranchConstraintKind {
     /// `(1 - JALR) * carry_1_pc * (1 - carry_1_pc) = 0`
     /// where carry_1_pc = (pc[1] + offset[1] + carry_0_pc - next_pc_unmasked[1]) / 2^32
     PcCarry1IsBit,
+    /// `IS_BIT<JALR>`: `JALR * (1 - JALR) = 0` (spec defense-in-depth assumption)
+    JalrIsBit,
     /// `JALR * carry_0_reg * (1 - carry_0_reg) = 0`
     /// where carry_0_reg = (register[0] + offset[0] - next_pc_unmasked[0]) / 2^32
     RegCarry0IsBit,
@@ -494,6 +491,7 @@ impl BranchConstraint {
         let one = FieldElement::<F>::one();
 
         match self.kind {
+            BranchConstraintKind::JalrIsBit => &jalr * (&one - &jalr),
             BranchConstraintKind::PcCarry0IsBit => {
                 let cond = &one - &jalr;
                 let c = Self::compute_carry_0_for(cols::PC_0, step);
@@ -520,8 +518,12 @@ impl BranchConstraint {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
     fn degree(&self) -> usize {
-        // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
-        3
+        match self.kind {
+            // JALR * (1 - JALR) = degree 2
+            BranchConstraintKind::JalrIsBit => 2,
+            // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
+            _ => 3,
+        }
     }
 
     fn constraint_idx(&self) -> usize {
@@ -539,11 +541,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
 
 /// Creates all constraints for the BRANCH table.
 ///
-/// Returns 4 constraints (two conditional ADD templates × 2 carries each):
+/// Returns 5 constraints (two conditional ADD templates × 2 carries each, plus
+/// the `IS_BIT<JALR>` defense-in-depth assumption):
 /// - PcCarry0IsBit:  `(1 - JALR) * carry_0 * (1 - carry_0) = 0`  (pc path)
 /// - PcCarry1IsBit:  `(1 - JALR) * carry_1 * (1 - carry_1) = 0`  (pc path)
 /// - RegCarry0IsBit: `JALR * carry_0 * (1 - carry_0) = 0`        (register path)
 /// - RegCarry1IsBit: `JALR * carry_1 * (1 - carry_1) = 0`        (register path)
+/// - JalrIsBit:      `JALR * (1 - JALR) = 0`
 pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>, usize) {
     let mut idx = constraint_idx_start;
     let mut next = || {
@@ -556,6 +560,7 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
         BranchConstraint::new(BranchConstraintKind::PcCarry1IsBit, next()),
         BranchConstraint::new(BranchConstraintKind::RegCarry0IsBit, next()),
         BranchConstraint::new(BranchConstraintKind::RegCarry1IsBit, next()),
+        BranchConstraint::new(BranchConstraintKind::JalrIsBit, next()),
     ];
     (constraints, idx)
 }

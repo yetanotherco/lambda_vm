@@ -1,7 +1,16 @@
 //! Tests for the MUL (Multiplication) table.
 
-use crate::tables::mul::{MulOperation, bus_interactions, cols, generate_mul_trace};
+use stark::proof::options::ProofOptions;
+use stark::traits::AIR;
+
+use crate::tables::mul::{
+    MulOperation, bus_interactions, cols, generate_mul_trace, mul_constraints,
+};
 use crate::tables::types::FE;
+use crate::test_utils::{
+    busless_air, create_mul_air, in_chip_constraint_count, is_halfword_sender_columns,
+    validate_busless,
+};
 
 #[test]
 fn test_mul_unsigned_basic() {
@@ -254,13 +263,15 @@ fn test_different_signed_flags_separate_rows() {
 #[test]
 fn test_bus_interactions_count() {
     let interactions = bus_interactions();
-    // Expected interactions:
+    // Expected interactions (every MUL lookup goes through the unified ALU
+    // bus — CPU MUL/MULH dispatch and dvrm's `d*q` consistency):
     // - 2x MSB16 senders (lhs sign, rhs sign)
-    // - 8x IS_HALF senders (lo[0..4], hi[0..4])
+    // - 8x IS_HALF senders for inputs (lhs[0..4], rhs[0..4]) — range-check input halves
+    // - 8x IS_HALF senders for outputs (lo[0..4], hi[0..4])
     // - 4x IS_B20 senders (carry[0..4] virtual range checks)
-    // - 2x MUL receivers (lo, hi)
-    // Total: 2 + 8 + 4 + 2 = 16
-    assert_eq!(interactions.len(), 16, "Expected 16 bus interactions");
+    // - 2x ALU receivers (lo, hi)
+    // Total: 2 + 8 + 8 + 4 + 2 = 24
+    assert_eq!(interactions.len(), 24, "Expected 24 bus interactions");
 }
 
 #[test]
@@ -294,4 +305,112 @@ fn test_identity_multiplication() {
     let (lo, hi) = op.compute_product();
     assert_eq!(lo, 12345);
     assert_eq!(hi, 0);
+}
+
+// Soundness regression: the output must equal the product of the inputs, and the
+// input halves must be range-checked. The in-chip constraints were dead code until
+// they were wired into `create_mul_air`, so a prover could certify a false product.
+
+/// Enforcement: a forged raw product (`20 * 20` claimed as 999) is rejected by the
+/// `RawProduct` convolution, evaluated in isolation over a bus-less AIR.
+#[test]
+fn test_mul_rejects_false_product() {
+    let air = busless_air(cols::NUM_COLUMNS, mul_constraints(0).0);
+    let mut trace = generate_mul_trace(&[(MulOperation::new(20, false, 20, false), false)]);
+    assert!(
+        validate_busless(&air, &trace),
+        "honest MUL row (20 * 20 = 400) must validate"
+    );
+
+    trace.set_main(0, cols::RAW_PRODUCT_0, FE::from(999u64));
+    assert!(
+        !validate_busless(&air, &trace),
+        "forged raw product must be rejected by RawProduct"
+    );
+}
+
+/// Wiring: `create_mul_air` registers the in-chip constraints on top of its bus
+/// constraints. Directly catches a revert to `transition_constraints = vec![]`.
+#[test]
+fn test_mul_air_wires_in_chip_constraints() {
+    let air = create_mul_air(&ProofOptions::default_test_options());
+    let in_chip = in_chip_constraint_count(
+        air.num_transition_constraints(),
+        cols::NUM_COLUMNS,
+        bus_interactions(),
+    );
+    assert_eq!(in_chip, mul_constraints(0).0.len());
+    // 2x SignedIsBit + LhsSign + RhsSign + 4x RawProduct (#644 added the two
+    // SignedIsBit constraints that #652's count of 6 predated).
+    assert_eq!(mul_constraints(0).0.len(), 8);
+}
+
+/// Presence: every input halfword is range-checked via IS_HALFWORD senders, so a
+/// field-wrapping decomposition that keeps the packed word constant cannot change
+/// the product undetected.
+#[test]
+fn test_mul_range_checks_input_halves() {
+    let cols_checked = is_halfword_sender_columns(&bus_interactions());
+    for c in [
+        cols::LHS_0,
+        cols::LHS_1,
+        cols::LHS_2,
+        cols::LHS_3,
+        cols::RHS_0,
+        cols::RHS_1,
+        cols::RHS_2,
+        cols::RHS_3,
+    ] {
+        assert!(
+            cols_checked.contains(&c),
+            "MUL must IS_HALF range-check input half column {c}"
+        );
+    }
+}
+
+/// Regression test for the `Msb16` LogUp over-send bug.
+///
+/// MUL is split into chip instances of `max_rows.mul` raw ops (`chunk_and_generate`)
+/// and each instance deduplicates only its own chunk, sending the MSB16 sign lookup
+/// once per unique signed op *per instance* (multiplicity = the `SIGNED` bit). So
+/// `collect_bitwise_from_mul`, which feeds the BITWISE MSB16 multiplicity, must use
+/// the *same* per-chunk dedup: a unique signed op spanning two instances is sent
+/// twice but, with a single global dedup, would be tallied once — leaving the `Msb16`
+/// bus unbalanced and verification failing for any block large enough to split MUL.
+#[test]
+fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::trace_builder::collect_bitwise_from_mul;
+
+    let chunk = 4usize;
+    // One unique signed mul op repeated so it spans two `chunk`-sized instances.
+    let op = MulOperation::new(0x1234_5678_9abc_def0, true, 0x0fed_cba9_8765_4321, true);
+    let ops: Vec<(MulOperation, bool)> = std::iter::repeat_n((op, false), 6).collect();
+    assert!(
+        ops.len() > chunk,
+        "scenario must split MUL into >1 instance"
+    );
+
+    // Ground truth: each instance is one chunk, and the MUL AIR sends MSB16 with
+    // multiplicity Column(LHS_SIGNED) (lhs) and Column(RHS_SIGNED) (rhs) per row, so
+    // total sends = Σ rows (LHS_SIGNED + RHS_SIGNED).
+    let mut sends = 0usize;
+    for c in ops.chunks(chunk) {
+        let trace = generate_mul_trace(c);
+        for row in 0..trace.num_rows() {
+            sends += (*trace.get_main(row, cols::LHS_SIGNED) == FE::one()) as usize;
+            sends += (*trace.get_main(row, cols::RHS_SIGNED) == FE::one()) as usize;
+        }
+    }
+    assert_eq!(sends, 4, "sanity: 2 instances × (lhs + rhs) sends");
+
+    let tallied = collect_bitwise_from_mul(&ops, chunk)
+        .iter()
+        .filter(|b| matches!(b.lookup_type, BitwiseOperationType::Msb16))
+        .count();
+    assert_eq!(
+        tallied, sends,
+        "BITWISE MSB16 multiplicity ({tallied}) must equal total MUL-instance MSB16 \
+         sends ({sends}); a mismatch leaves the Msb16 bus unbalanced"
+    );
 }

@@ -32,7 +32,7 @@ use stark::trace::{TraceTable, columns2rows};
 use executor::vm::registers::Registers;
 
 use super::page::STACK_TOP;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Constants
@@ -208,17 +208,20 @@ pub fn generate_register_trace(
     init: &HashMap<u64, u32>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
     let addr_list = register_word_address_list();
 
     for (row, &word_addr) in addr_list.iter().enumerate().take(NUM_REGISTER_ADDRESSES) {
-        let base = row * cols::NUM_COLUMNS;
-
         // Offset = actual Word address in register space
-        data[base + cols::OFFSET] = FE::from(word_addr);
+        table.set_u64(row, cols::OFFSET, word_addr);
 
         let init_value = init.get(&word_addr).copied().unwrap_or(0);
-        data[base + cols::INIT] = FE::from(init_value as u64);
+        table.set_word(row, cols::INIT, init_value);
 
         // Final state: if accessed use final, otherwise use initial (timestamp 1)
         let (timestamp, fini_value) = if let Some(state) = final_state.get(&word_addr) {
@@ -228,20 +231,18 @@ pub fn generate_register_trace(
             (1, init_value)
         };
 
-        data[base + cols::FINI] = FE::from(fini_value as u64);
-        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+        table.set_word(row, cols::FINI, fini_value);
+        table.set_dword_wl(row, cols::TIMESTAMP_LO, timestamp);
     }
 
     // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES): set TIMESTAMP_LO=1 so
     // REG-C1's constant ts=1 emission matches REG-C2's ts=TIMESTAMP_LO consumption,
     // keeping padding rows self-cancelling on the bus.
     for row in NUM_REGISTER_ADDRESSES..num_rows {
-        let base = row * cols::NUM_COLUMNS;
-        data[base + cols::TIMESTAMP_LO] = FE::from(1u64);
+        table.set_u64(row, cols::TIMESTAMP_LO, 1);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 /// Extract the per-register final values (`R_{i+1}`) from a committed REGISTER

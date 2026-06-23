@@ -48,7 +48,10 @@ impl std::fmt::Debug for TableMmapBacking {
 )]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
-    pub data: Vec<FieldElement<F>>,
+    /// Row-major backing store. Crate-private: external callers must go through
+    /// the spill-safe accessors (`get`/`get_row`/`set`) rather than indexing the
+    /// raw buffer, which bypasses the disk-spill mmap backing.
+    pub(crate) data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
     #[cfg(feature = "disk-spill")]

@@ -50,11 +50,12 @@ use crate::tables::trace_builder::Traces;
 use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
-    E, F, VmAir, create_bitwise_air, create_branch_air, create_commit_air, create_cpu_air,
-    create_decode_air, create_dvrm_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
-    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_scalar_air,
+    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
-    create_register_air, create_shift_air,
+    create_register_air, create_shift_air, create_store_air,
 };
 
 use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
@@ -72,6 +73,11 @@ pub struct RuntimePageRange {
     pub count: u64,
 }
 
+/// Number of tables that always contribute exactly one sub-proof, regardless
+/// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
+/// keccak_rc, register, ecsm, ec_scalar, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 11;
+
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -86,6 +92,11 @@ pub struct TableCounts {
     pub shift: usize,
     pub branch: usize,
     pub memw_register: usize,
+    // Auxiliary ALU / memory / CPU32 dispatch chips
+    pub eq: usize,
+    pub bytewise: usize,
+    pub store: usize,
+    pub cpu32: usize,
 }
 
 impl TableCounts {
@@ -101,6 +112,10 @@ impl TableCounts {
             + self.shift
             + self.branch
             + self.memw_register
+            + self.eq
+            + self.bytewise
+            + self.store
+            + self.cpu32
     }
 
     /// Validate that all required tables have at least one chunk.
@@ -119,6 +134,10 @@ impl TableCounts {
             ("shift", self.shift),
             ("branch", self.branch),
             ("memw_register", self.memw_register),
+            ("eq", self.eq),
+            ("bytewise", self.bytewise),
+            ("store", self.store),
+            ("cpu32", self.cpu32),
         ];
         for (name, count) in checks {
             if count == 0 {
@@ -220,12 +239,20 @@ pub(crate) struct VmAirs {
     pub keccak: VmAir,
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
+    pub ecsm: VmAir,
+    pub ec_scalar: VmAir,
+    pub ecdas: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
     /// Whether the HALT table participates in this proof. False for intermediate
     /// continuation epochs, which do not terminate the program.
     pub include_halt: bool,
+    // Auxiliary ALU / memory / CPU32 dispatch chips
+    pub eqs: Vec<VmAir>,
+    pub bytewises: Vec<VmAir>,
+    pub stores: Vec<VmAir>,
+    pub cpu32s: Vec<VmAir>,
 }
 
 impl VmAirs {
@@ -238,6 +265,9 @@ impl VmAirs {
             (&self.keccak, &mut traces.keccak, &()),
             (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
             (&self.keccak_rc, &mut traces.keccak_rc, &()),
+            (&self.ecsm, &mut traces.ecsm, &()),
+            (&self.ec_scalar, &mut traces.ec_scalar, &()),
+            (&self.ecdas, &mut traces.ecdas, &()),
             (&self.register, &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -285,6 +315,18 @@ impl VmAirs {
         {
             pairs.push((air, trace, &()));
         }
+        for (air, trace) in self.eqs.iter().zip(traces.eqs.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.bytewises.iter().zip(traces.bytewises.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.stores.iter().zip(traces.stores.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
+        for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
+            pairs.push((air, trace, &()));
+        }
 
         pairs
     }
@@ -298,6 +340,9 @@ impl VmAirs {
             &self.keccak,
             &self.keccak_rnd,
             &self.keccak_rc,
+            &self.ecsm,
+            &self.ec_scalar,
+            &self.ecdas,
             &self.register,
         ];
         if self.include_halt {
@@ -335,6 +380,18 @@ impl VmAirs {
             refs.push(air);
         }
         for air in &self.memw_registers {
+            refs.push(air);
+        }
+        for air in &self.eqs {
+            refs.push(air);
+        }
+        for air in &self.bytewises {
+            refs.push(air);
+        }
+        for air in &self.stores {
+            refs.push(air);
+        }
+        for air in &self.cpu32s {
             refs.push(air);
         }
 
@@ -435,6 +492,9 @@ impl VmAirs {
         let register_init = register_init
             .cloned()
             .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+        let ecsm = create_ecsm_air(proof_options);
+        let ec_scalar = create_ec_scalar_air(proof_options);
+        let ecdas = create_ecdas_air(proof_options);
         let register = create_register_air(proof_options).with_preprocessed(
             register::preprocessed_commitment(proof_options, &register_init),
             register::NUM_PREPROCESSED_COLS,
@@ -478,6 +538,18 @@ impl VmAirs {
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
             .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
             .collect();
+        let eqs: Vec<_> = (0..table_counts.eq)
+            .map(|i| create_eq_air(proof_options).with_name(&format!("EQ[{}]", i)))
+            .collect();
+        let bytewises: Vec<_> = (0..table_counts.bytewise)
+            .map(|i| create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+            .collect();
+        let stores: Vec<_> = (0..table_counts.store)
+            .map(|i| create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+            .collect();
+        let cpu32s: Vec<_> = (0..table_counts.cpu32)
+            .map(|i| create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+            .collect();
 
         #[cfg(feature = "debug-checks")]
         debug_report::print_bus_legend();
@@ -499,10 +571,17 @@ impl VmAirs {
             keccak,
             keccak_rnd,
             keccak_rc,
+            ecsm,
+            ec_scalar,
+            ecdas,
             register,
             pages,
             memw_registers,
             include_halt,
+            eqs,
+            bytewises,
+            stores,
+            cpu32s,
         }
     }
 }
@@ -886,11 +965,12 @@ pub fn verify_with_options(
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
-    // Fixed tables (bitwise, decode, halt, commit, keccak, keccak_rnd, keccak_rc, register) = 8, plus page tables.
-    let expected_proof_count = vm_proof.table_counts.total() + 8 + page_configs.len();
+    // FIXED_TABLE_COUNT always-present tables, plus page tables.
+    let expected_proof_count =
+        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
     if expected_proof_count != vm_proof.proof.proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
-            "table_counts total ({}) + 8 fixed + {} pages = {}, but proof contains {} sub-proofs",
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,

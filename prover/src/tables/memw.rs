@@ -22,7 +22,8 @@
 //! - `μ_sum`: μ_read + μ_write
 //!
 //! ## Bus Interactions (26)
-//! - 8 LT timestamp checks (old_timestamp[i] < timestamp)
+//! - 8 ALU lookups for timestamp ordering (old_timestamp[i] < timestamp,
+//!   dispatched as `ALU[old_ts, ts, opsel(LT), 1, 0]` on the unified bus)
 //! - 16 Memory bus tokens (read old + write new, per byte)
 //! - 2 MEMW output interactions (read + write, from CPU)
 //!
@@ -35,7 +36,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW table chunk.
@@ -174,59 +175,59 @@ pub fn generate_memw_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Input columns
-        data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
+        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
 
         // base_address as DWordWL (2 words)
         let base_addr_lo = op.base_address & 0xFFFF_FFFF;
-        data[base + cols::BASE_ADDRESS_0] = FE::from(base_addr_lo);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
 
         // value[8]
         for i in 0..8 {
-            data[base + cols::VALUE[i]] = FE::from(op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
         }
 
         // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // write flags
         let (w2, w4, w8) = op.write_flags();
-        data[base + cols::WRITE2] = FE::from(w2 as u64);
-        data[base + cols::WRITE4] = FE::from(w4 as u64);
-        data[base + cols::WRITE8] = FE::from(w8 as u64);
+        table.set_bool(row_idx, cols::WRITE2, w2);
+        table.set_bool(row_idx, cols::WRITE4, w4);
+        table.set_bool(row_idx, cols::WRITE8, w8);
 
         // Output: old[8]
         for i in 0..8 {
-            data[base + cols::OLD[i]] = FE::from(op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i]);
         }
 
         // Auxiliary: carry[7]
         // carry[i] = 1 if (base_address_lo + i+1) >= 2^32
         for i in 0..7 {
             let overflows = base_addr_lo + (i as u64 + 1) >= (1u64 << 32);
-            data[base + cols::CARRY[i]] = FE::from(overflows as u64);
+            table.set_bool(row_idx, cols::CARRY[i], overflows);
         }
 
         // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
         for i in 0..8 {
             let cols_i = cols::old_timestamp(i);
-            data[base + cols_i[0]] = FE::from(op.old_timestamp[i] & 0xFFFF_FFFF);
-            data[base + cols_i[1]] = FE::from(op.old_timestamp[i] >> 32);
+            table.set_dword_wl(row_idx, cols_i[0], op.old_timestamp[i]);
         }
 
         // Multiplicity
-        data[base + cols::MU_READ] = FE::from(op.is_read as u64);
-        data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
+        table.set_bool(row_idx, cols::MU_READ, op.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -747,12 +748,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // LT interactions for timestamp ordering (MEMW-C4 through C7)
+    // ALU interactions for timestamp ordering (MEMW-C4 through C7).
+    // Each lookup is dispatched on the unified ALU bus as
+    // `[old_ts, ts, opsel(LT), 1, 0]` (signed=0, invert=0, asserting
+    // old_ts < ts); there is no dedicated `Lt` bus.
     // -------------------------------------------------------------------------
 
-    // MEMW-C4: LT[1; old_timestamp[0], timestamp] with μ_sum
+    // MEMW-C4: old_timestamp[0] < timestamp with μ_sum
     interactions.push(BusInteraction::sender(
-        BusId::Lt,
+        BusId::Alu,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
             BusValue::Packed {
@@ -763,14 +767,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
             BusValue::constant(1),
+            BusValue::constant(0),
         ],
     ));
 
-    // MEMW-C5: LT[1; old_timestamp[1], timestamp] with w2
+    // MEMW-C5: old_timestamp[1] < timestamp with w2
     interactions.push(BusInteraction::sender(
-        BusId::Lt,
+        BusId::Alu,
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
@@ -781,15 +786,16 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP_0,
                 packing: Packing::DWordWL,
             },
-            BusValue::constant(0),
+            BusValue::constant(alu_op::LT as u64),
             BusValue::constant(1),
+            BusValue::constant(0),
         ],
     ));
 
-    // MEMW-C6: LT[1; old_timestamp[i], timestamp] for i ∈ [2,3] with w4
+    // MEMW-C6: old_timestamp[i] < timestamp for i ∈ [2,3] with w4
     for i in 2..4 {
         interactions.push(BusInteraction::sender(
-            BusId::Lt,
+            BusId::Alu,
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
@@ -800,16 +806,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_0,
                     packing: Packing::DWordWL,
                 },
-                BusValue::constant(0),
+                BusValue::constant(alu_op::LT as u64),
                 BusValue::constant(1),
+                BusValue::constant(0),
             ],
         ));
     }
 
-    // MEMW-C7: LT[1; old_timestamp[i], timestamp] for i ∈ [4,7] with write8
+    // MEMW-C7: old_timestamp[i] < timestamp for i ∈ [4,7] with write8
     for i in 4..8 {
         interactions.push(BusInteraction::sender(
-            BusId::Lt,
+            BusId::Alu,
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
@@ -820,8 +827,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     start_column: cols::TIMESTAMP_0,
                     packing: Packing::DWordWL,
                 },
-                BusValue::constant(0),
+                BusValue::constant(alu_op::LT as u64),
                 BusValue::constant(1),
+                BusValue::constant(0),
             ],
         ));
     }
@@ -867,6 +875,8 @@ pub enum MemwConstraintKind {
     MuSumIsBit,
     /// w2 => μ_sum: if accessing 2+ bytes, must be active row
     W2ImpliesMuSum,
+    /// IS_BIT<write2 + write4 + write8>: the width-sum is 0 or 1 (spec assumption).
+    WidthSumIsBit,
 }
 
 /// MEMW table constraint.
@@ -900,6 +910,10 @@ impl MemwConstraint {
                 let mu_sum = compute_mu_sum(step);
                 &w2 * (&one - &mu_sum)
             }
+            MemwConstraintKind::WidthSumIsBit => {
+                let w2 = compute_w2(step);
+                &w2 * (&one - &w2)
+            }
         }
     }
 }
@@ -909,6 +923,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         match self.kind {
             MemwConstraintKind::MuSumIsBit => 2,
             MemwConstraintKind::W2ImpliesMuSum => 2,
+            MemwConstraintKind::WidthSumIsBit => 2,
         }
     }
 
@@ -927,12 +942,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 
 /// Creates all constraints for the MEMW table.
 ///
-/// 11 constraints total:
+/// 15 constraints total:
 /// - IS_BIT<μ_sum> (1)
 /// - w2 => μ_sum (1)
 /// - IS_BIT<μ_read> (1)
 /// - IS_BIT<μ_write> (1)
 /// - IS_BIT for carry[0..6] (7)
+/// - IS_BIT<write2/write4/write8> (3) + IS_BIT<write2+write4+write8> (1) [spec assumption]
 pub fn constraints()
 -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<
@@ -962,6 +978,13 @@ pub fn constraints()
         constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
         idx += 1;
     }
+
+    // IS_BIT on the width flags + their sum (spec defense-in-depth assumption).
+    for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
+        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
+        idx += 1;
+    }
+    constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
 
     constraints
 }

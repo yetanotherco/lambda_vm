@@ -23,7 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
 // =========================================================================
@@ -94,36 +94,30 @@ pub struct KeccakOperation {
 // Trace generation
 // =========================================================================
 
-fn byte_of(val: u64, b: usize) -> u8 {
-    ((val >> (b * 8)) & 0xFF) as u8
-}
-
 pub fn generate_keccak_trace(
     ops: &[KeccakOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Timestamp
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // Address as 8 bytes
-        for b in 0..8 {
-            data[base + cols::addr(b)] = FE::from(byte_of(op.state_addr, b) as u64);
-        }
+        table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
 
         // Input state as bytes
         for x in 0..5 {
             for y in 0..5 {
                 let lane = op.input[x + 5 * y];
-                for b in 0..8 {
-                    data[base + cols::input_state(x, y, b)] = FE::from(byte_of(lane, b) as u64);
-                }
+                table.set_dword_bl(row_idx, cols::input_state(x, y, 0), lane);
             }
         }
 
@@ -131,9 +125,7 @@ pub fn generate_keccak_trace(
         for x in 0..5 {
             for y in 0..5 {
                 let lane = op.output[x + 5 * y];
-                for b in 0..8 {
-                    data[base + cols::output_state(x, y, b)] = FE::from(byte_of(lane, b) as u64);
-                }
+                table.set_dword_bl(row_idx, cols::output_state(x, y, 0), lane);
             }
         }
 
@@ -143,14 +135,11 @@ pub fn generate_keccak_trace(
                 .state_addr
                 .checked_add(lane_idx as u64 * 8)
                 .expect("keccak state address range must be validated by the executor");
-            data[base + cols::state_ptr(lane_idx, 0)] = FE::from(ptr & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 1)] = FE::from((ptr >> 16) & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 2)] = FE::from((ptr >> 32) & 0xFFFF);
-            data[base + cols::state_ptr(lane_idx, 3)] = FE::from((ptr >> 48) & 0xFFFF);
+            table.set_dword_hl(row_idx, cols::state_ptr(lane_idx, 0), ptr);
         }
 
         // mu = 1 (real row)
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows: state_ptr[lane][0] = 8 * lane_idx (per spec keccak.toml pad).
@@ -158,13 +147,12 @@ pub fn generate_keccak_trace(
     // mu = 0 gates all bus interactions and the ADD constraint, so these values
     // only need to satisfy the pad requirement, not reconstruct a real address.
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
         for lane_idx in 0..25 {
-            data[base + cols::state_ptr(lane_idx, 0)] = FE::from((lane_idx as u64) * 8);
+            table.set_u64(row_idx, cols::state_ptr(lane_idx, 0), (lane_idx as u64) * 8);
         }
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -354,9 +342,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 5. Alignment: addr[0] & 7 = 0, which enforces addr % 8 == 0.
     interactions.push(BusInteraction::sender(
-        BusId::AndByte,
+        BusId::ByteAlu,
         Multiplicity::Column(cols::MU),
         vec![
+            BusValue::constant(alu_op::AND as u64),
             BusValue::Packed {
                 start_column: cols::addr(0),
                 packing: Packing::Direct,

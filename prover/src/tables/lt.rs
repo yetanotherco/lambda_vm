@@ -23,16 +23,17 @@
 //! ## Bus Interactions
 //! - Sender: MSB16 (×2 for lhs_msb, rhs_msb)
 //! - Sender: IS_HALFWORD (×6: ×4 for lhs_sub_rhs, ×1 for lhs[1], ×1 for rhs[1])
-//! - Receiver: LT (provides less-than results to other tables)
+//! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
+//!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
-use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
 // =========================================================================
 // Column indices for LT table
@@ -80,12 +81,18 @@ pub mod cols {
     /// rhs_msb: Bit (MSB of rhs, i.e., bit 63)
     pub const RHS_MSB: usize = 13;
 
-    // Multiplicity column
-    /// μ: multiplicity for bus interactions
-    pub const MU: usize = 14;
+    // Every LT lookup (CPU SLT/BLT/BGE dispatch and the internal
+    // memw/memw_aligned/dvrm comparisons) goes through the unified `ALU` bus,
+    // so one multiplicity column suffices.
+    /// invert: Bit — invert the comparison (BGE/BGEU); `out = lt XOR invert`.
+    pub const INVERT: usize = 14;
+    /// out: the ALU result `lt XOR invert` (the low word; high word is 0).
+    pub const OUT: usize = 15;
+    /// μ: multiplicity for the `ALU` bus receiver.
+    pub const MU: usize = 16;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 15;
+    pub const NUM_COLUMNS: usize = 17;
 }
 
 // =========================================================================
@@ -93,6 +100,10 @@ pub mod cols {
 // =========================================================================
 
 /// A single LT operation to be added to the trace.
+///
+/// Every operation is dispatched on the unified `ALU` bus; the `invert` flag
+/// distinguishes plain less-than (memw/dvrm internal checks, CPU `SLT[U]`/`BLT[U]`)
+/// from the inverted form (`BGE[U]`).
 ///
 /// Derives Hash and Eq so it can be used as a HashMap key for deduplication.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -103,21 +114,43 @@ pub struct LtOperation {
     pub rhs: u64,
     /// Whether to do signed comparison
     pub signed: bool,
+    /// Whether to invert the result (`out = lt XOR invert`); used for BGE/BGEU.
+    pub invert: bool,
 }
 
 impl LtOperation {
-    /// Create a new LT operation.
+    /// Create a new LT operation with `invert = false` (plain less-than).
     pub fn new(lhs: u64, rhs: u64, signed: bool) -> Self {
-        Self { lhs, rhs, signed }
+        Self {
+            lhs,
+            rhs,
+            signed,
+            invert: false,
+        }
     }
 
-    /// Compute the less-than result.
+    /// Create a new LT operation with an explicit `invert` flag (BGE/BGEU dispatch).
+    pub fn new_with_invert(lhs: u64, rhs: u64, signed: bool, invert: bool) -> Self {
+        Self {
+            lhs,
+            rhs,
+            signed,
+            invert,
+        }
+    }
+
+    /// Compute the raw less-than result (before inversion).
     pub fn compute_lt(&self) -> bool {
         if self.signed {
             (self.lhs as i64) < (self.rhs as i64)
         } else {
             self.lhs < self.rhs
         }
+    }
+
+    /// The ALU output: `lt XOR invert`.
+    pub fn compute_out(&self) -> bool {
+        self.compute_lt() ^ self.invert
     }
 }
 
@@ -138,59 +171,45 @@ pub fn generate_lt_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
-        // Extract lhs as DWordHHW: [Word, Half, Half]
-        let lhs_0 = (op.lhs & 0xFFFF_FFFF) as u32; // bits 0-31
-        let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16; // bits 32-47
-        let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16; // bits 48-63
-
-        // Extract rhs as DWordHHW: [Word, Half, Half]
-        let rhs_0 = (op.rhs & 0xFFFF_FFFF) as u32; // bits 0-31
-        let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16; // bits 32-47
-        let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16; // bits 48-63
-
         // Store input columns
-        data[base + cols::LHS_0] = FE::from(lhs_0 as u64);
-        data[base + cols::LHS_1] = FE::from(lhs_1 as u64);
-        data[base + cols::LHS_2] = FE::from(lhs_2 as u64);
-        data[base + cols::RHS_0] = FE::from(rhs_0 as u64);
-        data[base + cols::RHS_1] = FE::from(rhs_1 as u64);
-        data[base + cols::RHS_2] = FE::from(rhs_2 as u64);
-        data[base + cols::SIGNED] = FE::from(if op.signed { 1u64 } else { 0u64 });
+        table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
+        table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
 
         // Compute lt result
         let lt = op.compute_lt();
-        data[base + cols::LT] = FE::from(if lt { 1u64 } else { 0u64 });
+        table.set_bool(row_idx, cols::LT, lt);
 
         // Compute lhs_sub_rhs = lhs - rhs (wrapping)
         // Note: We compute this as a 64-bit wrapping subtraction
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
 
         // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
-        let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
-        let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
-        let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
-        let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
-        data[base + cols::LHS_SUB_RHS_0] = FE::from(sub_0 as u64);
-        data[base + cols::LHS_SUB_RHS_1] = FE::from(sub_1 as u64);
-        data[base + cols::LHS_SUB_RHS_2] = FE::from(sub_2 as u64);
-        data[base + cols::LHS_SUB_RHS_3] = FE::from(sub_3 as u64);
+        table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
 
         // Compute MSBs (bit 63 of each value)
         let lhs_msb = (op.lhs >> 63) & 1;
         let rhs_msb = (op.rhs >> 63) & 1;
-        data[base + cols::LHS_MSB] = FE::from(lhs_msb);
-        data[base + cols::RHS_MSB] = FE::from(rhs_msb);
+        table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
+        table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
 
-        // Multiplicity: aggregated count of this operation
-        data[base + cols::MU] = FE::from(*multiplicity);
+        // ALU-bus fields: invert + the inverted output.
+        table.set_bool(row_idx, cols::INVERT, op.invert);
+        table.set_bool(row_idx, cols::OUT, op.compute_out());
+
+        // All LT lookups go through the unified ALU bus → single multiplicity.
+        table.set_u64(row_idx, cols::MU, *multiplicity);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
@@ -291,78 +310,43 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             }],
         ),
-        // LT[lhs, rhs, signed] -> lt (receiver)
-        // lhs is DWordHHW, rhs is DWordHHW, signed is Bit, lt is Bit
-        // Uses DWordHHW packing: reads 3 columns (Word, Half, Half), produces 2 bus elements [lo32, hi32]
-        // This allows DWordWL senders (like MEMW timestamps) to match via Packing::DWordWL
+        // ALU[lhs, rhs, opsel(LT) + 32*signed + 64*invert] -> out  (receiver).
+        // Every LT lookup arrives here: the CPU dispatches SLT/BLT/BGE on the
+        // unified ALU bus, and the internal memw/memw_aligned/dvrm comparisons
+        // (timestamps and |r|<|d|) encode `signed=0, invert=0`. lhs/rhs are
+        // packed DWordHHW -> [lo32, hi32] (matching DWordWL senders); the
+        // output is [out, 0] (a comparison result fits in the low word).
         BusInteraction::receiver(
-            BusId::Lt,
+            BusId::Alu,
             Multiplicity::Column(cols::MU),
             vec![
-                // lhs as DWordHHW (reads 3 columns: Word, Half, Half; produces 2 elements: [lo32, hi32])
                 BusValue::Packed {
                     start_column: cols::LHS_0,
                     packing: Packing::DWordHHW,
                 },
-                // rhs as DWordHHW (reads 3 columns, produces 2 elements)
                 BusValue::Packed {
                     start_column: cols::RHS_0,
                     packing: Packing::DWordHHW,
                 },
-                // signed
+                BusValue::linear(vec![
+                    LinearTerm::Constant(alu_op::LT as i64),
+                    LinearTerm::Column {
+                        coefficient: 32,
+                        column: cols::SIGNED,
+                    },
+                    LinearTerm::Column {
+                        coefficient: 64,
+                        column: cols::INVERT,
+                    },
+                ]),
                 BusValue::Packed {
-                    start_column: cols::SIGNED,
+                    start_column: cols::OUT,
                     packing: Packing::Direct,
                 },
-                // lt (output)
-                BusValue::Packed {
-                    start_column: cols::LT,
-                    packing: Packing::Direct,
-                },
+                BusValue::constant(0),
             ],
         ),
     ]
-}
-
-/// Compute virtual carry[0] and carry[1] for the addition rhs + lhs_sub_rhs = lhs
-///
-/// From spec:
-/// carry[0] = 2^(-32) * (rhs[0] + cast(lhs_sub_rhs, DWordWL)[0] - lhs[0])
-/// carry[1] = 2^(-32) * (cast(rhs, DWordWL)[1] + cast(lhs_sub_rhs, DWordWL)[1] + carry[0] - cast(lhs, DWordWL)[1])
-///
-/// Note: carry[1] = 1 means lhs < rhs (unsigned), because the subtraction borrowed
-pub fn compute_carries(lhs: u64, rhs: u64, lhs_sub_rhs: u64) -> (u64, u64) {
-    // Cast to DWordWL format (2 words)
-    let lhs_lo = lhs & 0xFFFF_FFFF;
-    let lhs_hi = lhs >> 32;
-
-    let rhs_lo = rhs & 0xFFFF_FFFF;
-    let rhs_hi = rhs >> 32;
-
-    let sub_lo = lhs_sub_rhs & 0xFFFF_FFFF;
-    let sub_hi = lhs_sub_rhs >> 32;
-
-    // carry[0] = (rhs_lo + sub_lo - lhs_lo) / 2^32
-    // This should be 0 or 1 (or -1 in some representations)
-    let sum_lo = rhs_lo + sub_lo;
-    let carry_0 = if sum_lo >= lhs_lo {
-        (sum_lo - lhs_lo) >> 32
-    } else {
-        // This shouldn't happen if lhs_sub_rhs is computed correctly
-        0
-    };
-
-    // carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32
-    let sum_hi = rhs_hi + sub_hi + carry_0;
-    let carry_1 = if sum_hi >= lhs_hi {
-        (sum_hi - lhs_hi) >> 32
-    } else {
-        // This indicates lhs < rhs (unsigned)
-        // In field arithmetic, this would be handled differently
-        1
-    };
-
-    (carry_0, carry_1)
 }
 
 // =========================================================================
@@ -392,6 +376,15 @@ pub enum LtConstraintKind {
     Carry1IsBit,
     /// LT formula constraint
     LtFormula,
+    /// `out = lt XOR invert`, i.e. `out - (lt + invert - 2*lt*invert) = 0`
+    /// (`lt.toml:159`). The ALU bus consumes `out`, while `LtFormula` only binds
+    /// `lt` — without this the `out` column (used for BGE/BGEU via `invert`) is
+    /// free and any comparison result can be forged.
+    OutXorInvert,
+    /// IS_BIT constraint on `invert` (`lt:c:range_invert`).
+    InvertIsBit,
+    /// IS_BIT constraint on `signed` (`lt:c:range_signed`).
+    SignedIsBit,
 }
 
 impl LtConstraint {
@@ -518,6 +511,24 @@ impl LtConstraint {
                 // Constraint: lt - expected_lt = 0
                 lt - expected_lt
             }
+            LtConstraintKind::OutXorInvert => {
+                // out = lt XOR invert = lt + invert - 2*lt*invert
+                let out = step.get_main_evaluation_element(0, cols::OUT).clone();
+                let lt = step.get_main_evaluation_element(0, cols::LT).clone();
+                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
+                let two = FieldElement::<F>::from(2u64);
+                out - (&lt + &invert - two * &lt * &invert)
+            }
+            LtConstraintKind::InvertIsBit => {
+                // invert * (1 - invert) = 0
+                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
+                &invert * (one - &invert)
+            }
+            LtConstraintKind::SignedIsBit => {
+                // signed * (1 - signed) = 0
+                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
+                &signed * (one - &signed)
+            }
         }
     }
 }
@@ -530,6 +541,11 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint
             LtConstraintKind::Carry1IsBit => 2,
             // LT formula involves products like signed * A * (1-B)
             LtConstraintKind::LtFormula => 3,
+            // out - (lt + invert - 2*lt*invert): the lt*invert product is degree 2
+            LtConstraintKind::OutXorInvert => 2,
+            // X*(1-X)
+            LtConstraintKind::InvertIsBit => 2,
+            LtConstraintKind::SignedIsBit => 2,
         }
     }
 
@@ -563,6 +579,23 @@ pub fn lt_constraints(constraint_idx_start: usize) -> (Vec<LtConstraint>, usize)
             i
         }),
         LtConstraint::new(LtConstraintKind::LtFormula, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        // out = lt XOR invert (binds the ALU-bus-consumed `out` column).
+        LtConstraint::new(LtConstraintKind::OutXorInvert, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        // Range-check the boolean flags that drive the formula / bus.
+        LtConstraint::new(LtConstraintKind::InvertIsBit, {
+            let i = idx;
+            idx += 1;
+            i
+        }),
+        LtConstraint::new(LtConstraintKind::SignedIsBit, {
             let i = idx;
             idx += 1;
             i
