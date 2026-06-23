@@ -379,7 +379,12 @@ fn collect_ops_from_cpu(
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
-    let mut current_commit_index = 0u32;
+    // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
+    // continuation epoch indexes its commits globally, matching the x254 the
+    // register binding transports across epochs. Resetting to 0 here would drift
+    // from x254 and break the COMMIT chip's Memw token (see the drift assert below).
+    let start_commit_index = register_state.read_index().0;
+    let mut current_commit_index = start_commit_index;
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
@@ -482,10 +487,11 @@ fn collect_ops_from_cpu(
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    // Each ecall generates count+1 operations (count real rows + 1 end row)
+    // Each ecall generates count+1 operations (count real rows + 1 end row).
+    // Count only this epoch's rows, so subtract the carried start index.
     debug_assert_eq!(
         commit_ops.len(),
-        current_commit_index as usize + commit_ecall_count as usize,
+        (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
 

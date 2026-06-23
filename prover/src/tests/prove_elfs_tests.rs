@@ -79,6 +79,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -164,6 +165,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -1202,6 +1204,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -1954,6 +1957,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2024,6 +2028,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2129,6 +2134,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2780,6 +2786,7 @@ fn test_prove_first_epoch_without_halt() {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
+        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -2867,6 +2874,7 @@ fn test_prove_second_epoch_from_snapshot() {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
+        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -2975,6 +2983,7 @@ fn test_epoch_proof_commits_l2g() {
         &refs,
         &multi_proof,
         &traces.public_output_bytes,
+        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -3130,6 +3139,7 @@ fn test_continuation_pipeline_end_to_end() {
             &refs,
             &multi_proof,
             &traces.public_output_bytes,
+            0,
             &mut replay,
         )
         .expect("fingerprint collision in test");
@@ -3258,6 +3268,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         &refs,
         &multi_proof,
         &traces.public_output_bytes,
+        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");

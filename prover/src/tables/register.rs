@@ -178,10 +178,10 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Has
         init.insert(base, (value & 0xFFFF_FFFF) as u32);
         init.insert(base + 1, (value >> 32) as u32);
     }
-    // x254 synthetic commit index. NAIVE LIMITATION: hardcoded to 0, which is
-    // only correct for an epoch with no preceding COMMIT. The commit index is
-    // not carried across epochs, so this is unsound for programs that COMMIT
-    // across an epoch boundary — deferred to the cross-epoch soundness work.
+    // x254 synthetic commit index, hardcoded to 0 in this test-only helper, so it
+    // is only correct for an epoch with no preceding COMMIT. The production path
+    // carries x254 across epochs via `register_init_from_fini` (the bound FINI),
+    // not this snapshot helper.
     init.insert(508, 0);
     init.insert(510, (pc & 0xFFFF_FFFF) as u32);
     init.insert(511, (pc >> 32) as u32);

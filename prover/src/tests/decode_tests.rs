@@ -1081,6 +1081,7 @@ fn test_decode_soundness_same_elf_accepted() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
+        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");

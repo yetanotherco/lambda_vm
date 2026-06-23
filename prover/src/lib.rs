@@ -543,6 +543,7 @@ pub(crate) fn replay_transcript_phase_a(
 /// which the caller should treat as verification failure.
 pub(crate) fn compute_commit_bus_offset(
     public_output: &[u8],
+    start_index: u64,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
 ) -> Option<FieldElement<E>> {
@@ -553,13 +554,16 @@ pub(crate) fn compute_commit_bus_offset(
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
     let alpha_sq = alpha * alpha;
 
-    // fingerprint_i = z - (BusId::Commit + i·α + value_i·α²)
+    // fingerprint_i = z - (BusId::Commit + (start_index + i)·α + value_i·α²).
+    // `start_index` is the carried x254: 0 for a monolithic proof or the first
+    // epoch, nonzero for a continuation epoch whose commits continue a prior one.
     let mut fingerprints: Vec<FieldElement<E>> = public_output
         .iter()
         .enumerate()
         .map(|(i, &value)| {
+            let global_index = start_index + i as u64;
             let linear_combination = bus_id
-                + (FieldElement::<E>::from(i as u64) * alpha)
+                + (FieldElement::<E>::from(global_index) * alpha)
                 + (FieldElement::<E>::from(value as u64) * alpha_sq);
             z - linear_combination
         })
@@ -585,10 +589,11 @@ pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
+    start_index: u64,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
-    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
 /// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
@@ -932,6 +937,8 @@ pub fn verify_with_options(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        // Monolithic proof: commits are indexed from 0.
+        0,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,

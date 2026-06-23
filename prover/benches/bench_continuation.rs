@@ -116,13 +116,13 @@ fn main() {
                 .get(3)
                 .map(|s| s.parse().expect("bad epoch_size"))
                 .unwrap_or(65536);
-            let ok = lambda_vm_prover::continuation::prove_and_verify_continuation(
+            let output = lambda_vm_prover::continuation::prove_and_verify_continuation(
                 &elf,
                 &private_inputs,
                 epoch_size,
             )
             .expect("continuation failed");
-            assert!(ok, "continuation did not verify");
+            assert!(output.is_some(), "continuation did not verify");
             println!("cont prove+verify ok (epoch_size={epoch_size})");
         }
         other => {

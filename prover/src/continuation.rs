@@ -22,9 +22,15 @@
 //! `R_{i+1}` (alongside `INIT = R_i`), and the driver reuses the same `R_{i+1}`
 //! as the next epoch's preprocessed `INIT` — so `init(epoch i+1) == fini(epoch i)`
 //! by construction, with the REG-C2 Memory bus binding `FINI` to the true final
-//! registers. No extra bus. Still deferred: statement/Fiat-Shamir binding of the
-//! per-epoch transcripts (only needed for a split prover/verifier) and the x254
-//! commit-index across epoch boundaries.
+//! registers. No extra bus.
+//!
+//! The x254 commit index is carried across epochs by that same register binding,
+//! so a continuation epoch indexes its commits from the carried value: both the
+//! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
+//! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
+//! driver concatenates each epoch's committed bytes into the run-wide output.
+//! Still deferred: a standalone split prover/verifier (the prove and verify halves
+//! currently run in one integrated function).
 
 use std::collections::HashMap;
 
@@ -224,14 +230,16 @@ struct EpochStart<'a> {
 }
 
 /// A successful epoch proof's outputs:
-/// - the L2G commitment root the global proof binds against (cross-epoch memory), and
+/// - the L2G commitment root the global proof binds against (cross-epoch memory),
 /// - the epoch's final register file `R_{i+1}`: the 67 final register values in
-///   `register_word_address_list` order (read from the committed REGISTER trace).
+///   `register_word_address_list` order (read from the committed REGISTER trace), and
+/// - the bytes this epoch committed, concatenated by the driver into the run-wide
+///   public output (each epoch indexes its commits from the carried x254).
 ///
 /// The driver feeds `R_{i+1}` to the next epoch as its preprocessed INIT — that,
 /// plus this epoch's preprocessed FINI commitment over the same `R_{i+1}`, binds
 /// `init(epoch i+1) == fini(epoch i)`.
-type EpochOutput = (Commitment, Vec<u32>);
+type EpochOutput = (Commitment, Vec<u32>, Vec<u8>);
 
 /// Prove and verify one epoch, committing its local-to-global table (built from
 /// `boundary`) on the epoch-local Memory bus, and its REGISTER table with FINI
@@ -349,8 +357,21 @@ fn prove_verify_epoch(
 
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
-    let expected = compute_expected_commit_bus_balance(&refs, &proof, &public_output, &mut seed())
-        .ok_or_else(|| Error::Prover("commit bus fingerprint collision".into()))?;
+    // This epoch's commits continue from the carried x254 (the running global
+    // commit index), so the verifier indexes them from there, not from 0.
+    let commit_start_index = start
+        .register_init
+        .get(&register::register_base_address(254))
+        .copied()
+        .unwrap_or(0) as u64;
+    let expected = compute_expected_commit_bus_balance(
+        &refs,
+        &proof,
+        &public_output,
+        commit_start_index,
+        &mut seed(),
+    )
+    .ok_or_else(|| Error::Prover("commit bus fingerprint collision".into()))?;
 
     if !Verifier::multi_verify(&refs, &proof, &mut seed(), &expected) {
         return Ok(None);
@@ -358,6 +379,7 @@ fn prove_verify_epoch(
     Ok(Some((
         proof.proofs.last().unwrap().lde_trace_main_merkle_root,
         reg_fini,
+        public_output,
     )))
 }
 
@@ -464,12 +486,14 @@ fn verify_global(
 /// Prove and verify a full continuation: split the execution into epochs of
 /// `epoch_size` cycles, prove+verify each epoch, prove+verify the cross-epoch
 /// global memory linkage, and check that each epoch proof committed the same
-/// local-to-global table the global proof used. Returns `Ok(true)` iff all hold.
+/// local-to-global table the global proof used. On success returns
+/// `Ok(Some(public_output))` — the run-wide committed bytes concatenated across
+/// epochs in execution order; returns `Ok(None)` if any check fails.
 pub fn prove_and_verify_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size: usize,
-) -> Result<bool, Error> {
+) -> Result<Option<Vec<u8>>, Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -486,6 +510,10 @@ pub fn prove_and_verify_continuation(
     let mut provenance = local_to_global::genesis_provenance(&initial_memory);
     let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
     let mut epoch_roots: Vec<Commitment> = Vec::new();
+    // The run-wide public output: each epoch's committed bytes, concatenated in
+    // execution order. Epoch i+1's commits are indexed from the carried x254, so
+    // this is the same byte stream a monolithic proof would commit.
+    let mut public_output: Vec<u8> = Vec::new();
     // The previous epoch's bound final register file (its REGISTER FINI, read back
     // via `fini_from_trace` as the 67 values in `register_word_address_list` order).
     // Epoch i+1's register init is sourced from it — and its preprocessed INIT
@@ -546,11 +574,12 @@ pub fn prove_and_verify_continuation(
             private_inputs,
             &opts,
         )? {
-            Some((root, reg_fini)) => {
+            Some((root, reg_fini, epoch_output)) => {
                 epoch_roots.push(root);
                 prev_fini = Some(reg_fini);
+                public_output.extend_from_slice(&epoch_output);
             }
-            None => return Ok(false),
+            None => return Ok(None),
         }
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -576,16 +605,52 @@ pub fn prove_and_verify_continuation(
         private_inputs,
         &opts,
     ) {
-        return Ok(false);
+        return Ok(None);
     }
 
-    Ok(verify_l2g_commitment_binding(&epoch_roots, &global_proof))
+    if verify_l2g_commitment_binding(&epoch_roots, &global_proof) {
+        Ok(Some(public_output))
+    } else {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::test_utils::asm_elf_bytes;
+
+    // `test_commit_split` issues two Commit syscalls, one early and one late, so a
+    // small epoch puts the second commit in a later epoch. That epoch starts with
+    // x254 > 0 (the carried commit index), which exercises the cross-epoch commit
+    // indexing: both the COMMIT trace and the verifier's `compute_commit_bus_offset`
+    // index from the carried x254 rather than 0. Regression test for that fix.
+    #[test]
+    fn test_commit_across_epochs_verifies() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let expected_output: [u8; 4] = [0xAA, 0xBB, 0xCC, 0xDD];
+
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
+
+        // Both commits in a single epoch (x254 starts at 0).
+        let single = prove_and_verify_continuation(&elf_bytes, &[], total).unwrap();
+        assert_eq!(single.as_deref(), Some(&expected_output[..]));
+
+        // The late commit (only `halt` follows it) lands past the midpoint, so a
+        // half-sized epoch forces it into a later epoch where x254 is already 2.
+        let split = prove_and_verify_continuation(&elf_bytes, &[], (total / 2).max(1)).unwrap();
+        assert_eq!(
+            split.as_deref(),
+            Some(&expected_output[..]),
+            "commit in a later epoch must verify and aggregate to the same output"
+        );
+    }
 
     #[test]
     fn test_prove_and_verify_continuation() {
@@ -599,6 +664,10 @@ mod tests {
             .logs
             .len();
         let epoch_size = (total / 3).max(1);
-        assert!(prove_and_verify_continuation(&elf_bytes, &[], epoch_size).unwrap());
+        assert!(
+            prove_and_verify_continuation(&elf_bytes, &[], epoch_size)
+                .unwrap()
+                .is_some()
+        );
     }
 }
