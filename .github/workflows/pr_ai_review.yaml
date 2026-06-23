@@ -8,6 +8,7 @@ on:
 
 # One review at a time per PR; a genuine re-request cancels the in-flight run so
 # rapid re-labels/`/ai-review` comments can't race and post duplicate reports.
+# Both `/ai-review` and `/review-ai` are accepted (the name is easy to misremember).
 #
 # cancel-in-progress is gated on the trigger being a REAL request. The native
 # claude-review job posts its report as a GitHub App comment (claude[bot]), and
@@ -19,7 +20,7 @@ on:
 # Gating the cancel means such non-command comments queue-and-skip instead.
 concurrency:
   group: ai-review-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && contains(github.event.comment.body, '/ai-review')) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || (github.event_name == 'issue_comment' && (contains(github.event.comment.body, '/ai-review') || contains(github.event.comment.body, '/review-ai'))) }}
 
 # Default least-privilege: read-only. Only the jobs that need to write (final-report
 # posts the comment; the native reviews) request write/id-token at the job level.
@@ -33,7 +34,7 @@ jobs:
       (
         github.event_name == 'issue_comment' &&
         github.event.issue.pull_request &&
-        contains(github.event.comment.body, '/ai-review') &&
+        (contains(github.event.comment.body, '/ai-review') || contains(github.event.comment.body, '/review-ai')) &&
         contains(fromJson('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.comment.author_association)
       ) ||
       (
@@ -515,7 +516,7 @@ jobs:
     uses: yetanotherco/actions/.github/workflows/pr_review_claude.yml@v1.0.0
     with:
       model: opus
-      max_turns: 30
+      max_turns: 50
       custom_prompt: ${{ needs.prepare.outputs.custom_prompt }}
     secrets:
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
