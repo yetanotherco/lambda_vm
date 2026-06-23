@@ -990,11 +990,7 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 
-/// Collect BITWISE table lookups needed by a set of unique shift operations.
-///
-/// Each unique operation (with its multiplicity) generates HWSL/BYTE_ALU/MSB16/ZERO
-/// lookups. The lookups must be generated per-unique-operation (matching the SHIFT table's
-/// deduplication and μ column), and repeated `multiplicity` times.
+/// Collect BITWISE table lookups needed by a set of shift operations.
 pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseOperation> {
     // No deduplication: each operation has μ=1, matching generate_shift_trace.
     let mut bitwise_ops = Vec::new();
