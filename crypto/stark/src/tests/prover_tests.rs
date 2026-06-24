@@ -520,3 +520,48 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         );
     }
 }
+
+// Verify that the row-major commit path (used by the CPU LDE after the row-major
+// rework) and the column-major commit path (used by the GPU fused pipeline, which
+// builds its Merkle tree on-device from the same column layout) produce identical
+// Merkle roots for the same data. This closes the CPU/GPU commitment parity gap
+// raised in review: the GPU never calls commit_rows_bit_reversed directly (it
+// commits inline on-device), but the row-major buffer it hands off via
+// columns_to_row_major must be consistent with what the CPU path would commit.
+#[test]
+fn commit_rows_bit_reversed_matches_commit_columns_bit_reversed() {
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    for num_cols in [1usize, 3, 7] {
+        for log_rows in [4usize, 6, 8] {
+            let num_rows = 1usize << log_rows;
+
+            let columns: Vec<Vec<FE>> = (0..num_cols)
+                .map(|c| {
+                    (0..num_rows)
+                        .map(|r| FE::from((c * num_rows + r) as u64 * 6700417 + 1))
+                        .collect()
+                })
+                .collect();
+
+            // Row-major interleaving: data[row * num_cols + col] = columns[col][row].
+            let mut row_major: Vec<FE> = Vec::with_capacity(num_rows * num_cols);
+            for r in 0..num_rows {
+                for c in 0..num_cols {
+                    row_major.push(columns[c][r].clone());
+                }
+            }
+
+            let (_, root_col) = Prover::<F, F, ()>::commit_columns_bit_reversed(&columns)
+                .expect("column-major commit must succeed");
+            let (_, root_row) = Prover::<F, F, ()>::commit_rows_bit_reversed(&row_major, num_cols)
+                .expect("row-major commit must succeed");
+
+            assert_eq!(
+                root_col, root_row,
+                "commit root mismatch: num_cols={num_cols} log_rows={log_rows}"
+            );
+        }
+    }
+}
