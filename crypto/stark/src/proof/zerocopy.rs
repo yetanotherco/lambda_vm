@@ -34,7 +34,6 @@ use crate::frame::Frame;
 /// evaluation slices.
 pub struct PolynomialOpeningsRef<'a, F: IsField> {
     pub proof: &'a [Commitment],
-    pub proof_sym: &'a [Commitment],
     pub evaluations: &'a [FieldElement<F>],
     pub evaluations_sym: &'a [FieldElement<F>],
 }
@@ -281,7 +280,6 @@ fn polynomial_openings_ref<'a, G: IsField>(
 ) -> PolynomialOpeningsRef<'a, G> {
     PolynomialOpeningsRef {
         proof: &p.proof.merkle_path,
-        proof_sym: &p.proof_sym.merkle_path,
         evaluations: &p.evaluations,
         evaluations_sym: &p.evaluations_sym,
     }
@@ -317,7 +315,6 @@ mod archived_impl {
     {
         PolynomialOpeningsRef {
             proof: p.proof.merkle_path.as_slice(),
-            proof_sym: p.proof_sym.merkle_path.as_slice(),
             evaluations: archived_evals(&p.evaluations),
             evaluations_sym: archived_evals(&p.evaluations_sym),
         }

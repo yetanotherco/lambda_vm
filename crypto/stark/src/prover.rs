@@ -1408,8 +1408,7 @@ pub trait IsStarkProver<
             .collect();
 
         PolynomialOpenings {
-            proof: proof.clone(),
-            proof_sym: proof,
+            proof,
             evaluations: lde_composition_poly_parts_evaluation
                 .clone()
                 .into_iter()
@@ -1442,7 +1441,6 @@ pub trait IsStarkProver<
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
             evaluations: lde_trace.gather_main_row(reverse_index(index, domain_size as u64)),
             evaluations_sym: lde_trace
                 .gather_main_row(reverse_index(index_sym, domain_size as u64)),
@@ -1468,7 +1466,6 @@ pub trait IsStarkProver<
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
             evaluations: lde_trace.gather_main_row_range(
                 reverse_index(index, domain_size as u64),
                 col_start,
@@ -1499,7 +1496,6 @@ pub trait IsStarkProver<
         let index_sym = challenge * 2 + 1;
         PolynomialOpenings {
             proof: tree.get_proof_by_pos(index).unwrap(),
-            proof_sym: tree.get_proof_by_pos(index_sym).unwrap(),
             evaluations: lde_trace.gather_aux_row(reverse_index(index, domain_size as u64)),
             evaluations_sym: lde_trace.gather_aux_row(reverse_index(index_sym, domain_size as u64)),
         }

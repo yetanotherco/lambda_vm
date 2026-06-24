@@ -17,7 +17,9 @@ use crate::{
 )]
 pub struct PolynomialOpenings<F: IsField> {
     pub proof: Proof<Commitment>,
-    pub proof_sym: Proof<Commitment>,
+    // proof_sym removed: the verifier uses verify_paired_keccak256_openings which
+    // verifies both evaluations (regular + symmetric) against the single `proof`
+    // path — proof_sym is never consumed by the verifier.
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
 }
