@@ -636,6 +636,15 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         bytes
     }
 
+    #[inline(always)]
+    fn write_bytes_le(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= 24);
+        let components = self.value();
+        buf[0..8].copy_from_slice(&components[0].to_bytes_le());
+        buf[8..16].copy_from_slice(&components[1].to_bytes_le());
+        buf[16..24].copy_from_slice(&components[2].to_bytes_le());
+    }
+
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
     where
         Self: Sized,
