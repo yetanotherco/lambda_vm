@@ -11,6 +11,7 @@ on:
       - 'crypto/**'
       - 'executor/**'
       - 'bin/cli/**'
+      - 'tooling/ethrex-fixtures/**'
   # Uncomment to auto-run on PRs:
   # pull_request:
   #   branches: [main]
@@ -30,12 +31,19 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  PROGRAM: executor/programs/asm/fib_iterative_8M.s
-  ELF: executor/program_artifacts/asm/fib_iterative_8M.elf
+  # Headline program: the ethrex guest ELF proven against a 20-transfer block
+  # (distinct sender -> distinct recipient per tx). One ELF; the workload is the
+  # private input (rkyv ProgramInput), generated in-job and gitignored (see the
+  # "Generate ethrex bench fixtures" step).
+  ELF: executor/program_artifacts/rust/ethrex.elf
+  INPUT: executor/tests/ethrex_bench_20.bin
   BENCH_RUNS_PR: 3
   BENCH_RUNS_BASELINE: 3
-  GROWTH_PROGRAMS: "fib_iterative_1M fib_iterative_2M fib_iterative_4M fib_iterative_8M"
-  GROWTH_STEPS: "1000000 2000000 4000000 8000000"
+  # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
+  # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
+  # the matching transfer counts (x-axis; slope is MB per transfer).
+  GROWTH_PROGRAMS: "ethrex_bench_4 ethrex_bench_8 ethrex_bench_12 ethrex_bench_16 ethrex_bench_20"
+  GROWTH_STEPS: "4 8 12 16 20"
 
 jobs:
   benchmark:
@@ -76,27 +84,29 @@ jobs:
         with:
           ref: ${{ steps.pr-ref.outputs.sha || github.sha }}
 
-      - name: Compile benchmark ELFs
-        run: |
-          mkdir -p executor/program_artifacts/asm
-          # Compile main benchmark ELF
-          MAIN_SRC="$PROGRAM"
-          MAIN_OUT="$ELF"
-          if [ ! -f "$MAIN_OUT" ] && [ -f "$MAIN_SRC" ]; then
-            clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
-              "$MAIN_SRC" -o "$MAIN_OUT"
-          fi
-          for prog in $GROWTH_PROGRAMS; do
-            SRC="executor/programs/asm/${prog}.s"
-            OUT="executor/program_artifacts/asm/${prog}.elf"
-            if [ ! -f "$OUT" ]; then
-              clang --target=riscv64 -march=rv64im -fuse-ld=lld -nostdlib -Wl,-e,main \
-                "$SRC" -o "$OUT"
-            fi
-          done
-
       - name: Add cargo to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Build ethrex guest ELF
+        run: |
+          # Self-provision the RV64 sysroot in a user-writable dir (matches the
+          # nightly bench job); make picks it up via SYSROOT_DIR ?= and passes it
+          # to clang as --sysroot. The ELF is gitignored and persists across the
+          # baseline `git checkout`, so the same workload is proven on both sides.
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
+          make executor/program_artifacts/rust/ethrex.elf
+
+      - name: Generate ethrex bench fixtures
+        run: |
+          # Generated, not committed (gitignored via executor/.gitignore). They are
+          # untracked, so they survive the baseline `git checkout origin/main` below —
+          # the SAME workload (ELF + inputs) is proven on both the PR and main sides.
+          # distinct = N independent genesis-funded senders -> N distinct recipients.
+          ( cd tooling/ethrex-fixtures && cargo build --release )
+          GEN=tooling/ethrex-fixtures/target/release/ethrex-fixtures
+          for n in $GROWTH_STEPS; do
+            "$GEN" "$n" "executor/tests/ethrex_bench_${n}.bin" distinct
+          done
 
       - name: Build CLI (PR)
         run: cargo build --release -p cli --features jemalloc-stats
@@ -134,13 +144,11 @@ jobs:
 
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
-          # Parse TABLE_PARALLELISM:
-          # /bench-growth always uses k=1 (for reproducible comparisons)
-          # /bench accepts k=N parameter
+          # Optional table parallelism for the HEADLINE benchmark only (the memory
+          # growth sweep always runs at default parallelism). `/bench k=N` overrides;
+          # otherwise default (cores/3). /bench-growth no longer forces k=1.
           TABLE_K=""
-          if [ "$EVENT_NAME" = "issue_comment" ] && echo "$COMMENT_BODY" | grep -q '^/bench-growth'; then
-            TABLE_K="1"
-          elif [ "$EVENT_NAME" = "issue_comment" ]; then
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
             TABLE_K=$(echo "$COMMENT_BODY" | grep -o 'k=[0-9]*' | head -1 | cut -d= -f2)
           fi
           echo "table_parallelism=${TABLE_K:-}" >> "$GITHUB_OUTPUT"
@@ -166,7 +174,7 @@ jobs:
           HEAPS=""
           for i in $(seq 1 $RUNS); do
             echo "--- Run $i/$RUNS ---"
-            ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+            ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
               | tee /tmp/cli_output_$i.txt
             rm -f /tmp/proof.bin
 
@@ -224,23 +232,23 @@ jobs:
       - name: Memory growth (PR)
         id: pr-growth
         if: steps.config.outputs.run_growth == 'true'
-        env:
-          TABLE_PARALLELISM: "1"
         run: |
           PROGRAMS=($GROWTH_PROGRAMS)
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
-          SAMPLES=2
+          # 1 sample/point: run-to-run heap is ~deterministic (<0.3%), so an extra
+          # transfer-count point buys more slope accuracy than a replicate.
+          SAMPLES=1
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
-            ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
+            INPUT_PATH="executor/tests/${prog}.bin"
             SAMPLE_HEAPS=""
             SAMPLE_TIMES=""
             for s in $(seq 1 $SAMPLES); do
-              echo "--- Growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
-              ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+              echo "--- Growth: $prog (sample $s/$SAMPLES, default parallelism) ---"
+              ./target/release/cli prove "$ELF" --private-input "$INPUT_PATH" -o /tmp/proof.bin --time \
                 | tee /tmp/growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
               T=$(grep -o 'Proving time: [0-9.]*' /tmp/growth_${prog}_${s}.txt | awk '{print $3}')
@@ -258,14 +266,14 @@ jobs:
             GROWTH_TIMES="${GROWTH_TIMES:+$GROWTH_TIMES/}$T"
           done
 
-          # Linear regression: heap (MB) vs steps (millions)
+          # Linear regression: heap (MB) vs transfer count (slope = MB per transfer)
           STEPS_SLASH=$(echo "${STEPS_ARR[@]}" | tr ' ' '/')
           read SLOPE R2 <<< $(awk -v steps="$STEPS_SLASH" -v heaps="$GROWTH_HEAPS" 'BEGIN {
             n = split(steps, xs, "/")
             split(heaps, ys, "/")
             sx = 0; sy = 0; sxy = 0; sx2 = 0
             for (i = 1; i <= n; i++) {
-              x = xs[i] / 1000000; y = ys[i] + 0
+              x = xs[i]; y = ys[i] + 0
               sx += x; sy += y; sxy += x * y; sx2 += x * x
             }
             d = n * sx2 - sx * sx
@@ -273,7 +281,7 @@ jobs:
             slope = (n * sxy - sx * sy) / d
             my = sy / n; ss_tot = 0; ss_res = 0
             for (i = 1; i <= n; i++) {
-              x = xs[i] / 1000000; y = ys[i] + 0
+              x = xs[i]; y = ys[i] + 0
               pred = slope * x + (sy - slope * sx) / n
               ss_res += (y - pred) * (y - pred)
               ss_tot += (y - my) * (y - my)
@@ -355,18 +363,20 @@ jobs:
           # Save current HEAD
           PR_SHA=$(git rev-parse HEAD)
 
-          # Checkout main and build
+          # Checkout main and rebuild the prover (CLI) only. The workload — the gitignored
+          # ethrex ELF and the generated, untracked bench fixtures — is left untouched by
+          # the checkout, so the same inputs are proven on both the PR and main sides.
           git fetch origin main
           git checkout origin/main
 
           cargo build --release -p cli --features jemalloc-stats
 
-          # --- Primary benchmark (2M) ---
+          # --- Primary benchmark (ethrex 20 transfers) ---
           TIMES=""
           HEAPS=""
           for i in $(seq 1 $RUNS); do
             echo "--- Baseline run $i/$RUNS ---"
-            ./target/release/cli prove "$ELF" -o /tmp/proof.bin --time \
+            ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
               | tee /tmp/baseline_output_$i.txt
             rm -f /tmp/proof.bin
 
@@ -411,7 +421,7 @@ jobs:
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
 
-          # --- Growth benchmarks (TABLE_PARALLELISM=1, 2 samples each) ---
+          # --- Growth benchmarks (default parallelism, 1 sample each) ---
           # Only run if /bench-growth, push, or workflow_dispatch
           if [ "$RUN_GROWTH" != "true" ]; then
             echo "Skipping growth benchmarks (use /bench-growth to enable)"
@@ -420,16 +430,16 @@ jobs:
           STEPS_ARR=($GROWTH_STEPS)
           GROWTH_HEAPS=""
           GROWTH_TIMES=""
-          SAMPLES=2
+          SAMPLES=1
 
           for idx in "${!PROGRAMS[@]}"; do
             prog="${PROGRAMS[$idx]}"
-            ELF_PATH="executor/program_artifacts/asm/${prog}.elf"
+            INPUT_PATH="executor/tests/${prog}.bin"
             SAMPLE_HEAPS=""
             SAMPLE_TIMES=""
             for s in $(seq 1 $SAMPLES); do
-              echo "--- Baseline growth: $prog (sample $s/$SAMPLES, TABLE_PARALLELISM=1) ---"
-              TABLE_PARALLELISM=1 ./target/release/cli prove "$ELF_PATH" -o /tmp/proof.bin --time \
+              echo "--- Baseline growth: $prog (sample $s/$SAMPLES, default parallelism) ---"
+              ./target/release/cli prove "$ELF" --private-input "$INPUT_PATH" -o /tmp/proof.bin --time \
                 | tee /tmp/baseline_growth_${prog}_${s}.txt
               rm -f /tmp/proof.bin
               T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_growth_${prog}_${s}.txt | awk '{print $3}')
@@ -453,7 +463,7 @@ jobs:
             split(heaps, ys, "/")
             sx = 0; sy = 0; sxy = 0; sx2 = 0
             for (i = 1; i <= n; i++) {
-              x = xs[i] / 1000000; y = ys[i] + 0
+              x = xs[i]; y = ys[i] + 0
               sx += x; sy += y; sxy += x * y; sx2 += x * x
             }
             d = n * sx2 - sx * sx
@@ -461,7 +471,7 @@ jobs:
             slope = (n * sxy - sx * sy) / d
             my = sy / n; ss_tot = 0; ss_res = 0
             for (i = 1; i <= n; i++) {
-              x = xs[i] / 1000000; y = ys[i] + 0
+              x = xs[i]; y = ys[i] + 0
               pred = slope * x + (sy - slope * sx) / n
               ss_res += (y - pred) * (y - pred)
               ss_tot += (y - my) * (y - my)
@@ -675,7 +685,7 @@ jobs:
             const nLabel = parseInt(runs) > 1 ? ` (median of ${runs})` : '';
             const tableParallelism = process.env.TABLE_PARALLELISM;
             const tpLabel = tableParallelism ? tableParallelism : 'auto (cores / 3)';
-            let body = `## Benchmark — fib_iterative_8M${nLabel}\n\n`;
+            let body = `## Benchmark — ethrex 20 transfers${nLabel}\n\n`;
             body += `<sub>Table parallelism: ${tpLabel}</sub>\n\n`;
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
@@ -730,34 +740,35 @@ jobs:
             if (prGrowthHeaps) {
               const prHeaps = prGrowthHeaps.split('/');
               const baseHeaps = baseGrowthHeaps ? baseGrowthHeaps.split('/') : null;
-              const labels = ['1M', '2M', '4M', '8M'];
-              const programs = ['fib_iterative_1M', 'fib_iterative_2M', 'fib_iterative_4M', 'fib_iterative_8M'];
+              // Transfer counts (x-axis); keep in sync with GROWTH_STEPS in the env block.
+              const labels = ['4', '8', '12', '16', '20'];
+              const n = prHeaps.length;
 
               body += `\n## Memory Growth\n\n`;
-              body += `<sub>Measured with \`TABLE_PARALLELISM=1\` (sequential) · best of 2 samples per point</sub>\n\n`;
+              body += `<sub>ethrex distinct-account transfers · default parallelism · 1 sample per point</sub>\n\n`;
 
-              if (baseHeaps && baseHeaps.length === 4 && baseHeaps[0]) {
-                body += `| Program | Steps | main (MB) | PR (MB) | Δ |\n`;
-                body += `|---------|-------|-----------|---------|---|\n`;
-                for (let i = 0; i < 4; i++) {
+              if (baseHeaps && baseHeaps.length === n && baseHeaps[0]) {
+                body += `| Transfers | main (MB) | PR (MB) | Δ |\n`;
+                body += `|-----------|-----------|---------|---|\n`;
+                for (let i = 0; i < n; i++) {
                   const bh = parseInt(baseHeaps[i]);
                   const ph = parseInt(prHeaps[i]);
                   const diff = ph - bh;
                   const pct = bh > 0 ? ((diff / bh) * 100).toFixed(1) : '0.0';
-                  body += `| ${programs[i]} | ${labels[i]} | ${baseHeaps[i]} | ${prHeaps[i]} | ${fmt(diff)} MB (${fmt(pct)}%) |\n`;
+                  body += `| ${labels[i]} | ${baseHeaps[i]} | ${prHeaps[i]} | ${fmt(diff)} MB (${fmt(pct)}%) |\n`;
                 }
               } else {
-                body += `| Program | Steps | PR (MB) |\n`;
-                body += `|---------|-------|---------|\n`;
-                for (let i = 0; i < 4; i++) {
-                  body += `| ${programs[i]} | ${labels[i]} | ${prHeaps[i]} |\n`;
+                body += `| Transfers | PR (MB) |\n`;
+                body += `|-----------|---------|\n`;
+                for (let i = 0; i < n; i++) {
+                  body += `| ${labels[i]} | ${prHeaps[i]} |\n`;
                 }
               }
 
               body += `\n`;
 
               if (prGrowthSlope) {
-                body += `**Growth rate:** ${prGrowthSlope} MB / 1M steps`;
+                body += `**Growth rate:** ${prGrowthSlope} MB / transfer`;
                 if (baseGrowthSlope && growthSlopePct) {
                   body += ` (main: ${baseGrowthSlope}, Δ: ${fmt(growthSlopePct)}%)`;
                 }
@@ -796,6 +807,7 @@ jobs:
             // Find existing comment (check both old and new markers for transition)
             const existing = comments.find(c =>
               c.user.type === 'Bot' && (
+                c.body.includes('Benchmark — ethrex') ||
                 c.body.includes('Benchmark — fib_iterative_8M') ||
                 c.body.includes('Benchmark — fib_iterative_2M') ||
                 c.body.includes('Benchmark — fib_iterative_372k')

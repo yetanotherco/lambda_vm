@@ -457,6 +457,7 @@ PROVIDER_KEYS = {
     "minimax/": "MINIMAX_API_KEY",
     "anthropic/": "ANTHROPIC_API_KEY",
     "openai/": "OPENAI_API_KEY",
+    "zro/": "ZRO_API_KEY",
 }
 
 
