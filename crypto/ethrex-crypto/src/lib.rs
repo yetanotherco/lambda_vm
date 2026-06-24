@@ -124,8 +124,8 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32],
 ///
 /// On riscv64 this reconstructs the full affine result from four x-only ECSM
 /// queries (see [`lincomb2_with_oracle`]); on other targets, and whenever a
-/// degenerate-configuration guard trips, it returns `None` so the caller uses
-/// the pure-Rust `ProjectivePoint::lincomb`.
+/// guard trips (degenerate input or oracle inconsistency), it returns `None`
+/// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_lincomb2(
     p1: &ProjectivePoint,
@@ -241,9 +241,9 @@ where
     point_from_xy(&xq, &yq)
 }
 
-/// Recovers `y(k·P)` for `P = (xp, yp)` from `xa = x(k·P)` and
-/// `xc = x((k+1)·P)`, given `dx = xa − xp` and `inv_den = (2·yp·dx)⁻¹`.
-/// `None` if the λ² consistency check fails (degenerate configuration).
+/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
+/// Returns `None` if `xc` is inconsistent with the computed `lambda`
+/// (oracle misbehavior); degeneracy guards are in [`lincomb2_with_oracle`].
 #[cfg(any(target_arch = "riscv64", test))]
 fn solve_y(
     xp: &FieldElement,
@@ -263,8 +263,8 @@ fn solve_y(
     Some((*yp + lambda * dx).normalize())
 }
 
-/// `k ∈ {0, 1, n−1}`: cases where `k` or `k+1` is an invalid ecall scalar or
-/// the chord algebra degenerates (`A = ±P`).
+/// `k ∈ {0, 1, n−1}`: fast early-exit before oracle calls.
+/// k=0: invalid ecall scalar. k=1: dx=0. k=n-1: k+1 wraps to 0 mod n.
 #[cfg(any(target_arch = "riscv64", test))]
 fn scalar_near_edge(k: &Scalar) -> bool {
     use k256::elliptic_curve::subtle::ConstantTimeEq;
@@ -310,37 +310,25 @@ fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F
     let mut state = [0u64; 25];
     let mut offset = 0;
 
-    while input.len().saturating_sub(offset) >= RATE {
+    while input.len() - offset >= RATE {
         absorb_block(&mut state, &input[offset..offset + RATE]);
         permute(&mut state);
-        offset = offset.saturating_add(RATE);
+        offset += RATE;
     }
 
     // Final block with multi-rate padding.
     let mut last = [0u8; RATE];
-    let remaining = input.len().saturating_sub(offset);
-    if let Some(tail) = last.get_mut(..remaining) {
-        if let Some(src) = input.get(offset..) {
-            tail.copy_from_slice(src);
-        }
-    }
-    if let Some(b) = last.get_mut(remaining) {
-        *b ^= 0x01;
-    }
-    if let Some(b) = last.get_mut(RATE - 1) {
-        *b ^= 0x80;
-    }
+    let remaining = input.len() - offset;
+    last[..remaining].copy_from_slice(&input[offset..]);
+    last[remaining] ^= 0x01;
+    last[RATE - 1] ^= 0x80;
     absorb_block(&mut state, &last);
     permute(&mut state);
 
     // Squeeze the first 32 bytes (four lanes) as little-endian.
     let mut output = [0u8; 32];
     for (i, lane) in state.iter().take(4).enumerate() {
-        let bytes = lane.to_le_bytes();
-        let start = i.saturating_mul(8);
-        if let Some(dst) = output.get_mut(start..start.saturating_add(8)) {
-            dst.copy_from_slice(&bytes);
-        }
+        output[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
     }
     output
 }

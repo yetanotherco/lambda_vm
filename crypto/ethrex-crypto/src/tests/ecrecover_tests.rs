@@ -25,6 +25,15 @@ fn make_ecdsa_fixture(d: Scalar, kk: Scalar, msg: [u8; 32]) -> ([u8; 64], u8, [u
     let (rx, ry) = affine_xy(&r_point).expect("R is not identity");
     let r = <Scalar as Reduce<U256>>::reduce_bytes(&rx.to_bytes());
     assert!(!bool::from(r.is_zero()), "r must be nonzero");
+    // rx is in Fp; since n < p, rx >= n with probability ~2^{-128}. When that
+    // happens r = rx-n and the signature requires the high-x recovery bit
+    // (recid >= 2, meaning R.x = r+n) which ecsm_ecrecover does not handle.
+    // Assert no reduction occurred so the low-x path is valid.
+    assert_eq!(
+        r.to_bytes(),
+        rx.to_bytes(),
+        "rx >= n: this kk needs high-x recovery (recid >= 2) — pick a different nonce"
+    );
 
     // recid parity: low bit of Ry (big-endian, byte 31).
     let recid = ry.normalize().to_bytes()[31] & 1;
