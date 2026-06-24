@@ -880,7 +880,6 @@ pub trait IsStarkVerifier<
         // recomputed inside every query (×num_queries, ×2 for the symmetric point).
         // On a realistic proof this function is ~56% of guest cycles and this term
         // was its dominant repeated work.
-        let b_terms = Self::precompute_ood_coeff_terms(proof, challenges);
         // Hoist the primitive root computation out of the per-query loop — it is
         // the same value for every query (depends only on the domain order).
         let primitive_root =
@@ -899,7 +898,10 @@ pub trait IsStarkVerifier<
             let precomp = first.precomputed_trace_polys.as_ref().map_or(0, |p| p.evaluations.len());
             precomp + first.main_trace_polys.evaluations.len()
         };
-        let (coeffs_base_row0, coeffs_base_row1, coeffs_ext_row0, coeffs_ext_row1) =
+        // Build row-major coefficient slices: split by base vs ext cols, and
+        // combined (all_row0 = base_row0 ++ ext_row0) for b_terms dot product.
+        let (coeffs_base_row0, coeffs_base_row1, coeffs_ext_row0, coeffs_ext_row1,
+             coeffs_all_row0, coeffs_all_row1) =
             if ood_height_for_dot == 2 {
                 let mut br0: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(n_base_precomputed_cols);
                 let mut br1: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(n_base_precomputed_cols);
@@ -918,10 +920,35 @@ pub trait IsStarkVerifier<
                         er1.push(c1);
                     }
                 }
-                (br0, br1, er0, er1)
+                // combined all_row = br ++ er (contiguous for b_terms dot product)
+                let mut ar0 = Vec::with_capacity(ood_width_for_dot);
+                ar0.extend_from_slice(&br0);
+                ar0.extend_from_slice(&er0);
+                let mut ar1 = Vec::with_capacity(ood_width_for_dot);
+                ar1.extend_from_slice(&br1);
+                ar1.extend_from_slice(&er1);
+                (br0, br1, er0, er1, ar0, ar1)
             } else {
-                (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new())
             };
+
+        // b_terms[row] = Σ_col ood[row][col] × coeff[col][row]: precomputed once for all queries.
+        // For height=2 use dot product (one FP3_DOT ecall for all columns).
+        let b_terms = if ood_height_for_dot == 2 && !coeffs_all_row0.is_empty() {
+            let ood = proof.trace_ood_evaluations();
+            let mut b_terms = Vec::with_capacity(2);
+            let ood_row_0 = ood.get_row(0);
+            let ood_row_1 = ood.get_row(1);
+            let mut b0 = FieldElement::zero();
+            let mut b1 = FieldElement::zero();
+            b0.dot(ood_row_0, &coeffs_all_row0);
+            b1.dot(ood_row_1, &coeffs_all_row1);
+            b_terms.push(b0);
+            b_terms.push(b1);
+            b_terms
+        } else {
+            Self::precompute_ood_coeff_terms(proof, challenges)
+        };
 
         // Precompute `z^N_parts` once — both `challenges.z` and the number of
         // composition-poly parts are proof-global constants, so recomputing this
