@@ -19,18 +19,27 @@ this crate's `Cargo.toml` too and regenerate.
 
 ```bash
 cd tooling/ethrex-fixtures
-cargo run --release -- <n_transfers> <output_path>
+cargo run --release -- <n_transfers> <output_path> [mode]
 ```
 
 - `<n_transfers>` — how many ETH transfers to include in the block (`0` = empty
   block).
 - `<output_path>` — where to write the `.bin` (relative to this directory).
+- `[mode]` — account diversity (optional, default `same`):
+  - `same` — one funded sender (`RICH_PK`) → one fixed recipient (`0xdeadbeef`).
+  - `recipients` — one funded sender → N distinct recipients (1 → N fan-out).
+  - `distinct` — N distinct, genesis-funded senders → N distinct recipients
+    (N independent 1-1 pairs; senders are deterministic synthetic keys injected
+    into the genesis allocation). This is what the CI benchmark uses, since the
+    state-trie witness for many distinct accounts is closer to a real block.
 
-It prints the output size and the number of transactions included, e.g.:
+It prints the output size, the number of transactions, and the mode, e.g.:
 
 ```
-wrote ../../executor/tests/ethrex_simple_tx.bin (12745 bytes): block #1 with 1/1 transfer(s)
+wrote ../../executor/tests/ethrex_simple_tx.bin (12745 bytes): block #1 with 1/1 transfer(s) [1 sender -> 1 recipient]
 ```
+
+Output is deterministic for a given `(n_transfers, mode)`.
 
 ## Creating blocks with different numbers of transactions
 
@@ -59,9 +68,11 @@ it regenerates the standard fixtures and refreshes
 > machine — e.g. 10 transfers ≈ 42M cycles.
 
 ## Details
-- Transactions are plain ETH transfers signed by a funded dev account from
-  `genesis.json` (well-known load-test key — not a secret), so output is
-  deterministic.
+- Transactions are plain ETH transfers. In `same`/`recipients` mode they are
+  signed by a funded dev account from `genesis.json` (well-known load-test key —
+  not a secret); in `distinct` mode each is signed by its own synthetic key,
+  funded by injecting an entry into the genesis allocation. Output is
+  deterministic in all modes.
 - Currently only ETH transfers are supported. (ERC20 / contract calls would be
   a future extension.)
 - Once the upstream LambdaVM-backend ethrex PR merges, this tool can be replaced
