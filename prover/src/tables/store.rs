@@ -26,7 +26,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::new_is_bit_constraints;
 
 // =========================================================================
@@ -98,25 +98,24 @@ pub fn generate_store_trace(
     operations: &[StoreOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
-        data[base + cols::BASE_ADDRESS_0] = FE::from(op.base_address & 0xFFFF_FFFF);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::WRITE2] = FE::from(op.write2 as u64);
-        data[base + cols::WRITE4] = FE::from(op.write4 as u64);
-        data[base + cols::WRITE8] = FE::from(op.write8 as u64);
-        for i in 0..8 {
-            data[base + cols::VALUE[i]] = FE::from((op.value >> (8 * i)) & 0xFF);
-        }
-        data[base + cols::MU] = FE::one();
+        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_bool(row_idx, cols::WRITE2, op.write2);
+        table.set_bool(row_idx, cols::WRITE4, op.write4);
+        table.set_bool(row_idx, cols::WRITE8, op.write8);
+        table.set_dword_bl(row_idx, cols::VALUE[0], op.value);
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

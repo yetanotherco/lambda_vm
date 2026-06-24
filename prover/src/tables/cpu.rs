@@ -24,7 +24,7 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -439,20 +439,23 @@ pub fn generate_cpu_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = operations.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let f = &op.decode.fields;
         let word = f.word_instr;
 
         // For a word_instr delegate row the operational flags/register I/O are
         // suppressed (CPU32 owns them); only the PC-advancing columns are set.
-        let effective = |flag: bool| (!word && flag) as u64;
+        let effective = |flag: bool| !word && flag;
 
-        data[base + cols::TIMESTAMP] = FE::from(op.timestamp);
-        data[base + cols::PC_0] = FE::from(op.decode.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(op.decode.pc >> 32);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
+        table.set_dword_wl(row_idx, cols::PC_0, op.decode.pc);
 
         // rs1/rs2/rd and read/write flags are only present on non-word rows.
         let (rs1, rs2, rd) = if word {
@@ -460,15 +463,27 @@ pub fn generate_cpu_trace(
         } else {
             (f.rs1, f.rs2, f.rd)
         };
-        data[base + cols::RS1] = FE::from(rs1 as u64);
-        data[base + cols::RS2] = FE::from(rs2 as u64);
-        data[base + cols::RD] = FE::from(rd as u64);
+        table.set_byte(row_idx, cols::RS1, rs1);
+        table.set_byte(row_idx, cols::RS2, rs2);
+        table.set_byte(row_idx, cols::RD, rd);
 
         // x0 is hardwired zero (never read/written); x255 is the PC register and
         // must be read (read_register1=1) so its MEMW interaction fires.
-        data[base + cols::READ_REGISTER1] = FE::from(effective(f.read_register1 && f.rs1 != 0));
-        data[base + cols::READ_REGISTER2] = FE::from(effective(f.read_register2 && f.rs2 != 0));
-        data[base + cols::WRITE_REGISTER] = FE::from(effective(f.write_register && f.rd != 0));
+        table.set_bool(
+            row_idx,
+            cols::READ_REGISTER1,
+            effective(f.read_register1 && f.rs1 != 0),
+        );
+        table.set_bool(
+            row_idx,
+            cols::READ_REGISTER2,
+            effective(f.read_register2 && f.rs2 != 0),
+        );
+        table.set_bool(
+            row_idx,
+            cols::WRITE_REGISTER,
+            effective(f.write_register && f.rd != 0),
+        );
 
         // On word delegate rows, all operational data columns are 0 (CPU32 owns
         // the real values); the register-zero / arg2 / rvd=res constraints all
@@ -480,52 +495,44 @@ pub fn generate_cpu_trace(
             (op.decode.imm, op.rvd, op.rv1, op.rv2, op.arg2, op.res)
         };
 
-        data[base + cols::IMM_0] = FE::from(imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(imm >> 32);
+        table.set_dword_wl(row_idx, cols::IMM_0, imm);
 
-        data[base + cols::HALF_INSTRUCTION_LENGTH] = FE::from(f.half_instruction_length as u64);
-        data[base + cols::WORD_INSTR] = FE::from(word as u64);
+        table.set_byte(
+            row_idx,
+            cols::HALF_INSTRUCTION_LENGTH,
+            f.half_instruction_length,
+        );
+        table.set_bool(row_idx, cols::WORD_INSTR, word);
 
-        data[base + cols::ALU] = FE::from(effective(f.alu));
-        data[base + cols::ALU_FLAGS] = FE::from(if word { 0 } else { f.alu_flags as u64 });
-        data[base + cols::ADD] = FE::from(effective(f.add));
-        data[base + cols::SUB] = FE::from(effective(f.sub));
-        data[base + cols::MEMORY] = FE::from(effective(f.memory));
-        data[base + cols::MEM_FLAGS] = FE::from(if word { 0 } else { f.mem_flags as u64 });
-        data[base + cols::BRANCH] = FE::from(effective(f.branch));
-        data[base + cols::ECALL] = FE::from(effective(f.ecall));
+        table.set_bool(row_idx, cols::ALU, effective(f.alu));
+        table.set_byte(row_idx, cols::ALU_FLAGS, if word { 0 } else { f.alu_flags });
+        table.set_bool(row_idx, cols::ADD, effective(f.add));
+        table.set_bool(row_idx, cols::SUB, effective(f.sub));
+        table.set_bool(row_idx, cols::MEMORY, effective(f.memory));
+        table.set_byte(row_idx, cols::MEM_FLAGS, if word { 0 } else { f.mem_flags });
+        table.set_bool(row_idx, cols::BRANCH, effective(f.branch));
+        table.set_bool(row_idx, cols::ECALL, effective(f.ecall));
 
-        data[base + cols::NEXT_PC_0] = FE::from(op.next_pc & 0xFFFF_FFFF);
-        data[base + cols::NEXT_PC_1] = FE::from(op.next_pc >> 32);
+        table.set_dword_wl(row_idx, cols::NEXT_PC_0, op.next_pc);
 
-        data[base + cols::RVD_0] = FE::from(rvd & 0xFFFF_FFFF);
-        data[base + cols::RVD_1] = FE::from(rvd >> 32);
+        table.set_dword_wl(row_idx, cols::RVD_0, rvd);
 
         // rv1/rv2/arg2 as DWordWL (2 × 32-bit words).
-        data[base + cols::RV1_0] = FE::from(rv1 & 0xFFFF_FFFF);
-        data[base + cols::RV1_1] = FE::from(rv1 >> 32);
-        data[base + cols::RV2_0] = FE::from(rv2 & 0xFFFF_FFFF);
-        data[base + cols::RV2_1] = FE::from(rv2 >> 32);
-        data[base + cols::ARG2_0] = FE::from(arg2 & 0xFFFF_FFFF);
-        data[base + cols::ARG2_1] = FE::from(arg2 >> 32);
+        table.set_dword_wl(row_idx, cols::RV1_0, rv1);
+        table.set_dword_wl(row_idx, cols::RV2_0, rv2);
+        table.set_dword_wl(row_idx, cols::ARG2_0, arg2);
 
         // res as DWordHL (4 × 16-bit halves).
-        for i in 0..4 {
-            data[base + cols::RES[i]] = FE::from((res >> (i * 16)) & 0xFFFF);
-        }
+        table.set_dword_hl(row_idx, cols::RES_0, res);
 
-        data[base + cols::BRANCH_COND] = FE::from(op.branch_cond as u64);
+        table.set_bool(row_idx, cols::BRANCH_COND, op.branch_cond);
 
         // Inline-PC coordination columns.
-        let pc_double_read = (!word && f.read_register1 && f.rs1 == 255) as u64;
+        let pc_double_read = !word && f.read_register1 && f.rs1 == 255;
         let ts_lo = op.timestamp & 0xFFFF_FFFF;
-        let prev_pc_ts_borrow = if pc_double_read == 0 && ts_lo < 3 {
-            1
-        } else {
-            0
-        };
-        data[base + cols::PC_DOUBLE_READ] = FE::from(pc_double_read);
-        data[base + cols::PREV_PC_TIMESTAMP_BORROW] = FE::from(prev_pc_ts_borrow);
+        let prev_pc_ts_borrow = !pc_double_read && ts_lo < 3;
+        table.set_bool(row_idx, cols::PC_DOUBLE_READ, pc_double_read);
+        table.set_bool(row_idx, cols::PREV_PC_TIMESTAMP_BORROW, prev_pc_ts_borrow);
     }
 
     // Padding rows: pc = next_pc = 1 (odd, unreachable), half_instruction_length = 0 so
@@ -538,14 +545,13 @@ pub fn generate_cpu_trace(
     // lands on last_ts + 1, where the HALT chip's emit_pc deposited pc = 1.
     let last_ts = operations.last().map(|op| op.timestamp).unwrap_or(0);
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
         let j = (row_idx - n + 1) as u64;
-        data[base + cols::TIMESTAMP] = FE::from(last_ts + 4 * j);
-        data[base + cols::PC_0] = FE::from(CPU_PADDING_PC);
-        data[base + cols::NEXT_PC_0] = FE::from(CPU_PADDING_PC);
+        table.set_u64(row_idx, cols::TIMESTAMP, last_ts + 4 * j);
+        table.set_u64(row_idx, cols::PC_0, CPU_PADDING_PC);
+        table.set_u64(row_idx, cols::NEXT_PC_0, CPU_PADDING_PC);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 /// Generates the CPU trace table directly from executor logs.

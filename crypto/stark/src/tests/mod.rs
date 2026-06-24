@@ -1,9 +1,15 @@
 pub mod air_tests;
+#[cfg(feature = "debug-checks")]
+pub mod bus_debug_tests;
 pub mod bus_tests;
 pub mod domain_cache_stats;
 pub mod fri_tests;
+pub mod grinding_tests;
 pub mod proof_options_tests;
 pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
 pub mod small_trace_tests;
+#[cfg(feature = "disk-spill")]
+pub mod table_disk_spill_tests;
+pub mod trace_test_helpers;
 pub mod transition_tests;
