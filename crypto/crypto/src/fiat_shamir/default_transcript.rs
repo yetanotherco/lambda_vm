@@ -68,9 +68,9 @@ where
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
-        // `to_bytes_be` returns a fixed-size array (no allocation); feed its
-        // bytes straight to the hasher. This is a hot path in verification.
-        self.append_bytes(element.to_bytes_be().as_ref());
+        // `to_bytes_le` returns a fixed-size array (no allocation); raw LE
+        // (no canonical, no swap) matches the Merkle leaf hash protocol.
+        self.append_bytes(element.to_bytes_le().as_ref());
     }
 
     fn state(&self) -> [u8; 32] {
