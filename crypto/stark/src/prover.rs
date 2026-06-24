@@ -620,59 +620,7 @@ pub trait IsStarkProver<
         FieldElement<E>: AsBytes + Sync + Send + math::traits::ByteConversion,
         E: IsField,
     {
-        use math::traits::ByteConversion;
-
-        if num_cols == 0 || data.is_empty() {
-            return None;
-        }
-        debug_assert_eq!(data.len() % num_cols, 0);
-        let num_rows = data.len() / num_cols;
-        if num_rows == 0 {
-            return None;
-        }
-        let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
-        let row_bytes = num_cols * byte_len;
-
-        debug_assert!(
-            num_rows.is_power_of_two(),
-            "num_rows must be a power of two for reverse_index"
-        );
-
-        #[cfg(feature = "parallel")]
-        let hashed_leaves: Vec<Commitment> = (0..num_rows)
-            .into_par_iter()
-            .map_init(
-                || vec![0u8; row_bytes],
-                |buf, row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
-                    let row = &data[row_start..row_start + num_cols];
-                    for (col_idx, elem) in row.iter().enumerate() {
-                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-                    }
-                    BatchedMerkleTreeBackend::<E>::hash_bytes(buf)
-                },
-            )
-            .collect();
-        #[cfg(not(feature = "parallel"))]
-        let hashed_leaves: Vec<Commitment> = {
-            let mut buf = vec![0u8; row_bytes];
-            (0..num_rows)
-                .map(|row_idx| {
-                    let br_idx = reverse_index(row_idx, num_rows as u64);
-                    let row_start = br_idx * num_cols;
-                    let row = &data[row_start..row_start + num_cols];
-                    for (col_idx, elem) in row.iter().enumerate() {
-                        elem.write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
-                    }
-                    BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
-                })
-                .collect()
-        };
-
-        let tree = BatchedMerkleTree::<E>::build_from_hashed_leaves(hashed_leaves)?;
-        let root = tree.root;
-        Some((tree, root))
+        Self::commit_rows_bit_reversed_subset(data, num_cols, 0, num_cols)
     }
 
     /// Subset variant of [`commit_rows_bit_reversed`]: hash only columns in the

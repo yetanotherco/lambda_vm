@@ -15,7 +15,9 @@
 //! the same domain recurs across tables and rounds).
 
 #[cfg(feature = "alloc")]
-use crate::fft::bit_reversing::{in_place_bit_reverse_permute_row_major, reverse_index};
+use crate::fft::bit_reversing::{
+    in_place_bit_reverse_permute, in_place_bit_reverse_permute_row_major,
+};
 #[cfg(feature = "alloc")]
 use crate::fft::errors::FFTError;
 #[cfg(feature = "alloc")]
@@ -27,18 +29,6 @@ use crate::field::{
 use alloc::vec::Vec;
 #[cfg(all(feature = "alloc", feature = "parallel"))]
 use rayon::prelude::*;
-
-/// In-place bit-reversal permutation of a flat slice (length a power of two).
-#[cfg(feature = "alloc")]
-fn bit_reverse_vec<F: IsField>(v: &mut [FieldElement<F>]) {
-    let n = v.len();
-    for i in 0..n {
-        let j = reverse_index(i, n as u64);
-        if j > i {
-            v.swap(i, j);
-        }
-    }
-}
 
 /// Precomputed twiddles for a size-`2^log_n` two-half FFT in one direction.
 ///
@@ -81,7 +71,7 @@ impl<F: IsFFTField> TwoHalfTwiddles<F> {
             cur = &cur * &omega;
         }
         let mut bitrev_tw = tw.clone();
-        bit_reverse_vec(&mut bitrev_tw);
+        in_place_bit_reverse_permute(&mut bitrev_tw);
 
         Ok(Self {
             log_n,
