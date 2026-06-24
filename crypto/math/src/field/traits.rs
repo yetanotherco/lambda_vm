@@ -141,6 +141,18 @@ pub trait IsField: Debug + Clone {
         *acc = Self::add(acc, &Self::mul(a, b));
     }
 
+    /// Fp3-Fp3 dot product: `acc += lhs[i] × rhs[i]` for all i.
+    /// Default: loop of fma. Concrete fields may issue a single batch ecall.
+    fn dot(
+        acc: &mut Self::BaseType,
+        lhs: &[crate::field::element::FieldElement<Self>],
+        rhs: &[crate::field::element::FieldElement<Self>],
+    ) {
+        for (l, r) in lhs.iter().zip(rhs.iter()) {
+            Self::fma(acc, l.value(), r.value());
+        }
+    }
+
     /// Returns the multiplication of `a` and `a`.
     fn square(a: &Self::BaseType) -> Self::BaseType {
         Self::mul(a, a)

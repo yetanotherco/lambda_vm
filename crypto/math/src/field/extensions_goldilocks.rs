@@ -286,6 +286,43 @@ impl IsField for Degree3GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
     }
 
+    /// Fp3-Fp3 dot product: `acc += lhs[i] × rhs[i]` for all i via FP3_DOT ecall on riscv64.
+    fn dot(
+        acc: &mut Self::BaseType,
+        lhs: &[FieldElement<Degree3GoldilocksExtensionField>],
+        rhs: &[FieldElement<Degree3GoldilocksExtensionField>],
+    ) {
+        debug_assert_eq!(lhs.len(), rhs.len());
+        let n = lhs.len();
+        #[cfg(target_arch = "riscv64")]
+        {
+            const FP3_DOT_SYSCALL: u64 = u64::MAX - 6;
+            let acc_ptr = acc.as_mut_ptr() as *mut u64;
+            let lhs_ptr = lhs.as_ptr() as *const u64;
+            let rhs_ptr = rhs.as_ptr() as *const u64;
+            unsafe {
+                core::arch::asm!(
+                    "ecall",
+                    in("a0") acc_ptr,
+                    in("a1") lhs_ptr,
+                    in("a2") rhs_ptr,
+                    in("a3") n,
+                    in("a7") FP3_DOT_SYSCALL,
+                );
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            for i in 0..n {
+                let l = lhs[i].value();
+                let r = rhs[i].value();
+                let prod = <Self as IsField>::mul(l, r);
+                *acc = <Self as IsField>::add(acc, &prod);
+            }
+        }
+    }
+
     /// Fused multiply-add: `acc += a × b` using the Fp3Fma ecall on riscv64 — one ecall
     /// instead of Fp3Mul ecall + 3 Goldilocks adds, saving ~12 instructions per call.
     #[inline(always)]

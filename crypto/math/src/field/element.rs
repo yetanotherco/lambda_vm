@@ -543,6 +543,14 @@ where
         S::scalar_dot(&mut self.value, scalars, fp3);
     }
 
+    /// Fp3-Fp3 dot product: `self += lhs[i] × rhs[i]` for all i.
+    /// Dispatches to `F::dot` which on riscv64 with Degree3GoldilocksExtensionField
+    /// uses the FP3_DOT ecall for all n at once.
+    #[inline(always)]
+    pub fn dot(&mut self, lhs: &[Self], rhs: &[Self]) {
+        F::dot(&mut self.value, lhs, rhs);
+    }
+
     /// Returns the multiplicative inverse of `self`
     #[inline(always)]
     pub fn inv(&self) -> Result<Self, FieldError> {

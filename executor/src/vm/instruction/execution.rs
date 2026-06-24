@@ -6,8 +6,8 @@ use crate::vm::{
 };
 
 use crate::constants::{
-    FP3_FMA_SYSCALL_NUMBER, FP3_MUL_SYSCALL_NUMBER, FP3_SCALAR_DOT_SYSCALL_NUMBER,
-    FP3_SCALAR_FMA_SYSCALL_NUMBER,
+    FP3_DOT_SYSCALL_NUMBER, FP3_FMA_SYSCALL_NUMBER, FP3_MUL_SYSCALL_NUMBER,
+    FP3_SCALAR_DOT_SYSCALL_NUMBER, FP3_SCALAR_FMA_SYSCALL_NUMBER,
 };
 
 const REGULAR_PC_UPDATE: u64 = 4;
@@ -30,6 +30,8 @@ pub enum SyscallNumbers {
     Fp3ScalarFma,
     // FP3_SCALAR_DOT_SYSCALL_NUMBER (u64::MAX - 5): acc += dot(scalars, fp3_array).
     Fp3ScalarDot,
+    // FP3_DOT_SYSCALL_NUMBER (u64::MAX - 6): acc += dot(fp3_lhs, fp3_rhs).
+    Fp3Dot,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -63,6 +65,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == FP3_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Fma),
             v if v == FP3_SCALAR_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3ScalarFma),
             v if v == FP3_SCALAR_DOT_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3ScalarDot),
+            v if v == FP3_DOT_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Dot),
             _ => Err(()),
         }
     }
@@ -558,6 +561,43 @@ impl Instruction {
                         memory.store_doubleword(addr_acc + 16, acc[2])?;
                         src2_val = addr_scalars;
                         dst_val = addr_fp3;
+                    }
+                    SyscallNumbers::Fp3Dot => {
+                        // Fp3-Fp3 dot product: acc += lhs[i] * rhs[i] for i in 0..n
+                        // x10=acc_ptr ([u64;3] in/out), x11=lhs_ptr ([u64;3n]),
+                        // x12=rhs_ptr ([u64;3n]), x13=n (count)
+                        let addr_acc = registers.read(10)?;
+                        let addr_lhs = registers.read(11)?;
+                        let addr_rhs = registers.read(12)?;
+                        let count = registers.read(13)? as usize;
+                        let mut acc = [
+                            memory.load_doubleword(addr_acc)?,
+                            memory.load_doubleword(addr_acc + 8)?,
+                            memory.load_doubleword(addr_acc + 16)?,
+                        ];
+                        for i in 0..count {
+                            let lhs = [
+                                memory.load_doubleword(addr_lhs + (i as u64) * 24)?,
+                                memory.load_doubleword(addr_lhs + (i as u64) * 24 + 8)?,
+                                memory.load_doubleword(addr_lhs + (i as u64) * 24 + 16)?,
+                            ];
+                            let rhs = [
+                                memory.load_doubleword(addr_rhs + (i as u64) * 24)?,
+                                memory.load_doubleword(addr_rhs + (i as u64) * 24 + 8)?,
+                                memory.load_doubleword(addr_rhs + (i as u64) * 24 + 16)?,
+                            ];
+                            let c0 = goldilocks_fp3_mul_c0(lhs, rhs);
+                            let c1 = goldilocks_fp3_mul_c1(lhs, rhs);
+                            let c2 = goldilocks_fp3_mul_c2(lhs, rhs);
+                            acc[0] = goldilocks_add(acc[0], c0);
+                            acc[1] = goldilocks_add(acc[1], c1);
+                            acc[2] = goldilocks_add(acc[2], c2);
+                        }
+                        memory.store_doubleword(addr_acc, acc[0])?;
+                        memory.store_doubleword(addr_acc + 8, acc[1])?;
+                        memory.store_doubleword(addr_acc + 16, acc[2])?;
+                        src2_val = addr_lhs;
+                        dst_val = addr_rhs;
                     }
                     SyscallNumbers::Halt => {
                         // halt

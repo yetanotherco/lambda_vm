@@ -42,6 +42,13 @@ pub const FP3_SCALAR_FMA_SYSCALL_NUMBER: u64 = u64::MAX - 4;
 ///      a1=scalars_ptr ([u64;n]), a2=fp3_ptr ([u64;3*n]), a3=n (count)
 pub const FP3_SCALAR_DOT_SYSCALL_NUMBER: u64 = u64::MAX - 5;
 
+/// Syscall number for the Goldilocks Fp3-Fp3 dot product precompile.
+/// Computes `acc += lhs[0]*rhs[0] + lhs[1]*rhs[1] + ... + lhs[n-1]*rhs[n-1]`
+/// in a single ecall. Replaces n calls to FP3_FMA_SYSCALL.
+/// ABI: a7=FP3_DOT_SYSCALL_NUMBER, a0=acc_ptr (in/out, [u64;3]),
+///      a1=lhs_ptr ([u64;3*n]), a2=rhs_ptr ([u64;3*n]), a3=n (count)
+pub const FP3_DOT_SYSCALL_NUMBER: u64 = u64::MAX - 6;
+
 /// Round constants for Keccak-f[1600] (24 rounds).
 pub const KECCAK_RC: [u64; 24] = [
     0x0000000000000001,
