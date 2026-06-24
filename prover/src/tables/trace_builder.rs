@@ -355,6 +355,71 @@ fn collect_cpu_ops(
 ///
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
 /// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
+/// Collect the chips that depend only on each `CpuOperation` (no memory/register
+/// state): the CPU range-check bitwise lookups plus the CPU32 / LT / SHIFT
+/// dispatch. Parallel under the `parallel` feature; results stay in program
+/// order, matching the sequential build.
+fn collect_state_free_ops(
+    cpu_ops: &[CpuOperation],
+) -> (
+    Vec<BitwiseOperation>,
+    Vec<cpu32::Cpu32Operation>,
+    Vec<LtOperation>,
+    Vec<ShiftOperation>,
+) {
+    let lt = |op: &CpuOperation| -> Option<LtOperation> {
+        let f = op.decode.fields;
+        (!f.word_instr && f.is_lt()).then(|| {
+            LtOperation::new_with_invert(op.rv1, op.arg2, f.alu_signed(), f.alu_signed2_or_invert())
+        })
+    };
+    let shift = |op: &CpuOperation| -> Option<ShiftOperation> {
+        let f = op.decode.fields;
+        (!f.word_instr && f.is_shift()).then(|| {
+            ShiftOperation::new(
+                op.rv1,
+                op.arg2,
+                f.alu_signed2_or_invert(),
+                f.alu_signed(),
+                f.word_instr,
+            )
+        })
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        (
+            cpu_ops
+                .par_iter()
+                .flat_map_iter(|op| op.collect_bitwise_ops())
+                .collect(),
+            cpu_ops
+                .par_iter()
+                .filter(|op| op.decode.fields.word_instr)
+                .map(build_cpu32_op)
+                .collect(),
+            cpu_ops.par_iter().filter_map(lt).collect(),
+            cpu_ops.par_iter().filter_map(shift).collect(),
+        )
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        (
+            cpu_ops
+                .iter()
+                .flat_map(|op| op.collect_bitwise_ops())
+                .collect(),
+            cpu_ops
+                .iter()
+                .filter(|op| op.decode.fields.word_instr)
+                .map(build_cpu32_op)
+                .collect(),
+            cpu_ops.iter().filter_map(lt).collect(),
+            cpu_ops.iter().filter_map(shift).collect(),
+        )
+    }
+}
+
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -373,14 +438,16 @@ fn collect_ops_from_cpu(
     Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
+    // State-free chips (CPU range-check bitwise lookups + CPU32/LT/SHIFT dispatch)
+    // are collected in parallel; the loop below only does the state-dependent work
+    // (MEMW/register/commit/keccak/ecsm — which thread memory/register state).
+    let (cpu_bitwise_ops, cpu32_ops, lt_ops, shift_ops) = collect_state_free_ops(cpu_ops);
+
     let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
-    let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
-    let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ec_scalar_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
@@ -388,12 +455,9 @@ fn collect_ops_from_cpu(
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
-        // Word (`*W`) instructions delegate to the CPU32 table (built in program
-        // order; its register accesses are still emitted via the shared register
-        // collector below so the MEMW table balances).
-        if op.decode.fields.word_instr {
-            cpu32_ops.push(build_cpu32_op(op));
-        }
+        // CPU32 register accesses are still emitted via the shared register
+        // collector below so the MEMW table balances; the CPU32 op itself is
+        // built in the state-free parallel pass.
 
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
@@ -474,40 +538,12 @@ fn collect_ops_from_cpu(
             ec_scalar_ops.extend(ec_scalar_rows);
             ecdas_ops.extend(ecdas_rows);
         }
-
-        // --- ALU chip dispatch (no state tracking) ---
-        // Word (`*W`) instructions are delegated to CPU32 (which itself drives
-        // the ALU chips); the main CPU does not send the ALU bus for them, so we
-        // must not emit chip ops here. CPU32 op-generation is B5b.
-        let f = op.decode.fields;
-        if !f.word_instr {
-            // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
-            // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
-            if f.is_lt() {
-                lt_ops.push(LtOperation::new_with_invert(
-                    op.rv1,
-                    op.arg2,
-                    f.alu_signed(),
-                    f.alu_signed2_or_invert(),
-                ));
-            }
-            // SHIFT: SLL/SRL/SRA. direction = invert bit (0 = left, 1 = right).
-            // The full arg2 goes on the ALU bus as in2; the chip uses its low
-            // byte for the (mod 32/64) computation.
-            if f.is_shift() {
-                shift_ops.push(ShiftOperation::new(
-                    op.rv1,
-                    op.arg2,
-                    f.alu_signed2_or_invert(),
-                    f.alu_signed(),
-                    f.word_instr,
-                ));
-            }
-        }
-
-        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
-        bitwise_ops.extend(op.collect_bitwise_ops());
     }
+
+    // CPU range-check lookups (ARE_BYTES + IS_HALF) were collected in the
+    // state-free pass above; merge them in. Order is irrelevant for the bitwise
+    // multiplicity accumulation.
+    bitwise_ops.extend(cpu_bitwise_ops);
 
     // Each ecall generates count+1 operations (count real rows + 1 end row)
     debug_assert_eq!(
