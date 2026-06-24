@@ -365,13 +365,17 @@ pub trait IsStarkVerifier<
 
         FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).unwrap();
 
-        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
-            boundary_c_i_evaluations_num
+        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> = {
+            let mut acc = FieldElement::<FieldExtension>::zero();
+            for ((num, den), beta) in boundary_c_i_evaluations_num
                 .iter()
                 .zip(&boundary_c_i_evaluations_den)
                 .zip(&challenges.boundary_coeffs)
-                .map(|((num, den), beta)| num * den * beta)
-                .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
+            {
+                acc.fma(&(num.clone() * den), beta);
+            }
+            acc
+        };
 
         let periodic_values = air
             .get_periodic_column_polynomials(trace_length)
@@ -462,14 +466,17 @@ pub trait IsStarkVerifier<
             scratch.denominators[c.constraint_idx()] = zerofier;
         });
 
-        let transition_c_i_evaluations_sum = itertools::izip!(
-            &scratch.transition_evals,
-            &challenges.transition_coeffs,
-            &scratch.denominators
-        )
-        .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-            acc + beta * eval * denominator
-        });
+        let transition_c_i_evaluations_sum = {
+            let mut acc = FieldElement::zero();
+            for (eval, beta, denominator) in itertools::izip!(
+                &scratch.transition_evals,
+                &challenges.transition_coeffs,
+                &scratch.denominators
+            ) {
+                acc.fma(&(beta.clone() * eval), denominator);
+            }
+            acc
+        };
 
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
@@ -1094,8 +1101,8 @@ pub trait IsStarkVerifier<
                 row_acc_0.fma(eval, &trace_term_coeffs[base]);
                 row_acc_1.fma(eval, &trace_term_coeffs[base + 1]);
             }
-            trace_term += (row_acc_0 - &b_terms[0]) * denom0;
-            trace_term += (row_acc_1 - &b_terms[1]) * denom1;
+            trace_term.fma(&(row_acc_0 - &b_terms[0]), denom0);
+            trace_term.fma(&(row_acc_1 - &b_terms[1]), denom1);
         } else {
             for (row_idx, denom) in denoms_trace_inv.iter().enumerate() {
                 let mut row_acc = FieldElement::zero();
@@ -1109,15 +1116,14 @@ pub trait IsStarkVerifier<
                     let col_idx = n_base_cols + aux_idx;
                     row_acc.fma(eval, &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx]);
                 }
-                trace_term += (row_acc - &b_terms[row_idx]) * denom;
+                trace_term.fma(&(row_acc - &b_terms[row_idx]), denom);
             }
         }
 
         let mut h_terms = FieldElement::zero();
         for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
             let h_i_zpower = &composition_poly_parts_ood[j];
-            let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
-            h_terms += h_i_term;
+            h_terms.fma(&(h_i_upsilon - h_i_zpower), &challenges.gammas[j]);
         }
         h_terms *= denom_composition_inv;
 
