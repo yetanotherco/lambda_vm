@@ -23,38 +23,41 @@ In this section, we discuss, in order,
 + prove correctness of a set of constraints that can be used to constrain quadratic relations.
 
 = Limb decomposition
-Let $[X]$ denote the set ${0, ..., X-1} subset.eq NN$.
+Let $[X]$ denote the set ${0, ..., X-1} subset.eq NN$, and $[X]^n$ with $n in NN$ the $n$-dimensional self-product of this set.
 Let $S := L^n in NN$ be an upper bound on the integers we want to represent, 
-where $L in NN without {0, 1}$ is the number of values a limb can represent 
+where $L in NN$ with $L >= 4$ is the number of values a limb can represent 
 and $n in N$ denotes the number of limbs.
 
-Observe that for all $x in [S]$, there exists a unique tuple of integers 
-$(x_0, x_1, x_2, x_(n-1)) in [L]^(n)$ such that
+Observe that for all $x in [S]$, there exists a unique "limb decomposition"
+$(x_0, x_1, x_2, ...,  x_(n-1)) in [L]^(n)$ such that
 $
   x 
   = sum_(i=0)^(n-1) x_i dot L^i.
 $ #<eq:decomposition>
 To simplify future notation, we define $x_i := 0$ for all $i >= n$.
-Next, we define the family of multi-linear functions 
+
+#let vec(x) = math.bold(math.upright(x))
+
+Next, we define the family of functions 
 $
-f_(mu, alpha) (x, y, z) := sum_(m in [mu]) (x^((m)) dot y^((m))) + sum_(a in [alpha]) z^((a))
+f_(mu, alpha) (vec(x), vec(y), vec(z)) := sum_(m in [mu]) (vec(x)^((m)) dot vec(y)^((m))) + sum_(a in [alpha]) vec(z)^((a))
 $
-over variables $x, y in [S]^mu$ and $z in [S]^alpha$, with parameters $mu, alpha in NN$.
-Working towards the limb-decomposition of $f_(mu, alpha)$, we rewrite
+over variables $vec(x), vec(y) in [S]^mu$ and $vec(z) in [S]^alpha$, with parameters $mu, alpha in NN$.
+Working towards the limb decomposition of $w := f_(mu, alpha)(vec(x), vec(y), vec(z))$, we rewrite
 
 $
-  f_(mu, alpha) (x, y, z) 
-  &= sum_(m in [mu]) (sum_(i=0)^(n-1) x^((m))_i dot L^i) (sum_(j=0)^(n-1) y^((m))_j dot L^j) + sum_(a in [alpha]) (sum_(k=0)^(n-1) z^((a))_k dot L^k)\
-  &= sum_(m in [mu]) (sum_(i=0)^(n-1) sum_(j=0)^(n-1) x^((m))_i dot y^((m))_j dot L^(i+j)) + sum_(a in [alpha]) (sum_(k=0)^(n-1) z^((a))_k dot L^k)\
-  &= sum_(i=0)^(n-1) sum_(j=0)^(n-1) (sum_(m in [mu]) x^((m))_i dot y^((m))_j dot L^(i+j)) + sum_(k=0)^(n-1) (sum_(a in [alpha]) z^((a))_k dot L^k)\
-  &= sum_(i=0)^(n-1) (sum_(j=0)^(n-1) (sum_(m in [mu]) x^((m))_i dot y^((m))_j dot L^(i+j)) + sum_(a in [alpha]) z^((a))_i dot L^i )\
-  &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) x^((m))_(r-j) dot y^((m))_j dot L^r) + sum_(a in [alpha]) z^((a))_r dot L^r )\
-  &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) x^((m))_(r-j) dot y^((m))_j) + sum_(a in [alpha]) z^((a))_r) dot L^r\
+  f_(mu, alpha) (vec(x), vec(y), vec(z)) 
+  &= sum_(m in [mu]) (sum_(i=0)^(n-1) vec(x)^((m))_i dot L^i) (sum_(j=0)^(n-1) vec(y)^((m))_j dot L^j) + sum_(a in [alpha]) (sum_(k=0)^(n-1) vec(z)^((a))_k dot L^k)\
+  &= sum_(m in [mu]) (sum_(i=0)^(n-1) sum_(j=0)^(n-1) vec(x)^((m))_i dot vec(y)^((m))_j dot L^(i+j)) + sum_(a in [alpha]) (sum_(k=0)^(n-1) vec(z)^((a))_k dot L^k)\
+  &= sum_(i=0)^(n-1) sum_(j=0)^(n-1) (sum_(m in [mu]) vec(x)^((m))_i dot vec(y)^((m))_j dot L^(i+j)) + sum_(k=0)^(n-1) (sum_(a in [alpha]) vec(z)^((a))_k dot L^k)\
+  &= sum_(i=0)^(n-1) (sum_(j=0)^(n-1) (sum_(m in [mu]) vec(x)^((m))_i dot vec(y)^((m))_j dot L^(i+j)) + sum_(a in [alpha]) vec(z)^((a))_i dot L^i )\
+  &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) vec(x)^((m))_(r-j) dot vec(y)^((m))_j dot L^r) + sum_(a in [alpha]) vec(z)^((a))_r dot L^r )\
+  &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) vec(x)^((m))_(r-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_r) dot L^r\
   &= sum_(r=0)^(2(n-1)) overline(w)_r dot L^r, #<eq:f-semi-decomposition>
 $
 where
 $
-  overline(w)_i := sum_(m in [mu]) (sum_(j=0)^(i) x^((m))_(i-j) dot y^((m))_j) + sum_(a in [alpha]) z^((a))_i.
+  overline(w)_i := sum_(m in [mu]) (sum_(j=0)^(i) vec(x)^((m))_(i-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_i.
 $
 
 While @eq:f-semi-decomposition closely resembles that of a limb-decomposition (@eq:decomposition), 
@@ -71,7 +74,7 @@ they're commonly referred to as the _carry_ values.
 #lemma[
     For all $g >= 2n-1$, 
     $(w_0, w_1, ..., w_(g-1)) in [L]^(g)$ 
-    is the unique $g$-limb decomposition of $f_(mu, alpha)$
+    is the unique $g$-limb decomposition of $w := f_(mu, alpha)(vec(x), vec(y), vec(z))$
     if and only if $c_(g-1) = 0$.
 ]<lm:wi_decomp_f>
 #proof[
@@ -109,11 +112,11 @@ To find some of the conditions under which $c_(g-1) = 0$, we prove two upperboun
   = floor.l (overline(w)_i + c_(i-1)) dot L^(-1) floor.r.$
   Hence, $c_i$ is maximized when both $overline(w)_i$ and $c_(i-1)$ are, and thus, 
   by induction, when $overline(w)_j$ is maximized for all $j <= i$.
-  Given that $x^((m))_i, y^((m))_i, z^((a))_i <= L-1$ for all $m < mu, a < alpha, i < n$, it follows that
+  Given that for all $m in [mu], a in [alpha], i in [n]: vec(x)^((m))_i, vec(y)^((m))_i, vec(z)^((a))_i <= L-1$, it follows that
   $
 
   &overline(w)_0
-  &=& sum_(m in [mu]) (x^((m))_0 dot y^((m))_0) + sum_(a in [alpha]) z^((a))_0\
+  &=& sum_(m in [mu]) (vec(x)^((m))_0 dot vec(y)^((m))_0) + sum_(a in [alpha]) vec(z)^((a))_0\
   &&<=& mu (L - 1)^2 + alpha (L-1)\
   &&=& mu (L - 2)L + mu + (alpha - delta) L + delta L - alpha\
   &&=& mu (L - 2)L + (alpha - delta) L + delta L + mu - alpha,\
@@ -126,7 +129,7 @@ To find some of the conditions under which $c_(g-1) = 0$, we prove two upperboun
   Assuming the statement holds for up to some $i >= 0$, we find that
   $
   overline(w)_(i+1)
-  &= sum_(m in [mu]) (sum_(j=0)^(i+1) x^((m))_(i+1-j) dot y^((m))_j) + sum_(a in [alpha]) z^((a))_(i+1) \
+  &= sum_(m in [mu]) (sum_(j=0)^(i+1) vec(x)^((m))_(i+1-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_(i+1) \
   &<= mu (i+2)(L-1)^2 + alpha (L-1),\
   c_(i+1) 
   &<= lr(floor.l (mu (i+2) (L-1)^2 + alpha (L-1) + mu (i+1) (L-1) + alpha - mu - delta)/L floor.r)\
@@ -136,7 +139,7 @@ To find some of the conditions under which $c_(g-1) = 0$, we prove two upperboun
   $
 ]
 
-Inspecting this upper bound, we find that it is _tight_ for all $i<n$; for $x = y = z = S-1$, $c_i$ achieves the upper bound.
+Inspecting this upper bound, we find that it is _tight_ for all $i<n$; for $vec(x)^((m)) = vec(y)^((m)) = vec(z)^((a)) = S-1$, $c_i$ achieves the upper bound.
 To achieve a tight upper bound for $i >= n$, we introduce a second lemma:
 
 #lemma("Carry upper bound [part 2]")[
@@ -151,10 +154,10 @@ To achieve a tight upper bound for $i >= n$, we introduce a second lemma:
   Starting with $k=0$, we find
   $
   overline(w)_n 
-  &= sum_(m in [mu]) (sum_(j=0)^(n) x^((m))_(n-j) dot y^((m))_j) + sum_(a in [alpha]) z^((a))_n\
+  &= sum_(m in [mu]) (sum_(j=0)^(n) vec(x)^((m))_(n-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_n\
   &<= mu (n-1) (L-1)^2
   $
-  since $x^((m))_i$, $y^((m))_i$, and $z^((a))$ are $0$ for $i >= n$.
+  since $vec(x)^((m))_i$, $vec(y)^((m))_i$, and $vec(z)^((a))_i$ are $0$ for $i >= n$.
   Applying this upper bound to $c_n$, we obtain
   $
   c_(n)
@@ -169,7 +172,7 @@ To achieve a tight upper bound for $i >= n$, we introduce a second lemma:
   When the bound holds for some $i=n+k-1$ with $k in [1, n)$, it follows that
   $
   overline(w)_(n+k)
-  &= sum_(m in [mu]) (sum_(j=0)^(n+k) x^((m))_(n+k-j) dot y^((m))_j) + sum_(a in [alpha]) z^((a))_(n+k)\
+  &= sum_(m in [mu]) (sum_(j=0)^(n+k) vec(x)^((m))_(n+k-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_(n+k)\
   &<= mu (n-k-1) (L-1)^2\
   c_(n+k)
   &<= lr(floor.l (mu (n-k-1) (L-1)^2 + mu (n-k)(L-2) + mu (n - k + 1) - delta') / L floor.r)\
@@ -179,6 +182,12 @@ To achieve a tight upper bound for $i >= n$, we introduce a second lemma:
   $
   The claimed upper bound now follows for all $k in [0, n)$ by induction. 
 ]
+Note that this upper bound is tight: 
+$c_(n+k)$ achieves the bound for all $k in [n]$ when $vec(x)^((m)) = vec(y)^((m)) = vec(z)^((a)) = S-1$ for all $m in [mu]$ and $a in [alpha]$.
+For $k = n-1$, this yields $c_(n+(n-1)) = c_(2n-1) <= mu - delta'$, which evaluates to zero when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$.
+We can therefore conclude that $(w_0, w_1, ..., w_(2n-1)) in [L]^(2n)$ is a valid $2n$-limb decomposition of $f_(mu, alpha) (vec(x), vec(y), vec(z))$ in these cases.
+For larger values of $mu in [2, L/2]$, we note that $c_(2n) <= floor.l frac((mu - delta'), L, style: "horizontal") floor.r = 0$ and thus $c_(2n + i) = 0$ for all $i >= 0$.
+Hence, attaching extra limb $w_(2n) := c_(2n)$ yields a $(2n+1)$-limb decomposition for these cases.
 
 Combining both upper bounds, we now find that
 
@@ -186,18 +195,11 @@ Combining both upper bounds, we now find that
 Given $alpha in [L]$ and $mu in [L/2]$, then for all $i <= 2n$:
 $
 c_i <= &max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
-  &max_(k in [n]) #h(1em) mu (2n-k-1)(L-2) + mu (2n-k) - delta')\
-&= max(& mu n (L-1) + alpha - mu - delta, mu (2n-1)(L-2) + 2 mu n - delta')\
+  &max_(k in [n]) #h(1em) mu (n-k-1)(L-2) + mu (n-k) - delta')\
+&= max(& mu n (L-1) + alpha - mu - delta, mu (n-1)(L-2) + mu n - delta')\
 &= mu n (L-1) + alpha - mu - delta
 $
-]
-
-Note that this upper bound is tight: 
-$c_(n+k)$ achieves the bound for all $k in [n]$ when $x^((m)) = y^((m)) = z^((a)) = S-1$ for all $m in [mu]$ and $a in [alpha]$.
-For $k = n-1$, this yields $c_(n+(n-1)) = c_(2n-1) <= mu - delta'$, which evaluates to zero when $mu = 0$ and $alpha < L$, or $mu = 1$ and $alpha <= 2$.
-We can therefore conclude that $(w_0, w_1, ..., w_(2n-1)) in [L]^(2n)$ is a valid $2n$-limb decomposition of $f_(mu, alpha) (x, y, z)$ in these cases.
-For larger values of $mu in [2, L/2]$, we note that $c_(2n) <= floor.l frac((mu - delta'), L, style: "horizontal") floor.r = 0$ and thus $c_(2n + i) = 0$ for all $i >= 0$.
-Hence, attaching extra limb $w_(2n) := c_(2n)$ yields a $(2n+1)$-limb decomposition for these cases.
+]<cor:carry-upper-bound>
 
 = Proof of Correctness
 Lastly, we prove that there exists a correct method of constraining the relation between $overline(w)_i$, $w_i$ and $c_i$ inside this VM:
@@ -232,7 +234,7 @@ Lastly, we prove that there exists a correct method of constraining the relation
     $
     where the utilized upper bound 
     $overline(w)_i <= mu n(L-1)^2 + alpha (L-1)$ 
-    can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2.
+    can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2, while the upper bound for $c_(i-1)$ follows from @cor:carry-upper-bound.
     Moreover, observe that $|X_i inter [L]| <= 1$ since $C < frac(p,L, style:"horizontal")$.
     Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
     and as a result, $c_i = floor.l frac(overline(w)_i + c_(i-1), L, style: "horizontal") floor.r$ is correct.
