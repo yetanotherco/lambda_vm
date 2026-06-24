@@ -681,10 +681,39 @@ mod tests {
     fn test_prove_and_verify_continuation() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let epoch_size = 8;
+        // Guard against silent degradation: the program must be longer than one
+        // epoch, otherwise this collapses to a single final epoch and stops testing
+        // the cross-epoch (intermediate-epoch) path.
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
         assert!(
-            prove_and_verify_continuation(&elf_bytes, &[], 8)
+            total > epoch_size,
+            "program too short ({total} cycles) to exercise intermediate epochs"
+        );
+        assert!(
+            prove_and_verify_continuation(&elf_bytes, &[], epoch_size)
                 .unwrap()
                 .is_some()
         );
+    }
+
+    // Guards the power-of-two epoch-size rounding in `prove_and_verify_continuation`.
+    // A non-power-of-two `epoch_size` (10) must still verify: the driver rounds it up
+    // to 16, so intermediate epochs have no CPU padding rows. Without the rounding
+    // this returns `Ok(None)` (dangling padding pc=1 tokens). 16-cycle epochs over
+    // the 33-cycle `test_commit_split` also put its two commits in different epochs,
+    // exercising the cross-epoch x254 carry; asserting the exact aggregated output
+    // keeps this test from silently degrading to a trivial pass.
+    #[test]
+    fn test_continuation_non_power_of_two_epoch_size() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let out = prove_and_verify_continuation(&elf_bytes, &[], 10).unwrap();
+        assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 }
