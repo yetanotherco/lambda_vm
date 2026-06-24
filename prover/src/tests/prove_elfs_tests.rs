@@ -3076,13 +3076,9 @@ fn test_epoch_proof_commits_l2g() {
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
     let elf = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&elf, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs
-        .len();
-    let epoch_size = (total / 3).max(1);
+    // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
+    // makes epoch 0 an intermediate epoch with no CPU padding rows.
+    let epoch_size = 8;
     let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
