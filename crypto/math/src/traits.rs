@@ -38,6 +38,13 @@ pub trait ByteConversion {
         let bytes = bytes.as_ref();
         buf[..bytes.len()].copy_from_slice(bytes);
     }
+
+    /// Write little-endian bytes into `buf[..BYTE_LEN]`.
+    fn write_bytes_le(&self, buf: &mut [u8]) {
+        let bytes = self.to_bytes_le();
+        let bytes = bytes.as_ref();
+        buf[..bytes.len()].copy_from_slice(bytes);
+    }
 }
 
 /// Serialize function without args

@@ -181,7 +181,7 @@ where
         use crate::hash::keccak256::keccak256;
         leaf_scratch.clear();
         for element in value.iter() {
-            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+            leaf_scratch.extend_from_slice(element.to_bytes_le().as_ref());
         }
         keccak256(leaf_scratch)
     };
@@ -283,12 +283,12 @@ where
         use crate::hash::keccak256::keccak256;
         leaf_scratch.clear();
         for element in value_a.iter() {
-            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+            leaf_scratch.extend_from_slice(element.to_bytes_le().as_ref());
         }
         let ha = keccak256(leaf_scratch);
         leaf_scratch.clear();
         for element in value_b.iter() {
-            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+            leaf_scratch.extend_from_slice(element.to_bytes_le().as_ref());
         }
         let hb = keccak256(leaf_scratch);
         (ha, hb)

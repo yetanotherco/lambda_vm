@@ -36,7 +36,7 @@ where
         let mut hasher = D::new();
         // Hash the big-endian bytes directly from the fixed-size array (no
         // allocation). Same bytes as the previous `as_bytes()` (= to_bytes_be).
-        hasher.update(input.to_bytes_be().as_ref());
+        hasher.update(input.to_bytes_le().as_ref());
         hasher.finalize().into()
     }
 

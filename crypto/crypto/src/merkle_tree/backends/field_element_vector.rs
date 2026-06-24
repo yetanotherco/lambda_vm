@@ -40,8 +40,8 @@ where
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         // Hash BE bytes from the fixed-size arrays directly (no allocation).
-        hasher.update(input[0].to_bytes_be().as_ref());
-        hasher.update(input[1].to_bytes_be().as_ref());
+        hasher.update(input[0].to_bytes_le().as_ref());
+        hasher.update(input[1].to_bytes_le().as_ref());
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -100,7 +100,7 @@ where
         let mut hasher = D::new();
         for element in input.iter() {
             // BE bytes from the fixed-size array, no per-element allocation.
-            hasher.update(element.to_bytes_be().as_ref());
+            hasher.update(element.to_bytes_le().as_ref());
         }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
@@ -132,7 +132,7 @@ where
         let mut hasher = D::new();
         for element in input.iter() {
             // BE bytes from the fixed-size array, no per-element allocation.
-            hasher.update(element.to_bytes_be().as_ref());
+            hasher.update(element.to_bytes_le().as_ref());
         }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());

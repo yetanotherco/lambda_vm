@@ -421,7 +421,7 @@ where
         let mut buf = vec![0u8; total_bytes];
         for col_idx in 0..num_cols {
             columns[col_idx][br_idx]
-                .write_bytes_be(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
+                .write_bytes_le(&mut buf[col_idx * byte_len..(col_idx + 1) * byte_len]);
         }
         BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)
     })
@@ -468,11 +468,11 @@ where
         let mut buf = vec![0u8; total_bytes];
         let mut offset = 0;
         for part in parts.iter() {
-            part[br_0].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            part[br_0].write_bytes_le(&mut buf[offset..offset + byte_len]);
             offset += byte_len;
         }
         for part in parts.iter() {
-            part[br_1].write_bytes_be(&mut buf[offset..offset + byte_len]);
+            part[br_1].write_bytes_le(&mut buf[offset..offset + byte_len]);
             offset += byte_len;
         }
         BatchedMerkleTreeBackend::<E>::hash_bytes(&buf)

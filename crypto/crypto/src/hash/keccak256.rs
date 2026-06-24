@@ -173,7 +173,7 @@ fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
 /// **Contract**: `BYTE_LEN` must be a multiple of 8. For elements where `total_bytes < RATE`
 /// (fits in a single block) prefer [`keccak256_field_elements_direct`] instead.
 ///
-/// Output is byte-identical to `keccak256(concat(element.to_bytes_be() for element in elements))`.
+/// Output is byte-identical to `keccak256(concat(element.to_bytes_le() for element in elements))`.
 #[inline]
 pub fn keccak256_field_elements_streaming<F>(
     elements: &[math::field::element::FieldElement<F>],
@@ -190,7 +190,7 @@ where
     let mut state = [0u64; 25];
     let mut lane_idx = 0usize; // next lane to write (mod 17)
     for element in elements.iter() {
-        let bytes = element.to_bytes_be();
+        let bytes = element.to_bytes_le();
         for chunk in bytes.as_ref().chunks_exact(8) {
             state[lane_idx] ^= u64::from_le_bytes(chunk.try_into().unwrap());
             lane_idx += 1;
@@ -242,7 +242,7 @@ where
     let mut state = [0u64; 25];
     let mut lane_idx = 0usize;
     for element in elements.iter() {
-        let bytes = element.to_bytes_be();
+        let bytes = element.to_bytes_le();
         for chunk in bytes.as_ref().chunks_exact(8) {
             state[lane_idx] = u64::from_le_bytes(chunk.try_into().unwrap());
             lane_idx += 1;
@@ -503,7 +503,7 @@ mod tests {
             // Reference: serialize then hash.
             let mut bytes = alloc::vec::Vec::new();
             for e in &elements {
-                bytes.extend_from_slice(e.to_bytes_be().as_ref());
+                bytes.extend_from_slice(e.to_bytes_le().as_ref());
             }
             let reference = if bytes.len() < RATE {
                 keccak256_single_block(&bytes)
@@ -536,7 +536,7 @@ mod tests {
                 .collect();
             let mut bytes = alloc::vec::Vec::new();
             for e in &elements {
-                bytes.extend_from_slice(e.to_bytes_be().as_ref());
+                bytes.extend_from_slice(e.to_bytes_le().as_ref());
             }
             let reference = keccak256(&bytes);
             let streaming = keccak256_field_elements_streaming::<Fp>(&elements);
