@@ -313,8 +313,12 @@ pub fn generate_dvrm_trace(
     for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
         let q = op.compute_quotient();
         let r = op.compute_remainder();
-        let n_sub_r = op.n_sub_r();
-        let abs_r = op.abs_r();
+        // Derive the rest from the single `r` above instead of the helper methods,
+        // each of which recomputes the integer division internally (6×/row → 1×).
+        let sign_r = op.signed && (r >> 63) == 1;
+        let n_sub_r = op.n.wrapping_sub(r);
+        let sign_n_sub_r = op.signed && (n_sub_r >> 63) == 1;
+        let abs_r = DvrmOperation::abs_value(r, sign_r);
         let abs_d = op.abs_d();
 
         // Fill n as DWordHL (4 halfwords)
@@ -341,11 +345,11 @@ pub fn generate_dvrm_trace(
         // Fill n_sub_r as DWordHL (4 halfwords)
         table.set_dword_hl(row_idx, cols::N_SUB_R_0, n_sub_r);
 
-        table.set_bool(row_idx, cols::SIGN_N_SUB_R, op.sign_n_sub_r());
+        table.set_bool(row_idx, cols::SIGN_N_SUB_R, sign_n_sub_r);
         table.set_bool(row_idx, cols::SIGN_N, op.sign_n());
         table.set_bool(row_idx, cols::SIGN_D, op.sign_d());
         table.set_bool(row_idx, cols::SIGN_Q, op.sign_q());
-        table.set_bool(row_idx, cols::SIGN_R, op.sign_r());
+        table.set_bool(row_idx, cols::SIGN_R, sign_r);
 
         // Multiplicities
         table.set_u64(row_idx, cols::MU_Q, multiplicities.mu_q);
