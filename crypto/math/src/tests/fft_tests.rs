@@ -51,7 +51,7 @@ mod fft_polynomial_tests {
     use crate::fft::test_helpers::get_powers_of_primitive_root;
     use crate::field::element::FieldElement;
     use crate::field::extensions_goldilocks::Degree2GoldilocksExtensionField;
-    use crate::field::traits::{IsFFTField, RootsConfig};
+    use crate::field::traits::{IsFFTField, IsSubFieldOf, RootsConfig};
     use crate::polynomial::Polynomial;
     use proptest::{collection, prelude::*};
 
@@ -60,7 +60,7 @@ mod fft_polynomial_tests {
         poly_2: &Polynomial<FieldElement<E>>,
     ) -> Polynomial<FieldElement<E>>
     where
-        F: IsFFTField + crate::field::traits::IsSubFieldOf<E>,
+        F: IsFFTField + IsSubFieldOf<E>,
         E: IsField + Send + Sync,
     {
         let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
