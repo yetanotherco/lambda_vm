@@ -62,7 +62,7 @@ pad = 0
 name = "half_instruction_length"
 type = "Byte"
 desc = "Half the number of bytes consumed by this instruction, commonly used to indicate whether the instruction is of C type, i.e., whether it is 2 bytes long (= 1) instead of 4 (= 2)"
-pad = 2
+pad = 0
 
 [[variables.input]]
 name = "word_instr"
