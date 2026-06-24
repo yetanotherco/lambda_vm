@@ -814,6 +814,12 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Concrete LogUp term constraints for monomorphic prover dispatch.
+    /// These mirror the boxed versions in `transition_constraints` but enable
+    /// the compiler to inline fingerprint computation in the hot loop.
+    logup_term_constraints_direct: Vec<LookupBatchedTermConstraint>,
+    /// Concrete LogUp accumulated constraint for monomorphic prover dispatch.
+    logup_accumulated_direct: Option<LookupAccumulatedConstraint>,
 }
 
 impl<
@@ -852,7 +858,9 @@ impl<
         let absorbed =
             auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
 
-        // Create batched term constraints for committed pairs only
+        // Create batched term constraints for committed pairs only.
+        // Store concrete copies for monomorphic prover dispatch alongside boxed versions.
+        let mut logup_term_constraints_direct = Vec::with_capacity(num_committed_pairs);
         for pair_idx in 0..num_committed_pairs {
             let constraint = LookupBatchedTermConstraint::new(
                 auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
@@ -860,20 +868,25 @@ impl<
                 pair_idx,
                 transition_constraints.len(),
             );
+            logup_term_constraints_direct.push(constraint.clone());
             transition_constraints.push(Box::new(constraint));
         }
 
         let num_term_columns = num_committed_pairs;
 
-        // Add the accumulated constraint with absorbed interactions
-        if num_interactions > 0 {
+        // Add the accumulated constraint with absorbed interactions.
+        let logup_accumulated_direct = if num_interactions > 0 {
             let accumulated_constraint = LookupAccumulatedConstraint::new(
                 transition_constraints.len(),
                 num_term_columns,
                 absorbed,
             );
+            let direct = accumulated_constraint.clone();
             transition_constraints.push(Box::new(accumulated_constraint));
-        }
+            Some(direct)
+        } else {
+            None
+        };
 
         // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
@@ -911,6 +924,8 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            logup_term_constraints_direct,
+            logup_accumulated_direct,
         }
     }
 
@@ -1013,6 +1028,46 @@ where
 
     fn num_base_transition_constraints(&self) -> usize {
         self.num_base_constraints
+    }
+
+    /// Prover-optimized constraint evaluation with monomorphic LogUp dispatch.
+    ///
+    /// Base (domain) constraints use the standard vtable path — they're heterogeneous
+    /// user-defined types that can't be devirtualized.
+    ///
+    /// LogUp constraints (`LookupBatchedTermConstraint`, `LookupAccumulatedConstraint`)
+    /// are dispatched through concrete types, enabling the compiler to inline
+    /// fingerprint computation and eliminate indirect call overhead in the hot loop.
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        // Zero base-field buffers
+        for e in base_evals.iter_mut() {
+            *e = FieldElement::zero();
+        }
+        let num_base = base_evals.len();
+        // Zero extension slots (LogUp constraints write here)
+        for e in ext_evals[num_base..].iter_mut() {
+            *e = FieldElement::zero();
+        }
+
+        // Phase 1: Base (domain) constraints — dyn dispatch (heterogeneous types)
+        for c in &self.transition_constraints[..num_base] {
+            c.evaluate_prover(evaluation_context, base_evals, ext_evals);
+        }
+
+        // Phase 2: LogUp term constraints — monomorphic dispatch (concrete type)
+        for c in &self.logup_term_constraints_direct {
+            c.evaluate_verifier(evaluation_context, ext_evals);
+        }
+
+        // Phase 3: LogUp accumulated constraint — monomorphic dispatch (concrete type)
+        if let Some(c) = &self.logup_accumulated_direct {
+            c.evaluate_verifier(evaluation_context, ext_evals);
+        }
     }
 
     fn transition_constraints(
@@ -1705,6 +1760,7 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
 ///
 /// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
+#[derive(Clone)]
 struct LookupBatchedTermConstraint {
     interaction_a: BusInteraction,
     interaction_b: BusInteraction,
@@ -1830,6 +1886,7 @@ where
 ///
 /// For 2 absorbed interactions:
 ///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
+#[derive(Clone)]
 struct LookupAccumulatedConstraint {
     constraint_idx: usize,
     /// Number of committed term columns (excludes absorbed interactions)
