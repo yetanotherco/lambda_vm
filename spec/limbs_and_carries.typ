@@ -6,7 +6,7 @@
 // Theorem/lemma formatting
 #show: thmrules.with(qed-symbol: $square$)
 #let lemma = thmbox("lemma", "Lemma", fill: rgb("#eee"),base_level: 0)
-#let corollary = thmbox("lemma", "Corrollary", fill: rgb("#eee"), base_level: 0)
+#let corollary = thmbox("lemma", "Corollary", fill: rgb("#eee"), base_level: 0)
 #let proof = thmproof("proof", "Proof")
 
 // Equation formatting
@@ -26,7 +26,7 @@ In this section, we discuss, in order,
 Let $[X]$ denote the set ${0, ..., X-1} subset.eq NN$, and $[X]^n$ with $n in NN$ the $n$-dimensional self-product of this set.
 Let $S := L^n in NN$ be an upper bound on the integers we want to represent, 
 where $L in NN$ with $L >= 4$ is the number of values a limb can represent 
-and $n in N$ denotes the number of limbs.
+and $n in NN$ denotes the number of limbs.
 
 Observe that for all $x in [S]$, there exists a unique "limb decomposition"
 $(x_0, x_1, x_2, ...,  x_(n-1)) in [L]^(n)$ such that
@@ -61,8 +61,8 @@ $
 $
 
 While @eq:f-semi-decomposition closely resembles that of a limb-decomposition (@eq:decomposition), 
-there is the problem that $overline(w)_i$ will exceed $L$ for sufficiently large $alpha, mu, x, y, z$, and $i$.
-We therefore introduce helper sequence $c_i$ to transform $overline(w)_i$ into a proper decomposition $w_i$ as:
+there is the problem that $overline(w)_i$ will generally not be bounded by $L$.
+We therefore introduce a helper sequence, $c_i$, to transform $overline(w)_i$ into a proper decomposition $w_i$ as:
 $
   w_i &:= overline(w)_i + c_(i-1) mod L &text("for") i >= 0,\
   c_i &:= (overline(w)_i + c_(i-1) - w_i )/L &text("for") i >= 0,\
@@ -95,7 +95,7 @@ they're commonly referred to as the _carry_ values.
 ]
 
 = Upper bounding the carry
-To find some of the conditions under which $c_(g-1) = 0$, we prove two upperbounds for $c_i$.
+To bound for which $g$ we can guarantee that $c_(g-1) = 0$, we prove two upper bounds for $c_i$.
 
 #lemma("Carry upper bound [part 1]")[
   For $alpha, mu in [L]$, it holds that
@@ -235,7 +235,7 @@ Lastly, we prove that there exists a correct method of constraining the relation
     where the utilized upper bound 
     $overline(w)_i <= mu n(L-1)^2 + alpha (L-1)$ 
     can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2, while the upper bound for $c_(i-1)$ follows from @cor:carry-upper-bound.
-    Moreover, observe that $|X_i inter [L]| <= 1$ since $C < frac(p,L, style:"horizontal")$.
+    Moreover, observe that $|X_i inter [L]| <= 1$ since $0 <= C L < p$.
     Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
     and as a result, $c_i = floor.l frac(overline(w)_i + c_(i-1), L, style: "horizontal") floor.r$ is correct.
     The proof now follows by induction, with @eq:c_-1_is_zero enforcing the base case.
