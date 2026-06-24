@@ -31,6 +31,7 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 /// - Bus interaction balancing (sends = receives)
 /// - Constraint satisfaction
 /// - LogUp protocol correctness
+#[cfg(test)]
 pub(crate) fn trim_zero_rows(
     trace: TraceTable<GoldilocksField, GoldilocksExtension>,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
