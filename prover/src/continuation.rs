@@ -238,6 +238,7 @@ struct EpochStart<'a> {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
@@ -263,13 +264,20 @@ struct EpochProof {
 /// the one cross-epoch global-memory proof, and the private inputs (needed to
 /// rebuild the genesis image — bound by the global proof's genesis-from-ELF check).
 ///
-/// `verify_continuation` checks this using only the bundle and the ELF. It is held
-/// in memory for now; serializing it (`MultiProof` already derives serde) is a
-/// follow-up.
+/// `verify_continuation` checks this using only the bundle and the ELF. It derives
+/// serde, so it round-trips through `bincode` exactly like a monolithic `VmProof`.
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
     private_inputs: Vec<u8>,
+}
+
+impl ContinuationProof {
+    /// Number of epochs the execution was split into.
+    pub fn num_epochs(&self) -> usize {
+        self.epochs.len()
+    }
 }
 
 /// Build an epoch's AIRs identically on the prove and verify sides — the single
@@ -907,6 +915,21 @@ mod tests {
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let bundle = prove_continuation(&elf_bytes, &[], 10).unwrap();
         let out = verify_continuation(&elf_bytes, &bundle).unwrap();
+        assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    // A bundle survives a bincode round-trip and still verifies to the same output —
+    // the serialization path the CLI's `prove`/`verify --continuations` relies on.
+    #[test]
+    fn test_continuation_bincode_roundtrip() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let bundle = prove_continuation(&elf_bytes, &[], 10).unwrap();
+
+        let bytes = bincode::serialize(&bundle).unwrap();
+        let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
+
+        let out = verify_continuation(&elf_bytes, &restored).unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 

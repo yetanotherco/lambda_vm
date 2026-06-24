@@ -144,6 +144,19 @@ enum Commands {
         /// all tables) and aux-trace field elements (committed EF columns × rows)
         #[arg(long)]
         elements: bool,
+
+        /// Prove with continuations (split execution into epochs; flat peak memory)
+        #[arg(long)]
+        continuations: bool,
+
+        /// Epoch length in cycles (continuations only). Rounded up to a power of two (>=4).
+        #[arg(long, requires = "continuations", conflicts_with = "num_epochs")]
+        epoch_size: Option<usize>,
+
+        /// Target number of epochs (continuations only); sets epoch_size = ceil(cycles / N).
+        /// Default when neither flag is given: 4.
+        #[arg(long, requires = "continuations", conflicts_with = "epoch_size")]
+        num_epochs: Option<usize>,
     },
 
     /// Verify a proof bundle
@@ -163,6 +176,10 @@ enum Commands {
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// Verify a continuation proof bundle (produced by `prove --continuations`)
+        #[arg(long)]
+        continuations: bool,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -196,13 +213,29 @@ fn main() -> ExitCode {
             time,
             cycles,
             elements,
-        } => cmd_prove(elf, output, private_input, blowup, time, cycles, elements),
+            continuations,
+            epoch_size,
+            num_epochs,
+        } => {
+            if continuations {
+                cmd_prove_continuation(elf, output, private_input, epoch_size, num_epochs, time)
+            } else {
+                cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
+            }
+        }
         Commands::Verify {
             proof,
             elf,
             blowup,
             time,
-        } => cmd_verify(proof, elf, blowup, time),
+            continuations,
+        } => {
+            if continuations {
+                cmd_verify_continuation(proof, elf, time)
+            } else {
+                cmd_verify(proof, elf, blowup, time)
+            }
+        }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -537,6 +570,158 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
     }
 }
 
+fn cmd_prove_continuation(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    epoch_size: Option<usize>,
+    num_epochs: Option<usize>,
+    time: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Resolve the epoch size. An explicit --epoch-size wins; otherwise split the
+    // run into N epochs (--num-epochs, default 4) via a cycle pre-pass.
+    let epoch_size = match epoch_size {
+        Some(n) => n,
+        None => {
+            let n = num_epochs.unwrap_or(4).max(1);
+            let program = match Elf::load(&elf_data) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("Failed to load ELF for cycle count: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let executor = match Executor::new(&program, private_inputs.clone()) {
+                Ok(e) => e,
+                Err(e) => {
+                    eprintln!("Failed to create executor for cycle count: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let total_cycles = match executor.run() {
+                Ok(result) => result.logs.len(),
+                Err(e) => {
+                    eprintln!("Execution failed during cycle count: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            total_cycles.div_ceil(n).max(1)
+        }
+    };
+
+    eprintln!(
+        "Generating continuation proof (epoch_size={epoch_size}, rounded to {})...",
+        epoch_size.next_power_of_two().max(4)
+    );
+    let start = Instant::now();
+    let bundle =
+        match prover::continuation::prove_continuation(&elf_data, &private_inputs, epoch_size) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Continuation proof generation failed: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+    let prove_elapsed = start.elapsed();
+
+    eprintln!("Writing proof...");
+    let file = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create output file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let bytes = match bincode::serialize(&bundle) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = writer.write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("Proof written to {:?}", output_path);
+    println!("Epochs: {}", bundle.num_epochs());
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_continuation(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Reading proof...");
+    let proof_bytes = match std::fs::read(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let bundle: prover::continuation::ContinuationProof = match bincode::deserialize(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Verifying continuation proof...");
+    let start = Instant::now();
+    let result = prover::continuation::verify_continuation(&elf_data, &bundle);
+    let verify_elapsed = start.elapsed();
+
+    match result {
+        Ok(Some(output)) => {
+            eprintln!("Verification succeeded!");
+            let hex: String = output.iter().map(|b| format!("{:02x}", b)).collect();
+            println!("Output: {}", hex);
+            if time {
+                println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("Verification failed!");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -564,5 +749,50 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
             eprintln!("Failed to count elements: {:?}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // The arg graph is well-formed (e.g. `requires`/`conflicts_with` reference real args).
+    #[test]
+    fn cli_command_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    // --epoch-size and --num-epochs are mutually exclusive.
+    #[test]
+    fn epoch_size_and_num_epochs_conflict() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size",
+            "8",
+            "--num-epochs",
+            "4",
+        ]);
+        assert!(r.is_err());
+    }
+
+    // The continuation epoch flags require --continuations.
+    #[test]
+    fn epoch_size_requires_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--epoch-size",
+            "8",
+        ]);
+        assert!(r.is_err());
     }
 }
