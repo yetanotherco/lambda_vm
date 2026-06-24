@@ -72,8 +72,8 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
-    let r_bytes = FieldBytes::from_slice(&sig[..32]);
-    let s_bytes = FieldBytes::from_slice(&sig[32..]);
+    let r_bytes = <&FieldBytes>::from(&sig[..32]);
+    let s_bytes = <&FieldBytes>::from(&sig[32..]);
 
     // Parse r and s as scalars, rejecting values >= the curve order.
     let r: Option<Scalar> = Scalar::from_repr(*r_bytes).into();
@@ -97,7 +97,7 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32],
     };
     let r_proj = ProjectivePoint::from(r_point);
 
-    let z = <Scalar as Reduce<U256>>::reduce_bytes(FieldBytes::from_slice(msg));
+    let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*msg));
     let r_inv: Option<Scalar> = r.invert_vartime().into();
     let Some(r_inv) = r_inv else {
         return Err(CryptoError::RecoveryFailed);
@@ -124,8 +124,8 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32],
 ///
 /// On riscv64 this reconstructs the full affine result from four x-only ECSM
 /// queries (see [`lincomb2_with_oracle`]); on other targets, and whenever a
-/// degenerate-configuration guard trips, it returns `None` so the caller uses
-/// the pure-Rust `ProjectivePoint::lincomb`.
+/// guard trips (degenerate input or oracle inconsistency), it returns `None`
+/// so the caller uses the pure-Rust `ProjectivePoint::lincomb`.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_lincomb2(
     p1: &ProjectivePoint,
@@ -146,11 +146,13 @@ fn ecsm_lincomb2(
     None
 }
 
-/// x-only scalar-mul oracle backed by the ECSM precompile. `x` must be the
-/// x-coordinate of a curve point and `k` in `(0, n)` — guaranteed by the guards
-/// in [`lincomb2_with_oracle`]. Values cross the ABI as 32-byte little-endian;
-/// `xg` and `k` are distinct stack arrays so the executor's
-/// `|addr_xG − addr_k| ≥ 32` assumption holds by construction.
+/// x-only scalar-mul oracle backed by the ECSM precompile: computes `x(k·P)`
+/// for the curve point P whose x-coordinate is passed in. `x` must be the
+/// x-coordinate of a curve point and `k` in `(0, N)` (N = curve order) —
+/// guaranteed by the guards in [`lincomb2_with_oracle`]. Values cross the ABI
+/// as 32-byte little-endian; `x_le` and `k_le` are distinct stack arrays so
+/// the executor's `|addr_x_le − addr_k_le| ≥ 32` assumption holds by
+/// construction.
 #[cfg(target_arch = "riscv64")]
 fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
     let x_be = x.to_bytes();
@@ -232,14 +234,16 @@ where
     let xq = (lq.square() - xa - xb).normalize();
     let yq = (lq * (xa - xq) - ya).normalize();
 
-    // `point_from_xy` re-validates the result is on the curve (rejecting →
-    // software fallback), so no separate curve-equation assertion is needed.
+    // `point_from_xy` checks the result is on the curve as a cheap backstop:
+    // it rejects gross off-curve garbage and falls back to software, but
+    // correctness rests on the algebra above — an on-curve-but-wrong point
+    // would still pass this check.
     point_from_xy(&xq, &yq)
 }
 
-/// Recovers `y(k·P)` for `P = (xp, yp)` from `xa = x(k·P)` and
-/// `xc = x((k+1)·P)`, given `dx = xa − xp` and `inv_den = (2·yp·dx)⁻¹`.
-/// `None` if the λ² consistency check fails (degenerate configuration).
+/// Recovers `y(k·P)` from `xa = x(k·P)` and `xc = x((k+1)·P)`.
+/// Returns `None` if `xc` is inconsistent with the computed `lambda`
+/// (oracle misbehavior); degeneracy guards are in [`lincomb2_with_oracle`].
 #[cfg(any(target_arch = "riscv64", test))]
 fn solve_y(
     xp: &FieldElement,
@@ -259,8 +263,8 @@ fn solve_y(
     Some((*yp + lambda * dx).normalize())
 }
 
-/// `k ∈ {0, 1, n−1}`: cases where `k` or `k+1` is an invalid ecall scalar or
-/// the chord algebra degenerates (`A = ±P`).
+/// `k ∈ {0, 1, n−1}`: fast early-exit before oracle calls.
+/// k=0: invalid ecall scalar. k=1: dx=0. k=n-1: k+1 wraps to 0 mod n.
 #[cfg(any(target_arch = "riscv64", test))]
 fn scalar_near_edge(k: &Scalar) -> bool {
     use k256::elliptic_curve::subtle::ConstantTimeEq;
@@ -290,56 +294,53 @@ fn point_from_xy(x: &FieldElement, y: &FieldElement) -> Option<ProjectivePoint> 
 
 // ── Keccak-256 over the keccak_permute precompile (riscv64 guest) ───────────
 
-/// Keccak-256 as a sponge over LambdaVM's `keccak_permute` syscall.
+/// Keccak-256 sponge with an injected permutation function.
 ///
 /// Keccak-f[1600], rate 1088 bits (136 bytes), capacity 512 bits.
 /// Padding: `0x01 ... 0x80` (multi-rate, last bit set). The state is a
 /// 25-element u64 array; bytes are absorbed into the state via little-endian
 /// XOR (matching the standard Keccak byte-to-lane mapping).
-#[cfg(target_arch = "riscv64")]
-fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
+///
+/// Gated to `riscv64 | test` so the generic function is available to the host
+/// unit tests without being dead code in the non-test host build.
+#[cfg(any(target_arch = "riscv64", test))]
+fn keccak256_with_permute<F: FnMut(&mut [u64; 25])>(input: &[u8], mut permute: F) -> [u8; 32] {
     const RATE: usize = 136;
 
     let mut state = [0u64; 25];
     let mut offset = 0;
 
-    while input.len().saturating_sub(offset) >= RATE {
+    while input.len() - offset >= RATE {
         absorb_block(&mut state, &input[offset..offset + RATE]);
-        lambda_vm_syscalls::syscalls::keccak_permute(&mut state);
-        offset = offset.saturating_add(RATE);
+        permute(&mut state);
+        offset += RATE;
     }
 
     // Final block with multi-rate padding.
     let mut last = [0u8; RATE];
-    let remaining = input.len().saturating_sub(offset);
-    if let Some(tail) = last.get_mut(..remaining) {
-        if let Some(src) = input.get(offset..) {
-            tail.copy_from_slice(src);
-        }
-    }
-    if let Some(b) = last.get_mut(remaining) {
-        *b ^= 0x01;
-    }
-    if let Some(b) = last.get_mut(RATE - 1) {
-        *b ^= 0x80;
-    }
+    let remaining = input.len() - offset;
+    last[..remaining].copy_from_slice(&input[offset..]);
+    last[remaining] ^= 0x01;
+    last[RATE - 1] ^= 0x80;
     absorb_block(&mut state, &last);
-    lambda_vm_syscalls::syscalls::keccak_permute(&mut state);
+    permute(&mut state);
 
     // Squeeze the first 32 bytes (four lanes) as little-endian.
     let mut output = [0u8; 32];
     for (i, lane) in state.iter().take(4).enumerate() {
-        let bytes = lane.to_le_bytes();
-        let start = i.saturating_mul(8);
-        if let Some(dst) = output.get_mut(start..start.saturating_add(8)) {
-            dst.copy_from_slice(&bytes);
-        }
+        output[i * 8..i * 8 + 8].copy_from_slice(&lane.to_le_bytes());
     }
     output
 }
 
-/// XOR one rate-sized block of bytes into the state lanes (little-endian).
+/// Keccak-256 via LambdaVM's `keccak_permute` syscall (riscv64 guest only).
 #[cfg(target_arch = "riscv64")]
+fn keccak256_via_lambdavm(input: &[u8]) -> [u8; 32] {
+    keccak256_with_permute(input, |s| lambda_vm_syscalls::syscalls::keccak_permute(s))
+}
+
+/// XOR one rate-sized block of bytes into the state lanes (little-endian).
+#[cfg(any(target_arch = "riscv64", test))]
 fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
     for (lane, chunk) in state.iter_mut().zip(block.chunks_exact(8)) {
         let mut buf = [0u8; 8];
@@ -349,86 +350,4 @@ fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// secp256k1 curve constant `b = 7`.
-    fn curve_b() -> FieldElement {
-        let mut bytes = [0u8; 32];
-        bytes[31] = 7;
-        FieldElement::from_bytes(&bytes.into()).unwrap()
-    }
-
-    /// Software stand-in for the ECSM precompile: lift `x` to a curve point and
-    /// return `x(k·P)` (parity-invariant, like the real ecall).
-    fn soft_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
-        let xn = x.normalize();
-        let y2 = (xn.square() * xn + curve_b()).normalize();
-        let y = Option::<FieldElement>::from(y2.sqrt())?;
-        let p = point_from_xy(&xn, &y.normalize())?;
-        let prod = (p * k).to_affine();
-        Some(affine_xy(&prod)?.0)
-    }
-
-    fn g_times(n: u64) -> ProjectivePoint {
-        ProjectivePoint::GENERATOR * Scalar::from(n)
-    }
-
-    #[test]
-    fn matches_software_lincomb_on_fixed_inputs() {
-        let cases = [
-            (g_times(3), 123_456_789u64, g_times(7), 987_654_321u64),
-            (g_times(11), 2u64.pow(20) + 5, g_times(2), 42u64),
-            (ProjectivePoint::GENERATOR, 7u64, g_times(5), 9u64),
-        ];
-        for (p1, k1, p2, k2) in cases {
-            let (k1, k2) = (Scalar::from(k1), Scalar::from(k2));
-            let expected = ProjectivePoint::lincomb(&p1, &k1, &p2, &k2);
-            let got = lincomb2_with_oracle(&p1, &k1, &p2, &k2, soft_oracle)
-                .expect("non-degenerate inputs must reconstruct");
-            assert_eq!(got.to_affine(), expected.to_affine());
-        }
-    }
-
-    #[test]
-    fn matches_software_lincomb_on_recovery_shape() {
-        // u1·G + u2·R, generator first, like ECDSA recovery.
-        let g = ProjectivePoint::GENERATOR;
-        let r = g_times(0x1234);
-        let u1 = Scalar::from(0xdead_beefu64);
-        let u2 = Scalar::from(0x0bad_f00du64);
-        let expected = ProjectivePoint::lincomb(&g, &u1, &r, &u2);
-        let got = lincomb2_with_oracle(&g, &u1, &r, &u2, soft_oracle)
-            .expect("non-degenerate inputs must reconstruct");
-        assert_eq!(got.to_affine(), expected.to_affine());
-    }
-
-    #[test]
-    fn edge_scalars_fall_back() {
-        let p1 = g_times(3);
-        let p2 = g_times(5);
-        let ok = Scalar::from(12345u64);
-        for bad in [Scalar::ZERO, Scalar::ONE, -Scalar::ONE] {
-            assert!(lincomb2_with_oracle(&p1, &bad, &p2, &ok, soft_oracle).is_none());
-            assert!(lincomb2_with_oracle(&p1, &ok, &p2, &bad, soft_oracle).is_none());
-        }
-    }
-
-    #[test]
-    fn identity_points_fall_back() {
-        let p = g_times(3);
-        let k = Scalar::from(7u64);
-        let id = ProjectivePoint::IDENTITY;
-        assert!(lincomb2_with_oracle(&id, &k, &p, &k, soft_oracle).is_none());
-        assert!(lincomb2_with_oracle(&p, &k, &id, &k, soft_oracle).is_none());
-    }
-
-    #[test]
-    fn cancelling_and_doubling_terms_fall_back() {
-        let p = g_times(3);
-        let k = Scalar::from(7u64);
-        // A = B (doubling chord) and A = −B (Q = O): both share x(A) = x(B).
-        assert!(lincomb2_with_oracle(&p, &k, &p, &k, soft_oracle).is_none());
-        assert!(lincomb2_with_oracle(&p, &k, &(-p), &k, soft_oracle).is_none());
-    }
-}
+mod tests;
