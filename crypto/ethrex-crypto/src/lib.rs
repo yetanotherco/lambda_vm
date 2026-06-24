@@ -43,7 +43,8 @@ impl Crypto for LambdaVmEcsmCrypto {
         recid: u8,
         msg: &[u8; 32],
     ) -> Result<[u8; 32], CryptoError> {
-        ecsm_ecrecover(sig, recid, msg)
+        let pk_bytes = ecsm_ecrecover(sig, recid, msg)?;
+        Ok(self.keccak256(&pk_bytes))
     }
 
     fn keccak256(&self, input: &[u8]) -> [u8; 32] {
@@ -59,9 +60,14 @@ impl Crypto for LambdaVmEcsmCrypto {
 
 // ── ECDSA secp256k1 recovery via the ECSM precompile ────────────────────────
 
-/// Recover the keccak hash of the uncompressed public key from a 64-byte
+/// Recover the uncompressed public key bytes (X‖Y, 64 bytes) from a 64-byte
 /// signature, recovery id, and 32-byte message hash. Used by the ECRECOVER
 /// precompile (0x01).
+///
+/// Returns the raw 64-byte key; the caller is responsible for hashing it.
+/// Keeping keccak out of this function lets `secp256k1_ecrecover` route the
+/// hash through `self.keccak256`, which uses the keccak_permute precompile on
+/// riscv64 instead of always falling back to software.
 ///
 /// Mirrors the pure-Rust recovery in the `Crypto` trait default
 /// (`pk = r⁻¹·(s·R − z·G)`), but evaluates the 2-term linear combination
@@ -71,7 +77,7 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// We compute the recovery directly rather than calling k256's
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
-fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32], CryptoError> {
+fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
     let r_bytes = <&FieldBytes>::from(&sig[..32]);
     let s_bytes = <&FieldBytes>::from(&sig[32..]);
 
@@ -115,9 +121,11 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 32],
         return Err(CryptoError::RecoveryFailed);
     }
 
-    // SEC1 uncompressed: 0x04 || X(32) || Y(32). The address is keccak(X || Y).
+    // SEC1 uncompressed: 0x04 || X(32) || Y(32). Return X‖Y for the caller to hash.
     let uncompressed = pk_affine.to_encoded_point(false);
-    Ok(keccak_hash(&uncompressed.as_bytes()[1..65]))
+    let mut pk_bytes = [0u8; 64];
+    pk_bytes.copy_from_slice(&uncompressed.as_bytes()[1..65]);
+    Ok(pk_bytes)
 }
 
 /// ECSM-accelerated 2-term linear combination `k1·P1 + k2·P2`.

@@ -93,7 +93,8 @@ fn ecrecover_known_answer_three_tuples() {
         let d = Scalar::from(d_u64);
         let kk = Scalar::from(kk_u64);
         let (sig, recid, expected) = make_ecdsa_fixture(d, kk, msg);
-        match ecsm_ecrecover(&sig, recid, &msg) {
+        let crypto = LambdaVmEcsmCrypto;
+        match crypto.secp256k1_ecrecover(&sig, recid, &msg) {
             Ok(got) => assert_eq!(
                 got, expected,
                 "ecrecover returned wrong address for d={d_u64:#x} kk={kk_u64:#x}"
@@ -110,9 +111,10 @@ fn ecrecover_rejects_zero_s() {
     // r = 1 (nonzero, but s = 0 in the second half).
     sig[31] = 0x01;
     let msg = [0u8; 32];
+    let crypto = LambdaVmEcsmCrypto;
     assert!(
         matches!(
-            ecsm_ecrecover(&sig, 0, &msg),
+            crypto.secp256k1_ecrecover(&sig, 0, &msg),
             Err(CryptoError::InvalidSignature)
         ),
         "expected InvalidSignature for zero s"
@@ -125,9 +127,10 @@ fn ecrecover_rejects_zero_r() {
     let mut sig = [0u8; 64];
     sig[63] = 0x01; // s = 1, r = 0
     let msg = [0u8; 32];
+    let crypto = LambdaVmEcsmCrypto;
     assert!(
         matches!(
-            ecsm_ecrecover(&sig, 0, &msg),
+            crypto.secp256k1_ecrecover(&sig, 0, &msg),
             Err(CryptoError::InvalidSignature)
         ),
         "expected InvalidSignature for zero r"
