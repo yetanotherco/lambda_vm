@@ -781,9 +781,11 @@ pub trait IsStarkVerifier<
         let p0_eval = deep_composition_evaluation;
         let p0_eval_sym = deep_composition_evaluation_sym;
 
-        // Reconstruct p₁(𝜐²)
-        let mut v = (p0_eval + p0_eval_sym)
-            + evaluation_point_inv.clone() * &zetas[0] * (p0_eval - p0_eval_sym);
+        // Reconstruct p₁(𝜐²): v = (p0 + p0_sym) + eval_point_inv * zeta0 * (p0 - p0_sym)
+        let d0 = p0_eval - p0_eval_sym;
+        let z0 = evaluation_point_inv.clone() * &zetas[0]; // scalar×Fp3
+        let mut v = p0_eval + p0_eval_sym;
+        v.fma(&z0, &d0);
         let mut index = iota;
 
         // Handle case with 0 FRI layers (trace_length <= 2)
@@ -827,8 +829,13 @@ pub trait IsStarkVerifier<
                     );
 
                     // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym)
-                        + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+                    // v = (v + eval_sym) + eval_point_inv * zeta * (v - eval_sym)
+                    // Use fma to fold the final Fp3Add into the FP3_FMA ecall.
+                    let d = &v - evaluation_sym;
+                    let scalar_times_zeta = evaluation_point_inv * &zetas[i + 1]; // scalar×Fp3
+                    let mut new_v = &v + evaluation_sym;
+                    new_v.fma(&scalar_times_zeta, &d);
+                    v = new_v;
 
                     // Update index for next iteration. The index of the squares in the next layer
                     // is obtained by halving the current index. This is due to the bit-reverse
