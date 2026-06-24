@@ -5,15 +5,19 @@
 //! This is the end-to-end checkpoint that closes the CPU/GPU commitment parity
 //! gap: the GPU fused pipeline commits on-device (before `columns_to_row_major`
 //! is called), so its root must agree with what the CPU path would commit for
-//! the same input columns.
+//! the same input columns. Covers both base field (main trace) and ext3
+//! (aux trace).
 
 use math::fft::two_half_fft::TwoHalfTwiddles;
 use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
 use math::polynomial::Polynomial;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use stark::prover::{IsStarkProver, Prover};
+
+type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
 
 type Fp = FieldElement<GoldilocksField>;
 
@@ -60,9 +64,10 @@ fn gpu_merkle_root(columns: &[Vec<u64>], blowup: usize, weights: &[u64]) -> [u8;
     let nodes = math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves)
         .expect("GPU Merkle tree");
 
-    // Root is the last 32 bytes of the node array.
+    // `build_merkle_tree_on_device` places the root at index 0 (the leaves
+    // live in the tail), so the root is the first 32 bytes of the node array.
     let mut root = [0u8; 32];
-    root.copy_from_slice(&nodes[nodes.len() - 32..]);
+    root.copy_from_slice(&nodes[0..32]);
     root
 }
 
@@ -141,6 +146,166 @@ fn gpu_and_cpu_row_major_merkle_roots_match() {
                     gpu_root,
                     cpu_root,
                     "root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
+                );
+            }
+        }
+    }
+}
+
+// ── Ext3 helpers ─────────────────────────────────────────────────────────────
+
+fn rand_ext3(rng: &mut ChaCha8Rng) -> Fp3 {
+    Fp3::new([
+        FieldElement::<GoldilocksField>::from_raw(rng.r#gen::<u64>()),
+        FieldElement::<GoldilocksField>::from_raw(rng.r#gen::<u64>()),
+        FieldElement::<GoldilocksField>::from_raw(rng.r#gen::<u64>()),
+    ])
+}
+
+fn ext3_to_u64s(col: &[Fp3]) -> Vec<u64> {
+    let mut out = Vec::with_capacity(col.len() * 3);
+    for e in col {
+        out.push(*e.value()[0].value());
+        out.push(*e.value()[1].value());
+        out.push(*e.value()[2].value());
+    }
+    out
+}
+
+fn u64s_to_ext3(flat: &[u64]) -> Vec<Fp3> {
+    flat.chunks_exact(3)
+        .map(|c| {
+            Fp3::new([
+                FieldElement::<GoldilocksField>::from_raw(c[0]),
+                FieldElement::<GoldilocksField>::from_raw(c[1]),
+                FieldElement::<GoldilocksField>::from_raw(c[2]),
+            ])
+        })
+        .collect()
+}
+
+/// GPU ext3 LDE + Keccak leaf hash + Merkle tree → root.
+fn gpu_ext3_merkle_root(columns: &[Vec<Fp3>], blowup: usize, weights: &[u64]) -> [u8; 32] {
+    let n = columns[0].len();
+    let lde_size = n * blowup;
+    let num_cols = columns.len();
+
+    let flat_inputs: Vec<Vec<u64>> = columns.iter().map(|c| ext3_to_u64s(c)).collect();
+    let input_slices: Vec<&[u64]> = flat_inputs.iter().map(|v| v.as_slice()).collect();
+
+    let mut flat_outputs: Vec<Vec<u64>> = (0..num_cols).map(|_| vec![0u64; 3 * lde_size]).collect();
+    {
+        let mut out_slices: Vec<&mut [u64]> =
+            flat_outputs.iter_mut().map(|v| v.as_mut_slice()).collect();
+        math_cuda::lde::coset_lde_batch_ext3_into(
+            &input_slices,
+            n,
+            blowup,
+            weights,
+            &mut out_slices,
+        )
+        .expect("GPU ext3 LDE");
+    }
+
+    // GPU keccak_leaves_ext3 expects columns interleaved as [a0,b0,c0, a1,b1,c1, ...]
+    // of length 3*lde_size per column, packed into one slab per column.
+    // flat layout: [col * 3 * stride + component * stride + row]
+    let mut flat_for_keccak = vec![0u64; num_cols * 3 * lde_size];
+    for (c, out) in flat_outputs.iter().enumerate() {
+        // out is [a0,b0,c0, a1,b1,c1, ...] (interleaved per element)
+        // GPU keccak expects [col*3+comp]*stride + row (component-major)
+        for r in 0..lde_size {
+            flat_for_keccak[(c * 3) * lde_size + r] = out[r * 3];
+            flat_for_keccak[(c * 3 + 1) * lde_size + r] = out[r * 3 + 1];
+            flat_for_keccak[(c * 3 + 2) * lde_size + r] = out[r * 3 + 2];
+        }
+    }
+
+    let gpu_leaves =
+        math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size)
+            .expect("GPU ext3 keccak leaves");
+    let nodes = math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves)
+        .expect("GPU Merkle tree");
+
+    let mut root = [0u8; 32];
+    root.copy_from_slice(&nodes[0..32]);
+    root
+}
+
+/// CPU row-major ext3 LDE + `commit_rows_bit_reversed` → root.
+fn cpu_ext3_row_major_merkle_root(
+    columns: &[Vec<Fp3>],
+    blowup: usize,
+    weights: &[FieldElement<GoldilocksField>],
+    inv_tw: &TwoHalfTwiddles<GoldilocksField>,
+    fwd_tw: &TwoHalfTwiddles<GoldilocksField>,
+) -> [u8; 32] {
+    let n = columns[0].len();
+    let num_cols = columns.len();
+
+    let mut buf: Vec<Fp3> = vec![Fp3::from(0u64); n * num_cols];
+    for (c, col) in columns.iter().enumerate() {
+        for (r, v) in col.iter().enumerate() {
+            buf[r * num_cols + c] = v.clone();
+        }
+    }
+
+    Polynomial::<Fp3>::coset_lde_full_expand_row_major::<GoldilocksField>(
+        &mut buf,
+        num_cols,
+        blowup,
+        weights,
+        inv_tw,
+        fwd_tw,
+    )
+    .expect("CPU ext3 row-major LDE");
+
+    let (_, root) =
+        Prover::<GoldilocksField, Degree3GoldilocksExtensionField, ()>::commit_rows_bit_reversed(
+            &buf, num_cols,
+        )
+        .expect("CPU ext3 commit");
+
+    root
+}
+
+#[test]
+fn gpu_and_cpu_ext3_merkle_roots_match() {
+    const COSET_OFFSET: u64 = 7;
+
+    for log_n in [4usize, 6, 8] {
+        for blowup in [2usize, 4] {
+            for num_cols in [1usize, 3, 5] {
+                let n = 1usize << log_n;
+                let log_lde = (n * blowup).trailing_zeros() as usize;
+                let mut rng = ChaCha8Rng::seed_from_u64(
+                    (log_n * 1000 + blowup * 100 + num_cols) as u64 + 9999,
+                );
+
+                let columns: Vec<Vec<Fp3>> = (0..num_cols)
+                    .map(|_| (0..n).map(|_| rand_ext3(&mut rng)).collect())
+                    .collect();
+
+                let weights_u64 = coset_weights_u64(n, COSET_OFFSET);
+                let weights_fp = coset_weights(n, COSET_OFFSET);
+                let inv_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_n, true).expect("inv twiddles");
+                let fwd_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
+
+                let gpu_root = gpu_ext3_merkle_root(&columns, blowup, &weights_u64);
+                let cpu_root = cpu_ext3_row_major_merkle_root(
+                    &columns,
+                    blowup,
+                    &weights_fp,
+                    &inv_tw,
+                    &fwd_tw,
+                );
+
+                assert_eq!(
+                    gpu_root,
+                    cpu_root,
+                    "ext3 root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
                 );
             }
         }
