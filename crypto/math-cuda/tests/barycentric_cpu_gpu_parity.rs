@@ -232,17 +232,15 @@ fn gpu_barycentric_ext3(
         })
         .collect();
 
-    // Pre-strided ext3: trace points interleaved [a, b, c] × n.
-    let pre_strided: Vec<u64> = (0..n)
-        .flat_map(|i| {
-            let e = &lde_col[i * blowup];
-            [
-                *e.value()[0].value(),
-                *e.value()[1].value(),
-                *e.value()[2].value(),
-            ]
-        })
-        .collect();
+    // Pre-strided ext3 in the de-interleaved (component-major) layout the
+    // kernel expects: slab k at offset k*n holds component k of all n points.
+    let mut pre_strided: Vec<u64> = vec![0u64; 3 * n];
+    for i in 0..n {
+        let e = &lde_col[i * blowup];
+        pre_strided[i] = *e.value()[0].value();
+        pre_strided[n + i] = *e.value()[1].value();
+        pre_strided[2 * n + i] = *e.value()[2].value();
+    }
 
     let raw =
         math_cuda::barycentric::barycentric_ext3(&pre_strided, n, &pts_u64, &inv_u64, n, 1)
