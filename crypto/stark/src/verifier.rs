@@ -1032,7 +1032,7 @@ pub trait IsStarkVerifier<
             let ood_row = ood.get_row(row_idx);
             let mut b = FieldElement::zero();
             for col_idx in 0..width {
-                b += ood_row[col_idx].clone() * &trace_term_coeffs[col_idx * chunk_len + row_idx];
+                b += &ood_row[col_idx] * &trace_term_coeffs[col_idx * chunk_len + row_idx];
             }
             b_terms.push(b);
         }
@@ -1083,16 +1083,30 @@ pub trait IsStarkVerifier<
         // once across all queries (see `precompute_ood_coeff_terms`), and
         // `denom[row]` is pre-inverted by the caller via a single batch inversion
         // across all 2×num_queries×height trace denominators.
+        // Fast path for the common OOD height=2 case: one pass through lde_trace_evaluations
+        // serves both rows, halving the number of array loads vs two independent row loops.
         let mut trace_term = FieldElement::zero();
-        for (row_idx, denom) in denoms_trace_inv.iter().enumerate() {
-            let mut row_acc = FieldElement::zero();
+        if ood_evaluations_table_height == 2 {
+            let (denom0, denom1) = (&denoms_trace_inv[0], &denoms_trace_inv[1]);
+            let mut row_acc_0 = FieldElement::zero();
+            let mut row_acc_1 = FieldElement::zero();
             for col_idx in 0..ood_evaluations_table_width {
-                // Flat column-major index: column `col_idx`'s run starts at
-                // `col_idx * trace_term_chunk_len`, row `row_idx` within it.
-                row_acc += lde_trace_evaluations[col_idx].clone()
-                    * &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx];
+                let base = col_idx * 2;
+                let eval = &lde_trace_evaluations[col_idx];
+                row_acc_0 += eval * &trace_term_coeffs[base];
+                row_acc_1 += eval * &trace_term_coeffs[base + 1];
             }
-            trace_term += (row_acc - &b_terms[row_idx]) * denom;
+            trace_term += (row_acc_0 - &b_terms[0]) * denom0;
+            trace_term += (row_acc_1 - &b_terms[1]) * denom1;
+        } else {
+            for (row_idx, denom) in denoms_trace_inv.iter().enumerate() {
+                let mut row_acc = FieldElement::zero();
+                for col_idx in 0..ood_evaluations_table_width {
+                    row_acc += &lde_trace_evaluations[col_idx]
+                        * &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx];
+                }
+                trace_term += (row_acc - &b_terms[row_idx]) * denom;
+            }
         }
 
         let mut h_terms = FieldElement::zero();
