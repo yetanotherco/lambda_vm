@@ -43,7 +43,7 @@ $
 f_(mu, alpha) (vec(x), vec(y), vec(z)) := sum_(m in [mu]) (vec(x)^((m)) dot vec(y)^((m))) + sum_(a in [alpha]) vec(z)^((a))
 $
 over variables $vec(x), vec(y) in [S]^mu$ and $vec(z) in [S]^alpha$, with parameters $mu, alpha in NN$.
-Working towards the limb decomposition of $w := f_(mu, alpha)(vec(x), vec(y), vec(z))$, we rewrite
+Working towards the limb decomposition of $w = f_(mu, alpha)(vec(x), vec(y), vec(z))$, we rewrite
 
 $
   f_(mu, alpha) (vec(x), vec(y), vec(z)) 
@@ -74,7 +74,7 @@ they're commonly referred to as the _carry_ values.
 #lemma[
     For all $g >= 2n-1$, 
     $(w_0, w_1, ..., w_(g-1)) in [L]^(g)$ 
-    is the unique $g$-limb decomposition of $w := f_(mu, alpha)(vec(x), vec(y), vec(z))$
+    is the unique $g$-limb decomposition of $w = f_(mu, alpha)(vec(x), vec(y), vec(z))$
     if and only if $c_(g-1) = 0$.
 ]<lm:wi_decomp_f>
 #proof[
@@ -88,10 +88,10 @@ they're commonly referred to as the _carry_ values.
     &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) + c_(-1) - c_(g-1) dot L^(g-1+1)\
     &= (sum_(r=0)^(g-1) overline(w)_r dot L^r) - c_(g-1) dot L^(g),\
     &= (sum_(r=0)^(2(n-1)) overline(w)_r dot L^r) - c_(g-1) dot L^(g),\
-    &= f_(mu, alpha)(x, y, z) - c_(g-1) dot L^(g),\
+    &= f_(mu, alpha)(vec(x), vec(y), vec(z)) - c_(g-1) dot L^(g),\
     $
     where the second-to-last step follows from the observation that $overline(w)_j = 0$ for $j > 2(n-1)$.
-    We conclude that $w_i$ is a proper $g$-limb decomposition of $f_(mu,alpha)$ if and only if $c_(g-1) = 0$.
+    We conclude that $w_i$ is a proper $g$-limb decomposition of $w$ if and only if $c_(g-1) = 0$.
 ]
 
 = Upper bounding the carry
@@ -108,8 +108,8 @@ To bound for which $g$ we can guarantee that $c_(g-1) = 0$, we prove two upper b
 #proof[
   Since $w_i in [L]$,
   $c_i 
-  :=(overline(w)_i + c_(i-1) - w_i ) dot L^(-1) 
-  = floor.l (overline(w)_i + c_(i-1)) dot L^(-1) floor.r.$
+  := frac((overline(w)_i + c_(i-1) - w_i ), L, style: "horizontal")
+  = floor.l frac((overline(w)_i + c_(i-1)), L, style: "horizontal") floor.r.$
   Hence, $c_i$ is maximized when both $overline(w)_i$ and $c_(i-1)$ are, and thus, 
   by induction, when $overline(w)_j$ is maximized for all $j <= i$.
   Given that for all $m in [mu], a in [alpha], i in [n]: vec(x)^((m))_i, vec(y)^((m))_i, vec(z)^((a))_i <= L-1$, it follows that
@@ -237,6 +237,6 @@ Lastly, we prove that there exists a correct method of constraining the relation
     can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2, while the upper bound for $c_(i-1)$ follows from @cor:carry-upper-bound.
     Moreover, observe that $|X_i inter [L]| <= 1$ since $0 <= C L < p$.
     Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
-    and as a result, $c_i = floor.l frac(overline(w)_i + c_(i-1), L, style: "horizontal") floor.r$ is correct.
+    and as a result, $c_i = floor.l frac((overline(w)_i + c_(i-1)), L, style: "horizontal") floor.r$ is correct.
     The proof now follows by induction, with @eq:c_-1_is_zero enforcing the base case.
 ]
