@@ -494,6 +494,19 @@ pub fn prove_and_verify_continuation(
     private_inputs: &[u8],
     epoch_size: usize,
 ) -> Result<Option<Vec<u8>>, Error> {
+    // Epoch size must be a power of two. An intermediate epoch runs exactly
+    // `epoch_size` cycles, so a power-of-two size gives its CPU table a power-of-two
+    // row count and therefore zero padding rows. That matters because CPU padding
+    // rows participate in the inline-PC `memory` chain (they carry pc=1) and that
+    // chain is only anchored by the HALT chip's emit_pc/consume_pc — which an
+    // intermediate epoch excludes. With padding rows present and no HALT, their
+    // pc=1 tokens dangle and the Memory bus fails to balance. Zero padding rows
+    // sidesteps that entirely; the final epoch keeps its remainder and its HALT, so
+    // its padding chain is anchored as usual. If the whole program fits in one
+    // epoch (total cycles <= epoch_size) it runs as a single final epoch (HALT
+    // present), i.e. monolithic-style.
+    let epoch_size = epoch_size.next_power_of_two().max(4);
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -550,6 +563,15 @@ pub fn prove_and_verify_continuation(
             None => break,
         };
         let is_final = executor.pc() == 0;
+
+        // Invariant the fix relies on: a non-final epoch ran the full `epoch_size`
+        // (a power of two), so its CPU table has no padding rows. If this ever
+        // fails, the intermediate epoch would carry dangling padding pc=1 tokens.
+        debug_assert!(
+            is_final || logs.len().is_power_of_two(),
+            "intermediate epoch must run a power-of-two number of cycles (got {})",
+            logs.len()
+        );
 
         // `image` is this epoch's starting memory (the previous epoch's fini).
         // Epoch tables are labelled 1-based (genesis is 0), so the ordering check
@@ -652,27 +674,15 @@ mod tests {
         );
     }
 
-    // TODO(continuation-memory-dispatch): a memory-heavy multi-epoch continuation
-    // fails per-epoch Memory-bus verification after merging main's new memory/ALU
-    // dispatch (STORE/EQ/BYTEWISE/CPU32 chips + MemoryOp/Alu buses). The L2G memory
-    // bookend predates that model and must be reconciled with the STORE-chip path.
-    // Commit-only continuations (no word stores) still verify; see
-    // `test_commit_across_epochs_verifies`.
+    // A memory-heavy multi-epoch continuation. `all_loadstore_32` is ~34 cycles, so
+    // a power-of-two `epoch_size` of 8 yields several intermediate epochs (each an
+    // exact power-of-two cycle count → no CPU padding rows) plus a final epoch.
     #[test]
-    #[ignore = "continuation L2G memory bookend needs adapting to main's STORE/MemoryOp dispatch"]
     fn test_prove_and_verify_continuation() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let elf = Elf::load(&elf_bytes).unwrap();
-        let total = Executor::new(&elf, vec![])
-            .unwrap()
-            .run()
-            .unwrap()
-            .logs
-            .len();
-        let epoch_size = (total / 3).max(1);
         assert!(
-            prove_and_verify_continuation(&elf_bytes, &[], epoch_size)
+            prove_and_verify_continuation(&elf_bytes, &[], 8)
                 .unwrap()
                 .is_some()
         );

@@ -2904,17 +2904,13 @@ fn test_prove_first_epoch_without_halt() {
     use crate::test_utils::asm_elf_bytes;
 
     let _ = env_logger::builder().is_test(true).try_init();
-    let elf_bytes = asm_elf_bytes("basic_program");
+    let elf_bytes = asm_elf_bytes("arith_8");
     let elf = Elf::load(&elf_bytes).unwrap();
 
-    // Split so epoch 0 is intermediate (the program spans more than one epoch).
-    let total = Executor::new(&elf, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs
-        .len();
-    let epoch_size = (total / 3).max(1);
+    // arith_8 is ~10 cycles; a power-of-two epoch_size of 4 makes epoch 0 an
+    // intermediate epoch (4 cycles → no CPU padding rows) with the program
+    // continuing past it.
+    let epoch_size = 4;
     let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
@@ -2990,17 +2986,12 @@ fn test_prove_second_epoch_from_snapshot() {
     use crate::test_utils::asm_elf_bytes;
 
     let _ = env_logger::builder().is_test(true).try_init();
-    let elf_bytes = asm_elf_bytes("basic_program");
+    let elf_bytes = asm_elf_bytes("arith_8");
     let elf = Elf::load(&elf_bytes).unwrap();
 
-    // Split so epoch 1 is an intermediate epoch (not first, not last).
-    let total = Executor::new(&elf, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs
-        .len();
-    let epoch_size = (total / 3).max(1);
+    // arith_8 is ~10 cycles; epoch_size 4 (power of two) yields epochs 4/4/2, so
+    // epoch 1 is intermediate (4 cycles → no CPU padding rows).
+    let epoch_size = 4;
     let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
@@ -3210,14 +3201,9 @@ fn test_continuation_pipeline_end_to_end() {
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
     let elf = Elf::load(&elf_bytes).unwrap();
 
-    // Split execution into epochs.
-    let total = Executor::new(&elf, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs
-        .len();
-    let epoch_size = (total / 3).max(1);
+    // Split execution into power-of-two epochs (all_loadstore_32 is ~34 cycles, so
+    // epoch_size 8 gives intermediate epochs with no CPU padding rows).
+    let epoch_size = 8;
     let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
@@ -3371,13 +3357,9 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
     let elf = Elf::load(&elf_bytes).unwrap();
 
-    let total = Executor::new(&elf, vec![])
-        .unwrap()
-        .run()
-        .unwrap()
-        .logs
-        .len();
-    let epoch_size = (total / 3).max(1);
+    // Power-of-two epoch size: all_loadstore_32 is ~34 cycles, so epoch_size 8
+    // makes epoch 0 an intermediate epoch with no CPU padding rows.
+    let epoch_size = 8;
     let epochs = Executor::new(&elf, vec![])
         .unwrap()
         .run_epochs(epoch_size)
