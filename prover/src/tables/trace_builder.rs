@@ -2741,15 +2741,31 @@ fn build_traces(
         ecdas_ops,
     } = ops;
 
+    // TEMP PROFILING (revert): per-step trace-generation timers, gated on instruments.
+    macro_rules! timed {
+        ($label:expr, $e:expr) => {{
+            #[cfg(feature = "instruments")]
+            let __t = std::time::Instant::now();
+            let __r = $e;
+            #[cfg(feature = "instruments")]
+            eprintln!("[gen] {:<18} {:>9.3?}", $label, __t.elapsed());
+            __r
+        }};
+    }
+
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    lt_ops.extend(collect_lt_from_memw(&memw_ops));
-    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    timed!("phase3_lt_collect", {
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    });
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __t_phase4 = std::time::Instant::now();
     bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
     // the same chunk size used to split them into instances (see chunk_and_generate
@@ -2795,6 +2811,13 @@ fn build_traces(
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+    #[cfg(feature = "instruments")]
+    eprintln!(
+        "[gen] {:<18} {:>9.3?}  (bitwise_ops len={})",
+        "phase4_bitwise_collect",
+        __t_phase4.elapsed(),
+        bitwise_ops.len()
+    );
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
@@ -2817,118 +2840,123 @@ fn build_traces(
     // must match that last write to balance the memory argument.
     register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
 
-    let cpus = chunk_and_generate(
+    let cpus = timed!("cpus", chunk_and_generate(
         &cpu_ops,
         max_rows.cpu,
         cpu::generate_cpu_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let memws = chunk_and_generate(
+    ))?;
+    let memws = timed!("memws", chunk_and_generate(
         &memw_ops,
         max_rows.memw,
         memw::generate_memw_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let memw_aligneds = chunk_and_generate(
+    ))?;
+    let memw_aligneds = timed!("memw_aligneds", chunk_and_generate(
         &memw_aligned_ops,
         max_rows.memw_aligned,
         memw_aligned::generate_memw_aligned_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let memw_registers = chunk_and_generate(
+    ))?;
+    let memw_registers = timed!("memw_registers", chunk_and_generate(
         &memw_register_ops,
         max_rows.memw_register,
         memw_register::generate_memw_register_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let loads = chunk_and_generate(
+    ))?;
+    let loads = timed!("loads", chunk_and_generate(
         &load_ops,
         max_rows.load,
         load::generate_load_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let lts = chunk_and_generate(
+    ))?;
+    let lts = timed!("lts", chunk_and_generate(
         &lt_ops,
         max_rows.lt,
         lt::generate_lt_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let shifts = chunk_and_generate(
+    ))?;
+    let shifts = timed!("shifts", chunk_and_generate(
         &shift_ops,
         max_rows.shift,
         shift::generate_shift_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let muls = chunk_and_generate(
+    ))?;
+    let muls = timed!("muls", chunk_and_generate(
         &mul_ops,
         max_rows.mul,
         mul::generate_mul_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let dvrms = chunk_and_generate(
+    ))?;
+    let dvrms = timed!("dvrms", chunk_and_generate(
         &dvrm_ops,
         max_rows.dvrm,
         dvrm::generate_dvrm_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let branches = chunk_and_generate(
+    ))?;
+    let branches = timed!("branches", chunk_and_generate(
         &branch_ops,
         max_rows.branch,
         branch::generate_branch_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
+    ))?;
 
     // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
-    let eqs = chunk_and_generate::<eq::EqOperation>(
+    let eqs = timed!("eqs", chunk_and_generate::<eq::EqOperation>(
         &eq_ops,
         max_rows.eq,
         eq::generate_eq_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
+    ))?;
+    let bytewises = timed!("bytewises", chunk_and_generate::<bytewise::BytewiseOperation>(
         &bytewise_ops,
         max_rows.bytewise,
         bytewise::generate_bytewise_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let stores = chunk_and_generate::<store::StoreOperation>(
+    ))?;
+    let stores = timed!("stores", chunk_and_generate::<store::StoreOperation>(
         &store_ops,
         max_rows.store,
         store::generate_store_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
-    let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
+    ))?;
+    let cpu32s = timed!("cpu32s", chunk_and_generate::<cpu32::Cpu32Operation>(
         &cpu32_ops,
         max_rows.cpu32,
         cpu32::generate_cpu32_trace,
         #[cfg(feature = "disk-spill")]
         storage_mode,
-    )?;
+    ))?;
 
-    let mut bitwise = bitwise::generate_bitwise_trace();
-    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+    let mut bitwise = timed!("bitwise+mult", {
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        bitwise
+    });
 
     // Update DECODE multiplicities
     // Each CPU operation looks up the DECODE table once
     // Padding rows also look up pc=1 (the CPU padding entry)
     // When CPU is split, each chunk pads independently
     let mut decode = decode_trace;
-    let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-    decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-    decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+    timed!("decode_mult", {
+        let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+    });
 
     // Prepare register final state before scope (needs register_state ownership)
     let register_final_state = register_state.to_final_state_map();
@@ -2936,7 +2964,7 @@ fn build_traces(
     // Generate remaining traces in parallel (page, register, halt, commit).
     // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
     #[allow(unused_mut)]
-    let mut commit_trace = commit::generate_commit_trace(&commit_ops);
+    let mut commit_trace = timed!("commit", commit::generate_commit_trace(&commit_ops));
 
     // Generate keccak traces (core table + per-round table + preprocessed RC)
     let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
@@ -2947,18 +2975,29 @@ fn build_traces(
             output: op.output,
         })
         .collect();
-    let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
-    let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
-    let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-    keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+    let keccak_trace = timed!("keccak_core", keccak::generate_keccak_trace(&keccak_ops));
+    let keccak_rnd_trace = timed!(
+        "keccak_rnd",
+        keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
+    );
+    let mut keccak_rc_trace = timed!("keccak_rc", {
+        let mut t = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut t, keccak_ops.len());
+        t
+    });
 
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
-    let ecsm_trace = ecsm::generate_ecsm_trace(&ecsm_ops);
-    let ec_scalar_trace = ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops);
-    let ecdas_trace = ecdas::generate_ecdas_trace(&ecdas_ops);
+    let ecsm_trace = timed!("ecsm", ecsm::generate_ecsm_trace(&ecsm_ops));
+    let ec_scalar_trace = timed!(
+        "ec_scalar",
+        ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops)
+    );
+    let ecdas_trace = timed!("ecdas", ecdas::generate_ecdas_trace(&ecdas_ops));
 
     #[allow(unused_mut)]
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
+    #[cfg(feature = "instruments")]
+    let __t_prh = std::time::Instant::now();
     #[cfg(feature = "parallel")]
     {
         let ((pages_val, register_val), halt_val) = rayon::join(
@@ -2995,6 +3034,12 @@ fn build_traces(
         register_trace = register::generate_register_trace(&register_final_state, entry_point);
         halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     }
+    #[cfg(feature = "instruments")]
+    eprintln!(
+        "[gen] {:<18} {:>9.3?}",
+        "page+register+halt",
+        __t_prh.elapsed()
+    );
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3692,17 +3737,34 @@ impl Traces {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        #[cfg(feature = "instruments")]
+        let __t = std::time::Instant::now();
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        #[cfg(feature = "instruments")]
+        {
+            eprintln!("[gen] {:<18} {:>9.3?}", "phase0_decode", __t.elapsed());
+        }
 
         // Phase 1: Logs → CPU operations
+        #[cfg(feature = "instruments")]
+        let __t = std::time::Instant::now();
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        #[cfg(feature = "instruments")]
+        eprintln!(
+            "[gen] {:<18} {:>9.3?}  (cpu_ops len={})",
+            "phase1_cpu_ops",
+            __t.elapsed(),
+            cpu_ops.len()
+        );
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_elf(elf);
         memory_state.add_private_input(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
+        #[cfg(feature = "instruments")]
+        let __t = std::time::Instant::now();
         let (
             memw_ops,
             load_ops,
@@ -3732,6 +3794,8 @@ impl Traces {
             ecdas_ops,
             &mut register_state,
         );
+        #[cfg(feature = "instruments")]
+        eprintln!("[gen] {:<18} {:>9.3?}", "phase2_route_ops", __t.elapsed());
 
         // Phases 3-5
         build_traces(
