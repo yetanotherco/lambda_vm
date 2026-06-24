@@ -452,7 +452,16 @@ impl ByteConversion for FieldElement<GoldilocksField> {
 
     #[inline(always)]
     fn to_bytes_le(&self) -> [u8; 8] {
-        self.canonical_u64().to_le_bytes()
+        // Use raw (non-canonical) stored value — no compare-subtract.
+        // The LE leaf hash protocol (write_bytes_le / keccak streaming LE) uses
+        // this consistently; both prover and verifier skip canonicalization.
+        self.value().to_le_bytes()
+    }
+
+    #[inline(always)]
+    fn write_bytes_le(&self, buf: &mut [u8]) {
+        debug_assert!(buf.len() >= 8);
+        buf[..8].copy_from_slice(&self.value().to_le_bytes());
     }
 
     fn from_bytes_be(bytes: &[u8]) -> Result<Self, crate::errors::ByteConversionError>
