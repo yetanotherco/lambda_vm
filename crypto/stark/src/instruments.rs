@@ -1,7 +1,149 @@
 use std::cell::RefCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+// =========================================================================
+// Accurate wall-clock span timeline
+// =========================================================================
+//
+// A lightweight nested-span recorder for measuring the *wall-clock* latency of
+// each proving step. Unlike the `accum_*` / thread-local sub-timers below — which
+// accumulate per-worker CPU time across rayon threads and therefore over-count
+// (their percentages sum well past 100%) — these spans are opened and closed on
+// the driving (main) thread at phase boundaries, so they are non-overlapping and
+// sum to the parent. Parallel regions (LDE/Merkle) are measured as a single span
+// around the call that blocks the main thread, which is exactly their latency.
+//
+// Usage:
+//     let _s = instruments::span("trace_build");   // RAII: stops on drop
+//     { let _s = instruments::span("p4_bitwise"); ... }   // nested
+//
+// `Instant::now()` is ~20 ns — fine at phase/sub-phase granularity. Do NOT open
+// spans inside per-op hot loops (use a sampling profiler for within-span detail).
+
+/// One recorded span: its label, nesting depth, wall time, and open-order.
+#[derive(Clone, Debug)]
+pub struct SpanRecord {
+    pub label: &'static str,
+    pub depth: u16,
+    pub wall: Duration,
+    /// Sequence number assigned when the span *opened* (so the tree can be
+    /// reconstructed in start-order even though records are pushed on close).
+    pub order: u32,
+}
+
+static TIMELINE: Mutex<Vec<SpanRecord>> = Mutex::new(Vec::new());
+static SPAN_ORDER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard: records the span's wall time when dropped.
+#[must_use]
+pub struct SpanGuard {
+    label: &'static str,
+    depth: u16,
+    order: u32,
+    start: Instant,
+}
+
+/// Open a wall-clock span. The returned guard records the elapsed time when it
+/// drops (end of scope). Spans nest by lexical scope on the calling thread.
+pub fn span(label: &'static str) -> SpanGuard {
+    let depth = SPAN_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    let order = SPAN_ORDER.fetch_add(1, Ordering::Relaxed) as u32;
+    SpanGuard {
+        label,
+        depth,
+        order,
+        start: Instant::now(),
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        let wall = self.start.elapsed();
+        SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Ok(mut t) = TIMELINE.lock() {
+            t.push(SpanRecord {
+                label: self.label,
+                depth: self.depth,
+                wall,
+                order: self.order,
+            });
+        }
+    }
+}
+
+/// Clear all recorded spans. Call at the start of a measured `prove`.
+pub fn reset_timeline() {
+    SPAN_ORDER.store(0, Ordering::Relaxed);
+    SPAN_DEPTH.with(|d| d.set(0));
+    if let Ok(mut t) = TIMELINE.lock() {
+        t.clear();
+    }
+}
+
+/// Drain the recorded spans, sorted in start-order (ready for tree printing).
+pub fn take_timeline() -> Vec<SpanRecord> {
+    let mut spans = TIMELINE
+        .lock()
+        .map(|mut t| std::mem::take(&mut *t))
+        .unwrap_or_default();
+    spans.sort_by_key(|s| s.order);
+    spans
+}
+
+/// Render the timeline as an indented tree with wall time and % of the first
+/// (root) span. Returns an empty string if no spans were recorded.
+pub fn format_timeline(spans: &[SpanRecord]) -> String {
+    use std::fmt::Write;
+    if spans.is_empty() {
+        return String::new();
+    }
+    let total = spans.first().map(|s| s.wall).unwrap_or_default();
+    let total_s = total.as_secs_f64().max(1e-9);
+    let mut out = String::from("=== TIMELINE (wall-clock) ===\n");
+    for s in spans {
+        let indent = "  ".repeat(s.depth as usize);
+        let pct = 100.0 * s.wall.as_secs_f64() / total_s;
+        let _ = writeln!(
+            out,
+            "{:<40} {:>10.3?} {:>6.1}%",
+            format!("{indent}{}", s.label),
+            s.wall,
+            pct
+        );
+    }
+    out
+}
+
+/// Render the timeline as a JSON array of `{label, depth, wall_ns, order}` for
+/// diffing across runs / plotting scaling. Hand-rolled to avoid a serde dep here.
+pub fn timeline_json(spans: &[SpanRecord]) -> String {
+    let mut out = String::from("[");
+    for (i, s) in spans.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"label\":\"{}\",\"depth\":{},\"wall_ns\":{},\"order\":{}}}",
+            s.label,
+            s.depth,
+            s.wall.as_nanos(),
+            s.order
+        ));
+    }
+    out.push(']');
+    out
+}
 
 static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
 

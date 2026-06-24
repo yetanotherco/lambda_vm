@@ -3,6 +3,21 @@
 #[cfg(all(target_arch = "wasm32", feature = "disk-spill"))]
 compile_error!("the `disk-spill` feature requires memmap2, which does not compile on wasm32");
 
+/// Open a wall-clock profiling span (no-op unless the `instruments` feature is on).
+///
+/// RAII: the span records its elapsed wall time when the binding drops at end of
+/// the enclosing scope. Wrap a region in its own `{ }` block to scope it:
+/// ```ignore
+/// { prof_span!("p4_bitwise"); collect_bitwise(...); }
+/// ```
+#[macro_export]
+macro_rules! prof_span {
+    ($label:expr) => {
+        #[cfg(feature = "instruments")]
+        let _prof_span = $crate::instruments::span($label);
+    };
+}
+
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod constraints;

@@ -43,3 +43,7 @@ harness = false
 [[bench]]
 name = "profile_vm_prover"
 harness = false
+
+[[bench]]
+name = "profile_ethrex"
+harness = false
