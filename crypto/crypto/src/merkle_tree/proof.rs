@@ -155,23 +155,27 @@ where
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
     use crate::hash::keccak256::{
-        keccak256, keccak256_four_nodes, keccak256_single_block, keccak256_two_nodes,
+        keccak256, keccak256_field_elements_direct, keccak256_four_nodes, keccak256_two_nodes,
     };
     use math::traits::ByteConversion;
     // Keccak-256 rate in bytes.
     const RATE: usize = 136;
 
-    // Leaf: serialize field elements big-endian into `leaf_scratch`, then hash.
-    // If the serialized leaf fits in a single keccak rate block (< 136 bytes),
-    // use the single-block path (one permutation, no sponge bookkeeping).
-    // Otherwise fall back to the multi-block sponge.
-    leaf_scratch.clear();
-    for element in value.iter() {
-        leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
-    }
-    let mut hashed_value = if leaf_scratch.len() < RATE {
-        keccak256_single_block(leaf_scratch)
+    // Leaf hash: for lane-aligned element sizes (BYTE_LEN divisible by 8) that
+    // fit in a single keccak block, absorb directly into state lanes — no
+    // intermediate `[u8; RATE]` buffer copy and no `leaf_scratch` Vec write.
+    // For wider leaves (main trace with many columns), fall back to the
+    // scratch-buffer path.
+    let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
+    let total_bytes = value.len() * elem_bytes;
+    let mut hashed_value = if elem_bytes % 8 == 0 && total_bytes < RATE {
+        keccak256_field_elements_direct::<F>(value)
     } else {
+        // Wide leaf: serialize into `leaf_scratch` (reused across calls) then hash.
+        leaf_scratch.clear();
+        for element in value.iter() {
+            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+        }
         keccak256(leaf_scratch)
     };
 
@@ -239,7 +243,7 @@ where
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
     use crate::hash::keccak256::{
-        keccak256, keccak256_four_nodes, keccak256_single_block, keccak256_two_nodes,
+        keccak256, keccak256_field_elements_direct, keccak256_four_nodes, keccak256_two_nodes,
     };
     use math::traits::ByteConversion;
 
@@ -251,25 +255,29 @@ where
     // Keccak rate for 256-bit output.
     const RATE: usize = 136;
 
+    let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
+    let total_bytes = value_a.len() * elem_bytes;
+    let lane_aligned = elem_bytes % 8 == 0;
+
     // Hash leaf A (at `index`).
-    leaf_scratch.clear();
-    for element in value_a.iter() {
-        leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
-    }
-    let hash_a = if leaf_scratch.len() < RATE {
-        keccak256_single_block(leaf_scratch)
+    let hash_a = if lane_aligned && total_bytes < RATE {
+        keccak256_field_elements_direct::<F>(value_a)
     } else {
+        leaf_scratch.clear();
+        for element in value_a.iter() {
+            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+        }
         keccak256(leaf_scratch)
     };
 
     // Hash leaf B (at `index + 1`).
-    leaf_scratch.clear();
-    for element in value_b.iter() {
-        leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
-    }
-    let hash_b = if leaf_scratch.len() < RATE {
-        keccak256_single_block(leaf_scratch)
+    let hash_b = if lane_aligned && total_bytes < RATE {
+        keccak256_field_elements_direct::<F>(value_b)
     } else {
+        leaf_scratch.clear();
+        for element in value_b.iter() {
+            leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
+        }
         keccak256(leaf_scratch)
     };
 

@@ -162,6 +162,57 @@ fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
     }
 }
 
+/// Keccak256 of a short sequence of field elements without any intermediate byte
+/// buffer. Each element is serialized as 8-byte-aligned big-endian chunks (via
+/// `to_bytes_be()`), which are XORed directly into successive keccak state lanes
+/// (little-endian within each lane). Padding is applied in-place to the state
+/// without a `[u8; RATE]` intermediate.
+///
+/// **Contract**: The total serialized length of all elements must be `< RATE`
+/// (136 bytes) — i.e. at most 17 Goldilocks elements or 5 Fp3 elements — and
+/// each element's `BYTE_LEN` must be a multiple of 8 (lane-aligned). Debug
+/// asserts enforce both. For wider leaves use the `leaf_scratch`-based path.
+///
+/// Identical output to `keccak256_single_block(concatenation of to_bytes_be())`.
+#[inline]
+pub fn keccak256_field_elements_direct<F>(elements: &[math::field::element::FieldElement<F>]) -> [u8; OUTPUT_LEN]
+where
+    F: math::field::traits::IsField,
+    math::field::element::FieldElement<F>: math::traits::ByteConversion,
+{
+    use math::traits::ByteConversion;
+    // Each element contributes BYTE_LEN bytes, lane-aligned (multiple of 8).
+    let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
+    debug_assert_eq!(elem_bytes % 8, 0, "element byte length must be lane-aligned");
+    let total_bytes = elements.len() * elem_bytes;
+    debug_assert!(total_bytes < RATE, "leaf too wide for single-block direct absorb");
+
+    let lanes_per_elem = elem_bytes / 8;
+    let mut state = [0u64; 25];
+    let mut lane_idx = 0usize;
+    for element in elements.iter() {
+        let bytes = element.to_bytes_be();
+        for chunk in bytes.as_ref().chunks_exact(8) {
+            state[lane_idx] = u64::from_le_bytes(chunk.try_into().unwrap());
+            lane_idx += 1;
+        }
+    }
+    // pad10*1 directly into state lanes — no intermediate [u8; RATE] buffer.
+    // Byte `total_bytes` is in lane `total_bytes/8` at byte offset `total_bytes%8`.
+    let pad_lane = total_bytes / 8;
+    let pad_shift = (total_bytes % 8) * 8;
+    state[pad_lane] ^= 0x01u64 << pad_shift;
+    // Last rate byte (byte 135) is in lane 16, byte offset 7 → shift 56.
+    state[16] ^= 0x80u64 << 56;
+    keccak::f1600(&mut state);
+    let mut out = [0u8; OUTPUT_LEN];
+    for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    let _ = lanes_per_elem; // suppress unused warning in release builds
+    out
+}
+
 /// Streaming Keccak256 hasher, byte-identical to `sha3::Keccak256` but built on a
 /// direct `keccak::f1600` (the `KeccakPermute` precompile on the guest) and a
 /// fixed-rate buffer, skipping `sha3`'s generic `block_buffer`/`Digest` machinery.
@@ -378,6 +429,43 @@ mod tests {
         mine.update(&[7u8; 50]);
         theirs.update(&[7u8; 50]);
         assert_eq!(mine.finalize(), <[u8; 32]>::from(theirs.clone().finalize()));
+    }
+
+    #[test]
+    fn field_elements_direct_matches_scratch_path() {
+        // Verify that `keccak256_field_elements_direct` produces byte-identical
+        // output to the scratch-buffer path (serialize to bytes, then
+        // `keccak256_single_block`) for the two field types used by the verifier:
+        // Goldilocks (8 bytes/element) and Fp3 extension (24 bytes/element).
+        use math::field::{
+            element::FieldElement,
+            goldilocks::GoldilocksField,
+        };
+        use math::traits::ByteConversion;
+        type Fp = GoldilocksField;
+        type FpE = FieldElement<Fp>;
+
+        // --- Goldilocks (8 bytes/element) ---
+        for n in [1usize, 3, 5, 8, 16] {
+            let elements: alloc::vec::Vec<FpE> = (0..n)
+                .map(|i| FpE::from(i as u64 * 0x9e3779b97f4a7c15 + 1))
+                .collect();
+            // Reference: serialize then hash.
+            let mut bytes = alloc::vec::Vec::new();
+            for e in &elements {
+                bytes.extend_from_slice(e.to_bytes_be().as_ref());
+            }
+            let reference = if bytes.len() < RATE {
+                keccak256_single_block(&bytes)
+            } else {
+                keccak256(&bytes)
+            };
+            let direct = keccak256_field_elements_direct::<Fp>(&elements);
+            assert_eq!(
+                direct, reference,
+                "Goldilocks mismatch for n={n} elements"
+            );
+        }
     }
 
     #[test]
