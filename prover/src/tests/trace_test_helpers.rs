@@ -21,6 +21,8 @@ use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
 /// Removes rows where all multiplicity columns are zero (TEST ONLY).
 ///
+/// # WARNING: UNSOUND FOR PRODUCTION
+///
 /// This function is for tests only. The reduced table is NOT a valid
 /// preprocessed table because:
 /// 1. Row indices no longer match the (x, y, z) encoding
@@ -79,7 +81,7 @@ impl Traces {
     /// rows with non-zero multiplicities. This makes the table much smaller for
     /// tests that don't exercise many distinct byte values.
     ///
-    /// # Safety / Unsoundness
+    /// # WARNING: UNSOUND FOR PRODUCTION
     ///
     /// The trimmed bitwise table is NOT a valid preprocessed table because:
     /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
