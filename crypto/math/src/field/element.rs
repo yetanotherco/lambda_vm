@@ -531,6 +531,18 @@ where
         S::scalar_fma(&mut self.value, &scalar.value, &rhs.value);
     }
 
+    /// Scalar-into-extension dot product: `self += scalars[i] × fp3[i]` for all i.
+    /// Dispatches to `S::scalar_dot` which on riscv64 with GoldilocksField scalar and
+    /// Degree3GoldilocksExtensionField uses the FP3_SCALAR_DOT ecall for all n at once.
+    #[inline(always)]
+    pub fn scalar_dot<S: super::traits::IsSubFieldOf<F>>(
+        &mut self,
+        scalars: &[FieldElement<S>],
+        fp3: &[Self],
+    ) {
+        S::scalar_dot(&mut self.value, scalars, fp3);
+    }
+
     /// Returns the multiplicative inverse of `self`
     #[inline(always)]
     pub fn inv(&self) -> Result<Self, FieldError> {

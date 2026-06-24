@@ -886,6 +886,25 @@ pub trait IsStarkVerifier<
         let primitive_root =
             &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
 
+        // For the height=2 fast path: precompute row-major coefficient slices so that
+        // the dot product precompile (Fp3ScalarDot) can access them contiguously.
+        // trace_term_coeffs is column-major: [col0_row0, col0_row1, col1_row0, col1_row1, ...]
+        // We split into coeffs_row0 = [col0_row0, col1_row0, ...] and coeffs_row1 = [col0_row1, ...].
+        let ood_height_for_dot = proof.trace_ood_evaluations().height();
+        let ood_width_for_dot = proof.trace_ood_evaluations().width();
+        let (coeffs_row0, coeffs_row1) = if ood_height_for_dot == 2 {
+            let mut r0: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(ood_width_for_dot);
+            let mut r1: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(ood_width_for_dot);
+            for col in 0..ood_width_for_dot {
+                let base = col * 2;
+                r0.push(challenges.trace_term_coeffs[base].clone());
+                r1.push(challenges.trace_term_coeffs[base + 1].clone());
+            }
+            (r0, r1)
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
         // Precompute `z^N_parts` once — both `challenges.z` and the number of
         // composition-poly parts are proof-global constants, so recomputing this
         // inside each of the 2×num_queries reconstruction calls wastes `num_parts`
@@ -959,6 +978,11 @@ pub trait IsStarkVerifier<
 
             // trace_denoms_inv layout per query i: [ep_i row0..row(h-1), ep_sym_i row0..row(h-1)]
             let td_base = i * 2 * ood_height;
+            let coeffs_rows_ref = if !coeffs_row0.is_empty() {
+                Some((coeffs_row0.as_slice(), coeffs_row1.as_slice()))
+            } else {
+                None
+            };
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 challenges,
@@ -968,6 +992,7 @@ pub trait IsStarkVerifier<
                 &b_terms,
                 &trace_denoms_inv[td_base..td_base + ood_height],
                 comp_denoms[2 * i].clone(),
+                coeffs_rows_ref,
             ));
 
             // Symmetric point — same column split.
@@ -991,6 +1016,7 @@ pub trait IsStarkVerifier<
                 &b_terms,
                 &trace_denoms_inv[td_sym_base..td_sym_base + ood_height],
                 comp_denoms[2 * i + 1].clone(),
+                coeffs_rows_ref,
             ));
         }
         (deep_poly_evaluations, deep_poly_evaluations_sym)
@@ -1033,7 +1059,7 @@ pub trait IsStarkVerifier<
         proof: &P,
         challenges: &Challenges<FieldExtension>,
         // Base-field (precomputed + main) trace evaluations as Field scalars.
-        // Uses scalar_fma (Fp3ScalarFma ecall) — avoids to_extension() and Fp3 wrapper.
+        // Uses scalar_dot (Fp3ScalarDot ecall) — avoids to_extension() and Fp3 wrapper.
         lde_base_evaluations: &[FieldElement<Field>],
         // Extension-field (aux) trace evaluations as genuine Fp3 values.
         lde_ext_evaluations: &[FieldElement<FieldExtension>],
@@ -1045,6 +1071,10 @@ pub trait IsStarkVerifier<
         // Pre-inverted composition denominator: `(eval_point − z^N_parts)⁻¹`,
         // batch-computed by the caller across all queries (avoids 146 separate `.inv()` calls).
         denom_composition_inv: FieldElement<FieldExtension>,
+        // For height=2 fast path: pre-split row-major coefficient slices for dot product.
+        // coeffs_row0[col] = trace_term_coeffs[col*2+0], coeffs_row1[col] = ...[col*2+1].
+        // None if ood_height != 2.
+        coeffs_rows: Option<(&[FieldElement<FieldExtension>], &[FieldElement<FieldExtension>])>,
     ) -> FieldElement<FieldExtension>
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -1086,13 +1116,18 @@ pub trait IsStarkVerifier<
             let (denom0, denom1) = (&denoms_trace_inv[0], &denoms_trace_inv[1]);
             let mut row_acc_0 = FieldElement::zero();
             let mut row_acc_1 = FieldElement::zero();
-            // Base-field columns: scalar_fma (Fp3ScalarFma ecall) — 3 Goldilocks muls,
-            // no Fp3 wrapper, no to_extension() copy.
-            for col_idx in 0..n_base_cols {
-                let base = col_idx * 2;
-                let scalar = &lde_base_evaluations[col_idx];
-                row_acc_0.scalar_fma::<Field>(scalar, &trace_term_coeffs[base]);
-                row_acc_1.scalar_fma::<Field>(scalar, &trace_term_coeffs[base + 1]);
+            if let Some((coeffs_row0, coeffs_row1)) = coeffs_rows {
+                // Use dot product precompile (FP3_SCALAR_DOT): one ecall for all n_base_cols.
+                // coeffs_row0 and coeffs_row1 are pre-split contiguous row-major slices.
+                row_acc_0.scalar_dot(lde_base_evaluations, &coeffs_row0[..n_base_cols]);
+                row_acc_1.scalar_dot(lde_base_evaluations, &coeffs_row1[..n_base_cols]);
+            } else {
+                for col_idx in 0..n_base_cols {
+                    let base = col_idx * 2;
+                    let scalar = &lde_base_evaluations[col_idx];
+                    row_acc_0.scalar_fma::<Field>(scalar, &trace_term_coeffs[base]);
+                    row_acc_1.scalar_fma::<Field>(scalar, &trace_term_coeffs[base + 1]);
+                }
             }
             // Extension-field columns: Fp3 fma (Fp3Fma ecall).
             for (aux_idx, eval) in lde_ext_evaluations.iter().enumerate() {

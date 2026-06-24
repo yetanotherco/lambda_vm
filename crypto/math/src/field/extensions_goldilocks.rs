@@ -501,6 +501,17 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         goldilocks_scalar_fp3_fma(acc, a, b);
     }
 
+    /// Scalar Fp3 dot product: one FP3_SCALAR_DOT ecall for all n elements.
+    fn scalar_dot(
+        acc: &mut <Degree3GoldilocksExtensionField as IsField>::BaseType,
+        scalars: &[FieldElement<GoldilocksField>],
+        fp3: &[FieldElement<Degree3GoldilocksExtensionField>],
+    ) {
+        // SAFETY: [FpE; 3] has the same memory layout as [u64; 3] since FpE = {value: u64}.
+        let acc_arr = unsafe { &mut *(acc as *mut _ as *mut [FpE; 3]) };
+        goldilocks_scalar_fp3_dot(acc_arr, scalars, fp3);
+    }
+
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -621,6 +632,54 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
 
 /// Type alias for the Goldilocks cubic extension field element.
 pub type Fp3Element = FieldElement<Degree3GoldilocksExtensionField>;
+
+
+/// Scalar-Fp3 dot product: `acc += scalars[0]*fp3[0] + ... + scalars[n-1]*fp3[n-1]`.
+/// Issues a single ecall on riscv64 instead of n separate scalar_fma ecalls.
+/// `scalars`: slice of Goldilocks field elements (1 u64 each)
+/// `fp3`: slice of Fp3 field elements (3 u64 each, [FpE; 3] layout contiguous)
+#[inline(always)]
+pub fn goldilocks_scalar_fp3_dot(
+    acc: &mut [FpE; 3],
+    scalars: &[FieldElement<GoldilocksField>],
+    fp3: &[FieldElement<Degree3GoldilocksExtensionField>],
+) {
+    debug_assert_eq!(scalars.len(), fp3.len(), "scalars and fp3 must have equal length");
+    let n = scalars.len();
+    #[cfg(target_arch = "riscv64")]
+    {
+        const FP3_SCALAR_DOT_SYSCALL: u64 = u64::MAX - 5;
+        let acc_ptr = acc.as_mut_ptr() as *mut u64;
+        // FieldElement<GoldilocksField> = { value: u64 } → contiguous u64 array.
+        let scalars_ptr = scalars.as_ptr() as *const u64;
+        // FieldElement<Degree3GoldilocksExtensionField> = { value: [FpE; 3] } = { value: [u64; 3] }
+        // → contiguous [u64; 3] array (24 bytes per element).
+        let fp3_ptr = fp3.as_ptr() as *const u64;
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a0") acc_ptr,
+                in("a1") scalars_ptr,
+                in("a2") fp3_ptr,
+                in("a3") n,
+                in("a7") FP3_SCALAR_DOT_SYSCALL,
+            );
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let add = <GoldilocksField as IsField>::add;
+        let mul = <GoldilocksField as IsField>::mul;
+        for i in 0..n {
+            let s = scalars[i].value();
+            let c = fp3[i].value();
+            acc[0] = FpE::from_raw(add(&mul(s, c[0].value()), acc[0].value()));
+            acc[1] = FpE::from_raw(add(&mul(s, c[1].value()), acc[1].value()));
+            acc[2] = FpE::from_raw(add(&mul(s, c[2].value()), acc[2].value()));
+        }
+    }
+}
 
 /// Standalone scalar-Fp3 FMA function for use by the `IsSubFieldOf` impl.
 /// `acc += scalar * b`: 3 Goldilocks muls via Fp3ScalarFma ecall on riscv64.

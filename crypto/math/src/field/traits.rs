@@ -31,6 +31,18 @@ pub trait IsSubFieldOf<F: IsField>: IsField {
     fn scalar_fma(acc: &mut F::BaseType, a: &Self::BaseType, b: &F::BaseType) {
         *acc = F::add(acc, &<Self as IsSubFieldOf<F>>::mul(a, b));
     }
+
+    /// Scalar dot product: `acc += scalars[i] × fp3[i]` for all i.
+    /// Default: loop of scalar_fma. Concrete pairs may issue a single batch ecall.
+    fn scalar_dot(
+        acc: &mut F::BaseType,
+        scalars: &[crate::field::element::FieldElement<Self>],
+        fp3: &[crate::field::element::FieldElement<F>],
+    ) {
+        for (scalar, fp3_elem) in scalars.iter().zip(fp3.iter()) {
+            <Self as IsSubFieldOf<F>>::scalar_fma(acc, scalar.value(), fp3_elem.value());
+        }
+    }
 }
 
 impl<F> IsSubFieldOf<F> for F
