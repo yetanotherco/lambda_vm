@@ -295,8 +295,10 @@ impl MulOperation {
 pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
-    let mut op_map: HashMap<MulOperation, MulMultiplicities> = HashMap::new();
+    // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi).
+    // Pre-size to the op count (an upper bound on unique ops) to avoid rehashing.
+    let mut op_map: HashMap<MulOperation, MulMultiplicities> =
+        HashMap::with_capacity(operations.len());
 
     for (op, wants_hi) in operations {
         let entry = op_map.entry(op.clone()).or_default();

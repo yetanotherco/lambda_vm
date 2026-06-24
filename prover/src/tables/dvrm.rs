@@ -287,8 +287,10 @@ impl DvrmOperation {
 pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
-    let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
+    // Deduplicate: (n, d, signed) -> (mu_q, mu_r).
+    // Pre-size to the op count (an upper bound on unique ops) to avoid rehashing.
+    let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> =
+        HashMap::with_capacity(operations.len());
 
     for (op, wants_remainder) in operations {
         let entry = op_map.entry(op.clone()).or_default();
