@@ -22,6 +22,15 @@ pub trait IsSubFieldOf<F: IsField>: IsField {
     fn embed(a: Self::BaseType) -> F::BaseType;
     #[cfg(feature = "alloc")]
     fn to_subfield_vec(b: F::BaseType) -> alloc::vec::Vec<Self::BaseType>;
+
+    /// Scalar fused multiply-add: `acc += self_scalar × b` where acc and b are
+    /// in the extension field F and self is the base field scalar.
+    ///
+    /// Default implementation uses `mul` + `F::add`. Concrete pairs that have a
+    /// hardware-accelerated scalar FMA may override this.
+    fn scalar_fma(acc: &mut F::BaseType, a: &Self::BaseType, b: &F::BaseType) {
+        *acc = F::add(acc, &<Self as IsSubFieldOf<F>>::mul(a, b));
+    }
 }
 
 impl<F> IsSubFieldOf<F> for F

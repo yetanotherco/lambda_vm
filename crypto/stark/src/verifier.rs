@@ -852,11 +852,15 @@ pub trait IsStarkVerifier<
         let num_queries = challenges.iotas.len();
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
-        // Scratch buffers reused across every query iteration: the per-row trace
-        // evaluations gathered for the regular and symmetric points. Cleared and
-        // refilled each query — no heap allocation after the first iteration.
-        let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
-        let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
+        // Scratch buffers reused across every query iteration.
+        // Base-field columns (precomputed + main trace) stay as Field elements
+        // so scalar_fma (Fp3ScalarFma ecall) handles acc += scalar × coeff,
+        // avoiding both to_extension() copies and the Fp3 wrapper's extra 2-zero stores.
+        // Extension-field columns (aux trace) use regular fma (Fp3Fma ecall).
+        let mut evals_base: Vec<FieldElement<Field>> = Vec::new();
+        let mut evals_base_sym: Vec<FieldElement<Field>> = Vec::new();
+        let mut evals_ext: Vec<FieldElement<FieldExtension>> = Vec::new();
+        let mut evals_ext_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
 
         // Precompute the query-INVARIANT half of the deep-trace term, once for all
         // queries. The trace term is
@@ -934,27 +938,16 @@ pub trait IsStarkVerifier<
         for (i, _iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            evaluations.clear();
+            // Base-field columns (precomputed + main): kept as Field scalars for scalar_fma.
+            evals_base.clear();
             if let Some(precomputed_polys) = &opening.precomputed_trace_polys {
-                evaluations.extend(
-                    precomputed_polys
-                        .evaluations
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
+                evals_base.extend_from_slice(precomputed_polys.evaluations);
             }
-            evaluations.extend(
-                opening
-                    .main_trace_polys
-                    .evaluations
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
+            evals_base.extend_from_slice(opening.main_trace_polys.evaluations);
+            // Extension-field columns (aux trace): genuine Fp3 for regular fma.
+            evals_ext.clear();
             if let Some(aux_trace_polys) = &opening.aux_trace_polys {
-                evaluations.extend_from_slice(aux_trace_polys.evaluations);
+                evals_ext.extend_from_slice(aux_trace_polys.evaluations);
             }
 
             // trace_denoms_inv layout per query i: [ep_i row0..row(h-1), ep_sym_i row0..row(h-1)]
@@ -962,41 +955,31 @@ pub trait IsStarkVerifier<
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 challenges,
-                &evaluations,
+                &evals_base,
+                &evals_ext,
                 opening.composition_poly.evaluations,
                 &b_terms,
                 &trace_denoms_inv[td_base..td_base + ood_height],
                 comp_denoms[2 * i].clone(),
             ));
 
-            // For preprocessed tables: precomputed columns come FIRST, then multiplicities
-            evaluations_sym.clear();
+            // Symmetric point — same column split.
+            evals_base_sym.clear();
             if let Some(precomputed_polys) = &opening.precomputed_trace_polys {
-                evaluations_sym.extend(
-                    precomputed_polys
-                        .evaluations_sym
-                        .iter()
-                        .cloned()
-                        .map(|x| x.to_extension()),
-                );
+                evals_base_sym.extend_from_slice(precomputed_polys.evaluations_sym);
             }
-            evaluations_sym.extend(
-                opening
-                    .main_trace_polys
-                    .evaluations_sym
-                    .iter()
-                    .cloned()
-                    .map(|x| x.to_extension()),
-            );
+            evals_base_sym.extend_from_slice(opening.main_trace_polys.evaluations_sym);
+            evals_ext_sym.clear();
             if let Some(aux_trace_polys) = &opening.aux_trace_polys {
-                evaluations_sym.extend_from_slice(aux_trace_polys.evaluations_sym);
+                evals_ext_sym.extend_from_slice(aux_trace_polys.evaluations_sym);
             }
 
             let td_sym_base = td_base + ood_height;
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
                 challenges,
-                &evaluations_sym,
+                &evals_base_sym,
+                &evals_ext_sym,
                 opening.composition_poly.evaluations_sym,
                 &b_terms,
                 &trace_denoms_inv[td_sym_base..td_sym_base + ood_height],
@@ -1042,7 +1025,11 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluation<'p, P>(
         proof: &P,
         challenges: &Challenges<FieldExtension>,
-        lde_trace_evaluations: &[FieldElement<FieldExtension>],
+        // Base-field (precomputed + main) trace evaluations as Field scalars.
+        // Uses scalar_fma (Fp3ScalarFma ecall) — avoids to_extension() and Fp3 wrapper.
+        lde_base_evaluations: &[FieldElement<Field>],
+        // Extension-field (aux) trace evaluations as genuine Fp3 values.
+        lde_ext_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
         b_terms: &[FieldElement<FieldExtension>],
         // Pre-inverted trace denominators for this call's evaluation point, length = ood_height.
@@ -1061,6 +1048,7 @@ pub trait IsStarkVerifier<
         let ood = proof.trace_ood_evaluations();
         let ood_evaluations_table_height = ood.height();
         let ood_evaluations_table_width = ood.width();
+        let n_base_cols = lde_base_evaluations.len();
         let composition_poly_parts_ood = proof.composition_poly_parts_ood_evaluation();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
         let trace_term_chunk_len = challenges.trace_term_chunk_len;
@@ -1068,6 +1056,7 @@ pub trait IsStarkVerifier<
             ood_evaluations_table_height * ood_evaluations_table_width,
             trace_term_coeffs.len()
         );
+        debug_assert_eq!(n_base_cols + lde_ext_evaluations.len(), ood_evaluations_table_width);
         // Each column's run has length `trace_term_chunk_len`, which equals the
         // number of OOD rows; the column-major index below relies on this.
         debug_assert_eq!(trace_term_chunk_len, ood_evaluations_table_height);
@@ -1090,12 +1079,18 @@ pub trait IsStarkVerifier<
             let (denom0, denom1) = (&denoms_trace_inv[0], &denoms_trace_inv[1]);
             let mut row_acc_0 = FieldElement::zero();
             let mut row_acc_1 = FieldElement::zero();
-            for col_idx in 0..ood_evaluations_table_width {
+            // Base-field columns: scalar_fma (Fp3ScalarFma ecall) — 3 Goldilocks muls,
+            // no Fp3 wrapper, no to_extension() copy.
+            for col_idx in 0..n_base_cols {
                 let base = col_idx * 2;
-                let eval = &lde_trace_evaluations[col_idx];
-                // Use F::fma (fused multiply-add): acc += eval × coeff.
-                // On riscv64 with Degree3GoldilocksExtensionField this issues the
-                // Fp3Fma ecall instead of Fp3Mul + 3 Goldilocks adds.
+                let scalar = &lde_base_evaluations[col_idx];
+                row_acc_0.scalar_fma::<Field>(scalar, &trace_term_coeffs[base]);
+                row_acc_1.scalar_fma::<Field>(scalar, &trace_term_coeffs[base + 1]);
+            }
+            // Extension-field columns: Fp3 fma (Fp3Fma ecall).
+            for (aux_idx, eval) in lde_ext_evaluations.iter().enumerate() {
+                let col_idx = n_base_cols + aux_idx;
+                let base = col_idx * 2;
                 row_acc_0.fma(eval, &trace_term_coeffs[base]);
                 row_acc_1.fma(eval, &trace_term_coeffs[base + 1]);
             }
@@ -1104,11 +1099,15 @@ pub trait IsStarkVerifier<
         } else {
             for (row_idx, denom) in denoms_trace_inv.iter().enumerate() {
                 let mut row_acc = FieldElement::zero();
-                for col_idx in 0..ood_evaluations_table_width {
-                    row_acc.fma(
-                        &lde_trace_evaluations[col_idx],
+                for col_idx in 0..n_base_cols {
+                    row_acc.scalar_fma::<Field>(
+                        &lde_base_evaluations[col_idx],
                         &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx],
                     );
+                }
+                for (aux_idx, eval) in lde_ext_evaluations.iter().enumerate() {
+                    let col_idx = n_base_cols + aux_idx;
+                    row_acc.fma(eval, &trace_term_coeffs[col_idx * trace_term_chunk_len + row_idx]);
                 }
                 trace_term += (row_acc - &b_terms[row_idx]) * denom;
             }

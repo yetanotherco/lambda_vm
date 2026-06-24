@@ -5,7 +5,7 @@ use crate::vm::{
     registers::Registers,
 };
 
-use crate::constants::{FP3_FMA_SYSCALL_NUMBER, FP3_MUL_SYSCALL_NUMBER};
+use crate::constants::{FP3_FMA_SYSCALL_NUMBER, FP3_MUL_SYSCALL_NUMBER, FP3_SCALAR_FMA_SYSCALL_NUMBER};
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
@@ -23,6 +23,8 @@ pub enum SyscallNumbers {
     Fp3Mul,
     // FP3_FMA_SYSCALL_NUMBER (u64::MAX - 3): fused multiply-add, acc += lhs × rhs.
     Fp3Fma,
+    // FP3_SCALAR_FMA_SYSCALL_NUMBER (u64::MAX - 4): acc += scalar × fp3, 3 muls.
+    Fp3ScalarFma,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -54,6 +56,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == FP3_MUL_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Mul),
             v if v == FP3_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Fma),
+            v if v == FP3_SCALAR_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3ScalarFma),
             _ => Err(()),
         }
     }
@@ -491,6 +494,33 @@ impl Instruction {
                         memory.store_doubleword(addr_acc + 8, goldilocks_add(acc[1], c1))?;
                         memory.store_doubleword(addr_acc + 16, goldilocks_add(acc[2], c2))?;
                         src2_val = addr_lhs;
+                        dst_val = addr_rhs;
+                    }
+                    SyscallNumbers::Fp3ScalarFma => {
+                        // Scalar × Fp3 fused multiply-add: acc += scalar * rhs
+                        // x10 = acc_ptr ([u64;3], in/out), x11 = scalar_ptr ([u64;1]), x12 = rhs_ptr ([u64;3])
+                        let addr_acc = registers.read(10)?;
+                        let addr_scalar = registers.read(11)?;
+                        let addr_rhs = registers.read(12)?;
+                        let acc = [
+                            memory.load_doubleword(addr_acc)?,
+                            memory.load_doubleword(addr_acc + 8)?,
+                            memory.load_doubleword(addr_acc + 16)?,
+                        ];
+                        let scalar = memory.load_doubleword(addr_scalar)?;
+                        let rhs = [
+                            memory.load_doubleword(addr_rhs)?,
+                            memory.load_doubleword(addr_rhs + 8)?,
+                            memory.load_doubleword(addr_rhs + 16)?,
+                        ];
+                        // acc += scalar * rhs: 3 Goldilocks multiplications + 3 additions
+                        let c0 = goldilocks_add(acc[0], goldilocks_mul(scalar, rhs[0]));
+                        let c1 = goldilocks_add(acc[1], goldilocks_mul(scalar, rhs[1]));
+                        let c2 = goldilocks_add(acc[2], goldilocks_mul(scalar, rhs[2]));
+                        memory.store_doubleword(addr_acc, c0)?;
+                        memory.store_doubleword(addr_acc + 8, c1)?;
+                        memory.store_doubleword(addr_acc + 16, c2)?;
+                        src2_val = addr_scalar;
                         dst_val = addr_rhs;
                     }
                     SyscallNumbers::Halt => {

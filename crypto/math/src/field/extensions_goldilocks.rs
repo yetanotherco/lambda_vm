@@ -492,6 +492,15 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    /// Scalar Fp3 FMA: `acc += scalar × b` via Fp3ScalarFma ecall on riscv64.
+    fn scalar_fma(
+        acc: &mut <Degree3GoldilocksExtensionField as IsField>::BaseType,
+        a: &Self::BaseType,
+        b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
+    ) {
+        goldilocks_scalar_fp3_fma(acc, a, b);
+    }
+
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -612,6 +621,43 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
 
 /// Type alias for the Goldilocks cubic extension field element.
 pub type Fp3Element = FieldElement<Degree3GoldilocksExtensionField>;
+
+/// Standalone scalar-Fp3 FMA function for use by the `IsSubFieldOf` impl.
+/// `acc += scalar * b`: 3 Goldilocks muls via Fp3ScalarFma ecall on riscv64.
+#[inline(always)]
+pub(crate) fn goldilocks_scalar_fp3_fma(
+    acc: &mut [FpE; 3],
+    scalar: &u64,
+    b: &[FpE; 3],
+) {
+    #[cfg(target_arch = "riscv64")]
+    {
+        const FP3_SCALAR_FMA_SYSCALL: u64 = u64::MAX - 4;
+        let b_raw: [u64; 3] = [*b[0].value(), *b[1].value(), *b[2].value()];
+        let acc_ptr = acc.as_mut_ptr() as *mut u64;
+        unsafe {
+            core::arch::asm!(
+                "ecall",
+                in("a0") acc_ptr,
+                in("a1") scalar as *const u64,
+                in("a2") b_raw.as_ptr(),
+                in("a7") FP3_SCALAR_FMA_SYSCALL,
+            );
+            core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        let mul = <GoldilocksField as IsField>::mul;
+        let add = <GoldilocksField as IsField>::add;
+        let c0 = add(&mul(scalar, b[0].value()), acc[0].value());
+        let c1 = add(&mul(scalar, b[1].value()), acc[1].value());
+        let c2 = add(&mul(scalar, b[2].value()), acc[2].value());
+        acc[0] = FpE::from_raw(c0);
+        acc[1] = FpE::from_raw(c1);
+        acc[2] = FpE::from_raw(c2);
+    }
+}
 
 #[cfg(feature = "alloc")]
 impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {

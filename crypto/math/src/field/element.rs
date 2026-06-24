@@ -519,6 +519,18 @@ where
         F::fma(&mut self.value, &lhs.value, &rhs.value);
     }
 
+    /// Scalar-into-extension fused multiply-add: `self (extension) += scalar × rhs`.
+    /// Dispatches to `S::scalar_fma` which on riscv64 with GoldilocksField scalar and
+    /// Degree3GoldilocksExtensionField uses the Fp3ScalarFma ecall (3 muls, no Fp3 wrapper).
+    #[inline(always)]
+    pub fn scalar_fma<S: super::traits::IsSubFieldOf<F>>(
+        &mut self,
+        scalar: &FieldElement<S>,
+        rhs: &Self,
+    ) {
+        S::scalar_fma(&mut self.value, &scalar.value, &rhs.value);
+    }
+
     /// Returns the multiplicative inverse of `self`
     #[inline(always)]
     pub fn inv(&self) -> Result<Self, FieldError> {

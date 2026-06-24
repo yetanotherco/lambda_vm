@@ -26,8 +26,14 @@ pub const FP3_MUL_SYSCALL_NUMBER: u64 = u64::MAX - 2;
 
 /// Syscall number for the Goldilocks Fp3 fused multiply-add precompile.
 /// Computes `acc += lhs × rhs` for Fp3 elements in one VM cycle.
-/// ABI: a7=FP3_FMA_SYSCALL_NUMBER, a0=acc_ptr (in/out), a1=lhs_ptr, a2=rhs_ptr
+/// ABI: a7=FP3_FMA_SYSCALL_NUMBER, a0=acc_ptr (in/out, [u64;3]), a1=lhs_ptr ([u64;3]), a2=rhs_ptr ([u64;3])
 pub const FP3_FMA_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+
+/// Syscall number for the Goldilocks scalar×Fp3 fused multiply-add precompile.
+/// Computes `acc += scalar × fp3_rhs` where scalar is a single Goldilocks element.
+/// Costs 3 Goldilocks muls (vs 9 for Fp3×Fp3) while still issuing one ecall.
+/// ABI: a7=FP3_SCALAR_FMA_SYSCALL_NUMBER, a0=acc_ptr (in/out, [u64;3]), a1=scalar_ptr ([u64;1]), a2=rhs_ptr ([u64;3])
+pub const FP3_SCALAR_FMA_SYSCALL_NUMBER: u64 = u64::MAX - 4;
 
 /// Round constants for Keccak-f[1600] (24 rounds).
 pub const KECCAK_RC: [u64; 24] = [
