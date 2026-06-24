@@ -1,5 +1,6 @@
 #import "@preview/shiroa:0.3.1": *
 #import "/templates/page.typ": project
+#import "@preview/equate:0.3.2": equate
 
 #show: book
 
@@ -51,7 +52,7 @@
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
     )),
     ("MATHEMATICS", (
-      ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs-and-carries>),
+      ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs>),
     ))
   )
 )
@@ -70,6 +71,7 @@
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
+  show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
   body
 }
 

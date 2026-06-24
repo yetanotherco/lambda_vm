@@ -10,7 +10,7 @@
 #let proof = thmproof("proof", "Proof")
 
 // Equation formatting
-#show: equate.with(breakable: true, sub-numbering: true)
+#show: equate.with(breakable: true, sub-numbering: true, number-mode: "label")
 #set math.equation(numbering: "(1.1)")
 #show math.equation.where(block: false): box
 
@@ -33,7 +33,7 @@ $(x_0, x_1, x_2, ...,  x_(n-1)) in [L]^(n)$ such that
 $
   x 
   = sum_(i=0)^(n-1) x_i dot L^i.
-$ #<eq:decomposition>
+$ #<limbs:eq:decomposition>
 To simplify future notation, we define $x_i := 0$ for all $i >= n$.
 
 #let vec(x) = math.bold(math.upright(x))
@@ -53,14 +53,14 @@ $
   &= sum_(i=0)^(n-1) (sum_(j=0)^(n-1) (sum_(m in [mu]) vec(x)^((m))_i dot vec(y)^((m))_j dot L^(i+j)) + sum_(a in [alpha]) vec(z)^((a))_i dot L^i )\
   &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) vec(x)^((m))_(r-j) dot vec(y)^((m))_j dot L^r) + sum_(a in [alpha]) vec(z)^((a))_r dot L^r )\
   &= sum_(r=0)^(2(n-1)) (sum_(j=0)^(r) (sum_(m in [mu]) vec(x)^((m))_(r-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_r) dot L^r\
-  &= sum_(r=0)^(2(n-1)) overline(w)_r dot L^r, #<eq:f-semi-decomposition>
+  &= sum_(r=0)^(2(n-1)) overline(w)_r dot L^r, #<limbs:eq:f-semi-decomposition>
 $
 where
 $
   overline(w)_i := sum_(m in [mu]) (sum_(j=0)^(i) vec(x)^((m))_(i-j) dot vec(y)^((m))_j) + sum_(a in [alpha]) vec(z)^((a))_i.
 $
 
-While @eq:f-semi-decomposition closely resembles that of a limb-decomposition (@eq:decomposition), 
+While @limbs:eq:f-semi-decomposition closely resembles that of a limb-decomposition (@limbs:eq:decomposition), 
 there is the problem that $overline(w)_i$ will generally not be bounded by $L$.
 We therefore introduce a helper sequence, $c_i$, to transform $overline(w)_i$ into a proper decomposition $w_i$ as:
 $
@@ -76,7 +76,7 @@ they're commonly referred to as the _carry_ values.
     $(w_0, w_1, ..., w_(g-1)) in [L]^(g)$ 
     is the unique $g$-limb decomposition of $w = f_(mu, alpha)(vec(x), vec(y), vec(z))$
     if and only if $c_(g-1) = 0$.
-]<lm:wi_decomp_f>
+]<limbs:lm:wi_decomp_f>
 #proof[
     Reordering the definition of $c_i$, we find the equality $w_i = overline(w)_i + c_(i-1) - c_i dot L$.
     Leveraging this, we see that
@@ -103,7 +103,7 @@ To bound for which $g$ we can guarantee that $c_(g-1) = 0$, we prove two upper b
   c_i <= mu (i+1) (L-1) + alpha - mu - delta_(mu < alpha)
   $
   where kronecker delta $delta_x$ equals $1$ if $x$ holds, and $0$ otherwise.
-]<lm:carry-upperbound-pt1>
+]<limbs:lm:carry-upperbound-pt1>
 
 #proof[
   Since $w_i in [L]$,
@@ -148,7 +148,7 @@ To achieve a tight upper bound for $i >= n$, we introduce a second lemma:
     c_(n+k) <= mu (n - k - 1)(L-2) + mu (n-k) - delta_(alpha < 2mu + delta)
   $
   for $k in [n]$.
-]<lm:carry-upperbound-pt2>
+]<limbs:lm:carry-upperbound-pt2>
 
 #proof[
   Starting with $k=0$, we find
@@ -199,7 +199,7 @@ c_i <= &max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\
 &= max(& mu n (L-1) + alpha - mu - delta, mu (n-1)(L-2) + mu n - delta')\
 &= mu n (L-1) + alpha - mu - delta
 $
-]<cor:carry-upper-bound>
+]<limbs:cor:carry-upper-bound>
 
 = Proof of Correctness
 Lastly, we prove that there exists a correct method of constraining the relation between $overline(w)_i$, $w_i$ and $c_i$ inside this VM:
@@ -208,16 +208,16 @@ Lastly, we prove that there exists a correct method of constraining the relation
     Let $c_i, w_i in FF_p$ with $p$ prime. 
     The constraints
     $
-        c_i &= (overline(w)_i + c_(i-1) - w_i) dot L^(-1), #<eq:def_ci>\
-        c_i &in [C], #<eq:range_ci>\
-        c_(-1) &= 0, #<eq:c_-1_is_zero>\
-        w_i &in [L] #<eq:range_wi>
+        c_i &= (overline(w)_i + c_(i-1) - w_i) dot L^(-1), #<limbs:eq:def_ci>\
+        c_i &in [C], #<limbs:eq:range_ci>\
+        c_(-1) &= 0, #<limbs:eq:c_-1_is_zero>\
+        w_i &in [L] #<limbs:eq:range_wi>
     $
     together enforce $w_i = overline(w)_i + c_(i-1) mod L$ as long as $C in [mu n L + alpha, frac(p,L, style:"horizontal"))$.
-]<lm:limb-decomposition-constraint-correctness>
+]<limbs:lm:limb-decomposition-constraint-correctness>
 
 #proof[
-    Combining @eq:def_ci and @eq:range_ci, we find that
+    Combining @limbs:eq:def_ci and @limbs:eq:range_ci, we find that
     $
     &&c_i &in [C]\
     &<=>& overline(w)_i + c_(i-1) - w_i &in {0, L, ..., (C-1)L},\
@@ -234,9 +234,9 @@ Lastly, we prove that there exists a correct method of constraining the relation
     $
     where the utilized upper bound 
     $overline(w)_i <= mu n(L-1)^2 + alpha (L-1)$ 
-    can be extracted from the proofs of @lm:carry-upperbound-pt1 and @lm:carry-upperbound-pt2, while the upper bound for $c_(i-1)$ follows from @cor:carry-upper-bound.
+    can be extracted from the proofs of @limbs:lm:carry-upperbound-pt1 and @limbs:lm:carry-upperbound-pt2, while the upper bound for $c_(i-1)$ follows from @limbs:cor:carry-upper-bound.
     Moreover, observe that $|X_i inter [L]| <= 1$ since $0 <= C L < p$.
-    Constraint @eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
+    Constraint @limbs:eq:range_wi therefore enforces that $w_i = overline(w)_i + c_(i-1) mod L$ if $c_(i-1)$ (and therefore $w_(i-1)$) is correct, 
     and as a result, $c_i = floor.l frac((overline(w)_i + c_(i-1)), L, style: "horizontal") floor.r$ is correct.
-    The proof now follows by induction, with @eq:c_-1_is_zero enforcing the base case.
+    The proof now follows by induction, with @limbs:eq:c_-1_is_zero enforcing the base case.
 ]
