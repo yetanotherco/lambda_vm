@@ -17,7 +17,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::IsBitConstraint;
 use crate::tables::ecsm::ecdas_tuple;
 use ecsm::{EcdasStep, P_BYTES};
@@ -93,59 +93,55 @@ fn fe_from_i64(c: i64) -> FE {
     }
 }
 
-fn write_bytes(data: &mut [FE], base: usize, col: usize, bytes: &[u8]) {
-    for (i, &b) in bytes.iter().enumerate() {
-        data[base + col + i] = FE::from(b as u64);
-    }
-}
-
 pub fn generate_ecdas_trace(
     ops: &[EcdasOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let s = &op.step;
 
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        write_bytes(&mut data, base, cols::XG, &s.x_g);
-        write_bytes(&mut data, base, cols::YG, &s.y_g);
-        write_bytes(&mut data, base, cols::XA, &s.x_a);
-        write_bytes(&mut data, base, cols::YA, &s.y_a);
-        data[base + cols::ROUND] = FE::from(s.round as u64);
-        data[base + cols::OP] = FE::from(s.op as u64);
-        write_bytes(&mut data, base, cols::XR, &s.x_r);
-        write_bytes(&mut data, base, cols::YR, &s.y_r);
-        write_bytes(&mut data, base, cols::LAMBDA, &s.lambda);
-        write_bytes(&mut data, base, cols::Q0, &s.q0);
-        write_bytes(&mut data, base, cols::Q1, &s.q1);
-        write_bytes(&mut data, base, cols::Q2, &s.q2);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_bytes(row_idx, cols::XG, &s.x_g);
+        table.set_bytes(row_idx, cols::YG, &s.y_g);
+        table.set_bytes(row_idx, cols::XA, &s.x_a);
+        table.set_bytes(row_idx, cols::YA, &s.y_a);
+        table.set_byte(row_idx, cols::ROUND, s.round);
+        table.set_byte(row_idx, cols::OP, s.op);
+        table.set_bytes(row_idx, cols::XR, &s.x_r);
+        table.set_bytes(row_idx, cols::YR, &s.y_r);
+        table.set_bytes(row_idx, cols::LAMBDA, &s.lambda);
+        table.set_bytes(row_idx, cols::Q0, &s.q0);
+        table.set_bytes(row_idx, cols::Q1, &s.q1);
+        table.set_bytes(row_idx, cols::Q2, &s.q2);
         for i in 0..64 {
             debug_assert!((0..1 << 16).contains(&(s.c0[i] + CARRY_OFFSET_LAMBDA)));
             debug_assert!((0..1 << 16).contains(&(s.c1[i] + CARRY_OFFSET_XR)));
             debug_assert!((0..1 << 16).contains(&(s.c2[i] + CARRY_OFFSET_YR)));
-            data[base + cols::c0(i)] = fe_from_i64(s.c0[i]);
-            data[base + cols::c1(i)] = fe_from_i64(s.c1[i]);
-            data[base + cols::c2(i)] = fe_from_i64(s.c2[i]);
+            table.set_fe(row_idx, cols::c0(i), fe_from_i64(s.c0[i]));
+            table.set_fe(row_idx, cols::c1(i), fe_from_i64(s.c1[i]));
+            table.set_fe(row_idx, cols::c2(i), fe_from_i64(s.c2[i]));
         }
-        data[base + cols::NEXT_OP] = FE::from(s.next_op as u64);
-        data[base + cols::MU] = FE::one();
+        table.set_byte(row_idx, cols::NEXT_OP, s.next_op);
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows: q0 = q1 = q2 = r, op = 0, everything else 0. This makes every
     // (unconditional) convolution relation hold with zero carries.
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        write_bytes(&mut data, base, cols::Q0, &R_BYTES);
-        write_bytes(&mut data, base, cols::Q1, &R_BYTES);
-        write_bytes(&mut data, base, cols::Q2, &R_BYTES);
+        table.set_bytes(row_idx, cols::Q0, &R_BYTES);
+        table.set_bytes(row_idx, cols::Q1, &R_BYTES);
+        table.set_bytes(row_idx, cols::Q2, &R_BYTES);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

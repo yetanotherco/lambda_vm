@@ -367,3 +367,50 @@ fn test_mul_range_checks_input_halves() {
         );
     }
 }
+
+/// Regression test for the `Msb16` LogUp over-send bug.
+///
+/// MUL is split into chip instances of `max_rows.mul` raw ops (`chunk_and_generate`)
+/// and each instance deduplicates only its own chunk, sending the MSB16 sign lookup
+/// once per unique signed op *per instance* (multiplicity = the `SIGNED` bit). So
+/// `collect_bitwise_from_mul`, which feeds the BITWISE MSB16 multiplicity, must use
+/// the *same* per-chunk dedup: a unique signed op spanning two instances is sent
+/// twice but, with a single global dedup, would be tallied once — leaving the `Msb16`
+/// bus unbalanced and verification failing for any block large enough to split MUL.
+#[test]
+fn msb16_bitwise_multiplicity_matches_per_instance_sends() {
+    use crate::tables::bitwise::BitwiseOperationType;
+    use crate::tables::trace_builder::collect_bitwise_from_mul;
+
+    let chunk = 4usize;
+    // One unique signed mul op repeated so it spans two `chunk`-sized instances.
+    let op = MulOperation::new(0x1234_5678_9abc_def0, true, 0x0fed_cba9_8765_4321, true);
+    let ops: Vec<(MulOperation, bool)> = std::iter::repeat_n((op, false), 6).collect();
+    assert!(
+        ops.len() > chunk,
+        "scenario must split MUL into >1 instance"
+    );
+
+    // Ground truth: each instance is one chunk, and the MUL AIR sends MSB16 with
+    // multiplicity Column(LHS_SIGNED) (lhs) and Column(RHS_SIGNED) (rhs) per row, so
+    // total sends = Σ rows (LHS_SIGNED + RHS_SIGNED).
+    let mut sends = 0usize;
+    for c in ops.chunks(chunk) {
+        let trace = generate_mul_trace(c);
+        for row in 0..trace.num_rows() {
+            sends += (*trace.get_main(row, cols::LHS_SIGNED) == FE::one()) as usize;
+            sends += (*trace.get_main(row, cols::RHS_SIGNED) == FE::one()) as usize;
+        }
+    }
+    assert_eq!(sends, 4, "sanity: 2 instances × (lhs + rhs) sends");
+
+    let tallied = collect_bitwise_from_mul(&ops, chunk)
+        .iter()
+        .filter(|b| matches!(b.lookup_type, BitwiseOperationType::Msb16))
+        .count();
+    assert_eq!(
+        tallied, sends,
+        "BITWISE MSB16 multiplicity ({tallied}) must equal total MUL-instance MSB16 \
+         sends ({sends}); a mismatch leaves the Msb16 bus unbalanced"
+    );
+}

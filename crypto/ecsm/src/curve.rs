@@ -8,9 +8,6 @@
 
 use num_bigint::BigUint;
 
-#[cfg(test)]
-use crate::field::Fp;
-
 /// An affine curve point. Never the point at infinity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AffinePoint {
@@ -36,38 +33,6 @@ pub fn recover_y_canonical(x: &BigUint) -> Option<BigUint> {
     Some(from_k256_affine(&affine).y)
 }
 
-/// `2·a` on the curve. Requires `a.y != 0` (always true on secp256k1).
-#[cfg(test)]
-pub fn point_double(a: &AffinePoint) -> AffinePoint {
-    let x = Fp::new(a.x.clone());
-    let y = Fp::new(a.y.clone());
-    // λ = 3x² / 2y
-    let three_x2 = x.mul(&x).mul(&Fp::from_u64(3));
-    let two_y = y.add(&y);
-    let lambda = three_x2.mul(&two_y.inv());
-    // xr = λ² - 2x
-    let xr = lambda.mul(&lambda).sub(&x).sub(&x);
-    // yr = λ(x - xr) - y
-    let yr = lambda.mul(&x.sub(&xr)).sub(&y);
-    AffinePoint { x: xr.0, y: yr.0 }
-}
-
-/// `a + g` on the curve. Requires `a.x != g.x` (always true in the chip's add steps).
-#[cfg(test)]
-pub fn point_add(a: &AffinePoint, g: &AffinePoint) -> AffinePoint {
-    let xa = Fp::new(a.x.clone());
-    let ya = Fp::new(a.y.clone());
-    let xg = Fp::new(g.x.clone());
-    let yg = Fp::new(g.y.clone());
-    // λ = (yg - ya) / (xg - xa)
-    let lambda = yg.sub(&ya).mul(&xg.sub(&xa).inv());
-    // xr = λ² - xa - xg
-    let xr = lambda.mul(&lambda).sub(&xa).sub(&xg);
-    // yr = λ(xa - xr) - ya
-    let yr = lambda.mul(&xa.sub(&xr)).sub(&ya);
-    AffinePoint { x: xr.0, y: yr.0 }
-}
-
 /// One step of the double-and-add replay, at point level.
 ///
 /// Mirrors a single ECDAS row: receive accumulator `a` (and base `g`), perform `op`
@@ -85,78 +50,11 @@ pub struct StepPts {
     pub lambda: BigUint,
 }
 
-/// Reference slope `lambda` for one step, computed in `BigUint` `F_p`.
-/// Used by the reference replay.
-#[cfg(test)]
-pub fn step_lambda(a: &AffinePoint, g: &AffinePoint, op: u8) -> BigUint {
-    let xa = Fp::new(a.x.clone());
-    let ya = Fp::new(a.y.clone());
-    if op == 1 {
-        let xg = Fp::new(g.x.clone());
-        let yg = Fp::new(g.y.clone());
-        yg.sub(&ya).mul(&xg.sub(&xa).inv()).0
-    } else {
-        let three_x2 = xa.mul(&xa).mul(&Fp::from_u64(3));
-        let two_y = ya.add(&ya);
-        three_x2.mul(&two_y.inv()).0
-    }
-}
-
 /// Bit length minus one = position of the most significant set bit (`len_k`).
 /// Requires `k >= 1`.
 pub fn msb_position(k: &BigUint) -> u32 {
     debug_assert!(k > &BigUint::from(0u8));
     (k.bits() as u32) - 1
-}
-
-/// Replays the ECDAS double-and-add sequence for `k·g`, returning every step and the
-/// final point. This is the single source of truth for both the executor (which needs
-/// only `final.x`) and the prover (which needs the full step list to build witnesses).
-///
-/// The schedule matches the spec exactly: start with `A = g`, `round = len_k - 1`,
-/// `op = double`; a double at `round` sets `next_op` to the scalar bit at `round`
-/// (1 ⇒ the next row adds at the same round); an add forces `next_op = 0` and advances
-/// the round. The MSB itself is represented by the initial `A = g` (consumed by ECSM via
-/// the `BIT[len_k]` interaction), so it is never processed as an add here.
-#[cfg(test)]
-pub fn replay_double_and_add_reference(
-    k: &BigUint,
-    g: &AffinePoint,
-) -> (Vec<StepPts>, AffinePoint) {
-    let m = msb_position(k) as i64; // len_k
-    let mut a = g.clone();
-    let mut round: i64 = m - 1;
-    let mut op: u8 = 0; // double
-    let mut steps = Vec::new();
-
-    while round >= 0 {
-        let (r, next_op) = if op == 0 {
-            let r = point_double(&a);
-            let bit = if k.bit(round as u64) { 1u8 } else { 0u8 };
-            (r, bit)
-        } else {
-            let r = point_add(&a, g);
-            (r, 0u8)
-        };
-        steps.push(StepPts {
-            lambda: step_lambda(&a, g, op),
-            a: a.clone(),
-            g: g.clone(),
-            round: round as u8,
-            op,
-            next_op,
-            r: r.clone(),
-        });
-        let round_sent = round - (1 - next_op as i64);
-        a = r;
-        if round_sent < 0 {
-            break;
-        }
-        round = round_sent;
-        op = next_op;
-    }
-
-    (steps, a)
 }
 
 // =========================================================================
@@ -261,9 +159,9 @@ pub fn scalar_mul_affine_x(k: &BigUint, g: &AffinePoint) -> BigUint {
 }
 
 /// Replays the ECDAS double-and-add for `k·g` using k256 projective arithmetic and
-/// batched inversion. Produces the identical `StepPts` sequence as
-/// [`replay_double_and_add_reference`] (validated by the parity test), but with two
-/// batched inversions instead of one per double/add step.
+/// batched inversion. Produces the identical `StepPts` sequence as the BigUint
+/// reference replay (validated by the parity test in `tests::curve_tests`), but with
+/// two batched inversions instead of one per double/add step.
 pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, AffinePoint) {
     let sched = schedule(k);
     if sched.is_empty() {
@@ -335,84 +233,4 @@ pub fn replay_double_and_add(k: &BigUint, g: &AffinePoint) -> (Vec<StepPts>, Aff
 
     let result = r_aff[n - 1].clone();
     (steps, result)
-}
-
-#[cfg(test)]
-mod parity_tests {
-    use super::*;
-    use crate::n;
-    use num_bigint::BigUint;
-
-    /// secp256k1 generator (even y), via the canonical y recovery.
-    fn generator() -> AffinePoint {
-        let gx = BigUint::parse_bytes(
-            b"79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798",
-            16,
-        )
-        .unwrap();
-        let gy = recover_y_canonical(&gx).expect("G on curve");
-        AffinePoint { x: gx, y: gy }
-    }
-
-    fn be(hex: &[u8]) -> BigUint {
-        BigUint::parse_bytes(hex, 16).unwrap()
-    }
-
-    /// The k256 fast path must produce byte-identical `StepPts` (points + λ) and the
-    /// same final point as the BigUint reference, across small, structured, large and
-    /// near-order scalars. This pins the audited fast path to the spec-faithful reference.
-    #[test]
-    fn k256_replay_matches_reference() {
-        let g = generator();
-        let mut scalars: Vec<BigUint> = (1u64..40).map(BigUint::from).collect();
-        for &kv in &[
-            0xFFu64,
-            0x101,
-            0xABCD,
-            0xFFFF,
-            0x1_0000,
-            1 << 20,
-            123_456_789,
-            u64::MAX,
-        ] {
-            scalars.push(BigUint::from(kv));
-        }
-        // large 256-bit scalars (must stay < N) and the order boundary
-        scalars.push(be(
-            b"0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF",
-        ));
-        scalars.push(be(
-            b"7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF5D576E7357A4501DDFE92F46681B20A0",
-        ));
-        scalars.push(&n() / BigUint::from(2u8));
-        scalars.push(&n() - BigUint::from(1u8));
-
-        for k in scalars {
-            let (steps, result) = replay_double_and_add(&k, &g);
-            let (steps_ref, result_ref) = replay_double_and_add_reference(&k, &g);
-            assert_eq!(result, result_ref, "final point mismatch for k = {k}");
-            assert_eq!(steps, steps_ref, "step list mismatch for k = {k}");
-        }
-    }
-
-    /// The executor's fast path (`scalar_mul_affine_x`) and the prover's replay must agree
-    /// on `x(k·G)`: the executor writes it to guest memory and the prover proves it, so any
-    /// divergence would make a correct execution unprovable. They run through two distinct
-    /// k256 entry points (native scalar-mul vs projective double-and-add), so pin them here.
-    #[test]
-    fn executor_and_replay_agree_on_result_x() {
-        let g = generator();
-        let mut scalars: Vec<BigUint> = (1u64..40).map(BigUint::from).collect();
-        for &kv in &[0xFFu64, 0xABCD, 1 << 20, 123_456_789, u64::MAX] {
-            scalars.push(BigUint::from(kv));
-        }
-        scalars.push(&n() / BigUint::from(2u8));
-        scalars.push(&n() - BigUint::from(1u8));
-
-        for k in scalars {
-            let (_steps, result) = replay_double_and_add(&k, &g);
-            let exec_x = scalar_mul_affine_x(&k, &g);
-            assert_eq!(result.x, exec_x, "executor/replay x mismatch for k = {k}");
-        }
-    }
 }
