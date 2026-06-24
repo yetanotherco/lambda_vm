@@ -155,23 +155,30 @@ where
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
     use crate::hash::keccak256::{
-        keccak256, keccak256_field_elements_direct, keccak256_four_nodes, keccak256_two_nodes,
+        keccak256_field_elements_direct, keccak256_field_elements_streaming, keccak256_four_nodes,
+        keccak256_two_nodes,
     };
     use math::traits::ByteConversion;
     // Keccak-256 rate in bytes.
     const RATE: usize = 136;
 
-    // Leaf hash: for lane-aligned element sizes (BYTE_LEN divisible by 8) that
-    // fit in a single keccak block, absorb directly into state lanes — no
-    // intermediate `[u8; RATE]` buffer copy and no `leaf_scratch` Vec write.
-    // For wider leaves (main trace with many columns), fall back to the
-    // scratch-buffer path.
+    // Leaf hash: for lane-aligned element sizes (BYTE_LEN % 8 == 0), absorb
+    // directly into keccak state lanes without any intermediate byte buffer.
+    // - Small leaves (< RATE bytes): single-block direct path.
+    // - Wide leaves (≥ RATE bytes): streaming multi-block path — still no Vec.
+    // The `leaf_scratch` Vec parameter is retained for callers that pass it but
+    // the fast paths never write to it.
     let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
     let total_bytes = value.len() * elem_bytes;
-    let mut hashed_value = if elem_bytes % 8 == 0 && total_bytes < RATE {
-        keccak256_field_elements_direct::<F>(value)
+    let mut hashed_value = if elem_bytes % 8 == 0 {
+        if total_bytes < RATE {
+            keccak256_field_elements_direct::<F>(value)
+        } else {
+            keccak256_field_elements_streaming::<F>(value)
+        }
     } else {
-        // Wide leaf: serialize into `leaf_scratch` (reused across calls) then hash.
+        // Non-lane-aligned elements (rare): fall back to the scratch-buffer path.
+        use crate::hash::keccak256::keccak256;
         leaf_scratch.clear();
         for element in value.iter() {
             leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
@@ -243,7 +250,8 @@ where
     math::field::element::FieldElement<F>: math::traits::ByteConversion,
 {
     use crate::hash::keccak256::{
-        keccak256, keccak256_field_elements_direct, keccak256_four_nodes, keccak256_two_nodes,
+        keccak256_field_elements_direct, keccak256_field_elements_streaming, keccak256_four_nodes,
+        keccak256_two_nodes,
     };
     use math::traits::ByteConversion;
 
@@ -257,28 +265,33 @@ where
 
     let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
     let total_bytes = value_a.len() * elem_bytes;
-    let lane_aligned = elem_bytes % 8 == 0;
 
-    // Hash leaf A (at `index`).
-    let hash_a = if lane_aligned && total_bytes < RATE {
-        keccak256_field_elements_direct::<F>(value_a)
+    // Hash both leaves using the lane-direct path for aligned elements — no Vec.
+    let (hash_a, hash_b) = if elem_bytes % 8 == 0 {
+        if total_bytes < RATE {
+            (
+                keccak256_field_elements_direct::<F>(value_a),
+                keccak256_field_elements_direct::<F>(value_b),
+            )
+        } else {
+            (
+                keccak256_field_elements_streaming::<F>(value_a),
+                keccak256_field_elements_streaming::<F>(value_b),
+            )
+        }
     } else {
+        use crate::hash::keccak256::keccak256;
         leaf_scratch.clear();
         for element in value_a.iter() {
             leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
         }
-        keccak256(leaf_scratch)
-    };
-
-    // Hash leaf B (at `index + 1`).
-    let hash_b = if lane_aligned && total_bytes < RATE {
-        keccak256_field_elements_direct::<F>(value_b)
-    } else {
+        let ha = keccak256(leaf_scratch);
         leaf_scratch.clear();
         for element in value_b.iter() {
             leaf_scratch.extend_from_slice(element.to_bytes_be().as_ref());
         }
-        keccak256(leaf_scratch)
+        let hb = keccak256(leaf_scratch);
+        (ha, hb)
     };
 
     // Assemble the level-0 group of ARITY children.

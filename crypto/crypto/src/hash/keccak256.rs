@@ -162,6 +162,58 @@ fn absorb_block(state: &mut [u64; 25], block: &[u8]) {
     }
 }
 
+/// Keccak256 of a slice of field elements using lane-aligned `ByteConversion::to_bytes_be()`,
+/// absorbing directly into the keccak state without any intermediate byte buffer.
+///
+/// Each element contributes `elem_lanes = BYTE_LEN / 8` consecutive keccak lanes
+/// (interpreting `to_bytes_be()` chunks as LE u64 — the same as `keccak256(serialized_bytes)`).
+/// When `RATE` (136 bytes = 17 lanes) is filled, `keccak::f1600` is called; the final
+/// partial block is padded in-place.
+///
+/// **Contract**: `BYTE_LEN` must be a multiple of 8. For elements where `total_bytes < RATE`
+/// (fits in a single block) prefer [`keccak256_field_elements_direct`] instead.
+///
+/// Output is byte-identical to `keccak256(concat(element.to_bytes_be() for element in elements))`.
+#[inline]
+pub fn keccak256_field_elements_streaming<F>(
+    elements: &[math::field::element::FieldElement<F>],
+) -> [u8; OUTPUT_LEN]
+where
+    F: math::field::traits::IsField,
+    math::field::element::FieldElement<F>: math::traits::ByteConversion,
+{
+    use math::traits::ByteConversion;
+    let elem_bytes = <math::field::element::FieldElement<F>>::BYTE_LEN;
+    debug_assert_eq!(elem_bytes % 8, 0, "element byte length must be lane-aligned");
+    const RATE_LANES: usize = RATE / 8; // 17
+
+    let mut state = [0u64; 25];
+    let mut lane_idx = 0usize; // next lane to write (mod 17)
+    for element in elements.iter() {
+        let bytes = element.to_bytes_be();
+        for chunk in bytes.as_ref().chunks_exact(8) {
+            state[lane_idx] ^= u64::from_le_bytes(chunk.try_into().unwrap());
+            lane_idx += 1;
+            if lane_idx == RATE_LANES {
+                keccak::f1600(&mut state);
+                lane_idx = 0;
+            }
+        }
+    }
+    // Final partial block: pad10*1.
+    // Since BYTE_LEN % 8 == 0, `lane_idx` lanes are fully written; the next byte
+    // (the 0x01 pad) is at byte 0 of lane `lane_idx` → shift = 0.
+    state[lane_idx] ^= 0x01u64;
+    // 0x80 is the last byte of the rate region = byte 135 = lane 16, byte offset 7.
+    state[RATE_LANES - 1] ^= 0x80u64 << 56;
+    keccak::f1600(&mut state);
+    let mut out = [0u8; OUTPUT_LEN];
+    for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
+        chunk.copy_from_slice(&lane.to_le_bytes());
+    }
+    out
+}
+
 /// Keccak256 of a short sequence of field elements without any intermediate byte
 /// buffer. Each element is serialized as 8-byte-aligned big-endian chunks (via
 /// `to_bytes_be()`), which are XORed directly into successive keccak state lanes
@@ -187,7 +239,6 @@ where
     let total_bytes = elements.len() * elem_bytes;
     debug_assert!(total_bytes < RATE, "leaf too wide for single-block direct absorb");
 
-    let lanes_per_elem = elem_bytes / 8;
     let mut state = [0u64; 25];
     let mut lane_idx = 0usize;
     for element in elements.iter() {
@@ -209,7 +260,6 @@ where
     for (chunk, lane) in out.chunks_exact_mut(8).zip(state.iter()) {
         chunk.copy_from_slice(&lane.to_le_bytes());
     }
-    let _ = lanes_per_elem; // suppress unused warning in release builds
     out
 }
 
@@ -464,6 +514,35 @@ mod tests {
             assert_eq!(
                 direct, reference,
                 "Goldilocks mismatch for n={n} elements"
+            );
+        }
+    }
+
+    #[test]
+    fn field_elements_streaming_matches_keccak() {
+        // Verify that keccak256_field_elements_streaming matches keccak256(serialized)
+        // for Goldilocks elements at various counts including multi-block sizes.
+        use math::field::{element::FieldElement, goldilocks::GoldilocksField};
+        use math::traits::ByteConversion;
+        type Fp = GoldilocksField;
+        type FpE = FieldElement<Fp>;
+
+        // Test various counts including ones that span multiple keccak blocks.
+        // 17 Goldilocks elements = 136 bytes = exactly 1 full block.
+        // 18+ elements = multi-block.
+        for n in [1usize, 5, 16, 17, 18, 34, 35, 100, 500, 4670] {
+            let elements: alloc::vec::Vec<FpE> = (0..n)
+                .map(|i| FpE::from((i as u64).wrapping_mul(0x9e3779b97f4a7c15).wrapping_add(1)))
+                .collect();
+            let mut bytes = alloc::vec::Vec::new();
+            for e in &elements {
+                bytes.extend_from_slice(e.to_bytes_be().as_ref());
+            }
+            let reference = keccak256(&bytes);
+            let streaming = keccak256_field_elements_streaming::<Fp>(&elements);
+            assert_eq!(
+                streaming, reference,
+                "streaming mismatch for n={n} Goldilocks elements"
             );
         }
     }
