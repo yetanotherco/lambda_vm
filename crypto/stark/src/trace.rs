@@ -1,21 +1,12 @@
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
-#[cfg(test)]
-use itertools::Itertools;
-#[cfg(test)]
-use math::fft::errors::FFTError;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::field::{element::FieldElement, traits::IsFFTField};
-#[cfg(test)]
-use math::polynomial::Polynomial;
 use math::polynomial::barycentric_inv_denoms;
 #[cfg(feature = "disk-spill")]
 use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-// `par_iter()` is only used by the test-only `compute_trace_polys_main`.
-#[cfg(all(test, feature = "parallel"))]
-use rayon::prelude::IntoParallelRefIterator;
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -171,24 +162,6 @@ where
         E::BaseType: SpillSafe,
     {
         self.aux_table.spill_to_disk()
-    }
-
-    #[cfg(test)]
-    pub fn compute_trace_polys_main<S>(&self) -> Vec<Polynomial<FieldElement<F>>>
-    where
-        S: IsFFTField + IsSubFieldOf<F>,
-        F: Send + Sync,
-        FieldElement<F>: Send + Sync,
-    {
-        let columns = self.columns_main();
-        #[cfg(feature = "parallel")]
-        let iter = columns.par_iter();
-        #[cfg(not(feature = "parallel"))]
-        let iter = columns.iter();
-
-        iter.map(|col| Polynomial::interpolate_fft::<S>(col))
-            .collect::<Result<Vec<Polynomial<FieldElement<F>>>, FFTError>>()
-            .unwrap()
     }
 
     /// Extract main columns as owned vectors, each allocated at `capacity`.
@@ -355,61 +328,6 @@ where
     pub fn step_to_row(&self, step: usize) -> usize {
         self.lde_step_size * step
     }
-}
-
-/// Reference Horner-based trace-evaluation used as an oracle by the prover
-/// tests (`tests::prover_tests`). The production prover uses the LDE-based
-/// barycentric `get_trace_evaluations_from_lde` below; the two are
-/// cross-checked in tests.
-#[cfg(test)]
-pub(crate) fn get_trace_evaluations<F, E>(
-    main_trace_polys: &[Polynomial<FieldElement<F>>],
-    aux_trace_polys: &[Polynomial<FieldElement<E>>],
-    x: &FieldElement<E>,
-    frame_offsets: &[usize],
-    primitive_root: &FieldElement<F>,
-    step_size: usize,
-) -> Table<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let evaluation_points =
-        compute_frame_evaluation_points(x, frame_offsets, primitive_root, step_size);
-
-    let main_evaluations = evaluation_points
-        .iter()
-        .map(|eval_point| {
-            main_trace_polys
-                .iter()
-                .map(|main_poly| main_poly.evaluate(eval_point))
-                .collect_vec()
-        })
-        .collect_vec();
-
-    let aux_evaluations = evaluation_points
-        .iter()
-        .map(|eval_point| {
-            aux_trace_polys
-                .iter()
-                .map(|aux_poly| aux_poly.evaluate(eval_point))
-                .collect_vec()
-        })
-        .collect_vec();
-
-    debug_assert_eq!(main_evaluations.len(), aux_evaluations.len());
-    let mut main_evaluations = main_evaluations;
-    let mut table_data = Vec::new();
-    for (main_row, aux_row) in main_evaluations.iter_mut().zip(aux_evaluations) {
-        main_row.extend_from_slice(&aux_row);
-        table_data.extend_from_slice(main_row);
-    }
-
-    let main_trace_width = main_trace_polys.len();
-    let aux_trace_width = aux_trace_polys.len();
-    let table_width = main_trace_width + aux_trace_width;
-
-    Table::new(table_data, table_width)
 }
 
 /// Evaluates trace polynomials at OOD points using barycentric interpolation
@@ -634,7 +552,7 @@ where
         .collect()
 }
 
-fn compute_frame_evaluation_points<F, E>(
+pub(crate) fn compute_frame_evaluation_points<F, E>(
     x: &FieldElement<E>,
     frame_offsets: &[usize],
     primitive_root: &FieldElement<F>,

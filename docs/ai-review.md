@@ -89,6 +89,9 @@ opencode id, so the provider determines which key is used:
   deduper (everything `openrouter/...`). This key has a **daily spend limit**;
   heavy experimentation can exhaust it (403 "Key limit exceeded (daily limit)").
 - `MINIMAX_API_KEY` — the direct `minimax/MiniMax-M3` finder lanes.
+- `ZRO_API_KEY` — the `moonmath` finder lane, which reaches MiniMax-M3 through the
+  Moonmath **zro** OpenAI-compatible gateway (`zro/...`, defined in
+  `.opencode/opencode.json` since the provider is not in models.dev).
 - `ANTHROPIC_API_KEY` — the native Claude review (opus).
 - `OPENAI_API_KEY` — the native Codex review.
 - `KIMI_API_KEY` (→ `MOONSHOT_API_KEY`) is **no longer used** — the standalone
@@ -125,6 +128,7 @@ one pass), at `low` effort except minimax (`high`, its measured sweet spot — s
 | `kimi` | `openrouter/moonshotai/kimi-k2.7-code` | general | low |
 | `nemotron` | `openrouter/nvidia/nemotron-3-ultra-550b-a55b` | general | low |
 | `minimax` | `minimax/MiniMax-M3` | general | high |
+| `moonmath` | `zro/minimax-m3` | general | low |
 | `deepseek-verifier` (verify) | `openrouter/deepseek/deepseek-v4-pro` | verify | low |
 | deduper | `openrouter/minimax/minimax-m3` | — | low |
 
@@ -189,6 +193,14 @@ events) yet submit nothing — that's a reasoning-burn / convergence failure.
    `verifier_lanes`) in `.github/ai-review/matrix.json`. Use a provider-qualified
    opencode id (`openrouter/<author>/<model>` or a direct provider id); confirm it
    exists on models.dev and its provider key is in the workflow env.
+   - **Provider not on models.dev** (e.g. an OpenAI-compatible gateway like the
+     Moonmath `zro` provider): define it in `.opencode/opencode.json`
+     (`npm: "@ai-sdk/openai-compatible"`, `baseURL`, `apiKey: "{env:<KEY>}"`) —
+     the workflow installs that file into opencode's config dir. Then add its host
+     to `allowed-endpoints` in the harden-runner step, add the key to the lane
+     `env:` block, and map its `<prefix>/` → `<KEY>` in `PROVIDER_KEYS`
+     (`.github/scripts/ai_review.py`) so `scoped_provider_env` keeps least-privilege
+     scoping. `cost` won't be computed without models.dev pricing.
 2. Run the review on a real PR and read the lane artifact:
    - `submission.submitted == true` with findings → working.
    - `submitted: false` / `event_counts: {step_start: 1}` → emitted nothing
