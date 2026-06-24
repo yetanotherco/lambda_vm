@@ -852,8 +852,11 @@ pub trait IsStarkProver<
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 let root = tree.root;
+                // GPU fused pipeline: LDE + Keccak + Merkle all run on-device in
+                // one timed block. Bill the full duration to LDE and zero to Merkle
+                // so the report shows the true fused time once, not doubled.
                 #[cfg(feature = "instruments")]
-                crate::instruments::accum_r1_main(main_lde_dur, main_lde_dur);
+                crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
                 let (main_data, total_cols) = columns_to_row_major(&columns);
                 return Ok((
                     TableCommit::plain(tree, root),
