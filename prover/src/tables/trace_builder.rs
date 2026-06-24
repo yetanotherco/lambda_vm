@@ -2520,10 +2520,10 @@ struct CollectedOps {
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
-fn chunk_and_generate<T>(
+fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -2531,8 +2531,11 @@ fn chunk_and_generate<T>(
     } else {
         ops.chunks(max_rows).collect()
     };
-    let mut tables = Vec::with_capacity(op_chunks.len());
-    for chunk in op_chunks {
+
+    // Each chunk is independent, so generate them concurrently. `collect` into a
+    // `Result<Vec<_>>` preserves chunk order, so the output is byte-identical to
+    // the sequential build.
+    let gen_one = |chunk: &[T]| -> Result<TraceTable<GoldilocksField, GoldilocksExtension>, Error> {
         #[allow(unused_mut)]
         let mut t = generate(chunk);
         #[cfg(feature = "disk-spill")]
@@ -2541,9 +2544,18 @@ fn chunk_and_generate<T>(
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
         }
-        tables.push(t);
+        Ok(t)
+    };
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        op_chunks.into_par_iter().map(gen_one).collect()
     }
-    Ok(tables)
+    #[cfg(not(feature = "parallel"))]
+    {
+        op_chunks.into_iter().map(gen_one).collect()
+    }
 }
 
 /// Phase 2: Collect and route all operations from CPU ops.
