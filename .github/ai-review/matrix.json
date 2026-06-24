@@ -23,6 +23,12 @@
       "model": "minimax/MiniMax-M3",
       "prompt": "general",
       "variant": "high"
+    },
+    {
+      "id": "moonmath",
+      "model": "zro/minimax-m3",
+      "prompt": "general",
+      "variant": "low"
     }
   ],
   "verifier_lanes": [
