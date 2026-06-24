@@ -25,7 +25,7 @@ In this section, we discuss, in order,
 = Limb decomposition
 Let $[X]$ denote the set ${0, ..., X-1} subset.eq NN$, and $[X]^n$ with $n in NN$ the $n$-dimensional self-product of this set.
 Let $S := L^n in NN$ be an upper bound on the integers we want to represent, 
-where $L in NN$ with $L >= 4$ is the number of values a limb can represent 
+where $L in NN without {0, 1}$ is the number of values a limb can represent 
 and $n in NN$ denotes the number of limbs.
 
 Observe that for all $x in [S]$, there exists a unique "limb decomposition"
@@ -192,20 +192,22 @@ Hence, attaching extra limb $w_(2n) := c_(2n)$ yields a $(2n+1)$-limb decomposit
 Combining both upper bounds, we now find that
 
 #corollary[
-Given $alpha in [L]$ and $mu in [L/2]$, then for all $i <= 2n$:
+Given $alpha in [L]$ and $mu in [L/2]$ where at least one of the two is non-zero, 
+then for all $i <= 2n$:
 $
 c_i <= &max(&max_(i in [n]) #h(1em) mu (i+1) (L-1) + alpha - mu - delta,\ 
   &max_(k in [n]) #h(1em) mu (n-k-1)(L-2) + mu (n-k) - delta')\
 &= max(& mu n (L-1) + alpha - mu - delta, mu (n-1)(L-2) + mu n - delta')\
-&= mu n (L-1) + alpha - mu - delta
+&= mu n (L-1) + max(& alpha - mu - delta, - mu (L-2) - delta').
 $
+Note that this simplifies to $mu n (L-1) + alpha - mu - delta$ for $L >= 4$.
 ]<limbs:cor:carry-upper-bound>
 
 = Proof of Correctness
 Lastly, we prove that there exists a correct method of constraining the relation between $overline(w)_i$, $w_i$ and $c_i$ inside this VM:
 
 #lemma("Constraint correctness")[
-    Let $c_i, w_i in FF_p$ with $p$ prime. 
+    Let $L >= 4$, and $c_i, w_i in FF_p$ with $p$ prime. 
     The constraints
     $
         c_i &= (overline(w)_i + c_(i-1) - w_i) dot L^(-1), #<limbs:eq:def_ci>\
