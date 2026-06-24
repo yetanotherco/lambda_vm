@@ -33,7 +33,7 @@ use stark::constraints::transition::{TransitionConstraint, TransitionConstraintE
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
 // Column indices
@@ -243,7 +243,12 @@ pub fn generate_keccak_rnd_trace(
     ops: &[KeccakRoundOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n_rows = (ops.len() * 24).next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); n_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); n_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (op_idx, op) in ops.iter().enumerate() {
         // Execute round-by-round, tracking the state
@@ -251,20 +256,16 @@ pub fn generate_keccak_rnd_trace(
 
         for round in 0..24 {
             let row_idx = op_idx * 24 + round;
-            let base = row_idx * cols::NUM_COLUMNS;
 
             // Timestamp & round
-            data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-            data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-            data[base + cols::ROUND] = FE::from(round as u64);
+            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_u64(row_idx, cols::ROUND, round as u64);
 
             // start = current state as bytes
             for x in 0..5 {
                 for y in 0..5 {
                     let lane = state[x + 5 * y];
-                    for b in 0..8 {
-                        data[base + cols::start(x, y, b)] = FE::from(byte_of(lane, b) as u64);
-                    }
+                    table.set_dword_bl(row_idx, cols::start(x, y, 0), lane);
                 }
             }
 
@@ -280,8 +281,9 @@ pub fn generate_keccak_rnd_trace(
                     let v0 = byte_of(state[x], b);
                     let v1 = byte_of(state[x + 5], b);
                     cxz[x][0][b] = v0 ^ v1;
-                    data[base + cols::cxz(x, 0, b)] = FE::from(cxz[x][0][b] as u64);
                 }
+                table.set_bytes(row_idx, cols::cxz(x, 0, 0), &cxz[x][0]);
+
                 // Stages 1..3: XOR(Cxz[x][k-1], start[x, k+1])
                 for stage in 1..4 {
                     let y = stage + 1;
@@ -289,8 +291,8 @@ pub fn generate_keccak_rnd_trace(
                         let prev = cxz[x][stage - 1][b];
                         let sv = byte_of(state[x + 5 * y], b);
                         cxz[x][stage][b] = prev ^ sv;
-                        data[base + cols::cxz(x, stage, b)] = FE::from(cxz[x][stage][b] as u64);
                     }
+                    table.set_bytes(row_idx, cols::cxz(x, stage, 0), &cxz[x][stage]);
                 }
                 c_bytes[x] = cxz[x][3];
             }
@@ -313,13 +315,10 @@ pub fn generate_keccak_rnd_trace(
                     cxz_left_bytes[x][hw * 2 + 1] = (shifted >> 8) as u8;
                     // For shift=1, carry ∈ {0, 1}.
                     cxz_right_bits[x][hw] = carry as u8;
-                    data[base + cols::cxz_left(x, hw * 2)] =
-                        FE::from(cxz_left_bytes[x][hw * 2] as u64);
-                    data[base + cols::cxz_left(x, hw * 2 + 1)] =
-                        FE::from(cxz_left_bytes[x][hw * 2 + 1] as u64);
-                    data[base + cols::cxz_right_bit(x, hw)] =
-                        FE::from(cxz_right_bits[x][hw] as u64);
                 }
+                table.set_bytes(row_idx, cols::cxz_left(x, 0), &cxz_left_bytes[x]);
+                table.set_bytes(row_idx, cols::cxz_right_bit(x, 0), &cxz_right_bits[x]);
+
                 // Reconstruct: left[b] + (1 - b%2) * right[(b/2 + 3) mod 4]
                 for b in 0..8 {
                     let right_contribution = match cols::cxz_right_bit_for_byte(b) {
@@ -336,8 +335,8 @@ pub fn generate_keccak_rnd_trace(
                 for b in 0..8 {
                     let val = c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b];
                     d_bytes[x][b] = val;
-                    data[base + cols::dxz(x, b)] = FE::from(val as u64);
                 }
+                table.set_bytes(row_idx, cols::dxz(x, 0), &d_bytes[x]);
             }
 
             // theta[x][y] = start[x][y] XOR D[x]
@@ -350,10 +349,7 @@ pub fn generate_keccak_rnd_trace(
                         d_lane |= (d_bytes[x][b] as u64) << (b * 8);
                     }
                     theta_lanes[x + 5 * y] = lane ^ d_lane;
-                    for b in 0..8 {
-                        data[base + cols::theta(x, y, b)] =
-                            FE::from(byte_of(theta_lanes[x + 5 * y], b) as u64);
-                    }
+                    table.set_dword_bl(row_idx, cols::theta(x, y, 0), theta_lanes[x + 5 * y]);
                 }
             }
 
@@ -367,18 +363,18 @@ pub fn generate_keccak_rnd_trace(
                     let rho_offset = KECCAK_RHO[x][y] as usize;
                     let rnc_val = (rho_offset % 16) as u8;
                     let theta_lane = theta_lanes[x + 5 * y];
+                    let mut rot_left_bytes = [0u8; 8];
+                    let mut rot_right_bytes = [0u8; 8];
                     for hw in 0..4 {
                         let halfword = ((theta_lane >> (hw * 16)) & 0xFFFF) as u16;
                         let (shifted, carry) = hwsl(halfword, rnc_val);
-                        data[base + cols::rot_left(x, y, hw * 2)] =
-                            FE::from((shifted & 0xFF) as u64);
-                        data[base + cols::rot_left(x, y, hw * 2 + 1)] =
-                            FE::from((shifted >> 8) as u64);
-                        data[base + cols::rot_right(x, y, hw * 2)] =
-                            FE::from((carry & 0xFF) as u64);
-                        data[base + cols::rot_right(x, y, hw * 2 + 1)] =
-                            FE::from((carry >> 8) as u64);
+                        rot_left_bytes[hw * 2] = (shifted & 0xFF) as u8;
+                        rot_left_bytes[hw * 2 + 1] = (shifted >> 8) as u8;
+                        rot_right_bytes[hw * 2] = (carry & 0xFF) as u8;
+                        rot_right_bytes[hw * 2 + 1] = (carry >> 8) as u8;
                     }
+                    table.set_bytes(row_idx, cols::rot_left(x, y, 0), &rot_left_bytes);
+                    table.set_bytes(row_idx, cols::rot_right(x, y, 0), &rot_right_bytes);
                 }
             }
 
@@ -408,33 +404,28 @@ pub fn generate_keccak_rnd_trace(
                     let next2 = pi_lanes[(x + 2) % 5 + 5 * y];
                     let and_val = not_next & next2;
                     chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
-                    for b in 0..8 {
-                        data[base + cols::chi_ands(x, y, b)] = FE::from(byte_of(and_val, b) as u64);
-                        data[base + cols::chi(x, y, b)] =
-                            FE::from(byte_of(chi_lanes[x + 5 * y], b) as u64);
-                    }
+                    table.set_dword_bl(row_idx, cols::chi_ands(x, y, 0), and_val);
+                    table.set_dword_bl(row_idx, cols::chi(x, y, 0), chi_lanes[x + 5 * y]);
                 }
             }
 
             // === ι (iota) ===
             let rc_val = KECCAK_RC[round];
-            for b in 0..8 {
-                data[base + cols::rc(b)] = FE::from(byte_of(rc_val, b) as u64);
-                let iota_byte = byte_of(chi_lanes[0], b) ^ byte_of(rc_val, b);
-                data[base + cols::iota(b)] = FE::from(iota_byte as u64);
-            }
+            let iota_lane = chi_lanes[0] ^ rc_val;
+            table.set_dword_bl(row_idx, cols::rc(0), rc_val);
+            table.set_dword_bl(row_idx, cols::iota(0), iota_lane);
 
             // Update state for next round
-            chi_lanes[0] ^= rc_val;
+            chi_lanes[0] = iota_lane;
             state = chi_lanes;
 
             // mu = 1 (real row)
-            data[base + cols::MU] = FE::one();
+            table.set_fe(row_idx, cols::MU, FE::one());
         }
     }
 
     // Padding rows have mu=0 and all zeros (default)
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

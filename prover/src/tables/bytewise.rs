@@ -19,7 +19,7 @@
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
 // Column indices for BYTEWISE table
@@ -106,22 +106,24 @@ pub fn generate_bytewise_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let res = op.compute_res();
 
-        for i in 0..8 {
-            data[base + cols::A[i]] = FE::from((op.a >> (8 * i)) & 0xFF);
-            data[base + cols::B[i]] = FE::from((op.b >> (8 * i)) & 0xFF);
-            data[base + cols::RES[i]] = FE::from((res >> (8 * i)) & 0xFF);
-        }
-        data[base + cols::OP] = FE::from(op.op as u64);
-        data[base + cols::MU] = FE::from(*multiplicity);
+        table.set_dword_bl(row_idx, cols::A[0], op.a);
+        table.set_dword_bl(row_idx, cols::B[0], op.b);
+        table.set_dword_bl(row_idx, cols::RES[0], res);
+        table.set_byte(row_idx, cols::OP, op.op);
+        table.set_u64(row_idx, cols::MU, *multiplicity);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

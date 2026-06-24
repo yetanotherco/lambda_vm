@@ -42,7 +42,7 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::{TraceTable, columns2rows};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // Re-export DecodeEntry from types for backwards compatibility
 pub use super::types::DecodeEntry;
@@ -128,51 +128,49 @@ pub fn generate_decode_trace(
     // +1 for the CPU padding entry
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     // Fill actual entries (MU = 0 initially)
     for (row_idx, entry) in entries.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // PC as DWordWL
-        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
+        table.set_dword_wl(row_idx, cols::PC_0, entry.pc);
 
         // packed_decode
-        data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
+        table.set_u64(row_idx, cols::PACKED_DECODE, entry.packed_decode());
 
         // imm as DWordWL
-        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+        table.set_dword_wl(row_idx, cols::IMM_0, entry.imm);
 
         // MU = 0 (already zero from vec initialization)
     }
 
     // Write CPU padding entry (pc=1, all flags=0)
     {
-        let base = cpu_padding_row * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
-        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+        table.set_dword_wl(cpu_padding_row, cols::PC_0, cpu_padding_entry.pc);
+        table.set_u64(
+            cpu_padding_row,
+            cols::PACKED_DECODE,
+            cpu_padding_entry.packed_decode(),
+        );
+        table.set_dword_wl(cpu_padding_row, cols::IMM_0, cpu_padding_entry.imm);
     }
 
     // Fill padding rows with the DECODE padding pattern: odd pc=1, all flags 0
     // (unprovable as a fetch target; same row the CPU pads to).
     let padding_entry = DecodeEntry::padding_entry();
     for row_idx in num_entries..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-
-        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
-        data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+        table.set_dword_wl(row_idx, cols::PC_0, padding_entry.pc);
+        table.set_u64(row_idx, cols::PACKED_DECODE, padding_entry.packed_decode());
+        table.set_dword_wl(row_idx, cols::IMM_0, padding_entry.imm);
         // MU = 0 for padding rows (already zero from vec initialization)
     }
 
-    (TraceTable::new_main(data, cols::NUM_COLUMNS, 1), pc_to_row)
+    (trace, pc_to_row)
 }
 
 /// Updates multiplicities in the DECODE trace table.
@@ -186,7 +184,9 @@ pub fn update_multiplicities(
     for &pc in lookups {
         if let Some(&row_idx) = pc_to_row.get(&pc) {
             let current = trace.main_table.get(row_idx, cols::MU);
-            trace.main_table.set(row_idx, cols::MU, current + FE::one());
+            trace
+                .main_table
+                .set_fe(row_idx, cols::MU, current + FE::one());
         }
     }
 }
@@ -402,38 +402,38 @@ fn build_decode_table(
     // Pad to next power of 2, minimum 2
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     // Fill actual entries
     for (row_idx, entry) in entries.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(entry.pc >> 32);
-        data[base + cols::PACKED_DECODE] = FE::from(entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(entry.imm >> 32);
+        table.set_dword_wl(row_idx, cols::PC_0, entry.pc);
+        table.set_u64(row_idx, cols::PACKED_DECODE, entry.packed_decode());
+        table.set_dword_wl(row_idx, cols::IMM_0, entry.imm);
     }
 
     // Write CPU padding entry
     {
-        let base = cpu_padding_row * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(cpu_padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(cpu_padding_entry.pc >> 32);
-        data[base + cols::PACKED_DECODE] = FE::from(cpu_padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(cpu_padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(cpu_padding_entry.imm >> 32);
+        table.set_dword_wl(cpu_padding_row, cols::PC_0, cpu_padding_entry.pc);
+        table.set_u64(
+            cpu_padding_row,
+            cols::PACKED_DECODE,
+            cpu_padding_entry.packed_decode(),
+        );
+        table.set_dword_wl(cpu_padding_row, cols::IMM_0, cpu_padding_entry.imm);
     }
 
     // Fill padding rows with DECODE padding pattern
     let padding_entry = DecodeEntry::padding_entry();
     for row_idx in num_entries..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::PC_0] = FE::from(padding_entry.pc & 0xFFFF_FFFF);
-        data[base + cols::PC_1] = FE::from(padding_entry.pc >> 32);
-        data[base + cols::PACKED_DECODE] = FE::from(padding_entry.packed_decode());
-        data[base + cols::IMM_0] = FE::from(padding_entry.imm & 0xFFFF_FFFF);
-        data[base + cols::IMM_1] = FE::from(padding_entry.imm >> 32);
+        table.set_dword_wl(row_idx, cols::PC_0, padding_entry.pc);
+        table.set_u64(row_idx, cols::PACKED_DECODE, padding_entry.packed_decode());
+        table.set_dword_wl(row_idx, cols::IMM_0, padding_entry.imm);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }

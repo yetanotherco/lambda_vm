@@ -36,7 +36,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::IsBitConstraint;
 
 /// Maximum number of rows per MEMW table chunk.
@@ -175,59 +175,59 @@ pub fn generate_memw_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Input columns
-        data[base + cols::IS_REGISTER] = FE::from(op.is_register as u64);
+        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
 
         // base_address as DWordWL (2 words)
         let base_addr_lo = op.base_address & 0xFFFF_FFFF;
-        data[base + cols::BASE_ADDRESS_0] = FE::from(base_addr_lo);
-        data[base + cols::BASE_ADDRESS_1] = FE::from(op.base_address >> 32);
+        table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
 
         // value[8]
         for i in 0..8 {
-            data[base + cols::VALUE[i]] = FE::from(op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
         }
 
         // timestamp as DWordWL (2 words)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // write flags
         let (w2, w4, w8) = op.write_flags();
-        data[base + cols::WRITE2] = FE::from(w2 as u64);
-        data[base + cols::WRITE4] = FE::from(w4 as u64);
-        data[base + cols::WRITE8] = FE::from(w8 as u64);
+        table.set_bool(row_idx, cols::WRITE2, w2);
+        table.set_bool(row_idx, cols::WRITE4, w4);
+        table.set_bool(row_idx, cols::WRITE8, w8);
 
         // Output: old[8]
         for i in 0..8 {
-            data[base + cols::OLD[i]] = FE::from(op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i]);
         }
 
         // Auxiliary: carry[7]
         // carry[i] = 1 if (base_address_lo + i+1) >= 2^32
         for i in 0..7 {
             let overflows = base_addr_lo + (i as u64 + 1) >= (1u64 << 32);
-            data[base + cols::CARRY[i]] = FE::from(overflows as u64);
+            table.set_bool(row_idx, cols::CARRY[i], overflows);
         }
 
         // Auxiliary: old_timestamp[8] - each as DWordWL (2 words)
         for i in 0..8 {
             let cols_i = cols::old_timestamp(i);
-            data[base + cols_i[0]] = FE::from(op.old_timestamp[i] & 0xFFFF_FFFF);
-            data[base + cols_i[1]] = FE::from(op.old_timestamp[i] >> 32);
+            table.set_dword_wl(row_idx, cols_i[0], op.old_timestamp[i]);
         }
 
         // Multiplicity
-        data[base + cols::MU_READ] = FE::from(op.is_read as u64);
-        data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
+        table.set_bool(row_idx, cols::MU_READ, op.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
