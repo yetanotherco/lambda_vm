@@ -2,10 +2,17 @@
 //! lambda-vm prover/benchmarks — in-memory, offline, deterministic.
 //!
 //! Usage:
-//!   cargo run -- <n_transfers> <output_path>
+//!   cargo run -- <n_transfers> <output_path> [mode]
+//!
+//! mode (optional, default `same`):
+//!   same        all txs: the rich sender -> one fixed recipient (0xdeadbeef)
+//!   recipients  the rich sender -> N distinct recipients (1 -> N fan-out)
+//!   distinct    N distinct, genesis-funded senders -> N distinct recipients
+//!               (N independent, unrelated 1-1 account pairs)
 //! e.g.
 //!   cargo run -- 1  ../../executor/tests/ethrex_simple_tx.bin
 //!   cargo run -- 10 ../../executor/tests/ethrex_10_transfers.bin
+//!   cargo run -- 20 /tmp/ethrex_20_distinct.bin distinct
 //!
 //! TODO(ethrex-integration, PR #666): TEMPORARY. Delete this whole crate once
 //! the LambdaVM-backend ethrex PR lands on ethrex `main` and fixtures are
@@ -18,7 +25,7 @@ use bytes::Bytes;
 use ethrex_blockchain::payload::{BuildPayloadArgs, create_payload};
 use ethrex_blockchain::{Blockchain, BlockchainOptions};
 use ethrex_common::types::{
-    EIP1559Transaction, ELASTICITY_MULTIPLIER, Genesis, Transaction, TxKind,
+    EIP1559Transaction, ELASTICITY_MULTIPLIER, Genesis, GenesisAccount, Transaction, TxKind,
 };
 use ethrex_common::{Address, H256, U256};
 use ethrex_guest_program::l1::ProgramInput;
@@ -31,9 +38,47 @@ use secp256k1::SecretKey;
 const RICH_PK: &str = "bcdf20249abf0ed6d944c0288fad489e33f66b3960d9e6229c1cd214ed3bbe31";
 const GENESIS_JSON: &str = include_str!("../genesis.json");
 
+/// How the block's transactions distribute across accounts.
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    /// All txs: the rich sender -> one fixed recipient (original behavior).
+    Same,
+    /// The rich sender -> N distinct recipients (1 -> N fan-out).
+    Recipients,
+    /// N distinct, genesis-funded senders -> N distinct recipients.
+    Distinct,
+}
+
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s {
+        "same" => Some(Mode::Same),
+        "recipients" | "fanout" => Some(Mode::Recipients),
+        "distinct" | "diverse" => Some(Mode::Distinct),
+        _ => None,
+    }
+}
+
 fn usage_and_exit(program: &str) -> ! {
-    eprintln!("usage: {program} <n_transfers> <output_path>");
+    eprintln!("usage: {program} <n_transfers> <output_path> [same|recipients|distinct]");
     std::process::exit(2);
+}
+
+/// Deterministic, distinct, valid secp256k1 signer for sender index `i`.
+/// Key = 0x01 ‖ 0…0 ‖ big-endian(i): always nonzero and far below the curve order.
+fn deterministic_signer(i: u64) -> Signer {
+    let mut sk = [0u8; 32];
+    sk[0] = 1;
+    sk[24..32].copy_from_slice(&i.to_be_bytes());
+    LocalSigner::new(SecretKey::from_slice(&sk).expect("valid secret key")).into()
+}
+
+fn rich_signer() -> Result<Signer, Box<dyn std::error::Error>> {
+    Ok(LocalSigner::new(SecretKey::from_slice(&hex::decode(RICH_PK)?)?).into())
+}
+
+/// Distinct recipient address for tx index `i` (fresh account, no funding needed).
+fn recipient_for(i: u64) -> Address {
+    Address::from_low_u64_be(0xdead_0000_0000u64 + i)
 }
 
 #[tokio::main]
@@ -46,6 +91,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let Some(out_path) = args.next() else {
         usage_and_exit(&program);
     };
+    let mode = match args.next() {
+        None => Mode::Same,
+        Some(s) => match parse_mode(&s) {
+            Some(m) => m,
+            None => usage_and_exit(&program),
+        },
+    };
     if args.next().is_some() {
         usage_and_exit(&program);
     }
@@ -54,7 +106,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // --- 1. genesis -> in-memory store -------------------------------------
-    let genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;
+    let mut genesis: Genesis = serde_json::from_str(GENESIS_JSON)?;
+
+    // For `distinct`, fund each synthetic sender in genesis so its tx is valid.
+    if mode == Mode::Distinct {
+        for i in 0..n_transfers {
+            genesis.alloc.insert(
+                deterministic_signer(i).address(),
+                GenesisAccount {
+                    code: Bytes::new(),
+                    storage: Default::default(),
+                    balance: U256::from(100_000_000_000_000_000_000u128), // 100 ETH
+                    nonce: 0,
+                },
+            );
+        }
+    }
+
     let chain_id = genesis.config.chain_id;
     let mut store = Store::new(".ethrex-fixtures-tmp", EngineType::InMemory)?;
     store.add_initial_state(genesis).await?;
@@ -69,9 +137,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blockchain = Blockchain::new(store.clone(), BlockchainOptions::default());
 
     // --- 2. build + sign N transfers, push to the mempool ------------------
-    let signer: Signer = LocalSigner::new(SecretKey::from_slice(&hex::decode(RICH_PK)?)?).into();
-    let recipient = Address::from_low_u64_be(0xdead_beef);
-    for nonce in 0..n_transfers {
+    // `same`:       rich sender, nonce 0..N, fixed recipient.
+    // `recipients`: rich sender, nonce 0..N, distinct recipient per tx.
+    // `distinct`:   distinct sender per tx (nonce 0), distinct recipient per tx.
+    for i in 0..n_transfers {
+        let (signer, nonce, recipient) = match mode {
+            Mode::Same => (rich_signer()?, i, Address::from_low_u64_be(0xdead_beef)),
+            Mode::Recipients => (rich_signer()?, i, recipient_for(i)),
+            Mode::Distinct => (deterministic_signer(i), 0, recipient_for(i)),
+        };
         let mut tx = Transaction::EIP1559Transaction(EIP1559Transaction {
             chain_id,
             nonce,
@@ -119,8 +193,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&program_input)?;
     std::fs::write(&out_path, &bytes)?;
 
+    let mode_label = match mode {
+        Mode::Same => "1 sender -> 1 recipient",
+        Mode::Recipients => "1 sender -> N recipients",
+        Mode::Distinct => "N senders -> N recipients",
+    };
     println!(
-        "wrote {out_path} ({} bytes): block #{} with {included}/{n_transfers} transfer(s)",
+        "wrote {out_path} ({} bytes): block #{} with {included}/{n_transfers} transfer(s) [{mode_label}]",
         bytes.len(),
         head_number + 1,
     );
