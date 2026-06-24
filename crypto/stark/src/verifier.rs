@@ -853,13 +853,10 @@ pub trait IsStarkVerifier<
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
         // Scratch buffers reused across every query iteration: the per-row trace
-        // evaluations gathered for the regular and symmetric points, plus the
-        // batch-inverse denominator buffer threaded into the reconstruction. They
-        // are `clear()`ed and refilled each query, so the hot loop performs no
-        // heap allocation after the first iteration.
+        // evaluations gathered for the regular and symmetric points. Cleared and
+        // refilled each query — no heap allocation after the first iteration.
         let mut evaluations: Vec<FieldElement<FieldExtension>> = Vec::new();
         let mut evaluations_sym: Vec<FieldElement<FieldExtension>> = Vec::new();
-        let mut denoms_trace: Vec<FieldElement<FieldExtension>> = Vec::new();
 
         // Precompute the query-INVARIANT half of the deep-trace term, once for all
         // queries. The trace term is
@@ -899,7 +896,42 @@ pub trait IsStarkVerifier<
         }
         FieldElement::inplace_batch_inverse(&mut comp_denoms).unwrap();
 
-        for (i, iota) in challenges.iotas.iter().enumerate() {
+        // Batch-invert all 2×num_queries×height trace denominators across all queries.
+        // Currently each of the 146 calls to reconstruct_deep_composition_poly_evaluation
+        // inverts its own 2-element denoms_trace (1 inversion per call = 146 total).
+        // Collecting all 146×height values and inverting once reduces to 1 inversion.
+        //
+        // Layout: for each (iota, sym) pair interleaved, height rows:
+        //   [ep_0−z, ep_0−z·g, ep_sym_0−z, ep_sym_0−z·g, ep_1−z, ep_1−z·g, ...]
+        // Access: trace_denoms_inv[((2*i + sym_flag) * height) + row_idx]
+        let ood_height = proof.trace_ood_evaluations().height();
+        // OOD shift values: z·g^0, z·g^1, ..., z·g^(height-1), used as the
+        // denominator bases for trace terms across all queries.
+        let ood_z_shifts: Vec<FieldElement<FieldExtension>> = {
+            let mut shifts = Vec::with_capacity(ood_height);
+            let mut cur = challenges.z.clone();
+            for _ in 0..ood_height {
+                shifts.push(cur.clone());
+                cur = primitive_root * &cur;
+            }
+            shifts
+        };
+        let mut trace_denoms_inv: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(2 * num_queries * ood_height);
+        for iota in challenges.iotas.iter() {
+            let ep = Self::query_challenge_to_evaluation_point(*iota, domain).to_extension();
+            let ep_sym =
+                Self::query_challenge_to_evaluation_point_sym(*iota, domain).to_extension();
+            for z_shift in ood_z_shifts.iter() {
+                trace_denoms_inv.push(ep.clone() - z_shift);
+            }
+            for z_shift in ood_z_shifts.iter() {
+                trace_denoms_inv.push(ep_sym.clone() - z_shift);
+            }
+        }
+        FieldElement::inplace_batch_inverse(&mut trace_denoms_inv).unwrap();
+
+        for (i, _iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
 
             // For preprocessed tables: precomputed columns come FIRST, then multiplicities
@@ -925,16 +957,15 @@ pub trait IsStarkVerifier<
                 evaluations.extend_from_slice(aux_trace_polys.evaluations);
             }
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, domain);
+            // trace_denoms_inv layout per query i: [ep_i row0..row(h-1), ep_sym_i row0..row(h-1)]
+            let td_base = i * 2 * ood_height;
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
-                primitive_root,
                 challenges,
                 &evaluations,
                 opening.composition_poly.evaluations,
                 &b_terms,
-                &mut denoms_trace,
+                &trace_denoms_inv[td_base..td_base + ood_height],
                 comp_denoms[2 * i].clone(),
             ));
 
@@ -961,16 +992,14 @@ pub trait IsStarkVerifier<
                 evaluations_sym.extend_from_slice(aux_trace_polys.evaluations_sym);
             }
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
+            let td_sym_base = td_base + ood_height;
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
-                primitive_root,
                 challenges,
                 &evaluations_sym,
                 opening.composition_poly.evaluations_sym,
                 &b_terms,
-                &mut denoms_trace,
+                &trace_denoms_inv[td_sym_base..td_sym_base + ood_height],
                 comp_denoms[2 * i + 1].clone(),
             ));
         }
@@ -1012,13 +1041,13 @@ pub trait IsStarkVerifier<
 
     fn reconstruct_deep_composition_poly_evaluation<'p, P>(
         proof: &P,
-        evaluation_point: &FieldElement<Field>,
-        primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         lde_trace_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
         b_terms: &[FieldElement<FieldExtension>],
-        denoms_trace: &mut Vec<FieldElement<FieldExtension>>,
+        // Pre-inverted trace denominators for this call's evaluation point, length = ood_height.
+        // Batch-inverted by the caller across all queries (avoids 146 separate inversions).
+        denoms_trace_inv: &[FieldElement<FieldExtension>],
         // Pre-inverted composition denominator: `(eval_point − z^N_parts)⁻¹`,
         // batch-computed by the caller across all queries (avoids 146 separate `.inv()` calls).
         denom_composition_inv: FieldElement<FieldExtension>,
@@ -1043,16 +1072,7 @@ pub trait IsStarkVerifier<
         // number of OOD rows; the column-major index below relies on this.
         debug_assert_eq!(trace_term_chunk_len, ood_evaluations_table_height);
         debug_assert_eq!(b_terms.len(), ood_evaluations_table_height);
-
-        // `denoms_trace` is a caller-owned scratch buffer reused across queries;
-        // refill it from scratch each call rather than allocating a fresh `Vec`.
-        denoms_trace.clear();
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms_trace.push(evaluation_point - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        FieldElement::inplace_batch_inverse(denoms_trace).unwrap();
+        debug_assert_eq!(denoms_trace_inv.len(), ood_evaluations_table_height);
 
         // Deep-trace term, with the query-invariant OOD·coeff half lifted out:
         //
@@ -1060,12 +1080,11 @@ pub trait IsStarkVerifier<
         // = Σ_row denom[row] · ( (Σ_col lde[col]·coeff[col][row]) − b_terms[row] )
         //
         // where `b_terms[row] = Σ_col ood[row][col]·coeff[col][row]` is precomputed
-        // once across all queries (see `precompute_ood_coeff_terms`). The remaining
-        // per-query work is one `lde[col]·coeff` multiply per cell (the `lde`
-        // opening is query-specific), one subtraction of the precomputed `b`, and
-        // one `·denom[row]` per row.
+        // once across all queries (see `precompute_ood_coeff_terms`), and
+        // `denom[row]` is pre-inverted by the caller via a single batch inversion
+        // across all 2×num_queries×height trace denominators.
         let mut trace_term = FieldElement::zero();
-        for (row_idx, denom) in denoms_trace.iter().enumerate() {
+        for (row_idx, denom) in denoms_trace_inv.iter().enumerate() {
             let mut row_acc = FieldElement::zero();
             for col_idx in 0..ood_evaluations_table_width {
                 // Flat column-major index: column `col_idx`'s run starts at
