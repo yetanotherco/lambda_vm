@@ -1,4 +1,5 @@
 use crate::errors::{ByteConversionError, DeserializationError};
+
 /// A trait for converting an element to and from its byte representation and
 /// for getting an element from its byte representation in big-endian or
 /// little-endian order.

@@ -5,7 +5,7 @@ use crate::vm::{
     registers::Registers,
 };
 
-use crate::constants::FP3_MUL_SYSCALL_NUMBER;
+use crate::constants::{FP3_FMA_SYSCALL_NUMBER, FP3_MUL_SYSCALL_NUMBER};
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
@@ -21,6 +21,8 @@ pub enum SyscallNumbers {
     // FP3_MUL_SYSCALL_NUMBER (u64::MAX - 2) cannot be an enum discriminant because
     // it exceeds isize::MAX; handled via TryFrom<u64> like KeccakPermute.
     Fp3Mul,
+    // FP3_FMA_SYSCALL_NUMBER (u64::MAX - 3): fused multiply-add, acc += lhs × rhs.
+    Fp3Fma,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -51,6 +53,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == FP3_MUL_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Mul),
+            v if v == FP3_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::Fp3Fma),
             _ => Err(()),
         }
     }
@@ -457,6 +460,36 @@ impl Instruction {
                         memory.store_doubleword(addr_res, c0)?;
                         memory.store_doubleword(addr_res + 8, c1)?;
                         memory.store_doubleword(addr_res + 16, c2)?;
+                        src2_val = addr_lhs;
+                        dst_val = addr_rhs;
+                    }
+                    SyscallNumbers::Fp3Fma => {
+                        // Goldilocks Fp3 fused multiply-add: acc += lhs × rhs (in-place on acc).
+                        // x10 = ptr to acc (3 × u64, read+write), x11 = ptr to lhs, x12 = ptr to rhs
+                        let addr_acc = registers.read(10)?;
+                        let addr_lhs = registers.read(11)?;
+                        let addr_rhs = registers.read(12)?;
+                        let acc = [
+                            memory.load_doubleword(addr_acc)?,
+                            memory.load_doubleword(addr_acc + 8)?,
+                            memory.load_doubleword(addr_acc + 16)?,
+                        ];
+                        let lhs = [
+                            memory.load_doubleword(addr_lhs)?,
+                            memory.load_doubleword(addr_lhs + 8)?,
+                            memory.load_doubleword(addr_lhs + 16)?,
+                        ];
+                        let rhs = [
+                            memory.load_doubleword(addr_rhs)?,
+                            memory.load_doubleword(addr_rhs + 8)?,
+                            memory.load_doubleword(addr_rhs + 16)?,
+                        ];
+                        let c0 = goldilocks_fp3_mul_c0(lhs, rhs);
+                        let c1 = goldilocks_fp3_mul_c1(lhs, rhs);
+                        let c2 = goldilocks_fp3_mul_c2(lhs, rhs);
+                        memory.store_doubleword(addr_acc, goldilocks_add(acc[0], c0))?;
+                        memory.store_doubleword(addr_acc + 8, goldilocks_add(acc[1], c1))?;
+                        memory.store_doubleword(addr_acc + 16, goldilocks_add(acc[2], c2))?;
                         src2_val = addr_lhs;
                         dst_val = addr_rhs;
                     }

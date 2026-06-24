@@ -111,6 +111,15 @@ pub trait IsField: Debug + Clone {
     /// Returns the multiplication of `a` and `b`.
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType;
 
+    /// Fused multiply-add: `acc += a * b`.
+    ///
+    /// Default implementation uses `mul` + `add`. Concrete fields that have a
+    /// hardware-accelerated FMA (e.g. Goldilocks Fp3 on the lambda-vm RISC-V guest
+    /// via the Fp3Fma ecall) may override this to issue a single operation.
+    fn fma(acc: &mut Self::BaseType, a: &Self::BaseType, b: &Self::BaseType) {
+        *acc = Self::add(acc, &Self::mul(a, b));
+    }
+
     /// Returns the multiplication of `a` and `a`.
     fn square(a: &Self::BaseType) -> Self::BaseType {
         Self::mul(a, a)

@@ -511,6 +511,14 @@ where
         &self.value
     }
 
+    /// Fused multiply-add: `self += lhs × rhs`. Dispatches to `F::fma` which
+    /// uses the Fp3Fma ecall on riscv64 for `Degree3GoldilocksExtensionField`,
+    /// saving the 3-element Goldilocks addition vs Fp3Mul + AddAssign.
+    #[inline(always)]
+    pub fn fma(&mut self, lhs: &Self, rhs: &Self) {
+        F::fma(&mut self.value, &lhs.value, &rhs.value);
+    }
+
     /// Returns the multiplicative inverse of `self`
     #[inline(always)]
     pub fn inv(&self) -> Result<Self, FieldError> {

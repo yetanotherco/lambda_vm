@@ -286,6 +286,37 @@ impl IsField for Degree3GoldilocksExtensionField {
         [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
     }
 
+    /// Fused multiply-add: `acc += a × b` using the Fp3Fma ecall on riscv64 — one ecall
+    /// instead of Fp3Mul ecall + 3 Goldilocks adds, saving ~12 instructions per call.
+    #[inline(always)]
+    fn fma(acc: &mut Self::BaseType, a: &Self::BaseType, b: &Self::BaseType) {
+        #[cfg(target_arch = "riscv64")]
+        {
+            const FP3_FMA_SYSCALL: u64 = u64::MAX - 3;
+            let a_raw: [u64; 3] = [*a[0].value(), *a[1].value(), *a[2].value()];
+            let b_raw: [u64; 3] = [*b[0].value(), *b[1].value(), *b[2].value()];
+            // acc is a &mut [FpE; 3] = &mut [FieldElement<GoldilocksField>; 3].
+            // FieldElement<GoldilocksField> = { value: u64 }, so [FpE; 3] = [u64; 3] in memory.
+            // Cast directly to *mut u64 for the ecall — the executor reads acc[0..2],
+            // computes acc += a×b, and writes the result back in place.
+            let acc_ptr = acc.as_mut_ptr() as *mut u64;
+            unsafe {
+                core::arch::asm!(
+                    "ecall",
+                    in("a0") acc_ptr,
+                    in("a1") a_raw.as_ptr(),
+                    in("a2") b_raw.as_ptr(),
+                    in("a7") FP3_FMA_SYSCALL,
+                );
+                core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        {
+            *acc = <Self as IsField>::add(acc, &<Self as IsField>::mul(a, b));
+        }
+    }
+
     /// Multiplication using schoolbook with fused dot products.
     /// (a0 + a1*w + a2*w^2) * (b0 + b1*w + b2*w^2) mod (w^3 - 2)
     ///
@@ -578,6 +609,9 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
         Ok(Self::new([x0, x1, x2]))
     }
 }
+
+/// Type alias for the Goldilocks cubic extension field element.
+pub type Fp3Element = FieldElement<Degree3GoldilocksExtensionField>;
 
 #[cfg(feature = "alloc")]
 impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
