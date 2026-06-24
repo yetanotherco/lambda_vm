@@ -877,6 +877,28 @@ pub trait IsStarkVerifier<
         // the same value for every query (depends only on the domain order).
         let primitive_root =
             &Field::get_primitive_root_of_unity(domain.root_order as u64).unwrap();
+
+        // Precompute `z^N_parts` once — both `challenges.z` and the number of
+        // composition-poly parts are proof-global constants, so recomputing this
+        // inside each of the 2×num_queries reconstruction calls wastes `num_parts`
+        // field multiplications per call.
+        let number_of_parts = proof.composition_poly_parts_ood_evaluation().len();
+        let z_pow_n: FieldElement<FieldExtension> = challenges.z.pow(number_of_parts);
+
+        // Batch-invert all 2×num_queries composition denominators in a single
+        // `inplace_batch_inverse` call (1 inversion + 3×(2Q-1) muls) instead of
+        // 2×num_queries independent `.inv()` calls inside the reconstruction loop.
+        // Layout: [ep_0 − z^N, ep_sym_0 − z^N, ep_1 − z^N, ep_sym_1 − z^N, ...]
+        let mut comp_denoms: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(2 * num_queries);
+        for iota in challenges.iotas.iter() {
+            let ep = Self::query_challenge_to_evaluation_point(*iota, domain);
+            let ep_sym = Self::query_challenge_to_evaluation_point_sym(*iota, domain);
+            comp_denoms.push(ep.to_extension() - &z_pow_n);
+            comp_denoms.push(ep_sym.to_extension() - &z_pow_n);
+        }
+        FieldElement::inplace_batch_inverse(&mut comp_denoms).unwrap();
+
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
 
@@ -913,6 +935,7 @@ pub trait IsStarkVerifier<
                 opening.composition_poly.evaluations,
                 &b_terms,
                 &mut denoms_trace,
+                comp_denoms[2 * i].clone(),
             ));
 
             // For preprocessed tables: precomputed columns come FIRST, then multiplicities
@@ -948,6 +971,7 @@ pub trait IsStarkVerifier<
                 opening.composition_poly.evaluations_sym,
                 &b_terms,
                 &mut denoms_trace,
+                comp_denoms[2 * i + 1].clone(),
             ));
         }
         (deep_poly_evaluations, deep_poly_evaluations_sym)
@@ -995,6 +1019,9 @@ pub trait IsStarkVerifier<
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
         b_terms: &[FieldElement<FieldExtension>],
         denoms_trace: &mut Vec<FieldElement<FieldExtension>>,
+        // Pre-inverted composition denominator: `(eval_point − z^N_parts)⁻¹`,
+        // batch-computed by the caller across all queries (avoids 146 separate `.inv()` calls).
+        denom_composition_inv: FieldElement<FieldExtension>,
     ) -> FieldElement<FieldExtension>
     where
         P: StarkProofRef<'p, Field, FieldExtension, PI>,
@@ -1049,17 +1076,13 @@ pub trait IsStarkVerifier<
             trace_term += (row_acc - &b_terms[row_idx]) * denom;
         }
 
-        let number_of_parts = lde_composition_poly_parts_evaluation.len();
-        let z_pow = &challenges.z.pow(number_of_parts);
-
-        let denom_composition = (evaluation_point - z_pow).inv().unwrap();
         let mut h_terms = FieldElement::zero();
         for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
             let h_i_zpower = &composition_poly_parts_ood[j];
             let h_i_term = (h_i_upsilon - h_i_zpower) * &challenges.gammas[j];
             h_terms += h_i_term;
         }
-        h_terms *= denom_composition;
+        h_terms *= denom_composition_inv;
 
         trace_term + h_terms
     }
