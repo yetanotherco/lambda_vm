@@ -84,83 +84,72 @@ fn test_trace_generation() {
 }
 
 #[test]
-fn test_multiplicity_aggregation() {
-    // Create 5 operations where (5, 10, UNSIGNED) appears 3 times
+fn test_no_dedup_one_row_per_op() {
+    // 5 operations: (5, 10, UNSIGNED) appears 3×, (100, 200, UNSIGNED) 2×.
+    // Per the spec `μ` is a Bit, so there is NO deduplication: one row per op,
+    // each with μ = 1.
     let ops = vec![
-        LtOperation::new(5, 10, UNSIGNED), // appears 1st time
+        LtOperation::new(5, 10, UNSIGNED),
         LtOperation::new(100, 200, UNSIGNED),
-        LtOperation::new(5, 10, UNSIGNED),    // appears 2nd time
-        LtOperation::new(5, 10, UNSIGNED),    // appears 3rd time
-        LtOperation::new(100, 200, UNSIGNED), // duplicate
+        LtOperation::new(5, 10, UNSIGNED),
+        LtOperation::new(5, 10, UNSIGNED),
+        LtOperation::new(100, 200, UNSIGNED),
     ];
 
     let trace = generate_lt_trace(&ops);
 
-    // Should deduplicate to 2 unique rows, padded to 4 (minimum for FRI)
-    assert_eq!(trace.main_table.height, 4);
+    // 5 ops -> 5 rows, padded to the next power of two (8).
+    assert_eq!(trace.main_table.height, 8);
 
-    // Find each unique operation and check multiplicity
-    let mut found_5_10 = false;
-    let mut found_100_200 = false;
-
-    for row_idx in 0..4 {
+    let mut count_5_10 = 0;
+    let mut count_100_200 = 0;
+    for row_idx in 0..trace.main_table.height {
         let row = trace.main_table.get_row(row_idx);
         if row[cols::LHS_0] == FE::from(5u64) && row[cols::RHS_0] == FE::from(10u64) {
-            assert_eq!(
-                row[cols::MU],
-                FE::from(3u64),
-                "Expected multiplicity 3 for (5, 10)"
-            );
-            found_5_10 = true;
+            assert_eq!(row[cols::MU], FE::one(), "μ is the Bit 1 per row");
+            count_5_10 += 1;
         }
         if row[cols::LHS_0] == FE::from(100u64) && row[cols::RHS_0] == FE::from(200u64) {
-            assert_eq!(
-                row[cols::MU],
-                FE::from(2u64),
-                "Expected multiplicity 2 for (100, 200)"
-            );
-            found_100_200 = true;
+            assert_eq!(row[cols::MU], FE::one(), "μ is the Bit 1 per row");
+            count_100_200 += 1;
         }
     }
 
-    assert!(found_5_10, "Row with lhs=5, rhs=10 not found");
-    assert!(found_100_200, "Row with lhs=100, rhs=200 not found");
+    assert_eq!(count_5_10, 3, "one row per (5, 10) op");
+    assert_eq!(count_100_200, 2, "one row per (100, 200) op");
 }
 
 #[test]
-fn test_multiplicity_different_signed_flags() {
-    // Same lhs/rhs but different signed flag should be separate rows
+fn test_signed_flag_separate_rows() {
+    // Same lhs/rhs, different signed flag, plus a repeat. No dedup (μ is a Bit):
+    // 3 ops -> 3 rows (2 unsigned, 1 signed), each μ = 1.
     let ops = vec![
-        LtOperation::new(5, 10, UNSIGNED), // unsigned
-        LtOperation::new(5, 10, SIGNED),   // signed - different operation!
-        LtOperation::new(5, 10, UNSIGNED), // unsigned again
+        LtOperation::new(5, 10, UNSIGNED),
+        LtOperation::new(5, 10, SIGNED),
+        LtOperation::new(5, 10, UNSIGNED),
     ];
 
     let trace = generate_lt_trace(&ops);
 
-    // Should have 2 unique rows (unsigned and signed), padded to 4 (minimum for FRI)
+    // 3 ops -> 3 rows, padded to 4.
     assert_eq!(trace.main_table.height, 4);
 
-    let mut unsigned_mu = None;
-    let mut signed_mu = None;
-
-    for row_idx in 0..4 {
+    let mut unsigned_rows = 0;
+    let mut signed_rows = 0;
+    for row_idx in 0..trace.main_table.height {
         let row = trace.main_table.get_row(row_idx);
         if row[cols::LHS_0] == FE::from(5u64) && row[cols::RHS_0] == FE::from(10u64) {
+            assert_eq!(row[cols::MU], FE::one(), "μ is the Bit 1 per row");
             if row[cols::SIGNED] == FE::zero() {
-                unsigned_mu = Some(row[cols::MU]);
+                unsigned_rows += 1;
             } else {
-                signed_mu = Some(row[cols::MU]);
+                signed_rows += 1;
             }
         }
     }
 
-    assert_eq!(
-        unsigned_mu,
-        Some(FE::from(2u64)),
-        "Unsigned (5,10) should have mu=2"
-    );
-    assert_eq!(signed_mu, Some(FE::one()), "Signed (5,10) should have mu=1");
+    assert_eq!(unsigned_rows, 2, "two unsigned (5, 10) rows");
+    assert_eq!(signed_rows, 1, "one signed (5, 10) row");
 }
 
 #[test]

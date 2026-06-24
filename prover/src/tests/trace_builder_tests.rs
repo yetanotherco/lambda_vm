@@ -164,7 +164,7 @@ fn test_lt_operations_collected() {
 }
 
 #[test]
-fn test_lt_deduplication() {
+fn test_lt_no_dedup_one_row_per_op() {
     let mut logs = vec![
         make_slt_log(0x1000, 5, 10, 1),
         make_slt_log(0x1004, 5, 10, 1), // duplicate
@@ -202,32 +202,29 @@ fn test_lt_deduplication() {
 
     let traces = Traces::from_logs(&logs, instructions, &Default::default()).unwrap();
 
-    // The 3 identical SLT operations (5 < 10, signed) should be deduplicated.
-    // With MEMW timestamp ordering LT ops also added, the table is larger,
-    // but we can verify the SLT deduplication by finding the row with lhs=5, rhs=10.
-    let mut found_slt = false;
+    // Per the spec, `μ` is a Bit: one row per op (no deduplication). The 3
+    // identical SLT operations (5 < 10, signed) each get their own row with μ = 1.
+    let mut slt_rows = 0;
     for row_idx in 0..traces.lts[0].main_table.height {
         let row = traces.lts[0].main_table.get_row(row_idx);
-        // Check for our SLT: lhs=5, rhs=10, signed=1
-        // lhs is stored as DWordHHW: [half0, half1, word2]
-        // For value 5: half0=5, half1=0, word2=0
+        // lhs is stored as DWordHHW: [half0, half1, word2]; value 5 => [5, 0, 0].
         if row[lt::cols::LHS_0] == FE::from(5u64)
             && row[lt::cols::LHS_1] == FE::from(0u64)
             && row[lt::cols::LHS_2] == FE::from(0u64)
             && row[lt::cols::RHS_0] == FE::from(10u64)
             && row[lt::cols::SIGNED] == FE::from(1u64)
         {
-            // Found our SLT row - verify multiplicity is 3. Every LT lookup
-            // (including SLT) goes through the unified ALU bus and
-            // is counted in the single `MU` column.
-            assert_eq!(row[lt::cols::MU], FE::from(3u64));
-            found_slt = true;
-            break;
+            assert_eq!(
+                row[lt::cols::MU],
+                FE::from(1u64),
+                "μ is the Bit 1 for each real LT row"
+            );
+            slt_rows += 1;
         }
     }
-    assert!(
-        found_slt,
-        "SLT operation (5 < 10, signed) not found in LT table"
+    assert_eq!(
+        slt_rows, 3,
+        "expected one LT row per SLT op (spec: μ is a Bit, no dedup)"
     );
 }
 

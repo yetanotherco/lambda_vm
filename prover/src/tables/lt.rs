@@ -156,21 +156,12 @@ impl LtOperation {
 
 /// Generates the LT trace table from a list of operations.
 ///
-/// Duplicate operations (same lhs, rhs, signed) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// One row per operation with `μ = 1` (the spec types `μ` as a `Bit`). The table
+/// is padded to the next power of two.
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
-    // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
-    let mut op_map: HashMap<LtOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
         cols::NUM_COLUMNS,
@@ -178,7 +169,7 @@ pub fn generate_lt_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+    for (row_idx, op) in operations.iter().enumerate() {
         // Store input columns
         table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
         table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
@@ -205,8 +196,9 @@ pub fn generate_lt_trace(
         table.set_bool(row_idx, cols::INVERT, op.invert);
         table.set_bool(row_idx, cols::OUT, op.compute_out());
 
-        // All LT lookups go through the unified ALU bus → single multiplicity.
-        table.set_u64(row_idx, cols::MU, *multiplicity);
+        // All LT lookups go through the unified ALU bus. One row per op, so
+        // μ is the Bit the spec declares (1 for real rows, 0 for padding).
+        table.set_u64(row_idx, cols::MU, 1);
     }
 
     trace

@@ -153,21 +153,12 @@ impl BranchOperation {
 
 /// Generates the BRANCH trace table from a list of operations.
 ///
-/// Duplicate operations (same pc, offset, register, jalr) are merged into a single row
-/// with their multiplicities summed. The table is then padded to the next power of 2.
+/// One row per operation with `μ = 1` (the spec types `μ` as a `Bit`). The table
+/// is padded to the next power of two.
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
-    // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
-    for op in operations {
-        *op_map.entry(op.clone()).or_insert(0) += 1;
-    }
-
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
-    let num_rows = unique_ops.len().next_power_of_two().max(4);
+    let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
         cols::NUM_COLUMNS,
@@ -175,7 +166,7 @@ pub fn generate_branch_trace(
     );
     let table = &mut trace.main_table;
 
-    for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
+    for (row_idx, op) in operations.iter().enumerate() {
         // Compute next_pc
         let next_pc_unmasked = op.compute_next_pc_unmasked();
         let next_pc = op.compute_next_pc();
@@ -209,7 +200,8 @@ pub fn generate_branch_trace(
             &[next_pc_low_0, next_pc_low_1],
         );
         table.set_byte(row_idx, cols::UNMASKED_LOW_BYTE, unmasked_low_byte);
-        table.set_u64(row_idx, cols::MU, *multiplicity);
+        // One row per op, so μ is the Bit the spec declares (1 real / 0 padding).
+        table.set_u64(row_idx, cols::MU, 1);
     }
 
     trace
