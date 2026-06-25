@@ -1,12 +1,6 @@
-//! Parity: GPU LDE + GPU Keccak leaf hash + GPU Merkle tree must produce the
-//! same root as the CPU row-major LDE path introduced in PR #650
-//! (`coset_lde_full_expand_row_major` + `commit_rows_bit_reversed`).
-//!
-//! This is the end-to-end checkpoint that closes the CPU/GPU commitment parity
-//! gap: the GPU fused pipeline commits on-device (before `columns_to_row_major`
-//! is called), so its root must agree with what the CPU path would commit for
-//! the same input columns. Covers both base field (main trace) and ext3
-//! (aux trace).
+//! GPU LDE + GPU Keccak leaf hash + GPU Merkle tree must produce the same root
+//! as the CPU row-major LDE path (`coset_lde_full_expand_row_major` +
+//! `commit_rows_bit_reversed`). Covers base field (main trace) and ext3 (aux trace).
 
 use math::fft::two_half_fft::TwoHalfTwiddles;
 use math::field::element::FieldElement;
@@ -207,13 +201,10 @@ fn gpu_ext3_merkle_root(columns: &[Vec<Fp3>], blowup: usize, weights: &[u64]) ->
         .expect("GPU ext3 LDE");
     }
 
-    // GPU keccak_leaves_ext3 expects columns interleaved as [a0,b0,c0, a1,b1,c1, ...]
-    // of length 3*lde_size per column, packed into one slab per column.
-    // flat layout: [col * 3 * stride + component * stride + row]
+    // Repack from interleaved [a,b,c per element] to component-major
+    // [all-a, all-b, all-c] as keccak_leaves_ext3 expects.
     let mut flat_for_keccak = vec![0u64; num_cols * 3 * lde_size];
     for (c, out) in flat_outputs.iter().enumerate() {
-        // out is [a0,b0,c0, a1,b1,c1, ...] (interleaved per element)
-        // GPU keccak expects [col*3+comp]*stride + row (component-major)
         for r in 0..lde_size {
             flat_for_keccak[(c * 3) * lde_size + r] = out[r * 3];
             flat_for_keccak[(c * 3 + 1) * lde_size + r] = out[r * 3 + 1];

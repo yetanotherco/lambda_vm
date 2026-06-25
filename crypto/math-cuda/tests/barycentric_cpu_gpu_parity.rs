@@ -1,9 +1,6 @@
-//! Parity: GPU barycentric kernel (`barycentric_base` / `barycentric_ext3`)
-//! must produce the same OOD evaluation as the CPU path used in
-//! `get_trace_evaluations_from_lde` (`interpolate_coset_eval_ext_with_g_n_inv`).
-//!
-//! The existing `barycentric_strided` test verifies GPU strided == GPU
-//! non-strided. This test closes the remaining gap: GPU kernel == CPU formula.
+//! GPU barycentric kernels (`barycentric_base` / `barycentric_ext3`) must produce
+//! the same OOD evaluation as the CPU formula in `get_trace_evaluations_from_lde`
+//! (`interpolate_coset_eval_ext_with_g_n_inv`). Covers base field and ext3.
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;

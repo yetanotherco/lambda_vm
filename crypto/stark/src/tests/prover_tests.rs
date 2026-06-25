@@ -521,13 +521,6 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
     }
 }
 
-// Verify that the row-major commit path (used by the CPU LDE after the row-major
-// rework) and the column-major commit path (used by the GPU fused pipeline, which
-// builds its Merkle tree on-device from the same column layout) produce identical
-// Merkle roots for the same data. This closes the CPU/GPU commitment parity gap
-// raised in review: the GPU never calls commit_rows_bit_reversed directly (it
-// commits inline on-device), but the row-major buffer it hands off via
-// columns_to_row_major must be consistent with what the CPU path would commit.
 #[test]
 fn commit_rows_bit_reversed_matches_commit_columns_bit_reversed() {
     type F = GoldilocksField;
