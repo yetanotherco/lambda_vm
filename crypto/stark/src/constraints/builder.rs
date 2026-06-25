@@ -12,6 +12,7 @@
 
 use crate::constraints::row_view::RowView;
 use crate::frame::Frame;
+use crate::lookup::PackingShifts;
 use crate::trace::LDETraceTable;
 use crate::traits::ZerofierEvaluations;
 use math::field::{
@@ -43,6 +44,26 @@ pub trait ConstraintBuilder {
     fn fold(&mut self, residual: FieldElement<Self::F>);
     /// Fold an extension-field (LogUp) constraint residual.
     fn fold_ext(&mut self, residual: FieldElement<Self::E>);
+}
+
+/// Row-independent context a table's `eval` reads alongside the builder: LogUp
+/// challenges and the periodic-column values at the current row. Passed as a second
+/// argument to the eval so the builder stays focused on row access + folding.
+///
+/// `F` is the main field (base on the prover, extension on the verifier), `E` the
+/// extension — matching the builder's associated types.
+#[derive(Clone, Copy)]
+pub struct ConstraintContext<'a, F: IsField, E: IsField> {
+    /// RAP/LogUp challenges (e.g. `z = rap_challenges[0]`).
+    pub rap_challenges: &'a [FieldElement<E>],
+    /// Precomputed powers of the LogUp `alpha` challenge.
+    pub logup_alpha_powers: &'a [FieldElement<E>],
+    /// `table_contribution / N`, added by the LogUp accumulated constraint.
+    pub logup_table_offset: &'a FieldElement<E>,
+    /// Precomputed packing-shift constants for fingerprint combining.
+    pub packing_shifts: &'a PackingShifts<F>,
+    /// Periodic-column values at the current row.
+    pub periodic: &'a [FieldElement<F>],
 }
 
 /// Folds a table's constraints at one LDE row into the composition value.
@@ -230,9 +251,9 @@ where
     E: IsField,
 {
     /// Fold every residual of this table into the prover folder (over the LDE).
-    fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, E>);
+    fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, E>, ctx: &ConstraintContext<F, E>);
     /// Fold every residual of this table into the verifier folder (at `z`).
-    fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<E>);
+    fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<E>, ctx: &ConstraintContext<E, E>);
 }
 
 #[cfg(test)]
@@ -405,10 +426,10 @@ mod tests {
 
     struct DummyTable;
     impl TableConstraints<F, F> for DummyTable {
-        fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, F>) {
+        fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, F>, _ctx: &ConstraintContext<F, F>) {
             fold_main0_then_aux0(cb);
         }
-        fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<F>) {
+        fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<F>, _ctx: &ConstraintContext<F, F>) {
             fold_main0_then_aux0(cb);
         }
     }
@@ -418,6 +439,15 @@ mod tests {
     #[test]
     fn table_constraints_dispatches_to_both_builders_via_box() {
         let table: Box<dyn TableConstraints<F, F>> = Box::new(DummyTable);
+        let zero = fe(0);
+        let shifts = PackingShifts::<F>::new();
+        let ctx = ConstraintContext {
+            rap_challenges: &[],
+            logup_alpha_powers: &[],
+            logup_table_offset: &zero,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
 
         // Prover side: fold over a 1-col LDE at row 2.
         let n = 4;
@@ -435,7 +465,7 @@ mod tests {
         };
         let coeffs = [fe(100), fe(200)];
         let mut pcb = ProverConstraintBuilder::<F, F>::new(&lde, 2, &zerofier, &coeffs);
-        table.eval_prover(&mut pcb);
+        table.eval_prover(&mut pcb, &ctx);
         let prover_expected = &zerofier.groups[0][2] * &fe(3) * &coeffs[0]
             + &zerofier.groups[1][2] * &fe(52) * &coeffs[1];
         assert_eq!(pcb.finish(), prover_expected);
@@ -446,9 +476,71 @@ mod tests {
         let frame = Frame::new(vec![step0, step1]);
         let zerofiers_z = [fe(5), fe(17)];
         let mut vcb = VerifierConstraintBuilder::<F>::new(&frame, &zerofiers_z, &coeffs);
-        table.eval_verifier(&mut vcb);
+        table.eval_verifier(&mut vcb, &ctx);
         let verifier_expected =
             &zerofiers_z[0] * &fe(3) * &coeffs[0] + &zerofiers_z[1] * &fe(52) * &coeffs[1];
         assert_eq!(vcb.finish(), verifier_expected);
+    }
+
+    /// A generic eval that reads a LogUp challenge from the context: fold main[0]
+    /// (domain) and aux[0]*z (logup), proving the context is threaded through.
+    fn fold_with_challenge<CB: ConstraintBuilder>(
+        cb: &mut CB,
+        ctx: &ConstraintContext<CB::F, CB::E>,
+    ) {
+        let m = cb.main(0).clone();
+        cb.fold(m);
+        let weighted = cb.aux(0) * &ctx.rap_challenges[0];
+        cb.fold_ext(weighted);
+    }
+
+    struct ChallengeTable;
+    impl TableConstraints<F, F> for ChallengeTable {
+        fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, F>, ctx: &ConstraintContext<F, F>) {
+            fold_with_challenge(cb, ctx);
+        }
+        fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<F>, ctx: &ConstraintContext<F, F>) {
+            fold_with_challenge(cb, ctx);
+        }
+    }
+
+    /// The eval reads `ctx.rap_challenges[0]` and folds with it — verifies context
+    /// threading end-to-end through TableConstraints (prover side).
+    #[test]
+    fn eval_reads_challenge_from_context() {
+        let n = 4;
+        let main_columns: Vec<Vec<FieldElement<F>>> =
+            vec![(0..n).map(|r| fe(r as u64 + 1)).collect()];
+        let aux_columns: Vec<Vec<FieldElement<F>>> =
+            vec![(0..n).map(|r| fe(50 + r as u64)).collect()];
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, aux_columns, 1, 1);
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![
+                vec![fe(2), fe(3), fe(5), fe(7)],
+                vec![fe(11), fe(13), fe(17), fe(19)],
+            ],
+            constraint_to_group: vec![0, 1],
+        };
+        let coeffs = [fe(100), fe(200)];
+
+        let z = fe(9);
+        let shifts = PackingShifts::<F>::new();
+        let zero = fe(0);
+        let rap = [z.clone()];
+        let ctx = ConstraintContext {
+            rap_challenges: &rap,
+            logup_alpha_powers: &[],
+            logup_table_offset: &zero,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
+
+        let table = ChallengeTable;
+        let mut pcb = ProverConstraintBuilder::<F, F>::new(&lde, 2, &zerofier, &coeffs);
+        table.eval_prover(&mut pcb, &ctx);
+
+        let expected = &zerofier.groups[0][2] * &fe(3) * &coeffs[0]
+            + &zerofier.groups[1][2] * &(&fe(52) * &z) * &coeffs[1];
+        assert_eq!(pcb.finish(), expected);
     }
 }
