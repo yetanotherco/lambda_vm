@@ -57,8 +57,10 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--private-input <FILE>` | Pass private input bytes to the guest. |
 | `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. [default: 2] |
 | `--time` | Print total proving time. |
-| `--cycles` | Run one extra pre-pass outside the timer and print the dynamic instruction count. |
+| `--cycles` | Run one extra execution outside the timer and print the dynamic instruction count. |
 | `--elements` | Build traces and print main-trace and aux-trace field element counts. |
+| `--continuations` | Prove as a continuation bundle split into fixed-size epochs. |
+| `--epoch-size-log2 <N>` | Continuation epoch size as `2^N` cycles. Requires `--continuations`. Defaults to `20`; values below `18` are rejected. |
 
 ### Verify
 
@@ -72,6 +74,7 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 |---|---|
 | `--blowup <N>` | FRI blowup factor used during proving. Must match. [default: 2] |
 | `--time` | Print verification time. |
+| `--continuations` | Verify a continuation proof bundle produced by `prove --continuations`. |
 
 Returns exit code `0` on successful verification, `1` on failure.
 
@@ -96,9 +99,20 @@ cargo run -p cli --release -- execute executor/program_artifacts/asm/add.elf
 cargo run -p cli --release -- prove executor/program_artifacts/asm/add.elf -o /tmp/proof.bin
 cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/asm/add.elf
 
+# Generate and verify a continuation proof
+cargo run -p cli --release -- prove program.elf -o /tmp/cont.bin --continuations --epoch-size-log2 20
+cargo run -p cli --release -- verify /tmp/cont.bin program.elf --continuations
+
 # Prove with private input and print metrics
 cargo run -p cli --release -- prove program.elf -o /tmp/proof.bin --private-input input.bin --time --cycles
 ```
+
+For continuation proofs, `--epoch-size-log2` is the power in `2^N` cycles. Larger
+values reduce epoch count and fixed per-epoch overhead, but increase peak memory.
+As rough ethrex 10-transfer distinct-account reference points from a local sweep:
+`19` used about 6.9 GB peak heap, `20` about 9.5 GB, `21` about 15.8 GB, and `22`
+about 26.8 GB. For a new workload, use the highest value the machine can run
+without swapping.
 
 ## Guest Program Flamegraphs
 

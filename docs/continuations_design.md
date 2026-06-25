@@ -496,8 +496,11 @@ Merkle/hash collision, a bus imbalance, or a Fiat-Shamir divergence.
 The bundle derives serde and round-trips through `bincode` (exactly like a
 monolithic `VmProof`); the CLI drives it via `prove --continuations` (writes the
 bundle) and `verify --continuations` (checks bundle + ELF only). `prove` picks the
-epoch size from `--epoch-size`, or `--num-epochs` (split into N), defaulting to 4
-epochs via a cycle pre-pass.
+epoch size from `--epoch-size-log2 N` (`N=20` means 1,048,576 cycles), defaulting
+to `20`. A local ethrex 10-transfer distinct-account
+sweep measured peak heap at roughly 6.9 GB (`19`), 9.5 GB (`20`), 15.8 GB (`21`),
+and 26.8 GB (`22`); pick the highest value the workload and machine can run
+without swapping.
 
 **Limitation — not succinct.** The bundle carries, and the verifier checks, all *N*
 epoch proofs plus the global proof. Continuations keep peak *prover* memory flat;
