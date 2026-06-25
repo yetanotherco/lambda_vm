@@ -29,8 +29,10 @@
 //! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
 //! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
 //! driver concatenates each epoch's committed bytes into the run-wide output.
-//! Still deferred: a standalone split prover/verifier (the prove and verify halves
-//! currently run in one integrated function).
+//!
+//! The prover and verifier are split: `prove_continuation` emits a self-contained
+//! `ContinuationProof` bundle and `verify_continuation` checks it from the bundle
+//! and ELF alone (`prove_and_verify_continuation` is a thin wrapper over both).
 
 use std::collections::HashMap;
 

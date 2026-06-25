@@ -1,12 +1,13 @@
 # Continuations (Approach 2) — design
 
 This is the single design document for the "continuations" prover (Approach 2,
-"prove-epoch" from the streaming spec). It covers the three things a continuation
-must carry across epoch boundaries — **memory** (the bulk of the doc: §1–§5,
-including the cross-epoch local-to-global table and the Design X vs Design Y
-decision), **registers** (§6), and the **Fiat-Shamir statement binding** (§7) that
-ties each epoch proof to its program and position — plus the soundness mechanisms
-that make each safe.
+"prove-epoch" from the streaming spec). It covers the things a continuation must
+carry across epoch boundaries — **memory** (the bulk of the doc: §1–§5, including
+the cross-epoch local-to-global table and the Design X vs Design Y decision),
+**registers** including the commit index x254 (§6), and the **Fiat-Shamir statement
+binding** (§7) that ties each epoch proof to its program and position — plus the
+soundness mechanisms that make each safe. §8 describes the **standalone (split)
+prover/verifier** that checks a proof bundle with only the ELF.
 
 It is written to be read by a human picking this up cold.
 
@@ -199,6 +200,31 @@ Fix: a selector column `MU` (1 on real rows, 0 on padding). Interactions gated b
 rows by bus balance (a real row with `MU=0` drops its telescoping link →
 imbalance).
 
+### 3.5 CPU padding and the power-of-two epoch size
+
+The CPU table is padded to a power of two (the same FFT requirement). After the
+inline-PC rework, padding rows are **not** inert: each carries `pc = 1` and
+reads/writes it on the inline-PC `memory` chain, and that chain is anchored only by
+the HALT chip's `consume_pc`/`emit_pc` — which converts the last real `next_pc`
+into the `pc = 1` sentinel the padding rows expect.
+
+An **intermediate** continuation epoch excludes HALT (only the *final* epoch
+halts). So if an intermediate epoch had padding rows, their `pc = 1` tokens would
+dangle — no HALT to anchor them, and the REGISTER FINI carries the real next PC,
+not `1` — and the Memory bus would not balance. The honest prover could not produce
+a verifying proof.
+
+Fix: **epoch size is rounded up to a power of two** (`next_power_of_two().max(4)`).
+An intermediate epoch runs *exactly* `epoch_size` cycles, so its CPU table already
+has a power-of-two row count and therefore **zero padding rows** — nothing to
+dangle. The final epoch keeps its remainder *and* its HALT, so its padding chain is
+anchored as usual. A program shorter than one epoch runs as a single final
+(monolithic-style) epoch.
+
+This is a **completeness** fix: it changes no constraint and nothing the verifier
+accepts — only how the driver slices cycles. A debug-assert enforces the
+"intermediate epoch ⟹ power-of-two cycle count" invariant.
+
 ---
 
 ## 4. Design X vs Design Y — *where* `MU` is applied
@@ -377,6 +403,25 @@ to the next epoch is pinned to real execution.
 The **monolithic prover is unchanged**: it keeps FINI as a main-trace column (it
 has no verifier-known final state) and preprocesses 2 columns, not 3.
 
+### Commit index (x254)
+
+The COMMIT chip's running output index lives in a synthetic single-word register
+**x254** (word-address 508), so it rides the **same** register binding above —
+epoch *i*'s `FINI[x254]` becomes epoch *i+1*'s `INIT[x254]`, pinned by the two
+locks like any register. Each epoch therefore indexes its committed bytes from the
+*carried* value, not from `0`:
+
+- the COMMIT trace seeds `current_commit_index` from x254
+  (`register_state.read_index()` in `trace_builder.rs`), with a debug-assert
+  pinning the two in sync every step;
+- the verifier's commit-bus offset (`compute_commit_bus_offset`'s `start_index`)
+  starts at the same carried x254.
+
+The driver concatenates each epoch's committed slice into the run-wide output.
+Because every slice is commit-bus-bound *and* the x254 indices are forced
+contiguous (`init(i+1) == fini(i)`), the concatenation equals the true output
+stream — no separate global "commit output" bus is needed.
+
 ---
 
 ## 7. Fiat-Shamir statement binding
@@ -396,35 +441,94 @@ The monolithic encoding is unchanged (same function, monolithic tag, no label).
 The genesis / register / memory anchor values are *additionally* bound via the
 preprocessed commitments absorbed during proving.
 
-Note: this is sound for the **integrated** prove+verify path (one process). A
-standalone *split* verifier must carry these statement fields in the proof and
-take the epoch label / count from a trusted enumeration — deferred (§8).
+The standalone *split* verifier (§8) carries these statement fields in the proof
+bundle and takes the epoch label / count from its own trusted enumeration, so the
+binding holds there too — not just on the integrated path.
 
 ---
 
-## 8. Status and open items
+## 8. Standalone (split) prover/verifier
+
+The continuation can be proved and verified by separate parties. `prove_continuation`
+emits a self-contained `ContinuationProof` bundle; `verify_continuation(elf, &bundle)`
+checks it using **only the bundle and the ELF** — nothing from the prover's memory.
+The integrated `prove_and_verify_continuation` is now a thin wrapper
+(`prove_continuation` then `verify_continuation`), and `prove_verify_epoch` is
+likewise split into `prove_epoch` + `verify_epoch`.
+
+The bundle is prover-supplied and therefore **untrusted**. Per epoch it carries the
+`MultiProof`, the `public_output` slice, `table_counts`, `page_configs`,
+`num_private_input_pages`, `runtime_page_ranges`, the bound `reg_fini` (`R_{i+1}`),
+the epoch `l2g_root`, and the touched-cell `boundary`; plus the global `MultiProof`
+and the `private_inputs`. Everything the integrated path reused from prover memory
+becomes an **explicit verifier action**:
+
+- **Enumerate, don't trust.** The verifier assigns each epoch's `label` and the
+  `is_final` flag **by position** (`0..N-1`; the last is final), so the prover can't
+  relabel, reorder, truncate, or append epochs — a wrong label diverges that epoch's
+  Fiat-Shamir challenges, and a wrong `is_final` builds the HALT table in/out and
+  mismatches the committed proof.
+- **Derive the register / x254 chain.** Epoch 0's register INIT is derived from the
+  ELF entry point; epoch *i+1*'s INIT is derived from epoch *i*'s bundle `reg_fini`
+  (incl. x254 @ 508). So `init(i+1) == fini(i)` is now *enforced by the verifier
+  rebuilding the AIR from the previous FINI* (via the shared `build_epoch_airs`),
+  not merely true-by-construction. The commit-bus `start_index` is taken from the
+  carried `register_init[508]`, not a free scalar.
+- **Genesis from the ELF.** `verify_global` rebuilds the memory genesis from the ELF
+  (+ bundle private inputs) and closes the GlobalMemory bus;
+  `verify_l2g_commitment_binding` ties each epoch's `l2g_root` to the corresponding
+  global-proof sub-table root — which is what makes the prover-supplied `boundary`
+  trustworthy.
+- **Reconstruct the output** by concatenating the per-epoch commit slices (each
+  commit-bus-bound, contiguous via the x254 chain).
+- The verifier also `validate()`s `table_counts` and never trusts a prover-supplied
+  page config (continuation epochs have none — PAGE is skipped under the L2G
+  bookend, so `page_configs` is always empty).
+
+A single `build_epoch_airs` helper builds the AIR set identically on both sides, so
+prove and verify cannot diverge.
+
+**Reviewed.** An adversarial "construct-a-break" audit (Phase-3 dismissal audit with
+fresh agents) of the register/x254 chain, the L2G root binding, and
+completeness-by-enumeration found no false-accept: each forgery is caught by a
+Merkle/hash collision, a bus imbalance, or a Fiat-Shamir divergence.
+
+The bundle derives serde and round-trips through `bincode` (exactly like a
+monolithic `VmProof`); the CLI drives it via `prove --continuations` (writes the
+bundle) and `verify --continuations` (checks bundle + ELF only). `prove` picks the
+epoch size from `--epoch-size`, or `--num-epochs` (split into N), defaulting to 4
+epochs via a cycle pre-pass.
+
+**Limitation — not succinct.** The bundle carries, and the verifier checks, all *N*
+epoch proofs plus the global proof. Continuations keep peak *prover* memory flat;
+they do **not** shrink proof size or verify time. A single succinct proof needs a
+recursion/aggregation layer (deferred).
+
+---
+
+## 9. Status and open items
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
-  ordering check (§3.3), the `MU` selector (§3.4), **cross-epoch registers** (§6),
-  and the **Fiat-Shamir statement binding** (§7).
+  ordering check (§3.3), the `MU` selector (§3.4), the **power-of-two epoch size**
+  (§3.5), **cross-epoch registers** (§6), the **commit index x254** across epochs
+  (§6), the **Fiat-Shamir statement binding** (§7), and the **standalone split
+  prover/verifier** (§8) — bundle serialized with `bincode` and driven from the CLI
+  (`prove`/`verify --continuations`).
 - **The committed code implements Design X** (`MU` gates every L2G interaction),
   which is the sound design. Design Y was implemented briefly, then found unsound
   (§4, the chain-truncation attack) and **reverted**. Do not re-introduce the
   Design Y wiring: gating only the GlobalMemory bus reopens the orphan attack.
-- Deferred (independent of the memory work):
-  - **A standalone (split) continuation verifier.** Today prove and verify run in
-    one integrated function, so the statement/boundary values are reused from the
-    prover's in-memory state. A split verifier must carry them in the proof and
-    re-bind them (and supply the epoch label / count from a trusted enumeration),
-    and the global proof must also commit to the boundary *content*, not just the
-    ELF + epoch count.
-  - **x254 (commit index) across an epoch boundary.** Its value is now carried by
-    the register binding (§6), but the COMMIT machinery across a boundary is not
-    yet tested.
+- Deferred:
+  - **Succinctness.** The split verifier is non-succinct (N+1 proofs, §8). A single
+    small proof needs a recursion/aggregation layer — a separate, larger effort.
+  - **Private-input binding.** The genesis image depends on `private_inputs`, which
+    the bundle carries in the clear; binding them into the statement (so "which input
+    produced this output" is pinned) is a follow-up that also touches the monolithic
+    proof.
 
 ---
 
-## 9. Where the code lives
+## 10. Where the code lives
 
 - `prover/src/tables/local_to_global.rs` — L2G columns, trace generation, the
   Memory/GlobalMemory bus interactions, range checks, the ordering lookup, and
@@ -436,7 +540,16 @@ take the epoch label / count from a trusted enumeration — deferred (§8).
   `NUM_PREPROCESSED_COLS_WITH_FINI`), and `fini_from_trace`.
 - `prover/src/statement.rs` — the Fiat-Shamir statement absorbers
   (`absorb_statement` with `StatementKind`, `absorb_continuation_global_statement`).
-- `prover/src/continuation.rs` — the epoch loop, per-epoch proofs
-  (`prove_verify_epoch`), the global proof (`prove_global` / `verify_global`),
-  the per-epoch AIRs (`l2g_memory_air` / `l2g_global_air`), the register-FINI
-  preprocessing, the transcript seeding, and the commitment binding.
+- `prover/src/continuation.rs` — the split prover/verifier: `prove_continuation` /
+  `verify_continuation` and the `ContinuationProof` bundle; the per-epoch
+  `prove_epoch` / `verify_epoch` with the shared `build_epoch_airs` helper; the
+  global proof (`prove_global` / `verify_global`); the per-epoch AIRs
+  (`l2g_memory_air` / `l2g_global_air`); the power-of-two epoch rounding
+  (`next_power_of_two().max(4)`); the register-FINI preprocessing; the transcript
+  seeding; and `prove_and_verify_continuation` (the thin integrated wrapper).
+- `prover/src/lib.rs` — `verify_l2g_commitment_binding` (epoch L2G root ↔ global
+  sub-table root) and the commit-bus offset/balance helpers
+  (`compute_commit_bus_offset`, `compute_expected_commit_bus_balance`) that take the
+  carried x254 as `start_index`.
+- `prover/src/tables/trace_builder.rs` — seeds `current_commit_index` from x254
+  (`read_index`) so committed-byte indexing carries across epochs.

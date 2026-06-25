@@ -683,9 +683,8 @@ pub(crate) fn compute_expected_commit_bus_balance(
 /// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
 /// the very same L2G tables the epochs committed (shared commitments).
 ///
-/// Not yet wired into a production verify entry point (the per-epoch continuation
-/// verifier is forthcoming); exercised by the local-to-global bus tests.
-#[allow(dead_code)]
+/// Called by `continuation::verify_continuation`; also exercised by the
+/// local-to-global bus tests.
 pub(crate) fn verify_l2g_commitment_binding(
     epoch_l2g_roots: &[Commitment],
     final_proof: &MultiProof<F, E, ()>,
