@@ -25,17 +25,21 @@
 #   scripts/bench_abba.sh [REF_A] [REF_B] [N_PAIRS]
 #     REF_A    PR ref     (default: origin/perf/logup-fingerprint-constants, PR #696)
 #     REF_B    baseline   (default: origin/main)
-#     N_PAIRS  pairs      (default: 16 -> 32 runs; use 24 for a ~40-min ethrex run)
+#     N_PAIRS  pairs      (default: 20 -> 40 runs, ~33 min on ethrex)
 #   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
 #
-#   scripts/bench_abba.sh                                   # PR #696 vs main, 16 pairs
-#   scripts/bench_abba.sh origin/perf/logup-fingerprint-constants origin/main 24
+#   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
+#   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
+#   (if a 20-pair run straddles 0 on a ~0.6%-looking effect, extend to 32).
+#
+#   scripts/bench_abba.sh                                   # PR #696 vs main, 20 pairs
+#   scripts/bench_abba.sh origin/perf/logup-fingerprint-constants origin/main 32
 
 set -euo pipefail
 
 REF_A="${1:-origin/perf/logup-fingerprint-constants}"
 REF_B="${2:-origin/main}"
-N_PAIRS="${3:-16}"
+N_PAIRS="${3:-20}"
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 INPUT_REL="executor/tests/ethrex_bench_20.bin"
