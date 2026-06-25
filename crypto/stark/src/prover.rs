@@ -835,32 +835,30 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-        // Fused GPU path (cuda only): extract columns and try the on-device
-        // pipeline; on success it returns the LDE + tree directly.
+        // Fused GPU path (cuda only): single H2D of the row-major trace, on-device
+        // transpose + NTT + Keccak + Merkle, on-device transpose back, single D2H.
+        // Eliminates extract_columns_main and columns_to_row_major on the host.
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
-            let mut columns = trace.extract_columns_main(lde_size);
+            let (trace_slice, num_cols) = trace.main_data_row_major();
+            let n = trace_slice.len() / num_cols.max(1);
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            if let Some((tree, handle)) =
-                crate::gpu_lde::try_expand_leaf_and_tree_batched_keep::<
+            if let Some((tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
                     Field,
                     Field,
                     BatchedMerkleTreeBackend<Field>,
-                >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
+                >(trace_slice, n, num_cols, domain.blowup_factor, &twiddles.coset_weights)
             {
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 let root = tree.root;
-                // GPU fused pipeline: LDE + Keccak + Merkle all run on-device in
-                // one timed block. Bill the full duration to LDE and zero to Merkle
-                // so the report shows the true fused time once, not doubled.
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
-                let (main_data, total_cols) = columns_to_row_major(&columns);
                 return Ok((
                     TableCommit::plain(tree, root),
-                    (main_data, total_cols),
+                    (main_data, num_cols),
                     Some(handle),
                 ));
             }

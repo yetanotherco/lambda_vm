@@ -285,3 +285,73 @@ extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
     // Store back to the remapped row.
     x[row] = tile[threadIdx.x];
 }
+
+// ============================================================================
+// MATRIX TRANSPOSE
+//
+// Tiled 32×32 transpose with +1 padding to avoid shared-memory bank conflicts.
+// Used to convert the trace buffer between row-major (host layout) and
+// column-major (NTT layout) without touching main memory twice on the CPU.
+//
+// matrix_transpose: (rows × cols) → (cols × rows)
+//   src[r * cols + c]  →  dst[c * rows + r]
+//
+// Launch with a 2-D grid of (ceil(cols/32), ceil(rows/32)) blocks,
+// each block 32×32 threads (1024 threads per block).
+// ============================================================================
+
+#define MTILE 32
+#define MTILE_P (MTILE + 1)
+
+extern "C" __global__ void matrix_transpose(
+    const uint64_t *__restrict__ src,
+    uint64_t *__restrict__ dst,
+    uint32_t rows,
+    uint32_t cols)
+{
+    __shared__ uint64_t tile[MTILE][MTILE_P];
+
+    uint32_t x = blockIdx.x * MTILE + threadIdx.x;  // col in src
+    uint32_t y = blockIdx.y * MTILE + threadIdx.y;  // row in src
+
+    if (x < cols && y < rows)
+        tile[threadIdx.y][threadIdx.x] = src[(uint64_t)y * cols + x];
+
+    __syncthreads();
+
+    // Transposed coordinates: this thread now writes element at
+    // (blockIdx.x * MTILE + threadIdx.y, blockIdx.y * MTILE + threadIdx.x)
+    // in the output (cols × rows) matrix.
+    uint32_t tx = blockIdx.y * MTILE + threadIdx.x;  // row in dst (= col in src tile)
+    uint32_t ty = blockIdx.x * MTILE + threadIdx.y;  // col in dst (= row in src tile)
+
+    if (tx < rows && ty < cols)
+        dst[(uint64_t)ty * rows + tx] = tile[threadIdx.x][threadIdx.y];
+}
+
+// Like matrix_transpose but the output column stride is `out_stride` instead
+// of `rows`. Used to scatter the row-major trace directly into the LDE buffer
+// (where col_stride = lde_size >= n): element src[r*cols + c] → dst[c*out_stride + r].
+extern "C" __global__ void matrix_transpose_strided(
+    const uint64_t *__restrict__ src,
+    uint64_t *__restrict__ dst,
+    uint32_t rows,
+    uint32_t cols,
+    uint64_t out_stride)
+{
+    __shared__ uint64_t tile[MTILE][MTILE_P];
+
+    uint32_t x = blockIdx.x * MTILE + threadIdx.x;
+    uint32_t y = blockIdx.y * MTILE + threadIdx.y;
+
+    if (x < cols && y < rows)
+        tile[threadIdx.y][threadIdx.x] = src[(uint64_t)y * cols + x];
+
+    __syncthreads();
+
+    uint32_t tx = blockIdx.y * MTILE + threadIdx.x;
+    uint32_t ty = blockIdx.x * MTILE + threadIdx.y;
+
+    if (tx < rows && ty < cols)
+        dst[(uint64_t)ty * out_stride + tx] = tile[threadIdx.x][threadIdx.y];
+}
