@@ -39,6 +39,8 @@ pub trait ConstraintBuilder {
     fn aux(&self, col: usize) -> &FieldElement<Self::E>;
     /// Next-row aux cell — only the LogUp running-sum constraint needs this.
     fn aux_next(&self, col: usize) -> &FieldElement<Self::E>;
+    /// Next-row main cell — only the LogUp running-sum (absorbed interactions) needs this.
+    fn main_next(&self, col: usize) -> &FieldElement<Self::F>;
 
     /// Fold a base-field (domain) constraint residual.
     fn fold(&mut self, residual: FieldElement<Self::F>);
@@ -143,6 +145,11 @@ where
         self.view.get_aux(1, 0, col)
     }
 
+    #[inline]
+    fn main_next(&self, col: usize) -> &FieldElement<F> {
+        self.view.get_main(1, 0, col)
+    }
+
     /// Accumulate `residual · coeff[idx]` into this constraint's zerofier-group running
     /// sum; the shared zerofier is applied once per group in `finish`.
     fn fold(&mut self, residual: FieldElement<F>) {
@@ -220,6 +227,13 @@ impl<'a, E: IsField> ConstraintBuilder for VerifierConstraintBuilder<'a, E> {
         self.frame
             .get_evaluation_step(1)
             .get_aux_evaluation_element(0, col)
+    }
+
+    #[inline]
+    fn main_next(&self, col: usize) -> &FieldElement<E> {
+        self.frame
+            .get_evaluation_step(1)
+            .get_main_evaluation_element(0, col)
     }
 
     /// `acc += zerofier_z[idx] · residual · coeff[idx]`, mirroring `verifier.rs`'s

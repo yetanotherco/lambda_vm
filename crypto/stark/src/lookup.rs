@@ -1757,24 +1757,49 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 /// Fingerprint `z - (bus_id*a^0 + sum values*a^k)` for an interaction, read through a
 /// [`ConstraintBuilder`] (current row). Builder analogue of
 /// [`compute_fingerprint_from_step`] — same value, byte-identical.
+/// Fingerprint `z - (bus_id*a^0 + sum values*a^k)` for an interaction, reading cells
+/// through `get_main` — current row (`cb.main`) for most constraints, next row
+/// (`cb.main_next`) for the absorbed interactions of the accumulated constraint.
+fn logup_fingerprint_read<'a, F, E, G>(
+    get_main: &G,
+    interaction: &BusInteraction,
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+    shifts: &PackingShifts<F>,
+) -> FieldElement<E>
+where
+    F: IsField + IsSubFieldOf<E> + 'a,
+    E: IsField,
+    G: Fn(usize) -> &'a FieldElement<F>,
+{
+    let mut linear_combination = FieldElement::<F>::from(interaction.bus_id) * &alpha_powers[0];
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        alpha_idx += bv.accumulate_fingerprint_with(
+            get_main,
+            alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+            shifts,
+        );
+    }
+    z - &linear_combination
+}
+
+/// Fingerprint for an interaction read at the current row through a `ConstraintBuilder`.
+/// Builder analogue of [`compute_fingerprint_from_step`] — same value, byte-identical.
 fn logup_fingerprint<CB: ConstraintBuilder>(
     cb: &CB,
     interaction: &BusInteraction,
     ctx: &ConstraintContext<CB::F, CB::E>,
 ) -> FieldElement<CB::E> {
-    let bus_id_f = FieldElement::<CB::F>::from(interaction.bus_id);
-    let mut linear_combination = bus_id_f * &ctx.logup_alpha_powers[0];
-    let mut alpha_idx = 1;
-    for bv in &interaction.values {
-        alpha_idx += bv.accumulate_fingerprint_with(
-            |col| cb.main(col),
-            ctx.logup_alpha_powers,
-            alpha_idx,
-            &mut linear_combination,
-            ctx.packing_shifts,
-        );
-    }
-    &ctx.rap_challenges[0] - &linear_combination
+    logup_fingerprint_read(
+        &|col| cb.main(col),
+        interaction,
+        &ctx.rap_challenges[0],
+        ctx.logup_alpha_powers,
+        ctx.packing_shifts,
+    )
 }
 
 /// Multiplicity for an interaction, read through a [`ConstraintBuilder`] (current
@@ -1808,6 +1833,73 @@ fn logup_batched_term<CB: ConstraintBuilder>(
     let term_b = if interaction_b.is_sender { term_b } else { -term_b };
 
     c * &fp_a * &fp_b - term_a - term_b
+}
+
+/// Accumulated (running-sum) LogUp residual, reading the current AND next rows. The
+/// committed term columns + acc are aux cells; the 1-2 absorbed interactions read
+/// next-row main. Builder analogue of `LookupAccumulatedConstraint::evaluate`
+/// (degree 2 with 1 absorbed, 3 with 2).
+fn logup_accumulated<CB: ConstraintBuilder>(
+    cb: &CB,
+    ctx: &ConstraintContext<CB::F, CB::E>,
+    num_term_columns: usize,
+    absorbed: &[BusInteraction],
+) -> FieldElement<CB::E> {
+    let acc_column_idx = num_term_columns;
+    let terms_sum: FieldElement<CB::E> =
+        (0..num_term_columns).map(|i| cb.aux_next(i).clone()).sum();
+    let delta =
+        cb.aux_next(acc_column_idx) - cb.aux(acc_column_idx) - terms_sum + ctx.logup_table_offset;
+    let z = &ctx.rap_challenges[0];
+
+    match absorbed.len() {
+        1 => {
+            let m = absorbed[0]
+                .multiplicity
+                .evaluate_with(|col| cb.main_next(col).clone());
+            let f = logup_fingerprint_read(
+                &|col| cb.main_next(col),
+                &absorbed[0],
+                z,
+                ctx.logup_alpha_powers,
+                ctx.packing_shifts,
+            );
+            let sign = if absorbed[0].is_sender {
+                FieldElement::<CB::E>::one()
+            } else {
+                -FieldElement::<CB::E>::one()
+            };
+            delta * &f - m * sign
+        }
+        2 => {
+            let m1 = absorbed[0]
+                .multiplicity
+                .evaluate_with(|col| cb.main_next(col).clone());
+            let m2 = absorbed[1]
+                .multiplicity
+                .evaluate_with(|col| cb.main_next(col).clone());
+            let f1 = logup_fingerprint_read(
+                &|col| cb.main_next(col),
+                &absorbed[0],
+                z,
+                ctx.logup_alpha_powers,
+                ctx.packing_shifts,
+            );
+            let f2 = logup_fingerprint_read(
+                &|col| cb.main_next(col),
+                &absorbed[1],
+                z,
+                ctx.logup_alpha_powers,
+                ctx.packing_shifts,
+            );
+            let term1 = m1 * &f2;
+            let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+            let term2 = m2 * &f1;
+            let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+            delta * &f1 * &f2 - term1 - term2
+        }
+        _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+    }
 }
 
 
@@ -2217,6 +2309,76 @@ mod logup_builder_tests {
         let frame = Frame::<F, F>::new(vec![step]);
         let ctx_old =
             TransitionEvaluationContext::new_prover(&frame, &[], &rap, &alpha_powers, &zero, &shifts);
+        let mut evals = [fe(0)];
+        constraint.evaluate_verifier(&ctx_old, &mut evals);
+
+        assert_eq!(got, evals[0]);
+    }
+
+    /// The builder-based logup_accumulated must equal the existing boxed
+    /// LookupAccumulatedConstraint::evaluate over the same two rows (current + next).
+    #[test]
+    fn builder_accumulated_matches_boxed_constraint() {
+        use crate::constraints::transition::TransitionConstraintEvaluator;
+        use crate::frame::Frame;
+
+        let main_r0 = [fe(1), fe(2), fe(3), fe(4)];
+        let main_r1 = [fe(7), fe(11), fe(13), fe(17)];
+        let term_col = [fe(19), fe(31)]; // aux col 0 (committed term) over the two rows
+        let acc_col = [fe(41), fe(43)]; // aux col 1 (accumulated) over the two rows
+        let main_columns: Vec<Vec<FieldElement<F>>> = (0..4)
+            .map(|c| vec![main_r0[c].clone(), main_r1[c].clone()])
+            .collect();
+        let aux_columns: Vec<Vec<FieldElement<F>>> = vec![term_col.to_vec(), acc_col.to_vec()];
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, aux_columns, 1, 1);
+
+        let absorbed = vec![BusInteraction::sender(
+            3u64,
+            Multiplicity::Column(0),
+            Packing::Direct.columns(&[1]),
+        )];
+        let num_term_columns = 1;
+
+        let z = fe(99);
+        let alpha = fe(5);
+        let alpha_powers = compute_alpha_powers(&alpha, 8);
+        let shifts = PackingShifts::<F>::new();
+        let table_offset = fe(5);
+        let rap = [z.clone()];
+
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![vec![fe(1), fe(1)]],
+            constraint_to_group: vec![0],
+        };
+        let coeffs = [fe(1)];
+        let cb = ProverConstraintBuilder::<F, F>::new(&lde, 0, &zerofier, &coeffs);
+        let ctx = ConstraintContext {
+            rap_challenges: &rap,
+            logup_alpha_powers: &alpha_powers,
+            logup_table_offset: &table_offset,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
+        let got = logup_accumulated(&cb, &ctx, num_term_columns, &absorbed);
+
+        let constraint = LookupAccumulatedConstraint::new(0, num_term_columns, absorbed.clone());
+        let step0 = TableView::<F, F>::new(
+            vec![main_r0.to_vec()],
+            vec![vec![term_col[0].clone(), acc_col[0].clone()]],
+        );
+        let step1 = TableView::<F, F>::new(
+            vec![main_r1.to_vec()],
+            vec![vec![term_col[1].clone(), acc_col[1].clone()]],
+        );
+        let frame = Frame::<F, F>::new(vec![step0, step1]);
+        let ctx_old = TransitionEvaluationContext::new_prover(
+            &frame,
+            &[],
+            &rap,
+            &alpha_powers,
+            &table_offset,
+            &shifts,
+        );
         let mut evals = [fe(0)];
         constraint.evaluate_verifier(&ctx_old, &mut evals);
 
