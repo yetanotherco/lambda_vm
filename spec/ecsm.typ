@@ -51,7 +51,7 @@ When $x_P = x_Q$ and $y_P eq.not - y_Q$, one instead uses $lambda = frac(3x_P^2,
 The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the addition results in $#inf$.
 
 = Overview
-This accelerator provides a compact way to prove scalar multiplication $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [2^240, 2^256)$ that induce curves of odd order.
+This accelerator provides a compact way to prove the $x$-coordinate of the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [2^240, 2^256)$ that induce curves of odd order.
 In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 
 #attention("Variable space.")[
@@ -62,7 +62,7 @@ In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 The accelerator comprises two chips:
 - *`ECSM` (Elliptic Curve Scalar Multiply)*.
     This chip is responsible for 
-    - loading $k$ from memory and verifying that is is contained in $[1, N)$,
+    - loading $k$ from memory and verifying that it is contained in $[1, N)$,
     - loading inputs $x_G$ and reconstructing $y_G$,
     - verifying $(k times G)_x < p$, and
     - writing $(k times G)_x$ to memory.
@@ -87,7 +87,7 @@ The chip expects
 - `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,
 - `x12` to contain the address at which the least significant byte of $k$ is to be found,
-where it is assumed that $x_G, x_R$ and $k$ are provided as little-endian.
+where it is assumed that $x_G$ and $k$ are provided as little-endian integers; $x_R$ is written to memory in little-endian form.
 
 == Columns
 #let nr_variables = total_nr_variables(ecsm_chip)
@@ -120,7 +120,7 @@ Rather than reading it from memory, the prover provides it as a witness and prov
 In particular, the chip enforces the relations 
 $
   x_G^2 - #`x2` - q_1 dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - a dot x_G - b + (p - q_2)p &= 0\
+  y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_2)p &= 0\
 $
 where non-negative $q_1$ and $q_2$ are prover-provided witnesses.
 Note that these are equivalent to
@@ -131,15 +131,20 @@ $
 which combine to $y_G^2 equiv x_G^3 + a x_G + b mod p$.
 Rewriting the two relations, we get
 $
-  q_1 &= (x_G^2 - #`x2`) dot p^(-1),\
-  q_2 &= (y_G^2 - x_G dot #`x2` - a dot x_G - b) dot p^(-1) + 2p.
+  q_1 &= (x_G^2 - #`x2`)/p,\
+  q_2 &= (y_G^2 - x_G dot #`x2` - a dot x_G - b)/p + 2p.
 $
-Using the fact that $x_G, y_G, #`x2` in [0, p)$, we find that $q_1 in [0, p)$ and $q_2 in [0, 3p)$.
+Using the fact that $x_G, y_G, #`x2`,a in [0, p)$, we find that $q_1 in [0, p)$ and $q_2 in [0, 3p)$.
 We must therefore support quotients $q_1 in [0, 2^256)$ and $q_2 in [0, 2^258)$.
+
+#aside("Two options for " + $y_G$)[
+  In most cases, $y_G^2$ has _two_ roots $mod p$.
+  This means that enforcing the above relation does not fully constrain the prover: it can choose which of the two to provide as hint.
+  However, in this setting, this is not a problem: the `ECSM`-chip only outputs the $x$-coordinate of $k times G$, which is the same, irrespective of the chosen root.
+]
 
 Below, we enforce the first of the two sub-relations.
 We emphasize here that @ec:c:c1_63_is_zero is required to ensure the sum evaluates to $0$, rather than just $0 mod 2^256$.
-The constraints @ec:c:c1_0 and @ec:c:c1_i, as well as the magic number $8160$ in @ec:c:range_c1 are discussed in @ecsm-limb_carry.
 #render_constraint_table(ecsm_chip, config, groups: "xG2")
 
 Next, we restrict the witness pair $(y_G, #`q1`)$.
@@ -174,9 +179,35 @@ We read `addr_xR` from register `x10` (@ec:c:load_addr_xR), and subsequently wri
 Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` to equal `addr_xG` and thus for $x_R$ to overwrite $x_G$ in memory.
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
-== Carry offset
-#et[Finish this]
-$#`offsets` = [65535, 8160, 24478]$
+== Carry offsets
+We close by deriving the values of `carry_offsets`.
+We start with the formula
+$
+  #`raw_xG` - #`xG` - q_0 dot p &= 0\
+$
+which we decompose in terms of the positive and negative components to find
+$
+  #`raw_xG` - (#`xG` + q_0 dot p) &= 0.
+$
+We can now apply @limbs:cor:carry-upper-bound with $(L, n) = (2^32, 8)$ to compute the maximum contribution of the two components to the carry.
+From this we gather that $#`c0`_i &in [-2^19+8, 1]$.
+Selecting $#`carry_offsets[0]` = 2^19-8$, 
+we arrive at
+$
+  #`c0`_i + #`carry_offsets[0]` &in [0, 2^19-7] subset.eq [2^20].
+$
+
+Applying the same technique to formulae
+$
+  #`xG`^2 - #`x2` - q_1 dot p &= 0, text("and")\
+y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_2)p &= 0
+$
+we apply @limbs:cor:carry-upper-bound with $(L, n) = (2^8, 32)$ to find that
+$
+  #`c1`_i + #`carry_offsets[1]` &in [0, &2^14-65] subset.eq [2^16],\
+  #`c2`_i + #`carry_offsets[2]` &in [0, &40796] subset.eq [2^16].\
+$
+when $#`carry_offsets[1]` = 2^13-32$ and $#`carry_offsets[2]` = 24478$.
 
 == Padding
 #render_chip_padding_table(ecsm_chip, config)
@@ -298,6 +329,32 @@ Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_
 #et[Finish this]
 $#`carry_offsets` = (32636, 8161, 16320)$
 
+We derive the values of `carry_offsets`.
+We start with the three formulae
+$
+  #`op` dot (lambda (x_G - x_A) - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2 - a) + (#`r` - q_0) p &= 0,\
+  lambda^2 - x_A - x_G - x_R - (1-#`op`) (x_A - x_G) + (#`r` - q_1) p &= 0,\
+  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0
+$
+which we rewrite in terms of the positive and negative components to find
+$
+  (#`op` dot (lambda x_G + y_A) + (1-#`op`) dot 2lambda y_A + #`r` dot p) - (#`op` dot (lambda x_A + y_G) + (1-#`op`) (3x_A^2 + a) + q_0 dot p) &= 0,\
+  (lambda^2 + #`r` dot p) - (x_A + x_G + x_R + (1-#`op`) (x_A - x_G) + q_1 dot p) &= 0,\
+  (lambda x_A + #`r` dot p) - (lambda x_R + y_A + y_R + q_2 dot p) &= 0.
+$
+Leveraging @limbs:cor:carry-upper-bound with $(L, n) = (2^8, 33)$ and maximizing for the value of $#`op` in {0, 1}$, we gather
+$
+  #`c0`_i &in [-33657, 25242],\
+  #`c1`_i &in [-8416, 16828], text("and")\
+  #`c2`_i &in [-16830, 16828].\
+$
+Selecting $#`carry_offsets` = (33657,8416,16830)$, we arrive at
+$
+  #`c0`_i + #`carry_offsets[0]` &in [0, 58899] subset.eq [2^16],\
+  #`c1`_i + #`carry_offsets[1]` &in [0, 25244] subset.eq [2^16],text("and")\
+  #`c2`_i + #`carry_offsets[2]` &in [0, 33688] subset.eq [2^16].
+$
+
 == Padding
 #render_chip_padding_table(ecdas_chip, config)
 
@@ -319,78 +376,3 @@ $#`carry_offsets` = (32636, 8161, 16320)$
   It might be possible to arrive at more compact design by making some assumptions on these values.
 - At the cost of introducing a minor completeness gap, one may decide to _not_ reduce $#`xG` mod p$: the exceptional case `k=1` and $#`xG `> #`p`$ will be unprovable (for larger $k$, the prover can select a reduced $x_R$), while saving 41 columns and 65 interactions.
   - If one foregoes the requirement that $x_R < p$, the completeness gap is again closed and an additional 24 columns and 16 interactions are saved.
-
-= Discussing the carries <ecsm-limb_carry>
-To constrain `x2` and $y_G$ in #ecsm, and $lambda$, $x_R$ and $y_R$ in #ecdas, we use (variations of) the same technique:
-- multiplications are performed limb-by-limb, 
-- a set of carry-limbs is used to exchange the underflow/overflow from one limb to another, and
-- the carry limbs are range constrained to ensure only one output value is possible.
-
-We now explore this carry-technique and provide some proofs.
-
-== Lemma 1
-Let $V in NN$ and $A,M in [0, V)$.
-For $i >= 1$, we define
-$
-r_i &:= A (V-1) + M sum_(j=1)^i (V-1)^2 = i M(V-1)^2 + A(V-1),\
-v_i &:= r_i + c_(i-1) mod V,\
-c_i &:= V^(-1) (r_i + c_(i-1) - v_i),\
-c_0 &:= 0
-$
-It holds that
-$
-c_i = i M(V-1) + A - M - delta_(M<A)
-$
-where kronecker delta $delta_x$ equals $1$ if $x$ is true, and $0$ otherwise.
-
-#emph("Proof:")
-For $i = 1$, we find that 
-$
-r_1 
-&= M(V - 1)^2 + A(V-1) \
-&= M(V^2-2V) + (A-delta) V + delta V + M - A \
-v_1 
-&equiv delta V + M - A mod V\
-c_1 
-&= V^(-1) (M(V^2 - 2V) + (A-delta) V)\
-&= M(V-2) + A-delta
-$
-Suppose the statement to hold for arbitrary $i >= 1$.
-We find that 
-$
-d_(i+1)
-&= (i+1)M(V-1)^2 + A(V-1)\
-v_(i+1)
-&equiv (i+1)M(V^2 - 2V) + (i+1)M + A V - A + i M(V-2) + (i-1)M + A-delta &&mod V\
-&equiv (i+1)M(V^2 - 2V) + (A + i M - delta)V + delta (V-1) &&mod V\
-&equiv delta (V-1) &&mod V\
-c_(i+1)
-&= V^(-1) dot ((i+1)M(V^2 - 2V) + V(A + i M - delta))\
-&= (i+1)M(V - 2) + A + i M - delta
-$ 
-$qed$
-
-== Corollary 1
-Let $L$ be a number of limbs, $b$ be the number of bits per limb, $M in [0, L)$ the number of multiplications in the formula, and $A in [0, L)$ the number of additions.
-The maximum value of the carry is
-$
-  L M (2^b-1) + A - M - delta_(M < A)
-$
-
-Applying the corollary to the relations
-$
-  x_G^2 - #`x2` - q_0 dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - b + (p - q_1)p &= 0,\
-
-  #`op` dot ((x_G - x_A)lambda - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2) + (#`r` - q_0) p &= 0,\
-  lambda^2 - x_A - x_G - x_R + (1-#`op`) (x_G - x_A) + (#`r` - q_1) p &= 0,\
-  lambda (x_A - x_R) - y_A - y_R + (#`r` - q_2) p &= 0.\
-$
-We find that the carries for sixteen 8-bit limbs are in the range
-$
-  (1): [-8160, 8159]\
-  (2): [-16319, 16318]\
-  (3): [-32636, 24477]\
-  (4): [-8161, 16318]\
-  (5): [-16320, 16318]\
-$
