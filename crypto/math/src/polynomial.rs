@@ -4,6 +4,7 @@ use crate::fft::bowers_fft::{LayerTwiddles, bowers_fft_opt_fused, bowers_ifft_op
 #[cfg(feature = "parallel")]
 use crate::fft::bowers_fft::{bowers_fft_opt_fused_parallel, bowers_ifft_opt_parallel};
 use crate::fft::errors::FFTError;
+use crate::fft::two_half_fft::{TwoHalfTwiddles, fft_batch_two_half};
 use crate::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use alloc::{borrow::ToOwned, vec, vec::Vec};
 
@@ -499,6 +500,98 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
         // 4. Forward FFT on the full buffer
         dispatch_fft(buffer, fwd_twiddles)?;
         in_place_bit_reverse_permute(buffer);
+
+        Ok(())
+    }
+
+    /// Batched row-major coset LDE expansion.
+    ///
+    /// `buffer` is the row-major flat layout of `n * num_cols` elements
+    /// (input trace evaluations on the natural-order domain, all M columns
+    /// interleaved per row). It is expanded in place to length
+    /// `n * blowup_factor * num_cols`, also row-major, holding the LDE
+    /// evaluations on the coset.
+    ///
+    /// Pipeline mirrors [`coset_lde_full_expand`] cell-for-cell, just with
+    /// the row-major batched FFT primitives so the M columns share twiddle
+    /// loads inside each butterfly:
+    ///   1. batched iFFT (DIT) over rows[..n]
+    ///   2. scale rows[..n] by coset weights (one weight per row, applied to
+    ///      all M elements of that row)
+    ///   3. zero-pad rows to `n * blowup_factor`
+    ///   4. batched forward FFT (DIF)
+    ///
+    /// `weights` must be `n` base-field elements in natural row order.
+    /// `inv_twiddles` are the size-`n` inverse two-half twiddles; `fwd_twiddles`
+    /// the size-`n·blowup_factor` forward ones.
+    pub fn coset_lde_full_expand_row_major<F: IsFFTField + IsSubFieldOf<E> + Send + Sync>(
+        buffer: &mut Vec<FieldElement<E>>,
+        num_cols: usize,
+        blowup_factor: usize,
+        weights: &[FieldElement<F>],
+        inv_twiddles: &TwoHalfTwiddles<F>,
+        fwd_twiddles: &TwoHalfTwiddles<F>,
+    ) -> Result<(), FFTError>
+    where
+        E: Send + Sync,
+    {
+        if num_cols == 0 || buffer.is_empty() {
+            return Ok(());
+        }
+        let total = buffer.len();
+        if !total.is_multiple_of(num_cols) {
+            return Err(FFTError::InputError(total));
+        }
+        let n = total / num_cols;
+        if !n.is_power_of_two() {
+            return Err(FFTError::InputError(n));
+        }
+        let lde_n = n * blowup_factor;
+        if (lde_n.trailing_zeros() as u64) > F::TWO_ADICITY {
+            return Err(FFTError::DomainSizeError(lde_n.trailing_zeros() as usize));
+        }
+        if weights.len() < n {
+            return Err(FFTError::InputError(weights.len()));
+        }
+
+        // 1. iFFT on rows[..n] (cache-blocked two-half; natural→natural, no 1/n
+        //    — the 1/n is folded into the coset-weight pass below). Replaces the
+        //    flat-Bowers iFFT, which cache-thrashes at large n.
+        let prefix_len = n * num_cols;
+        fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
+
+        // 2. Scale by coset weights — one weight per row, multiply M elements
+        //    of that row by it. Each row is independent → parallelizable.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+            buffer[..prefix_len]
+                .par_chunks_exact_mut(num_cols)
+                .enumerate()
+                .for_each(|(r, row)| {
+                    let w = &weights[r];
+                    for x in row.iter_mut() {
+                        *x = w * &*x;
+                    }
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for r in 0..n {
+                let w = &weights[r];
+                let row = &mut buffer[r * num_cols..(r + 1) * num_cols];
+                for x in row.iter_mut() {
+                    *x = w * &*x;
+                }
+            }
+        }
+
+        // 3. Zero-pad rows to lde_n.
+        buffer.resize(lde_n * num_cols, FieldElement::zero());
+
+        // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
+        //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
+        fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
 
         Ok(())
     }

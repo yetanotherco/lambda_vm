@@ -39,7 +39,9 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::is_bit_fold;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
+use super::types::{
+    BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
+};
 
 // =========================================================================
 // Column indices for BRANCH table
@@ -164,10 +166,8 @@ impl BranchOperation {
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
-
     // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
-    let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();
+    let mut op_map: FxHashMap<BranchOperation, u64> = FxHashMap::default();
     for op in operations {
         *op_map.entry(op.clone()).or_insert(0) += 1;
     }

@@ -224,6 +224,22 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
+    /// Full row-major data as a contiguous slice, reading the mmap when spilled.
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            // SAFETY: same contract as get_row — spill_to_disk writes row-major and
+            // FieldElement<F> is #[repr(transparent)] over F::BaseType: SpillSafe.
+            return unsafe {
+                std::slice::from_raw_parts(
+                    backing.mmap.as_ptr() as *const FieldElement<F>,
+                    backing.height * backing.width,
+                )
+            };
+        }
+        &self.data
+    }
+
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {

@@ -16,14 +16,17 @@ use math::field::{
 };
 
 /// A borrowed, zero-copy view of one evaluation point's rows over a
-/// column-major [`LDETraceTable`].
+/// row-major [`LDETraceTable`]. A row's cells are contiguous, so a constraint's
+/// per-row column reads scan sequential memory (the row-major-LDE win).
 pub struct RowView<'a, F, E>
 where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    main: &'a [Vec<FieldElement<F>>],
-    aux: &'a [Vec<FieldElement<E>>],
+    main: &'a [FieldElement<F>],
+    aux: &'a [FieldElement<E>],
+    num_main_cols: usize,
+    num_aux_cols: usize,
     row: usize,
     lde_step_size: usize,
     blowup_factor: usize,
@@ -38,12 +41,14 @@ where
     /// Build a view anchored at LDE row `row`.
     pub fn new(lde_trace: &'a LDETraceTable<F, E>, row: usize) -> Self {
         Self {
-            main: &lde_trace.main_columns,
-            aux: &lde_trace.aux_columns,
+            main: &lde_trace.main_data,
+            aux: &lde_trace.aux_data,
+            num_main_cols: lde_trace.num_main_cols,
+            num_aux_cols: lde_trace.num_aux_cols,
             row,
             lde_step_size: lde_trace.lde_step_size,
             blowup_factor: lde_trace.blowup_factor,
-            num_rows: lde_trace.num_rows(),
+            num_rows: lde_trace.num_rows,
         }
     }
 
@@ -54,16 +59,16 @@ where
         (self.row + offset * self.lde_step_size + sub_row * self.blowup_factor) % self.num_rows
     }
 
-    /// Main-trace cell at offset/sub_row/col, by reference.
+    /// Main-trace cell at offset/sub_row/col, by reference (row-major index).
     #[inline]
     pub fn get_main(&self, offset: usize, sub_row: usize, col: usize) -> &FieldElement<F> {
-        &self.main[col][self.lde_row(offset, sub_row)]
+        &self.main[self.lde_row(offset, sub_row) * self.num_main_cols + col]
     }
 
-    /// Auxiliary-trace cell at offset/sub_row/col, by reference.
+    /// Auxiliary-trace cell at offset/sub_row/col, by reference (row-major index).
     #[inline]
     pub fn get_aux(&self, offset: usize, sub_row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux[col][self.lde_row(offset, sub_row)]
+        &self.aux[self.lde_row(offset, sub_row) * self.num_aux_cols + col]
     }
 }
 

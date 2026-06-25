@@ -1587,10 +1587,6 @@ where
         .max()
         .unwrap_or(0);
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
-    let bus_ids: Vec<FieldElement<F>> = interactions
-        .iter()
-        .map(|i| FieldElement::<F>::from(i.bus_id))
-        .collect();
     let shifts = PackingShifts::<F>::new();
     let n = interactions.len();
 
@@ -1602,9 +1598,12 @@ where
         // Phase 1 — fingerprints, laid out as [int_0 rows…, int_1 rows…].
         // fp[k*chunk_len + i] = interaction k at row chunk_start+i.
         let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(n * chunk_len);
-        for (k, interaction) in interactions.iter().enumerate() {
+        for interaction in interactions.iter() {
             for row in chunk_start..chunk_start + chunk_len {
-                let mut lc = &bus_ids[k] * &alpha_powers[0];
+                // alpha_powers[0] is always 1, so the bus_id term is just the
+                // embedded bus id — skip the base×ext multiply and build the
+                // extension element straight from the bus id.
+                let mut lc = FieldElement::<E>::from(interaction.bus_id);
                 let mut alpha_offset = 1;
                 for bv in &interaction.values {
                     alpha_offset += bv.accumulate_fingerprint(
@@ -1624,7 +1623,8 @@ where
         if n == 1 {
             let interaction = interactions[0];
             for (i, row) in (chunk_start..chunk_start + chunk_len).enumerate() {
-                let mut base_elements: Vec<FieldElement<F>> = vec![bus_ids[0].clone()];
+                let mut base_elements: Vec<FieldElement<F>> =
+                    vec![FieldElement::<F>::from(interaction.bus_id)];
                 base_elements.extend(
                     interaction
                         .values
@@ -1799,8 +1799,10 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     alpha_powers: &[FieldElement<B>],
     shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
-    let bus_id_f: FieldElement<A> = FieldElement::from(interaction.bus_id);
-    let mut linear_combination = bus_id_f * &alpha_powers[0];
+    // alpha_powers[0] is always 1, so the bus_id term is just the embedded bus
+    // id — skip the base×ext multiply and build the extension element straight
+    // from the bus id.
+    let mut linear_combination = FieldElement::<B>::from(interaction.bus_id);
     let mut alpha_idx = 1;
     for bv in &interaction.values {
         alpha_idx += bv.accumulate_fingerprint_from_step(

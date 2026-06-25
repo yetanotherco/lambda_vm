@@ -30,8 +30,6 @@
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
-use std::collections::HashMap;
-
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
@@ -46,8 +44,8 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
-    NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
+    BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96,
+    INV_2_128, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
 
@@ -302,7 +300,7 @@ pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
-    let mut op_map: HashMap<MulOperation, MulMultiplicities> = HashMap::new();
+    let mut op_map: FxHashMap<MulOperation, MulMultiplicities> = FxHashMap::default();
 
     for (op, wants_hi) in operations {
         let entry = op_map.entry(op.clone()).or_default();
