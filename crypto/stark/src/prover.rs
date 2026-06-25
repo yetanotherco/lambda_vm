@@ -2150,20 +2150,22 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-                        // Fused GPU path (cuda only): extract columns and try the
-                        // on-device ext3 pipeline; on success it returns directly.
+                        // Fused GPU path (cuda only): row-major ext3 NTT — single
+                        // H2D, no column extraction, no CPU transpose.
                         #[cfg(feature = "cuda")]
                         {
-                            let mut columns = trace.extract_columns_aux(lde_size);
+                            let (trace_slice, num_cols) = trace.aux_data_row_major();
+                            let n = if num_cols > 0 { trace_slice.len() / num_cols } else { 0 };
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
-                            if let Some((tree, handle)) =
-                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3_keep::<
+                            if let Some((tree, handle, aux_data)) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep::<
                                     Field,
                                     FieldExtension,
                                     BatchedMerkleTreeBackend<FieldExtension>,
                                 >(
-                                    &mut columns, domain.blowup_factor, &twiddles.coset_weights
+                                    trace_slice, n, num_cols, domain.blowup_factor,
+                                    &twiddles.coset_weights,
                                 )
                             {
                                 #[cfg(feature = "instruments")]
@@ -2171,10 +2173,9 @@ pub trait IsStarkProver<
                                 let root = tree.root;
                                 #[cfg(feature = "instruments")]
                                 crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
-                                let (aux_data, total_cols) = columns_to_row_major(&columns);
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
-                                    (aux_data, total_cols),
+                                    (aux_data, num_cols),
                                     Some(handle),
                                 ));
                             }

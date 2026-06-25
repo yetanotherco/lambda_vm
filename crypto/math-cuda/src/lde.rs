@@ -428,6 +428,117 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     Ok((nodes_out, handle, lde_out))
 }
 
+/// Row-major ext3 LDE + Keccak + Merkle, all on-device.
+///
+/// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is
+/// identical to row-major base-field with `m3 = m * 3`. The same row-major NTT
+/// and Keccak kernels handle all three components simultaneously — no extra
+/// de-interleave step.
+///
+/// Input: `row_major` is `n * m` ext3 elements as flat `n * m * 3` u64s
+/// (element [row][col] components k=0,1,2 at `row_major[(row*m + col)*3 + k]`).
+/// Returns (merkle_nodes, GpuLdeExt3 handle, row-major ext3 LDE Vec<u64>).
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(Vec<u8>, GpuLdeExt3, Vec<u64>)> {
+    let m3 = m * 3;
+    assert_eq!(row_major.len(), n * m3);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_ext3_row_major lde_size");
+
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(lde_size);
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let m3_u64 = m3 as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // H2D: single contiguous copy — row-major ext3 as flat u64s.
+    let mut buf = stream.clone_htod(row_major)?;
+    if lde_size > n {
+        let mut full_buf = stream.alloc_zeros::<u64>(lde_size * m3)?;
+        stream.memcpy_dtod(&buf, &mut full_buf.slice_mut(0..n * m3))?;
+        drop(buf);
+        buf = full_buf;
+    }
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    // iNTT + coset weights + forward NTT — same row-major kernels as base-field
+    // but with m3 = m*3 (all 3 components processed simultaneously).
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, m3_u64)?;
+    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, inv_tw.as_ref(), n_u64, log_n, m3_u64)?;
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, m3_u64)?;
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, m3_u64)?;
+    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, fwd_tw.as_ref(), lde_u64, log_lde, m3_u64)?;
+
+    // Keccak: same row-major kernel — each leaf reads m3 consecutive u64s (= m ext3 elements).
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(lde_size);
+    {
+        let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + lde_size * 32);
+        launch_keccak_base_row_major(
+            stream.as_ref(), be, &buf, m3_u64, lde_u64, log_lde, &mut leaves_view,
+        )?;
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+
+    // D2H: single contiguous copy of the row-major ext3 LDE.
+    let staging_slot = be.pinned_staging();
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(lde_size * m3, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(lde_size * m3) };
+    stream.memcpy_dtoh(&buf, pinned)?;
+
+    let mut nodes_out = vec![0u8; nodes_bytes];
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
+
+    let lde_out = pinned[..lde_size * m3].to_vec();
+    drop(staging);
+
+    // Transpose row-major (lde_size × m3) → GpuLdeExt3 column-major format:
+    // dst[(c*3 + k) * lde_size + r] = src[r * m3 + c*3 + k].
+    // matrix_transpose_strided(src, dst, rows=lde_size, cols=m3, out_stride=lde_size)
+    let mut col_major_dev = stream.alloc_zeros::<u64>(lde_size * m3)?;
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m3 as u32).div_ceil(32),
+                (lde_size as u32).div_ceil(32).min(65535),
+                1,
+            ),
+            block_dim: (32, 32, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.matrix_transpose_strided)
+                .arg(&buf)
+                .arg(&mut col_major_dev)
+                .arg(&(lde_size as u32))
+                .arg(&(m3 as u32))
+                .arg(&lde_u64)
+                .launch(cfg)?;
+        }
+        stream.synchronize()?;
+    }
+
+    let handle = GpuLdeExt3 { buf: Arc::new(col_major_dev), m, lde_size };
+    Ok((nodes_out, handle, lde_out))
+}
+
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
