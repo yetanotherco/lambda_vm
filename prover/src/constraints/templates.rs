@@ -13,6 +13,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::ConstraintBuilder;
 use stark::{constraints::transition::TransitionConstraint, table::TableView};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -107,6 +108,25 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
     }
 }
 
+/// Fold an IS_BIT residual into a [`ConstraintBuilder`], matching
+/// [`IsBitConstraint`]'s `evaluate`: `cond * X * (1-X)` when `cond_col` is
+/// `Some`, else `X * (1-X)`. Used by tables migrated to the monomorphized path.
+pub fn is_bit_fold<CB: ConstraintBuilder>(
+    cb: &mut CB,
+    cond_col: Option<usize>,
+    value_col: usize,
+) {
+    let one = FieldElement::<CB::F>::one();
+    let x = cb.main(value_col).clone();
+    match cond_col {
+        Some(cond_col) => {
+            let cond = cb.main(cond_col).clone();
+            cb.fold(&cond * &x * (&one - &x));
+        }
+        None => cb.fold(&x * (&one - &x)),
+    }
+}
+
 // =========================================================================
 // ADD Template (Embedded Carry Approach)
 // =========================================================================
@@ -177,6 +197,17 @@ impl AddLinearTerm {
             AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
         }
     }
+
+    /// Evaluate this term using a column accessor closure (builder path).
+    fn eval_with<F: IsField>(&self, get: &impl Fn(usize) -> FieldElement<F>) -> FieldElement<F> {
+        match self {
+            AddLinearTerm::Column {
+                coefficient,
+                column,
+            } => &get(*column) * &FieldElement::<F>::from(*coefficient),
+            AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
+        }
+    }
 }
 
 /// Evaluate a slice of terms as a sum.
@@ -193,6 +224,17 @@ where
             .map(|t| t.eval(step))
             .fold(FieldElement::zero(), |acc, x| acc + x)
     }
+}
+
+/// Sum a slice of terms using a column accessor closure (builder path).
+fn eval_terms_with<F: IsField>(
+    terms: &[AddLinearTerm],
+    get: &impl Fn(usize) -> FieldElement<F>,
+) -> FieldElement<F> {
+    terms
+        .iter()
+        .map(|t| t.eval_with(get))
+        .fold(FieldElement::zero(), |acc, x| acc + x)
 }
 
 impl AddOperand {
@@ -221,6 +263,28 @@ impl AddOperand {
                 .get_main_evaluation_element(0, *start_column + 1)
                 .clone(),
             AddOperand::Linear { hi, .. } => eval_terms(hi, step),
+        }
+    }
+
+    /// Low word via a column accessor closure (builder path).
+    pub fn eval_lo_with<F: IsField>(
+        &self,
+        get: &impl Fn(usize) -> FieldElement<F>,
+    ) -> FieldElement<F> {
+        match self {
+            AddOperand::DWordWL { start_column } => get(*start_column),
+            AddOperand::Linear { lo, .. } => eval_terms_with(lo, get),
+        }
+    }
+
+    /// High word via a column accessor closure (builder path).
+    pub fn eval_hi_with<F: IsField>(
+        &self,
+        get: &impl Fn(usize) -> FieldElement<F>,
+    ) -> FieldElement<F> {
+        match self {
+            AddOperand::DWordWL { start_column } => get(*start_column + 1),
+            AddOperand::Linear { hi, .. } => eval_terms_with(hi, get),
         }
     }
 
@@ -482,6 +546,56 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+/// Fold an ADD constraint pair (carry_0 then carry_1) into a [`ConstraintBuilder`],
+/// matching [`AddConstraint::new_pair`] + `compute`. The two carries are computed
+/// once and shared — the boxed `compute_carry_1` recomputes `compute_carry_0`.
+///
+/// Residual per carry: `cond * carry * (1-carry)` when `cond_cols` is non-empty
+/// (cond = Σ cond_cols), else `carry * (1-carry)`.
+pub fn add_pair_fold<CB: ConstraintBuilder>(
+    cb: &mut CB,
+    cond_cols: &[usize],
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) {
+    let one = FieldElement::<CB::F>::one();
+    let inv = FieldElement::<CB::F>::from(INV_SHIFT_32);
+
+    // Read-only phase: compute both carries and the condition from the row.
+    let (carry_0, carry_1, cond) = {
+        let get = |col: usize| cb.main(col).clone();
+        let lhs_lo = lhs.eval_lo_with(&get);
+        let rhs_lo = rhs.eval_lo_with(&get);
+        let sum_lo = sum.eval_lo_with(&get);
+        let carry_0 = (&lhs_lo + &rhs_lo - &sum_lo) * &inv;
+        let lhs_hi = lhs.eval_hi_with(&get);
+        let rhs_hi = rhs.eval_hi_with(&get);
+        let sum_hi = sum.eval_hi_with(&get);
+        let carry_1 = (&lhs_hi + &rhs_hi + &carry_0 - &sum_hi) * &inv;
+        let cond = if cond_cols.is_empty() {
+            None
+        } else {
+            Some(
+                cond_cols
+                    .iter()
+                    .map(|&c| get(c))
+                    .fold(FieldElement::<CB::F>::zero(), |acc, x| acc + x),
+            )
+        };
+        (carry_0, carry_1, cond)
+    };
+
+    // Fold carry_0 then carry_1 (the `new_pair` order).
+    for carry in [carry_0, carry_1] {
+        let residual = match &cond {
+            Some(c) => c * &carry * (&one - &carry),
+            None => &carry * (&one - &carry),
+        };
+        cb.fold(residual);
     }
 }
 
