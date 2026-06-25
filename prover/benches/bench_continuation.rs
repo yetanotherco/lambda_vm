@@ -116,10 +116,14 @@ fn main() {
                 .get(3)
                 .map(|s| s.parse().expect("bad epoch_size"))
                 .unwrap_or(65536);
+            // Match the monolithic `main` mode's options (blowup 2) for a fair comparison.
+            let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
+                .expect("blowup=2 is always valid");
             let output = lambda_vm_prover::continuation::prove_and_verify_continuation(
                 &elf,
                 &private_inputs,
                 epoch_size,
+                &opts,
             )
             .expect("continuation failed");
             assert!(output.is_some(), "continuation did not verify");

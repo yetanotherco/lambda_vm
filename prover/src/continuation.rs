@@ -636,6 +636,7 @@ pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size: usize,
+    opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
     let epoch_size = epoch_size.next_power_of_two().max(4);
 
@@ -653,7 +654,6 @@ pub fn prove_continuation(
     // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
     // derived from it (the cross-epoch register binding).
     let mut prev_fini: Option<Vec<u32>> = None;
-    let opts = ProofOptions::default_test_options();
 
     let mut index: u64 = 0;
     loop {
@@ -706,7 +706,7 @@ pub fn prove_continuation(
             is_final,
             &boundary,
             private_inputs,
-            &opts,
+            opts,
         )?;
         prev_fini = Some(epoch.reg_fini.clone());
 
@@ -725,7 +725,7 @@ pub fn prove_continuation(
     // One global LogUp over all the (kept) local-to-global tables.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         epochs.iter().map(|e| e.boundary.clone()).collect();
-    let global = prove_global(&all_boundaries, &elf, elf_bytes, private_inputs, &opts)?;
+    let global = prove_global(&all_boundaries, &elf, elf_bytes, private_inputs, opts)?;
 
     Ok(ContinuationProof {
         epochs,
@@ -754,9 +754,9 @@ pub fn prove_continuation(
 pub fn verify_continuation(
     elf_bytes: &[u8],
     bundle: &ContinuationProof,
+    opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let opts = ProofOptions::default_test_options();
 
     let n = bundle.epochs.len();
     if n == 0 {
@@ -781,7 +781,7 @@ pub fn verify_continuation(
             is_first,
             is_final,
             label,
-            &opts,
+            opts,
         ) {
             return Ok(None);
         }
@@ -803,7 +803,7 @@ pub fn verify_continuation(
         &elf,
         elf_bytes,
         &bundle.private_inputs,
-        &opts,
+        opts,
     ) {
         return Ok(None);
     }
@@ -822,9 +822,10 @@ pub fn prove_and_verify_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size: usize,
+    opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size)?;
-    verify_continuation(elf_bytes, &bundle)
+    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size, opts)?;
+    verify_continuation(elf_bytes, &bundle, opts)
 }
 
 #[cfg(test)]
@@ -851,12 +852,24 @@ mod tests {
             .len();
 
         // Both commits in a single epoch (x254 starts at 0).
-        let single = prove_and_verify_continuation(&elf_bytes, &[], total).unwrap();
+        let single = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            total,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
         assert_eq!(single.as_deref(), Some(&expected_output[..]));
 
         // The late commit (only `halt` follows it) lands past the midpoint, so a
         // half-sized epoch forces it into a later epoch where x254 is already 2.
-        let split = prove_and_verify_continuation(&elf_bytes, &[], (total / 2).max(1)).unwrap();
+        let split = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            (total / 2).max(1),
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
         assert_eq!(
             split.as_deref(),
             Some(&expected_output[..]),
@@ -886,9 +899,14 @@ mod tests {
             "program too short ({total} cycles) to exercise intermediate epochs"
         );
         assert!(
-            prove_and_verify_continuation(&elf_bytes, &[], epoch_size)
-                .unwrap()
-                .is_some()
+            prove_and_verify_continuation(
+                &elf_bytes,
+                &[],
+                epoch_size,
+                &ProofOptions::default_test_options()
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -903,7 +921,13 @@ mod tests {
     fn test_continuation_non_power_of_two_epoch_size() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let out = prove_and_verify_continuation(&elf_bytes, &[], 10).unwrap();
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            10,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
@@ -915,8 +939,10 @@ mod tests {
     fn test_split_verify_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle = prove_continuation(&elf_bytes, &[], 10).unwrap();
-        let out = verify_continuation(&elf_bytes, &bundle).unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 10, &ProofOptions::default_test_options()).unwrap();
+        let out = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
@@ -926,12 +952,14 @@ mod tests {
     fn test_continuation_bincode_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
-        let bundle = prove_continuation(&elf_bytes, &[], 10).unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 10, &ProofOptions::default_test_options()).unwrap();
 
         let bytes = bincode::serialize(&bundle).unwrap();
         let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
 
-        let out = verify_continuation(&elf_bytes, &restored).unwrap();
+        let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
+            .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
@@ -942,10 +970,15 @@ mod tests {
     fn test_split_verify_rejects_dropped_last_epoch() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(&elf_bytes, &[], 8).unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.pop();
-        assert!(verify_continuation(&elf_bytes, &bundle).unwrap().is_none());
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
     }
 
     // Negative: reordering epochs must be rejected — each epoch proof is bound to its
@@ -955,10 +988,15 @@ mod tests {
     fn test_split_verify_rejects_reordered_epochs() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(&elf_bytes, &[], 8).unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.swap(0, 1);
-        assert!(verify_continuation(&elf_bytes, &bundle).unwrap().is_none());
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
     }
 
     // Negative: corrupting an epoch's bound final register file (R_{i+1}) must be
@@ -969,13 +1007,18 @@ mod tests {
     fn test_split_verify_rejects_tampered_register_fini() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(&elf_bytes, &[], 8).unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need a second epoch to chain into"
         );
         bundle.epochs[0].reg_fini[0] ^= 1;
-        assert!(verify_continuation(&elf_bytes, &bundle).unwrap().is_none());
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
     }
 
     // The bundle's `boundary` field is used only to rebuild the global AIRs' touched-

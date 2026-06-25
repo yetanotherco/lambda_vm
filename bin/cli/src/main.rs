@@ -218,7 +218,15 @@ fn main() -> ExitCode {
             num_epochs,
         } => {
             if continuations {
-                cmd_prove_continuation(elf, output, private_input, epoch_size, num_epochs, time)
+                cmd_prove_continuation(
+                    elf,
+                    output,
+                    private_input,
+                    epoch_size,
+                    num_epochs,
+                    blowup,
+                    time,
+                )
             } else {
                 cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
             }
@@ -231,7 +239,7 @@ fn main() -> ExitCode {
             continuations,
         } => {
             if continuations {
-                cmd_verify_continuation(proof, elf, time)
+                cmd_verify_continuation(proof, elf, blowup, time)
             } else {
                 cmd_verify(proof, elf, blowup, time)
             }
@@ -576,6 +584,7 @@ fn cmd_prove_continuation(
     private_input_path: Option<PathBuf>,
     epoch_size: Option<usize>,
     num_epochs: Option<usize>,
+    blowup: Option<u8>,
     time: bool,
 ) -> ExitCode {
     eprintln!("Reading ELF file...");
@@ -626,19 +635,32 @@ fn cmd_prove_continuation(
         }
     };
 
+    let blowup = blowup.unwrap_or(2);
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     eprintln!(
-        "Generating continuation proof (epoch_size={epoch_size}, rounded to {})...",
+        "Generating continuation proof (blowup={blowup}, epoch_size={epoch_size}, rounded to {})...",
         epoch_size.next_power_of_two().max(4)
     );
     let start = Instant::now();
-    let bundle =
-        match prover::continuation::prove_continuation(&elf_data, &private_inputs, epoch_size) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("Continuation proof generation failed: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
+    let bundle = match prover::continuation::prove_continuation(
+        &elf_data,
+        &private_inputs,
+        epoch_size,
+        &opts,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Continuation proof generation failed: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
     let prove_elapsed = start.elapsed();
 
     eprintln!("Writing proof...");
@@ -670,7 +692,12 @@ fn cmd_prove_continuation(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify_continuation(proof_path: PathBuf, elf_path: PathBuf, time: bool) -> ExitCode {
+fn cmd_verify_continuation(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    blowup: Option<u8>,
+    time: bool,
+) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -696,9 +723,18 @@ fn cmd_verify_continuation(proof_path: PathBuf, elf_path: PathBuf, time: bool) -
         }
     };
 
+    let blowup = blowup.unwrap_or(2);
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     eprintln!("Verifying continuation proof...");
     let start = Instant::now();
-    let result = prover::continuation::verify_continuation(&elf_data, &bundle);
+    let result = prover::continuation::verify_continuation(&elf_data, &bundle, &opts);
     let verify_elapsed = start.elapsed();
 
     match result {
