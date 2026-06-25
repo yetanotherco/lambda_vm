@@ -457,7 +457,7 @@ The integrated `prove_and_verify_continuation` is now a thin wrapper
 likewise split into `prove_epoch` + `verify_epoch`.
 
 The bundle is prover-supplied and therefore **untrusted**. Per epoch it carries the
-`MultiProof`, the `public_output` slice, `table_counts`, `page_configs`,
+`MultiProof`, the `public_output` slice, `table_counts`,
 `num_private_input_pages`, `runtime_page_ranges`, the bound `reg_fini` (`R_{i+1}`),
 the epoch `l2g_root`, and the touched-cell `boundary`; plus the global `MultiProof`
 and the `private_inputs`. Everything the integrated path reused from prover memory

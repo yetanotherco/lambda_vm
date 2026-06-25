@@ -30,9 +30,6 @@ pub struct ExecutionResult {
 /// Size of each log chunk - balances memory usage vs callback overhead
 const CHUNK_SIZE: usize = 100_000;
 
-/// Default number of cycles (instructions) per continuation epoch.
-pub const DEFAULT_EPOCH_SIZE: usize = 100_000;
-
 /// Result of executing one continuation epoch: the logs produced during the
 /// epoch and the VM state at the epoch boundary. The boundary state is the
 /// starting state of the next epoch.
@@ -157,6 +154,9 @@ impl Executor {
     /// cycles. Each epoch captures its logs and the VM state at the epoch
     /// boundary, which is the starting state of the next epoch. Consumes the
     /// executor.
+    ///
+    /// Test/bench helper — the production continuation prover streams epochs via
+    /// `resume_with_limit` directly.
     pub fn run_epochs(mut self, epoch_size: usize) -> Result<Vec<EpochExecution>, ExecutorError> {
         assert!(epoch_size > 0, "epoch_size must be greater than zero");
 
