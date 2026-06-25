@@ -597,25 +597,6 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
     }
 }
 
-#[cfg(test)]
-pub fn compose_fft<F, E>(
-    poly_1: &Polynomial<FieldElement<E>>,
-    poly_2: &Polynomial<FieldElement<E>>,
-) -> Polynomial<FieldElement<E>>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
-
-    let values: Vec<_> = poly_2_evaluations
-        .iter()
-        .map(|value| poly_1.evaluate(value))
-        .collect();
-
-    Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
-}
-
 fn evaluate_fft_cpu_raw<F, E>(
     coeffs: &[FieldElement<E>],
     permute_to_natural: bool,

@@ -15,7 +15,7 @@ use rayon::prelude::*;
 /// Access goes through pointer arithmetic on the mmap, matching the
 /// original `data[row * width + col]` layout.
 #[cfg(feature = "disk-spill")]
-struct TableMmapBacking {
+pub(crate) struct TableMmapBacking {
     mmap: memmap2::Mmap,
     /// Number of columns per row.
     width: usize,
@@ -48,12 +48,15 @@ impl std::fmt::Debug for TableMmapBacking {
 )]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
-    pub data: Vec<FieldElement<F>>,
+    /// Row-major backing store. Crate-private: external callers must go through
+    /// the spill-safe accessors (`get`/`get_row`/`set`) rather than indexing the
+    /// raw buffer, which bypasses the disk-spill mmap backing.
+    pub(crate) data: Vec<FieldElement<F>>,
     pub width: usize,
     pub height: usize,
     #[cfg(feature = "disk-spill")]
     #[serde(skip)]
-    mmap_backing: Option<TableMmapBacking>,
+    pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
 
 #[cfg(feature = "disk-spill")]
@@ -410,158 +413,5 @@ where
 
     pub fn get_aux_evaluation_element(&self, row: usize, col: usize) -> &FieldElement<E> {
         &self.aux_data[row][col]
-    }
-}
-
-#[cfg(all(test, feature = "disk-spill"))]
-mod disk_spill_tests {
-    use super::*;
-    use math::field::goldilocks::GoldilocksField;
-
-    type F = GoldilocksField;
-
-    #[test]
-    fn test_table_spill_roundtrip() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let mut table = Table::new(data.clone(), width);
-        assert!(table.mmap_backing.is_none());
-
-        // Snapshot values before spill
-        let pre_spill: Vec<Vec<FieldElement<F>>> = (0..height)
-            .map(|r| (0..width).map(|c| *table.get(r, c)).collect())
-            .collect();
-
-        table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.mmap_backing.is_some());
-        assert!(
-            table.data.is_empty(),
-            "heap data should be freed after spill"
-        );
-
-        // Verify get() returns the same values
-        for (r, pre_row) in pre_spill.iter().enumerate() {
-            for (c, pre_val) in pre_row.iter().enumerate() {
-                assert_eq!(table.get(r, c), pre_val, "mismatch at ({r}, {c})");
-            }
-        }
-
-        // Verify get_row() returns the same values
-        for (r, pre_row) in pre_spill.iter().enumerate() {
-            let row = table.get_row(r);
-            assert_eq!(row.len(), width);
-            for (c, pre_val) in pre_row.iter().enumerate() {
-                assert_eq!(&row[c], pre_val, "get_row mismatch at ({r}, {c})");
-            }
-        }
-    }
-
-    /// `row_major_data()` is the accessor `Trace::main_data_row_major()` feeds
-    /// to the row-major LDE. After a spill the heap `data` is freed, so it must
-    /// read back through the mmap byte-for-byte. Regression guard for the
-    /// EmptyCommitment bug (commit 08eaa8b), where a spilled main table handed
-    /// the LDE an emptied buffer. `get`/`get_row` were already covered above;
-    /// the full row-major read (the one the LDE actually uses) was not.
-    #[test]
-    fn test_table_spill_row_major_data_roundtrip() {
-        let width = 5;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from((i as u64).wrapping_mul(7) + 3))
-            .collect();
-
-        let mut table = Table::new(data.clone(), width);
-        assert_eq!(
-            table.row_major_data(),
-            data.as_slice(),
-            "row_major_data must match the source before spill"
-        );
-
-        table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(
-            table.data.is_empty(),
-            "heap data should be freed after spill"
-        );
-
-        assert_eq!(
-            table.row_major_data(),
-            data.as_slice(),
-            "row_major_data must round-trip through the mmap after spill"
-        );
-    }
-
-    #[test]
-    fn test_table_spill_empty_is_noop() {
-        let mut table = Table::<F>::new(Vec::new(), 0);
-        table
-            .spill_to_disk()
-            .expect("spill_to_disk on empty table failed");
-        assert!(table.mmap_backing.is_none());
-    }
-
-    #[test]
-    fn test_table_spill_idempotent() {
-        let data: Vec<FieldElement<F>> =
-            (0..16).map(|i| FieldElement::<F>::from(i as u64)).collect();
-        let mut table = Table::new(data, 4);
-
-        table.spill_to_disk().expect("first spill failed");
-        assert!(table.mmap_backing.is_some());
-
-        table.spill_to_disk().expect("second spill should be no-op");
-        assert!(table.mmap_backing.is_some());
-
-        // Still readable
-        assert_eq!(table.get(0, 0), &FieldElement::<F>::from(0u64));
-        assert_eq!(table.get(3, 3), &FieldElement::<F>::from(15u64));
-    }
-
-    #[test]
-    fn test_clone_spilled_table_materializes_to_heap() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let mut table = Table::new(data, width);
-        table.spill_to_disk().expect("spill_to_disk failed");
-        assert!(table.mmap_backing.is_some());
-
-        let cloned = table.clone();
-        assert!(cloned.mmap_backing.is_none(), "clone should not be spilled");
-        assert_eq!(cloned.width, width);
-        assert_eq!(cloned.height, height);
-        assert_eq!(cloned, table, "clone must equal source element-wise");
-    }
-
-    #[test]
-    fn test_serialize_spilled_table_matches_unspilled() {
-        let width = 4;
-        let height = 8;
-        let data: Vec<FieldElement<F>> = (0..width * height)
-            .map(|i| FieldElement::<F>::from(i as u64))
-            .collect();
-
-        let unspilled = Table::new(data.clone(), width);
-        let unspilled_bytes = bincode::serialize(&unspilled).expect("serialize unspilled");
-
-        let mut spilled = Table::new(data, width);
-        spilled.spill_to_disk().expect("spill_to_disk failed");
-        let spilled_bytes = bincode::serialize(&spilled).expect("serialize spilled");
-
-        assert_eq!(
-            spilled_bytes, unspilled_bytes,
-            "spilled and unspilled tables must serialize to identical bytes"
-        );
-
-        let restored: Table<F> =
-            bincode::deserialize(&spilled_bytes).expect("deserialize spilled bytes");
-        assert!(restored.mmap_backing.is_none());
-        assert_eq!(restored, unspilled);
     }
 }

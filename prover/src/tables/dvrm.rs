@@ -38,7 +38,7 @@ use stark::trace::TraceTable;
 
 use super::types::{
     BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32,
-    NEG_INV_2_48, NEG_INV_2_64, SHIFT_16, alu_op,
+    NEG_INV_2_48, NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
 };
 
 // =========================================================================
@@ -299,11 +299,14 @@ pub fn generate_dvrm_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicities)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         let q = op.compute_quotient();
         let r = op.compute_remainder();
         let n_sub_r = op.n_sub_r();
@@ -311,59 +314,41 @@ pub fn generate_dvrm_trace(
         let abs_d = op.abs_d();
 
         // Fill n as DWordHL (4 halfwords)
-        data[base + cols::N_0] = FE::from(op.n & 0xFFFF);
-        data[base + cols::N_1] = FE::from((op.n >> 16) & 0xFFFF);
-        data[base + cols::N_2] = FE::from((op.n >> 32) & 0xFFFF);
-        data[base + cols::N_3] = FE::from((op.n >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::N_0, op.n);
 
         // Fill d as DWordHL (4 halfwords)
-        data[base + cols::D_0] = FE::from(op.d & 0xFFFF);
-        data[base + cols::D_1] = FE::from((op.d >> 16) & 0xFFFF);
-        data[base + cols::D_2] = FE::from((op.d >> 32) & 0xFFFF);
-        data[base + cols::D_3] = FE::from((op.d >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::D_0, op.d);
 
-        data[base + cols::SIGNED] = FE::from(op.signed as u64);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
 
         // Fill q as DWordHL (4 halfwords)
-        data[base + cols::Q_0] = FE::from(q & 0xFFFF);
-        data[base + cols::Q_1] = FE::from((q >> 16) & 0xFFFF);
-        data[base + cols::Q_2] = FE::from((q >> 32) & 0xFFFF);
-        data[base + cols::Q_3] = FE::from((q >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::Q_0, q);
 
         // Fill r as DWordHL (4 halfwords)
-        data[base + cols::R_0] = FE::from(r & 0xFFFF);
-        data[base + cols::R_1] = FE::from((r >> 16) & 0xFFFF);
-        data[base + cols::R_2] = FE::from((r >> 32) & 0xFFFF);
-        data[base + cols::R_3] = FE::from((r >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::R_0, r);
 
         // Fill auxiliary columns
-        data[base + cols::DIV_BY_ZERO] = FE::from(op.is_div_by_zero() as u64);
-        data[base + cols::OVERFLOW] = FE::from(op.is_overflow() as u64);
+        table.set_bool(row_idx, cols::DIV_BY_ZERO, op.is_div_by_zero());
+        table.set_bool(row_idx, cols::OVERFLOW, op.is_overflow());
 
-        data[base + cols::ABS_R_0] = FE::from(abs_r & 0xFFFF_FFFF);
-        data[base + cols::ABS_R_1] = FE::from(abs_r >> 32);
-
-        data[base + cols::ABS_D_0] = FE::from(abs_d & 0xFFFF_FFFF);
-        data[base + cols::ABS_D_1] = FE::from(abs_d >> 32);
+        table.set_dword_wl(row_idx, cols::ABS_R_0, abs_r);
+        table.set_dword_wl(row_idx, cols::ABS_D_0, abs_d);
 
         // Fill n_sub_r as DWordHL (4 halfwords)
-        data[base + cols::N_SUB_R_0] = FE::from(n_sub_r & 0xFFFF);
-        data[base + cols::N_SUB_R_1] = FE::from((n_sub_r >> 16) & 0xFFFF);
-        data[base + cols::N_SUB_R_2] = FE::from((n_sub_r >> 32) & 0xFFFF);
-        data[base + cols::N_SUB_R_3] = FE::from((n_sub_r >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::N_SUB_R_0, n_sub_r);
 
-        data[base + cols::SIGN_N_SUB_R] = FE::from(op.sign_n_sub_r() as u64);
-        data[base + cols::SIGN_N] = FE::from(op.sign_n() as u64);
-        data[base + cols::SIGN_D] = FE::from(op.sign_d() as u64);
-        data[base + cols::SIGN_Q] = FE::from(op.sign_q() as u64);
-        data[base + cols::SIGN_R] = FE::from(op.sign_r() as u64);
+        table.set_bool(row_idx, cols::SIGN_N_SUB_R, op.sign_n_sub_r());
+        table.set_bool(row_idx, cols::SIGN_N, op.sign_n());
+        table.set_bool(row_idx, cols::SIGN_D, op.sign_d());
+        table.set_bool(row_idx, cols::SIGN_Q, op.sign_q());
+        table.set_bool(row_idx, cols::SIGN_R, op.sign_r());
 
         // Multiplicities
-        data[base + cols::MU_Q] = FE::from(multiplicities.mu_q);
-        data[base + cols::MU_R] = FE::from(multiplicities.mu_r);
+        table.set_u64(row_idx, cols::MU_Q, multiplicities.mu_q);
+        table.set_u64(row_idx, cols::MU_R, multiplicities.mu_r);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================
