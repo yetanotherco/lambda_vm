@@ -15,19 +15,73 @@
   show raw: r => r.text
   it
 }
+// TODO: aside, todo callouts (rj/et/cdsg), the alternating table colors of decode
 
-// TODO: navbar
-#let nav = []
+#let nav(chapter) = {
+  let content = meta.summary.map(((title, chapters)) => {
+    strong(title);
+    list(..chapters.map(((cname, ctitle, cref)) => {
+      if cname == chapter {
+        html.a(ctitle, class: "current")
+      } else {
+        link(label("doc:" + str(cname)), ctitle)
+      }
+    }))
+  }).join()
 
-#document("/index.html", include "front.typ")
+  html.nav({
+    html.div(class: "desktop-nav", content)
+    html.details(class: "mobile-nav", html.summary("Navigation") + content)
+  })
+}
+
+#let prev_next(chapter) = {
+  let flat = meta.summary.map(((_, chapters)) => chapters).sum(default: ())
+  let index = flat.position(c => c.at(0) == chapter)
+  if index == none {
+    index = -1
+  }
+
+  html.nav(class: "prev-next",
+    html.div(class: "prev",
+      if index == 0 {
+        link(label("doc:index"), meta.title)
+      } else if index > 0 {
+        let (name, title, _) = flat.at(index - 1)
+        link(label("doc:" + name), title)
+      }
+    )
+    +
+    html.div(class: "next",
+      if index < flat.len() - 1 {
+        let (name, title, _) = flat.at(index + 1)
+        link(label("doc:" + name), title)
+      }
+    )
+  )
+}
+
+#let chapter(filename, title, mainbody) = [
+  #document("/" + filename + ".html", title: title, {
+      html.link(href: "/style.css", rel: "stylesheet")
+      heading(numbering: none, link(<doc:index>, meta.title))
+      nav(filename)
+      html.main(mainbody)
+      prev_next(filename)
+  })#label("doc:"+filename)
+]
+
+#asset("/style.css", read("style.css"))
+// TODO? sidenotes
+#chapter("index", meta.title, include "front.typ")
 
 #for (partname, part) in meta.summary {
   for (name, title, ref) in part {
-    document("/" + name + ".html")[
+    chapter(name, title + " | " + meta.title, [
       #heading(level: 1, title)#ref
       #set heading(offset: 1)
       #include name + ".typ"
-    ]
+    ])
   }
 }
 

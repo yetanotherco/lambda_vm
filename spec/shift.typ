@@ -16,9 +16,9 @@
 The #shift chip is designed to constrain that 
 $ 
 #`shifted` := cases(
-  #`in` #`<<` #`s` " if" #`direction` = 0,
-  #`in` #`>>` #`s` " if" #`direction` = 1 and #`signed` = 0,
-  #`in` #`>>>` #`s` "if" #`direction` = 1 and #`signed` = 1,
+  #`in` << #`s` " if" #`direction` = 0,
+  #`in` >> #`s` " if" #`direction` = 1 and #`signed` = 0,
+  #`in` >>> #`s` "if" #`direction` = 1 and #`signed` = 1,
 ) 
 $
 where
@@ -28,7 +28,7 @@ $
   #`shift` mod 64 "if" #`word_instr` = 0,
 ) 
 $
-Here, `<<` and `>>` denote the _logical_ left and right shift operations, while `>>>` denotes the _arithmetic_ right shift operation.
+Here, $<<$ and $>>$ denote the _logical_ left and right shift operations, while $>>>$ denotes the _arithmetic_ right shift operation.
 
 = Variables
 #let nr_variables = total_nr_variables(chip)

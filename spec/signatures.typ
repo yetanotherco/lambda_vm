@@ -1,5 +1,5 @@
 #import "/src.typ": load_signatures, load_config
-#import "/expr.typ": type_to_code
+#import "/expr.typ": type_to_code, flatten_code
 
 #let config = load_config()
 #let signatures = load_signatures(config)
@@ -24,7 +24,7 @@
     type_to_code(output) + `; `
   } else {``}
 
-  return [#cond_str#raw(sig.tag)#lb#output_str#input_str#rb]
+  return flatten_code([#cond_str#raw(sig.tag)#lb#output_str#input_str#rb])
 }
 
 // Compute the bus size of an interaction
