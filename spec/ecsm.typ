@@ -119,10 +119,10 @@ With $x_G$ read and range checked, we direct our attention to $y_G$.
 Rather than reading it from memory, the prover provides it as a witness and proves it to be correct.
 In particular, the chip enforces the relations 
 $
-  x_G^2 - #`x2` - q_1 dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_2)p &= 0\
+  x_G^2 - #`x2` - q_0 dot p &= 0,\
+  y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_1)p &= 0\
 $
-where non-negative $q_1$ and $q_2$ are prover-provided witnesses.
+where non-negative $q_0$ and $q_1$ are prover-provided witnesses.
 Note that these are equivalent to
 $
   #`x2` &equiv x_G^2 mod p,\
@@ -131,11 +131,11 @@ $
 which combine to $y_G^2 equiv x_G^3 + a x_G + b mod p$.
 Rewriting the two relations, we get
 $
-  q_1 &= (x_G^2 - #`x2`)/p,\
-  q_2 &= (y_G^2 - x_G dot #`x2` - a dot x_G - b)/p + 2p.
+  q_0 &= (x_G^2 - #`x2`)/p,\
+  q_1 &= (y_G^2 - x_G dot #`x2` - a dot x_G - b)/p + 2p.
 $
-Using the fact that $x_G, y_G, #`x2`,a in [0, p)$, we find that $q_1 in [0, p)$ and $q_2 in [0, 3p)$.
-We must therefore support quotients $q_1 in [0, 2^256)$ and $q_2 in [0, 2^258)$.
+Using the fact that $x_G, y_G, #`x2`,a in [0, p)$, we find that $q_0 in [0, p)$ and $q_1 in [0, 3p)$.
+We must therefore support quotients $q_0 in [0, 2^256)$ and $q_1 in [0, 2^258)$.
 
 #aside("Two options for " + $y_G$)[
   In most cases, $y_G^2$ has _two_ roots $mod p$.
