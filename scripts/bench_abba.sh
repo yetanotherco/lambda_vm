@@ -158,7 +158,7 @@ df = n - 1
 tc = TT.get(df) or (1.96 if df > 120 else TT[min(TT, key=lambda k: abs(k - df))])
 lo, hi = mean - tc * se, mean + tc * se
 
-# ---- robust: median + Wilcoxon signed-rank (tie-averaged ranks, normal approx) ----
+# ---- robust: median + Wilcoxon signed-rank (tie-averaged ranks, EXACT p, pure stdlib) ----
 def median(xs):
     s = sorted(xs); m = len(s)
     return s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2
@@ -180,8 +180,25 @@ Wp = sum(r for r, x in zip(ranks, nz) if x > 0)
 Wn = sum(r for r, x in zip(ranks, nz) if x < 0)
 mu = m * (m + 1) / 4.0
 sig = math.sqrt(m * (m + 1) * (2 * m + 1) / 24.0) if m else 0.0
-z = (Wp - mu - (0.5 if Wp > mu else -0.5)) / sig if sig else 0.0   # continuity-corrected
-p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
+z = (Wp - mu - (0.5 if Wp > mu else -0.5)) / sig if sig else 0.0   # normal approx (display only)
+# EXACT two-sided p: enumerate the signed-rank null distribution. Each rank is +/- with
+# prob 1/2, so the count of assignments giving W+=v is the coeff of x^v in prod(1 + x^rank)
+# -- build it with a generating-function DP. Double the ranks so tie-averaged (half-integer)
+# ranks become integers. No scipy; exact even at small n where the normal approx is loose.
+if m:
+    ir = [int(round(2 * r)) for r in ranks]
+    poly = [1]
+    for r in ir:
+        nxt = [0] * (len(poly) + r)
+        for v, c in enumerate(poly):
+            if c:
+                nxt[v] += c          # this rank negative -> adds 0 to W+
+                nxt[v + r] += c      # this rank positive -> adds r to W+
+        poly = nxt
+    Wp2 = int(round(2 * Wp))
+    p = min(1.0, 2.0 * min(sum(poly[:Wp2 + 1]), sum(poly[Wp2:])) / (1 << m))
+else:
+    p = 1.0
 med = median(d)
 
 # ---- server stability (byproduct): run-to-run jitter + within-session drift ----
@@ -208,7 +225,8 @@ print(f"  pairs: {n}   mean A (PR): {sum(A)/n:.3f}s   mean B (base): {sum(B)/n:.
 print()
 print(f"  [parametric] paired-t   mean {mean:+.2f}%   sd {sd:.2f}%   se {se:.2f}%")
 print(f"               95% CI: [{lo:+.2f}%, {hi:+.2f}%]   (t df={df} = {tc})")
-print(f"  [robust]     median {med:+.2f}%   Wilcoxon W+={Wp:.0f} W-={Wn:.0f}  z={z:+.2f}  p~={p:.3f}")
+pstr = f"{p:.4f}" if p >= 1e-4 else f"{p:.1e}"
+print(f"  [robust]     median {med:+.2f}%   Wilcoxon W+={Wp:.0f} W-={Wn:.0f}  p(exact)={pstr}  (z={z:+.2f})")
 print()
 print("  --- server stability (this run; compare across servers) ---")
 print(f"  run-to-run jitter:    A CV {cvA:.2f}%   B CV {cvB:.2f}%        (lower = steadier)")
