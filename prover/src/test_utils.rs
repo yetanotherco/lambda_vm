@@ -1060,6 +1060,7 @@ pub fn create_ecsm_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("ECSM")
+    .with_domain_constraints(Box::new(crate::tables::ecsm::EcsmDomain))
 }
 
 /// Create EC_SCALAR AIR (serves the scalar bit-by-bit to ECDAS).

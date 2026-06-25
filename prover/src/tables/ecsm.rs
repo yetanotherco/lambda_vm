@@ -20,13 +20,17 @@
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
+use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint, is_bit_fold};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
@@ -936,4 +940,142 @@ pub fn create_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+/// ECSM's 148 domain constraints folded in `create_constraints` order: IS_BIT(µ),
+/// the 64 X2 convolution carries + closing, the 64 yG convolution carries + closing,
+/// IS_BIT(q1[32]), then the two 256-bit overflow checks (k<N, xR<p). Each overflow
+/// check's 8-word carry chain is computed once and shared across its 7 CarryBit + 1
+/// OverflowRequired constraints (the boxed path recomputes `carry_chain` for each).
+pub fn ecsm_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let zero = FieldElement::<CB::F>::zero();
+    let c256 = FieldElement::<CB::F>::from(256u64);
+    let s16 = FieldElement::<CB::F>::from(1u64 << 16);
+    let inv = FieldElement::<CB::F>::from(INV_SHIFT_32);
+
+    // --- read all needed columns once ---
+    let mu = cb.main(cols::MU).clone();
+    let read = |cb: &CB, base: usize, len: usize| -> Vec<FieldElement<CB::F>> {
+        (0..len).map(|j| cb.main(base + j).clone()).collect()
+    };
+    let xg = read(cb, cols::XG, 32);
+    let yg = read(cb, cols::YG, 32);
+    let x2 = read(cb, cols::X2, 32);
+    let q0 = read(cb, cols::Q0, 32);
+    let q1 = read(cb, cols::Q1, 33);
+    let c0 = read(cb, cols::C0, 64);
+    let c1 = read(cb, cols::C1, 64);
+    let k_sub_n = read(cb, cols::K_SUB_N, 16);
+    let xr_sub_p = read(cb, cols::XR_SUB_P, 16);
+    let k = read(cb, cols::K, 32);
+    let xr = read(cb, cols::XR, 32);
+
+    // zero-extended byte accessor and the constant p-byte.
+    let byte = |arr: &[FieldElement<CB::F>], j: usize| -> FieldElement<CB::F> {
+        if j < arr.len() { arr[j].clone() } else { zero.clone() }
+    };
+    let pb = |m: usize| -> FieldElement<CB::F> {
+        if m < 32 {
+            FieldElement::<CB::F>::from(P_BYTES[m] as u64)
+        } else {
+            zero.clone()
+        }
+    };
+
+    // idx 0: IS_BIT(µ)
+    is_bit_fold(cb, None, cols::MU);
+
+    // X2 convolution carries: 256·c0[i] − c0[i-1] − s_i  (s_i = Σ xG·xG − Σ q0·P − x2_i).
+    for i in 0..64 {
+        let mut sx = zero.clone();
+        for j in 0..=i {
+            sx = &sx + &(&byte(&xg, j) * &byte(&xg, i - j));
+            sx = &sx - &(&byte(&q0, j) * &pb(i - j));
+        }
+        sx = &sx - &byte(&x2, i);
+        let c_prev = if i == 0 { zero.clone() } else { c0[i - 1].clone() };
+        cb.fold(&(&(&c256 * &c0[i]) - &c_prev) - &sx);
+    }
+    // closing: c0[63] = 0
+    cb.fold(c0[63].clone());
+
+    // yG convolution carries.
+    for i in 0..64 {
+        let mut sy = zero.clone();
+        for j in 0..=i {
+            sy = &sy + &(&byte(&yg, j) * &byte(&yg, i - j));
+            sy = &sy + &(&pb(j) * &pb(i - j));
+            sy = &sy - &(&byte(&x2, j) * &byte(&xg, i - j));
+            sy = &sy - &(&byte(&q1, j) * &pb(i - j));
+        }
+        if i == 0 {
+            sy = &sy - &(&mu * &FieldElement::<CB::F>::from(B));
+        }
+        let c_prev = if i == 0 { zero.clone() } else { c1[i - 1].clone() };
+        cb.fold(&(&(&c256 * &c1[i]) - &c_prev) - &sy);
+    }
+    // closing: c1[63] = 0
+    cb.fold(c1[63].clone());
+
+    // IS_BIT(q1[32])
+    is_bit_fold(cb, None, cols::q1(32));
+
+    // 256-bit overflow carry chain: c_i = (const_word_i + addend1_i + c_{i-1} − sum_i)·2^-32.
+    let carry_chain = |hl: &[FieldElement<CB::F>],
+                       bl: &[FieldElement<CB::F>],
+                       cbytes: &[u8; 32]|
+     -> Vec<FieldElement<CB::F>> {
+        let mut c: Vec<FieldElement<CB::F>> = Vec::with_capacity(8);
+        let mut prev = zero.clone();
+        for i in 0..8 {
+            let addend1 = &hl[2 * i] + &(&hl[2 * i + 1] * &s16);
+            let mut sum = zero.clone();
+            for b in 0..4 {
+                sum = &sum + &(&bl[4 * i + b] * &FieldElement::<CB::F>::from(1u64 << (8 * b)));
+            }
+            let mut cw = 0u64;
+            for b in 0..4 {
+                cw += (cbytes[4 * i + b] as u64) << (8 * b);
+            }
+            let addend0 = FieldElement::<CB::F>::from(cw);
+            let ci = &(&(&(&addend0 + &addend1) + &prev) - &sum) * &inv;
+            c.push(ci.clone());
+            prev = ci;
+        }
+        c
+    };
+
+    // k < N, then xR < p: 7 CarryBit (µ·c_i·(1−c_i)) + OverflowRequired (µ·(1−c_7)).
+    for (hl, bl, cbytes) in [
+        (&k_sub_n, &k, &N_BYTES),
+        (&xr_sub_p, &xr, &P_BYTES),
+    ] {
+        let c = carry_chain(hl, bl, cbytes);
+        for i in 0..7 {
+            cb.fold(&(&mu * &c[i]) * &(&one - &c[i]));
+        }
+        cb.fold(&mu * &(&one - &c[7]));
+    }
+}
+
+/// ECSM's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct EcsmDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for EcsmDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        ecsm_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        ecsm_domain_eval(cb);
+    }
 }
