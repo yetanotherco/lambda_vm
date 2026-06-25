@@ -293,7 +293,12 @@ fn launch_keccak_base_row_major(
     buf: &CudaSlice<u64>, m: u64, num_rows: u64, log_num_rows: u64,
     leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
 ) -> Result<()> {
-    let cfg = LaunchConfig::for_num_elems(num_rows as u32);
+    // The keccak kernel is register-heavy (Keccak state `uint64_t st[25]`), so it
+    // must launch with the keccak-tuned block dim (128). `for_num_elems` uses 1024
+    // threads/block, which exceeds the per-block register budget and fails the
+    // launch with CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES — silently dropping the whole
+    // R1 GPU path to the CPU fallback (no device handle for rounds 2-4).
+    let cfg = keccak_launch_cfg(num_rows);
     unsafe {
         stream.launch_builder(&be.keccak256_leaves_base_row_major)
             .arg(buf).arg(&m).arg(&num_rows).arg(&log_num_rows)
