@@ -18,6 +18,9 @@ use executor::{
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
+const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
+const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
+
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
 /// thread-local caches — `epoch::advance()` just merges cached counters.
@@ -136,7 +139,7 @@ enum Commands {
         #[arg(long)]
         time: bool,
 
-        /// Execute one pre-pass outside the timer and print dynamic instruction count
+        /// Execute once outside the timer and print dynamic instruction count
         #[arg(long)]
         cycles: bool,
 
@@ -149,14 +152,15 @@ enum Commands {
         #[arg(long)]
         continuations: bool,
 
-        /// Epoch length in cycles (continuations only). Rounded up to a power of two (>=4).
-        #[arg(long, requires = "continuations", conflicts_with = "num_epochs")]
-        epoch_size: Option<usize>,
-
-        /// Target number of epochs (continuations only); sets epoch_size = ceil(cycles / N).
-        /// Default when neither flag is given: 4.
-        #[arg(long, requires = "continuations", conflicts_with = "epoch_size")]
-        num_epochs: Option<usize>,
+        /// Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "continuations",
+            value_parser = parse_epoch_size_log2,
+            long_help = "Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.\n\nDefault when omitted: 20. Values below 18 are rejected for the CLI because tiny epochs are dominated by fixed overhead. Indicative ethrex 10-transfer distinct-account peak heap from a local sweep: 19 ~= 6.9 GB, 20 ~= 9.5 GB, 21 ~= 15.8 GB, 22 ~= 26.8 GB. Higher values reduce epoch count, continuation bundle size, and fixed per-epoch overhead, but increase peak memory. For a new workload, try the highest value your machine can run without swapping."
+        )]
+        epoch_size_log2: Option<u32>,
     },
 
     /// Verify a proof bundle
@@ -214,19 +218,10 @@ fn main() -> ExitCode {
             cycles,
             elements,
             continuations,
-            epoch_size,
-            num_epochs,
+            epoch_size_log2,
         } => {
             if continuations {
-                cmd_prove_continuation(
-                    elf,
-                    output,
-                    private_input,
-                    epoch_size,
-                    num_epochs,
-                    blowup,
-                    time,
-                )
+                cmd_prove_continuation(elf, output, private_input, epoch_size_log2, blowup, time)
             } else {
                 cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
             }
@@ -582,8 +577,7 @@ fn cmd_prove_continuation(
     elf_path: PathBuf,
     output_path: PathBuf,
     private_input_path: Option<PathBuf>,
-    epoch_size: Option<usize>,
-    num_epochs: Option<usize>,
+    epoch_size_log2: Option<u32>,
     blowup: Option<u8>,
     time: bool,
 ) -> ExitCode {
@@ -604,34 +598,12 @@ fn cmd_prove_continuation(
         }
     };
 
-    // Resolve the epoch size. An explicit --epoch-size wins; otherwise split the
-    // run into N epochs (--num-epochs, default 4) via a cycle pre-pass.
-    let epoch_size = match epoch_size {
-        Some(n) => n,
-        None => {
-            let n = num_epochs.unwrap_or(4).max(1);
-            let program = match Elf::load(&elf_data) {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("Failed to load ELF for cycle count: {:?}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            let executor = match Executor::new(&program, private_inputs.clone()) {
-                Ok(e) => e,
-                Err(e) => {
-                    eprintln!("Failed to create executor for cycle count: {:?}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            let total_cycles = match executor.run() {
-                Ok(result) => result.logs.len(),
-                Err(e) => {
-                    eprintln!("Execution failed during cycle count: {:?}", e);
-                    return ExitCode::FAILURE;
-                }
-            };
-            total_cycles.div_ceil(n).max(1)
+    let epoch_size_log2 = epoch_size_log2.unwrap_or(DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2);
+    let epoch_size = match continuation_epoch_size(epoch_size_log2) {
+        Ok(size) => size,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
         }
     };
 
@@ -645,8 +617,7 @@ fn cmd_prove_continuation(
     };
 
     eprintln!(
-        "Generating continuation proof (blowup={blowup}, epoch_size={epoch_size}, rounded to {})...",
-        epoch_size.next_power_of_two().max(4)
+        "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size})...",
     );
     let start = Instant::now();
     let bundle = match prover::continuation::prove_continuation(
@@ -788,6 +759,25 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
     }
 }
 
+fn continuation_epoch_size(epoch_size_log2: u32) -> Result<usize, String> {
+    if epoch_size_log2 < MIN_CONTINUATION_EPOCH_SIZE_LOG2 {
+        return Err(format!(
+            "--epoch-size-log2 must be at least {MIN_CONTINUATION_EPOCH_SIZE_LOG2} for CLI proving"
+        ));
+    }
+    1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+        format!("--epoch-size-log2 {epoch_size_log2} is too large for this platform")
+    })
+}
+
+fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
+    let epoch_size_log2 = value
+        .parse::<u32>()
+        .map_err(|_| format!("--epoch-size-log2 must be an integer, got `{value}`"))?;
+    continuation_epoch_size(epoch_size_log2)?;
+    Ok(epoch_size_log2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -799,9 +789,53 @@ mod tests {
         Cli::command().debug_assert();
     }
 
-    // --epoch-size and --num-epochs are mutually exclusive.
+    // The continuation epoch flag requires --continuations.
     #[test]
-    fn epoch_size_and_num_epochs_conflict() {
+    fn epoch_size_log2_requires_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--epoch-size-log2",
+            "20",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn epoch_size_log2_accepts_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size-log2",
+            "20",
+        ]);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn epoch_size_log2_rejects_tiny_cli_values() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size-log2",
+            "17",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn old_epoch_size_flag_is_rejected() {
         let r = Cli::command().try_get_matches_from([
             "cli",
             "prove",
@@ -810,25 +844,46 @@ mod tests {
             "out",
             "--continuations",
             "--epoch-size",
-            "8",
-            "--num-epochs",
-            "4",
+            "1048576",
         ]);
         assert!(r.is_err());
     }
 
-    // The continuation epoch flags require --continuations.
     #[test]
-    fn epoch_size_requires_continuations() {
+    fn old_num_epochs_flag_is_rejected() {
         let r = Cli::command().try_get_matches_from([
             "cli",
             "prove",
             "prog.elf",
             "-o",
             "out",
-            "--epoch-size",
-            "8",
+            "--continuations",
+            "--num-epochs",
+            "4",
         ]);
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn prove_help_omits_removed_epoch_flags() {
+        let mut cmd = Cli::command();
+        let prove = cmd.find_subcommand_mut("prove").unwrap();
+        let mut help = Vec::new();
+        prove.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--epoch-size-log2 <N>"));
+        assert!(!help.contains("--num-epochs"));
+        assert!(!help.contains("--epoch-size <"));
+    }
+
+    #[test]
+    fn continuation_epoch_size_rejects_tiny_cli_values() {
+        assert!(continuation_epoch_size(17).is_err());
+    }
+
+    #[test]
+    fn continuation_epoch_size_uses_exact_power_of_two() {
+        assert_eq!(continuation_epoch_size(20).unwrap(), 1 << 20);
     }
 }
