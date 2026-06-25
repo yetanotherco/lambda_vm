@@ -875,13 +875,21 @@ mod tests {
 
         // The late commit (only `halt` follows it) lands past the midpoint, so a
         // half-sized epoch forces it into a later epoch where x254 is already 2.
-        let split = prove_and_verify_continuation(
+        // Prove first so we can assert the run actually split into >1 epoch — without
+        // this the test would silently pass even if it degraded to a single epoch.
+        let bundle = prove_continuation(
             &elf_bytes,
             &[],
             (total / 2).max(1),
             &ProofOptions::default_test_options(),
         )
         .unwrap();
+        assert!(
+            bundle.num_epochs() > 1,
+            "a half-sized epoch must split the run into multiple epochs"
+        );
+        let split = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            .unwrap();
         assert_eq!(
             split.as_deref(),
             Some(&expected_output[..]),
