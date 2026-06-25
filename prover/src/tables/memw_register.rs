@@ -46,7 +46,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::memw::MemwOperation;
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices (10 columns)
@@ -94,11 +94,14 @@ pub fn generate_memw_register_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         debug_assert_eq!(
             op.base_address % 2,
             0,
@@ -116,29 +119,32 @@ pub fn generate_memw_register_trace(
         );
 
         // ADDRESS = base_address / 2 (CPU sends 2 * register_index)
-        data[base + cols::ADDRESS] = FE::from(op.base_address / 2);
+        table.set_u64(row_idx, cols::ADDRESS, op.base_address / 2);
 
         // Timestamp split into lo/hi 32-bit words
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // Value: registers are DWordWL = 2 words
-        data[base + cols::VAL_0] = FE::from(op.value[0]);
-        data[base + cols::VAL_1] = FE::from(op.value[1]);
+        table.set_u64(row_idx, cols::VAL_0, op.value[0]);
+        table.set_u64(row_idx, cols::VAL_1, op.value[1]);
 
         // Old value
-        data[base + cols::OLD_0] = FE::from(op.old[0]);
-        data[base + cols::OLD_1] = FE::from(op.old[1]);
+        table.set_u64(row_idx, cols::OLD_0, op.old[0]);
+        table.set_u64(row_idx, cols::OLD_1, op.old[1]);
 
         // Old timestamp low (upper limb shared with TIMESTAMP_1)
-        data[base + cols::OLD_TIMESTAMP_LO] = FE::from(op.old_timestamp[0] & 0xFFFF_FFFF);
+        table.set_u64(
+            row_idx,
+            cols::OLD_TIMESTAMP_LO,
+            op.old_timestamp[0] & 0xFFFF_FFFF,
+        );
 
         // Multiplicity
-        data[base + cols::MU_READ] = FE::from(op.is_read as u64);
-        data[base + cols::MU_WRITE] = FE::from(!op.is_read as u64);
+        table.set_bool(row_idx, cols::MU_READ, op.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

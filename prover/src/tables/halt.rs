@@ -30,7 +30,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices for HALT table
@@ -72,17 +72,13 @@ pub fn generate_halt_trace(
         timestamp <= u32::MAX as u64,
         "HALT timestamp {timestamp} exceeds u32 range"
     );
-    let timestamp_lo = timestamp & 0xFFFF_FFFF;
-    let timestamp_hi = timestamp >> 32;
+    let mut trace = TraceTable::new_main(vec![FE::zero(); cols::NUM_COLUMNS], cols::NUM_COLUMNS, 1);
+    let table = &mut trace.main_table;
 
-    let data = vec![
-        FE::from(timestamp_lo),
-        FE::from(timestamp_hi),
-        FE::from(next_pc & 0xFFFF_FFFF),
-        FE::from(next_pc >> 32),
-    ];
+    table.set_dword_wl(0, cols::TIMESTAMP_0, timestamp);
+    table.set_dword_wl(0, cols::PC_0, next_pc);
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

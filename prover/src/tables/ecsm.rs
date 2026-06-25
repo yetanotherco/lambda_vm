@@ -25,7 +25,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
@@ -137,23 +137,13 @@ fn fe_from_i64(c: i64) -> FE {
     }
 }
 
-fn write_dword_wl(data: &mut [FE], base: usize, lo_col: usize, value: u64) {
-    data[base + lo_col] = FE::from(value & 0xFFFF_FFFF);
-    data[base + lo_col + 1] = FE::from(value >> 32);
-}
-
-fn write_bytes(data: &mut [FE], base: usize, col: usize, bytes: &[u8]) {
-    for (i, &b) in bytes.iter().enumerate() {
-        data[base + col + i] = FE::from(b as u64);
-    }
-}
-
 /// Writes a 32-byte little-endian value as 16 halfwords (U256HL).
-fn write_halfwords(data: &mut [FE], base: usize, col: usize, bytes: &[u8; 32]) {
+fn write_halfwords(table: &mut impl VmTable, row: usize, col: usize, bytes: &[u8; 32]) {
+    let mut halfwords = [0u16; 16];
     for j in 0..16 {
-        let hw = bytes[2 * j] as u64 + ((bytes[2 * j + 1] as u64) << 8);
-        data[base + col + j] = FE::from(hw);
+        halfwords[j] = u16::from_le_bytes([bytes[2 * j], bytes[2 * j + 1]]);
     }
+    table.set_halves(row, col, &halfwords);
 }
 
 pub fn generate_ecsm_trace(
@@ -161,48 +151,51 @@ pub fn generate_ecsm_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
         let w = &op.witness;
 
-        write_dword_wl(&mut data, base, cols::TIMESTAMP_0, op.timestamp);
-        write_dword_wl(&mut data, base, cols::ADDR_XG_0, op.addr_xg);
-        write_dword_wl(&mut data, base, cols::ADDR_K_0, op.addr_k);
-        write_dword_wl(&mut data, base, cols::ADDR_XR_0, op.addr_xr);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_dword_wl(row_idx, cols::ADDR_XG_0, op.addr_xg);
+        table.set_dword_wl(row_idx, cols::ADDR_K_0, op.addr_k);
+        table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
 
-        write_bytes(&mut data, base, cols::XR, &w.x_r);
-        write_bytes(&mut data, base, cols::YR, &w.y_r);
-        write_bytes(&mut data, base, cols::K, &w.k);
-        data[base + cols::LEN_K] = FE::from(w.len_k as u64);
-        write_bytes(&mut data, base, cols::XG, &w.x_g);
-        write_bytes(&mut data, base, cols::YG, &w.y_g);
-        write_bytes(&mut data, base, cols::X2, &w.x2);
-        write_bytes(&mut data, base, cols::Q0, &w.q0);
-        write_bytes(&mut data, base, cols::Q1, &w.q1);
-        write_halfwords(&mut data, base, cols::K_SUB_N, &w.k_sub_n);
-        write_halfwords(&mut data, base, cols::XR_SUB_P, &w.x_r_sub_p);
+        table.set_bytes(row_idx, cols::XR, &w.x_r);
+        table.set_bytes(row_idx, cols::YR, &w.y_r);
+        table.set_bytes(row_idx, cols::K, &w.k);
+        table.set_u64(row_idx, cols::LEN_K, w.len_k as u64);
+        table.set_bytes(row_idx, cols::XG, &w.x_g);
+        table.set_bytes(row_idx, cols::YG, &w.y_g);
+        table.set_bytes(row_idx, cols::X2, &w.x2);
+        table.set_bytes(row_idx, cols::Q0, &w.q0);
+        table.set_bytes(row_idx, cols::Q1, &w.q1);
+        write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
+        write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
 
         for i in 0..64 {
             debug_assert!((0..1 << 16).contains(&(w.c0[i] + CARRY_OFFSET_X2)));
             debug_assert!((0..1 << 16).contains(&(w.c1[i] + CARRY_OFFSET_YG)));
-            data[base + cols::c0(i)] = fe_from_i64(w.c0[i]);
-            data[base + cols::c1(i)] = fe_from_i64(w.c1[i]);
+            table.set_fe(row_idx, cols::c0(i), fe_from_i64(w.c0[i]));
+            table.set_fe(row_idx, cols::c1(i), fe_from_i64(w.c1[i]));
         }
 
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows (`mu = 0`) must carry `q1 = p` so the yG carry relation closes: the
     // `p² − q1·p` offset cancels and the µ-gated `b` term drops. Bytes 0..31 hold p; byte 32
     // stays 0 (a valid IS_BIT value).
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
-        write_bytes(&mut data, base, cols::Q1, &P_BYTES);
+        table.set_bytes(row_idx, cols::Q1, &P_BYTES);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

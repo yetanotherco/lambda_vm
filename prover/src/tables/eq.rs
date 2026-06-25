@@ -28,7 +28,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
 
 // =========================================================================
@@ -129,32 +129,30 @@ pub fn generate_eq_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // a, b as DWordWL (2 words each)
-        data[base + cols::A_0] = FE::from(op.a & 0xFFFF_FFFF);
-        data[base + cols::A_1] = FE::from(op.a >> 32);
-        data[base + cols::B_0] = FE::from(op.b & 0xFFFF_FFFF);
-        data[base + cols::B_1] = FE::from(op.b >> 32);
+        table.set_dword_wl(row_idx, cols::A_0, op.a);
+        table.set_dword_wl(row_idx, cols::B_0, op.b);
 
-        data[base + cols::INVERT] = FE::from(op.invert as u64);
-        data[base + cols::RES] = FE::from(op.compute_res() as u64);
+        table.set_bool(row_idx, cols::INVERT, op.invert);
+        table.set_bool(row_idx, cols::RES, op.compute_res());
 
         // diff = a - b (wrapping) as DWordHL (4 halves)
         let diff = op.a.wrapping_sub(op.b);
-        data[base + cols::DIFF_0] = FE::from(diff & 0xFFFF);
-        data[base + cols::DIFF_1] = FE::from((diff >> 16) & 0xFFFF);
-        data[base + cols::DIFF_2] = FE::from((diff >> 32) & 0xFFFF);
-        data[base + cols::DIFF_3] = FE::from((diff >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::DIFF_0, diff);
 
-        data[base + cols::EQ] = FE::from(op.compute_eq() as u64);
-        data[base + cols::MU] = FE::from(*multiplicity);
+        table.set_bool(row_idx, cols::EQ, op.compute_eq());
+        table.set_u64(row_idx, cols::MU, *multiplicity);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

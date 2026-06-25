@@ -9,7 +9,6 @@
 //! `ProofOptions` not covered by the static table).
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
-use math::field::element::FieldElement;
 use math::polynomial::Polynomial;
 use stark::config::{BatchedMerkleTree, Commitment};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
@@ -19,7 +18,7 @@ use stark::trace::{TraceTable, columns2rows};
 
 use executor::vm::instruction::execution::KECCAK_RC;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices
@@ -198,18 +197,22 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// All precomputed columns are filled; MU is initialized to zero and must be
 /// updated via `update_multiplicities` after all round-chip lookups are known.
 pub fn generate_keccak_rc_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let mut data = vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for idx in 0..NUM_ROWS {
-        let base = idx * cols::NUM_COLUMNS;
         let row = generate_row(idx);
         for (col_idx, &value) in row.iter().enumerate() {
-            data[base + col_idx] = FE::from(value);
+            table.set_u64(idx, col_idx, value);
         }
         // MU = 0 (will be updated later)
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 /// Increment MU for each round lookup.
@@ -221,9 +224,10 @@ pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     num_keccak_ops: usize,
 ) {
-    let mu = FieldElement::from(num_keccak_ops as u64);
     for round in 0..NUM_REAL_ROWS {
-        trace.set_main(round, cols::MU, mu);
+        trace
+            .main_table
+            .set_u64(round, cols::MU, num_keccak_ops as u64);
     }
 }
 

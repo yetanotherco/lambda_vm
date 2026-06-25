@@ -549,16 +549,28 @@ class AiReviewSubmissionTests(unittest.TestCase):
                 os.environ["GITHUB_WORKSPACE"] = old
 
     def test_scoped_provider_env_keeps_only_relevant_key(self) -> None:
-        saved = {k: os.environ.get(k) for k in ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY"]}
-        os.environ.update({"OPENROUTER_API_KEY": "or", "ANTHROPIC_API_KEY": "an", "MINIMAX_API_KEY": "mm"})
+        saved = {
+            k: os.environ.get(k)
+            for k in ["OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "ZRO_API_KEY"]
+        }
+        os.environ.update(
+            {"OPENROUTER_API_KEY": "or", "ANTHROPIC_API_KEY": "an", "MINIMAX_API_KEY": "mm", "ZRO_API_KEY": "zr"}
+        )
         try:
             env = ai_review.scoped_provider_env("openrouter/z-ai/glm-5.2")
             self.assertEqual(env.get("OPENROUTER_API_KEY"), "or")
             self.assertNotIn("ANTHROPIC_API_KEY", env)
             self.assertNotIn("MINIMAX_API_KEY", env)
+            self.assertNotIn("ZRO_API_KEY", env)
             env2 = ai_review.scoped_provider_env("minimax/MiniMax-M3")
             self.assertEqual(env2.get("MINIMAX_API_KEY"), "mm")
             self.assertNotIn("OPENROUTER_API_KEY", env2)
+            # The Moonmath "zro" gateway lane keeps only ZRO_API_KEY (see PROVIDER_KEYS).
+            env3 = ai_review.scoped_provider_env("zro/minimax-m3")
+            self.assertEqual(env3.get("ZRO_API_KEY"), "zr")
+            self.assertNotIn("OPENROUTER_API_KEY", env3)
+            self.assertNotIn("ANTHROPIC_API_KEY", env3)
+            self.assertNotIn("MINIMAX_API_KEY", env3)
         finally:
             for k, v in saved.items():
                 if v is None:
