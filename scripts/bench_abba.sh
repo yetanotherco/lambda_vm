@@ -184,12 +184,36 @@ z = (Wp - mu - (0.5 if Wp > mu else -0.5)) / sig if sig else 0.0   # continuity-
 p = 2 * (1 - 0.5 * (1 + math.erf(abs(z) / math.sqrt(2))))
 med = median(d)
 
+# ---- server stability (byproduct): run-to-run jitter + within-session drift ----
+def cv(xs):
+    mm = sum(xs) / len(xs)
+    s = math.sqrt(sum((x - mm) ** 2 for x in xs) / (len(xs) - 1)) if len(xs) > 1 else 0.0
+    return (s / mm * 100.0) if mm else 0.0
+mA, mB = sum(A) / n, sum(B) / n
+cvA, cvB = cv(A), cv(B)
+# reconstruct execution order (odd pair: A,B ; even pair: B,A) and normalize each
+# run by its binary's mean so the A/B offset drops out, leaving pure machine drift.
+seq = []
+for i in range(n):
+    seq += ([('A', A[i]), ('B', B[i])] if (i + 1) % 2 else [('B', B[i]), ('A', A[i])])
+nrm = [(t / (mA if lbl == 'A' else mB) - 1) * 100 for lbl, t in seq]
+N = len(nrm); mi = (N - 1) / 2.0; mn = sum(nrm) / N
+denom = sum((i - mi) ** 2 for i in range(N))
+slope = (sum((i - mi) * (nrm[i] - mn) for i in range(N)) / denom) if denom else 0.0
+half = N // 2
+drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
+
 print("\n=== ABBA paired result  (improvement: + = PR faster) ===")
 print(f"  pairs: {n}   mean A (PR): {sum(A)/n:.3f}s   mean B (base): {sum(B)/n:.3f}s")
 print()
 print(f"  [parametric] paired-t   mean {mean:+.2f}%   sd {sd:.2f}%   se {se:.2f}%")
 print(f"               95% CI: [{lo:+.2f}%, {hi:+.2f}%]   (t df={df} = {tc})")
 print(f"  [robust]     median {med:+.2f}%   Wilcoxon W+={Wp:.0f} W-={Wn:.0f}  z={z:+.2f}  p~={p:.3f}")
+print()
+print("  --- server stability (this run; compare across servers) ---")
+print(f"  run-to-run jitter:    A CV {cvA:.2f}%   B CV {cvB:.2f}%        (lower = steadier)")
+print(f"  within-session drift: {slope * N:+.2f}% over the run, 1st->2nd half {drift_shift:+.2f}%")
+print(f"    (jitter -> Tier-1 cached gate floor; drift -> whether the cached baseline can be trusted)")
 print()
 if lo > 0 and p < 0.05:
     print(f"  VERDICT: REAL IMPROVEMENT - PR faster by ~{mean:.2f}% (t-CI and Wilcoxon agree)")
