@@ -10,7 +10,7 @@
 //!
 //! Curve point operations are delegated to the RustCrypto `k256` crate; witness generation
 //! replays the schedule in `k256` projective coordinates and batch-inverts the slope
-//! denominators, while `num-bigint` carries the coordinate/limb representation the trace
+//! denominators, while `crypto-bigint` carries the coordinate/limb representation the trace
 //! needs. All of this runs once per `ECALL`, so it is not performance critical.
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
@@ -21,7 +21,7 @@ pub mod witness;
 #[cfg(test)]
 mod tests;
 
-use num_bigint::BigUint;
+use crypto_bigint::{Encoding, U256};
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
 pub use witness::{EcdasStep, EcsmWitness, compute_witness};
@@ -48,14 +48,14 @@ pub const R_BYTES: [u8; 33] = [
     0x02,
 ];
 
-/// The prime field modulus `p` as a `BigUint`.
-pub fn p() -> BigUint {
-    BigUint::from_bytes_le(&P_BYTES)
+/// The prime field modulus `p` as a `U256`.
+pub fn p() -> U256 {
+    U256::from_le_slice(&P_BYTES)
 }
 
-/// The curve order `N` as a `BigUint`.
-pub fn n() -> BigUint {
-    BigUint::from_bytes_le(&N_BYTES)
+/// The curve order `N` as a `U256`.
+pub fn n() -> U256 {
+    U256::from_le_slice(&N_BYTES)
 }
 
 /// Errors that prevent a sound ECSM witness from existing for the given inputs.
@@ -86,16 +86,6 @@ impl core::fmt::Display for EcsmError {
 
 impl std::error::Error for EcsmError {}
 
-/// Converts a `BigUint` to 32 little-endian bytes (zero-padded / truncated to 32).
-pub fn to_le_32(v: &BigUint) -> [u8; 32] {
-    debug_assert!(v.bits() <= 256, "to_le_32: value exceeds 256 bits");
-    let mut bytes = v.to_bytes_le();
-    bytes.resize(32, 0);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&bytes[..32]);
-    out
-}
-
 /// Validates the scalar and recovers the generator point from `(xG, k)`.
 ///
 /// Shared front-end for both entry points: checks `0 < k < N`, rebuilds `xG`, and recovers
@@ -103,15 +93,15 @@ pub fn to_le_32(v: &BigUint) -> [u8; 32] {
 pub(crate) fn prepare(
     k_le: &[u8; 32],
     xg_le: &[u8; 32],
-) -> Result<(BigUint, AffinePoint), EcsmError> {
-    let k = BigUint::from_bytes_le(k_le);
-    if k == BigUint::from(0u8) {
+) -> Result<(U256, AffinePoint), EcsmError> {
+    let k = U256::from_le_slice(k_le);
+    if k == U256::ZERO {
         return Err(EcsmError::ScalarIsZero);
     }
     if k >= n() {
         return Err(EcsmError::ScalarOutOfRange);
     }
-    let xg = BigUint::from_bytes_le(xg_le);
+    let xg = U256::from_le_slice(xg_le);
     if xg >= p() {
         return Err(EcsmError::CoordinateOutOfRange);
     }
@@ -124,5 +114,5 @@ pub(crate) fn prepare(
 /// to guest memory at `addr_xR`.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    Ok(to_le_32(&curve::scalar_mul_affine_x(&k, &g)))
+    Ok(curve::scalar_mul_affine_x(&k, &g).to_le_bytes())
 }

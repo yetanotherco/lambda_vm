@@ -892,9 +892,8 @@ dependencies = [
 name = "ecsm"
 version = "0.1.0"
 dependencies = [
+ "crypto-bigint",
  "k256",
- "num-bigint",
- "num-traits",
 ]
 
 [[package]]
