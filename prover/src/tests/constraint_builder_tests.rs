@@ -372,3 +372,88 @@ fn cpu_domain_eval_matches_boxed_residuals() {
     }
     assert_domain_matches_boxed(cols::NUM_COLUMNS, boxed, &CpuDomain);
 }
+
+
+// =========================================================================
+// Multi-table end-to-end: a single proof over several tables together must be
+// byte-identical on the builder path vs the boxed path (validates that the whole
+// pipeline — not just isolated tables — routes through the builder correctly).
+// =========================================================================
+
+#[test]
+fn multi_table_builder_path_byte_identical() {
+    let _env_guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    use crate::tables::commit::generate_commit_trace;
+    use crate::tables::ec_scalar::{generate_ec_scalar_trace, rows_for_scalar};
+    use crate::tables::ecdas::{generate_ecdas_trace, EcdasOperation};
+    use crate::tables::ecsm::{generate_ecsm_trace, EcsmOperation};
+    use crate::test_utils::{create_commit_air, create_ec_scalar_air, create_ecdas_air, create_ecsm_air};
+    use ecsm::compute_witness;
+
+    let mut proof_options = ProofOptions::default_test_options();
+    proof_options.grinding_factor = 0;
+    let commit_air = create_commit_air(&proof_options);
+    let ec_scalar_air = create_ec_scalar_air(&proof_options);
+    let ecsm_air = create_ecsm_air(&proof_options);
+    let ecdas_air = create_ecdas_air(&proof_options);
+
+    let gx_le = || {
+        let mut be = [
+            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        be.reverse();
+        be
+    };
+    let mut k = [0u8; 32];
+    k[0] = 0xA5;
+    k[31] = 0x01;
+
+    let commit_t = generate_commit_trace(&[]);
+    let ec_scalar_t = generate_ec_scalar_trace(&rows_for_scalar(444, 0x3000, &k));
+    let ecsm_t = generate_ecsm_trace(&[EcsmOperation {
+        timestamp: 444,
+        addr_xg: 0x2000,
+        addr_k: 0x3000,
+        addr_xr: 0x1000,
+        witness: compute_witness(&k, &gx_le()).unwrap(),
+    }]);
+    let w = compute_witness(&k, &gx_le()).unwrap();
+    let ecdas_t = generate_ecdas_trace(
+        &w.steps
+            .into_iter()
+            .map(|step| EcdasOperation { timestamp: 444, step })
+            .collect::<Vec<_>>(),
+    );
+
+    let prove = || {
+        let mut ct = commit_t.clone();
+        let mut st = ec_scalar_t.clone();
+        let mut mt = ecsm_t.clone();
+        let mut dt = ecdas_t.clone();
+        let pairs: Vec<(
+            &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+            _,
+            _,
+        )> = vec![
+            (&commit_air, &mut ct, &()),
+            (&ec_scalar_air, &mut st, &()),
+            (&ecsm_air, &mut mt, &()),
+            (&ecdas_air, &mut dt, &()),
+        ];
+        multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
+            .expect("multi-table prove failed")
+    };
+
+    stark::constraints::evaluator::set_constraint_builder(false);
+    let off = prove();
+    stark::constraints::evaluator::set_constraint_builder(true);
+    let on = prove();
+    stark::constraints::evaluator::set_constraint_builder(false);
+    assert_eq!(
+        bincode::serialize(&off).unwrap(),
+        bincode::serialize(&on).unwrap(),
+        "multi-table builder path must produce a byte-identical proof"
+    );
+}
