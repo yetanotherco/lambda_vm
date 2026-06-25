@@ -1067,7 +1067,16 @@ fn test_local_to_global_traces_from_real_execution() {
         } else {
             epochs[i - 1].end_memory.iter_bytes().collect()
         };
-        per_epoch_touches.push(epoch_touched_cells(&program, &image, &epoch.logs).unwrap());
+        let register_init = if i == 0 {
+            crate::tables::register::register_init_from_entry_point(program.entry_point)
+        } else {
+            crate::tables::register::register_init_from_snapshot(
+                &epochs[i - 1].end_registers,
+                epochs[i - 1].end_pc,
+            )
+        };
+        per_epoch_touches
+            .push(epoch_touched_cells(&program, &image, &register_init, &epoch.logs).unwrap());
     }
 
     // The program touches memory somewhere, and every per-epoch touched set is

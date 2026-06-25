@@ -689,7 +689,7 @@ pub fn prove_continuation(
         );
 
         let label = local_to_global::epoch_label(index);
-        let touched = epoch_touched_cells(&elf, &image, &logs)?;
+        let touched = epoch_touched_cells(&elf, &image, &register_init, &logs)?;
         let boundary = local_to_global::epoch_boundary(&mut provenance, label, &touched);
 
         let start = EpochStart {
@@ -907,6 +907,38 @@ mod tests {
             )
             .unwrap()
             .is_some()
+        );
+    }
+
+    // Regression for the `epoch_touched_cells` fresh-register bug. A syscall whose
+    // operand pointers live in registers (ECSM reads a0/a1/a2) can have those
+    // registers set in an EARLIER epoch than the call. `test_ecsm_split` sets
+    // a0/a1/a2 at the very start and runs the ECSM ~46 cycles later; epoch_size 32
+    // puts the pointer setup in epoch 0 and the ecall in epoch 1. The per-epoch
+    // touched-cell pass must carry registers across the boundary — otherwise it
+    // reads the pointers as 0, mispredicts the touched cells (and the ECSM
+    // operands), and the epoch cannot verify.
+    #[test]
+    fn test_ecsm_across_epochs_verifies() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_ecsm_split");
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
+        assert!(total > 32, "the ECSM ecall must fall past the first epoch");
+        let out = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            32,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert!(
+            out.is_some(),
+            "an ECSM whose pointer registers were set in an earlier epoch must still verify"
         );
     }
 

@@ -3102,7 +3102,8 @@ fn test_epoch_proof_commits_l2g() {
     .unwrap();
 
     // Epoch 0's local-to-global trace, committed inertly below.
-    let touched = epoch_touched_cells(&elf, &image, &epochs[0].logs).unwrap();
+    let register_init0 = register::register_init_from_entry_point(elf.entry_point);
+    let touched = epoch_touched_cells(&elf, &image, &register_init0, &epochs[0].logs).unwrap();
     let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
     let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[0]);
@@ -3228,7 +3229,7 @@ fn test_continuation_pipeline_end_to_end() {
             );
             (image_i, register_init_i)
         };
-        let touched_i = epoch_touched_cells(&elf, &image_i, &epoch.logs).unwrap();
+        let touched_i = epoch_touched_cells(&elf, &image_i, &register_init_i, &epoch.logs).unwrap();
         images.push(image_i);
         register_inits.push(register_init_i);
         all_touched.push(touched_i);

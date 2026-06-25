@@ -1895,14 +1895,18 @@ pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> Page
 ///
 /// The epoch's `MemoryState` is seeded from `initial_image` at timestamp 0, and
 /// the epoch's accesses set real timestamps (which start at 4). So cells with a
-/// non-zero timestamp are exactly the ones this epoch read or wrote. Registers
-/// don't affect which RAM bytes are touched, so register init is irrelevant here.
+/// non-zero timestamp are exactly the ones this epoch read or wrote. The register
+/// file is seeded from `register_init` (the carried registers), matching the real
+/// epoch trace pass: a syscall can read its operand pointers from registers (e.g.
+/// ECSM reads a0/a1/a2), so with a fresh register file those pointers would be wrong
+/// for any epoch after the first, mispredicting the touched cells.
 ///
 /// Reuses the early phases of [`Traces::from_image_and_logs`] read-only; sharing
 /// a single path with it is left to a later step.
 pub fn epoch_touched_cells<I: ImageSource>(
     elf: &Elf,
     initial_image: &I,
+    register_init: &HashMap<u64, u32>,
     logs: &[Log],
 ) -> Result<Vec<(u64, u64, u64)>, Error> {
     let instructions = decode::instructions_from_elf(elf)
@@ -1910,7 +1914,7 @@ pub fn epoch_touched_cells<I: ImageSource>(
     let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
     let mut memory_state = MemoryState::from_image(initial_image);
-    let mut register_state = RegisterState::new(elf.entry_point);
+    let mut register_state = RegisterState::from_init_map(register_init);
     let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
     let mut touched: Vec<(u64, u64, u64)> = memory_state
