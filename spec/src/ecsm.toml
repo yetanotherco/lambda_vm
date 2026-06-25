@@ -82,7 +82,7 @@ pad = 0
 name = "q1"
 type = ["Byte", 33]
 desc = "quotient for computing `yG`"
-pad = "p"
+pad = 0
 
 [[variables.auxiliary]]
 name = "c1"
@@ -424,11 +424,11 @@ ref = "ec:c:q1_257"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`A`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`P`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c1`_0 = #`YG`_0 dot #`YG`_0 - #`X2`_0 dot #`XG`_0 - #`A`_0 dot #`XG`_0 - #`μ` dot #`B`_0 + #`μ` dot #`P`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
 poly = ["-", 
     ["+", 
         ["*", ["idx", "YG", 0], ["idx", "YG", 0]], 
-        ["*", ["idx", "P", 0], ["idx", "P", 0]], 
+        ["*", "μ", ["idx", "P", 0], ["idx", "P", 0]], 
     ], 
     ["*", ["idx", "X2", 0], ["idx", "XG", 0]], 
     ["*", ["idx", "A", 0], ["idx", "XG", 0]], 
@@ -440,7 +440,7 @@ ref = "ec:c:c1_0"
 
 [[constraints.yG]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`A`_j dot #`XG`_(i-j) - #`Q1`_j dot #`P`_(i-j))$"
+constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`μ` dot #`B`_i + sum_(j=0)^i (#`YG`_j dot #`YG`_(i-j) + #`μ` dot #`P`_j dot #`P`_(i-j) - #`X2`_j dot #`XG`_(i-j) - #`A`_j dot #`XG`_(i-j) - #`Q1`_j dot #`P`_(i-j))$"
 poly = ["+", 
     ["-", 
         ["idx", "c1", ["-", "i", 1]], 
@@ -451,7 +451,7 @@ poly = ["+",
         ["-", 
             ["+", 
                 ["*", ["idx", "YG", "j"], ["idx", "YG", ["-", "i", "j"]]],
-                ["*", ["idx", "P", "j"], ["idx", "P", ["-", "i", "j"]]]
+                ["*", "μ", ["idx", "P", "j"], ["idx", "P", ["-", "i", "j"]]]
             ], 
             ["*", ["idx", "X2", "j"], ["idx", "XG", ["-", "i", "j"]]], 
             ["*", ["idx", "A", "j"], ["idx", "XG", ["-", "i", "j"]]], 

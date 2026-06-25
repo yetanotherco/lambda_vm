@@ -40,7 +40,7 @@ pad = 0
 name = "op"
 type = "Bit"
 desc = "whether to double (0) or add (1)"
-pad = 0
+pad = 1
 
 [[variables.output]]
 name = "xR"
@@ -64,7 +64,7 @@ pad = 0
 name = "q0"
 type = ["Byte", 33]
 desc = "quotient used to constrain `λ`"
-pad = "r"
+pad = 0
 
 [[variables.auxiliary]]
 name = "c0"
@@ -76,7 +76,7 @@ pad = 0
 name = "q1"
 type = ["Byte", 33]
 desc = "quotient used to constrain `xR`"
-pad = "r"
+pad = 0
 
 [[variables.auxiliary]]
 name = "c1"
@@ -88,7 +88,7 @@ pad = 0
 name = "q2"
 type = ["Byte", 33]
 desc = "quotient used to constrain `yR`"
-pad = "r"
+pad = 0
 
 [[variables.auxiliary]]
 name = "c2"
@@ -316,13 +316,13 @@ ref = "ecdas:c:range_q0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0 - #`A`_0) + #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
+constraint = "$2^8 dot #`c0`_0 = #`op` dot (#`Λ`_0 dot (#`XG`_0 - #`XA`_0) + #`YA`_0 - #`YG`_0) + (1 - #`op`) dot (2 dot #`Λ`_0 dot #`YA`_0 - 3 dot #`XA`_0 dot #`XA`_0 - #`A`_0) + #`μ` dot #`R`_0 dot #`P`_0 - #`Q0`_0 dot #`P`_0 = 0$"
 poly = ["-",
     ["+", 
         ["*", ["^", 2, 8], ["idx", "c0", 0]],
         ["*", ["idx", "Q0", 0], ["idx", "P", 0]]
     ],
-    ["*", ["idx", "R", 0], ["idx", "P", 0]],
+    ["*", "μ", ["idx", "R", 0], ["idx", "P", 0]],
     ["*", "op", 
         ["-", 
             ["+", 
@@ -344,7 +344,7 @@ ref = "ecdas:c:c0_0"
 
 [[constraints.lambda]]
 kind = "arith"
-constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + (1-#`op`) dot a + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c0`_i = #`c0`_(i-1) + #`op` dot (#`YA`_i - #`YG`_i) + (1-#`op`) dot #`A`_i + sum_(j=0)^i #`op` dot #`Λ`_j dot (#`XG`_(i-j) - #`XA`_(i-j)) + (1 - #`op`) dot (2 dot #`Λ`_j dot #`YA`_(i-j) - 3 dot #`XA`_j dot #`XA`_(i-j)) + #`μ` dot #`R`_j dot #`P`_(i-j) - #`Q0`_j dot #`P`_(i-j)$"
 poly = ["-", 
     ["*", ["^", 2, 8], ["idx", "c0", "i"]],
     ["idx", "c0", ["-", "i", 1]],
@@ -366,7 +366,7 @@ poly = ["-",
             ]
         ],
         ["-", 
-            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", "μ", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
             ["*", ["idx", "Q0", "j"], ["idx", "P", ["-", "i", "j"]]]
         ]        
     ]]
@@ -407,11 +407,11 @@ cond = "μ"
 
 [[constraints.xR]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_0 = #`Λ`_0 dot #`Λ`_0 - #`XA`_0 - #`XG`_0 - #`XR`_0 - (1-#`op`) (#`XA`_0 - #`XG`_0) + #`R`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c1`_0 = #`Λ`_0 dot #`Λ`_0 - #`XA`_0 - #`XG`_0 - #`XR`_0 - (1-#`op`) (#`XA`_0 - #`XG`_0) + #`μ` dot #`R`_0 dot #`P`_0 - #`Q1`_0 dot #`P`_0$"
 poly = ["-",
     ["+",
         ["*", ["idx", "Λ", 0], ["idx", "Λ", 0]],
-        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+        ["*", "μ", ["idx", "R", 0], ["idx", "P", 0]],
     ],    
     ["*", ["idx", "Q1", 0], ["idx", "P", 0]],
     ["idx", "XA", 0],
@@ -423,7 +423,7 @@ poly = ["-",
 
 [[constraints.xR]]
 kind = "arith"
-constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`XA`_i - #`XG`_i - #`XR`_i - (1- #`op`) (#`XA`_i - #`XG`_i) + sum_(j=0)^i #`Λ`_j dot #`Λ`_(i-j) + #`R`_j dot #`P`_(i-j) - #`Q1`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c1`_i = #`c1`_(i-1) - #`XA`_i - #`XG`_i - #`XR`_i - (1- #`op`) (#`XA`_i - #`XG`_i) + sum_(j=0)^i #`Λ`_j dot #`Λ`_(i-j) + #`μ` dot #`R`_j dot #`P`_(i-j) - #`Q1`_j dot #`P`_(i-j)$"
 poly = ["-",
     ["idx", "c1", ["-", "i", 1]],
     ["*", ["^", 2, 8], ["idx", "c1", "i"]],
@@ -434,7 +434,7 @@ poly = ["-",
     ["sum", ["=", "j", 0], "i",
         ["-", 
             ["*", ["idx", "Q1", "j"], ["idx", "P", ["-", "i", "j"]]],
-            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", "μ", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
             ["*", ["idx", "Λ", "j"], ["idx", "Λ", ["-", "i", "j"]]],
         ]
     ],    
@@ -473,11 +473,11 @@ cond = "μ"
 
 [[constraints.yR]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_0 = #`Λ`_0 dot (#`XA`_0 - #`XR`_0) - #`YA`_0 - #`YR`_0 + #`R`_0 dot #`P`_0 - #`Q2`_0 dot #`P`_0$"
+constraint = "$2^8 dot #`c2`_0 = #`Λ`_0 dot (#`XA`_0 - #`XR`_0) - #`YA`_0 - #`YR`_0 + #`μ` dot #`R`_0 dot #`P`_0 - #`Q2`_0 dot #`P`_0$"
 poly = ["-", 
     ["+",
         ["*", ["idx", "Λ", 0], ["-", ["idx", "XA", 0], ["idx", "XR", 0]]],
-        ["*", ["idx", "R", 0], ["idx", "P", 0]],
+        ["*", "μ", ["idx", "R", 0], ["idx", "P", 0]],
     ],
     ["*", ["idx", "Q2", 0], ["idx", "P", 0]],
     ["idx", "YA", 0],
@@ -487,7 +487,7 @@ poly = ["-",
 
 [[constraints.yR]]
 kind = "arith"
-constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`YA`_i - #`YR`_i + sum_(j=0)^i #`Λ`_j dot (#`XA`_(i-j) - #`XR`_(i-j)) + #`R`_j dot #`P`_(i-j) - #`Q2`_j dot #`P`_(i-j)$"
+constraint = "$2^8 dot #`c2`_i = #`c2`_(i-1) - #`YA`_i - #`YR`_i + sum_(j=0)^i #`Λ`_j dot (#`XA`_(i-j) - #`XR`_(i-j)) + #`μ` dot #`R`_j dot #`P`_(i-j) - #`Q2`_j dot #`P`_(i-j)$"
 poly = ["-",
     ["idx", "c2", ["-", "i", 1]],
     ["*", ["^", 2, 8], ["idx", "c2", "i"]],
@@ -496,7 +496,7 @@ poly = ["-",
     ["sum", ["=", "j", 0], "i",
         ["-", 
             ["*", ["idx", "Q2", "j"], ["idx", "P", ["-", "i", "j"]]],
-            ["*", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
+            ["*", "μ", ["idx", "R", "j"], ["idx", "P", ["-", "i", "j"]]],
             ["*", 
                 ["idx", "Λ", "j"],
                 ["-", 

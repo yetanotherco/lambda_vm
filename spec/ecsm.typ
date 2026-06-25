@@ -149,7 +149,7 @@ We emphasize here that @ec:c:c0_63_is_zero is required to ensure the sum evaluat
 #render_constraint_table(ecsm_chip, config, groups: "xG2")
 
 Next, we restrict the witness pair $(y_G, #`q1`)$.
-Note there that @ec:c:c1_0 and @ec:c:c1_i multiply `B` by `μ` to simplify the padding; there are no other side-effects to this since $#`μ` = 1$ on non-padding rows (@ec:c:mu_isbit).
+Note there that @ec:c:c1_0 and @ec:c:c1_i multiply `B` and `P` by `μ` to simplify the padding; there are no other side-effects to this since $#`μ` = 1$ on non-padding rows (@ec:c:mu_isbit).
 
 #render_constraint_table(ecsm_chip, config, groups: "yG")
 
