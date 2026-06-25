@@ -49,15 +49,9 @@ desc = "Zero-based index of `k`'s most significant 1-bit"
 pad = 0
 
 [[variables.auxiliary]]
-name = "raw_xG"
-type = "U256BL"
-desc = "the raw, potentially unreduced, value of $x_G$"
-pad = 0
-
-[[variables.auxiliary]]
 name = "xG"
 type = "U256BL"
-desc = "$:= #`raw_xG` mod #`p`$"
+desc = "$x_G$"
 pad = 0
 
 [[variables.auxiliary]]
@@ -70,18 +64,6 @@ pad = 0
 name = "x2"
 type = "U256BL"
 desc = "$x_G^2$"
-pad = 0
-
-[[variables.auxiliary]]
-name = "q0"
-type = "Half"
-desc = "quotient for computing `xG`"
-pad = 0
-
-[[variables.auxiliary]]
-name = "c0"
-type = ["BaseField", 8]
-desc = "carries for computing `xG`"
 pad = 0
 
 [[variables.auxiliary]]
@@ -306,27 +288,27 @@ input = [
     0,
     ["cast", ["idx", "addr_xG", "i"], "DWordWL"],
     ["arr",
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 0]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 1]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 2]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 3]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 4]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 5]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 6]],
-        ["idx", "raw_xG", ["+", ["*", 8, "i"], 7]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 0]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 1]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 2]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 3]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 4]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 5]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 6]],
+        ["idx", "xG", ["+", ["*", 8, "i"], 7]],
     ],
     "timestamp",
     0, 0, 1
 ]
 output = ["arr",
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 0]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 1]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 2]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 3]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 4]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 5]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 6]],
-    ["idx", "raw_xG", ["+", ["*", 8, "i"], 7]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 0]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 1]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 2]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 3]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 4]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 5]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 6]],
+    ["idx", "xG", ["+", ["*", 8, "i"], 7]],
 ]
 iter = ["i", 0, 3]
 multiplicity = "μ"
@@ -335,59 +317,17 @@ ref = "ec:c:read_xG"
 # Range check xG
 
 [[constraint_groups]]
-name = "reduce_xG"
+name = "range_xG"
 
-[[constraints.reduce_xG]]
-kind = "interaction"
-tag = "IS_HALF"
-input = ["q0"]
-multiplicity = "μ"
-ref = "ec:c:range_q0"
-
-[[constraints.reduce_xG]]
-kind = "template"
-tag = "IS_BYTE"
-input = [["idx", "xG", "i"]]
-iter = ["i", 0, 31]
-cond = "μ"
-ref = "ec:c:range_xG"
-
-[[constraints.reduce_xG]]
-kind = "arith"
-constraint = "$2^32 dot #`c0`_0 = #`raw_xG`_0 - #`xG`_0 - #`q0` dot #`p`_0$"
-poly = ["-", ["idx", ["cast", "raw_xG", "U256WL"], 0], ["idx", ["cast", "xG", "U256WL"], 0], ["*", "q0", ["idx", ["cast", "p", "U256WL"], 0]], ["*", ["^", 2, 32], ["idx", "c0", 0]]]
-ref = "ec:c:c0_0"
-
-[[constraints.reduce_xG]]
-kind = "arith"
-constraint = "$2^32 dot #`c0`_i = #`raw_xG`_i - #`xG`_i - #`q0` dot #`p`_i + #`c0`_(i-1)$"
-poly = ["+", ["-", ["idx", ["cast", "raw_xG", "U256WL"], "i"], ["idx", ["cast", "xG", "U256WL"], "i"], ["*", "q0", ["idx", ["cast", "p", "U256WL"], "i"]], ["*", ["^", 2, 32], ["idx", "c0", "i"]]], ["idx", "c0", ["-", "i", 1]]]
-iter = ["i", 1, 7]
-ref = "ec:c:c0_i"
-
-[[constraints.reduce_xG]]
-kind = "arith"
-constraint = "$#`c0`_7 = 0$"
-poly = ["idx", "c0", 7]
-ref = "ec:c:c0_7"
-
-[[constraints.reduce_xG]]
-kind = "interaction"
-tag = "IS_B20"
-input = [["+", ["idx", "c0", "i"], ["idx", "offsets", 0]]]
-multiplicity = "μ"
-iter = ["i", 0, 7]
-ref = "ec:c:range_c0"
-
-[[constraints.reduce_xG]]
+[[constraints.range_xG]]
 kind = "interaction"
 tag = "IS_HALF"
 input = [["idx", "xG_sub_p", "i"]]
 iter = ["i", 0, 15]
 multiplicity = "μ"
-ref = "ec:c:reduce_xG_sub_p"
+ref = "ec:c:range_xG_sub_p"
 
-[[constraints.reduce_xG]]
+[[constraints.range_xG]]
 kind = "template"
 tag = "IS_BIT"
 input = [["idx", "c3", "i"]]
@@ -395,7 +335,7 @@ iter = ["i", 0, 6]
 cond = "μ"
 ref = "ec:c:range_c3"
 
-[[constraints.reduce_xG]]
+[[constraints.range_xG]]
 kind = "arith"
 constraint = "$#`μ` => #`c3`_7 = 1$"
 poly = ["*", "μ", ["not", ["idx", "c3", 7]]]
