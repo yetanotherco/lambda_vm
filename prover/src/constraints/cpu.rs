@@ -18,12 +18,18 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::table::TableView;
 
 use crate::tables::cpu::cols;
 use crate::tables::types::{GoldilocksExtension, GoldilocksField, SHIFT_16};
 
-use super::templates::{AddConstraint, AddOperand, IsBitConstraint};
+use super::templates::{
+    add_pair_fold, is_bit_fold, AddConstraint, AddOperand, IsBitConstraint, INV_SHIFT_32,
+};
 
 // =========================================================================
 // Range: IS_BIT flag columns
@@ -708,4 +714,187 @@ pub fn create_all_cpu_constraints() -> (
     next_idx += 1;
 
     (is_bit, add_constraints, other, next_idx)
+}
+
+// =========================================================================
+// ConstraintBuilder path: cpu_domain_eval
+// =========================================================================
+
+/// Folds every CPU transition constraint produced by [`create_all_cpu_constraints`]
+/// into a [`ConstraintBuilder`], in the exact assembly (constraint_idx) order:
+/// (1) the unconditional IS_BIT flag-column constraints, (2) the ADD then SUB
+/// fast-path carry pairs, (3) the custom `other` constraints. Each residual is
+/// field-exact to the corresponding boxed `evaluate` / `compute`.
+pub fn cpu_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // (1) range: IS_BIT (unconditional) for each flag column, in order.
+    for &col in BIT_FLAG_COLUMNS {
+        is_bit_fold(cb, None, col);
+    }
+
+    // (2) alu: ADD then SUB fast-path carry pairs (same AddOperands as
+    // create_add_constraints / create_sub_constraints).
+    // ADD: cond = ADD, rv1 + arg2 = cast(res, WL).
+    let add_lhs = AddOperand::dword(cols::RV1_0);
+    let add_rhs = AddOperand::dword(cols::ARG2_0);
+    let add_sum = AddOperand::from_dword_hl(cols::RES_0);
+    add_pair_fold(cb, &[cols::ADD], &add_lhs, &add_rhs, &add_sum);
+    // SUB: cond = SUB, arg2 + res = rv1.
+    let sub_lhs = AddOperand::dword(cols::ARG2_0);
+    let sub_rhs = AddOperand::from_dword_hl(cols::RES_0);
+    let sub_sum = AddOperand::dword(cols::RV1_0);
+    add_pair_fold(cb, &[cols::SUB], &sub_lhs, &sub_rhs, &sub_sum);
+
+    // (3) other custom constraints, in push order.
+    let one = FieldElement::<CB::F>::one();
+
+    // decode: word_instr * {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
+    // READ_REGISTER1, READ_REGISTER2} = 0 (ProductZeroConstraint).
+    let word_instr = cb.main(cols::WORD_INSTR).clone();
+    for &col in &[
+        cols::MEMORY,
+        cols::BRANCH,
+        cols::ECALL,
+        cols::WRITE_REGISTER,
+        cols::READ_REGISTER1,
+        cols::READ_REGISTER2,
+    ] {
+        let c = cb.main(col).clone();
+        cb.fold(&word_instr * &c);
+    }
+
+    // alu: arg2 multiplex (low word then high word) -- Arg2Constraint.
+    for &(arg2_col, imm_col, rv2_col) in &[
+        (cols::ARG2_0, cols::IMM_0, cols::RV2_0),
+        (cols::ARG2_1, cols::IMM_1, cols::RV2_1),
+    ] {
+        let arg2 = cb.main(arg2_col).clone();
+        let imm = cb.main(imm_col).clone();
+        let rv2 = cb.main(rv2_col).clone();
+        let memory = cb.main(cols::MEMORY).clone();
+        let branch = cb.main(cols::BRANCH).clone();
+        // MEMORY*imm + BRANCH*rv2 + (1 - MEMORY - BRANCH)*(rv2 + imm).
+        let mut expected = &memory * &imm;
+        expected += &branch * &rv2;
+        expected += (&one - &memory - &branch) * (&rv2 + &imm);
+        cb.fold(arg2 - expected);
+    }
+
+    // mem: not read_registerN => rvN[i] = 0 (rv1 lo/hi then rv2 lo/hi) --
+    // RegNotReadIsZeroConstraint.
+    for &(flag_col, value_col) in &[
+        (cols::READ_REGISTER1, cols::RV1_0),
+        (cols::READ_REGISTER1, cols::RV1_1),
+        (cols::READ_REGISTER2, cols::RV2_0),
+        (cols::READ_REGISTER2, cols::RV2_1),
+    ] {
+        let flag = cb.main(flag_col).clone();
+        let value = cb.main(value_col).clone();
+        cb.fold((&one - &flag) * &value);
+    }
+
+    // mem: not MEMORY and not BRANCH => rvd = cast(res, WL) (low then high) --
+    // RvdEqResConstraint. cast(res, WL) word = res_lo + res_hi*2^16.
+    for high in [false, true] {
+        let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
+        let (lo_col, hi_col) = if high {
+            (cols::RES_2, cols::RES_3)
+        } else {
+            (cols::RES_0, cols::RES_1)
+        };
+        let memory = cb.main(cols::MEMORY).clone();
+        let branch = cb.main(cols::BRANCH).clone();
+        let rvd = cb.main(rvd_col).clone();
+        let res_lo = cb.main(lo_col).clone();
+        let res_hi = cb.main(hi_col).clone();
+        let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+        let res_w = &res_lo + &(&res_hi * &shift_16);
+        cb.fold((&one - &memory - &branch) * (rvd - res_w));
+    }
+
+    // branch: BRANCH => rvd = pc + instruction_length (carry_0 then carry_1) --
+    // BranchRvdConstraint. carry_1 reuses carry_0.
+    {
+        let pc_lo = cb.main(cols::PC_0).clone();
+        let rvd_lo = cb.main(cols::RVD_0).clone();
+        let pc_hi = cb.main(cols::PC_1).clone();
+        let rvd_hi = cb.main(cols::RVD_1).clone();
+        let half_len = cb.main(cols::HALF_INSTRUCTION_LENGTH).clone();
+        let branch = cb.main(cols::BRANCH).clone();
+        let inv = FieldElement::<CB::F>::from(INV_SHIFT_32);
+        let instr_len = &half_len + &half_len; // real byte length = 2 * half
+        let carry_0 = (&pc_lo + &instr_len - &rvd_lo) * &inv;
+        let carry_1 = (&pc_hi + &carry_0 - &rvd_hi) * &inv;
+        cb.fold(&branch * &carry_0 * (&one - &carry_0));
+        cb.fold(&branch * &carry_1 * (&one - &carry_1));
+    }
+
+    // branch: branch_cond = BRANCH*JALR + BRANCH*(1 - JALR)*res[0] --
+    // BranchCondConstraint (JALR = mem_flags under BRANCH).
+    {
+        let branch = cb.main(cols::BRANCH).clone();
+        let jalr = cb.main(cols::MEM_FLAGS).clone();
+        let res0 = cb.main(cols::RES_0).clone();
+        let branch_cond = cb.main(cols::BRANCH_COND).clone();
+        let expected = &branch * &jalr + &branch * (&one - &jalr) * &res0;
+        cb.fold(branch_cond - expected);
+    }
+
+    // branch: (1 - branch_cond)*carry*(1 - carry) for next_pc = pc +
+    // instruction_length (carry_0 then carry_1) -- NextPcAddConstraint.
+    {
+        let pc_lo = cb.main(cols::PC_0).clone();
+        let next_pc_lo = cb.main(cols::NEXT_PC_0).clone();
+        let pc_hi = cb.main(cols::PC_1).clone();
+        let next_pc_hi = cb.main(cols::NEXT_PC_1).clone();
+        let half_len = cb.main(cols::HALF_INSTRUCTION_LENGTH).clone();
+        let branch_cond = cb.main(cols::BRANCH_COND).clone();
+        let inv = FieldElement::<CB::F>::from(INV_SHIFT_32);
+        let instr_len = &half_len + &half_len; // real byte length = 2 * half
+        let carry_0 = (&pc_lo + &instr_len - &next_pc_lo) * &inv;
+        let carry_1 = (&pc_hi + &carry_0 - &next_pc_hi) * &inv;
+        let not_branch = &one - &branch_cond;
+        cb.fold(&not_branch * &carry_0 * (&one - &carry_0));
+        cb.fold(&not_branch * &carry_1 * (&one - &carry_1));
+    }
+
+    // assumptions: MEMORY*BRANCH mutex (ProductZeroConstraint).
+    {
+        let memory = cb.main(cols::MEMORY).clone();
+        let branch = cb.main(cols::BRANCH).clone();
+        cb.fold(&memory * &branch);
+    }
+    // assumptions: arg2 exclusivity (1 - MEMORY - BRANCH)*read_register2*imm[i]
+    // for imm_0 then imm_1 (Arg2ExclusiveConstraint).
+    for &imm_col in &[cols::IMM_0, cols::IMM_1] {
+        let memory = cb.main(cols::MEMORY).clone();
+        let branch = cb.main(cols::BRANCH).clone();
+        let rr2 = cb.main(cols::READ_REGISTER2).clone();
+        let imm = cb.main(imm_col).clone();
+        cb.fold((&one - &memory - &branch) * &rr2 * &imm);
+    }
+    // assumptions: IS_BIT<mem_flags> on non-memory rows
+    // (1 - MEMORY)*mem_flags*(1 - mem_flags) -- MemFlagsBitConstraint.
+    {
+        let memory = cb.main(cols::MEMORY).clone();
+        let mem_flags = cb.main(cols::MEM_FLAGS).clone();
+        cb.fold((&one - &memory) * &mem_flags * (&one - &mem_flags));
+    }
+}
+
+pub struct CpuDomain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for CpuDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        cpu_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        cpu_domain_eval(cb);
+    }
 }

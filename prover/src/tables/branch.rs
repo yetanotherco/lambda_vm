@@ -29,9 +29,15 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
+
+use crate::constraints::templates::is_bit_fold;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
@@ -590,4 +596,69 @@ pub fn compute_carries(base: u64, offset: u64) -> (u64, u64) {
     let carry_1 = (base_hi + offset_hi + carry_0) >> 32;
 
     (carry_0, carry_1)
+}
+
+pub fn branch_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let inv_2_32 = FieldElement::<CB::F>::from(crate::constraints::templates::INV_SHIFT_32);
+    let shift_8 = FieldElement::<CB::F>::from(SHIFT_8);
+    let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+
+    let unmasked_low_byte = cb.main(cols::UNMASKED_LOW_BYTE).clone();
+    let next_pc_low_1 = cb.main(cols::NEXT_PC_LOW_1).clone();
+    let next_pc_high_0 = cb.main(cols::NEXT_PC_HIGH_0).clone();
+    let next_pc_high_1 = cb.main(cols::NEXT_PC_HIGH_1).clone();
+    let next_pc_high_2 = cb.main(cols::NEXT_PC_HIGH_2).clone();
+    let unmasked_0 = &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
+    let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
+
+    let offset_0 = cb.main(cols::OFFSET_0).clone();
+    let offset_1 = cb.main(cols::OFFSET_1).clone();
+    let jalr = cb.main(cols::JALR).clone();
+    let pc_0 = cb.main(cols::PC_0).clone();
+    let pc_1 = cb.main(cols::PC_1).clone();
+    let reg_0 = cb.main(cols::REGISTER_0).clone();
+    let reg_1 = cb.main(cols::REGISTER_1).clone();
+
+    let cond_pc = &one - &jalr;
+    let cond_reg = jalr;
+
+    // Constraints are folded in the exact order of `branch_constraints(0)`:
+    //   0 PcCarry0IsBit, 1 PcCarry1IsBit, 2 RegCarry0IsBit, 3 RegCarry1IsBit, 4 JalrIsBit.
+
+    // PC path (carry_0 shared by both pc constraints).
+    let pc_c0 = (&pc_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+    let pc_c1 = (&pc_1 + &offset_1 + &pc_c0 - &unmasked_1) * &inv_2_32;
+    cb.fold(&cond_pc * &pc_c0 * (&one - &pc_c0));
+    cb.fold(&cond_pc * &pc_c1 * (&one - &pc_c1));
+
+    // REGISTER path.
+    let reg_c0 = (&reg_0 + &offset_0 - &unmasked_0) * &inv_2_32;
+    let reg_c1 = (&reg_1 + &offset_1 + &reg_c0 - &unmasked_1) * &inv_2_32;
+    cb.fold(&cond_reg * &reg_c0 * (&one - &reg_c0));
+    cb.fold(&cond_reg * &reg_c1 * (&one - &reg_c1));
+
+    // IS_BIT<JALR> defense-in-depth: `JALR * (1 - JALR) = 0` (unconditional IS_BIT).
+    is_bit_fold(cb, None, cols::JALR);
+}
+
+/// BRANCH's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct BranchDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for BranchDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        branch_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        branch_domain_eval(cb);
+    }
 }

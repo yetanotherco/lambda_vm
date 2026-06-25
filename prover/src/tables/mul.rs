@@ -35,7 +35,13 @@ use std::collections::HashMap;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+
+use crate::constraints::templates::is_bit_fold;
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
@@ -931,4 +937,119 @@ pub fn compute_carries(lo: u64, hi: u64, raw_products: &[u64; 4]) -> [u64; 4] {
     }
 
     carries
+}
+
+// =========================================================================
+// Monomorphized ConstraintBuilder path
+// =========================================================================
+
+/// Fold every MUL-table domain constraint into a [`ConstraintBuilder`], in the
+/// exact order produced by `mul_constraints(0)`, each residual field-exact to its
+/// boxed [`MulConstraint`] `evaluate`/`compute`.
+///
+/// Order: `SignedIsBit(LHS_SIGNED)`, `SignedIsBit(RHS_SIGNED)`, `LhsSign`,
+/// `RhsSign`, then `RawProduct(0..4)` -- 8 constraints total.
+pub fn mul_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // idx 0,1: SignedIsBit -- x * (1 - x) on the sign flags.
+    is_bit_fold(cb, None, cols::LHS_SIGNED);
+    is_bit_fold(cb, None, cols::RHS_SIGNED);
+
+    let one = FieldElement::<CB::F>::one();
+
+    // idx 2: LhsSign -- (1 - lhs_signed) * lhs_is_negative.
+    {
+        let lhs_signed = cb.main(cols::LHS_SIGNED).clone();
+        let lhs_is_neg = cb.main(cols::LHS_IS_NEGATIVE).clone();
+        cb.fold(&(&one - &lhs_signed) * &lhs_is_neg);
+    }
+
+    // idx 3: RhsSign -- (1 - rhs_signed) * rhs_is_negative.
+    {
+        let rhs_signed = cb.main(cols::RHS_SIGNED).clone();
+        let rhs_is_neg = cb.main(cols::RHS_IS_NEGATIVE).clone();
+        cb.fold(&(&one - &rhs_signed) * &rhs_is_neg);
+    }
+
+    // idx 4..8: RawProduct(i) -- convolution residual `raw_product[i] - sum`.
+    let sign_fill = FieldElement::<CB::F>::from(SIGN_FILL);
+    let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+    for i in 0..4usize {
+        let residual = {
+            // lhs / rhs halfwords (cloned into locals before folding).
+            let lhs: [FieldElement<CB::F>; 4] = [
+                cb.main(cols::LHS_0).clone(),
+                cb.main(cols::LHS_1).clone(),
+                cb.main(cols::LHS_2).clone(),
+                cb.main(cols::LHS_3).clone(),
+            ];
+            let rhs: [FieldElement<CB::F>; 4] = [
+                cb.main(cols::RHS_0).clone(),
+                cb.main(cols::RHS_1).clone(),
+                cb.main(cols::RHS_2).clone(),
+                cb.main(cols::RHS_3).clone(),
+            ];
+            let lhs_is_neg = cb.main(cols::LHS_IS_NEGATIVE).clone();
+            let rhs_is_neg = cb.main(cols::RHS_IS_NEGATIVE).clone();
+
+            // Sign-extended values: ext[0..4] = limbs, ext[4..8] = sign_fill * is_neg.
+            let mut lhs_ext: [FieldElement<CB::F>; 8] =
+                std::array::from_fn(|_| FieldElement::zero());
+            let mut rhs_ext: [FieldElement<CB::F>; 8] =
+                std::array::from_fn(|_| FieldElement::zero());
+            lhs_ext[..4].clone_from_slice(&lhs);
+            rhs_ext[..4].clone_from_slice(&rhs);
+            for j in 4..8 {
+                lhs_ext[j] = &sign_fill * &lhs_is_neg;
+                rhs_ext[j] = &sign_fill * &rhs_is_neg;
+            }
+
+            // Convolution sum, with the boxed compute's zero-guards on the
+            // (convolution-style) indices that can exceed the stored length.
+            let mut sum = FieldElement::<CB::F>::zero();
+            for k in 0..=1usize {
+                let idx = 2 * i + k;
+                if idx < 8 {
+                    let mut inner_sum = FieldElement::<CB::F>::zero();
+                    for j in 0..=idx {
+                        if j < 8 && (idx - j) < 8 {
+                            inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                        }
+                    }
+                    if k == 0 {
+                        sum = &sum + &inner_sum;
+                    } else {
+                        sum = &sum + &(&inner_sum * &shift_16);
+                    }
+                }
+            }
+
+            // raw_product columns are consecutive (RAW_PRODUCT_0..3 = cols 20..23),
+            // matching the boxed compute's `match i { 0 => RAW_PRODUCT_0, .. }`.
+            let raw_col = cols::RAW_PRODUCT_0 + i;
+            let raw_product = cb.main(raw_col).clone();
+            &raw_product - &sum
+        };
+        cb.fold(residual);
+    }
+}
+
+/// MUL's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct MulDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for MulDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        mul_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        mul_domain_eval(cb);
+    }
 }

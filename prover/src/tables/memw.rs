@@ -32,6 +32,10 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -987,4 +991,55 @@ pub fn constraints()
     constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
 
     constraints
+}
+
+pub fn memw_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let mu_read = cb.main(cols::MU_READ).clone();
+    let mu_write = cb.main(cols::MU_WRITE).clone();
+    let mu_sum = &mu_read + &mu_write;
+
+    // idx 0: MuSumIsBit — mu_sum*(1-mu_sum)
+    cb.fold(&mu_sum * (&one - &mu_sum));
+    // idx 1: W2ImpliesMuSum — (write2+write4+write8)*(1-mu_sum)
+    let w2 = cb.main(cols::WRITE2) + cb.main(cols::WRITE4) + cb.main(cols::WRITE8);
+    cb.fold(&w2 * (&one - &mu_sum));
+    // idx 2: IS_BIT<mu_read>
+    cb.fold(&mu_read * (&one - &mu_read));
+    // idx 3: IS_BIT<mu_write>
+    cb.fold(&mu_write * (&one - &mu_write));
+    // idx 4..=9: IS_BIT<carry[i]>
+    for &col in &cols::CARRY {
+        let v = cb.main(col).clone();
+        cb.fold(&v * (&one - &v));
+    }
+    // IS_BIT<write2/write4/write8>
+    for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
+        let v = cb.main(col).clone();
+        cb.fold(&v * (&one - &v));
+    }
+    // WidthSumIsBit — w2 * (1 - w2)
+    let w2 = cb.main(cols::WRITE2) + cb.main(cols::WRITE4) + cb.main(cols::WRITE8);
+    cb.fold(&w2 * (&one - &w2));
+}
+
+/// MEMW's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct MemwDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for MemwDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        memw_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        memw_domain_eval(cb);
+    }
 }

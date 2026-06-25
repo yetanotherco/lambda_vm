@@ -23,13 +23,19 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
+use crate::constraints::templates::{
+    AddConstraint, AddOperand, add_pair_fold, is_bit_fold, new_is_bit_constraints,
+};
 
 // =========================================================================
 // Column indices for EQ table
@@ -323,4 +329,51 @@ pub fn eq_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+/// Folds every EQ transition residual into `cb` in the same order as
+/// [`eq_constraints`], each residual field-exactly matching the boxed
+/// `evaluate`/`compute`:
+/// 1. ADD pair (carry_0, carry_1) for `b + diff = a` (unconditional);
+/// 2. `IS_BIT(invert)`;
+/// 3. `res = eq XOR invert`, i.e. `res - (eq + invert - 2*eq*invert)`.
+pub fn eq_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // diff = a - b, encoded as b + diff = a (unconditional). Folds carry_0 then carry_1.
+    add_pair_fold(
+        cb,
+        &[],
+        &AddOperand::dword(cols::B_0),
+        &AddOperand::from_dword_hl(cols::DIFF_0),
+        &AddOperand::dword(cols::A_0),
+    );
+
+    // IS_BIT(invert)
+    is_bit_fold(cb, None, cols::INVERT);
+
+    // res = eq XOR invert: res - (eq + invert - 2*eq*invert)
+    let res = cb.main(cols::RES).clone();
+    let eq = cb.main(cols::EQ).clone();
+    let invert = cb.main(cols::INVERT).clone();
+    let two = FieldElement::<CB::F>::from(2u64);
+    let prod = &(&two * &eq) * &invert;
+    let xor = &(&eq + &invert) - &prod;
+    cb.fold(&res - &xor);
+}
+
+pub struct EqDomain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for EqDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        eq_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        eq_domain_eval(cb);
+    }
 }

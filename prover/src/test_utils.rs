@@ -616,6 +616,7 @@ pub fn create_cpu_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("CPU")
+    .with_domain_constraints(Box::new(crate::constraints::cpu::CpuDomain))
 }
 
 /// Create Bitwise AIR with bus interactions.
@@ -654,6 +655,7 @@ pub fn create_lt_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("LT")
+    .with_domain_constraints(Box::new(crate::tables::lt::LtDomain))
 }
 
 /// Create SHIFT AIR with constraints and bus interactions.
@@ -674,6 +676,7 @@ pub fn create_shift_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("SHIFT")
+    .with_domain_constraints(Box::new(crate::tables::shift::ShiftDomain))
 }
 
 /// Create the EQ AIR.
@@ -690,6 +693,7 @@ pub fn create_eq_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("EQ")
+    .with_domain_constraints(Box::new(crate::tables::eq::EqDomain))
 }
 
 /// Create the BYTEWISE AIR. No polynomial constraints.
@@ -722,6 +726,7 @@ pub fn create_store_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("STORE")
+    .with_domain_constraints(Box::new(crate::tables::store::StoreDomain))
 }
 
 /// Create the CPU32 AIR.
@@ -738,6 +743,7 @@ pub fn create_cpu32_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("CPU32")
+    .with_domain_constraints(Box::new(crate::tables::cpu32::Cpu32Domain))
 }
 
 /// Create MEMW AIR with constraints and bus interactions.
@@ -756,6 +762,7 @@ pub fn create_memw_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW")
+    .with_domain_constraints(Box::new(crate::tables::memw::MemwDomain))
 }
 
 /// Create MEMW_A (aligned) AIR with constraints and bus interactions.
@@ -774,6 +781,7 @@ pub fn create_memw_aligned_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW_A")
+    .with_domain_constraints(Box::new(crate::tables::memw_aligned::MemwAlignedDomain))
 }
 
 /// Create MEMW_R (register) AIR with constraints and bus interactions.
@@ -792,6 +800,7 @@ pub fn create_memw_register_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MEMW_R")
+    .with_domain_constraints(Box::new(crate::tables::memw_register::MemwRegisterDomain))
 }
 
 /// Create LOAD AIR with constraints and bus interactions.
@@ -810,6 +819,7 @@ pub fn create_load_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("LOAD")
+    .with_domain_constraints(Box::new(crate::tables::load::LoadDomain))
 }
 
 /// Create DECODE AIR with bus interactions.
@@ -860,6 +870,7 @@ pub fn create_mul_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("MUL")
+    .with_domain_constraints(Box::new(crate::tables::mul::MulDomain))
 }
 
 /// Create DVRM AIR with constraints and bus interactions.
@@ -880,6 +891,7 @@ pub fn create_dvrm_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("DVRM")
+    .with_domain_constraints(Box::new(crate::tables::dvrm::DvrmDomain))
 }
 
 /// Create BRANCH AIR with constraints and bus interactions.
@@ -904,6 +916,7 @@ pub fn create_branch_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("BRANCH")
+    .with_domain_constraints(Box::new(crate::tables::branch::BranchDomain))
 }
 
 /// Create HALT AIR with bus interactions (no transition constraints).
@@ -940,6 +953,7 @@ pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("COMMIT")
+    .with_domain_constraints(Box::new(crate::tables::commit::CommitDomain))
 }
 
 /// Create PAGE AIR with bus interactions for a specific page.
@@ -1007,6 +1021,7 @@ pub fn create_keccak_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("KECCAK")
+    .with_domain_constraints(Box::new(crate::tables::keccak::KeccakDomain))
 }
 
 /// Create KECCAK_RND AIR with pi constraints and bus interactions.
@@ -1026,6 +1041,7 @@ pub fn create_keccak_rnd_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("KECCAK_RND")
+    .with_domain_constraints(Box::new(crate::tables::keccak_rnd::KeccakRndDomain))
 }
 
 /// Create KECCAK_RC AIR with bus interactions (preprocessed table).

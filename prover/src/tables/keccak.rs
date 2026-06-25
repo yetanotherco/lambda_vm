@@ -19,12 +19,16 @@ use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
+use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32, add_pair_fold};
 
 // =========================================================================
 // Column indices
@@ -560,4 +564,77 @@ pub fn create_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+/// Monomorphized constraint folding for the KECCAK core chip — folds every residual
+/// of [`create_constraints`] in order, each field-exact to its boxed `evaluate`.
+///
+/// Order: for each of the 25 lanes, the ADD pair `state_ptr[lane] = addr + 8*lane_idx`
+/// (carry_0 then carry_1, conditional on `mu`), then the top-lane no-overflow residual
+/// `mu * carry_1`.
+pub fn keccak_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // state_ptr[lane] = addr + 8*lane_idx, conditional on mu (50 residuals).
+    for lane_idx in 0..25 {
+        add_pair_fold(
+            cb,
+            &[cols::MU],
+            &AddOperand::from_dword_bl(cols::ADDR),
+            &AddOperand::constant(8 * lane_idx as i64),
+            &AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
+        );
+    }
+
+    // KeccakAddressNoOverflowConstraint: mu * carry_1, where the addr/state_ptr(24)
+    // limbs are repacked exactly as in `KeccakAddressNoOverflowConstraint::compute`.
+    let c256 = FieldElement::<CB::F>::from(256);
+    let c65536 = FieldElement::<CB::F>::from(65536);
+    let c16777216 = FieldElement::<CB::F>::from(16777216);
+    let c192 = FieldElement::<CB::F>::from(192);
+    let inv_2_32 = FieldElement::<CB::F>::from(INV_SHIFT_32);
+
+    let a0 = cb.main(cols::addr(0)).clone();
+    let a1 = cb.main(cols::addr(1)).clone();
+    let a2 = cb.main(cols::addr(2)).clone();
+    let a3 = cb.main(cols::addr(3)).clone();
+    let a4 = cb.main(cols::addr(4)).clone();
+    let a5 = cb.main(cols::addr(5)).clone();
+    let a6 = cb.main(cols::addr(6)).clone();
+    let a7 = cb.main(cols::addr(7)).clone();
+    let p0 = cb.main(cols::state_ptr(24, 0)).clone();
+    let p1 = cb.main(cols::state_ptr(24, 1)).clone();
+    let p2 = cb.main(cols::state_ptr(24, 2)).clone();
+    let p3 = cb.main(cols::state_ptr(24, 3)).clone();
+    let mu = cb.main(cols::MU).clone();
+
+    // addr_lo = a0 + a1*2^8 + a2*2^16 + a3*2^24
+    let addr_lo = &(&(&a0 + &(&a1 * &c256)) + &(&a2 * &c65536)) + &(&a3 * &c16777216);
+    // addr_hi = a4 + a5*2^8 + a6*2^16 + a7*2^24
+    let addr_hi = &(&(&a4 + &(&a5 * &c256)) + &(&a6 * &c65536)) + &(&a7 * &c16777216);
+    // ptr_lo = p0 + p1*2^16 ; ptr_hi = p2 + p3*2^16
+    let ptr_lo = &p0 + &(&p1 * &c65536);
+    let ptr_hi = &p2 + &(&p3 * &c65536);
+
+    // carry_0 = (addr_lo + 192 - ptr_lo) * 2^-32
+    let carry_0 = &(&(&addr_lo + &c192) - &ptr_lo) * &inv_2_32;
+    // carry_1 = (addr_hi + carry_0 - ptr_hi) * 2^-32
+    let carry_1 = &(&(&addr_hi + &carry_0) - &ptr_hi) * &inv_2_32;
+    cb.fold(&mu * &carry_1);
+}
+
+pub struct KeccakDomain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for KeccakDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        keccak_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        keccak_domain_eval(cb);
+    }
 }

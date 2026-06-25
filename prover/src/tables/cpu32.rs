@@ -20,6 +20,10 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -28,7 +32,9 @@ use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
 };
-use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
+use crate::constraints::templates::{
+    AddConstraint, AddOperand, add_pair_fold, is_bit_fold, new_is_bit_constraints,
+};
 
 // =========================================================================
 // Column indices for CPU32 table
@@ -842,4 +848,149 @@ pub fn cpu32_constraints(
     }
 
     (constraints, idx)
+}
+
+/// Folds every CPU32 transition constraint into `cb`, in the exact order of
+/// [`cpu32_constraints`], each residual field-identical to the corresponding
+/// boxed `evaluate`/`compute`. Monomorphized for the prover (over the LDE) and
+/// the verifier (at the OOD point) via [`ConstraintBuilder`].
+pub fn cpu32_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let shift16 = FieldElement::<CB::F>::from(SHIFT_16);
+    let hi_fill = FieldElement::<CB::F>::from(HI_FILL);
+
+    // IS_BIT (unconditional) on the flag columns and the multiplicity.
+    for col in [
+        cols::READ_REGISTER1,
+        cols::READ_REGISTER2,
+        cols::WRITE_REGISTER,
+        cols::ALU,
+        cols::ADD,
+        cols::SUB,
+        cols::MU,
+    ] {
+        is_bit_fold(cb, None, col);
+    }
+
+    // ADD fast-path: arg1 + arg2 = res (cond = ADD).
+    add_pair_fold(
+        cb,
+        &[cols::ADD],
+        &AddOperand::dword(cols::ARG1_0),
+        &AddOperand::dword(cols::ARG2_0),
+        &AddOperand::from_dword_hl(cols::RES_0),
+    );
+
+    // SUB fast-path: res = arg1 - arg2, encoded as arg2 + res = arg1 (cond = SUB).
+    add_pair_fold(
+        cb,
+        &[cols::SUB],
+        &AddOperand::dword(cols::ARG2_0),
+        &AddOperand::from_dword_hl(cols::RES_0),
+        &AddOperand::dword(cols::ARG1_0),
+    );
+
+    // Unread register limbs are zero: (1 - read)*value.
+    for (read_col, value_col) in [
+        (cols::READ_REGISTER1, cols::RV1_0),
+        (cols::READ_REGISTER1, cols::RV1_1),
+        (cols::READ_REGISTER1, cols::RV1_2),
+        (cols::READ_REGISTER2, cols::RV2_0),
+        (cols::READ_REGISTER2, cols::RV2_1),
+        (cols::READ_REGISTER2, cols::RV2_2),
+    ] {
+        let read = cb.main(read_col).clone();
+        let value = cb.main(value_col).clone();
+        cb.fold(&(&one - &read) * &value);
+    }
+
+    // Sign-extension (`ext`) arithmetic for arg1, arg2, rvd, in order.
+    // Arg1Lo: arg1[0] - rv1[0] - 2^16*rv1[1].
+    {
+        let arg1_0 = cb.main(cols::ARG1_0).clone();
+        let rv1_0 = cb.main(cols::RV1_0).clone();
+        let rv1_1 = cb.main(cols::RV1_1).clone();
+        cb.fold(&(&arg1_0 - &rv1_0) - &(&shift16 * &rv1_1));
+    }
+    // Arg1Hi: arg1[1] - (2^32-1)*rv1_sign.
+    {
+        let arg1_1 = cb.main(cols::ARG1_1).clone();
+        let rv1_sign = cb.main(cols::RV1_SIGN).clone();
+        cb.fold(&arg1_1 - &(&hi_fill * &rv1_sign));
+    }
+    // Arg2Lo: arg2[0] - rv2[0] - 2^16*rv2[1] - imm[0].
+    {
+        let arg2_0 = cb.main(cols::ARG2_0).clone();
+        let rv2_0 = cb.main(cols::RV2_0).clone();
+        let rv2_1 = cb.main(cols::RV2_1).clone();
+        let imm_0 = cb.main(cols::IMM_0).clone();
+        let t = &(&arg2_0 - &rv2_0) - &(&shift16 * &rv2_1);
+        cb.fold(&t - &imm_0);
+    }
+    // Arg2Hi: arg2[1] - (2^32-1)*rv2_sign - imm[1].
+    {
+        let arg2_1 = cb.main(cols::ARG2_1).clone();
+        let rv2_sign = cb.main(cols::RV2_SIGN).clone();
+        let imm_1 = cb.main(cols::IMM_1).clone();
+        let t = &arg2_1 - &(&hi_fill * &rv2_sign);
+        cb.fold(&t - &imm_1);
+    }
+    // RvdLo: rvd[0] - res[0] - 2^16*res[1].
+    {
+        let rvd_0 = cb.main(cols::RVD_0).clone();
+        let res_0 = cb.main(cols::RES_0).clone();
+        let res_1 = cb.main(cols::RES_1).clone();
+        cb.fold(&(&rvd_0 - &res_0) - &(&shift16 * &res_1));
+    }
+    // RvdHi: rvd[1] - (2^32-1)*res_sign.
+    {
+        let rvd_1 = cb.main(cols::RVD_1).clone();
+        let res_sign = cb.main(cols::RES_SIGN).clone();
+        cb.fold(&rvd_1 - &(&hi_fill * &res_sign));
+    }
+
+    // arith half of SIGN(rv.[1], signed): (1 - signed)*sign.
+    for sign_col in [cols::RV1_SIGN, cols::RV2_SIGN] {
+        let signed = cb.main(cols::SIGNED).clone();
+        let sign = cb.main(sign_col).clone();
+        cb.fold(&(&one - &signed) * &sign);
+    }
+
+    // arg2 multiplex exclusivity: read_register2*imm[i].
+    for imm_col in [cols::IMM_0, cols::IMM_1] {
+        let rr2 = cb.main(cols::READ_REGISTER2).clone();
+        let imm = cb.main(imm_col).clone();
+        cb.fold(&rr2 * &imm);
+    }
+
+    // flag => mu: (1 - mu)*flag on the bus/fill-driving flags.
+    for flag_col in [
+        cols::READ_REGISTER1,
+        cols::READ_REGISTER2,
+        cols::WRITE_REGISTER,
+        cols::SIGNED,
+        cols::RES_SIGN,
+    ] {
+        let mu = cb.main(cols::MU).clone();
+        let flag = cb.main(flag_col).clone();
+        cb.fold(&(&one - &mu) * &flag);
+    }
+}
+
+pub struct Cpu32Domain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for Cpu32Domain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        cpu32_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        cpu32_domain_eval(cb);
+    }
 }

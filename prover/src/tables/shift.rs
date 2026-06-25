@@ -20,9 +20,15 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
+
+use crate::constraints::templates::is_bit_fold;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
 
@@ -1104,4 +1110,110 @@ pub fn collect_bitwise_from_shift(operations: &[ShiftOperation]) -> Vec<BitwiseO
     }
 
     bitwise_ops
+}
+
+pub fn shift_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+
+    // --- shared reads (each column once) ---
+    let dir = cb.main(cols::DIRECTION).clone();
+    let mu = cb.main(cols::MU).clone();
+    let zbs = cb.main(cols::ZBS).clone();
+    let is_neg = cb.main(cols::IS_NEGATIVE).clone();
+    let in_: Vec<FieldElement<CB::F>> = cols::IN.iter().map(|&c| cb.main(c).clone()).collect();
+    let x: Vec<FieldElement<CB::F>> = cols::X.iter().map(|&c| cb.main(c).clone()).collect();
+    let y: Vec<FieldElement<CB::F>> = cols::Y.iter().map(|&c| cb.main(c).clone()).collect();
+    let ls_raw: Vec<FieldElement<CB::F>> = cols::LIMB_SHIFT_RAW
+        .iter()
+        .map(|&c| cb.main(c).clone())
+        .collect();
+
+    // --- shared derived values ---
+    let left = &mu - &dir; // left = μ - direction
+    let right = dir.clone(); // right = direction
+    let extension = &is_neg * &FieldElement::<CB::F>::from(65535u64);
+
+    // limb_shift[0..4]; ls[3] is virtual = 1 - raw0 - raw1 - raw2.
+    let mut ls = ls_raw.clone();
+    ls.push(&(&one - &ls_raw[0]) - &(&ls_raw[1] + &ls_raw[2]));
+
+    // intra_limb_left[i]: X[0] for i==0, else X[i] + Y[i-1]  (i = 0..5)
+    let intra_left: Vec<FieldElement<CB::F>> = (0..5)
+        .map(|i| if i == 0 { x[0].clone() } else { &x[i] + &y[i - 1] })
+        .collect();
+    // intra_limb_right[i]: Y[i] + X[i+1]  (i = 0..4)
+    let intra_right: Vec<FieldElement<CB::F>> = (0..4).map(|i| &y[i] + &x[i + 1]).collect();
+
+    // shifted virtual halves (half_idx 0..4), computed once and reused by C12.
+    let shifted_half = |i: usize| -> FieldElement<CB::F> {
+        // left_part = left * Σ_{j=0..=i} ls[j] * intra_left[i-j]
+        let mut left_sum = FieldElement::<CB::F>::zero();
+        for j in 0..=i {
+            left_sum += &ls[j] * &intra_left[i - j];
+        }
+        let left_part = &left * &left_sum;
+        // right_shift_part = Σ_{j=0..=3-i} ls[j] * intra_right[i+j]
+        let mut right_shift = FieldElement::<CB::F>::zero();
+        for j in 0..=(3 - i) {
+            right_shift += &ls[j] * &intra_right[i + j];
+        }
+        // ext_sum = Σ_{j=4-i..4} ls[j]
+        let mut ext_sum = FieldElement::<CB::F>::zero();
+        for j in (4 - i)..4 {
+            ext_sum += ls[j].clone();
+        }
+        let right_part = &right * &(&right_shift + &(&extension * &ext_sum));
+        &left_part + &right_part
+    };
+    let shifted: Vec<FieldElement<CB::F>> = (0..4).map(shifted_half).collect();
+
+    // --- fold the 19 constraints in `shift_constraints` order ---
+    // idx 0: DirectionImpliesMu — direction * (1 - μ)
+    cb.fold(&dir * &(&one - &mu));
+    // idx 1..=4: ZbsOverrideX(i) — zbs * (X[i] - in[i] * left)
+    for i in 0..4 {
+        cb.fold(&zbs * &(&x[i] - &(&in_[i] * &left)));
+    }
+    // idx 5: ZbsOverrideX4 — zbs * X[4]
+    cb.fold(&zbs * &x[4]);
+    // idx 6..=9: ZbsOverrideY(i) — zbs * (Y[i] - in[i] * right)
+    for i in 0..4 {
+        cb.fold(&zbs * &(&y[i] - &(&in_[i] * &right)));
+    }
+    // idx 10..=13: LimbShiftIsBit(i) — limb_shift[i] * (1 - limb_shift[i])
+    for i in 0..4 {
+        cb.fold(&ls[i] * &(&one - &ls[i]));
+    }
+    // idx 14..=15: OutputMatchesShifted(i) — out[i] - shifted[2i] - shifted[2i+1]*2^16
+    for i in 0..2 {
+        let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
+        let out = cb.main(out_col).clone();
+        cb.fold(&(&out - &shifted[2 * i]) - &(&shifted[2 * i + 1] * &shift_16));
+    }
+    // idx 16..=18: FlagIsBit(col) — flag * (1 - flag) for direction|signed|word_instr
+    for flag_col in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR] {
+        is_bit_fold(cb, None, flag_col);
+    }
+}
+
+/// SHIFT's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct ShiftDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for ShiftDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        shift_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        shift_domain_eval(cb);
+    }
 }

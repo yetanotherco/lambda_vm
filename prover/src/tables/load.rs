@@ -26,6 +26,10 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -636,4 +640,71 @@ pub fn constraints()
     constraints.push(LoadConstraint::new(LoadConstraintKind::ExtensionLow, idx).boxed());
 
     constraints
+}
+
+pub fn load_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let ff = FieldElement::<CB::F>::from(255u64); // 0xFF for sign extension
+
+    // Clone every column we read into locals BEFORE folding (builder borrow rule).
+    let mu = cb.main(cols::MU).clone();
+    let read2 = cb.main(cols::READ2).clone();
+    let read4 = cb.main(cols::READ4).clone();
+    let read8 = cb.main(cols::READ8).clone();
+    let signed = cb.main(cols::SIGNED).clone();
+    let sign_bit = cb.main(cols::SIGN_BIT).clone();
+    let res: [FieldElement<CB::F>; 8] = std::array::from_fn(|i| cb.main(cols::RES[i]).clone());
+
+    // expected = signed * sign_bit * 255 (the sign-extension fill byte).
+    let expected = &signed * &sign_bit * &ff;
+    // read2 + read4 + read8 — shared by WidthSumIsBit and ReadImpliesMu.
+    let read_sum = &read2 + &read4 + &read8;
+
+    // idx 0..=3: FlagIsBit(signed/read2/read4/read8) — flag*(1-flag).
+    for flag in [&signed, &read2, &read4, &read8] {
+        cb.fold(flag * (&one - flag));
+    }
+
+    // idx 4: WidthSumIsBit — sum*(1-sum), sum = read2+read4+read8.
+    cb.fold(&read_sum * (&one - &read_sum));
+
+    // idx 5: ReadImpliesMu — (read2+read4+read8)*(1-mu).
+    cb.fold(&read_sum * (&one - &mu));
+
+    // idx 6..=9: ExtensionHigh(4..8) — (1-read8)*(res[i]-expected).
+    let cond_high = &one - &read8;
+    for r in res.iter().take(8).skip(4) {
+        cb.fold(&cond_high * (r - &expected));
+    }
+
+    // idx 10..=11: ExtensionMid(2..4) — (1-read4-read8)*(res[i]-expected).
+    let cond_mid = &one - &read4 - &read8;
+    for r in res.iter().take(4).skip(2) {
+        cb.fold(&cond_mid * (r - &expected));
+    }
+
+    // idx 12: ExtensionLow — (1-read2-read4-read8)*(res[1]-expected).
+    let cond_low = &one - &read2 - &read4 - &read8;
+    cb.fold(&cond_low * (&res[1] - &expected));
+}
+
+/// LOAD's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct LoadDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for LoadDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        load_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        load_domain_eval(cb);
+    }
 }

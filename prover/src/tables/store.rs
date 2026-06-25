@@ -22,12 +22,16 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::new_is_bit_constraints;
+use crate::constraints::templates::{is_bit_fold, new_is_bit_constraints};
 
 // =========================================================================
 // Column indices for STORE table
@@ -334,4 +338,48 @@ pub fn store_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+/// Folds every STORE transition residual into a [`ConstraintBuilder`], in the same
+/// order as [`store_constraints`] and field-exact to each boxed `evaluate`:
+/// - `IS_BIT` (unconditional) on `WRITE2`, `WRITE4`, `WRITE8`, `MU` — `X·(1−X)`.
+/// - `WidthSumIsBit`: `sum·(1−sum)` with `sum = write2 + write4 + write8`.
+/// - `WidthImpliesMu`: `sum·(1−μ)`.
+pub fn store_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // IS_BIT on each width flag and the multiplicity (unconditional: X·(1−X)).
+    is_bit_fold(cb, None, cols::WRITE2);
+    is_bit_fold(cb, None, cols::WRITE4);
+    is_bit_fold(cb, None, cols::WRITE8);
+    is_bit_fold(cb, None, cols::MU);
+
+    // Clone the columns into locals BEFORE folding (borrow rule).
+    let one = FieldElement::<CB::F>::one();
+    let w2 = cb.main(cols::WRITE2).clone();
+    let w4 = cb.main(cols::WRITE4).clone();
+    let w8 = cb.main(cols::WRITE8).clone();
+    let mu = cb.main(cols::MU).clone();
+    let sum = &w2 + &w4 + &w8;
+
+    // WidthSumIsBit: sum·(1−sum).
+    cb.fold(&sum * (&one - &sum));
+    // WidthImpliesMu: sum·(1−μ).
+    cb.fold(&sum * (&one - &mu));
+}
+
+pub struct StoreDomain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for StoreDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        store_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        store_domain_eval(cb);
+    }
 }

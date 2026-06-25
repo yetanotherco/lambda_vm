@@ -29,6 +29,10 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -602,4 +606,87 @@ pub fn lt_constraints(constraint_idx_start: usize) -> (Vec<LtConstraint>, usize)
         }),
     ];
     (constraints, idx)
+}
+
+/// LT's migrated domain constraints, folded in the same order as
+/// [`lt_constraints`] (each residual field-exactly equal to the boxed
+/// `LtConstraint::compute`).
+///
+/// Order: Carry0IsBit, Carry1IsBit, LtFormula, OutXorInvert, InvertIsBit,
+/// SignedIsBit. The two virtual carries are computed once and shared with the
+/// LT formula (which reads `carry[1]`).
+pub fn lt_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+    let inv_2_32 = FieldElement::<CB::F>::from(crate::constraints::templates::INV_SHIFT_32);
+
+    // Read-only phase: pull every needed cell into owned locals.
+    let lhs_0 = cb.main(cols::LHS_0).clone();
+    let lhs_1 = cb.main(cols::LHS_1).clone();
+    let lhs_2 = cb.main(cols::LHS_2).clone();
+    let rhs_0 = cb.main(cols::RHS_0).clone();
+    let rhs_1 = cb.main(cols::RHS_1).clone();
+    let rhs_2 = cb.main(cols::RHS_2).clone();
+    let signed = cb.main(cols::SIGNED).clone();
+    let lt = cb.main(cols::LT).clone();
+    let sub_0 = cb.main(cols::LHS_SUB_RHS_0).clone();
+    let sub_1 = cb.main(cols::LHS_SUB_RHS_1).clone();
+    let sub_2 = cb.main(cols::LHS_SUB_RHS_2).clone();
+    let sub_3 = cb.main(cols::LHS_SUB_RHS_3).clone();
+    let a = cb.main(cols::LHS_MSB).clone();
+    let b = cb.main(cols::RHS_MSB).clone();
+    let invert = cb.main(cols::INVERT).clone();
+    let out = cb.main(cols::OUT).clone();
+
+    // Virtual carry[0] = (rhs[0] + cast(lhs_sub_rhs)[0] - lhs[0]) / 2^32.
+    let sub_lo = &sub_0 + &sub_1 * &shift_16;
+    let carry_0 = (&rhs_0 + &sub_lo - &lhs_0) * &inv_2_32;
+
+    // Virtual carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32.
+    let lhs_hi = &lhs_1 + &lhs_2 * &shift_16;
+    let rhs_hi = &rhs_1 + &rhs_2 * &shift_16;
+    let sub_hi = &sub_2 + &sub_3 * &shift_16;
+    let carry_1 = (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32;
+
+    // 0: IS_BIT<carry[0]>.
+    cb.fold(&carry_0 * (&one - &carry_0));
+    // 1: IS_BIT<carry[1]>.
+    cb.fold(&carry_1 * (&one - &carry_1));
+
+    // 2: LT formula. C = carry[1], unsigned_lt = carry[1].
+    let c = carry_1;
+    let one_minus_b = &one - &b;
+    let signed_lt = &a * &one_minus_b + &a * &c + &one_minus_b * &c;
+    let expected_lt = &signed * &signed_lt + (&one - &signed) * &c;
+    cb.fold(&lt - &expected_lt);
+
+    // 3: out = lt XOR invert = lt + invert - 2*lt*invert.
+    let two = FieldElement::<CB::F>::from(2u64);
+    cb.fold(out - (&lt + &invert - &two * &lt * &invert));
+
+    // 4: IS_BIT<invert>.
+    cb.fold(&invert * (&one - &invert));
+    // 5: IS_BIT<signed>.
+    cb.fold(&signed * (&one - &signed));
+}
+
+/// LT's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct LtDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for LtDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        lt_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        lt_domain_eval(cb);
+    }
 }

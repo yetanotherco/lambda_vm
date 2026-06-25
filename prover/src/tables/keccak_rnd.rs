@@ -29,9 +29,15 @@
 //! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
+
+use crate::constraints::templates::is_bit_fold;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
@@ -931,4 +937,35 @@ pub fn create_constraints(
         }
     }
     (constraints, idx)
+}
+
+/// Monomorphized constraint folding for KECCAK_RND, mirroring [`create_constraints`].
+///
+/// Folds the 20 conditional IS_BIT residuals `μ * X * (1 - X)` over
+/// `Cxz_right[x][hw]` for `x in 0..5`, `hw in 0..4`, in the same order as the
+/// boxed constraints — each residual is field-exact to `IsBitConstraint::evaluate`.
+pub fn keccak_rnd_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    for x in 0..5 {
+        for hw in 0..4 {
+            is_bit_fold(cb, Some(cols::MU), cols::cxz_right_bit(x, hw));
+        }
+    }
+}
+
+pub struct KeccakRndDomain;
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for KeccakRndDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        keccak_rnd_domain_eval(cb);
+    }
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        keccak_rnd_domain_eval(cb);
+    }
 }

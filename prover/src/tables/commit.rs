@@ -46,11 +46,15 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{AddConstraint, AddOperand};
+use crate::constraints::templates::{AddConstraint, AddOperand, add_pair_fold, is_bit_fold};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -849,5 +853,56 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstr
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+pub fn commit_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    // 0-2: IS_BIT(first, end, mu)
+    is_bit_fold(cb, None, cols::FIRST);
+    is_bit_fold(cb, None, cols::END);
+    is_bit_fold(cb, None, cols::MU);
+    // 3: (first + end) * (1 - mu)
+    let first = cb.main(cols::FIRST).clone();
+    let end = cb.main(cols::END).clone();
+    let mu = cb.main(cols::MU).clone();
+    let one = FieldElement::<CB::F>::one();
+    cb.fold(&(&first + &end) * &(&one - &mu));
+    // 4-5: ADD address + 1 = address_incr
+    add_pair_fold(
+        cb,
+        &[],
+        &AddOperand::dword(cols::ADDRESS_0),
+        &AddOperand::constant(1),
+        &AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
+    );
+    // 6-7: SUB count_decr + 1 = count
+    add_pair_fold(
+        cb,
+        &[],
+        &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
+        &AddOperand::constant(1),
+        &AddOperand::dword(cols::COUNT_0),
+    );
+}
+
+/// COMMIT's migrated domain constraints as an object-safe `TableConstraints`, attached
+/// to its `AirWithBuses` via `with_domain_constraints`.
+pub struct CommitDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for CommitDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        commit_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        commit_domain_eval(cb);
     }
 }

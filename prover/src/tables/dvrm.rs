@@ -34,6 +34,10 @@ use std::collections::HashMap;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -1309,4 +1313,135 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
     }
 
     (constraints, idx)
+}
+
+pub fn dvrm_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let shift_16 = FieldElement::<CB::F>::from(SHIFT_16);
+    let inv_2_32 = FieldElement::<CB::F>::from(crate::constraints::templates::INV_SHIFT_32);
+    let sign_fill = FieldElement::<CB::F>::from(SIGN_FILL);
+
+    // --- shared reads (each column once) ---
+    let signed = cb.main(cols::SIGNED).clone();
+    let sign_n = cb.main(cols::SIGN_N).clone();
+    let sign_d = cb.main(cols::SIGN_D).clone();
+    let sign_q = cb.main(cols::SIGN_Q).clone();
+    let sign_r = cb.main(cols::SIGN_R).clone();
+    let sign_nsr = cb.main(cols::SIGN_N_SUB_R).clone();
+    let overflow = cb.main(cols::OVERFLOW).clone();
+    let dbz = cb.main(cols::DIV_BY_ZERO).clone();
+
+    let n = [
+        cb.main(cols::N_0).clone(), cb.main(cols::N_1).clone(),
+        cb.main(cols::N_2).clone(), cb.main(cols::N_3).clone(),
+    ];
+    let d = [
+        cb.main(cols::D_0).clone(), cb.main(cols::D_1).clone(),
+        cb.main(cols::D_2).clone(), cb.main(cols::D_3).clone(),
+    ];
+    let q = [
+        cb.main(cols::Q_0).clone(), cb.main(cols::Q_1).clone(),
+        cb.main(cols::Q_2).clone(), cb.main(cols::Q_3).clone(),
+    ];
+    let r = [
+        cb.main(cols::R_0).clone(), cb.main(cols::R_1).clone(),
+        cb.main(cols::R_2).clone(), cb.main(cols::R_3).clone(),
+    ];
+    let nsr = [
+        cb.main(cols::N_SUB_R_0).clone(), cb.main(cols::N_SUB_R_1).clone(),
+        cb.main(cols::N_SUB_R_2).clone(), cb.main(cols::N_SUB_R_3).clone(),
+    ];
+    let abs_r = [cb.main(cols::ABS_R_0).clone(), cb.main(cols::ABS_R_1).clone()];
+    let abs_d = [cb.main(cols::ABS_D_0).clone(), cb.main(cols::ABS_D_1).clone()];
+
+    // --- shared virtual carries (n = n_sub_r + r) ---
+    // build_extended_quad: [hw0+hw1*2^16, hw2+hw3*2^16, ext, ext] with
+    // ext = sign*sign_fill + sign*sign_fill*2^16  ( = sign * 0xFFFFFFFF ).
+    let build_ext =
+        |hw: &[FieldElement<CB::F>; 4], sign: &FieldElement<CB::F>| -> [FieldElement<CB::F>; 4] {
+            let s_fill = sign * &sign_fill;
+            let ext_word = &s_fill + &(&s_fill * &shift_16);
+            [
+                &hw[0] + &(&hw[1] * &shift_16),
+                &hw[2] + &(&hw[3] * &shift_16),
+                ext_word.clone(),
+                ext_word,
+            ]
+        };
+    let ext_n = build_ext(&n, &sign_n);
+    let ext_r = build_ext(&r, &sign_r);
+    let ext_nsr = build_ext(&nsr, &sign_nsr);
+
+    let mut carry: Vec<FieldElement<CB::F>> = Vec::with_capacity(4);
+    // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
+    carry.push((&ext_nsr[0] + &ext_r[0] - &ext_n[0]) * &inv_2_32);
+    for i in 1..4 {
+        // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
+        let prev = carry[i - 1].clone();
+        carry.push((&ext_nsr[i] + &ext_r[i] + &prev - &ext_n[i]) * &inv_2_32);
+    }
+
+    // --- fold the 19 constraints in `dvrm_constraints` order ---
+    // idx 0: SignedIsBit — signed * (1 - signed)
+    cb.fold(&signed * &(&one - &signed));
+    // idx 1: RemainderSignMatchesNumerator — (r0+r1+r2+r3) * (sign_r - sign_n)
+    let r_sum = &r[0] + &r[1] + &r[2] + &r[3];
+    cb.fold(&r_sum * &(&sign_r - &sign_n));
+    // idx 2..=3: AbsRFormula(i) — (1-sign_r) * (abs_r[i] - r_wl[i])
+    for i in 0..2 {
+        let r_wl = if i == 0 {
+            &r[0] + &(&r[1] * &shift_16)
+        } else {
+            &r[2] + &(&r[3] * &shift_16)
+        };
+        cb.fold(&(&one - &sign_r) * &(&abs_r[i] - &r_wl));
+    }
+    // idx 4..=5: AbsDFormula(i) — (1-sign_d) * (abs_d[i] - d_wl[i])
+    for i in 0..2 {
+        let d_wl = if i == 0 {
+            &d[0] + &(&d[1] * &shift_16)
+        } else {
+            &d[2] + &(&d[3] * &shift_16)
+        };
+        cb.fold(&(&one - &sign_d) * &(&abs_d[i] - &d_wl));
+    }
+    // idx 6: SignQFormula — signed * (1-overflow) - sign_q
+    cb.fold(&(&signed * &(&one - &overflow)) - &sign_q);
+    // idx 7..=10: CarryIsBit(i) — carry[i] * (1 - carry[i])
+    for i in 0..4 {
+        cb.fold(&carry[i] * &(&one - &carry[i]));
+    }
+    // idx 11: SignNSubRIsBit — sign_n_sub_r * (1 - sign_n_sub_r)
+    cb.fold(&sign_nsr * &(&one - &sign_nsr));
+    // idx 12: UnsignedSignN — (1-signed) * sign_n
+    cb.fold(&(&one - &signed) * &sign_n);
+    // idx 13: UnsignedSignR — (1-signed) * sign_r
+    cb.fold(&(&one - &signed) * &sign_r);
+    // idx 14: UnsignedSignD — (1-signed) * sign_d
+    cb.fold(&(&one - &signed) * &sign_d);
+    // idx 15..=18: DivByZeroQ(i) — div_by_zero * (q[i] - SIGN_FILL)
+    for i in 0..4 {
+        cb.fold(&dbz * &(&q[i] - &sign_fill));
+    }
+}
+
+/// DVRM's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct DvrmDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for DvrmDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        dvrm_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        dvrm_domain_eval(cb);
+    }
 }

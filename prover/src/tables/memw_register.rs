@@ -41,6 +41,10 @@
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
@@ -417,4 +421,38 @@ pub fn constraints()
         IsBitConstraint::unconditional(cols::MU_WRITE, 1).boxed(),
         MemwRegisterMuSumIsBit::new(2).boxed(),
     ]
+}
+
+pub fn memw_register_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let mu_read = cb.main(cols::MU_READ).clone();
+    let mu_write = cb.main(cols::MU_WRITE).clone();
+    // idx 0: IS_BIT<mu_read>
+    cb.fold(&mu_read * &(&one - &mu_read));
+    // idx 1: IS_BIT<mu_write>
+    cb.fold(&mu_write * &(&one - &mu_write));
+    // idx 2: MuSumIsBit — mu_sum * (1 - mu_sum)
+    let mu_sum = &mu_read + &mu_write;
+    cb.fold(&mu_sum * &(&one - &mu_sum));
+}
+
+/// MEMW_R's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct MemwRegisterDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for MemwRegisterDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        memw_register_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        memw_register_domain_eval(cb);
+    }
 }

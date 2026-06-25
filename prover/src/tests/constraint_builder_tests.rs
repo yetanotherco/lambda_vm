@@ -7,7 +7,7 @@
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use stark::constraints::builder::{ConstraintContext, ProverConstraintBuilder, TableConstraints};
-use stark::constraints::transition::TransitionConstraintEvaluator;
+use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::frame::Frame;
 use stark::lookup::PackingShifts;
 use stark::proof::options::ProofOptions;
@@ -48,6 +48,14 @@ fn boxed_residual_sum(
         expected = expected + &evals[idx] * &coeffs[idx];
     }
     expected
+}
+
+/// Box a list of typed constraints into `dyn TransitionConstraintEvaluator` for the
+/// residual comparison (tables whose `*_constraints` return concrete types).
+fn box_all<C: TransitionConstraint<F, E> + 'static>(
+    cs: Vec<C>,
+) -> Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> {
+    cs.into_iter().map(|c| c.boxed()).collect()
 }
 
 /// Assert that a table's migrated `domain` (a `TableConstraints`) folds the same
@@ -244,4 +252,123 @@ fn ecdas_constraint_builder_path_byte_identical() {
     proof_options.grinding_factor = 0;
     let air = create_ecdas_air(&proof_options);
     assert_builder_path_byte_identical(&air, &base_trace, "ECDAS");
+}
+
+
+// =========================================================================
+// Re-migrated domain tables (ported from the pre-EC branch onto main)
+// =========================================================================
+
+#[test]
+fn commit_domain_eval_matches_boxed_residuals() {
+    use crate::tables::commit::{cols, create_constraints, CommitDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, create_constraints(0).0, &CommitDomain);
+}
+
+#[test]
+fn branch_domain_eval_matches_boxed_residuals() {
+    use crate::tables::branch::{branch_constraints, cols, BranchDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, box_all(branch_constraints(0).0), &BranchDomain);
+}
+
+#[test]
+fn load_domain_eval_matches_boxed_residuals() {
+    use crate::tables::load::{cols, constraints, LoadDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, constraints(), &LoadDomain);
+}
+
+#[test]
+fn memw_domain_eval_matches_boxed_residuals() {
+    use crate::tables::memw::{cols, constraints, MemwDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, constraints(), &MemwDomain);
+}
+
+#[test]
+fn memw_aligned_domain_eval_matches_boxed_residuals() {
+    use crate::tables::memw_aligned::{cols, constraints, MemwAlignedDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, constraints(), &MemwAlignedDomain);
+}
+
+#[test]
+fn memw_register_domain_eval_matches_boxed_residuals() {
+    use crate::tables::memw_register::{cols, constraints, MemwRegisterDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, constraints(), &MemwRegisterDomain);
+}
+
+#[test]
+fn shift_domain_eval_matches_boxed_residuals() {
+    use crate::tables::shift::{cols, shift_constraints, ShiftDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, box_all(shift_constraints(0).0), &ShiftDomain);
+}
+
+#[test]
+fn dvrm_domain_eval_matches_boxed_residuals() {
+    use crate::tables::dvrm::{cols, dvrm_constraints, DvrmDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, box_all(dvrm_constraints(0).0), &DvrmDomain);
+}
+
+
+// =========================================================================
+// Agent-migrated tables (new on main + re-derived)
+// =========================================================================
+
+#[test]
+fn lt_domain_eval_matches_boxed_residuals() {
+    use crate::tables::lt::{cols, lt_constraints, LtDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, box_all(lt_constraints(0).0), &LtDomain);
+}
+
+#[test]
+fn eq_domain_eval_matches_boxed_residuals() {
+    use crate::tables::eq::{cols, eq_constraints, EqDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, eq_constraints(0).0, &EqDomain);
+}
+
+#[test]
+fn store_domain_eval_matches_boxed_residuals() {
+    use crate::tables::store::{cols, store_constraints, StoreDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, store_constraints(0).0, &StoreDomain);
+}
+
+#[test]
+fn mul_domain_eval_matches_boxed_residuals() {
+    use crate::tables::mul::{cols, mul_constraints, MulDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, box_all(mul_constraints(0).0), &MulDomain);
+}
+
+#[test]
+fn cpu32_domain_eval_matches_boxed_residuals() {
+    use crate::tables::cpu32::{cols, cpu32_constraints, Cpu32Domain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, cpu32_constraints(0).0, &Cpu32Domain);
+}
+
+#[test]
+fn keccak_domain_eval_matches_boxed_residuals() {
+    use crate::tables::keccak::{cols, create_constraints, KeccakDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, create_constraints(0).0, &KeccakDomain);
+}
+
+#[test]
+fn keccak_rnd_domain_eval_matches_boxed_residuals() {
+    use crate::tables::keccak_rnd::{cols, create_constraints, KeccakRndDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, create_constraints(0).0, &KeccakRndDomain);
+}
+
+#[test]
+fn cpu_domain_eval_matches_boxed_residuals() {
+    use crate::constraints::cpu::{create_all_cpu_constraints, CpuDomain};
+    use crate::tables::cpu::cols;
+    let (is_bit, add, other, _t) = create_all_cpu_constraints();
+    let mut boxed: Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> =
+        Vec::new();
+    for c in is_bit {
+        boxed.push(c.boxed());
+    }
+    for c in add {
+        boxed.push(c.boxed());
+    }
+    for c in other {
+        boxed.push(c);
+    }
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, boxed, &CpuDomain);
 }
