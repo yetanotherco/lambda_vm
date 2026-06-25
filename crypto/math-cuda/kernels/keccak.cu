@@ -317,6 +317,40 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 //     children: nodes[parent_begin + n_pairs .. parent_begin + 3 * n_pairs]
 //     parents:  nodes[parent_begin .. parent_begin + n_pairs]
 //
+// ---------------------------------------------------------------------------
+// Row-major base leaf hashing.
+//
+// Input layout: data[row * m + col] for `num_rows` rows and `m` columns.
+// For leaf `tid`, reads the bit-reversed row `br(tid)` — a contiguous slice
+// of `m` elements starting at data[br * m]. Coalesced when multiple threads
+// in the same warp process consecutive `tid` values (they read non-overlapping
+// rows, each a contiguous block of m u64s in order).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_row_major(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= num_rows) return;
+    uint64_t br = __brevll(tid) >> (64 - log_num_rows);
+    const uint64_t *row = data + br * m;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    for (uint64_t c = 0; c < m; ++c) {
+        uint64_t canon = goldilocks::canonical(row[c]);
+        uint64_t lane  = bswap64(canon);
+        absorb_lane(st, rate_pos, lane);
+    }
+    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+}
+
 // Each thread hashes one child pair → one parent. Keccak-256 of the
 // concatenation of two 32-byte siblings, identical to
 // `FieldElementVectorBackend::hash_new_parent` on host.

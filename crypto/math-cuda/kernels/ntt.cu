@@ -285,3 +285,87 @@ extern "C" __global__ void ntt_dit_8_levels(uint64_t *x,
     // Store back to the remapped row.
     x[row] = tile[threadIdx.x];
 }
+
+// ============================================================================
+// ROW-MAJOR BATCHED KERNELS
+//
+// Data layout: data[row * m + col] for n rows and m columns.
+// threadIdx.x = column index → consecutive threads access consecutive columns
+// of the same row → coalesced global memory access.
+// Twiddle factors depend only on the butterfly position, not the column →
+// one twiddle load is broadcast across the entire warp.
+// ============================================================================
+
+// Bit-reverse permute rows: swap row `row` with row `br(row)`.
+// Grid: gridDim.x = ceil(m / 256), gridDim.y = min(n, 65535).
+// Grid-stride loop over rows so a capped gridDim.y covers all n rows.
+extern "C" __global__ void bit_reverse_row_major(uint64_t *data,
+                                                  uint64_t n,
+                                                  uint64_t log_n,
+                                                  uint64_t m)
+{
+    uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= m) return;
+    for (uint64_t row = blockIdx.y; row < n; row += gridDim.y) {
+        uint64_t rev = __brevll(row) >> (64 - log_n);
+        if (row < rev) {
+            uint64_t tmp          = data[row * m + col];
+            data[row * m + col]   = data[rev * m + col];
+            data[rev * m + col]   = tmp;
+        }
+    }
+}
+
+// One DIT butterfly level on row-major data.
+// Grid: gridDim.x = ceil(m / blockDim.x), gridDim.y = min(ceil(n/2 / blockDim.y), 65535).
+// blockDim.x covers columns (coalescing), blockDim.y covers butterfly pairs.
+// Grid-stride loop over butterfly-pair tiles so capped gridDim.y covers all n/2 pairs.
+extern "C" __global__ void ntt_dit_level_row_major(uint64_t *data,
+                                                    const uint64_t *tw,
+                                                    uint64_t n,
+                                                    uint64_t log_n,
+                                                    uint64_t level,
+                                                    uint64_t m)
+{
+    uint64_t col    = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t n_half = n >> 1;
+    if (col >= m) return;
+
+    uint64_t half       = 1ULL << level;
+    uint64_t block_size = half << 1;
+
+    for (uint64_t bfly_base = blockIdx.y * blockDim.y;
+         bfly_base < n_half;
+         bfly_base += (uint64_t)gridDim.y * blockDim.y) {
+        uint64_t butterfly = bfly_base + threadIdx.y;
+        if (butterfly >= n_half) break;
+
+        uint64_t block_idx = butterfly >> level;
+        uint64_t k         = butterfly & (half - 1);
+        uint64_t i0        = block_idx * block_size + k;
+        uint64_t i1        = i0 + half;
+
+        // Same twiddle for all columns at this butterfly position (broadcast).
+        uint64_t w = tw[k << (log_n - level - 1)];
+
+        uint64_t u = data[i0 * m + col];
+        uint64_t v = mul(w, data[i1 * m + col]);
+        data[i0 * m + col] = add(u, v);
+        data[i1 * m + col] = sub(u, v);
+    }
+}
+
+// Pointwise multiply row-major: data[row * m + col] *= weights[row].
+// One weight per row, broadcast across all m columns.
+// Grid: gridDim.x = ceil(m / 256), gridDim.y = min(n, 65535).
+// Grid-stride loop over rows.
+extern "C" __global__ void pointwise_mul_row_major(uint64_t *data,
+                                                    const uint64_t *weights,
+                                                    uint64_t n,
+                                                    uint64_t m)
+{
+    uint64_t col = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= m) return;
+    for (uint64_t row = blockIdx.y; row < n; row += gridDim.y)
+        data[row * m + col] = mul(data[row * m + col], weights[row]);
+}

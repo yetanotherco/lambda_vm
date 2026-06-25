@@ -216,6 +216,180 @@ fn launch_pointwise_mul_batched(
     Ok(())
 }
 
+// ── Row-major NTT helpers ────────────────────────────────────────────────────
+
+fn launch_bit_reverse_row_major(
+    stream: &CudaStream, be: &Backend,
+    buf: &mut CudaSlice<u64>, n: u64, log_n: u64, m: u64,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream.launch_builder(&be.bit_reverse_row_major)
+            .arg(buf).arg(&n).arg(&log_n).arg(&m).launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Run one batched NTT level on row-major data.
+/// blockDim = (COL_TILE, ROW_TILE, 1) where COL_TILE * ROW_TILE = 256.
+fn launch_ntt_dit_level_row_major(
+    stream: &CudaStream, be: &Backend,
+    buf: &mut CudaSlice<u64>, tw: &CudaSlice<u64>,
+    n: u64, log_n: u64, level: u64, m: u64,
+) -> Result<()> {
+    let col_tile: u32 = 32.min(m as u32);
+    let row_tile: u32 = (256 / col_tile).max(1);
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (m as u32).div_ceil(col_tile),
+            ((n >> 1) as u32).div_ceil(row_tile).min(65535),
+            1,
+        ),
+        block_dim: (col_tile, row_tile, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream.launch_builder(&be.ntt_dit_level_row_major)
+            .arg(buf).arg(tw).arg(&n).arg(&log_n).arg(&level).arg(&m)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+fn launch_pointwise_mul_row_major(
+    stream: &CudaStream, be: &Backend,
+    buf: &mut CudaSlice<u64>, weights: &CudaSlice<u64>,
+    n: u64, m: u64,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream.launch_builder(&be.pointwise_mul_row_major)
+            .arg(buf).arg(weights).arg(&n).arg(&m).launch(cfg)?;
+    }
+    Ok(())
+}
+
+fn run_row_major_ntt_body(
+    stream: &CudaStream, be: &Backend,
+    buf: &mut CudaSlice<u64>, tw: &CudaSlice<u64>,
+    n: u64, log_n: u64, m: u64,
+) -> Result<()> {
+    for level in 0..log_n {
+        launch_ntt_dit_level_row_major(stream, be, buf, tw, n, log_n, level, m)?;
+    }
+    Ok(())
+}
+
+fn launch_keccak_base_row_major(
+    stream: &CudaStream, be: &Backend,
+    buf: &CudaSlice<u64>, m: u64, num_rows: u64, log_num_rows: u64,
+    leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
+) -> Result<()> {
+    let cfg = LaunchConfig::for_num_elems(num_rows as u32);
+    unsafe {
+        stream.launch_builder(&be.keccak256_leaves_base_row_major)
+            .arg(buf).arg(&m).arg(&num_rows).arg(&log_num_rows)
+            .arg(leaves_out).launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-major LDE + Keccak + Merkle, all on-device.
+///
+/// Input: `row_major` is a flat `n * m` slice in row-major order.
+/// Returns (merkle_nodes, GpuLdeBase handle, row-major LDE Vec).
+/// No CPU-side column extraction or transpose — single H2D, row-major
+/// throughout, single D2H.
+pub fn coset_lde_row_major_with_merkle_tree_keep(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(Vec<u8>, GpuLdeBase, Vec<u64>)> {
+    assert_eq!(row_major.len(), n * m);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major lde_size");
+
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(lde_size);
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let m_u64 = m as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // H2D: single contiguous copy — no per-column extraction.
+    let mut buf = stream.clone_htod(row_major)?;
+    // Extend to lde_size rows (zero-pad for LDE expansion).
+    let pad_len = (lde_size - n) * m;
+    if pad_len > 0 {
+        let mut pad_dev = stream.alloc_zeros::<u64>(pad_len)?;
+        // Extend buf to lde_size * m by appending pad_dev.
+        // cudarc doesn't have concat; allocate the full LDE buffer and copy.
+        let mut full_buf = stream.alloc_zeros::<u64>(lde_size * m)?;
+        stream.memcpy_dtod(&buf, &mut full_buf.slice_mut(0..n * m))?;
+        drop(buf);
+        drop(pad_dev);
+        buf = full_buf;
+    }
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    // iNTT: bit-reverse rows → per-level DIT.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, m_u64)?;
+    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, inv_tw.as_ref(), n_u64, log_n, m_u64)?;
+
+    // Coset weights: one weight per row, broadcast across all m columns.
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, m_u64)?;
+
+    // Forward NTT at lde_size.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, m_u64)?;
+    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, fwd_tw.as_ref(), lde_u64, log_lde, m_u64)?;
+
+    // Keccak + Merkle on-device.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(lde_size);
+    {
+        let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + lde_size * 32);
+        launch_keccak_base_row_major(
+            stream.as_ref(), be, &buf, m_u64, lde_u64, log_lde, &mut leaves_view,
+        )?;
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+
+    // D2H: single contiguous copy of the row-major LDE.
+    let staging_slot = be.pinned_staging();
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(lde_size * m, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(lde_size * m) };
+    stream.memcpy_dtoh(&buf, pinned)?;
+
+    let mut nodes_out = vec![0u8; nodes_bytes];
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
+
+    let lde_out = pinned[..lde_size * m].to_vec();
+    drop(staging);
+
+    let handle = GpuLdeBase { buf: Arc::new(buf), m, lde_size };
+    Ok((nodes_out, handle, lde_out))
+}
+
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
