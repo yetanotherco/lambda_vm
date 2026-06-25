@@ -216,6 +216,25 @@ impl<'a, E: IsField> ConstraintBuilder for VerifierConstraintBuilder<'a, E> {
     }
 }
 
+/// A table's constraint set, as an object-safe per-table interface.
+///
+/// Each VM table provides one implementation whose two methods both call a single
+/// generic `eval<CB: ConstraintBuilder>` body — so the constraint logic is written
+/// once and monomorphized for the prover and the verifier. The prover/verifier hold
+/// this boxed and call it ONCE per table per row (the only remaining dynamic
+/// dispatch); the monomorphized eval body then runs straight-line, sharing
+/// intermediate values across the table's constraints.
+pub trait TableConstraints<F, E>: Send + Sync
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    /// Fold every residual of this table into the prover folder (over the LDE).
+    fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, E>);
+    /// Fold every residual of this table into the verifier folder (at `z`).
+    fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<E>);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,5 +401,54 @@ mod tests {
         let expected =
             &zerofiers_z[0] * &fe(3) * &coeffs[0] + &zerofiers_z[1] * &fe(52) * &coeffs[1];
         assert_eq!(got, expected);
+    }
+
+    struct DummyTable;
+    impl TableConstraints<F, F> for DummyTable {
+        fn eval_prover(&self, cb: &mut ProverConstraintBuilder<F, F>) {
+            fold_main0_then_aux0(cb);
+        }
+        fn eval_verifier(&self, cb: &mut VerifierConstraintBuilder<F>) {
+            fold_main0_then_aux0(cb);
+        }
+    }
+
+    /// The same table-constraints object drives both builders through an object-safe
+    /// boxed call (the per-table dispatch), each folding correctly.
+    #[test]
+    fn table_constraints_dispatches_to_both_builders_via_box() {
+        let table: Box<dyn TableConstraints<F, F>> = Box::new(DummyTable);
+
+        // Prover side: fold over a 1-col LDE at row 2.
+        let n = 4;
+        let main_columns: Vec<Vec<FieldElement<F>>> =
+            vec![(0..n).map(|r| fe(r as u64 + 1)).collect()];
+        let aux_columns: Vec<Vec<FieldElement<F>>> =
+            vec![(0..n).map(|r| fe(50 + r as u64)).collect()];
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, aux_columns, 1, 1);
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![
+                vec![fe(2), fe(3), fe(5), fe(7)],
+                vec![fe(11), fe(13), fe(17), fe(19)],
+            ],
+            constraint_to_group: vec![0, 1],
+        };
+        let coeffs = [fe(100), fe(200)];
+        let mut pcb = ProverConstraintBuilder::<F, F>::new(&lde, 2, &zerofier, &coeffs);
+        table.eval_prover(&mut pcb);
+        let prover_expected = &zerofier.groups[0][2] * &fe(3) * &coeffs[0]
+            + &zerofier.groups[1][2] * &fe(52) * &coeffs[1];
+        assert_eq!(pcb.finish(), prover_expected);
+
+        // Verifier side: fold at z.
+        let step0 = TableView::new(vec![vec![fe(3)]], vec![vec![fe(52)]]);
+        let step1 = TableView::new(vec![vec![fe(0)]], vec![vec![fe(0)]]);
+        let frame = Frame::new(vec![step0, step1]);
+        let zerofiers_z = [fe(5), fe(17)];
+        let mut vcb = VerifierConstraintBuilder::<F>::new(&frame, &zerofiers_z, &coeffs);
+        table.eval_verifier(&mut vcb);
+        let verifier_expected =
+            &zerofiers_z[0] * &fe(3) * &coeffs[0] + &zerofiers_z[1] * &fe(52) * &coeffs[1];
+        assert_eq!(vcb.finish(), verifier_expected);
     }
 }
