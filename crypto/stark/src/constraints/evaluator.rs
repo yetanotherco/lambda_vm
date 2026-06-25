@@ -339,12 +339,28 @@ where
     }
 }
 
-/// Opt-in flag for the monomorphized `ConstraintBuilder` evaluation path
-/// (`LAMBDA_CONSTRAINT_BUILDER=1`). Default off → boxed path.
+/// Thread-safe flag for the monomorphized `ConstraintBuilder` evaluation path.
+/// Read from `LAMBDA_CONSTRAINT_BUILDER` once into an atomic (the hot loop reads it
+/// on Rayon worker threads, so a per-call env read would be a data race in edition
+/// 2024). Override with [`set_constraint_builder`].
+static CB_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CB_INIT: std::sync::Once = std::sync::Once::new();
+
 fn use_constraint_builder() -> bool {
-    std::env::var("LAMBDA_CONSTRAINT_BUILDER")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    CB_INIT.call_once(|| {
+        let on = std::env::var("LAMBDA_CONSTRAINT_BUILDER")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        CB_FLAG.store(on, std::sync::atomic::Ordering::Relaxed);
+    });
+    CB_FLAG.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Override the ConstraintBuilder flag at runtime (thread-safe). Used by tests to
+/// compare the boxed and builder paths in one process without env-var data races.
+pub fn set_constraint_builder(on: bool) {
+    CB_INIT.call_once(|| {});
+    CB_FLAG.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// Per-LDE-row composition evaluation via the `ConstraintBuilder` folder: no `Frame`
