@@ -1,6 +1,6 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
-compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm test-no-compile \
-test-asm-no-compile test-rust test-rust-no-compile test-executor flamegraph-prover \
+compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm \
+test-rust test-executor test-flamegraph flamegraph-prover \
 test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
@@ -35,7 +35,8 @@ BENCH_ARTIFACTS_DIR=./executor/program_artifacts/bench
 
 SHARED_TARGET_DIR=./executor/shared_target
 
-ASM_PROGRAMS = $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
+ASM_PROGRAMS := $(wildcard $(ASM_PROGRAMS_DIR)/*.s)
+ASM_ARTIFACTS := $(patsubst $(ASM_PROGRAMS_DIR)/%.s,$(ASM_ARTIFACTS_DIR)/%.elf,$(ASM_PROGRAMS))
 
 RUST_PROGRAM_DIRS := $(dir $(wildcard $(RUST_PROGRAMS_DIR)/*/Cargo.toml))
 RUST_PROGRAMS := $(notdir $(basename $(RUST_PROGRAM_DIRS:%/=%)))
@@ -120,12 +121,13 @@ prepare-sysroot:
 		fi; \
 	fi
 
-compile-programs-asm:
-	@mkdir -p $(ASM_ARTIFACTS_DIR)
-	@set -e; for src in $(ASM_PROGRAMS); do \
-		echo "$(CLANG) $(ASM_CFLAGS) $(ASM_LDFLAGS) $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf"; \
-		$(CLANG) $(ASM_CFLAGS) $(ASM_LDFLAGS) $$src -o $(ASM_ARTIFACTS_DIR)/$$(basename $$src .s).elf; \
-	done
+compile-programs-asm: $(ASM_ARTIFACTS)
+
+$(ASM_ARTIFACTS_DIR):
+	mkdir -p $@
+
+$(ASM_ARTIFACTS_DIR)/%.elf: $(ASM_PROGRAMS_DIR)/%.s | $(ASM_ARTIFACTS_DIR)
+	$(CLANG) $(ASM_CFLAGS) $(ASM_LDFLAGS) $< -o $@
 
 compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
@@ -179,21 +181,14 @@ clean-shared:
 
 clean: clean-asm clean-rust clean-bench clean-shared
 
-test-executor: compile-programs test-no-compile
+test-executor: compile-programs
+	cargo test -p executor
 
-test-asm: compile-programs-asm test-asm-no-compile
-
-test-asm-no-compile:
+test-asm: compile-programs-asm
 	cargo test -p executor --test asm
 
 test-rust: compile-programs-rust
 	cargo test -p executor --test rust
-
-test-rust-no-compile:
-	cargo test -p executor --test rust
-
-test-no-compile:
-	cargo test -p executor
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
