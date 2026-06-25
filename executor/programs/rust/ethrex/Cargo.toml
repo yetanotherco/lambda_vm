@@ -7,12 +7,16 @@ edition = "2024"
 
 [dependencies]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
+# LambdaVM crypto provider (keccak + ECSM-accelerated ecrecover), defined in the
+# lambda_vm repo and injected in src/main.rs — so crypto changes stay in our repo
+# and don't require an ethrex PR.
+lambda-vm-ethrex-crypto = { path = "../../../../crypto/ethrex-crypto" }
 # Pinned by immutable `rev` to a commit on the open LambdaVM-backend PR branch
 # (feat/lambdavm-prover-backend) of ethrex; re-pin to the merge commit once it
-# lands on ethrex `main`. The `lambdavm` feature provides
-# `crypto::lambdavm::LambdaVmCrypto` (keccak via our precompile syscall; ECDSA
-# and BN254 via pure-Rust crates). KZG is NOT linked under this feature (no
-# kzg-rs/c-kzg in the guest Cargo.lock), so the point-evaluation precompile
+# lands on ethrex `main`. The `lambdavm` feature is kept only for its dependency
+# wiring (`ProgramInput`/`execution_program`/`ProgramOutput::encode` + pure-Rust
+# crypto defaults); ethrex's own `LambdaVmCrypto` compiles unused — we inject our
+# own. KZG is NOT linked under this feature, so the point-evaluation precompile
 # (0x0a) is unsupported — see src/main.rs.
 ethrex-guest-program = { git = "https://github.com/lambdaclass/ethrex.git", rev = "156cb8d6a3974f411d71622eecd1b249ee37ff1c", package = "ethrex-guest-program", default-features = false, features = ["lambdavm"] }
 # Exact pin: must match the fixture writer (tooling/ethrex-fixtures) and the

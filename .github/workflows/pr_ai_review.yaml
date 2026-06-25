@@ -136,14 +136,16 @@ jobs:
           egress-policy: block
           # Allowlist harvested from the harden-runner audit of a real run. Covers:
           # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
-          # model APIs actually used (openrouter + direct MiniMax). Adding a new
-          # direct provider means adding its host here or the lane is blocked.
+          # model APIs actually used (openrouter, direct MiniMax, Moonmath "zro"
+          # gateway). Adding a new direct provider means adding its host here or the
+          # lane is blocked.
           allowed-endpoints: >
             api.github.com:443
             api.minimax.io:443
             broker.actions.githubusercontent.com:443
             files.pythonhosted.org:443
             github.com:443
+            inference.moonmath.ai:443
             models.dev:443
             opencode.ai:443
             openrouter.ai:443
@@ -174,6 +176,10 @@ jobs:
           # Install custom tools (submit_findings) globally too, so review lanes report
           # findings via a tool call instead of hand-written JSON.
           cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+          # Install the global opencode config that defines custom providers not in
+          # models.dev (e.g. the Moonmath "zro" OpenAI-compatible gateway). Inert unless
+          # a lane references one of these provider ids.
+          cp .opencode/opencode.json "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -209,6 +215,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          ZRO_API_KEY: ${{ secrets.ZRO_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
           LANE_ID: ${{ matrix.lane.id }}
         run: |
@@ -314,14 +321,16 @@ jobs:
           egress-policy: block
           # Allowlist harvested from the harden-runner audit of a real run. Covers:
           # GitHub Actions infra, opencode install/binary/catalog, pip + npm, and the
-          # model APIs actually used (openrouter + direct MiniMax). Adding a new
-          # direct provider means adding its host here or the lane is blocked.
+          # model APIs actually used (openrouter, direct MiniMax, Moonmath "zro"
+          # gateway). Adding a new direct provider means adding its host here or the
+          # lane is blocked.
           allowed-endpoints: >
             api.github.com:443
             api.minimax.io:443
             broker.actions.githubusercontent.com:443
             files.pythonhosted.org:443
             github.com:443
+            inference.moonmath.ai:443
             models.dev:443
             opencode.ai:443
             openrouter.ai:443
@@ -352,6 +361,10 @@ jobs:
           # Install custom tools (submit_findings) globally too, so review lanes report
           # findings via a tool call instead of hand-written JSON.
           cp .opencode/tools/*.ts "$HOME/.config/opencode/tools/" 2>/dev/null || true
+          # Install the global opencode config that defines custom providers not in
+          # models.dev (e.g. the Moonmath "zro" OpenAI-compatible gateway). Inert unless
+          # a lane references one of these provider ids.
+          cp .opencode/opencode.json "$HOME/.config/opencode/opencode.json" 2>/dev/null || true
 
       - name: Download review context
         uses: actions/download-artifact@v4
@@ -393,6 +406,7 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           MINIMAX_API_KEY: ${{ secrets.MINIMAX_API_KEY }}
+          ZRO_API_KEY: ${{ secrets.ZRO_API_KEY }}
           LANE_JSON: ${{ toJson(matrix.lane) }}
           LANE_ID: ${{ matrix.lane.id }}
         run: |
