@@ -110,7 +110,7 @@ Once triggered, it loads register `x11` to see where $x_G$ is stored in memory (
 === Range check `xG`
 Before continuing, it is verified that $x_G in [0, p)$.
 To this end, witness $#`xG_sub_p` := #`xG` - p mod 2^256$ is added to `p`; if the addition sums to `xG` and overflows $mod 2^256$, it must hold that $#`xG` < p$.
-The addition is constrained by requiring that `c3` are bits (@ec:c:range_c3); an overflow occurs if and only if $#`c3[7]` = 1$ (@ec:c:xG_addition_overflows).
+The addition is constrained by requiring that `c2` are bits (@ec:c:range_c2); an overflow occurs if and only if $#`c2[7]` = 1$ (@ec:c:xG_addition_overflows).
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xG")
 
@@ -144,11 +144,11 @@ We must therefore support quotients $q_0 in [0, 2^256)$ and $q_1 in [0, 2^258)$.
 ]
 
 Below, we enforce the first of the two sub-relations.
-We emphasize here that @ec:c:c1_63_is_zero is required to ensure the sum evaluates to $0$, rather than just $0 mod 2^256$.
+We emphasize here that @ec:c:c0_63_is_zero is required to ensure the sum evaluates to $0$, rather than just $0 mod 2^256$.
 #render_constraint_table(ecsm_chip, config, groups: "xG2")
 
 Next, we restrict the witness pair $(y_G, #`q1`)$.
-Note there that @ec:c:c2_0 and @ec:c:c2_i multiply `B` by `μ` to simplify the padding; there are no other side-effects to this since $#`μ` = 1$ on non-padding rows (@ec:c:mu_isbit).
+Note there that @ec:c:c1_0 and @ec:c:c1_i multiply `B` by `μ` to simplify the padding; there are no other side-effects to this since $#`μ` = 1$ on non-padding rows (@ec:c:mu_isbit).
 
 #render_constraint_table(ecsm_chip, config, groups: "yG")
 
@@ -170,7 +170,7 @@ After completing its double-and-add sequence, the result is captured in `(xR,yR)
 === Range check `xR`
 Before storing $x_R$, it is verified that $x_R in [0, p)$.
 To this end, witness $#`xR_sub_p` := #`xR` - p mod 2^256$ is added to `p`; if the addition sums to `xR` and overflows $mod 2^256$, it must hold that $#`xR` < p$.
-The addition is constrained by requiring that `c5` are bits (@ec:c:range_c5); an overflow occurs if and only if $#`c5[7]` = 1$ (@ec:c:xR_addition_overflows).
+The addition is constrained by requiring that `c4` are bits (@ec:c:range_c4); an overflow occurs if and only if $#`c4[7]` = 1$ (@ec:c:xR_addition_overflows).
 
 #render_constraint_table(ecsm_chip, config, groups: "range_xR")
 
@@ -183,23 +183,23 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 We close by deriving the values of `carry_offsets`.
 To this end, we decompose the formulae
 $
-  #`xG`^2 - #`x2` - q_1 dot p &= 0,\
-  y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_2)p &= 0
+  #`xG`^2 - #`x2` - q_0 dot p &= 0,\
+  y_G^2 - x_G dot #`x2` - a dot x_G - b + (2p - q_1)p &= 0
 $
 in terms of the positive and negative components to find
 $
-  #`xG`^2 - (#`x2` + q_1 dot p) &= 0, text("and")\
-  (y_G^2 + 2p^2) - (x_G dot #`x2` + a dot x_G + b + q_2 dot p) &= 0.
+  #`xG`^2 - (#`x2` + q_0 dot p) &= 0, text("and")\
+  (y_G^2 + 2p^2) - (x_G dot #`x2` + a dot x_G + b + q_1 dot p) &= 0.
 $
 Applying @limbs:cor:carry-upper-bound with $(L, n) = (2^8, 32)$, we find that
 $
-  #`c1`_i &in [-8160, 8159],\
-  #`c2`_i &in [-24477, 24478].\
+  #`c0`_i &in [-8160, 8159],\
+  #`c1`_i &in [-24477, 24478].\
 $
 When we selectc $#`carry_offsets` = (8160, 24477)$, we arrive at
 $
-  #`c1`_i + #`carry_offsets[1]` &in [0, &16319] subset.eq [2^16],\
-  #`c2`_i + #`carry_offsets[2]` &in [0, &48955] subset.eq [2^16].\
+  #`c0`_i + #`carry_offsets[1]` &in [0, &16319] subset.eq [2^16],\
+  #`c1`_i + #`carry_offsets[2]` &in [0, &48955] subset.eq [2^16].\
 $
 
 == Padding
