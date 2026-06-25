@@ -131,11 +131,11 @@
   let (lo, hi) = (0x84222325, 0xCBF29CE4)
   for b in bytes {
     // hash := hash XOR byte_of_data
-    lo = lo.bit-xor(b)
-
     // hash := hash × FNV_prime
-    lo = lo * prime.at(0)
-    hi = lo * prime.at(1) + hi * prime.at(0)
+    (lo, hi) = (
+      lo.bit-xor(b) * prime.at(0), 
+      lo * prime.at(1) + hi * prime.at(0)
+    )
     
     // Carry result
     let carry = lo.bit-rshift(32)
