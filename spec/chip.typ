@@ -303,11 +303,8 @@
   assert(groups.all(group => group in all_groups), message: "unknown group: " + repr(groups))
   let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
-  // Find the group definition in the constraint_groups
-  let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
-
   /// Render the contraint's tag.
-  let tag(constraint, group) = {
+  let tag(constraint) = {
     let code = chip.at("code", default: chip.name)
     let counter-kind = code + "constraint"
     let tag = code + "-" + constraint.id
@@ -413,7 +410,7 @@
     ..for (group, group_constraints) in selected_constraints.pairs() {
       for constraint in group_constraints {
         (
-          ..tag(constraint, lookup_group(group)),
+          ..tag(constraint),
           [#iters(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],

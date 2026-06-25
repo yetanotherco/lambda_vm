@@ -285,7 +285,6 @@ multiplicity = "word_instr"
 
 [[constraint_groups]]
 name = "range"
-prefix = "R"
 
 [[constraints.range]]
 kind = "template"
@@ -390,7 +389,6 @@ iter = ["i", 0, 3]
 
 [[constraint_groups]]
 name = "alu"
-prefix = "A"
 
 [[constraints.alu]]
 kind = "arith"
@@ -427,7 +425,6 @@ multiplicity = "ALU"
 
 [[constraint_groups]]
 name = "mem"
-prefix = "M"
 
 [[constraints.mem]]
 kind = "interaction"
@@ -501,7 +498,6 @@ multiplicity = -1
 
 [[constraint_groups]]
 name = "branch"
-prefix = "B"
 
 [[constraints.branch]]
 kind = "arith"
@@ -538,7 +534,6 @@ desc = "Compute the next instruction address in `rvd` when BRANCH is active to e
 
 [[constraint_groups]]
 name = "sys"
-prefix = "S"
 
 [[constraints.sys]]
 kind = "interaction"

@@ -180,7 +180,6 @@ multiplicity = "μ_sum"
 
 [[constraint_groups]]
 name = "memory"
-prefix = "M"
 
 [[constraints.memory]]
 kind = "interaction"
@@ -237,7 +236,6 @@ iter = ["i", 4, 7]
 
 [[constraint_groups]]
 name = "output"
-prefix = "O"
 
 [[constraints.output]]
 kind = "interaction"
