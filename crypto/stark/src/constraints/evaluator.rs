@@ -1,6 +1,7 @@
 use super::boundary::BoundaryConstraints;
 use crate::domain::Domain;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
+use crate::constraints::builder::{ConstraintContext, ProverConstraintBuilder, TableConstraints};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use crate::{frame::Frame, prover::evaluate_polynomial_on_lde_domain};
@@ -62,6 +63,27 @@ where
 
         // Precompute packing shift constants once for all LDE domain points.
         let packing_shifts = PackingShifts::<Field>::new();
+
+        // Constraint-builder path (no Frame, monomorphized): when this table has been
+        // migrated (`table_constraints()` is Some) and the flag is on, evaluate the
+        // composition via the ConstraintBuilder folder instead of the boxed path.
+        if use_constraint_builder() {
+            if let Some(tc) = air.table_constraints() {
+                return evaluate_transitions_via_builder(
+                    tc,
+                    lde_trace,
+                    lde_periodic_columns,
+                    rap_challenges,
+                    &logup_alpha_powers,
+                    &packing_shifts,
+                    zerofier_data,
+                    transition_coefficients,
+                    boundary_evaluation,
+                    logup_table_offset,
+                );
+            }
+        }
+
 
         // Per-thread buffers via map_init: each Rayon worker allocates once,
         // then reuses for all iterations assigned to that thread.
@@ -314,5 +336,69 @@ where
             offsets,
             &self.logup_table_offset,
         )
+    }
+}
+
+/// Opt-in flag for the monomorphized `ConstraintBuilder` evaluation path
+/// (`LAMBDA_CONSTRAINT_BUILDER=1`). Default off → boxed path.
+fn use_constraint_builder() -> bool {
+    std::env::var("LAMBDA_CONSTRAINT_BUILDER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// Per-LDE-row composition evaluation via the `ConstraintBuilder` folder: no `Frame`
+/// gather, the table's monomorphized `eval_prover` folds residuals, and `finish()`
+/// applies the per-group zerofier. Returns the same per-row composition values as the
+/// boxed path (byte-identical).
+#[allow(clippy::too_many_arguments)]
+fn evaluate_transitions_via_builder<Field, FieldExtension>(
+    tc: &dyn TableConstraints<Field, FieldExtension>,
+    lde_trace: &LDETraceTable<Field, FieldExtension>,
+    lde_periodic_columns: &[Vec<FieldElement<Field>>],
+    rap_challenges: &[FieldElement<FieldExtension>],
+    logup_alpha_powers: &[FieldElement<FieldExtension>],
+    packing_shifts: &PackingShifts<Field>,
+    zerofier_data: &ZerofierEvaluations<Field>,
+    transition_coefficients: &[FieldElement<FieldExtension>],
+    boundary_evaluation: Vec<FieldElement<FieldExtension>>,
+    logup_table_offset: &FieldElement<FieldExtension>,
+) -> Vec<FieldElement<FieldExtension>>
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
+    FieldExtension: IsField + Send + Sync,
+{
+    let eval_row =
+        |i: usize, boundary: FieldElement<FieldExtension>| -> FieldElement<FieldExtension> {
+            let periodic_i: Vec<FieldElement<Field>> =
+                lde_periodic_columns.iter().map(|c| c[i].clone()).collect();
+            let ctx = ConstraintContext {
+                rap_challenges,
+                logup_alpha_powers,
+                logup_table_offset,
+                packing_shifts,
+                periodic: &periodic_i,
+            };
+            let mut cb =
+                ProverConstraintBuilder::new(lde_trace, i, zerofier_data, transition_coefficients);
+            tc.eval_prover(&mut cb, &ctx);
+            cb.finish() + boundary
+        };
+
+    #[cfg(feature = "parallel")]
+    {
+        boundary_evaluation
+            .into_par_iter()
+            .enumerate()
+            .map(|(i, boundary)| eval_row(i, boundary))
+            .collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        boundary_evaluation
+            .into_iter()
+            .enumerate()
+            .map(|(i, boundary)| eval_row(i, boundary))
+            .collect()
     }
 }
