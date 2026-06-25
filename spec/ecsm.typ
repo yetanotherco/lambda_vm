@@ -206,6 +206,7 @@ $
 == Padding
 #render_chip_padding_table(ecsm_chip, config)
 
+#pagebreak(weak: true)
 
 = ECDAS chip <ecdas>
 #let ecdas_chip = load_chip("src/ecdas.toml", config)
