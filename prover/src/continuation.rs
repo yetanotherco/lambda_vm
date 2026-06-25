@@ -206,6 +206,13 @@ fn global_memory_configs(
 ) -> Vec<PageConfig> {
     let image = build_initial_image(elf, private_inputs);
     let init_page_data = build_init_page_data(&image);
+    global_memory_configs_from_init_page_data(boundaries, &init_page_data)
+}
+
+fn global_memory_configs_from_init_page_data(
+    boundaries: &[Vec<CellBoundary>],
+    init_page_data: &HashMap<u64, Vec<u8>>,
+) -> Vec<PageConfig> {
     let touched_pages: std::collections::BTreeSet<u64> = boundaries
         .iter()
         .flatten()
@@ -526,9 +533,8 @@ fn verify_epoch(
 /// epoch's `init` and every genesis value matches the ELF.
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
-    elf: &Elf,
     elf_bytes: &[u8],
-    private_inputs: &[u8],
+    init_page_data: &HashMap<u64, Vec<u8>>,
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
@@ -546,7 +552,7 @@ fn prove_global(
         }
     }
 
-    let gm_configs = global_memory_configs(boundaries, elf, private_inputs);
+    let gm_configs = global_memory_configs_from_init_page_data(boundaries, init_page_data);
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
@@ -647,6 +653,7 @@ pub fn prove_continuation(
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
     let mut image = build_initial_image_paged(&elf, private_inputs);
+    let init_page_data = build_init_page_data(&image);
     let initial_memory: HashMap<u64, u64> = image.iter().map(|(a, v)| (a, v as u64)).collect();
     let mut provenance = local_to_global::genesis_provenance(&initial_memory);
 
@@ -725,7 +732,7 @@ pub fn prove_continuation(
     // One global LogUp over all the (kept) local-to-global tables.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         epochs.iter().map(|e| e.boundary.clone()).collect();
-    let global = prove_global(&all_boundaries, &elf, elf_bytes, private_inputs, opts)?;
+    let global = prove_global(&all_boundaries, elf_bytes, &init_page_data, opts)?;
 
     Ok(ContinuationProof {
         epochs,
