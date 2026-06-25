@@ -63,7 +63,7 @@ pub(crate) fn in_place_bit_reverse_permute_row_major<E: Send + Sync>(
 
     #[cfg(feature = "parallel")]
     {
-        // No upfront Vec<(usize, usize)> collection (saves ~16 MB at log21 n=64).
+        // No upfront Vec<(usize, usize)> collection (saves ~32 MB at log_n=21 on 64-bit).
         if n >= 2048 {
             use core::sync::atomic::{AtomicPtr, Ordering};
             let raw = AtomicPtr::new(buf.as_mut_ptr());
