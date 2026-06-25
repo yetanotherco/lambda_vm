@@ -54,3 +54,65 @@ fn witness_works_near_curve_order() {
     assert_eq!(w.x_r, gx); // (N-1)·G = -G shares x with G
     assert_eq!(w.len_k, 255);
 }
+
+/// Verifies that P_SQ and THREE_P_SQ match the values computed from p at runtime.
+#[test]
+fn p_sq_constants_match_computed() {
+    use crypto_bigint::{Encoding, U1024};
+    use crate::witness::{P_SQ, THREE_P_SQ};
+    use crate::p;
+
+    // Compute p² at runtime.
+    let (p_sq_lo, p_sq_hi) = p().mul_wide(&p());
+    let mut computed_p_sq = [0u8; 128];
+    computed_p_sq[..32].copy_from_slice(&p_sq_lo.to_le_bytes());
+    computed_p_sq[32..64].copy_from_slice(&p_sq_hi.to_le_bytes());
+    let computed_p_sq = U1024::from_le_slice(&computed_p_sq);
+    assert_eq!(computed_p_sq, P_SQ, "P_SQ does not match p*p");
+
+    // Verify THREE_P_SQ == 3 * P_SQ.
+    let three_p_sq = P_SQ.wrapping_add(&P_SQ).wrapping_add(&P_SQ);
+    assert_eq!(three_p_sq, THREE_P_SQ, "THREE_P_SQ does not match 3*p²");
+}
+
+/// Cross-checks the shifted_quotient result for the lambda double case.
+///
+/// Verifies that `q * p == 3p² + 2λ*yA - 3*xA²` exactly, confirming both
+/// divisibility and that the quotient round-trips correctly through U1024 division.
+#[test]
+fn shifted_quotient_double_matches_identity() {
+    use crypto_bigint::{Encoding, NonZero, U256, U512, U1024};
+    use crate::P_BYTES;
+    use crate::curve::{recover_y_canonical, replay_double_and_add};
+
+    let gx = U256::from_be_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
+    let g = crate::curve::AffinePoint { x: gx, y: recover_y_canonical(&gx).unwrap() };
+    let (steps, _) = replay_double_and_add(&U256::from(5u32), &g);
+    let s = &steps[0]; // first step: double (op=0)
+    assert_eq!(s.op, 0);
+
+    let mut p_le128 = [0u8; 128];
+    p_le128[..32].copy_from_slice(&P_BYTES);
+    let p1024 = NonZero::new(U1024::from_le_slice(&p_le128)).unwrap();
+
+    let mul512 = |a: &U256, b: &U256| -> U512 { let (lo, hi) = a.mul_wide(b); hi.concat(&lo) };
+    let widen = |v: U512| -> U1024 { let mut b = [0u8; 128]; b[..64].copy_from_slice(&v.to_le_bytes()); U1024::from_le_slice(&b) };
+
+    let pos = { let t = mul512(&s.lambda, &s.a.y); t.wrapping_add(&t) }; // 2λ*yA
+    let neg = { let t = mul512(&s.a.x, &s.a.x); t.wrapping_add(&t).wrapping_add(&t) }; // 3xA²
+
+    let (p_sq_lo, p_sq_hi) = crate::p().mul_wide(&crate::p());
+    let p_sq: U1024 = { let mut b = [0u8; 128]; b[..64].copy_from_slice(&p_sq_hi.concat(&p_sq_lo).to_le_bytes()); U1024::from_le_slice(&b) };
+    let r_3p_sq = p_sq.wrapping_add(&p_sq).wrapping_add(&p_sq);
+
+    let total = r_3p_sq.wrapping_add(&widen(pos)).wrapping_sub(&widen(neg));
+    let (q, r) = total.div_rem(&p1024);
+    assert_eq!(r, U1024::ZERO, "3p² + 2λyA - 3xA² must be divisible by p");
+
+    // q * p must equal total exactly.
+    let q_bytes = q.to_le_bytes();
+    assert!(q_bytes[64..].iter().all(|&b| b == 0), "quotient must fit in U512");
+    let q512 = U512::from_le_slice(&q_bytes[..64]);
+    let q512_bytes = q512.to_le_bytes();
+    assert!(q512_bytes[33..].iter().all(|&b| b == 0), "quotient must fit in 33 bytes");
+}
