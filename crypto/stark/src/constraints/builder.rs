@@ -35,7 +35,10 @@ where
     zerofier: &'a ZerofierEvaluations<F>,
     coeffs: &'a [FieldElement<E>],
     row: usize,
-    acc: FieldElement<E>,
+    /// One running sum per zerofier group (`Σ residual·coeff` over the constraints in
+    /// that group). The shared zerofier is applied once per group in `finish`, not
+    /// once per term — fewer multiplications when constraints share a zerofier.
+    group_sums: Vec<FieldElement<E>>,
     idx: usize,
 }
 
@@ -56,7 +59,7 @@ where
             zerofier,
             coeffs,
             row,
-            acc: FieldElement::<E>::zero(),
+            group_sums: vec![FieldElement::<E>::zero(); zerofier.groups.len()],
             idx: 0,
         }
     }
@@ -79,27 +82,36 @@ where
         self.view.get_aux(1, 0, col)
     }
 
-    /// Fold a base-field (domain) constraint **residual** into the composition
-    /// value: `acc += zerofier_inv(idx, row) · residual · coeff[idx]`, then advance
-    /// the index. (`zerofier.get` returns the inverse-zerofier evaluation.)
+    /// Fold a base-field (domain) constraint **residual**: accumulate
+    /// `residual · coeff[idx]` into this constraint's zerofier-group running sum,
+    /// then advance the index. The shared zerofier is applied once per group in
+    /// [`finish`](Self::finish), not per term.
     pub fn fold(&mut self, residual: FieldElement<F>) {
-        let term = (self.zerofier.get(self.idx, self.row) * &residual) * &self.coeffs[self.idx];
-        self.acc = &self.acc + &term;
+        let g = self.zerofier.constraint_to_group[self.idx];
+        self.group_sums[g] = &self.group_sums[g] + &(&residual * &self.coeffs[self.idx]);
         self.idx += 1;
     }
 
-    /// Fold an extension-field (LogUp) residual. Same fold as [`fold`](Self::fold)
-    /// but over the extension field.
+    /// Fold an extension-field (LogUp) residual. Same as [`fold`](Self::fold) but
+    /// over the extension field.
     pub fn fold_ext(&mut self, residual: FieldElement<E>) {
-        let term = (self.zerofier.get(self.idx, self.row) * &residual) * &self.coeffs[self.idx];
-        self.acc = &self.acc + &term;
+        let g = self.zerofier.constraint_to_group[self.idx];
+        self.group_sums[g] = &self.group_sums[g] + &(&residual * &self.coeffs[self.idx]);
         self.idx += 1;
     }
 
-    /// Consume the folder and return the accumulated transition value at this row.
+    /// Consume the folder: apply each group's zerofier to its running sum once and
+    /// sum across groups — `Σ_g zerofier_inv(group g, row) · group_sum[g]`. Equals the
+    /// per-term fold exactly (field distributivity), so proofs stay byte-identical.
     /// (Boundary contribution is added by the caller.)
     pub fn finish(self) -> FieldElement<E> {
-        self.acc
+        let mut acc = FieldElement::<E>::zero();
+        for (g, sum) in self.group_sums.iter().enumerate() {
+            let group = &self.zerofier.groups[g];
+            let z = &group[self.row % group.len()];
+            acc = &acc + &(z * sum);
+        }
+        acc
     }
 }
 
