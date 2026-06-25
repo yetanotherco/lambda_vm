@@ -140,8 +140,6 @@ pub struct Backend {
     pub ntt_dit_8_levels_batched: CudaFunction,
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
-    pub matrix_transpose: CudaFunction,
-    pub matrix_transpose_strided: CudaFunction,
 
     // keccak.ptx
     pub keccak256_leaves_base_batched: CudaFunction,
@@ -239,8 +237,6 @@ impl Backend {
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
-            matrix_transpose: ntt.load_function("matrix_transpose")?,
-            matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
