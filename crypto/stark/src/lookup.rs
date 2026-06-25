@@ -873,6 +873,9 @@ pub struct AirWithBuses<
     /// Maximum number of bus elements across all interactions.
     /// Used to compute the correct number of alpha powers.
     max_bus_elements: usize,
+    /// Migrated per-table domain (non-LogUp) constraints, folded before the LogUp
+    /// constraints. `None` for un-migrated tables (boxed path) and LogUp-only tables.
+    domain_constraints: Option<Box<dyn crate::constraints::builder::TableConstraints<F, E>>>,
 }
 
 impl<
@@ -970,6 +973,7 @@ impl<
             num_precomputed_cols: None,
             name: None,
             max_bus_elements,
+            domain_constraints: None,
         }
     }
 
@@ -1003,6 +1007,16 @@ impl<
     ///
     /// When set, debug output will show bus sums prefixed with this name,
     /// making it easy to identify which table is contributing to bus imbalances.
+    /// Attach this table's migrated domain (non-LogUp) constraints. Folded before
+    /// the LogUp constraints in `eval_prover`/`eval_verifier`, in `constraint_idx` order.
+    pub fn with_domain_constraints(
+        mut self,
+        domain: Box<dyn crate::constraints::builder::TableConstraints<F, E>>,
+    ) -> Self {
+        self.domain_constraints = Some(domain);
+        self
+    }
+
     pub fn with_name(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self
@@ -1021,10 +1035,9 @@ where
         cb: &mut ProverConstraintBuilder<F, E>,
         ctx: &ConstraintContext<F, E>,
     ) {
-        debug_assert_eq!(
-            self.num_base_constraints, 0,
-            "AirWithBuses TableConstraints handles LogUp-only tables"
-        );
+        if let Some(domain) = &self.domain_constraints {
+            domain.eval_prover(cb, ctx);
+        }
         logup_eval(cb, ctx, &self.auxiliary_trace_build_data.interactions);
     }
 
@@ -1033,10 +1046,9 @@ where
         cb: &mut VerifierConstraintBuilder<E>,
         ctx: &ConstraintContext<E, E>,
     ) {
-        debug_assert_eq!(
-            self.num_base_constraints, 0,
-            "AirWithBuses TableConstraints handles LogUp-only tables"
-        );
+        if let Some(domain) = &self.domain_constraints {
+            domain.eval_verifier(cb, ctx);
+        }
         logup_eval(cb, ctx, &self.auxiliary_trace_build_data.interactions);
     }
 }
@@ -1117,7 +1129,7 @@ where
     ) -> Option<&dyn crate::constraints::builder::TableConstraints<Self::Field, Self::FieldExtension>>
     {
         // Only LogUp-only tables (no domain constraints) are migrated so far.
-        if self.num_base_constraints == 0 {
+        if self.num_base_constraints == 0 || self.domain_constraints.is_some() {
             Some(self)
         } else {
             None

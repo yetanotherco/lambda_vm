@@ -1076,6 +1076,7 @@ pub fn create_ec_scalar_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("EC_SCALAR")
+    .with_domain_constraints(Box::new(crate::tables::ec_scalar::EcScalarDomain))
 }
 
 /// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).

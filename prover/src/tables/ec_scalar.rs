@@ -18,13 +18,17 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::new_is_bit_constraints;
+use crate::constraints::templates::{is_bit_fold, new_is_bit_constraints};
 
 // =========================================================================
 // Column indices
@@ -373,4 +377,52 @@ pub fn create_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+/// EC_SCALAR's 20 domain constraints folded in `create_constraints` order:
+/// 10 unconditional IS_BIT (MU, limb_bit[0..8], LAST_LIMB), then the MulZero
+/// constraints limb_bit[i]·(1-MU), LAST_LIMB·(1-MU), LAST_LIMB·OFFSET.
+pub fn ec_scalar_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+
+    // IS_BIT: MU, limb_bit[0..8], LAST_LIMB (unconditional).
+    is_bit_fold(cb, None, cols::MU);
+    for i in 0..8 {
+        is_bit_fold(cb, None, cols::limb_bit(i));
+    }
+    is_bit_fold(cb, None, cols::LAST_LIMB);
+
+    let mu = cb.main(cols::MU).clone();
+    // limb_bit[i] · (1 - MU)
+    for i in 0..8 {
+        let a = cb.main(cols::limb_bit(i)).clone();
+        cb.fold(&a * &(&one - &mu));
+    }
+    // LAST_LIMB · (1 - MU)
+    let last = cb.main(cols::LAST_LIMB).clone();
+    cb.fold(&last * &(&one - &mu));
+    // LAST_LIMB · OFFSET
+    let offset = cb.main(cols::OFFSET).clone();
+    cb.fold(&last * &offset);
+}
+
+/// EC_SCALAR's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct EcScalarDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for EcScalarDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        ec_scalar_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        ec_scalar_domain_eval(cb);
+    }
 }
