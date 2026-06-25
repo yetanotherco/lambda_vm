@@ -67,6 +67,7 @@ p:empty {
   body {
     grid-template:
       "header" var(--header-height)
+      "headerBorder" 1px
       "nav" auto
       "main" auto
       "footnotes" auto
@@ -261,7 +262,7 @@ body::after {
 }
 
 @media (max-width: 768px) {
-  body::before, body::after {
+  body::before {
     content: none;
   }
 }
