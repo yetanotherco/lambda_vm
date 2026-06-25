@@ -1902,6 +1902,35 @@ fn logup_accumulated<CB: ConstraintBuilder>(
     }
 }
 
+/// Fold all of a table's LogUp constraints — committed batched-term pairs, then the
+/// accumulated constraint — into the builder, in the same constraint_idx order
+/// `AirWithBuses::new` assigns. Domain constraints (folded first, indices 0..num_base)
+/// are emitted by the table's own eval before this runs.
+pub(crate) fn logup_eval<CB: ConstraintBuilder>(
+    cb: &mut CB,
+    ctx: &ConstraintContext<CB::F, CB::E>,
+    interactions: &[BusInteraction],
+) {
+    let num_interactions = interactions.len();
+    if num_interactions == 0 {
+        return;
+    }
+    let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
+    for pair_idx in 0..num_committed_pairs {
+        let residual = logup_batched_term(
+            cb,
+            ctx,
+            &interactions[pair_idx * 2],
+            &interactions[pair_idx * 2 + 1],
+            pair_idx,
+        );
+        cb.fold_ext(residual);
+    }
+    let absorbed = &interactions[num_interactions - absorbed_count..];
+    let residual = logup_accumulated(cb, ctx, num_committed_pairs, absorbed);
+    cb.fold_ext(residual);
+}
+
 
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
@@ -2383,5 +2412,61 @@ mod logup_builder_tests {
         constraint.evaluate_verifier(&ctx_old, &mut evals);
 
         assert_eq!(got, evals[0]);
+    }
+
+    /// logup_eval folds the committed batched-term pairs then the accumulated
+    /// constraint, in order — finish() equals the manual fold of those residuals.
+    #[test]
+    fn logup_eval_assembles_batched_then_accumulated() {
+        let main_r0 = [fe(1), fe(2), fe(3), fe(4)];
+        let main_r1 = [fe(7), fe(11), fe(13), fe(17)];
+        let term_col = [fe(19), fe(31)];
+        let acc_col = [fe(41), fe(43)];
+        let main_columns: Vec<Vec<FieldElement<F>>> = (0..4)
+            .map(|c| vec![main_r0[c].clone(), main_r1[c].clone()])
+            .collect();
+        let aux_columns: Vec<Vec<FieldElement<F>>> = vec![term_col.to_vec(), acc_col.to_vec()];
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, aux_columns, 1, 1);
+
+        // 3 interactions -> 1 committed pair (i0,i1) + 1 absorbed (i2).
+        let i0 =
+            BusInteraction::sender(3u64, Multiplicity::Column(0), Packing::Direct.columns(&[1]));
+        let i1 =
+            BusInteraction::receiver(4u64, Multiplicity::Column(2), Packing::Direct.columns(&[3]));
+        let i2 =
+            BusInteraction::sender(5u64, Multiplicity::Column(0), Packing::Direct.columns(&[1]));
+        let interactions = vec![i0.clone(), i1.clone(), i2.clone()];
+
+        let z = fe(99);
+        let alpha = fe(5);
+        let alpha_powers = compute_alpha_powers(&alpha, 8);
+        let shifts = PackingShifts::<F>::new();
+        let table_offset = fe(5);
+        let rap = [z.clone()];
+
+        let g = [fe(2), fe(3)];
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![g.to_vec()],
+            constraint_to_group: vec![0, 0],
+        };
+        let coeffs = [fe(100), fe(200)];
+        let ctx = ConstraintContext {
+            rap_challenges: &rap,
+            logup_alpha_powers: &alpha_powers,
+            logup_table_offset: &table_offset,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
+
+        // Reference residuals via the (differential-tested) helpers.
+        let ro = ProverConstraintBuilder::<F, F>::new(&lde, 0, &zerofier, &coeffs);
+        let batched = logup_batched_term(&ro, &ctx, &i0, &i1, 0);
+        let acc = logup_accumulated(&ro, &ctx, 1, &[i2.clone()]);
+        // row 0 -> g[0]; both constraints in group 0.
+        let expected = &g[0] * &(&batched * &coeffs[0] + &acc * &coeffs[1]);
+
+        let mut cb = ProverConstraintBuilder::<F, F>::new(&lde, 0, &zerofier, &coeffs);
+        logup_eval(&mut cb, &ctx, &interactions);
+        assert_eq!(cb.finish(), expected);
     }
 }
