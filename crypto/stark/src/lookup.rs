@@ -5,6 +5,7 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{ConstraintBuilder, ConstraintContext},
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -662,6 +663,61 @@ impl BusValue {
                         } => {
                             let coeff = FieldElement::<F>::from(*coefficient);
                             result += &main_cols[*column][row] * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(*value);
+                        }
+                    }
+                }
+                *acc += &result * &alpha_powers[alpha_offset];
+                1
+            }
+        }
+    }
+
+    /// Closure-based fingerprint accumulation, mirroring [`accumulate_fingerprint`]
+    /// but reading cells through `get_col` instead of a column-major matrix — so a
+    /// `ConstraintBuilder`'s `main(col)` can drive the same packing arithmetic for
+    /// both the prover and the verifier.
+    pub fn accumulate_fingerprint_with<'a, F, E>(
+        &self,
+        get_col: impl Fn(usize) -> &'a FieldElement<F>,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E> + 'a,
+        E: IsField,
+    {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => packing.accumulate_fingerprint_with(
+                *start_column,
+                get_col,
+                alpha_powers,
+                alpha_offset,
+                acc,
+                shifts,
+            ),
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            result += get_col(*column) * FieldElement::<F>::from(*coefficient);
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            result += get_col(*column) * FieldElement::<F>::from(*coefficient);
                         }
                         LinearTerm::Constant(value) => {
                             result += FieldElement::<F>::from(*value);
@@ -1698,6 +1754,38 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z - &linear_combination
 }
 
+/// Fingerprint `z - (bus_id*a^0 + sum values*a^k)` for an interaction, read through a
+/// [`ConstraintBuilder`] (current row). Builder analogue of
+/// [`compute_fingerprint_from_step`] — same value, byte-identical.
+fn logup_fingerprint<CB: ConstraintBuilder>(
+    cb: &CB,
+    interaction: &BusInteraction,
+    ctx: &ConstraintContext<CB::F, CB::E>,
+) -> FieldElement<CB::E> {
+    let bus_id_f = FieldElement::<CB::F>::from(interaction.bus_id);
+    let mut linear_combination = bus_id_f * &ctx.logup_alpha_powers[0];
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        alpha_idx += bv.accumulate_fingerprint_with(
+            |col| cb.main(col),
+            ctx.logup_alpha_powers,
+            alpha_idx,
+            &mut linear_combination,
+            ctx.packing_shifts,
+        );
+    }
+    &ctx.rap_challenges[0] - &linear_combination
+}
+
+/// Multiplicity for an interaction, read through a [`ConstraintBuilder`] (current
+/// row). Builder analogue of [`compute_multiplicity_from_step`].
+fn logup_multiplicity<CB: ConstraintBuilder>(
+    cb: &CB,
+    multiplicity: &Multiplicity,
+) -> FieldElement<CB::F> {
+    multiplicity.evaluate_with(|col| cb.main(col).clone())
+}
+
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
 /// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
@@ -1992,5 +2080,62 @@ where
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
+    }
+}
+
+#[cfg(test)]
+mod logup_builder_tests {
+    use super::*;
+    use crate::constraints::builder::ProverConstraintBuilder;
+    use crate::trace::LDETraceTable;
+    use crate::traits::ZerofierEvaluations;
+    use math::field::goldilocks::GoldilocksField;
+
+    type F = GoldilocksField;
+
+    fn fe(x: u64) -> FieldElement<F> {
+        FieldElement::<F>::from(x)
+    }
+
+    /// The builder-based logup_fingerprint / logup_multiplicity must equal the
+    /// existing TableView-based compute_*_from_step for the same row data.
+    #[test]
+    fn builder_logup_helpers_match_step_helpers() {
+        let row_vals = [fe(7), fe(11), fe(13), fe(17)];
+        let main_columns: Vec<Vec<FieldElement<F>>> =
+            row_vals.iter().map(|v| vec![v.clone()]).collect();
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, vec![], 1, 1);
+        let step = TableView::<F, F>::new(vec![row_vals.to_vec()], vec![]);
+
+        let interaction =
+            BusInteraction::sender(3u64, Multiplicity::Column(0), Packing::Direct.columns(&[1]));
+
+        let z = fe(99);
+        let alpha = fe(5);
+        let alpha_powers = compute_alpha_powers(&alpha, 8);
+        let shifts = PackingShifts::<F>::new();
+        let zero = fe(0);
+        let rap = [z.clone()];
+
+        let fp_ref =
+            compute_fingerprint_from_step(&step, &interaction, &z, &alpha_powers, &shifts);
+        let m_ref = compute_multiplicity_from_step(&step, &interaction.multiplicity);
+
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![vec![fe(1)]],
+            constraint_to_group: vec![0],
+        };
+        let coeffs = [fe(1)];
+        let cb = ProverConstraintBuilder::<F, F>::new(&lde, 0, &zerofier, &coeffs);
+        let ctx = ConstraintContext {
+            rap_challenges: &rap,
+            logup_alpha_powers: &alpha_powers,
+            logup_table_offset: &zero,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
+
+        assert_eq!(logup_fingerprint(&cb, &interaction, &ctx), fp_ref);
+        assert_eq!(logup_multiplicity(&cb, &interaction.multiplicity), m_ref);
     }
 }
