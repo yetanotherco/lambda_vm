@@ -38,7 +38,10 @@ env:
   ELF: executor/program_artifacts/rust/ethrex.elf
   INPUT: executor/tests/ethrex_bench_20.bin
   BENCH_RUNS_PR: 3
-  BENCH_RUNS_BASELINE: 3
+  # Baseline is the amortized side of the comparison (computed once per main push,
+  # off the PR critical path). With unequal n the smaller-n side dominates the
+  # comparison noise, so the baseline runs more than the PR side. 10 is the clamp max.
+  BENCH_RUNS_BASELINE: 10
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
   # the matching transfer counts (x-axis; slope is MB per transfer).
