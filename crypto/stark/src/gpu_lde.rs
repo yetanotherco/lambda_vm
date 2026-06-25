@@ -561,7 +561,6 @@ where
     Some((tree, handle, lde_out))
 }
 
-/// Fused ext3 path: LDE + Keccak-256 leaf hash + Merkle tree build over
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.

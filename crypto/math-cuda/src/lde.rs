@@ -307,6 +307,42 @@ fn launch_keccak_base_row_major(
     Ok(())
 }
 
+/// Transpose row-major `lde_size × cols` → column-major with stride `lde_size`,
+/// returning the new device buffer. Used to convert the row-major LDE output to
+/// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
+/// No synchronize — callers on the same stream are ordered; other streams must
+/// synchronize themselves.
+fn launch_row_to_col_major(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    src: &CudaSlice<u64>,
+    lde_size: usize,
+    cols: usize,
+    lde_u64: u64,
+) -> Result<CudaSlice<u64>> {
+    let mut dst = stream.alloc_zeros::<u64>(lde_size * cols)?;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (cols as u32).div_ceil(32),
+            (lde_size as u32).div_ceil(32).min(65535),
+            1,
+        ),
+        block_dim: (32, 32, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.matrix_transpose_strided)
+            .arg(src)
+            .arg(&mut dst)
+            .arg(&(lde_size as u32))
+            .arg(&(cols as u32))
+            .arg(&lde_u64)
+            .launch(cfg)?;
+    }
+    Ok(dst)
+}
+
 /// Row-major LDE + Keccak + Merkle, all on-device.
 ///
 /// Input: `row_major` is a flat `n * m` slice in row-major order.
@@ -338,20 +374,10 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     let be = backend()?;
     let stream = be.next_stream();
 
-    // H2D: single contiguous copy — no per-column extraction.
-    let mut buf = stream.clone_htod(row_major)?;
-    // Extend to lde_size rows (zero-pad for LDE expansion).
-    let pad_len = (lde_size - n) * m;
-    if pad_len > 0 {
-        let mut pad_dev = stream.alloc_zeros::<u64>(pad_len)?;
-        // Extend buf to lde_size * m by appending pad_dev.
-        // cudarc doesn't have concat; allocate the full LDE buffer and copy.
-        let mut full_buf = stream.alloc_zeros::<u64>(lde_size * m)?;
-        stream.memcpy_dtod(&buf, &mut full_buf.slice_mut(0..n * m))?;
-        drop(buf);
-        drop(pad_dev);
-        buf = full_buf;
-    }
+    // H2D into a zeroed lde_size*m buffer; only the first n*m rows carry data,
+    // the remainder are already zero (zero-padding for LDE expansion).
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * m)?;
+    stream.memcpy_htod(row_major, &mut buf.slice_mut(0..n * m))?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -379,50 +405,26 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
 
-    // D2H: single contiguous copy of the row-major LDE output.
-    // Do this BEFORE transposing buf to column-major so we get the row-major
-    // data without an extra copy.
-    let staging_slot = be.pinned_staging();
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(lde_size * m, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(lde_size * m) };
-    stream.memcpy_dtoh(&buf, pinned)?;
+    // D2H the row-major LDE first (before the handle transpose). Release the
+    // staging lock before the Merkle nodes transfer to minimise lock contention.
+    let lde_out = {
+        let staging_slot = be.pinned_staging();
+        let mut staging = staging_slot.lock().unwrap();
+        staging.ensure_capacity(lde_size * m, &be.ctx)?;
+        let pinned = unsafe { staging.as_mut_slice(lde_size * m) };
+        stream.memcpy_dtoh(&buf, pinned)?;
+        stream.synchronize()?;
+        let out = pinned[..lde_size * m].to_vec();
+        drop(staging);
+        out
+    };
 
     let mut nodes_out = vec![0u8; nodes_bytes];
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
 
-    let lde_out = pinned[..lde_size * m].to_vec();
-    drop(staging);
-
-    // Transpose buf row-major (lde_size × m) → column-major (m cols × lde_size)
-    // for the GpuLdeBase handle. Downstream GPU kernels (DEEP, barycentric) read
-    // buf[c * lde_size + r], which is column-major with stride lde_size.
-    // matrix_transpose_strided(src, dst, rows=lde_size, cols=m, out_stride=lde_size)
-    // writes dst[c * lde_size + r] = src[r * m + c]. Use a fresh allocation so
-    // the row-major buf (already D2H'd) and column-major handle don't alias.
-    let mut col_major_dev = stream.alloc_zeros::<u64>(lde_size * m)?;
-    {
-        let cfg = LaunchConfig {
-            grid_dim: (
-                (m as u32).div_ceil(32),
-                (lde_size as u32).div_ceil(32).min(65535),
-                1,
-            ),
-            block_dim: (32, 32, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.matrix_transpose_strided)
-                .arg(&buf)
-                .arg(&mut col_major_dev)
-                .arg(&(lde_size as u32))
-                .arg(&(m as u32))
-                .arg(&lde_u64)
-                .launch(cfg)?;
-        }
-        stream.synchronize()?;
-    }
+    // Transpose row-major buf → column-major for the handle. Downstream kernels
+    // (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
 
     let handle = GpuLdeBase { buf: Arc::new(col_major_dev), m, lde_size };
     Ok((nodes_out, handle, lde_out))
@@ -463,14 +465,8 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     let be = backend()?;
     let stream = be.next_stream();
 
-    // H2D: single contiguous copy — row-major ext3 as flat u64s.
-    let mut buf = stream.clone_htod(row_major)?;
-    if lde_size > n {
-        let mut full_buf = stream.alloc_zeros::<u64>(lde_size * m3)?;
-        stream.memcpy_dtod(&buf, &mut full_buf.slice_mut(0..n * m3))?;
-        drop(buf);
-        buf = full_buf;
-    }
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * m3)?;
+    stream.memcpy_htod(row_major, &mut buf.slice_mut(0..n * m3))?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -495,45 +491,22 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
 
-    // D2H: single contiguous copy of the row-major ext3 LDE.
-    let staging_slot = be.pinned_staging();
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(lde_size * m3, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(lde_size * m3) };
-    stream.memcpy_dtoh(&buf, pinned)?;
+    let lde_out = {
+        let staging_slot = be.pinned_staging();
+        let mut staging = staging_slot.lock().unwrap();
+        staging.ensure_capacity(lde_size * m3, &be.ctx)?;
+        let pinned = unsafe { staging.as_mut_slice(lde_size * m3) };
+        stream.memcpy_dtoh(&buf, pinned)?;
+        stream.synchronize()?;
+        let out = pinned[..lde_size * m3].to_vec();
+        drop(staging);
+        out
+    };
 
     let mut nodes_out = vec![0u8; nodes_bytes];
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
 
-    let lde_out = pinned[..lde_size * m3].to_vec();
-    drop(staging);
-
-    // Transpose row-major (lde_size × m3) → GpuLdeExt3 column-major format:
-    // dst[(c*3 + k) * lde_size + r] = src[r * m3 + c*3 + k].
-    // matrix_transpose_strided(src, dst, rows=lde_size, cols=m3, out_stride=lde_size)
-    let mut col_major_dev = stream.alloc_zeros::<u64>(lde_size * m3)?;
-    {
-        let cfg = LaunchConfig {
-            grid_dim: (
-                (m3 as u32).div_ceil(32),
-                (lde_size as u32).div_ceil(32).min(65535),
-                1,
-            ),
-            block_dim: (32, 32, 1),
-            shared_mem_bytes: 0,
-        };
-        unsafe {
-            stream
-                .launch_builder(&be.matrix_transpose_strided)
-                .arg(&buf)
-                .arg(&mut col_major_dev)
-                .arg(&(lde_size as u32))
-                .arg(&(m3 as u32))
-                .arg(&lde_u64)
-                .launch(cfg)?;
-        }
-        stream.synchronize()?;
-    }
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m3, lde_u64)?;
 
     let handle = GpuLdeExt3 { buf: Arc::new(col_major_dev), m, lde_size };
     Ok((nodes_out, handle, lde_out))

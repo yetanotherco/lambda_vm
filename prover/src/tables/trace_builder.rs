@@ -2900,9 +2900,7 @@ fn build_traces(
             storage_mode,
         )
     };
-    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
-    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
-    // contributes nothing to any bus.
+    // Auxiliary ALU / memory / CPU32 dispatch chips.
     let gen_eqs = || {
         chunk_and_generate::<eq::EqOperation>(
             &eq_ops,

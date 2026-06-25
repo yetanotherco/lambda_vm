@@ -1677,9 +1677,6 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     alpha_powers: &[FieldElement<B>],
     shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
-    // alpha_powers[0] is always 1, so the bus_id term is just the embedded bus
-    // id — skip the base×ext multiply and build the extension element straight
-    // from the bus id.
     let mut linear_combination = FieldElement::<B>::from(interaction.bus_id);
     let mut alpha_idx = 1;
     for bv in &interaction.values {
