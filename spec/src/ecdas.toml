@@ -220,6 +220,11 @@ def = {polys=[
 ]}
 
 [[variables.constant]]
+name = "id"
+type = "Bit"
+desc = "the curve identifier"
+
+[[variables.constant]]
 name = "a"
 type = "U256BL"
 desc = "`a`-coefficient of the elliptic curve"
@@ -268,7 +273,7 @@ name = "receive"
 [[constraints.receive]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xA", "yA", "xG", "yG", "round", "op"]
+input = ["id", "timestamp", "xA", "yA", "xG", "yG", "round", "op"]
 multiplicity = ["-", "μ"]
 
 [[constraints.receive]]
@@ -548,6 +553,6 @@ ref = "ecdas:c:next_op_implies_mu"
 [[constraints.send]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xR", "yR", "xG", "yG", ["-", "round", ["-", 1, "next_op"]], "next_op"]
+input = ["id", "timestamp", "xR", "yR", "xG", "yG", ["-", "round", ["-", 1, "next_op"]], "next_op"]
 multiplicity = "μ"
 ref = "ecdas:c:send"

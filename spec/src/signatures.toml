@@ -215,7 +215,7 @@ output = ["Byte", 8]
 [[signatures]]
 tag = "ECDAS"
 kind = "interaction"
-input = ["DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
+input = ["Bit", "DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
 
 [[signatures]]
 tag = "SERVE_K"

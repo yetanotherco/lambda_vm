@@ -52,7 +52,7 @@ The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the 
 
 = Overview
 This accelerator provides a compact way to prove the $x$-coordinate of the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
-In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
+In particular, the accelerator supports the curves `secp256k1` ($#`id` = 0$) and `secp256r1` ($#`id` = 1$).
 
 #attention("Variable space.")[
     This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
@@ -76,13 +76,14 @@ The accelerator comprises two chips:
 = ECSM <ecsm-sm>
 
 The #ecsm (Elliptic Curve Scalar Multiply) chip is generic over the constants
-- $a$, the first curve coefficient,
-- $b$, the second curve coefficient,
-- $p$, the prime field modulus, and
-- $N$, the order of the curve group.
-To support scalar multiplication over different curves, one chip instance should be created for each curve.
+- $#`id` in {0, 1}$, the curve identifier,
+- $p in NN$, the prime field modulus,
+- $a < p$, the first curve coefficient,
+- $b < p$, the second curve coefficient, and
+- $N in NN$, the order of the curve group.
+To support scalar multiplication over different curves, one chip instance should be created for each curve, where each instance is given a unique `id`.
 
-The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$.
+The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$ (`secp256k1`) or $-12$ (`secp256r1`).
 The chip expects 
 - `x10` to contain the address where $x_R := (k times G)_x$ is to be stored, 
 - `x11` to contain the address at which the least significant byte of $x_G$ is to be found,

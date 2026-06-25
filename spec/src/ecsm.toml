@@ -216,6 +216,11 @@ def = {polys=[
 ]}
 
 [[variables.constant]]
+name = "id"
+type = "Bit"
+desc = "curve identifier"
+
+[[variables.constant]]
 name = "a"
 type = "U256BL"
 desc = "`a`-coefficient of the elliptic curve"
@@ -709,7 +714,7 @@ ref = "ec:c:mu_isbit"
 [[constraints.ecall]]
 kind = "interaction"
 tag = "ECALL"
-input = ["timestamp", ["cast", ["-", ["^", 2, 64], 11], "DWordWL"]]
+input = ["timestamp", ["arr", ["-", ["^", 2, 32], 11, "id"], ["-", ["^", 2, 32], 1]]]
 multiplicity = ["-", "μ"]
 
 [[constraint_groups]]
@@ -736,13 +741,13 @@ multiplicity = "μ"
 [[constraints.delegate]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xG", "yG", "xG", "yG", ["-", "idx_k", 1], 0]
+input = ["id", "timestamp", "xG", "yG", "xG", "yG", ["-", "idx_k", 1], 0]
 multiplicity = "μ"
 ref = "ec:c:start_double_add"
 
 [[constraints.delegate]]
 kind = "interaction"
 tag = "ECDAS"
-input = ["timestamp", "xR", "yR", "xG", "yG", -1, 0]
+input = ["id", "timestamp", "xR", "yR", "xG", "yG", -1, 0]
 multiplicity = ["-", "μ"]
 ref = "ec:c:receive_double_add"
