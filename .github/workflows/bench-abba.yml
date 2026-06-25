@@ -27,6 +27,9 @@ jobs:
       startsWith(github.event.comment.body, '/bench-abba') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
+    # Generous ceiling so a hang/OOM can't strand the single bench runner; the
+    # workload itself is ~30-40 min at the default 20 pairs (clamped to <=40).
+    timeout-minutes: 120
     steps:
       - name: Acknowledge (react + occupancy notice)
         uses: actions/github-script@v7
@@ -49,16 +52,30 @@ jobs:
           PR_NUM: ${{ github.event.issue.number }}
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          HEAD_REF=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefName -q .headRefName)
-          echo "head_ref=$HEAD_REF" >> "$GITHUB_OUTPUT"
-          # Optional pair count, e.g. "/bench-abba 32"; default 20.
+          # Resolve the head SHA (not the branch name): pinning the commit works for
+          # fork PRs too (the branch lives in the fork, not origin/) and avoids a
+          # force-push race mid-run.
+          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # Optional pair count, e.g. "/bench-abba 32"; default 20. Clamp to [2,40]
+          # so a "/bench-abba 10000" can't monopolize the single bench server.
           N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-abba[[:space:]]*\([0-9]\+\).*|\1|p')
-          echo "pairs=${N:-20}" >> "$GITHUB_OUTPUT"
+          N=${N:-20}
+          if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
+            echo "::warning::pair count $N out of range [2,40]; using 20"
+            N=20
+          fi
+          echo "pairs=$N" >> "$GITHUB_OUTPUT"
 
       - name: Checkout (full history for ref resolution)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Fetch PR head commit (works for fork PRs)
+        env:
+          PR_NUM: ${{ github.event.issue.number }}
+        run: git fetch origin "pull/$PR_NUM/head" --quiet
 
       - name: Add cargo to PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -66,28 +83,29 @@ jobs:
       - name: Run ABBA tiebreaker
         id: run
         env:
-          HEAD_REF: ${{ steps.cfg.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
           # bench_abba.sh builds the cli at both refs (isolated worktree), runs the
           # interleaved pairs, and prints the paired-t CI + exact Wilcoxon test.
-          scripts/bench_abba.sh "origin/$HEAD_REF" origin/main "$PAIRS" 2>&1 | tee /tmp/abba_out.txt
+          # Pass the head SHA (pinned above) so fork PRs resolve.
+          scripts/bench_abba.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/abba_out.txt
           sed -n '/=== ABBA paired result/,$p' /tmp/abba_out.txt > /tmp/abba_result.txt
 
       - name: Post result
         if: always()
         uses: actions/github-script@v7
         env:
-          HEAD_REF: ${{ steps.cfg.outputs.head_ref }}
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
           OUTCOME: ${{ steps.run.outcome }}
         with:
           script: |
             const fs = require('fs');
             const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
-            const head = process.env.HEAD_REF, pairs = process.env.PAIRS;
+            const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
             let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/abba_result.txt') || read('/tmp/abba_out.txt');

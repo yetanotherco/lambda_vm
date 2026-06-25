@@ -22,8 +22,8 @@
 # CONVENTION: every reported number is an IMPROVEMENT, positive = PR FASTER.
 #
 # USAGE:
-#   scripts/bench_abba.sh [REF_A] [REF_B] [N_PAIRS]
-#     REF_A    PR ref     (default: origin/perf/logup-fingerprint-constants, PR #696)
+#   scripts/bench_abba.sh REF_A [REF_B] [N_PAIRS]
+#     REF_A    REQUIRED — ref or SHA to evaluate (the PR side)
 #     REF_B    baseline   (default: origin/main)
 #     N_PAIRS  pairs      (default: 20 -> 40 runs, ~33 min on ethrex)
 #   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
@@ -32,12 +32,17 @@
 #   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
 #   (if a 20-pair run straddles 0 on a ~0.6%-looking effect, extend to 32).
 #
-#   scripts/bench_abba.sh                                   # PR #696 vs main, 20 pairs
-#   scripts/bench_abba.sh origin/perf/logup-fingerprint-constants origin/main 32
+#   scripts/bench_abba.sh origin/my-pr-branch                # vs main, 20 pairs
+#   scripts/bench_abba.sh origin/my-pr-branch origin/main 32 # 32 pairs (~0.6%)
 
 set -euo pipefail
 
-REF_A="${1:-origin/perf/logup-fingerprint-constants}"
+if [ $# -lt 1 ]; then
+  echo "usage: bench_abba.sh REF_A [REF_B=origin/main] [N_PAIRS=20]" >&2
+  echo "  REF_A: ref or SHA to evaluate (the PR side)" >&2
+  exit 2
+fi
+REF_A="$1"
 REF_B="${2:-origin/main}"
 N_PAIRS="${3:-20}"
 
@@ -50,8 +55,11 @@ PROOF="/tmp/abba_proof.bin"
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
 
+# Fail fast on the toolchain the final stats step needs, before the ~30-min build.
+command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 is required (final stats step)." >&2; exit 1; }
+
 echo "==> Refs"
-git fetch origin --quiet || echo "   (fetch failed; using local refs)"
+git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed -- resolving against possibly-stale local refs." >&2
 SHA_A="$(git rev-parse "$REF_A")"
 SHA_B="$(git rev-parse "$REF_B")"
 echo "   A (PR)       $REF_A  -> ${SHA_A:0:10}"
@@ -81,6 +89,11 @@ INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
 need_build=0
 if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$WORK/cli_A" ] || [ ! -x "$WORK/cli_B" ]; then
   need_build=1
+elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A" ] || [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B" ]; then
+  # Cache persists on the self-hosted runner; rebuild if it's for different refs
+  # (a different PR, or main advanced) so we never benchmark stale binaries.
+  echo "==> Cached binaries are for different refs; rebuilding."
+  need_build=1
 fi
 if [ "$need_build" = "1" ]; then
   cleanup() { git worktree remove --force "$WT" 2>/dev/null || true; }
@@ -91,7 +104,11 @@ if [ "$need_build" = "1" ]; then
   build_cli() {  # $1=sha $2=out (shared target dir -> 2nd build is incremental)
     echo "==> Building cli @ ${1:0:10} -> $2"
     git -C "$WT" checkout --quiet "$1"
-    ( cd "$WT" && cargo build --release -p cli --features jemalloc-stats >/dev/null 2>&1 )
+    if ! ( cd "$WT" && cargo build --release -p cli --features jemalloc-stats >"$WORK/build_$2.log" 2>&1 ); then
+      echo "ERROR: cargo build failed for $2 (@ ${1:0:10}). Tail of $WORK/build_$2.log:" >&2
+      tail -40 "$WORK/build_$2.log" >&2
+      exit 1
+    fi
     cp "$WT/target/release/cli" "$WORK/$2"
     echo "$1" > "$WORK/$2.sha"
   }
@@ -100,16 +117,14 @@ if [ "$need_build" = "1" ]; then
   cleanup
   trap - EXIT
 else
-  echo "==> Reusing cached binaries (set REBUILD=1 to force a rebuild):"
-  echo "     cli_A: $(cat "$WORK/cli_A.sha" 2>/dev/null || echo '?')  ($(date -r "$WORK/cli_A" 2>/dev/null || echo 'built earlier'))"
-  echo "     cli_B: $(cat "$WORK/cli_B.sha" 2>/dev/null || echo '?')  ($(date -r "$WORK/cli_B" 2>/dev/null || echo 'built earlier'))"
-  echo "     (requested A=${SHA_A:0:10} B=${SHA_B:0:10} -- verify these match before trusting results)"
+  echo "==> Reusing cached binaries (SHAs match requested refs; REBUILD=1 to force):"
+  echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}"
 fi
 
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
 run_prove() {  # $1=binary -> echoes proving time (s)
   local out t
-  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time 2>/dev/null)"
+  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time 2>&1)"
   rm -f "$PROOF"
   t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
   if [ -z "$t" ]; then
