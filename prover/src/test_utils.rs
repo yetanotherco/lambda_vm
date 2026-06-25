@@ -1094,4 +1094,5 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("ECDAS")
+    .with_domain_constraints(Box::new(crate::tables::ecdas::EcdasDomain))
 }

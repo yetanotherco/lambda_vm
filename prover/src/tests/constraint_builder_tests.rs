@@ -200,3 +200,48 @@ fn ecsm_constraint_builder_path_byte_identical() {
     let air = create_ecsm_air(&proof_options);
     assert_builder_path_byte_identical(&air, &base_trace, "ECSM");
 }
+
+
+// =========================================================================
+// ECDAS
+// =========================================================================
+
+#[test]
+fn ecdas_domain_eval_matches_boxed_residuals() {
+    use crate::tables::ecdas::{cols, create_constraints, EcdasDomain};
+    assert_domain_matches_boxed(cols::NUM_COLUMNS, create_constraints(0).0, &EcdasDomain);
+}
+
+#[test]
+fn ecdas_constraint_builder_path_byte_identical() {
+    use crate::tables::ecdas::{generate_ecdas_trace, EcdasOperation};
+    use crate::test_utils::create_ecdas_air;
+    use ecsm::compute_witness;
+
+    let gx_le = || {
+        let mut be = [
+            0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC, 0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87,
+            0x0B, 0x07, 0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9, 0x59, 0xF2, 0x81, 0x5B,
+            0x16, 0xF8, 0x17, 0x98,
+        ];
+        be.reverse();
+        be
+    };
+    let k_le = |v: u64| {
+        let mut k = [0u8; 32];
+        k[..8].copy_from_slice(&v.to_le_bytes());
+        k
+    };
+    let w = compute_witness(&k_le(1_000_003), &gx_le()).unwrap();
+    let ops: Vec<EcdasOperation> = w
+        .steps
+        .into_iter()
+        .map(|step| EcdasOperation { timestamp: 444, step })
+        .collect();
+    let base_trace = generate_ecdas_trace(&ops);
+
+    let mut proof_options = ProofOptions::default_test_options();
+    proof_options.grinding_factor = 0;
+    let air = create_ecdas_air(&proof_options);
+    assert_builder_path_byte_identical(&air, &base_trace, "ECDAS");
+}

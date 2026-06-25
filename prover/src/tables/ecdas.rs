@@ -12,13 +12,17 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+    VerifierConstraintBuilder,
+};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::IsBitConstraint;
+use crate::constraints::templates::{IsBitConstraint, is_bit_fold};
 use crate::tables::ecsm::ecdas_tuple;
 use ecsm::{EcdasStep, P_BYTES};
 
@@ -514,4 +518,130 @@ pub fn create_constraints(
     }
 
     (constraints, idx)
+}
+
+/// ECDAS's 200 domain constraints folded in `create_constraints` order: IS_BIT on
+/// µ/op/next_op, `op·next_op` and `next_op·(1-µ)`, then the λ/xR/yR convolution
+/// carries (256·c_i − c_prev − s_i) + closings. Reads every byte column once and
+/// shares them across all three relations (the boxed `s_i` re-reads per constraint).
+pub fn ecdas_domain_eval<CB: ConstraintBuilder>(cb: &mut CB) {
+    let one = FieldElement::<CB::F>::one();
+    let zero = FieldElement::<CB::F>::zero();
+    let c256 = FieldElement::<CB::F>::from(256u64);
+    let two = FieldElement::<CB::F>::from(2u64);
+    let three = FieldElement::<CB::F>::from(3u64);
+
+    let read = |cb: &CB, base: usize, len: usize| -> Vec<FieldElement<CB::F>> {
+        (0..len).map(|j| cb.main(base + j).clone()).collect()
+    };
+    let lambda = read(cb, cols::LAMBDA, 32);
+    let xg = read(cb, cols::XG, 32);
+    let xa = read(cb, cols::XA, 32);
+    let ya = read(cb, cols::YA, 32);
+    let yg = read(cb, cols::YG, 32);
+    let xr = read(cb, cols::XR, 32);
+    let yr = read(cb, cols::YR, 32);
+    let q0 = read(cb, cols::Q0, 33);
+    let q1 = read(cb, cols::Q1, 33);
+    let q2 = read(cb, cols::Q2, 33);
+    let c0 = read(cb, cols::C0, 64);
+    let c1 = read(cb, cols::C1, 64);
+    let c2 = read(cb, cols::C2, 64);
+    let op = cb.main(cols::OP).clone();
+
+    let byte = |arr: &[FieldElement<CB::F>], j: usize| -> FieldElement<CB::F> {
+        if j < arr.len() { arr[j].clone() } else { zero.clone() }
+    };
+    let pb = |m: usize| -> FieldElement<CB::F> {
+        if m < 32 { FieldElement::<CB::F>::from(P_BYTES[m] as u64) } else { zero.clone() }
+    };
+    let rb = |m: usize| -> FieldElement<CB::F> {
+        if m < 33 { FieldElement::<CB::F>::from(R_BYTES[m] as u64) } else { zero.clone() }
+    };
+    // rq(q) = Σ_{j=0..=i} (r_byte(j) − q_j)·p_byte(i-j)
+    let rq = |q: &[FieldElement<CB::F>], i: usize| -> FieldElement<CB::F> {
+        let mut s = zero.clone();
+        for j in 0..=i {
+            s = &s + &(&(&rb(j) - &byte(q, j)) * &pb(i - j));
+        }
+        s
+    };
+
+    // IS_BIT on µ, op, next_op.
+    is_bit_fold(cb, None, cols::MU);
+    is_bit_fold(cb, None, cols::OP);
+    is_bit_fold(cb, None, cols::NEXT_OP);
+
+    // op · next_op
+    let next_op = cb.main(cols::NEXT_OP).clone();
+    cb.fold(&op * &next_op);
+    // next_op · (1 - mu)
+    let mu = cb.main(cols::MU).clone();
+    cb.fold(&next_op * &(&one - &mu));
+
+    let not_op = &one - &op;
+
+    // λ relation (c0): s_i = op·op_branch + (1-op)·notop_branch + rq(q0).
+    for i in 0..64 {
+        let mut op_branch = &byte(&ya, i) - &byte(&yg, i);
+        for j in 0..=i {
+            op_branch = &op_branch + &(&byte(&lambda, j) * &(&byte(&xg, i - j) - &byte(&xa, i - j)));
+        }
+        let mut notop_branch = zero.clone();
+        for j in 0..=i {
+            notop_branch = &notop_branch + &(&(&two * &byte(&lambda, j)) * &byte(&ya, i - j));
+            notop_branch = &notop_branch - &(&(&three * &byte(&xa, j)) * &byte(&xa, i - j));
+        }
+        let s = &(&(&op * &op_branch) + &(&not_op * &notop_branch)) + &rq(&q0, i);
+        let c_prev = if i == 0 { zero.clone() } else { c0[i - 1].clone() };
+        cb.fold(&(&(&c256 * &c0[i]) - &c_prev) - &s);
+    }
+    cb.fold(c0[63].clone());
+
+    // xR relation (c1): s_i = Σ λ_j λ_{i-j} − xA_i − xG_i − xR_i − (1-op)(xA_i − xG_i) + rq(q1).
+    for i in 0..64 {
+        let mut s = zero.clone();
+        for j in 0..=i {
+            s = &s + &(&byte(&lambda, j) * &byte(&lambda, i - j));
+        }
+        let s = &(&(&(&(&s - &byte(&xa, i)) - &byte(&xg, i)) - &byte(&xr, i))
+            - &(&not_op * &(&byte(&xa, i) - &byte(&xg, i))))
+            + &rq(&q1, i);
+        let c_prev = if i == 0 { zero.clone() } else { c1[i - 1].clone() };
+        cb.fold(&(&(&c256 * &c1[i]) - &c_prev) - &s);
+    }
+    cb.fold(c1[63].clone());
+
+    // yR relation (c2): s_i = Σ λ_j (xA_{i-j} − xR_{i-j}) − yA_i − yR_i + rq(q2).
+    for i in 0..64 {
+        let mut s = zero.clone();
+        for j in 0..=i {
+            s = &s + &(&byte(&lambda, j) * &(&byte(&xa, i - j) - &byte(&xr, i - j)));
+        }
+        let s = &(&(&s - &byte(&ya, i)) - &byte(&yr, i)) + &rq(&q2, i);
+        let c_prev = if i == 0 { zero.clone() } else { c2[i - 1].clone() };
+        cb.fold(&(&(&c256 * &c2[i]) - &c_prev) - &s);
+    }
+    cb.fold(c2[63].clone());
+}
+
+/// ECDAS's migrated domain constraints as an object-safe `TableConstraints`.
+pub struct EcdasDomain;
+
+impl TableConstraints<GoldilocksField, GoldilocksExtension> for EcdasDomain {
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<GoldilocksField, GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksField, GoldilocksExtension>,
+    ) {
+        ecdas_domain_eval(cb);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<GoldilocksExtension>,
+        _ctx: &ConstraintContext<GoldilocksExtension, GoldilocksExtension>,
+    ) {
+        ecdas_domain_eval(cb);
+    }
 }
