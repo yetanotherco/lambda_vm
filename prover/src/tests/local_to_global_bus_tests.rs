@@ -453,6 +453,454 @@ fn test_l2g_binding_rejects_mismatch() {
     assert!(!crate::verify_l2g_commitment_binding(&roots, &final_proof));
 }
 
+// =========================================================================
+// Helpers for soundness regression tests
+// =========================================================================
+
+/// Like `prove_verify_memory` but accepts a pre-built (possibly mutated)
+/// l2g trace instead of deriving it from a boundary slice.
+///
+/// Used by tests that forge individual columns (MU, epoch halfwords) after
+/// trace generation — the mutation must survive into the proof so the
+/// verifier sees the forged commitment.
+fn prove_verify_memory_with_trace(
+    l2g_trace: &mut TraceTable<F, E>,
+    memw_boundary: &[CellBoundary],
+) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+    let l2g = l2g_memory_air(&proof_options);
+    let memw = memw_sub_air(&proof_options);
+    let mut memw_trace = memw_sub_trace(memw_boundary);
+    let pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![(&l2g, l2g_trace, &()), (&memw, &mut memw_trace, &())];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&l2g, &memw];
+    Verifier::multi_verify(
+        &airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
+}
+
+/// Like `prove_global` (and `prove_and_verify`) but accepts pre-built l2g
+/// traces (one per epoch) so that column mutations applied before this call
+/// survive into the proof.
+///
+/// Returns `true` iff the multi-table verifier accepts the proof.
+fn prove_and_verify_global_with_traces(
+    boundaries: &[Vec<CellBoundary>],
+    l2g_traces: &mut [TraceTable<F, E>],
+) -> bool {
+    let all: Vec<CellBoundary> = boundaries.iter().flatten().copied().collect();
+
+    let genesis: Vec<Token> = all
+        .iter()
+        .filter(|b| b.init.originating_epoch == GENESIS_EPOCH)
+        .map(|b| {
+            (
+                b.address,
+                b.init.value,
+                b.init.originating_epoch,
+                b.init.timestamp,
+            )
+        })
+        .collect();
+
+    let mut final_fini: HashMap<u64, Token> = HashMap::new();
+    for epoch in boundaries {
+        for b in epoch {
+            final_fini.insert(
+                b.address,
+                (b.address, b.fini.value, b.fini.epoch, b.fini.timestamp),
+            );
+        }
+    }
+    let program_end: Vec<Token> = final_fini.into_values().collect();
+
+    let mut genesis_trace = anchor_trace(&genesis);
+    let mut program_end_trace = anchor_trace(&program_end);
+
+    let proof_options = ProofOptions::default_test_options();
+    let l2g_airs: Vec<_> = (0..boundaries.len())
+        .map(|i| l2g_air(&proof_options, local_to_global::epoch_label(i as u64)))
+        .collect();
+    let genesis_anchor = anchor_air(&proof_options, true);
+    let program_end_anchor = anchor_air(&proof_options, false);
+
+    let mut air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = l2g_airs
+        .iter()
+        .zip(l2g_traces.iter_mut())
+        .map(|(air, trace)| {
+            (
+                air as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+                trace,
+                &(),
+            )
+        })
+        .collect();
+    air_trace_pairs.push((&genesis_anchor, &mut genesis_trace, &()));
+    air_trace_pairs.push((&program_end_anchor, &mut program_end_trace, &()));
+
+    let proof = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    let mut airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = l2g_airs
+        .iter()
+        .map(|a| a as &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>)
+        .collect();
+    airs.push(&genesis_anchor);
+    airs.push(&program_end_anchor);
+
+    Verifier::multi_verify(
+        &airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
+}
+
+// =========================================================================
+// Soundness regression tests: MU selector (Design X / Statement S)
+// =========================================================================
+
+/// (1a) MU=0 on a real row silences its Memory-bus tokens → the bus dangles.
+///
+/// Property guarded: the `MU` selector gates EVERY L2G interaction on the
+/// epoch-local Memory bus. Clearing MU on a genuinely-touched cell means its
+/// init-receive and fini-send never fire; the MEMW-substitute chain still
+/// sends/receives for that cell, leaving both tokens unmatched → bus
+/// imbalance → proof must fail.
+///
+/// Modelled on `test_local_memory_bus_rejects_tamper` (same Memory-bus path)
+/// extended to mutate MU rather than a value column, using the new
+/// `prove_verify_memory_with_trace` helper.
+#[test]
+fn test_l2g_mu_zero_on_real_row_rejects() {
+    // Two touched cells; row 0 is real (MU=1). We forge row 0's MU to 0.
+    let initial_memory = HashMap::from([(10u64, 5u64)]);
+    let epochs = vec![vec![(10, 7, 3), (20, 9, 4)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+
+    // Honest round-trip must pass.
+    assert!(
+        prove_verify_memory(&boundaries[0], &boundaries[0]),
+        "baseline must verify before forgery"
+    );
+
+    // Forge: clear MU on the first real row.
+    let mut forged_trace = generate_local_to_global_trace(&boundaries[0]);
+    forged_trace
+        .main_table
+        .set(0, local_to_global::cols::MU, FE::zero());
+
+    // The Memory bus is now unbalanced: L2G's init-receive and fini-send for
+    // cell 10 are silenced (MU=0), but the MEMW-substitute sends cell 10's
+    // init and expects its fini — neither token finds its counterpart.
+    assert!(
+        !prove_verify_memory_with_trace(&mut forged_trace, &boundaries[0]),
+        "MU=0 on a real row must cause the Memory bus to reject"
+    );
+}
+
+/// (1b) MU=1 on a padding row injects phantom tokens → the GlobalMemory bus
+/// cannot balance.
+///
+/// Property guarded: same Design-X property, opposite direction. A padding row
+/// with MU=1 fires a spurious init-receive and fini-send on the GlobalMemory
+/// bus. The two phantom tokens carry different values — the init token carries
+/// originating_epoch=0 (zero-filled padding) while the fini token carries
+/// `fini_epoch=epoch_label` (the per-table constant, always ≥ 1). Because the
+/// epoch field differs, the phantom receive and send do NOT self-cancel; neither
+/// the genesis anchor nor the program-end anchor has a matching row for address 0
+/// → both tokens dangle → bus imbalance → proof fails.
+///
+/// Note: the epoch-local Memory bus would NOT catch this because the phantom
+/// row's init and fini tokens are identical (all columns zero) and self-cancel
+/// in the LogUp. The GlobalMemory bus carries the epoch constant in the fini
+/// token but not the init token, breaking the self-cancellation.
+///
+/// Three real boundaries pad to four rows; row 3 is the padding row (all-zero).
+/// Uses `prove_and_verify_global_with_traces` (same path as test 1c and test 3).
+#[test]
+fn test_l2g_mu_one_on_padding_row_rejects_global_bus() {
+    // 3 real rows → 4-row trace (padding row at index 3).
+    let initial_memory = HashMap::new();
+    let epochs = vec![vec![(10, 7, 3), (20, 9, 4), (30, 1, 5)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+    assert_eq!(boundaries[0].len(), 3, "expect 3 real rows");
+
+    // Honest baseline on the GlobalMemory bus.
+    assert!(
+        prove_and_verify(&boundaries),
+        "baseline must verify before forgery"
+    );
+
+    // Forge: set MU=1 on the padding row (row 3, all-zero columns).
+    let mut forged_trace = generate_local_to_global_trace(&boundaries[0]);
+    let num_rows = forged_trace.num_rows();
+    assert_eq!(num_rows, 4, "trace must be padded to 4 rows");
+    forged_trace
+        .main_table
+        .set(3, local_to_global::cols::MU, FE::one());
+    let mut l2g_traces = vec![forged_trace];
+
+    // The phantom row fires on the GlobalMemory bus:
+    //   - init-receive: epoch=0 (zero-filled), addr=0 — no genesis anchor row sends this.
+    //   - fini-send: epoch=epoch_label=1, addr=0 — no program-end anchor receives this.
+    // The two tokens differ in the epoch field, so they do not self-cancel.
+    assert!(
+        !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
+        "MU=1 on a padding row must cause the GlobalMemory bus to reject"
+    );
+}
+
+/// (1c) MU=2 (non-boolean) on a real row unbalances the GlobalMemory bus.
+///
+/// Property guarded: MU is the LogUp multiplicity for ALL bus interactions.
+/// With MU=2 the fini-sender fires twice but the program-end anchor receives
+/// only once, and the init-receiver fires twice but the genesis anchor sends
+/// only once → both sides of the GlobalMemory bus are off by 1 → proof fails.
+///
+/// Uses `prove_and_verify_global_with_traces` (forked from `prove_global`)
+/// to inject the pre-mutated trace. Modelled on
+/// `test_prove_elfs_ecsm_forged_ecdas_mu_rejected` (prove_elfs_tests.rs:1230)
+/// for the "set MU to 2, assert reject" pattern.
+#[test]
+fn test_l2g_mu_nonboolean_rejects_global_bus() {
+    let initial_memory = HashMap::from([(10u64, 5u64)]);
+    let epochs = vec![vec![(10, 7, 3)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+
+    // Honest baseline on the GlobalMemory bus.
+    assert!(
+        prove_and_verify(&boundaries),
+        "baseline must verify before forgery"
+    );
+
+    // Forge: set MU=2 on row 0 of epoch 0's L2G trace.
+    let mut l2g_trace = generate_local_to_global_trace(&boundaries[0]);
+    l2g_trace
+        .main_table
+        .set(0, local_to_global::cols::MU, FE::from(2u64));
+    let mut l2g_traces = vec![l2g_trace];
+
+    // Multiplicity 2 on both the init-receiver and fini-sender; genesis and
+    // program-end anchors only send/receive multiplicity 1 → bus imbalance.
+    assert!(
+        !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
+        "MU=2 (non-boolean) must cause the GlobalMemory bus to reject"
+    );
+}
+
+// =========================================================================
+// Soundness regression tests: init_epoch ordering (IsB20)
+// =========================================================================
+
+/// (2) Forged init_epoch violating the ordering constraint is rejected.
+///
+/// Property guarded: `init_epoch < fini_epoch` is enforced via an IsB20
+/// lookup on `fini_epoch − 1 − init_epoch`. A forged row that claims
+/// `init_epoch >= fini_epoch` causes the difference to underflow in the
+/// field to a value far outside [0, 2^20); no matching IsB20 row exists in
+/// the BITWISE table, so the range-check bus cannot balance and the proof
+/// must fail.
+///
+/// The ordering check lives on `range_check_interactions`, which is wired to
+/// the BITWISE table inside the epoch proof. The epoch-local `l2g_memory_air`
+/// in this test file does NOT include `range_check_interactions` — it only
+/// covers the Memory bus. The full range-check path (with a live BITWISE
+/// table) is exercised inside the epoch prover in `continuation.rs`
+/// (`l2g_memory_air` there concatenates both, see line 155-159). Wiring the
+/// complete BITWISE sub-proof here would require replicating `prove_epoch`'s
+/// full table set, which is out of scope for a unit bus test.
+///
+/// What we CAN assert at this level: the arithmetic property that makes the
+/// attack fail. `test_ordering_rejects_future_reference` in
+/// `local_to_global.rs::tests` (line 831) already verifies that the field
+/// value `fini_epoch − 1 − init_epoch` wraps to a value ≥ 2^20 for both
+/// self-references and future-references, so no IsB20 row matches. This test
+/// documents the gap and its justification — the ordering property is fully
+/// covered by that unit test plus the continuation integration tests.
+///
+/// Variants that ARE expressible without the full bitwise table:
+///   - Self-reference (init_epoch == fini_epoch) and future-reference
+///     (init_epoch > fini_epoch) are both covered by the arithmetic check.
+///   - The GlobalMemory bus itself does NOT enforce the ordering; it only
+///     checks that tokens match across epochs. The IsB20 sender is wired
+///     exclusively on the epoch-local table (which carries the BITWISE provider).
+///
+/// Skipping the full prove+verify here; the unit test at
+/// `local_to_global::tests::test_ordering_rejects_future_reference` (line 831)
+/// is the normative coverage for this invariant. A full integration test would
+/// require wiring the BITWISE table, which is tested end-to-end by the
+/// continuation tests in `continuation.rs::tests`.
+#[test]
+fn test_l2g_init_epoch_ordering_field_arithmetic() {
+    // Verify the arithmetic property that underlies the IsB20 soundness argument
+    // without running a full proof. The ordering sender computes:
+    //   fini_epoch − 1 − init_epoch   (in the Goldilocks field)
+    // For an honest row this is a small non-negative integer in [0, 2^20).
+    // For a forged row it wraps to a huge field value outside [0, 2^20).
+
+    let order_field_value = |fini_label: u64, init_epoch: u64| -> u64 {
+        // Replicate the field arithmetic: FE::from(fini_label - 1) - FE::from(init_epoch).
+        // The Goldilocks prime is 2^64 - 2^32 + 1.
+        let result = FE::from(fini_label - 1) - FE::from(init_epoch);
+        *result.value()
+    };
+
+    // Honest: epoch 2 consuming genesis (epoch 0) fini → 2 - 1 - 0 = 1.
+    assert!(order_field_value(2, GENESIS_EPOCH) < (1 << 20));
+
+    // Honest: epoch 5 consuming epoch 2's fini → 5 - 1 - 2 = 2.
+    assert!(order_field_value(5, 2) < (1 << 20));
+
+    // Forged self-reference: init_epoch == fini_epoch → 5 - 1 - 5 = -1 in field.
+    let self_ref = order_field_value(5, 5);
+    assert!(
+        self_ref >= (1 << 20),
+        "self-reference must produce a value outside the IsB20 range (got {self_ref})"
+    );
+
+    // Forged future-reference: init_epoch > fini_epoch → 5 - 1 - 9 < 0 in field.
+    let future_ref = order_field_value(5, 9);
+    assert!(
+        future_ref >= (1 << 20),
+        "future-reference must produce a value outside the IsB20 range (got {future_ref})"
+    );
+}
+
+// =========================================================================
+// Soundness regression tests: Design-Y orphan attack
+// =========================================================================
+
+/// (3) Design-Y orphan attack: MU=0 on a later epoch's L2G row truncates the
+/// cross-epoch chain → the GlobalMemory bus rejects.
+///
+/// Property guarded: setting MU=0 on an L2G row for epoch i+1 silences that
+/// epoch's fini-send on the GlobalMemory bus. If the global finalisation
+/// (program-end anchor) still expects the last fini to come from epoch i+1,
+/// the fini token is never sent → program-end anchor receives a token that
+/// nobody sent → bus imbalance.
+///
+/// Concretely: cell 10 is touched in both epoch 0 (label 1) and epoch 1
+/// (label 2). The forged trace sets MU=0 on epoch 1's L2G row for cell 10.
+/// Epoch 1's fini-send is silenced; the program-end anchor still tries to
+/// receive `(10, 8, 2, 10)` (the last honest fini) — but it was never sent.
+/// Separately, epoch 1's init-receive is also silenced, leaving epoch 0's
+/// fini token (which epoch 1 was supposed to consume) dangling. Both
+/// produce bus imbalances.
+///
+/// Modelled on `test_global_memory_bus_rejects_tampered_boundary` (which
+/// tampers a boundary value) and uses the new
+/// `prove_and_verify_global_with_traces` helper to inject the forged epoch-1
+/// trace. `prove_and_verify` (which generates its own traces) is used for the
+/// baseline check; the forged proof is built via the helper.
+#[test]
+fn test_l2g_design_y_orphan_mu_zero_rejects() {
+    // Cell 10 touched in epoch 0 (label 1, fini value=7, ts=3) and epoch 1
+    // (label 2, fini value=8, ts=10). Cell 20 touched in epoch 0 only.
+    let initial_memory = HashMap::from([(10u64, 5u64)]);
+    let epochs = vec![vec![(10, 7, 3), (20, 9, 4)], vec![(10, 8, 10)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+
+    // Honest baseline on the GlobalMemory bus.
+    assert!(
+        prove_and_verify(&boundaries),
+        "baseline must verify before forgery"
+    );
+
+    // Build honest traces for both epochs.
+    let epoch0_trace = generate_local_to_global_trace(&boundaries[0]);
+    let mut epoch1_trace = generate_local_to_global_trace(&boundaries[1]);
+
+    // Epoch 1 has exactly one real row (cell 10). Forge MU=0 on that row.
+    // This orphans cell 10's cross-epoch chain at epoch 1: the init-receive
+    // (consuming epoch 0's fini token for cell 10) and the fini-send (which
+    // the program-end anchor expects to receive) both fire with multiplicity 0.
+    assert_eq!(
+        boundaries[1].len(),
+        1,
+        "epoch 1 must have exactly one real row"
+    );
+    epoch1_trace
+        .main_table
+        .set(0, local_to_global::cols::MU, FE::zero());
+
+    let mut l2g_traces = vec![epoch0_trace, epoch1_trace];
+
+    // The GlobalMemory bus cannot balance:
+    //   - Epoch 0's fini token for cell 10 was sent (epoch 0's MU=1) but not
+    //     consumed by epoch 1 (epoch 1's init-receive is silenced → MU=0).
+    //   - The program-end anchor tries to receive epoch 1's fini for cell 10
+    //     (the last honest value), but that fini-send is also silenced.
+    assert!(
+        !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
+        "MU=0 on a later epoch's L2G row (Design-Y orphan) must cause the GlobalMemory bus to reject"
+    );
+}
+
+// =========================================================================
+// Soundness regression tests: private-input continuation
+// =========================================================================
+
+/// (4) Private-input continuation: `test_private_input_xpage` spans multiple
+/// epochs and verifies with non-empty private inputs.
+///
+/// Property guarded: the continuation prover correctly handles private-input
+/// pages (which are touched in the first epoch and potentially persist across
+/// epoch boundaries) and the resulting multi-epoch L2G chain verifies end-to-end.
+///
+/// The fixture reads 16 bytes of private input from 0xFF000000, then commits
+/// bytes 4..12 (8 bytes after the 4-byte length prefix). With epoch_size=4
+/// the 11-cycle program spans three epochs: epoch 0 reads the private-input
+/// page (touching 0xFF000000..), epoch 1 performs the commit syscall, epoch 2
+/// halts. The private-input page's L2G entry (epoch 0 fini → epoch 1+ init)
+/// is the cross-epoch link under test.
+///
+/// Modelled on `continuation::tests::test_prove_and_verify_continuation`
+/// (continuation.rs:896) and `prove_elfs_tests::test_prove_private_input_xpage`
+/// (prove_elfs_tests.rs:2649).
+#[test]
+fn test_continuation_private_input_spans_epochs() {
+    let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
+
+    // 16-byte private input: 4-byte length prefix (=16) + 8 bytes of payload
+    // that will be committed + 4 padding bytes (the fixture commits bytes 4..12).
+    let mut input: Vec<u8> = Vec::with_capacity(16);
+    // Length prefix: 16 as little-endian u32.
+    input.extend_from_slice(&16u32.to_le_bytes());
+    // 8-byte payload that will be committed.
+    input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
+    // 4 trailing padding bytes (not committed).
+    input.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x00]);
+    assert_eq!(input.len(), 16);
+
+    let result = crate::continuation::prove_and_verify_continuation(
+        &elf_bytes,
+        &input,
+        4,
+        &ProofOptions::default_test_options(),
+    );
+
+    // The continuation must prove and verify without error.
+    let output = result.expect("prove_and_verify_continuation must not error");
+
+    // The fixture commits bytes 4..12 of private input (the 8-byte payload).
+    assert_eq!(
+        output.as_deref(),
+        Some(&input[4..12]),
+        "committed output must equal private input bytes 4..12"
+    );
+}
+
 #[test]
 fn test_local_memory_bus_balances() {
     // For each touched byte, L2G's init-receive (ts=0) + fini-send cancel the

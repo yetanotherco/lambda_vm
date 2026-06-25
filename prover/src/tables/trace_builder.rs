@@ -189,7 +189,12 @@ impl RegisterState {
         }
         Self {
             regs,
-            index_register: (init.get(&508).copied().unwrap_or(0), 1),
+            index_register: (
+                init.get(&register::register_base_address(254))
+                    .copied()
+                    .unwrap_or(0),
+                1,
+            ),
             pc_register: (word(510) | (word(511) << 32), 1),
         }
     }
@@ -1069,8 +1074,15 @@ fn collect_commit_memw_ops(
         let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
         let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, 508, new_value, ts, 1, true)
-            .with_old(old_value, old_timestamps);
+        let memw_op = MemwOperation::new(
+            true,
+            register::register_base_address(254),
+            new_value,
+            ts,
+            1,
+            true,
+        )
+        .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write_index(new_index, ts);
     }

@@ -1096,8 +1096,30 @@ mod tests {
     // The bundle's `boundary` field is used only to rebuild the global AIRs' touched-
     // PAGE set (genesis is recomputed from the ELF). The cross-epoch memory values
     // live in the committed L2G traces, tied to the epoch proofs by
-    // `verify_l2g_commitment_binding` (exercised by the reorder test). Tampering a
-    // boundary value is therefore inconsequential; omitting/adding a touched page is
-    // caught by the GlobalMemory bus (unmatched fini / air count mismatch). So there
-    // is no meaningful "tamper a boundary value" negative test.
+    // `verify_l2g_commitment_binding` (exercised by test_split_verify_rejects_tampered_l2g_root
+    // below). Tampering a boundary value is therefore inconsequential; omitting/adding
+    // a touched page is caught by the GlobalMemory bus (unmatched fini / air count
+    // mismatch). So there is no meaningful "tamper a boundary value" negative test.
+
+    // Negative: corrupting an epoch's claimed L2G table root must be rejected —
+    // `verify_l2g_commitment_binding` compares each epoch's `l2g_root` against the
+    // corresponding sub-proof root in the global proof, so a mismatched root causes
+    // the binding to fail. Guards the L2G root↔global commitment binding.
+    #[test]
+    fn test_split_verify_rejects_tampered_l2g_root() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need multiple epochs to exercise the binding"
+        );
+        bundle.epochs[0].l2g_root[0] ^= 0xFF;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
+    }
 }

@@ -22,7 +22,8 @@
 //! | init_epoch | Epoch | Genesis sentinel (always `GENESIS_EPOCH`) |
 //! | fini | Byte | Value after the last touching epoch |
 //! | fini_epoch | Epoch | Last touching epoch (`GENESIS_EPOCH` if untouched) |
-//! | fini_timestamp | DWordWL | Last access timestamp (0 if untouched) |
+//! | fini_timestamp_lo | Word | Last access timestamp low word (0 if untouched) |
+//! | fini_timestamp_hi | Word | Last access timestamp high word (0 if untouched) |
 //!
 //! Virtual: `address = page_base + offset`, `page_base` constant per instance.
 //!
