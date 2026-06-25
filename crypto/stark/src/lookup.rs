@@ -1786,6 +1786,31 @@ fn logup_multiplicity<CB: ConstraintBuilder>(
     multiplicity.evaluate_with(|col| cb.main(col).clone())
 }
 
+/// Batched-pair LogUp residual for two interactions sharing aux column
+/// `term_column_idx`: `c·fp_a·fp_b − sign_a·m_a·fp_b − sign_b·m_b·fp_a`. Builder
+/// analogue of `LookupBatchedTermConstraint::evaluate` (degree 3).
+fn logup_batched_term<CB: ConstraintBuilder>(
+    cb: &CB,
+    ctx: &ConstraintContext<CB::F, CB::E>,
+    interaction_a: &BusInteraction,
+    interaction_b: &BusInteraction,
+    term_column_idx: usize,
+) -> FieldElement<CB::E> {
+    let c = cb.aux(term_column_idx);
+    let m_a = logup_multiplicity(cb, &interaction_a.multiplicity);
+    let m_b = logup_multiplicity(cb, &interaction_b.multiplicity);
+    let fp_a = logup_fingerprint(cb, interaction_a, ctx);
+    let fp_b = logup_fingerprint(cb, interaction_b, ctx);
+
+    let term_a = m_a * &fp_b;
+    let term_a = if interaction_a.is_sender { term_a } else { -term_a };
+    let term_b = m_b * &fp_a;
+    let term_b = if interaction_b.is_sender { term_b } else { -term_b };
+
+    c * &fp_a * &fp_b - term_a - term_b
+}
+
+
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
 /// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
@@ -2137,5 +2162,64 @@ mod logup_builder_tests {
 
         assert_eq!(logup_fingerprint(&cb, &interaction, &ctx), fp_ref);
         assert_eq!(logup_multiplicity(&cb, &interaction.multiplicity), m_ref);
+    }
+
+    /// The builder-based logup_batched_term must equal the existing boxed
+    /// LookupBatchedTermConstraint::evaluate for the same row data.
+    #[test]
+    fn builder_batched_term_matches_boxed_constraint() {
+        use crate::constraints::transition::TransitionConstraintEvaluator;
+        use crate::frame::Frame;
+
+        let main_row = [fe(7), fe(11), fe(13), fe(17)];
+        let aux_row = [fe(23)];
+        let main_columns: Vec<Vec<FieldElement<F>>> =
+            main_row.iter().map(|v| vec![v.clone()]).collect();
+        let aux_columns: Vec<Vec<FieldElement<F>>> =
+            aux_row.iter().map(|v| vec![v.clone()]).collect();
+        let lde = LDETraceTable::<F, F>::from_columns(main_columns, aux_columns, 1, 1);
+
+        let interaction_a =
+            BusInteraction::sender(3u64, Multiplicity::Column(0), Packing::Direct.columns(&[1]));
+        let interaction_b =
+            BusInteraction::receiver(4u64, Multiplicity::Column(2), Packing::Direct.columns(&[3]));
+        let term_col = 0;
+
+        let z = fe(99);
+        let alpha = fe(5);
+        let alpha_powers = compute_alpha_powers(&alpha, 8);
+        let shifts = PackingShifts::<F>::new();
+        let zero = fe(0);
+        let rap = [z.clone()];
+
+        let zerofier = ZerofierEvaluations::<F> {
+            groups: vec![vec![fe(1)]],
+            constraint_to_group: vec![0],
+        };
+        let coeffs = [fe(1)];
+        let cb = ProverConstraintBuilder::<F, F>::new(&lde, 0, &zerofier, &coeffs);
+        let ctx = ConstraintContext {
+            rap_challenges: &rap,
+            logup_alpha_powers: &alpha_powers,
+            logup_table_offset: &zero,
+            packing_shifts: &shifts,
+            periodic: &[],
+        };
+        let got = logup_batched_term(&cb, &ctx, &interaction_a, &interaction_b, term_col);
+
+        let constraint = LookupBatchedTermConstraint::new(
+            interaction_a.clone(),
+            interaction_b.clone(),
+            term_col,
+            0,
+        );
+        let step = TableView::<F, F>::new(vec![main_row.to_vec()], vec![aux_row.to_vec()]);
+        let frame = Frame::<F, F>::new(vec![step]);
+        let ctx_old =
+            TransitionEvaluationContext::new_prover(&frame, &[], &rap, &alpha_powers, &zero, &shifts);
+        let mut evals = [fe(0)];
+        constraint.evaluate_verifier(&ctx_old, &mut evals);
+
+        assert_eq!(got, evals[0]);
     }
 }
