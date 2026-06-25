@@ -39,7 +39,6 @@ use std::collections::HashMap;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-use executor::vm::logs::Log;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
@@ -50,14 +49,12 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::paged_mem::PagedMem;
 use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
 use crate::tables::trace_builder::{
     Traces, build_init_page_data, build_initial_image, build_initial_image_paged,
-    epoch_touched_cells,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
@@ -220,12 +217,9 @@ fn global_memory_configs(
         .collect()
 }
 
-/// Per-epoch starting state: the memory image and register image the epoch begins from.
-/// `image` is borrowed from the persistent cross-epoch image (init = previous fini), so
-/// it is not re-snapshotted or cloned per epoch.
+/// Per-epoch register state and label.
 struct EpochStart<'a> {
-    image: &'a PagedMem<u8>,
-    register_init: HashMap<u64, u32>,
+    register_init: &'a HashMap<u64, u32>,
     is_first: bool,
     /// This epoch's 1-based table label (the `fini_epoch` constant).
     label: u64,
@@ -331,25 +325,11 @@ fn prove_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
     start: &EpochStart,
-    logs: &[Log],
+    mut traces: Traces,
     is_final: bool,
     boundary: &[CellBoundary],
-    private_inputs: &[u8],
     opts: &ProofOptions,
 ) -> Result<EpochProof, Error> {
-    let mut traces = Traces::from_image_and_logs(
-        elf,
-        start.image,
-        &start.register_init,
-        logs,
-        &MaxRowsConfig::default(),
-        private_inputs,
-        is_final,
-        true,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )?;
-
     // Use the cross-epoch boundary so this epoch's L2G table is identical to the
     // one the global proof commits (the commitment binding compares their roots).
     traces.local_to_global = local_to_global::generate_local_to_global_trace(boundary);
@@ -386,7 +366,7 @@ fn prove_epoch(
         opts,
         &[],
         &table_counts,
-        &start.register_init,
+        start.register_init,
         &reg_fini,
         start.is_first,
         is_final,
@@ -689,25 +669,27 @@ pub fn prove_continuation(
         );
 
         let label = local_to_global::epoch_label(index);
-        let touched = epoch_touched_cells(&elf, &image, &register_init, &logs)?;
-        let boundary = local_to_global::epoch_boundary(&mut provenance, label, &touched);
+        let traces = Traces::from_image_and_logs(
+            &elf,
+            &image,
+            &register_init,
+            &logs,
+            &MaxRowsConfig::default(),
+            private_inputs,
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )?;
+        let boundary =
+            local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
 
         let start = EpochStart {
-            image: &image,
-            register_init,
+            register_init: &register_init,
             is_first: index == 0,
             label,
         };
-        let epoch = prove_epoch(
-            &elf,
-            elf_bytes,
-            &start,
-            &logs,
-            is_final,
-            &boundary,
-            private_inputs,
-            opts,
-        )?;
+        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
