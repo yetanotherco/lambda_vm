@@ -5,7 +5,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        builder::{ConstraintBuilder, ConstraintContext},
+        builder::{
+            ConstraintBuilder, ConstraintContext, ProverConstraintBuilder, TableConstraints,
+            VerifierConstraintBuilder,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -1006,6 +1009,38 @@ impl<
     }
 }
 
+impl<F, E, B, PI> crate::constraints::builder::TableConstraints<F, E> for AirWithBuses<F, E, B, PI>
+where
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI: Send + Sync,
+{
+    fn eval_prover(
+        &self,
+        cb: &mut ProverConstraintBuilder<F, E>,
+        ctx: &ConstraintContext<F, E>,
+    ) {
+        debug_assert_eq!(
+            self.num_base_constraints, 0,
+            "AirWithBuses TableConstraints handles LogUp-only tables"
+        );
+        logup_eval(cb, ctx, &self.auxiliary_trace_build_data.interactions);
+    }
+
+    fn eval_verifier(
+        &self,
+        cb: &mut VerifierConstraintBuilder<E>,
+        ctx: &ConstraintContext<E, E>,
+    ) {
+        debug_assert_eq!(
+            self.num_base_constraints, 0,
+            "AirWithBuses TableConstraints handles LogUp-only tables"
+        );
+        logup_eval(cb, ctx, &self.auxiliary_trace_build_data.interactions);
+    }
+}
+
 impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
@@ -1076,6 +1111,19 @@ where
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
     }
+
+    fn table_constraints(
+        &self,
+    ) -> Option<&dyn crate::constraints::builder::TableConstraints<Self::Field, Self::FieldExtension>>
+    {
+        // Only LogUp-only tables (no domain constraints) are migrated so far.
+        if self.num_base_constraints == 0 {
+            Some(self)
+        } else {
+            None
+        }
+    }
+
 
     fn build_auxiliary_trace(
         &self,

@@ -10,7 +10,7 @@ use math::{
 };
 
 use crate::{
-    constraints::transition::TransitionConstraintEvaluator,
+    constraints::{builder::TableConstraints, transition::TransitionConstraintEvaluator},
     domain::Domain,
     lookup::{BusPublicInputs, PackingShifts},
 };
@@ -349,5 +349,15 @@ pub trait AIR: Send + Sync {
             groups,
             constraint_to_group,
         }
+    }
+
+    /// Object-safe access to this table's monomorphized constraint eval (the
+    /// `ConstraintBuilder` path), if it has been migrated off the boxed
+    /// `TransitionConstraintEvaluator` path. Default `None` → use the boxed path.
+    /// Used by the prover/verifier behind the constraint-builder flag.
+    fn table_constraints(
+        &self,
+    ) -> Option<&dyn TableConstraints<Self::Field, Self::FieldExtension>> {
+        None
     }
 }
