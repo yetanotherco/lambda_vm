@@ -136,14 +136,19 @@ compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 compile-programs: compile-programs-asm compile-programs-rust compile-bench
 
 
+$(RUST_ARTIFACTS_DIR):
+	mkdir -p $@
+
+$(BENCH_ARTIFACTS_DIR):
+	mkdir -p $@
+
 # Compile rust (64-bit)
 # Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
 # first (the aggregate compile-programs-rust/compile-bench targets already do, but a
 # bare pattern-rule invocation like `make -B .../ethrex.elf` would otherwise skip it
 # and fail to compile guest C dependencies). Order-only because prepare-sysroot is
 # .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
-$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
-	@mkdir -p $(RUST_ARTIFACTS_DIR)
+$(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot $(RUST_ARTIFACTS_DIR)
 	cd $(RUST_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
@@ -155,8 +160,7 @@ $(RUST_ARTIFACTS_DIR)/%.elf: $(RUST_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
 # Compile rust benches (64-bit)
-$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot
-	@mkdir -p $(BENCH_ARTIFACTS_DIR)
+$(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 	cd $(BENCH_PROGRAMS_DIR)/$* && \
 		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
