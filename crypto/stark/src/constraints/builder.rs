@@ -17,6 +17,7 @@
 //! up exactly with today's indexing.
 
 use crate::constraints::row_view::RowView;
+use crate::frame::Frame;
 use crate::trace::LDETraceTable;
 use crate::traits::ZerofierEvaluations;
 use math::field::{
@@ -102,9 +103,87 @@ where
     }
 }
 
+/// Folds a table's constraints at the out-of-domain point `z` (verifier side).
+///
+/// Same fold as [`ProverConstraintBuilder`], but the residuals are evaluated at `z`
+/// (all in the extension field), the zerofier per constraint is the single
+/// inverse-zerofier value `evaluate_zerofier(z)` (not an LDE vector), and the row
+/// source is the OOD trace-evaluation frame (`into_frame`): step 0 holds the `z`
+/// evaluations, step 1 the `z·g` (next-row) evaluations.
+pub struct VerifierConstraintBuilder<'a, E: IsField> {
+    frame: &'a Frame<E, E>,
+    zerofiers_z: &'a [FieldElement<E>],
+    coeffs: &'a [FieldElement<E>],
+    acc: FieldElement<E>,
+    idx: usize,
+}
+
+impl<'a, E: IsField> VerifierConstraintBuilder<'a, E> {
+    /// `zerofiers_z[c]` is the inverse-zerofier at `z` for constraint `c` (the
+    /// verifier's `evaluate_zerofier` result), indexed by `constraint_idx`.
+    pub fn new(
+        frame: &'a Frame<E, E>,
+        zerofiers_z: &'a [FieldElement<E>],
+        coeffs: &'a [FieldElement<E>],
+    ) -> Self {
+        Self {
+            frame,
+            zerofiers_z,
+            coeffs,
+            acc: FieldElement::<E>::zero(),
+            idx: 0,
+        }
+    }
+
+    /// Current-row (`z`) main cell.
+    #[inline]
+    pub fn main(&self, col: usize) -> &FieldElement<E> {
+        self.frame
+            .get_evaluation_step(0)
+            .get_main_evaluation_element(0, col)
+    }
+
+    /// Current-row (`z`) aux cell.
+    #[inline]
+    pub fn aux(&self, col: usize) -> &FieldElement<E> {
+        self.frame
+            .get_evaluation_step(0)
+            .get_aux_evaluation_element(0, col)
+    }
+
+    /// Next-row (`z·g`) aux cell — only the LogUp running-sum constraint needs this.
+    #[inline]
+    pub fn aux_next(&self, col: usize) -> &FieldElement<E> {
+        self.frame
+            .get_evaluation_step(1)
+            .get_aux_evaluation_element(0, col)
+    }
+
+    /// Fold a domain residual at `z`: `acc += zerofier_z[idx] · residual · coeff[idx]`,
+    /// then advance the index. Mirrors `verifier.rs`'s `beta * eval * denominator`.
+    pub fn fold(&mut self, residual: FieldElement<E>) {
+        let term = &self.zerofiers_z[self.idx] * &residual * &self.coeffs[self.idx];
+        self.acc = &self.acc + &term;
+        self.idx += 1;
+    }
+
+    /// Fold a LogUp residual at `z`. Same fold as [`fold`](Self::fold).
+    pub fn fold_ext(&mut self, residual: FieldElement<E>) {
+        let term = &self.zerofiers_z[self.idx] * &residual * &self.coeffs[self.idx];
+        self.acc = &self.acc + &term;
+        self.idx += 1;
+    }
+
+    /// Consume the folder and return the accumulated transition value at `z`.
+    pub fn finish(self) -> FieldElement<E> {
+        self.acc
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::table::TableView;
     use math::field::goldilocks::GoldilocksField;
 
     type F = GoldilocksField;
@@ -177,5 +256,43 @@ mod tests {
         assert_eq!(cb.main(0), &fe(1));
         assert_eq!(cb.aux(0), &fe(101));
         assert_eq!(cb.aux_next(0), &fe(103));
+    }
+
+    /// Verifier folder accumulates Σ zerofier_z[idx]·residual·coeff[idx], the same
+    /// combination `verifier.rs` computes (`beta * eval * denominator`).
+    #[test]
+    fn verifier_folds_zerofier_coeff_residual() {
+        let frame = Frame::<F, F>::preallocate(2, 1, 1, 1);
+        let zerofiers_z = [fe(2), fe(3), fe(5)];
+        let coeffs = [fe(100), fe(200), fe(300)];
+        let r0 = fe(9);
+        let r1 = fe(8);
+        let r2 = fe(6);
+
+        let mut cb = VerifierConstraintBuilder::<F>::new(&frame, &zerofiers_z, &coeffs);
+        cb.fold(r0.clone());
+        cb.fold(r1.clone());
+        cb.fold_ext(r2.clone());
+        let got = cb.finish();
+
+        let expected = &zerofiers_z[0] * &r0 * &coeffs[0]
+            + &zerofiers_z[1] * &r1 * &coeffs[1]
+            + &zerofiers_z[2] * &r2 * &coeffs[2];
+        assert_eq!(got, expected);
+    }
+
+    /// `main`/`aux` read step 0 (`z`); `aux_next` reads step 1 (`z·g`).
+    #[test]
+    fn verifier_accessors_read_z_and_next_row() {
+        let step0 = TableView::new(vec![vec![fe(10)]], vec![vec![fe(20)]]);
+        let step1 = TableView::new(vec![vec![fe(0)]], vec![vec![fe(21)]]);
+        let frame = Frame::new(vec![step0, step1]);
+        let zerofiers_z = [fe(1)];
+        let coeffs = [fe(1)];
+
+        let cb = VerifierConstraintBuilder::<F>::new(&frame, &zerofiers_z, &coeffs);
+        assert_eq!(cb.main(0), &fe(10));
+        assert_eq!(cb.aux(0), &fe(20));
+        assert_eq!(cb.aux_next(0), &fe(21));
     }
 }
