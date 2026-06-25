@@ -306,8 +306,9 @@ fn launch_keccak_base_row_major(
 ///
 /// Input: `row_major` is a flat `n * m` slice in row-major order.
 /// Returns (merkle_nodes, GpuLdeBase handle, row-major LDE Vec).
-/// No CPU-side column extraction or transpose — single H2D, row-major
-/// throughout, single D2H.
+/// Single H2D, row-major NTT, single D2H — no CPU-side extract or transpose.
+/// The returned handle is column-major (as required by downstream GPU kernels):
+/// after D2H, `buf` is transposed on-device to column-major for the handle.
 pub fn coset_lde_row_major_with_merkle_tree_keep(
     row_major: &[u64],
     n: usize,
@@ -373,7 +374,9 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
 
-    // D2H: single contiguous copy of the row-major LDE.
+    // D2H: single contiguous copy of the row-major LDE output.
+    // Do this BEFORE transposing buf to column-major so we get the row-major
+    // data without an extra copy.
     let staging_slot = be.pinned_staging();
     let mut staging = staging_slot.lock().unwrap();
     staging.ensure_capacity(lde_size * m, &be.ctx)?;
@@ -386,7 +389,37 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     let lde_out = pinned[..lde_size * m].to_vec();
     drop(staging);
 
-    let handle = GpuLdeBase { buf: Arc::new(buf), m, lde_size };
+    // Transpose buf row-major (lde_size × m) → column-major (m cols × lde_size)
+    // for the GpuLdeBase handle. Downstream GPU kernels (DEEP, barycentric) read
+    // buf[c * lde_size + r], which is column-major with stride lde_size.
+    // matrix_transpose_strided(src, dst, rows=lde_size, cols=m, out_stride=lde_size)
+    // writes dst[c * lde_size + r] = src[r * m + c]. Use a fresh allocation so
+    // the row-major buf (already D2H'd) and column-major handle don't alias.
+    let mut col_major_dev = stream.alloc_zeros::<u64>(lde_size * m)?;
+    {
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m as u32).div_ceil(32),
+                (lde_size as u32).div_ceil(32).min(65535),
+                1,
+            ),
+            block_dim: (32, 32, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.matrix_transpose_strided)
+                .arg(&buf)
+                .arg(&mut col_major_dev)
+                .arg(&(lde_size as u32))
+                .arg(&(m as u32))
+                .arg(&lde_u64)
+                .launch(cfg)?;
+        }
+        stream.synchronize()?;
+    }
+
+    let handle = GpuLdeBase { buf: Arc::new(col_major_dev), m, lde_size };
     Ok((nodes_out, handle, lde_out))
 }
 

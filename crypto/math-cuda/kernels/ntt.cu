@@ -369,3 +369,45 @@ extern "C" __global__ void pointwise_mul_row_major(uint64_t *data,
     for (uint64_t row = blockIdx.y; row < n; row += gridDim.y)
         data[row * m + col] = mul(data[row * m + col], weights[row]);
 }
+
+// ── Row-major → column-major transpose (for GpuLdeBase handle) ───────────────
+//
+// Converts the row-major LDE output to the column-major layout that downstream
+// GPU kernels (DEEP, barycentric) require for the device handle.
+//
+// src[r * cols + c]  →  dst[c * out_stride + r]
+//
+// Grid: gridDim.x = ceil(cols/32), gridDim.y = min(ceil(rows/32), 65535).
+// Grid-strides over row tiles so all rows are covered when rows > 65535*32.
+
+#define MTILE 32
+#define MTILE_P (MTILE + 1)
+
+extern "C" __global__ void matrix_transpose_strided(
+    const uint64_t *__restrict__ src,
+    uint64_t *__restrict__ dst,
+    uint32_t rows,
+    uint32_t cols,
+    uint64_t out_stride)
+{
+    __shared__ uint64_t tile[MTILE][MTILE_P];
+
+    for (uint32_t row_base = blockIdx.y * MTILE; row_base < rows;
+         row_base += gridDim.y * MTILE) {
+        uint32_t x = blockIdx.x * MTILE + threadIdx.x;
+        uint32_t y = row_base + threadIdx.y;
+
+        if (x < cols && y < rows)
+            tile[threadIdx.y][threadIdx.x] = src[(uint64_t)y * cols + x];
+
+        __syncthreads();
+
+        uint32_t tx = row_base + threadIdx.x;
+        uint32_t ty = blockIdx.x * MTILE + threadIdx.y;
+
+        if (tx < rows && ty < cols)
+            dst[(uint64_t)ty * out_stride + tx] = tile[threadIdx.x][threadIdx.y];
+
+        __syncthreads();
+    }
+}

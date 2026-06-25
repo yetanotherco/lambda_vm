@@ -144,6 +144,7 @@ pub struct Backend {
     pub bit_reverse_row_major: CudaFunction,
     pub ntt_dit_level_row_major: CudaFunction,
     pub pointwise_mul_row_major: CudaFunction,
+    pub matrix_transpose_strided: CudaFunction,
 
     // keccak.ptx
     pub keccak256_leaves_base_row_major: CudaFunction,
@@ -245,6 +246,7 @@ impl Backend {
             bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
             ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
+            matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major: keccak.load_function("keccak256_leaves_base_row_major")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
