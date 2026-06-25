@@ -1,11 +1,15 @@
 //! GPU barycentric kernels (`barycentric_base` / `barycentric_ext3`) must produce
 //! the same OOD evaluation as the CPU formula in `get_trace_evaluations_from_lde`
 //! (`interpolate_coset_eval_ext_with_g_n_inv`). Covers base field and ext3.
+//!
+//! Note: `barycentric_ext3` expects the pre-strided input in component-major layout
+//! (`[all-a, all-b, all-c]`), not interleaved. Passing interleaved data produces
+//! wrong results without any error — the test catches this silently.
 
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 use math::field::goldilocks::GoldilocksField;
-use math::field::traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf};
+use math::field::traits::{IsFFTField, IsPrimeField};
 use math::polynomial::barycentric_inv_denoms;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -27,9 +31,9 @@ fn coset_points(n: usize, coset_offset: u64) -> Vec<Fp> {
     let omega = GoldilocksField::get_primitive_root_of_unity(log_n).unwrap();
     let g = Fp::from_raw(coset_offset);
     let mut pts = Vec::with_capacity(n);
-    let mut cur = g.clone();
+    let mut cur = g;
     for _ in 0..n {
-        pts.push(cur.clone());
+        pts.push(cur);
         cur = &cur * &omega;
     }
     pts
@@ -53,10 +57,8 @@ fn cpu_barycentric_base(
     let g_n_inv = g_n.inv().unwrap();
     let z_pow_n = z.pow(n as u64);
 
-    let inv_denoms = barycentric_inv_denoms::<GoldilocksField, Degree3GoldilocksExtensionField>(
-        z,
-        coset_pts,
-    );
+    let inv_denoms =
+        barycentric_inv_denoms::<GoldilocksField, Degree3GoldilocksExtensionField>(z, coset_pts);
 
     let col_scale: Vec<Fp3> = coset_pts
         .iter()
@@ -86,7 +88,6 @@ fn gpu_barycentric_base(
     coset_offset: &Fp,
 ) -> Fp3 {
     let n = coset_pts.len();
-    let lde_size = lde_col.len();
 
     let n_inv = Fp::from(n as u64).inv().unwrap();
     let g_n = coset_offset.pow(n as u64);
@@ -177,10 +178,8 @@ fn cpu_barycentric_ext3(
     let g_n_inv = g_n.inv().unwrap();
     let z_pow_n = z.pow(n as u64);
 
-    let inv_denoms = barycentric_inv_denoms::<GoldilocksField, Degree3GoldilocksExtensionField>(
-        z,
-        coset_pts,
-    );
+    let inv_denoms =
+        barycentric_inv_denoms::<GoldilocksField, Degree3GoldilocksExtensionField>(z, coset_pts);
 
     let col_scale: Vec<Fp3> = coset_pts
         .iter()
@@ -239,9 +238,8 @@ fn gpu_barycentric_ext3(
         pre_strided[2 * n + i] = *e.value()[2].value();
     }
 
-    let raw =
-        math_cuda::barycentric::barycentric_ext3(&pre_strided, n, &pts_u64, &inv_u64, n, 1)
-            .expect("GPU barycentric_ext3");
+    let raw = math_cuda::barycentric::barycentric_ext3(&pre_strided, n, &pts_u64, &inv_u64, n, 1)
+        .expect("GPU barycentric_ext3");
 
     let s = Fp3::new([
         Fp::from_raw(raw[0]),

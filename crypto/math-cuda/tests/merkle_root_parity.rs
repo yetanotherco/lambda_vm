@@ -1,6 +1,12 @@
 //! GPU LDE + GPU Keccak leaf hash + GPU Merkle tree must produce the same root
 //! as the CPU row-major LDE path (`coset_lde_full_expand_row_major` +
 //! `commit_rows_bit_reversed`). Covers base field (main trace) and ext3 (aux trace).
+//!
+//! Two non-obvious layout details caught while writing these tests:
+//! - `build_merkle_tree_on_device` stores the tree top-down: root at `nodes[0..32]`,
+//!   leaves in the tail (not the end).
+//! - `keccak_leaves_ext3` expects component-major layout `[all-a, all-b, all-c]`,
+//!   not the interleaved `[a,b,c per element]` that `coset_lde_batch_ext3_into` produces.
 
 use math::fft::two_half_fft::TwoHalfTwiddles;
 use math::field::element::FieldElement;
@@ -21,25 +27,22 @@ fn coset_weights(n: usize, g: u64) -> Vec<Fp> {
     let mut w = Vec::with_capacity(n);
     let mut cur = inv_n;
     for _ in 0..n {
-        w.push(cur.clone());
+        w.push(cur);
         cur = &cur * &g_fp;
     }
     w
 }
 
 fn coset_weights_u64(n: usize, g: u64) -> Vec<u64> {
-    coset_weights(n, g)
-        .iter()
-        .map(|w| *w.value())
-        .collect()
+    coset_weights(n, g).iter().map(|w| *w.value()).collect()
 }
 
 /// Run GPU batch LDE + GPU Keccak leaf hashing + GPU Merkle tree build.
 /// Returns the 32-byte root extracted from the node array.
 fn gpu_merkle_root(columns: &[Vec<u64>], blowup: usize, weights: &[u64]) -> [u8; 32] {
     let col_slices: Vec<&[u64]> = columns.iter().map(|c| c.as_slice()).collect();
-    let lde_columns = math_cuda::lde::coset_lde_batch_base(&col_slices, blowup, weights)
-        .expect("GPU batch LDE");
+    let lde_columns =
+        math_cuda::lde::coset_lde_batch_base(&col_slices, blowup, weights).expect("GPU batch LDE");
 
     let n_lde = lde_columns[0].len();
     let num_cols = lde_columns.len();
@@ -52,11 +55,10 @@ fn gpu_merkle_root(columns: &[Vec<u64>], blowup: usize, weights: &[u64]) -> [u8;
         }
     }
 
-    let gpu_leaves =
-        math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde)
-            .expect("GPU keccak leaves");
-    let nodes = math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves)
-        .expect("GPU Merkle tree");
+    let gpu_leaves = math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde)
+        .expect("GPU keccak leaves");
+    let nodes =
+        math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");
 
     // `build_merkle_tree_on_device` places the root at index 0 (the leaves
     // live in the tail), so the root is the first 32 bytes of the node array.
@@ -86,19 +88,13 @@ fn cpu_row_major_merkle_root(
     }
 
     Polynomial::<Fp>::coset_lde_full_expand_row_major::<GoldilocksField>(
-        &mut buf,
-        num_cols,
-        blowup,
-        weights,
-        inv_tw,
-        fwd_tw,
+        &mut buf, num_cols, blowup, weights, inv_tw, fwd_tw,
     )
     .expect("CPU row-major LDE");
 
-    let (_, root) = Prover::<GoldilocksField, GoldilocksField, ()>::commit_rows_bit_reversed(
-        &buf, num_cols,
-    )
-    .expect("CPU commit");
+    let (_, root) =
+        Prover::<GoldilocksField, GoldilocksField, ()>::commit_rows_bit_reversed(&buf, num_cols)
+            .expect("CPU commit");
 
     root
 }
@@ -112,9 +108,8 @@ fn gpu_and_cpu_row_major_merkle_roots_match() {
             for num_cols in [1usize, 3, 8] {
                 let n = 1usize << log_n;
                 let log_lde = (n * blowup).trailing_zeros() as usize;
-                let mut rng = ChaCha8Rng::seed_from_u64(
-                    (log_n * 1000 + blowup * 100 + num_cols) as u64,
-                );
+                let mut rng =
+                    ChaCha8Rng::seed_from_u64((log_n * 1000 + blowup * 100 + num_cols) as u64);
 
                 let columns: Vec<Vec<u64>> = (0..num_cols)
                     .map(|_| (0..n).map(|_| rng.r#gen::<u64>()).collect())
@@ -122,23 +117,17 @@ fn gpu_and_cpu_row_major_merkle_roots_match() {
 
                 let weights_u64 = coset_weights_u64(n, COSET_OFFSET);
                 let weights_fp = coset_weights(n, COSET_OFFSET);
-                let inv_tw = TwoHalfTwiddles::<GoldilocksField>::new(log_n, true)
-                    .expect("inv twiddles");
-                let fwd_tw = TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false)
-                    .expect("fwd twiddles");
+                let inv_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_n, true).expect("inv twiddles");
+                let fwd_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
                 let gpu_root = gpu_merkle_root(&columns, blowup, &weights_u64);
-                let cpu_root = cpu_row_major_merkle_root(
-                    &columns,
-                    blowup,
-                    &weights_fp,
-                    &inv_tw,
-                    &fwd_tw,
-                );
+                let cpu_root =
+                    cpu_row_major_merkle_root(&columns, blowup, &weights_fp, &inv_tw, &fwd_tw);
 
                 assert_eq!(
-                    gpu_root,
-                    cpu_root,
+                    gpu_root, cpu_root,
                     "root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
                 );
             }
@@ -164,18 +153,6 @@ fn ext3_to_u64s(col: &[Fp3]) -> Vec<u64> {
         out.push(*e.value()[2].value());
     }
     out
-}
-
-fn u64s_to_ext3(flat: &[u64]) -> Vec<Fp3> {
-    flat.chunks_exact(3)
-        .map(|c| {
-            Fp3::new([
-                FieldElement::<GoldilocksField>::from_raw(c[0]),
-                FieldElement::<GoldilocksField>::from_raw(c[1]),
-                FieldElement::<GoldilocksField>::from_raw(c[2]),
-            ])
-        })
-        .collect()
 }
 
 /// GPU ext3 LDE + Keccak leaf hash + Merkle tree → root.
@@ -215,8 +192,8 @@ fn gpu_ext3_merkle_root(columns: &[Vec<Fp3>], blowup: usize, weights: &[u64]) ->
     let gpu_leaves =
         math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size)
             .expect("GPU ext3 keccak leaves");
-    let nodes = math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves)
-        .expect("GPU Merkle tree");
+    let nodes =
+        math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");
 
     let mut root = [0u8; 32];
     root.copy_from_slice(&nodes[0..32]);
@@ -237,17 +214,12 @@ fn cpu_ext3_row_major_merkle_root(
     let mut buf: Vec<Fp3> = vec![Fp3::from(0u64); n * num_cols];
     for (c, col) in columns.iter().enumerate() {
         for (r, v) in col.iter().enumerate() {
-            buf[r * num_cols + c] = v.clone();
+            buf[r * num_cols + c] = *v;
         }
     }
 
     Polynomial::<Fp3>::coset_lde_full_expand_row_major::<GoldilocksField>(
-        &mut buf,
-        num_cols,
-        blowup,
-        weights,
-        inv_tw,
-        fwd_tw,
+        &mut buf, num_cols, blowup, weights, inv_tw, fwd_tw,
     )
     .expect("CPU ext3 row-major LDE");
 
@@ -285,17 +257,11 @@ fn gpu_and_cpu_ext3_merkle_roots_match() {
                     TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
                 let gpu_root = gpu_ext3_merkle_root(&columns, blowup, &weights_u64);
-                let cpu_root = cpu_ext3_row_major_merkle_root(
-                    &columns,
-                    blowup,
-                    &weights_fp,
-                    &inv_tw,
-                    &fwd_tw,
-                );
+                let cpu_root =
+                    cpu_ext3_row_major_merkle_root(&columns, blowup, &weights_fp, &inv_tw, &fwd_tw);
 
                 assert_eq!(
-                    gpu_root,
-                    cpu_root,
+                    gpu_root, cpu_root,
                     "ext3 root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
                 );
             }

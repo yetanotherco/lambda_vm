@@ -219,8 +219,12 @@ fn launch_pointwise_mul_batched(
 // ── Row-major NTT helpers ────────────────────────────────────────────────────
 
 fn launch_bit_reverse_row_major(
-    stream: &CudaStream, be: &Backend,
-    buf: &mut CudaSlice<u64>, n: u64, log_n: u64, m: u64,
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    m: u64,
 ) -> Result<()> {
     let cfg = LaunchConfig {
         grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
@@ -228,42 +232,24 @@ fn launch_bit_reverse_row_major(
         shared_mem_bytes: 0,
     };
     unsafe {
-        stream.launch_builder(&be.bit_reverse_row_major)
-            .arg(buf).arg(&n).arg(&log_n).arg(&m).launch(cfg)?;
-    }
-    Ok(())
-}
-
-/// Run one batched NTT level on row-major data.
-/// blockDim = (COL_TILE, ROW_TILE, 1) where COL_TILE * ROW_TILE = 256.
-fn launch_ntt_dit_level_row_major(
-    stream: &CudaStream, be: &Backend,
-    buf: &mut CudaSlice<u64>, tw: &CudaSlice<u64>,
-    n: u64, log_n: u64, level: u64, m: u64,
-) -> Result<()> {
-    let col_tile: u32 = 32.min(m as u32);
-    let row_tile: u32 = (256 / col_tile).max(1);
-    let cfg = LaunchConfig {
-        grid_dim: (
-            (m as u32).div_ceil(col_tile),
-            ((n >> 1) as u32).div_ceil(row_tile).min(65535),
-            1,
-        ),
-        block_dim: (col_tile, row_tile, 1),
-        shared_mem_bytes: 0,
-    };
-    unsafe {
-        stream.launch_builder(&be.ntt_dit_level_row_major)
-            .arg(buf).arg(tw).arg(&n).arg(&log_n).arg(&level).arg(&m)
+        stream
+            .launch_builder(&be.bit_reverse_row_major)
+            .arg(buf)
+            .arg(&n)
+            .arg(&log_n)
+            .arg(&m)
             .launch(cfg)?;
     }
     Ok(())
 }
 
 fn launch_pointwise_mul_row_major(
-    stream: &CudaStream, be: &Backend,
-    buf: &mut CudaSlice<u64>, weights: &CudaSlice<u64>,
-    n: u64, m: u64,
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    weights: &CudaSlice<u64>,
+    n: u64,
+    m: u64,
 ) -> Result<()> {
     let cfg = LaunchConfig {
         grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
@@ -271,26 +257,60 @@ fn launch_pointwise_mul_row_major(
         shared_mem_bytes: 0,
     };
     unsafe {
-        stream.launch_builder(&be.pointwise_mul_row_major)
-            .arg(buf).arg(weights).arg(&n).arg(&m).launch(cfg)?;
+        stream
+            .launch_builder(&be.pointwise_mul_row_major)
+            .arg(buf)
+            .arg(weights)
+            .arg(&n)
+            .arg(&m)
+            .launch(cfg)?;
     }
     Ok(())
 }
 
 fn run_row_major_ntt_body(
-    stream: &CudaStream, be: &Backend,
-    buf: &mut CudaSlice<u64>, tw: &CudaSlice<u64>,
-    n: u64, log_n: u64, m: u64,
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    tw: &CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    m: u64,
 ) -> Result<()> {
+    let col_tile: u32 = 32.min(m as u32);
+    let row_tile: u32 = (256 / col_tile).max(1);
     for level in 0..log_n {
-        launch_ntt_dit_level_row_major(stream, be, buf, tw, n, log_n, level, m)?;
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m as u32).div_ceil(col_tile),
+                ((n >> 1) as u32).div_ceil(row_tile).min(65535),
+                1,
+            ),
+            block_dim: (col_tile, row_tile, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_level_row_major)
+                .arg(&mut *buf)
+                .arg(tw)
+                .arg(&n)
+                .arg(&log_n)
+                .arg(&level)
+                .arg(&m)
+                .launch(cfg)?;
+        }
     }
     Ok(())
 }
 
 fn launch_keccak_base_row_major(
-    stream: &CudaStream, be: &Backend,
-    buf: &CudaSlice<u64>, m: u64, num_rows: u64, log_num_rows: u64,
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    num_rows: u64,
+    log_num_rows: u64,
     leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
 ) -> Result<()> {
     // The keccak kernel is register-heavy (Keccak state `uint64_t st[25]`), so it
@@ -300,9 +320,14 @@ fn launch_keccak_base_row_major(
     // R1 GPU path to the CPU fallback (no device handle for rounds 2-4).
     let cfg = keccak_launch_cfg(num_rows);
     unsafe {
-        stream.launch_builder(&be.keccak256_leaves_base_row_major)
-            .arg(buf).arg(&m).arg(&num_rows).arg(&log_num_rows)
-            .arg(leaves_out).launch(cfg)?;
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_major)
+            .arg(buf)
+            .arg(&m)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
     }
     Ok(())
 }
@@ -385,14 +410,30 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
 
     // iNTT: bit-reverse rows → per-level DIT.
     launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, m_u64)?;
-    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, inv_tw.as_ref(), n_u64, log_n, m_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        m_u64,
+    )?;
 
     // Coset weights: one weight per row, broadcast across all m columns.
     launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, m_u64)?;
 
     // Forward NTT at lde_size.
     launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, m_u64)?;
-    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, fwd_tw.as_ref(), lde_u64, log_lde, m_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        m_u64,
+    )?;
 
     // Keccak + Merkle on-device.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
@@ -400,7 +441,13 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     {
         let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + lde_size * 32);
         launch_keccak_base_row_major(
-            stream.as_ref(), be, &buf, m_u64, lde_u64, log_lde, &mut leaves_view,
+            stream.as_ref(),
+            be,
+            &buf,
+            m_u64,
+            lde_u64,
+            log_lde,
+            &mut leaves_view,
         )?;
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
@@ -426,7 +473,11 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     // (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
 
-    let handle = GpuLdeBase { buf: Arc::new(col_major_dev), m, lde_size };
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+    };
     Ok((nodes_out, handle, lde_out))
 }
 
@@ -475,10 +526,26 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     // iNTT + coset weights + forward NTT — same row-major kernels as base-field
     // but with m3 = m*3 (all 3 components processed simultaneously).
     launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, m3_u64)?;
-    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, inv_tw.as_ref(), n_u64, log_n, m3_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        m3_u64,
+    )?;
     launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, m3_u64)?;
     launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, m3_u64)?;
-    run_row_major_ntt_body(stream.as_ref(), be, &mut buf, fwd_tw.as_ref(), lde_u64, log_lde, m3_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        m3_u64,
+    )?;
 
     // Keccak: same row-major kernel — each leaf reads m3 consecutive u64s (= m ext3 elements).
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
@@ -486,7 +553,13 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     {
         let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + lde_size * 32);
         launch_keccak_base_row_major(
-            stream.as_ref(), be, &buf, m3_u64, lde_u64, log_lde, &mut leaves_view,
+            stream.as_ref(),
+            be,
+            &buf,
+            m3_u64,
+            lde_u64,
+            log_lde,
+            &mut leaves_view,
         )?;
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
@@ -508,7 +581,11 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
 
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m3, lde_u64)?;
 
-    let handle = GpuLdeExt3 { buf: Arc::new(col_major_dev), m, lde_size };
+    let handle = GpuLdeExt3 {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+    };
     Ok((nodes_out, handle, lde_out))
 }
 

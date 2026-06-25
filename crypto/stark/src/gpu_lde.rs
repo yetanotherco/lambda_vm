@@ -518,17 +518,29 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeBase, Vec<FieldElement<E>>)>
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() { return None; }
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() { return None; }
-    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() { return None; }
-    if row_major.len() != n * m || m == 0 || n == 0 { return None; }
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
 
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
@@ -537,11 +549,14 @@ where
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    let (nodes_bytes, handle, lde_u64) =
-        math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
-            raw, n, m, blowup_factor, &weights_u64,
-        )
-        .ok()?;
+    let (nodes_bytes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -570,17 +585,29 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3, Vec<FieldElement<E>>)>
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeExt3,
+    Vec<FieldElement<E>>,
+)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
     let lde_size = n.saturating_mul(blowup_factor);
-    if lde_size < gpu_lde_threshold() { return None; }
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() { return None; }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() { return None; }
-    if row_major.len() != n * m || m == 0 || n == 0 { return None; }
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
 
     // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
     let m3 = m * 3;
@@ -593,7 +620,11 @@ where
 
     let (nodes_bytes, handle, lde_u64) =
         math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
-            raw, n, m, blowup_factor, &weights_u64,
+            raw,
+            n,
+            m,
+            blowup_factor,
+            &weights_u64,
         )
         .ok()?;
 

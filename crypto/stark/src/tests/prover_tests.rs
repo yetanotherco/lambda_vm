@@ -541,8 +541,8 @@ fn commit_rows_bit_reversed_matches_commit_columns_bit_reversed() {
             // Row-major interleaving: data[row * num_cols + col] = columns[col][row].
             let mut row_major: Vec<FE> = Vec::with_capacity(num_rows * num_cols);
             for r in 0..num_rows {
-                for c in 0..num_cols {
-                    row_major.push(columns[c][r].clone());
+                for col in &columns {
+                    row_major.push(col[r]);
                 }
             }
 

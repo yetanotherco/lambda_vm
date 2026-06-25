@@ -841,7 +841,11 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
-            let n = if num_cols > 0 { trace_slice.len() / num_cols } else { 0 };
+            let n = if num_cols > 0 {
+                trace_slice.len() / num_cols
+            } else {
+                0
+            };
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
             if let Some((tree, handle, main_data)) =
@@ -849,7 +853,13 @@ pub trait IsStarkProver<
                     Field,
                     Field,
                     BatchedMerkleTreeBackend<Field>,
-                >(trace_slice, n, num_cols, domain.blowup_factor, &twiddles.coset_weights)
+                >(
+                    trace_slice,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
             {
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();

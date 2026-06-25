@@ -247,7 +247,8 @@ impl Backend {
             ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
             pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
-            keccak256_leaves_base_row_major: keccak.load_function("keccak256_leaves_base_row_major")?,
+            keccak256_leaves_base_row_major: keccak
+                .load_function("keccak256_leaves_base_row_major")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
