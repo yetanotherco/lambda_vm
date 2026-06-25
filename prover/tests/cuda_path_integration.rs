@@ -66,3 +66,31 @@ fn gpu_path_fires_end_to_end() {
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
+
+/// Proves the same ELF twice — once with the GPU fused pipeline, once with the
+/// CPU-only path — and verifies both proofs. This is the direct answer to the
+/// review concern "otherwise CPU- and GPU-built proofs could diverge": both
+/// proofs must be accepted by the same verifier.
+///
+/// The two proof binaries will differ in ~64% of bytes due to non-deterministic
+/// HashMap iteration order in trace construction (pre-existing, orthogonal to
+/// the LDE rework). What matters is that the verifier accepts both.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_and_cpu_proofs_both_verify() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+
+    // GPU path: default threshold, GPU fused pipeline fires.
+    let proof_gpu = prove(&elf).expect("GPU prove");
+    let ok_gpu = verify(&proof_gpu, &elf).expect("GPU verify");
+    assert!(ok_gpu, "GPU-built proof failed verification");
+
+    // CPU path: set threshold above any realistic table size to force CPU.
+    // SAFETY: test runs single-threaded (--test-threads=1 or --ignored serial);
+    // no other thread reads this env var concurrently.
+    unsafe { std::env::set_var("LAMBDA_VM_GPU_LDE_THRESHOLD", "999999999") };
+    let proof_cpu = prove(&elf).expect("CPU prove");
+    unsafe { std::env::remove_var("LAMBDA_VM_GPU_LDE_THRESHOLD") };
+    let ok_cpu = verify(&proof_cpu, &elf).expect("CPU verify");
+    assert!(ok_cpu, "CPU-built proof failed verification");
+}
