@@ -763,6 +763,18 @@ pub fn verify_continuation(
         return Ok(None);
     }
 
+    // Reject a malformed bundle up front. `reg_fini` is prover-supplied (deserialized,
+    // untrusted) and is indexed by `NUM_REGISTER_ADDRESSES` when building each epoch's
+    // preprocessed REGISTER commitment, so a wrong length would otherwise panic the
+    // verifier instead of cleanly rejecting the proof.
+    if bundle
+        .epochs
+        .iter()
+        .any(|e| e.reg_fini.len() != register::NUM_REGISTER_ADDRESSES)
+    {
+        return Ok(None);
+    }
+
     // Derived from the ELF for epoch 0, then from each epoch's bound fini.
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
@@ -1046,6 +1058,26 @@ mod tests {
             "need a second epoch to chain into"
         );
         bundle.epochs[0].reg_fini[0] ^= 1;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Negative: a malformed bundle whose `reg_fini` has the wrong length must be
+    // rejected with `Ok(None)`, not panic the verifier. `reg_fini` is deserialized
+    // (untrusted) and indexed by `NUM_REGISTER_ADDRESSES` when building the
+    // preprocessed REGISTER commitment, so a short one would otherwise be an
+    // out-of-bounds panic in release builds.
+    #[test]
+    fn test_split_verify_rejects_malformed_register_fini_length() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+        assert!(!bundle.epochs.is_empty());
+        bundle.epochs[0].reg_fini.pop();
         assert!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
