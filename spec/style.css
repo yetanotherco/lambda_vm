@@ -2,6 +2,8 @@
   --content-max-width: 860px;
   --content-padding-x: 48px;
   --header-height: 72px;
+  --border-size: 1px;
+  --table-header-border-size: 3px;
 
   --radius: 3px;
 
@@ -51,7 +53,7 @@ body {
   display: grid;
   grid-template:
     "noHeader header header" var(--header-height)
-    "headerBorder headerBorder headerBorder" 1px
+    "headerBorder headerBorder headerBorder" var(--border-size)
     "nav main ." 1fr
     "nav footnotes ." auto
     "nav footnav footnav" auto
@@ -67,7 +69,7 @@ p:empty {
   body {
     grid-template:
       "header" var(--header-height)
-      "headerBorder" 1px
+      "headerBorder" var(--border-size)
       "nav" auto
       "main" auto
       "footnotes" auto
@@ -95,14 +97,14 @@ h1 + p em { /* version */
 nav:not(.prev-next) {
   grid-area: nav;
   background: var(--sidebar-bg);
-  border-right: 1px solid var(--border);
+  border-right: var(--border-size) solid var(--border);
   padding: 20px;
   overflow-y: auto;
-  min-height: calc(100vh - var(--header-height) - 1px);
+  min-height: calc(100vh - var(--header-height) - var(--border-size));
   font-size: 0.9em;
   position: sticky;
-  top: calc(var(--header-height) + 1px);
-  max-height: calc(100vh - var(--header-height) - 1px);
+  top: calc(var(--header-height) + var(--border-size));
+  max-height: calc(100vh - var(--header-height) - var(--border-size));
 }
 
 nav ul {
@@ -150,7 +152,7 @@ nav li code {
     height: auto;
     min-height: fit-content;
     border-right: none;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--border-size) solid var(--border);
     padding: 0;
     z-index: 5;
   }
@@ -170,7 +172,7 @@ nav li code {
     font-weight: 600;
     font-size: 0.9rem;
     padding: 10px 20px;
-    border-bottom: 1px solid var(--border);
+    border-bottom: var(--border-size) solid var(--border);
     list-style: none;
   }
 
@@ -189,7 +191,7 @@ nav.prev-next {
   display: flex;
   justify-content: space-between;
   padding: 0.8em var(--content-padding-x);
-  border-top: 1px solid var(--border);
+  border-top: var(--border-size) solid var(--border);
   background: var(--bg);
   position: sticky;
   bottom: 0;
@@ -293,7 +295,7 @@ section[role="doc-endnotes"] {
   margin: 0 auto;
   width: 100%;
   padding: 2em var(--content-padding-x) 1em;
-  border-top: 1px solid var(--border);
+  border-top: var(--border-size) solid var(--border);
   font-size: 0.85em;
   color: var(--endnote-fg);
 }
@@ -319,7 +321,7 @@ section[role="doc-endnotes"]:has(ol:empty) {
 
 sup[role="doc-noteref"] {
   font-size: 0.6em;
-  alignment-baseline: text-top;
+  vertical-align: text-top;
 }
 
 /* code blocks */
@@ -334,7 +336,7 @@ code {
 
 pre {
   background: var(--code-bg);
-  border: 1px solid var(--border);
+  border: var(--border-size) solid var(--border);
   border-radius: var(--radius);
   padding: 12px 16px;
   overflow-x: auto;
@@ -348,7 +350,7 @@ pre code {
 
 /* tables */
 figure {
-    margin: 1em 10px;
+    margin: 1em 0.3em;
 }
 
 table {
@@ -357,17 +359,16 @@ table {
 }
 
 thead tr:first-child {
-    border-bottom: 3px solid var(--table-border);
-    border-spacing: 10px;
+    border-bottom: var(--table-header-border-size) solid var(--table-border);
 }
 
 tr:has(th em) {
-    border-bottom: 1px solid var(--table-border);
+    border-bottom: var(--border-size) solid var(--table-border);
     text-align: left;
 }
 
 tr th:has(em) {
-    border-bottom: 1px solid var(--table-border);
+    border-bottom: var(--border-size) solid var(--table-border);
     font-weight: normal;
 }
 
