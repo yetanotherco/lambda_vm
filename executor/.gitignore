@@ -1,3 +1,4 @@
 /target
 /program_artifacts/rust
 /tests/ethrex_hoodi.bin
+/tests/ethrex_bench_*.bin
