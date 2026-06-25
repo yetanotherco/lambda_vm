@@ -668,8 +668,10 @@ impl BusValue {
                         }
                     }
                 }
-                // Fixed-zero bus elements (bus-width padding) contribute nothing —
-                // skip the F×E multiply. (α⁰ = 1 covers the bus-id term separately.)
+                // Bus elements that are zero on this row contribute nothing — skip the
+                // F×E multiply. (Covers the constant(0) bus-width padding plus any
+                // variable element that is zero on this row; α⁰ = 1 covers the bus-id
+                // term separately.)
                 if result != FieldElement::<F>::zero() {
                     *acc += &result * &alpha_powers[alpha_offset];
                 }
@@ -782,8 +784,9 @@ impl BusValue {
                         }
                     }
                 }
-                // Fixed-zero bus elements (bus-width padding) contribute nothing —
-                // skip the F×E multiply.
+                // Bus elements that are zero on this row contribute nothing — skip the
+                // F×E multiply. (Covers the constant(0) bus-width padding plus any
+                // variable element that is zero on this row.)
                 if result != FieldElement::<A>::zero() {
                     *acc += result * &alpha_powers[alpha_offset];
                 }
@@ -1682,7 +1685,7 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
 
 /// Computes the fingerprint for an interaction from a `TableView`.
 ///
-/// Returns `z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)`
+/// Returns `z - (bus_id + α·v[0] + α²·v[1] + ...)`
 fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     interaction: &BusInteraction,
