@@ -675,6 +675,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
     Ok(handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
