@@ -412,6 +412,7 @@ dependencies = [
  "executor",
  "log",
  "math",
+ "postcard",
  "serde",
  "sha3",
  "stark",

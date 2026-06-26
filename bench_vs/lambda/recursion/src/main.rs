@@ -14,7 +14,7 @@
 
 #![no_main]
 
-use lambda_vm_prover::{ProofOptions, VmProof};
+use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
 
 #[unsafe(export_name = "main")]
 pub fn main() -> ! {
@@ -29,14 +29,21 @@ pub fn main() -> ! {
     }));
 
     let blob = lambda_vm_syscalls::syscalls::get_private_input();
-    let (vm_proof, inner_elf, options): (VmProof, Vec<u8>, ProofOptions) =
+    let (vm_proof, inner_elf, options, vkey): (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey) =
         postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
     lambda_vm_prover::profile_markers::step_marker::<
         { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
     >();
 
-    let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options, None, None)
-        .expect("verify errored");
+    let ok = lambda_vm_prover::verify_with_options_with_vkey(
+        &vm_proof,
+        &inner_elf,
+        &options,
+        None,
+        None,
+        Some(&vkey),
+    )
+    .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
     lambda_vm_syscalls::syscalls::commit(&[1u8]);
