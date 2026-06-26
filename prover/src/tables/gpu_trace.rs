@@ -21,6 +21,7 @@ use stark::trace::TraceTable;
 
 use super::bytewise::{self, BytewiseOperation};
 use super::cpu::cols;
+use super::dvrm::{self, DvrmOperation};
 use super::eq::{self, EqOperation};
 use super::lt::{self, LtOperation};
 use super::mul::{self, MulOperation};
@@ -67,6 +68,12 @@ pub fn gpu_shift_table_builds() -> u64 {
 pub static GPU_MUL_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_mul_table_builds() -> u64 {
     GPU_MUL_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU DVRM-table builds.
+pub static GPU_DVRM_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_dvrm_table_builds() -> u64 {
+    GPU_DVRM_TABLE_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -383,5 +390,56 @@ pub fn gpu_build_mul_trace_tables(
         tables.push(tt);
     }
     GPU_MUL_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// DVRM tables on GPU (per-chunk host dedup with dual mu_q/mu_r counters → GPU
+/// fill). Mirrors generate_dvrm_trace. Input is (op, wants_remainder) pairs.
+pub fn gpu_build_dvrm_trace_tables(
+    dvrm_ops: &[(DvrmOperation, bool)],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    use std::collections::HashMap;
+    if dvrm_ops.is_empty() {
+        return None;
+    }
+    let ncols = dvrm::cols::NUM_COLUMNS;
+    let mut tables = Vec::with_capacity(dvrm_ops.len().div_ceil(max_rows));
+    for chunk in dvrm_ops.chunks(max_rows) {
+        // Dedup by (n, d, signed); wants_remainder selects mu_r else mu_q.
+        let mut map: HashMap<(u64, u64, bool), (u64, u64)> = HashMap::new();
+        for (op, wants_remainder) in chunk {
+            let e = map.entry((op.n, op.d, op.signed)).or_default();
+            if *wants_remainder {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        let unique: Vec<((u64, u64, bool), (u64, u64))> = map.into_iter().collect();
+        let n = unique.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut n_num = vec![0u64; n];
+        let mut d_den = vec![0u64; n];
+        let mut flags = vec![0u64; n];
+        let mut mu_q = vec![0u64; n];
+        let mut mu_r = vec![0u64; n];
+        for (i, ((nn, dd, signed), (mq, mr))) in unique.iter().enumerate() {
+            n_num[i] = *nn;
+            d_den[i] = *dd;
+            flags[i] = *signed as u64;
+            mu_q[i] = *mq;
+            mu_r[i] = *mr;
+        }
+        let dev = trace::gpu_build_dvrm_trace(&n_num, &d_den, &flags, &mu_q, &mu_r, n, nrows).ok()?;
+        let host = dev.to_host().ok()?;
+        let columns: Vec<Vec<FE>> = (0..ncols)
+            .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
+            .collect();
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
+    }
+    GPU_DVRM_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }

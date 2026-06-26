@@ -181,6 +181,7 @@ pub struct Backend {
     pub trace_bytewise_kernel: CudaFunction,
     pub trace_shift_kernel: CudaFunction,
     pub trace_mul_kernel: CudaFunction,
+    pub trace_dvrm_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -283,6 +284,7 @@ impl Backend {
             trace_bytewise_kernel: trace_alu.load_function("trace_bytewise_kernel")?,
             trace_shift_kernel: trace_shift.load_function("trace_shift_kernel")?,
             trace_mul_kernel: trace_mulrem.load_function("trace_mul_kernel")?,
+            trace_dvrm_kernel: trace_mulrem.load_function("trace_dvrm_kernel")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

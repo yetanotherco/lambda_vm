@@ -33,6 +33,9 @@ pub const NUM_SHIFT_COLS: usize = 29;
 /// MUL table column count (`prover::tables::mul::cols::NUM_COLUMNS`).
 pub const NUM_MUL_COLS: usize = 26;
 
+/// DVRM table column count (`prover::tables::dvrm::cols::NUM_COLUMNS`).
+pub const NUM_DVRM_COLS: usize = 34;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -337,6 +340,31 @@ pub fn gpu_build_mul_trace(
         n,
         nrows,
         NUM_MUL_COLS,
+    )
+}
+
+/// Build the DVRM trace table on device from deduped ops. SoA over `n` unique
+/// ops: `n_num`, `d_den`, `flags` (bit0=signed), `mu_q`, `mu_r`. Padding rows
+/// stay zero.
+pub fn gpu_build_dvrm_trace(
+    n_num: &[u64],
+    d_den: &[u64],
+    flags: &[u64],
+    mu_q: &[u64],
+    mu_r: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    build_alu5(
+        &backend()?.trace_dvrm_kernel,
+        n_num,
+        d_den,
+        flags,
+        mu_q,
+        mu_r,
+        n,
+        nrows,
+        NUM_DVRM_COLS,
     )
 }
 
