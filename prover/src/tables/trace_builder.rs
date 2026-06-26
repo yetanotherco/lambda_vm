@@ -2101,13 +2101,10 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 }
 
 // =============================================================================
-// PAGE Table Generation
+// BITWISE lookup helpers
 // =============================================================================
 
-/// Generates PAGE tables for memory initialization and finalization.
-///
-/// Derives all page bases from `memory_state.cells.keys()` — this includes
-/// IS_HALF lookup for a value `v ∈ [0, 2^16)` (split into low/high bytes).
+/// IS_HALF lookup for a value `v in [0, 2^16)` (split into low/high bytes).
 fn is_half_op(v: u16) -> BitwiseOperation {
     BitwiseOperation::halfword(
         BitwiseOperationType::IsHalf,

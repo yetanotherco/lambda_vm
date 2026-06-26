@@ -36,10 +36,10 @@
 
 use std::collections::HashMap;
 
-use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
+use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity};
 use stark::trace::TraceTable;
 
-use super::local_to_global::GENESIS_EPOCH;
+use super::local_to_global::{GENESIS_EPOCH, direct};
 use super::page::{DEFAULT_PAGE_SIZE, PageConfig};
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 
@@ -102,7 +102,7 @@ pub type FiniStateMap = HashMap<u64, FiniState>;
 /// Generates a GLOBAL_MEMORY trace for a single page.
 ///
 /// `config` supplies `page_base` and the genesis `init_values` (from the ELF);
-/// `final_state` maps each touched byte to its final value/epoch/timestamp.
+/// `final_state` maps each touched byte to its final value and last-touch epoch.
 pub fn generate_global_trace(
     config: &PageConfig,
     final_state: &FiniStateMap,
@@ -184,10 +184,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             vec![
                 address_lo.clone(),
                 address_hi.clone(),
-                BusValue::Packed {
-                    start_column: cols::INIT,
-                    packing: Packing::Direct,
-                },
+                direct(cols::INIT),
                 BusValue::constant(GENESIS_EPOCH),
             ],
         ),
@@ -198,14 +195,8 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             vec![
                 address_lo,
                 address_hi,
-                BusValue::Packed {
-                    start_column: cols::FINI,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_EPOCH,
-                    packing: Packing::Direct,
-                },
+                direct(cols::FINI),
+                direct(cols::FINI_EPOCH),
             ],
         ),
     ]

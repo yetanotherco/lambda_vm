@@ -37,15 +37,14 @@
 //! every row of an epoch's table, so it is supplied as a per-table constant (not
 //! a column) by [`bus_interactions`].
 //!
-//! The columns that live ONLY on the cross-epoch `GlobalMemory` bus have no MEMW
-//! partner: `init_epoch` and `init_timestamp` (the epoch-local `init` token is
-//! seeded at timestamp 0, so `init_timestamp` never reaches the Memory bus).
-//! These are stored as 16-bit halfword columns, each checked via `IsHalfword`,
-//! and the 32-bit value the bus matches on is rebuilt from them by a linear
-//! combination (see [`word`]). The checks are emitted on the epoch-local table
-//! (which has the BITWISE provider); the global proof commits the identical
+//! The only column that lives ONLY on the cross-epoch `GlobalMemory` bus has no
+//! MEMW partner: `init_epoch`. It is stored as two 16-bit halfword columns, each
+//! checked via `IsHalfword`, and the 32-bit bus value is rebuilt from them by a
+//! linear combination (see [`word`]). The checks are emitted on the epoch-local
+//! table (which has the BITWISE provider); the global proof commits the identical
 //! trace (the commitment binding compares their roots), so it inherits the same
-//! guarantee.
+//! guarantee. There is no `init_timestamp` column: timestamps are epoch-local, and
+//! the cross-epoch chain is ordered by epoch.
 //!
 //! ## Padding
 //!
@@ -187,11 +186,11 @@ pub fn genesis_provenance(genesis: impl IntoIterator<Item = (u64, u64)>) -> Prov
 /// Column indices for the local-to-global table: one row per touched cell.
 ///
 /// `address` and `fini_timestamp` are plain 32-bit columns (matched on the Memory
-/// bus against MEMW). The cross-epoch-only quantities `init_epoch` and
-/// `init_timestamp` are stored as 16-bit halfword columns ([`RANGE_CHECKED_HALFWORDS`])
-/// checked via `IsHalfword` and rebuilt into their 32-bit bus value via [`word`].
-/// The value bytes get the batched `AreBytes` check. `fini_epoch` is a per-table
-/// constant (not a column). `MU` is the real-row selector / multiplicity.
+/// bus against MEMW). The cross-epoch-only `init_epoch` is stored as 16-bit
+/// halfword columns ([`RANGE_CHECKED_HALFWORDS`]), checked via `IsHalfword`, and
+/// rebuilt into its 32-bit bus value via [`word`]. The value bytes get the
+/// batched `AreBytes` check. `fini_epoch` is a per-table constant (not a column).
+/// `MU` is the real-row selector / multiplicity.
 pub mod cols {
     /// address_lo: 32-bit; matched on the Memory bus against MEMW.
     pub const ADDRESS_LO: usize = 0;
@@ -290,7 +289,7 @@ fn word(lo_col: usize, hi_col: usize) -> BusValue {
 }
 
 /// A column read directly as a single field element (a 32-bit word or a byte).
-fn direct(column: usize) -> BusValue {
+pub(crate) fn direct(column: usize) -> BusValue {
     BusValue::Packed {
         start_column: column,
         packing: Packing::Direct,

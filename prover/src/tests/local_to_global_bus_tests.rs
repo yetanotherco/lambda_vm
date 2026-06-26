@@ -22,6 +22,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::tables::bitwise::{BitwiseOperation, BitwiseOperationType};
 use crate::tables::local_to_global::{
     self, CellBoundary, GENESIS_EPOCH, epoch_boundaries, generate_local_to_global_trace,
 };
@@ -140,6 +141,19 @@ mod memw_sub_cols {
     pub const NUM_COLUMNS: usize = 6;
 }
 
+/// Minimal BITWISE-receiver substitute for the L2G range-check buses. It receives
+/// the same AreBytes, IsHalfword, and IsB20 tokens that the real BITWISE table
+/// would receive, but only for rows supplied by the test.
+mod range_recv_cols {
+    pub const X: usize = 0;
+    pub const Y: usize = 1;
+    pub const Z: usize = 2;
+    pub const MU_ARE_BYTES: usize = 3;
+    pub const MU_IS_HALF: usize = 4;
+    pub const MU_IS_B20: usize = 5;
+    pub const NUM_COLUMNS: usize = 6;
+}
+
 /// MEMW-substitute air: counterpart to `memory_bus_interactions`. Sends each
 /// cell's init token at ts=0 (cancelling L2G's init-receive) and receives each
 /// cell's fini token at the last timestamp (cancelling L2G's fini-send).
@@ -206,6 +220,102 @@ fn memw_sub_air(
     )
 }
 
+fn l2g_range_air(
+    proof_options: &ProofOptions,
+    epoch_label: u64,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: local_to_global::range_check_interactions(epoch_label),
+        },
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+fn range_receiver_air(
+    proof_options: &ProofOptions,
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+    let interactions = vec![
+        BusInteraction::receiver(
+            BusId::AreBytes,
+            Multiplicity::Column(range_recv_cols::MU_ARE_BYTES),
+            vec![
+                BusValue::Packed {
+                    start_column: range_recv_cols::X,
+                    packing: Packing::Direct,
+                },
+                BusValue::Packed {
+                    start_column: range_recv_cols::Y,
+                    packing: Packing::Direct,
+                },
+            ],
+        ),
+        BusInteraction::receiver(
+            BusId::IsHalfword,
+            Multiplicity::Column(range_recv_cols::MU_IS_HALF),
+            vec![BusValue::linear(vec![
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: range_recv_cols::X,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 256,
+                    column: range_recv_cols::Y,
+                },
+            ])],
+        ),
+        BusInteraction::receiver(
+            BusId::IsB20,
+            Multiplicity::Column(range_recv_cols::MU_IS_B20),
+            vec![BusValue::linear(vec![
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 1,
+                    column: range_recv_cols::X,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 256,
+                    column: range_recv_cols::Y,
+                },
+                stark::lookup::LinearTerm::Column {
+                    coefficient: 65536,
+                    column: range_recv_cols::Z,
+                },
+            ])],
+        ),
+    ];
+    AirWithBuses::new(
+        range_recv_cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData { interactions },
+        proof_options,
+        1,
+        transition_constraints,
+    )
+}
+
+fn range_receiver_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
+    let num_rows = ops.len().next_power_of_two().max(4);
+    let mut data = vec![FE::zero(); num_rows * range_recv_cols::NUM_COLUMNS];
+    for (i, op) in ops.iter().enumerate() {
+        let base = i * range_recv_cols::NUM_COLUMNS;
+        data[base + range_recv_cols::X] = FE::from(op.x as u64);
+        data[base + range_recv_cols::Y] = FE::from(op.y as u64);
+        data[base + range_recv_cols::Z] = FE::from(op.z as u64);
+        let mu_col = match op.lookup_type {
+            BitwiseOperationType::AreBytes => range_recv_cols::MU_ARE_BYTES,
+            BitwiseOperationType::IsHalf => range_recv_cols::MU_IS_HALF,
+            BitwiseOperationType::IsB20 => range_recv_cols::MU_IS_B20,
+            _ => panic!("unexpected L2G range-check lookup"),
+        };
+        data[base + mu_col] = FE::one();
+    }
+    TraceTable::new_main(data, range_recv_cols::NUM_COLUMNS, 1)
+}
+
 fn memw_sub_trace(boundary: &[CellBoundary]) -> TraceTable<F, E> {
     let num_rows = boundary.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * memw_sub_cols::NUM_COLUMNS];
@@ -237,6 +347,34 @@ fn prove_verify_memory(l2g_boundary: &[CellBoundary], memw_boundary: &[CellBound
     )> = vec![(&l2g, &mut l2g_trace, &()), (&memw, &mut memw_trace, &())];
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![&l2g, &memw];
+    Verifier::multi_verify(
+        &airs,
+        &proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    )
+}
+
+fn prove_verify_l2g_range_with_trace(
+    l2g_trace: &mut TraceTable<F, E>,
+    range_ops: &[BitwiseOperation],
+    epoch_label: u64,
+) -> bool {
+    let proof_options = ProofOptions::default_test_options();
+    let l2g = l2g_range_air(&proof_options, epoch_label);
+    let receiver = range_receiver_air(&proof_options);
+    let mut receiver_trace = range_receiver_trace(range_ops);
+    let pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&l2g, l2g_trace, &()),
+        (&receiver, &mut receiver_trace, &()),
+    ];
+    let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&l2g, &receiver];
     Verifier::multi_verify(
         &airs,
         &proof,
@@ -690,13 +828,13 @@ fn test_l2g_mu_nonboolean_rejects_global_bus() {
 /// complete BITWISE sub-proof here would require replicating `prove_epoch`'s
 /// full table set, which is out of scope for a unit bus test.
 ///
-/// What we CAN assert at this level: the arithmetic property that makes the
-/// attack fail. `test_ordering_rejects_future_reference` in
+/// This test asserts the arithmetic property that makes the attack fail.
+/// `test_ordering_rejects_future_reference` in
 /// `local_to_global.rs::tests` (line 831) already verifies that the field
 /// value `fini_epoch − 1 − init_epoch` wraps to a value ≥ 2^20 for both
-/// self-references and future-references, so no IsB20 row matches. This test
-/// documents the gap and its justification — the ordering property is fully
-/// covered by that unit test plus the continuation integration tests.
+/// self-references and future-references, so no IsB20 row matches. The
+/// proof-level bus path is covered by
+/// `test_l2g_init_epoch_ordering_live_is_b20_rejects` below.
 ///
 /// Variants that ARE expressible without the full bitwise table:
 ///   - Self-reference (init_epoch == fini_epoch) and future-reference
@@ -705,11 +843,8 @@ fn test_l2g_mu_nonboolean_rejects_global_bus() {
 ///     checks that tokens match across epochs. The IsB20 sender is wired
 ///     exclusively on the epoch-local table (which carries the BITWISE provider).
 ///
-/// Skipping the full prove+verify here; the unit test at
-/// `local_to_global::tests::test_ordering_rejects_future_reference` (line 831)
-/// is the normative coverage for this invariant. A full integration test would
-/// require wiring the BITWISE table, which is tested end-to-end by the
-/// continuation tests in `continuation.rs::tests`.
+/// The paired live-bus test wires an L2G range-check AIR to a minimal BITWISE
+/// receiver table and proves that a self-reference rejects through IsB20.
 #[test]
 fn test_l2g_init_epoch_ordering_field_arithmetic() {
     // Verify the arithmetic property that underlies the IsB20 soundness argument
@@ -743,6 +878,58 @@ fn test_l2g_init_epoch_ordering_field_arithmetic() {
     assert!(
         future_ref >= (1 << 20),
         "future-reference must produce a value outside the IsB20 range (got {future_ref})"
+    );
+}
+
+#[test]
+fn test_l2g_init_epoch_ordering_live_is_b20_rejects() {
+    // Epoch 1 consumes epoch 0's fini for cell 10. Honest ordering has
+    // init_epoch=1, fini_epoch=2, so 2 - 1 - 1 = 0 is a valid IsB20 lookup.
+    let initial_memory = HashMap::new();
+    let epochs = vec![vec![(10, 7, 3)], vec![(10, 8, 10)]];
+    let boundaries = epoch_boundaries(&initial_memory, &epochs);
+    let boundary = &boundaries[1];
+    let epoch_label = boundary[0].fini.epoch;
+    assert_eq!(epoch_label, 2);
+
+    let mut honest_trace = generate_local_to_global_trace(boundary);
+    let honest_ops = local_to_global::collect_bitwise_from_l2g(boundary);
+    assert!(
+        prove_verify_l2g_range_with_trace(&mut honest_trace, &honest_ops, epoch_label),
+        "honest L2G range checks must balance against BITWISE receivers"
+    );
+
+    // Forge a self-reference: init_epoch == fini_epoch. The halfword lookups are
+    // still satisfiable, so the receiver table below includes them. The missing
+    // piece is exactly IsB20[2 - 1 - 2], which underflows in the field and has no
+    // valid 20-bit receiver row.
+    let mut forged_trace = generate_local_to_global_trace(boundary);
+    forged_trace.main_table.set(
+        0,
+        local_to_global::cols::INIT_EPOCH_0,
+        FE::from(epoch_label),
+    );
+    forged_trace
+        .main_table
+        .set(0, local_to_global::cols::INIT_EPOCH_1, FE::zero());
+
+    let cell = boundary[0];
+    let forged_ops = vec![
+        BitwiseOperation::byte_op(
+            BitwiseOperationType::AreBytes,
+            (cell.init.value & 0xFF) as u8,
+            (cell.fini.value & 0xFF) as u8,
+        ),
+        BitwiseOperation::halfword(
+            BitwiseOperationType::IsHalf,
+            (epoch_label & 0xFF) as u8,
+            ((epoch_label >> 8) & 0xFF) as u8,
+        ),
+        BitwiseOperation::halfword(BitwiseOperationType::IsHalf, 0, 0),
+    ];
+    assert!(
+        !prove_verify_l2g_range_with_trace(&mut forged_trace, &forged_ops, epoch_label),
+        "self-referential init_epoch must fail through the live IsB20 bus"
     );
 }
 
