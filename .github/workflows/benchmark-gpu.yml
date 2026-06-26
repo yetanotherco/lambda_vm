@@ -295,14 +295,17 @@ jobs:
             REF_A="origin/$BRANCH"
           fi
 
-          # bench_abba.sh builds the cli at REF_A and origin/main (isolated worktree),
-          # runs PAIRS interleaved A/B/B/A proves, and prints the paired-t CI + Wilcoxon
-          # verdict. BENCH_FEATURES routes the build through the CUDA prover path.
+          # The template clones the repo at the DEFAULT branch (main), so check out the PR
+          # ref first — otherwise we'd run main's bench_abba.sh (no BENCH_FEATURES => CPU
+          # build). bench_abba.sh then builds the cli at REF_A and origin/main (isolated
+          # worktree), runs PAIRS interleaved A/B/B/A proves, and prints the paired-t CI +
+          # Wilcoxon verdict. BENCH_FEATURES routes the build through the CUDA prover path.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
           # binaries (PTX is compiled for the detected arch); never trust a cached binary.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             git fetch --force origin main; $FETCH; \
+            git checkout -f $REF_A; \
             REBUILD=1 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
