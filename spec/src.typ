@@ -146,11 +146,33 @@
   (lo + hi.bit-lshift(32)).to-bytes()
 }
 
+// Recursively map nested object to bytes
+#let _SEP = bytes(",")
+#let to-bytes(leaf-transform, val) = {
+  let recurse = to-bytes.with(leaf-transform)
+  let t = type(val)
+  let (tag, val) = if t == bytes {
+    ("b", val)
+  } else if t == str {
+    ("s", leaf-transform(val))
+  } else if t == dictionary {
+    ("d", val.pairs().map(recurse).sum(default: _SEP))
+  } else if t == array {
+    ("a", val.map(recurse).join(_SEP, default: _SEP))
+  } else if t == int {
+    ("i", val.to-bytes())
+  }
+  bytes("(") + bytes(tag) + val + bytes(")")
+}
+
 /// Tag constraints with an identifier
 #let _add_constraint_ids(chip) = {
 
   /// A NON-CRYPTOGRAPHIC hash function.
-  let nchf(str) = FNV-1a(bytes(str))
+  let nchf(bytes) = FNV-1a(bytes)
+
+  /// Digests an object
+  let digest(obj, leaf-transform: bytes) = nchf(to-bytes(leaf-transform, obj))
   
   // ID settings
   let ID_CHAR_LEN = 4;
@@ -178,66 +200,32 @@
     }.sum()
   }
 
-  // Recursively flatten nested object
-  let flatten(obj, terminator: str, braces: ("(", ")"), sep: ",") = {
-    if type(obj) == dictionary {
-      obj = obj.keys().sorted().map(k => ((k), ":", obj.at(k)))
-    }
-    if type(obj) == array {
-      braces.at(0) + obj.map(a => flatten(a, terminator: terminator, braces: braces, sep: sep)).join(sep) + braces.at(1)
-    } else {
-      terminator(obj)
-    }
-  }
-
-  /// Converts a byte array to a hexadecimal string
-  let bytes-to-hex(bytes) = {
-    /// Pads a string with 0s on the left to reach a certain length
-    let z-fill(str) = "0" * calc.max(2 - str.len(), 0) + str
-
-    (("0x",) + array(bytes)
-      .map(b => upper(str(b, base: 16)))
-      .map(z-fill))
-      .sum()
-  }
-
-  /// Digests a variable based on its location and type.
-  let digest_variable(chip, group, idx, var) = {
-    let input = (chip, group, str(idx), flatten(var.type)).join("\x00")
-    bytes-to-hex(nchf(input))
-  }
-
-  // Assign variables an ID
-  let variable_IDs = chip
+  // Digest variables
+  let variable_digests = chip
     .variables
     .pairs()
     .map(((group, variables)) => variables
       .enumerate()
-      .map(((idx, var)) => (var.name: digest_variable(chip.name, group, idx, var)))
+      .map(((idx, var)) => (var.name: digest((chip.name, group, idx, var.type))))
       .sum(default: (:))
     ).sum(default: (:))
 
   // Replace variable names with their ID
-  let EXCLUDED_LABELS = ("desc", "ref", "constraint")
-  let digestable_constraint(c) = {
+  let _EXCLUDED_LABELS = ("desc", "ref", "constraint")
+  let digest_constraint(c) = {
     // filter out excluded fields
-    let filtered = c
-      .pairs()
-      .filter(((label, value)) => label not in EXCLUDED_LABELS)
-      .map(((label, value)) => ((label): value))
-      .sum(default: (:))
+    let filtered = c.keys().filter(k => k not in _EXCLUDED_LABELS).map(k => c.at(k))
 
     // replace iter variables with stub
-    let var_map = c.at("iters", default: if "iter" in c {(c.iter,)} else {()})
+    let iters = if "iters" in c {c.iters} else if "iter" in c {(c.iter,)} else {()}
+    let iter_map = iters
       .enumerate()
       .map(((idx, iter)) => ((iter.at(0)): "iter" + str(idx)))
       .sum(default: (:))
 
-    let terminator(x) = variable_IDs.at(str(x), default: var_map.at(str(x), default: str(x)))
+    let leaf-transform(x) = bytes((iter_map + variable_digests).at(x, default: x))
 
-    flatten(filtered, terminator: terminator)
-      .replace("\n", "")
-      .replace(" ", "")
+    digest(filtered, leaf-transform: leaf-transform)
   }
 
   // Add an ID to each constraint
@@ -248,7 +236,7 @@
         (group):
         constraints
           .map(c => {
-            c.id = digest_to_id(nchf(digestable_constraint(c)))
+            c.id = digest_to_id(digest_constraint(c))
             c
           })
       )
