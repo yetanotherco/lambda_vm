@@ -188,6 +188,8 @@ pub enum Error {
     InvalidTableCounts(String),
     /// Continuation epoch size exponent is invalid.
     InvalidContinuationEpochSize(String),
+    /// Continuation proof construction hit an internal invariant failure.
+    ContinuationInvariant(String),
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
@@ -206,6 +208,9 @@ impl fmt::Display for Error {
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
             Error::InvalidContinuationEpochSize(msg) => {
                 write!(f, "invalid continuation epoch size: {msg}")
+            }
+            Error::ContinuationInvariant(msg) => {
+                write!(f, "continuation invariant failed: {msg}")
             }
             Error::HaltInNonFinalEpoch => {
                 write!(
