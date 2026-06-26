@@ -668,7 +668,13 @@ impl BusValue {
                         }
                     }
                 }
-                *acc += &result * &alpha_powers[alpha_offset];
+                // Bus elements that are zero on this row contribute nothing — skip the
+                // F×E multiply. (Covers the constant(0) bus-width padding plus any
+                // variable element that is zero on this row; α⁰ = 1 covers the bus-id
+                // term separately.)
+                if result != FieldElement::<F>::zero() {
+                    *acc += &result * &alpha_powers[alpha_offset];
+                }
                 1
             }
         }
@@ -778,7 +784,12 @@ impl BusValue {
                         }
                     }
                 }
-                *acc += result * &alpha_powers[alpha_offset];
+                // Bus elements that are zero on this row contribute nothing — skip the
+                // F×E multiply. (Covers the constant(0) bus-width padding plus any
+                // variable element that is zero on this row.)
+                if result != FieldElement::<A>::zero() {
+                    *acc += result * &alpha_powers[alpha_offset];
+                }
                 1
             }
         }
@@ -1483,11 +1494,10 @@ where
         // fp[k*chunk_len + i] = interaction k at row chunk_start+i.
         let mut fingerprints: Vec<FieldElement<E>> = Vec::with_capacity(n * chunk_len);
         for interaction in interactions.iter() {
+            // α⁰ = 1: the bus-id term needs no multiply — embed it into E once.
+            let bus_id_e = FieldElement::<E>::from(interaction.bus_id);
             for row in chunk_start..chunk_start + chunk_len {
-                // alpha_powers[0] is always 1, so the bus_id term is just the
-                // embedded bus id — skip the base×ext multiply and build the
-                // extension element straight from the bus id.
-                let mut lc = FieldElement::<E>::from(interaction.bus_id);
+                let mut lc = bus_id_e.clone();
                 let mut alpha_offset = 1;
                 for bv in &interaction.values {
                     alpha_offset += bv.accumulate_fingerprint(
@@ -1675,7 +1685,7 @@ fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
 
 /// Computes the fingerprint for an interaction from a `TableView`.
 ///
-/// Returns `z - (bus_id*α^0 + v[0]*α^1 + v[1]*α^2 + ...)`
+/// Returns `z - (bus_id + α·v[0] + α²·v[1] + ...)`
 fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     step: &TableView<A, B>,
     interaction: &BusInteraction,
@@ -1683,9 +1693,7 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     alpha_powers: &[FieldElement<B>],
     shifts: &PackingShifts<A>,
 ) -> FieldElement<B> {
-    // alpha_powers[0] is always 1, so the bus_id term is just the embedded bus
-    // id — skip the base×ext multiply and build the extension element straight
-    // from the bus id.
+    // α⁰ = 1: the bus-id term needs no multiply — embed it into B directly.
     let mut linear_combination = FieldElement::<B>::from(interaction.bus_id);
     let mut alpha_idx = 1;
     for bv in &interaction.values {
