@@ -1,0 +1,337 @@
+name: Benchmark GPU (PR)
+
+# Rent an RTX 5090 on Vast.ai (hourly), run the SAME headline ethrex prover
+# benchmark as benchmark-pr.yml but with the CUDA path enabled, post the absolute
+# GPU numbers back to the PR, then always destroy the instance.
+#
+# Triggered by a "/bench-gpu [N]" comment on a PR (N = prove iterations, default 3),
+# or via workflow_dispatch. The orchestration runs on a GitHub-hosted runner; all the
+# GPU work happens on the rented Vast box (provisioned by the template onstart).
+#
+# Requires repo secrets:
+#   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
+#   VAST_TEMPLATE_HASH  — hash of the "NVIDIA CUDA Lambda VM 64GB" template
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "Number of prove iterations"
+        default: "3"
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: benchmark-gpu-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Vast offer search: datacenter RTX 5090, >=16 cores, >=32GB RAM, >=64GB disk,
+  # verified + rentable, Blackwell-capable driver, under the price cap ($/hr).
+  GPU_NAME: RTX_5090
+  PRICE_CAP: "3"
+  VAST_IMAGE_DISK: "64"
+
+jobs:
+  benchmark-gpu:
+    runs-on: ubuntu-latest
+    # Skip unless: workflow_dispatch, or a "/bench-gpu" comment from a privileged author.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/bench-gpu') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - name: React to comment
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              comment_id: context.payload.comment.id,
+              content: 'eyes'
+            });
+
+      - name: Resolve PR ref + run count
+        id: config
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_NUM: ${{ github.event.issue.number }}
+          DISPATCH_RUNS: ${{ github.event.inputs.runs }}
+          DISPATCH_REF: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+            echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
+            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+            # "/bench-gpu 5" -> 5 iterations; otherwise default.
+            N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-gpu[[:space:]]*\([0-9]\+\).*|\1|p')
+            RUNS=${N:-3}
+          else
+            echo "pr_num=" >> "$GITHUB_OUTPUT"
+            echo "sha=$DISPATCH_REF" >> "$GITHUB_OUTPUT"
+            RUNS=${DISPATCH_RUNS:-3}
+          fi
+          # Clamp to [1,10].
+          if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 10 ] 2>/dev/null; then
+            echo "::warning::run count out of range, defaulting to 3"
+            RUNS=3
+          fi
+          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
+          echo "Using $RUNS prove iteration(s)"
+
+      - name: Install Vast CLI
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+        run: |
+          pip install --quiet --upgrade vastai
+          vastai set api-key "$VAST_API_KEY"
+
+      - name: Register ephemeral SSH key
+        id: sshkey
+        run: |
+          mkdir -p "$HOME/.ssh"
+          KEY="$HOME/.ssh/vast_bench"
+          COMMENT="gh-actions-bench-${GITHUB_RUN_ID}"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "$COMMENT" >/dev/null
+          vastai create ssh-key "$(cat "$KEY.pub")"
+          echo "key_comment=$COMMENT" >> "$GITHUB_OUTPUT"
+          echo "key_path=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Pick a Vast offer
+        id: offer
+        run: |
+          # NB: cpu_ram is in MB (32 GB = 32 * 1024 = 32768); disk_space/cuda_max_good as named.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=32768 disk_space>=64 datacenter=true verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          echo "Query: $QUERY"
+          vastai search offers "$QUERY" --raw -o dph_total > offers.json
+          OFFER_ID=$(jq -r 'sort_by(.dph_total) | .[0].id // empty' offers.json)
+          OFFER_PRICE=$(jq -r 'sort_by(.dph_total) | .[0].dph_total // empty' offers.json)
+          if [ -z "$OFFER_ID" ]; then
+            echo "::error::No datacenter RTX 5090 offer matched (>=16 cores, >=32GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
+            exit 1
+          fi
+          echo "Selected offer $OFFER_ID at \$${OFFER_PRICE}/hr"
+          echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
+          echo "price=$OFFER_PRICE" >> "$GITHUB_OUTPUT"
+
+      - name: Create instance
+        id: instance
+        env:
+          VAST_TEMPLATE_HASH: ${{ secrets.VAST_TEMPLATE_HASH }}
+          OFFER_ID: ${{ steps.offer.outputs.id }}
+        run: |
+          vastai create instance "$OFFER_ID" \
+            --template_hash "$VAST_TEMPLATE_HASH" \
+            --disk "$VAST_IMAGE_DISK" \
+            --ssh --direct --raw > create.json
+          cat create.json
+          IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json)
+          if [ -z "$IID" ]; then
+            echo "::error::Failed to create Vast instance"
+            exit 1
+          fi
+          # Persist immediately so teardown runs even if later steps fail.
+          echo "$IID" > "$RUNNER_TEMP/vast_instance_id"
+          echo "id=$IID" >> "$GITHUB_OUTPUT"
+          echo "Created instance $IID"
+
+      - name: Wait for SSH
+        id: ssh
+        env:
+          IID: ${{ steps.instance.outputs.id }}
+        run: |
+          echo "Waiting for instance $IID to reach 'running' with SSH endpoint..."
+          HOST=""; PORT=""
+          for _ in $(seq 1 60); do   # ~10 min
+            vastai show instance "$IID" --raw > inst.json || true
+            STATUS=$(jq -r '.actual_status // empty' inst.json)
+            # We create with --direct, so SSH straight to the public IP + the host port
+            # mapped to container port 22. The .ssh_host/.ssh_port proxy fields are
+            # unreliable (observed off-by-one vs the real proxy port), so use the direct
+            # mapping — same endpoint `vastai ssh-url` reports.
+            HOST=$(jq -r '.public_ipaddr // empty' inst.json)
+            PORT=$(jq -r '.ports["22/tcp"][0].HostPort // empty' inst.json)
+            echo "  status=$STATUS ssh=$HOST:$PORT"
+            if [ "$STATUS" = "running" ] && [ -n "$HOST" ] && [ -n "$PORT" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ "$STATUS" != "running" ] || [ -z "$HOST" ] || [ -z "$PORT" ]; then
+            echo "::error::Instance never became reachable (status=$STATUS host=$HOST port=$PORT)"
+            exit 1
+          fi
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
+          # Wait for sshd to accept our key.
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
+                 -i "${{ steps.sshkey.outputs.key_path }}" -p "$PORT" "root@$HOST" true 2>/dev/null; then
+              echo "sshd reachable"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::sshd did not accept connections in time"
+          exit 1
+
+      - name: Wait for onstart provisioning
+        env:
+          HOST: ${{ steps.ssh.outputs.host }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
+          # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
+          # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
+          for _ in $(seq 1 120); do   # ~20 min
+            if $SSH 'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null'; then
+              echo "onstart reported done"; exit 0
+            fi
+            # shellcheck disable=SC2016  # $HOME/$(...) must expand on the remote box, not the runner
+            if $SSH 'test -x "$HOME/.cargo/bin/cargo" \
+                  && test -f /opt/lambda-vm-sysroot/include/stdlib.h \
+                  && test -d /workspace/lambda_vm/.git \
+                  && "$HOME/.cargo/bin/rustup" toolchain list 2>/dev/null | grep -q nightly-2026-02-01'; then
+              echo "provisioning artifacts present"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::onstart provisioning did not complete in time"
+          exit 1
+
+      - name: Check out PR source on the box
+        env:
+          HOST: ${{ steps.ssh.outputs.host }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          PR_NUM: ${{ steps.config.outputs.pr_num }}
+          SHA: ${{ steps.config.outputs.sha }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          if [ -n "$PR_NUM" ]; then
+            # Fetch the PR head via the base repo's pull ref (works for fork PRs too).
+            $SSH "cd /workspace/lambda_vm && git fetch --force origin 'refs/pull/${PR_NUM}/head' && git checkout --force '$SHA'"
+          else
+            # workflow_dispatch: check out the requested branch.
+            $SSH "cd /workspace/lambda_vm && git fetch --force origin '$SHA' && git checkout --force FETCH_HEAD"
+          fi
+          $SSH "cd /workspace/lambda_vm && git --no-pager log -1 --oneline"
+
+      - name: Run GPU benchmark
+        id: bench
+        env:
+          HOST: ${{ steps.ssh.outputs.host }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          RUNS: ${{ steps.config.outputs.runs }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # bash -l so ~/.bashrc (cargo env) is sourced; the script also sources it itself.
+          $SSH "bash -lc 'cd /workspace/lambda_vm && bash infra/gpu_bench.sh $RUNS'" | tee bench.log
+
+          # Parse per-run metrics (same format as the CPU bench: "Proving time:" / "Peak heap:").
+          mapfile -t TIMES < <(grep -o 'Proving time: [0-9.]*' bench.log | awk '{print $3}')
+          mapfile -t HEAPS < <(grep -o 'Peak heap: [0-9]*'   bench.log | awk '{print $3}')
+          if [ "${#TIMES[@]}" -eq 0 ] || [ "${#HEAPS[@]}" -eq 0 ]; then
+            echo "::error::Failed to parse any GPU metrics from the bench output"
+            exit 1
+          fi
+          MED_POS=$(( (${#TIMES[@]} + 1) / 2 ))
+          TIME_MED=$(printf '%s\n' "${TIMES[@]}" | sort -n | awk "NR==$MED_POS")
+          HEAP_MED=$(printf '%s\n' "${HEAPS[@]}" | sort -n | awk "NR==$MED_POS")
+          ALL_TIMES=$(printf '%s\n' "${TIMES[@]}" | paste -sd '/' -)
+          ALL_HEAPS=$(printf '%s\n' "${HEAPS[@]}" | paste -sd '/' -)
+          {
+            echo "time_s=$TIME_MED"
+            echo "peak_mb=$HEAP_MED"
+            echo "all_times=$ALL_TIMES"
+            echo "all_heaps=$ALL_HEAPS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Comment on PR
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          TIME_S: ${{ steps.bench.outputs.time_s }}
+          PEAK_MB: ${{ steps.bench.outputs.peak_mb }}
+          ALL_TIMES: ${{ steps.bench.outputs.all_times }}
+          ALL_HEAPS: ${{ steps.bench.outputs.all_heaps }}
+          RUNS: ${{ steps.config.outputs.runs }}
+          GPU_NAME: ${{ env.GPU_NAME }}
+          OFFER_PRICE: ${{ steps.offer.outputs.price }}
+          COMMIT_SHA: ${{ steps.config.outputs.sha }}
+        with:
+          script: |
+            const time = process.env.TIME_S;
+            const peak = process.env.PEAK_MB;
+            const runs = parseInt(process.env.RUNS || '1');
+            const allTimes = (process.env.ALL_TIMES || '').split('/').map(t => `${t}s`).join(' / ');
+            const allHeaps = (process.env.ALL_HEAPS || '').split('/').map(h => `${h} MB`).join(' / ');
+            const nLabel = runs > 1 ? ` (median of ${runs})` : '';
+            const sha = (process.env.COMMIT_SHA || '').substring(0, 8);
+
+            let body = `## Benchmark (GPU) — ethrex 20 transfers${nLabel}\n\n`;
+            body += `<sub>GPU: ${process.env.GPU_NAME.replace('_', ' ')} · Vast.ai datacenter @ \$${process.env.OFFER_PRICE}/hr · \`prover/cuda\`</sub>\n\n`;
+            body += `| Metric | GPU |\n`;
+            body += `|--------|-----|\n`;
+            body += `| **Prove time** | ${time}s |\n`;
+            body += `| **Peak heap** | ${peak} MB |\n`;
+            if (runs > 1) {
+              body += `\n<sub>Runs — time: ${allTimes} · heap: ${allHeaps}</sub>\n`;
+            }
+            body += `\n<sub>Commit: ${sha} · Runner: Vast.ai RTX 5090</sub>\n`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const marker = 'Benchmark (GPU) — ethrex';
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # --- Teardown: ALWAYS destroy the instance (cost guardrail) ---
+      - name: Destroy instance
+        if: always()
+        run: |
+          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
+            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
+            echo "Destroying instance $IID"
+            vastai destroy instance "$IID" || echo "::warning::destroy instance $IID failed — check the Vast console"
+          else
+            echo "No instance id recorded; nothing to destroy."
+          fi
+
+      - name: Remove ephemeral SSH key
+        if: always()
+        env:
+          KEY_COMMENT: ${{ steps.sshkey.outputs.key_comment }}
+        run: |
+          [ -z "$KEY_COMMENT" ] && exit 0
+          vastai show ssh-keys --raw > keys.json 2>/dev/null || exit 0
+          for kid in $(jq -r --arg c "$KEY_COMMENT" '.[] | select(.public_key | contains($c)) | .id' keys.json); do
+            echo "Deleting ssh-key $kid"
+            vastai delete ssh-key "$kid" || true
+          done
