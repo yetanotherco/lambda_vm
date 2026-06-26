@@ -33,7 +33,9 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, SHIFT_16, alu_op};
+use super::types::{
+    BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
+};
 
 // =========================================================================
 // Column indices for LT table
@@ -169,63 +171,45 @@ pub fn generate_lt_trace(
 
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, (op, multiplicity)) in unique_ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
-        // Extract lhs as DWordHHW: [Word, Half, Half]
-        let lhs_0 = (op.lhs & 0xFFFF_FFFF) as u32; // bits 0-31
-        let lhs_1 = ((op.lhs >> 32) & 0xFFFF) as u16; // bits 32-47
-        let lhs_2 = ((op.lhs >> 48) & 0xFFFF) as u16; // bits 48-63
-
-        // Extract rhs as DWordHHW: [Word, Half, Half]
-        let rhs_0 = (op.rhs & 0xFFFF_FFFF) as u32; // bits 0-31
-        let rhs_1 = ((op.rhs >> 32) & 0xFFFF) as u16; // bits 32-47
-        let rhs_2 = ((op.rhs >> 48) & 0xFFFF) as u16; // bits 48-63
-
         // Store input columns
-        data[base + cols::LHS_0] = FE::from(lhs_0 as u64);
-        data[base + cols::LHS_1] = FE::from(lhs_1 as u64);
-        data[base + cols::LHS_2] = FE::from(lhs_2 as u64);
-        data[base + cols::RHS_0] = FE::from(rhs_0 as u64);
-        data[base + cols::RHS_1] = FE::from(rhs_1 as u64);
-        data[base + cols::RHS_2] = FE::from(rhs_2 as u64);
-        data[base + cols::SIGNED] = FE::from(if op.signed { 1u64 } else { 0u64 });
+        table.set_dword_hhw(row_idx, cols::LHS_0, op.lhs);
+        table.set_dword_hhw(row_idx, cols::RHS_0, op.rhs);
+        table.set_bool(row_idx, cols::SIGNED, op.signed);
 
         // Compute lt result
         let lt = op.compute_lt();
-        data[base + cols::LT] = FE::from(if lt { 1u64 } else { 0u64 });
+        table.set_bool(row_idx, cols::LT, lt);
 
         // Compute lhs_sub_rhs = lhs - rhs (wrapping)
         // Note: We compute this as a 64-bit wrapping subtraction
         let lhs_sub_rhs = op.lhs.wrapping_sub(op.rhs);
 
         // Store lhs_sub_rhs as DWordHL: [Half, Half, Half, Half]
-        let sub_0 = (lhs_sub_rhs & 0xFFFF) as u16;
-        let sub_1 = ((lhs_sub_rhs >> 16) & 0xFFFF) as u16;
-        let sub_2 = ((lhs_sub_rhs >> 32) & 0xFFFF) as u16;
-        let sub_3 = ((lhs_sub_rhs >> 48) & 0xFFFF) as u16;
-        data[base + cols::LHS_SUB_RHS_0] = FE::from(sub_0 as u64);
-        data[base + cols::LHS_SUB_RHS_1] = FE::from(sub_1 as u64);
-        data[base + cols::LHS_SUB_RHS_2] = FE::from(sub_2 as u64);
-        data[base + cols::LHS_SUB_RHS_3] = FE::from(sub_3 as u64);
+        table.set_dword_hl(row_idx, cols::LHS_SUB_RHS_0, lhs_sub_rhs);
 
         // Compute MSBs (bit 63 of each value)
         let lhs_msb = (op.lhs >> 63) & 1;
         let rhs_msb = (op.rhs >> 63) & 1;
-        data[base + cols::LHS_MSB] = FE::from(lhs_msb);
-        data[base + cols::RHS_MSB] = FE::from(rhs_msb);
+        table.set_u64(row_idx, cols::LHS_MSB, lhs_msb);
+        table.set_u64(row_idx, cols::RHS_MSB, rhs_msb);
 
         // ALU-bus fields: invert + the inverted output.
-        data[base + cols::INVERT] = FE::from(op.invert as u64);
-        data[base + cols::OUT] = FE::from(op.compute_out() as u64);
+        table.set_bool(row_idx, cols::INVERT, op.invert);
+        table.set_bool(row_idx, cols::OUT, op.compute_out());
 
         // All LT lookups go through the unified ALU bus → single multiplicity.
-        data[base + cols::MU] = FE::from(*multiplicity);
+        table.set_u64(row_idx, cols::MU, *multiplicity);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

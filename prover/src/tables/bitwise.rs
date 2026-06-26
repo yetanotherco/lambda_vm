@@ -36,7 +36,7 @@ use stark::trace::{TraceTable, columns2rows};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, alu_op};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
 // Column indices for BITWISE table
@@ -357,38 +357,37 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// All output columns are precomputed. Multiplicity columns are initialized
 /// to zero and will be updated when other tables send lookups.
 pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let mut data = vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for x in 0u32..256 {
         for y in 0u32..256 {
             for z in 0u32..16 {
                 let row_idx = (x as usize) + (y as usize) * 256 + (z as usize) * 256 * 256;
-                let base = row_idx * cols::NUM_COLUMNS;
 
                 // Input columns
-                data[base + cols::X] = FE::from(x as u64);
-                data[base + cols::Y] = FE::from(y as u64);
-                data[base + cols::Z] = FE::from(z as u64);
+                table.set_byte(row_idx, cols::X, x as u8);
+                table.set_byte(row_idx, cols::Y, y as u8);
+                table.set_byte(row_idx, cols::Z, z as u8);
 
                 // Bitwise operation results
-                data[base + cols::AND] = FE::from((x & y) as u64);
-                data[base + cols::OR] = FE::from((x | y) as u64);
-                data[base + cols::XOR] = FE::from((x ^ y) as u64);
+                table.set_byte(row_idx, cols::AND, (x & y) as u8);
+                table.set_byte(row_idx, cols::OR, (x | y) as u8);
+                table.set_byte(row_idx, cols::XOR, (x ^ y) as u8);
 
                 // MSB extractions
                 let msb8 = (x >> 7) & 1;
                 let halfword = x + y * 256;
                 let msb16 = (halfword >> 15) & 1;
-                data[base + cols::MSB8] = FE::from(msb8 as u64);
-                data[base + cols::MSB16] = FE::from(msb16 as u64);
+                table.set_bool(row_idx, cols::MSB8, msb8 == 1);
+                table.set_bool(row_idx, cols::MSB16, msb16 == 1);
 
                 // Zero check (X + 256*Y + 65536*Z must be zero)
-                let is_zero = if x == 0 && y == 0 && z == 0 {
-                    1u64
-                } else {
-                    0u64
-                };
-                data[base + cols::ZERO] = FE::from(is_zero);
+                table.set_bool(row_idx, cols::ZERO, x == 0 && y == 0 && z == 0);
 
                 // Shift operations on halfword
                 let sll = if z == 0 {
@@ -397,8 +396,8 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                     (halfword << z) & 0xFFFF
                 };
                 let sllc = if z == 0 { 0 } else { halfword >> (16 - z) };
-                data[base + cols::SLL] = FE::from(sll as u64);
-                data[base + cols::SLLC] = FE::from(sllc as u64);
+                table.set_half(row_idx, cols::SLL, sll as u16);
+                table.set_half(row_idx, cols::SLLC, sllc as u16);
 
                 // Multiplicity columns start at zero
                 // They will be updated by update_multiplicities()
@@ -406,7 +405,7 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
         }
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 /// Computes the row index for a given (X, Y, Z) tuple.
@@ -444,7 +443,7 @@ pub fn update_multiplicities(
 
         // Increment multiplicity
         let current = trace.main_table.get_row(row)[mu_col];
-        trace.set_main(row, mu_col, current + FE::one());
+        trace.main_table.set_fe(row, mu_col, current + FE::one());
     }
 }
 

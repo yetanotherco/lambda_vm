@@ -998,7 +998,13 @@ where
             .map(|c| c.degree())
             .max()
             .unwrap_or(1);
-        trace_length * max_degree
+        // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
+        // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
+        // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
+        // (max_degree−1) parts — the max_degree-th part is identically zero. The tight bound is
+        // therefore (max_degree−1)·N; the previous max_degree·N committed and opened a wasted
+        // all-zero part (e.g. 3 parts for a degree-3 AIR where 2 suffice).
+        trace_length * (max_degree - 1).max(1)
     }
 
     fn context(&self) -> &AirContext {
