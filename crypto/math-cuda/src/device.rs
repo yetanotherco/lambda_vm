@@ -106,6 +106,12 @@ const TRACE_MEMW_REGISTER_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/trace_memw_register.ptx"));
 const TRACE_LDST_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_ldst.ptx"));
 const TRACE_MEMW_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_memw.ptx"));
+const TRACE_BITWISE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_bitwise.ptx"));
+const TRACE_PAGE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_page.ptx"));
+const TRACE_BRANCH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_branch.ptx"));
+const TRACE_COMMIT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_commit.ptx"));
+const TRACE_MISC_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_misc.ptx"));
+const TRACE_CPU32_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_cpu32.ptx"));
 const TRACE_DEDUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_dedup.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
@@ -192,6 +198,16 @@ pub struct Backend {
     pub trace_store_kernel: CudaFunction,
     pub trace_memw_aligned_kernel: CudaFunction,
     pub trace_memw_kernel: CudaFunction,
+    pub bitwise_fixed_kernel: CudaFunction,
+    pub bitwise_hist_kernel: CudaFunction,
+    pub page_dense_kernel: CudaFunction,
+    pub page_scatter_kernel: CudaFunction,
+    pub trace_branch_kernel: CudaFunction,
+    pub trace_commit_kernel: CudaFunction,
+    pub register_dense_kernel: CudaFunction,
+    pub register_scatter_kernel: CudaFunction,
+    pub halt_kernel: CudaFunction,
+    pub trace_cpu32_kernel: CudaFunction,
     pub dedup_init: CudaFunction,
     pub dedup_insert: CudaFunction,
     pub dedup_compact: CudaFunction,
@@ -225,6 +241,12 @@ impl Backend {
         let trace_memw_register = ctx.load_module(Ptx::from_src(TRACE_MEMW_REGISTER_PTX))?;
         let trace_ldst = ctx.load_module(Ptx::from_src(TRACE_LDST_PTX))?;
         let trace_memw = ctx.load_module(Ptx::from_src(TRACE_MEMW_PTX))?;
+        let trace_bitwise = ctx.load_module(Ptx::from_src(TRACE_BITWISE_PTX))?;
+        let trace_page = ctx.load_module(Ptx::from_src(TRACE_PAGE_PTX))?;
+        let trace_branch = ctx.load_module(Ptx::from_src(TRACE_BRANCH_PTX))?;
+        let trace_commit = ctx.load_module(Ptx::from_src(TRACE_COMMIT_PTX))?;
+        let trace_misc = ctx.load_module(Ptx::from_src(TRACE_MISC_PTX))?;
+        let trace_cpu32 = ctx.load_module(Ptx::from_src(TRACE_CPU32_PTX))?;
         let trace_dedup = ctx.load_module(Ptx::from_src(TRACE_DEDUP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
@@ -308,6 +330,16 @@ impl Backend {
             trace_memw_aligned_kernel: trace_memw
                 .load_function("trace_memw_aligned_kernel")?,
             trace_memw_kernel: trace_memw.load_function("trace_memw_kernel")?,
+            bitwise_fixed_kernel: trace_bitwise.load_function("bitwise_fixed_kernel")?,
+            bitwise_hist_kernel: trace_bitwise.load_function("bitwise_hist_kernel")?,
+            page_dense_kernel: trace_page.load_function("page_dense_kernel")?,
+            page_scatter_kernel: trace_page.load_function("page_scatter_kernel")?,
+            trace_branch_kernel: trace_branch.load_function("trace_branch_kernel")?,
+            trace_commit_kernel: trace_commit.load_function("trace_commit_kernel")?,
+            register_dense_kernel: trace_misc.load_function("register_dense_kernel")?,
+            register_scatter_kernel: trace_misc.load_function("register_scatter_kernel")?,
+            halt_kernel: trace_misc.load_function("halt_kernel")?,
+            trace_cpu32_kernel: trace_cpu32.load_function("trace_cpu32_kernel")?,
             trace_dvrm_kernel: trace_mulrem.load_function("trace_dvrm_kernel")?,
             dedup_init: trace_dedup.load_function("dedup_init")?,
             dedup_insert: trace_dedup.load_function("dedup_insert")?,

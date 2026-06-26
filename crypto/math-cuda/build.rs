@@ -123,5 +123,11 @@ fn main() {
     compile_ptx("trace_memw_register.cu", "trace_memw_register.ptx", have_nvcc);
     compile_ptx("trace_ldst.cu", "trace_ldst.ptx", have_nvcc);
     compile_ptx("trace_memw.cu", "trace_memw.ptx", have_nvcc);
+    compile_ptx("trace_bitwise.cu", "trace_bitwise.ptx", have_nvcc);
+    compile_ptx("trace_page.cu", "trace_page.ptx", have_nvcc);
+    compile_ptx("trace_branch.cu", "trace_branch.ptx", have_nvcc);
+    compile_ptx("trace_commit.cu", "trace_commit.ptx", have_nvcc);
+    compile_ptx("trace_misc.cu", "trace_misc.ptx", have_nvcc);
+    compile_ptx("trace_cpu32.cu", "trace_cpu32.ptx", have_nvcc);
     compile_ptx("trace_dedup.cu", "trace_dedup.ptx", have_nvcc);
 }

@@ -62,6 +62,34 @@ pub const NUM_MEMW_COLS: usize = 49;
 /// MEMW per-op input stride (must match `trace_memw.cu` `MW_STRIDE`).
 pub const MEMW_STRIDE: usize = 29;
 
+/// BITWISE table column count (`prover::tables::bitwise::cols::NUM_COLUMNS`).
+pub const NUM_BITWISE_COLS: usize = 21;
+/// BITWISE table row count (`prover::tables::bitwise::NUM_ROWS` = 2^20).
+pub const NUM_BITWISE_ROWS: usize = 1 << 20;
+
+/// PAGE table column count (`prover::tables::page::cols::NUM_COLUMNS`).
+pub const NUM_PAGE_COLS: usize = 5;
+
+/// BRANCH table column count (`prover::tables::branch::cols::NUM_COLUMNS`).
+pub const NUM_BRANCH_COLS: usize = 14;
+/// BRANCH per-op input stride (must match `trace_branch.cu` `BR_STRIDE`).
+pub const BRANCH_STRIDE: usize = 5;
+
+/// COMMIT table column count (`prover::tables::commit::cols::NUM_COLUMNS`).
+pub const NUM_COMMIT_COLS: usize = 19;
+/// COMMIT per-op input stride (must match `trace_commit.cu` `C_STRIDE`).
+pub const COMMIT_STRIDE: usize = 7;
+
+/// REGISTER table column count (`prover::tables::register::cols::NUM_COLUMNS`).
+pub const NUM_REGISTER_COLS: usize = 5;
+/// HALT table column count (`prover::tables::halt::cols::NUM_COLUMNS`).
+pub const NUM_HALT_COLS: usize = 4;
+
+/// CPU32 table column count (`prover::tables::cpu32::cols::NUM_COLUMNS`).
+pub const NUM_CPU32_COLS: usize = 38;
+/// CPU32 per-op input stride (must match `trace_cpu32.cu` `C32_STRIDE`).
+pub const CPU32_STRIDE: usize = 17;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -496,6 +524,271 @@ pub fn gpu_build_memw_trace(input: &[u64], n: usize, nrows: usize) -> Result<Dev
         n,
         nrows,
         NUM_MEMW_COLS,
+    )
+}
+
+/// Build the BITWISE trace table on device: fill the 2^20 fixed rows
+/// (precomputed cols 0..10) then histogram `ops` (packed `x | y<<8 | z<<16 |
+/// type<<20`) into the multiplicity cols (11 + type) via atomic scatter-add.
+/// Mirrors `generate_bitwise_trace` + `update_multiplicities`.
+pub fn gpu_build_bitwise_trace(ops: &[u32]) -> Result<DeviceMainCols> {
+    let nrows = NUM_BITWISE_ROWS;
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let mut cols = stream.alloc_zeros::<u64>(NUM_BITWISE_COLS * nrows)?;
+
+    // Fixed columns: one thread per row.
+    let fixed_cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.bitwise_fixed_kernel)
+            .arg(&mut cols)
+            .launch(fixed_cfg)?;
+    }
+
+    // Multiplicity histogram: one thread per lookup.
+    let n = ops.len();
+    if n > 0 {
+        let ops_d = stream.clone_htod(ops)?;
+        let n_u64 = n as u64;
+        let hist_cfg = LaunchConfig {
+            grid_dim: ((n as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.bitwise_hist_kernel)
+                .arg(&ops_d)
+                .arg(&n_u64)
+                .arg(&mut cols)
+                .launch(hist_cfg)?;
+        }
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_BITWISE_COLS,
+        nrows,
+    })
+}
+
+/// Build one PAGE trace table on device: dense fill (OFFSET, INIT, FINI=INIT,
+/// TS=0) over `page_size` rows, then scatter the touched cells (overwrite FINI
+/// + TIMESTAMP). `init_values` is the page's initial bytes (len <= page_size, 0
+/// beyond); `cell_*` are the per-cell offset/value/timestamp arrays. Mirrors
+/// `generate_page_trace`.
+pub fn gpu_build_page_trace(
+    init_values: &[u8],
+    page_size: usize,
+    cell_offsets: &[u32],
+    cell_values: &[u8],
+    cell_timestamps: &[u64],
+) -> Result<DeviceMainCols> {
+    assert_eq!(cell_offsets.len(), cell_values.len());
+    assert_eq!(cell_offsets.len(), cell_timestamps.len());
+    assert!(init_values.len() <= page_size);
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let mut cols = stream.alloc_zeros::<u64>(NUM_PAGE_COLS * page_size)?;
+    let init_d = stream.clone_htod(init_values)?;
+    let init_len = init_values.len() as u64;
+    let page_size_u64 = page_size as u64;
+
+    let dense_cfg = LaunchConfig {
+        grid_dim: ((page_size as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.page_dense_kernel)
+            .arg(&init_d)
+            .arg(&init_len)
+            .arg(&page_size_u64)
+            .arg(&mut cols)
+            .launch(dense_cfg)?;
+    }
+
+    let n_cells = cell_offsets.len();
+    if n_cells > 0 {
+        let off_d = stream.clone_htod(cell_offsets)?;
+        let val_d = stream.clone_htod(cell_values)?;
+        let ts_d = stream.clone_htod(cell_timestamps)?;
+        let n_u64 = n_cells as u64;
+        let scatter_cfg = LaunchConfig {
+            grid_dim: ((n_cells as u32).div_ceil(256), 1, 1),
+            block_dim: (256, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.page_scatter_kernel)
+                .arg(&off_d)
+                .arg(&val_d)
+                .arg(&ts_d)
+                .arg(&n_u64)
+                .arg(&page_size_u64)
+                .arg(&mut cols)
+                .launch(scatter_cfg)?;
+        }
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_PAGE_COLS,
+        nrows: page_size,
+    })
+}
+
+/// Build the BRANCH trace on device. `input` interleaved, stride
+/// `BRANCH_STRIDE`: `[pc, offset, register, jalr, mult]` per host-deduped op.
+/// Mirrors `generate_branch_trace`.
+pub fn gpu_build_branch_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_branch_kernel,
+        input,
+        BRANCH_STRIDE,
+        n,
+        nrows,
+        NUM_BRANCH_COLS,
+    )
+}
+
+/// Build the COMMIT trace on device. `input` interleaved, stride
+/// `COMMIT_STRIDE`: `[timestamp, index, address, count, first, end, value]`.
+/// Padding rows get count=1, address_incr[0]=1 (handled in-kernel). Mirrors
+/// `generate_commit_trace`.
+pub fn gpu_build_commit_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_commit_kernel,
+        input,
+        COMMIT_STRIDE,
+        n,
+        nrows,
+        NUM_COMMIT_COLS,
+    )
+}
+
+/// Build the REGISTER trace on device: dense fill (OFFSET=addr_list[r],
+/// INIT=init[r], FINI=INIT, TS=1) over `nrows`, then scatter accessed words
+/// (`scatter_rows`/`scatter_values`/`scatter_ts`). Mirrors
+/// `generate_register_trace`.
+pub fn gpu_build_register_trace(
+    addr_list: &[u64],
+    init: &[u64],
+    nrows: usize,
+    scatter_rows: &[u32],
+    scatter_values: &[u64],
+    scatter_ts: &[u64],
+) -> Result<DeviceMainCols> {
+    assert_eq!(addr_list.len(), init.len());
+    let n_real = addr_list.len();
+    assert!(nrows >= n_real);
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut cols = stream.alloc_zeros::<u64>(NUM_REGISTER_COLS * nrows)?;
+    let addr_d = stream.clone_htod(addr_list)?;
+    let init_d = stream.clone_htod(init)?;
+    let (n_real_u64, nrows_u64) = (n_real as u64, nrows as u64);
+    let dense_cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(128), 1, 1),
+        block_dim: (128, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.register_dense_kernel)
+            .arg(&addr_d)
+            .arg(&init_d)
+            .arg(&n_real_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(dense_cfg)?;
+    }
+    let n_cells = scatter_rows.len();
+    if n_cells > 0 {
+        let rows_d = stream.clone_htod(scatter_rows)?;
+        let vals_d = stream.clone_htod(scatter_values)?;
+        let ts_d = stream.clone_htod(scatter_ts)?;
+        let n_u64 = n_cells as u64;
+        let cfg = LaunchConfig {
+            grid_dim: ((n_cells as u32).div_ceil(64).max(1), 1, 1),
+            block_dim: (64, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.register_scatter_kernel)
+                .arg(&rows_d)
+                .arg(&vals_d)
+                .arg(&ts_d)
+                .arg(&n_u64)
+                .arg(&nrows_u64)
+                .arg(&mut cols)
+                .launch(cfg)?;
+        }
+    }
+    stream.synchronize()?;
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_REGISTER_COLS,
+        nrows,
+    })
+}
+
+/// Build the HALT trace on device (single row): timestamp + next_pc as DWordWL.
+/// Mirrors `generate_halt_trace`.
+pub fn gpu_build_halt_trace(timestamp: u64, next_pc: u64) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut cols = stream.alloc_zeros::<u64>(NUM_HALT_COLS)?;
+    let cfg = LaunchConfig {
+        grid_dim: (1, 1, 1),
+        block_dim: (1, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.halt_kernel)
+            .arg(&timestamp)
+            .arg(&next_pc)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_HALT_COLS,
+        nrows: 1,
+    })
+}
+
+/// Build the CPU32 trace on device. `input` interleaved, stride `CPU32_STRIDE`:
+/// `[timestamp, pc, rs1, read_register1, rv1, rs2, read_register2, rv2, imm,
+/// res, rd, write_register, alu, alu_flags, add, sub, half_instruction_length]`.
+/// Mirrors `generate_cpu32_trace` + `compute_aux`.
+pub fn gpu_build_cpu32_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_cpu32_kernel,
+        input,
+        CPU32_STRIDE,
+        n,
+        nrows,
+        NUM_CPU32_COLS,
     )
 }
 

@@ -635,6 +635,162 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
+/// True when no op is a precompile ecall (commit/keccak/ecsm). Those read live
+/// memory mid-walk, so the parallel resolver (which has no live state) can't be
+/// used; such programs fall back to the sequential `collect_ops_from_cpu`.
+fn is_precompile_free(cpu_ops: &[CpuOperation]) -> bool {
+    !cpu_ops
+        .iter()
+        .any(|op| op.ecall_commit || op.ecall_keccak || op.ecall_ecsm)
+}
+
+/// A single byte-cell access produced by a LOAD/STORE op, for the parallel
+/// memory-model resolution. `key` is the byte address; `(key, ts)` is unique
+/// (one memory access per instruction, distinct per-instruction timestamps).
+struct ByteAccess {
+    key: u64,
+    ts: u64,
+    /// Whether this byte is actually written (`j < width`); read-only otherwise.
+    is_write: bool,
+    /// The byte value written (valid only when `is_write`).
+    wval: u8,
+    /// Index into the returned `memw_ops` this access patches.
+    memw_idx: usize,
+    /// Byte offset `j` within the op (`old`/`old_timestamp` slot).
+    j: usize,
+    /// LOAD ops set `old_value = res_bytes` (own value); STORE ops use the
+    /// predecessor value from the scan.
+    is_load: bool,
+}
+
+/// Stateless, parallelizable equivalent of the LOAD/STORE portion of
+/// `collect_ops_from_cpu`. Instead of threading a `MemoryState` HashMap (O(N)
+/// reads+writes), it emits one byte-access record per touched cell, sorts by
+/// `(addr, ts)`, and runs a segmented scan: `old_timestamp[j]` = predecessor
+/// write ts, `old_value[j]` = predecessor value (STORE) / own `res_bytes`
+/// (LOAD). The sort+scan is what moves to the GPU; everything else is a pure
+/// map over `cpu_ops`. Returns the memory MEMW ops and the LOAD ops (order
+/// independent — both tables are permutation-invariant on the LogUp bus).
+///
+/// Only valid for precompile-free programs (see `is_precompile_free`).
+fn collect_memory_ops_parallel(
+    cpu_ops: &[CpuOperation],
+    init: &MemoryState,
+) -> (Vec<MemwOperation>, Vec<LoadOperation>) {
+    let mut memw_ops: Vec<MemwOperation> = Vec::new();
+    let mut load_ops: Vec<LoadOperation> = Vec::new();
+    let mut recs: Vec<ByteAccess> = Vec::new();
+
+    for op in cpu_ops {
+        let f = &op.decode.fields;
+        if f.is_load() {
+            let base_address = op.res;
+            let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
+            let loaded_value = op.rvd;
+
+            let mut value_bytes = [0u64; 8];
+            for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+                *byte = (loaded_value >> (j * 8)) & 0xFF;
+            }
+            let mut res_bytes = value_bytes;
+            if byte_count < 8 {
+                let msb = value_bytes[byte_count - 1];
+                let sign_bit = (msb >> 7) & 1;
+                let fill = if signed && sign_bit == 1 { 0xFF } else { 0 };
+                for byte in res_bytes.iter_mut().skip(byte_count) {
+                    *byte = fill;
+                }
+            }
+
+            let idx = memw_ops.len();
+            // `old` filled by the scan: old_value = res_bytes (set per-byte
+            // below), old_timestamp = predecessor ts.
+            memw_ops.push(MemwOperation::new(
+                false,
+                base_address,
+                res_bytes,
+                op.timestamp,
+                byte_count as u8,
+                true,
+            ));
+            load_ops.push(LoadOperation::new(
+                base_address,
+                op.timestamp,
+                byte_count as u8,
+                signed,
+                res_bytes,
+            ));
+            for j in 0..8 {
+                recs.push(ByteAccess {
+                    key: base_address.wrapping_add(j as u64),
+                    ts: op.timestamp,
+                    is_write: j < byte_count,
+                    wval: (res_bytes[j] & 0xFF) as u8,
+                    memw_idx: idx,
+                    j,
+                    is_load: true,
+                });
+            }
+        } else if f.is_store() {
+            let base_address = op.res;
+            let (byte_count, _) = cpu_op_to_bytes_and_signed(op);
+            let store_value = op.rv2;
+
+            let mut value_bytes = [0u64; 8];
+            for (j, byte) in value_bytes.iter_mut().enumerate() {
+                *byte = (store_value >> (j * 8)) & 0xFF;
+            }
+
+            let idx = memw_ops.len();
+            memw_ops.push(MemwOperation::new(
+                false,
+                base_address,
+                value_bytes,
+                op.timestamp,
+                byte_count as u8,
+                false,
+            ));
+            for j in 0..8 {
+                recs.push(ByteAccess {
+                    key: base_address.wrapping_add(j as u64),
+                    ts: op.timestamp,
+                    is_write: j < byte_count,
+                    wval: (value_bytes[j] & 0xFF) as u8,
+                    memw_idx: idx,
+                    j,
+                    is_load: false,
+                });
+            }
+        }
+    }
+
+    // Sort by (address, timestamp). `(key, ts)` is unique, so ordering is total.
+    recs.sort_unstable_by(|a, b| (a.key, a.ts).cmp(&(b.key, b.ts)));
+
+    // Segmented scan over each address group (this is the GPU sort+scan).
+    let mut i = 0;
+    while i < recs.len() {
+        let key = recs[i].key;
+        let (init_v, init_ts) = init.read_byte(key);
+        let mut last_v = init_v as u64;
+        let mut last_ts = init_ts;
+        while i < recs.len() && recs[i].key == key {
+            let r = &recs[i];
+            let memw = &mut memw_ops[r.memw_idx];
+            memw.old_timestamp[r.j] = last_ts;
+            // LOAD old_value = res_bytes (== memw.value); STORE = predecessor.
+            memw.old[r.j] = if r.is_load { memw.value[r.j] } else { last_v };
+            if r.is_write {
+                last_v = r.wval as u64;
+                last_ts = r.ts;
+            }
+            i += 1;
+        }
+    }
+
+    (memw_ops, load_ops)
+}
+
 /// Collects all MEMW ops and the ECSM / EC_SCALAR / ECDAS table ops for one ECSM ecall.
 ///
 /// Timestamp scheme (within the instruction's 4-wide budget): the `x11`/`x12` register reads
@@ -2388,6 +2544,21 @@ fn generate_page_tables(
         std::collections::BTreeSet::new()
     };
 
+    // For the GPU per-page scatter, bucket the touched cells by page once:
+    // (offset, value, final timestamp). The dense fill + scatter replaces the
+    // per-byte final_state HashMap lookups in `generate_page_trace`.
+    #[cfg(feature = "cuda")]
+    let cells_by_page: HashMap<u64, Vec<(u32, u8, u64)>> = {
+        let mut m: HashMap<u64, Vec<(u32, u8, u64)>> = HashMap::new();
+        for (&addr, &(value, timestamp)) in &memory_state.cells {
+            let pb = page::page_base_for_address(addr);
+            m.entry(pb)
+                .or_default()
+                .push(((addr - pb) as u32, value, timestamp));
+        }
+        m
+    };
+
     for &page_base in &page_bases {
         let config = if private_input_page_bases.contains(&page_base) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
@@ -2398,7 +2569,19 @@ fn generate_page_tables(
             PageConfig::zero_init(page_base)
         };
 
+        #[cfg(feature = "cuda")]
+        let trace = {
+            let init = config.init_values.as_deref().unwrap_or(&[]);
+            let empty: Vec<(u32, u8, u64)> = Vec::new();
+            let cells = cells_by_page.get(&page_base).unwrap_or(&empty);
+            match super::gpu_trace::gpu_build_page_table(init, page::DEFAULT_PAGE_SIZE, cells) {
+                Some(t) => t,
+                None => page::generate_page_trace(&config, &final_state),
+            }
+        };
+        #[cfg(not(feature = "cuda"))]
         let trace = page::generate_page_trace(&config, &final_state);
+
         pages.push(trace);
         page_configs.push(config);
     }
@@ -2992,6 +3175,22 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // BRANCH: GPU host-dedup + per-row fill when cuda is on, else the CPU builder.
+    #[cfg(feature = "cuda")]
+    let branches = match super::gpu_trace::gpu_build_branch_trace_tables(
+        &branch_ops,
+        max_rows.branch,
+    ) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &branch_ops,
+            max_rows.branch,
+            branch::generate_branch_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let branches = chunk_and_generate(
         &branch_ops,
         max_rows.branch,
@@ -3061,6 +3260,19 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // CPU32: GPU per-op fill when cuda is on, else the CPU builder.
+    #[cfg(feature = "cuda")]
+    let cpu32s = match super::gpu_trace::gpu_build_cpu32_trace_tables(&cpu32_ops, max_rows.cpu32) {
+        Some(t) => t,
+        None => chunk_and_generate::<cpu32::Cpu32Operation>(
+            &cpu32_ops,
+            max_rows.cpu32,
+            cpu32::generate_cpu32_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
         &cpu32_ops,
         max_rows.cpu32,
@@ -3069,8 +3281,26 @@ fn build_traces(
         storage_mode,
     )?;
 
-    let mut bitwise = bitwise::generate_bitwise_trace();
-    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+    // BITWISE on GPU: fixed 2^20 cols + multiplicity histogram (atomic
+    // scatter-add). Part of moving the whole trace fill onto the device; the D2H
+    // cost here is transient (it disappears once the pipeline is fully resident).
+    #[cfg(feature = "cuda")]
+    #[allow(unused_mut)]
+    let mut bitwise = match super::gpu_trace::gpu_build_bitwise_table(&bitwise_ops) {
+        Some(t) => t,
+        None => {
+            let mut bitwise = bitwise::generate_bitwise_trace();
+            bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+            bitwise
+        }
+    };
+    #[cfg(not(feature = "cuda"))]
+    #[allow(unused_mut)]
+    let mut bitwise = {
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        bitwise
+    };
 
     // Update DECODE multiplicities
     // Each CPU operation looks up the DECODE table once
@@ -3086,6 +3316,15 @@ fn build_traces(
 
     // Generate remaining traces in parallel (page, register, halt, commit).
     // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
+    #[allow(unused_mut)]
+    // COMMIT: GPU per-op fill when cuda is on, else the CPU builder.
+    #[cfg(feature = "cuda")]
+    #[allow(unused_mut)]
+    let mut commit_trace = match super::gpu_trace::gpu_build_commit_table(&commit_ops) {
+        Some(t) => t,
+        None => commit::generate_commit_trace(&commit_ops),
+    };
+    #[cfg(not(feature = "cuda"))]
     #[allow(unused_mut)]
     let mut commit_trace = commit::generate_commit_trace(&commit_ops);
 
@@ -3109,6 +3348,24 @@ fn build_traces(
     let ecdas_trace = ecdas::generate_ecdas_trace(&ecdas_ops);
 
     #[allow(unused_mut)]
+    // GPU-first builders for the fixed REGISTER + HALT tables (CPU fallback).
+    let build_register = || {
+        #[cfg(feature = "cuda")]
+        if let Some(t) =
+            super::gpu_trace::gpu_build_register_table(&register_final_state, entry_point)
+        {
+            return t;
+        }
+        register::generate_register_trace(&register_final_state, entry_point)
+    };
+    let build_halt = || {
+        #[cfg(feature = "cuda")]
+        if let Some(t) = super::gpu_trace::gpu_build_halt_table(halt_timestamp, halt_next_pc) {
+            return t;
+        }
+        halt::generate_halt_trace(halt_timestamp, halt_next_pc)
+    };
+
     let (mut pages, page_configs, mut register_trace, mut halt_trace);
     #[cfg(feature = "parallel")]
     {
@@ -3119,10 +3376,10 @@ fn build_traces(
                         Some(elf) => generate_page_tables(elf, memory_state, private_input),
                         None => (Vec::new(), Vec::new()),
                     },
-                    || register::generate_register_trace(&register_final_state, entry_point),
+                    build_register,
                 )
             },
-            || halt::generate_halt_trace(halt_timestamp, halt_next_pc),
+            build_halt,
         );
         let (pages_v, page_configs_v) = pages_val;
         pages = pages_v;
@@ -3143,8 +3400,8 @@ fn build_traces(
                 page_configs = Vec::new();
             }
         }
-        register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+        register_trace = build_register();
+        halt_trace = build_halt();
     }
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3987,5 +4244,121 @@ impl Traces {
             StorageMode::Ram,
             &[],
         )
+    }
+}
+
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use crate::test_utils::run_asm_elf;
+
+    /// Probe the REAL workload (ethrex block): op composition (memory vs
+    /// register vs precompile) and the sequential memory-model walk's wall time.
+    /// Needs the built guest ELF — run with:
+    ///   cargo test -p lambda-vm-prover --release ethrex_walk_probe -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs built ethrex.elf; run with --ignored --nocapture"]
+    fn ethrex_walk_probe() {
+        use std::path::PathBuf;
+        use std::time::Instant;
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let elf_path = root.join("executor/program_artifacts/rust/ethrex.elf");
+        for block in ["ethrex_empty_block.bin", "ethrex_simple_tx.bin"] {
+            let input_path = root.join("executor/tests").join(block);
+            let elf_bytes = std::fs::read(&elf_path).expect("read ethrex.elf");
+            let private_input = std::fs::read(&input_path).expect("read block input");
+            let elf = executor::elf::Elf::load(&elf_bytes).expect("load elf");
+            let executor =
+                executor::vm::execution::Executor::new(&elf, private_input.clone()).expect("exec new");
+            let result = executor.run().expect("run");
+            let cpu_ops = collect_cpu_ops(&result.logs, &result.instructions).expect("cpu ops");
+
+            let n = cpu_ops.len();
+            let loads = cpu_ops.iter().filter(|o| o.decode.fields.is_load()).count();
+            let stores = cpu_ops.iter().filter(|o| o.decode.fields.is_store()).count();
+            let keccak = cpu_ops.iter().filter(|o| o.ecall_keccak).count();
+            let commit = cpu_ops.iter().filter(|o| o.ecall_commit).count();
+            let ecsm = cpu_ops.iter().filter(|o| o.ecall_ecsm).count();
+            let free = is_precompile_free(&cpu_ops);
+
+            let mut ms = MemoryState::from_elf(&elf);
+            ms.add_private_input(&private_input);
+            let mut rs = RegisterState::new(elf.entry_point);
+            let t = Instant::now();
+            let (memw, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops, cpu32_ops, ..) =
+                collect_ops_from_cpu(&cpu_ops, &mut ms, &mut rs);
+            let walk_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let reg_memw = memw.iter().filter(|o| o.is_register).count();
+            let mem_memw = memw.len() - reg_memw;
+
+            println!(
+                "{block}: cpu_ops={n} loads={loads} stores={stores} | ecall keccak={keccak} commit={commit} ecsm={ecsm} | precompile_free={free}\n  memw total={} (register={reg_memw}, memory={mem_memw}) load_ops={} | sequential walk={walk_ms:.1}ms",
+                memw.len(),
+                load_ops.len()
+            );
+            // Remaining CPU-side table op counts (which fills are NOT yet on GPU).
+            println!(
+                "  REMAINING FILLS: cpu32_ops={} bitwise_ops={} lt_ops={} shift_ops={} commit_ops={} keccak_ops={}",
+                cpu32_ops.len(),
+                bitwise_ops.len(),
+                lt_ops.len(),
+                shift_ops.len(),
+                commit_ops.len(),
+                keccak_ops.len()
+            );
+        }
+    }
+
+    /// The parallel memory resolver (`collect_memory_ops_parallel`) must produce
+    /// byte-identical memory MEMW ops + LOAD ops to the sequential walk on
+    /// precompile-free programs. Compared as sets keyed by the unique
+    /// per-instruction timestamp.
+    #[test]
+    fn parallel_memory_matches_sequential() {
+        for prog in ["all_loadstore_32", "all_instructions_64", "fib_iterative_372k"] {
+            let (elf, logs, instrs) = run_asm_elf(prog);
+            let cpu_ops = collect_cpu_ops(&logs, &instrs).expect("collect_cpu_ops");
+            assert!(
+                is_precompile_free(&cpu_ops),
+                "{prog}: expected a precompile-free program"
+            );
+
+            // Sequential reference.
+            let mut ms = MemoryState::from_elf(&elf);
+            let mut rs = RegisterState::new(elf.entry_point);
+            let (seq_memw, seq_load, ..) = collect_ops_from_cpu(&cpu_ops, &mut ms, &mut rs);
+            let mut seq_mem: Vec<MemwOperation> =
+                seq_memw.into_iter().filter(|o| !o.is_register).collect();
+
+            // Parallel resolver.
+            let init = MemoryState::from_elf(&elf);
+            let (mut par_mem, mut par_load) = collect_memory_ops_parallel(&cpu_ops, &init);
+            let mut seq_load = seq_load;
+
+            // Timestamps are unique per instruction; sort on (timestamp, address).
+            let key = |o: &MemwOperation| (o.timestamp, o.base_address);
+            seq_mem.sort_by_key(key);
+            par_mem.sort_by_key(key);
+            assert_eq!(
+                seq_mem.len(),
+                par_mem.len(),
+                "{prog}: memory MEMW op count mismatch"
+            );
+            assert_eq!(seq_mem, par_mem, "{prog}: memory MEMW ops differ");
+
+            let lkey = |o: &LoadOperation| (o.timestamp, o.base_address);
+            seq_load.sort_by_key(lkey);
+            par_load.sort_by_key(lkey);
+            assert_eq!(seq_load, par_load, "{prog}: LOAD ops differ");
+
+            println!(
+                "{prog}: parallel memory resolver matches sequential ({} mem ops, {} loads)",
+                par_mem.len(),
+                par_load.len()
+            );
+        }
     }
 }

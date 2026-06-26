@@ -102,7 +102,7 @@ pub mod cols {
 // =========================================================================
 
 /// A single MEMW operation to be added to the trace.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemwOperation {
     /// Whether this is a register access (true) or memory access (false)
     pub is_register: bool,

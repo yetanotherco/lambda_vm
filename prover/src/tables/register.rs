@@ -100,7 +100,7 @@ pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 /// Returns the Word addresses for all register table rows.
 ///
 /// x0-x31 use addresses 0..63, x254 uses address 508, x255 uses 510..511.
-fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
+pub(crate) fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
     let mut addrs = [0u64; NUM_REGISTER_ADDRESSES];
     // x0-x31: addresses 0..63
     for (i, addr) in addrs.iter_mut().enumerate().take(64) {
@@ -120,7 +120,7 @@ fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
 /// - x254 at offset 508 is the synthetic commit index, initialized to 0
 /// - PC (x255) words at offset 510,511 hold entry_point
 /// - All others are 0
-fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
+pub(crate) fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
     match word_addr {
         4 => (STACK_TOP & 0xFFFF_FFFF) as u32,
         5 => (STACK_TOP >> 32) as u32,

@@ -19,7 +19,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stark::trace::TraceTable;
 
+use super::bitwise::BitwiseOperation;
+use super::branch::BranchOperation;
 use super::bytewise::BytewiseOperation;
+use super::commit::CommitOperation;
+use super::cpu32::Cpu32Operation;
+use super::register::{
+    self, FinalRegisterStateMap, NUM_REGISTER_ADDRESSES,
+};
 use super::cpu::cols;
 use super::dvrm::DvrmOperation;
 use super::eq::EqOperation;
@@ -107,6 +114,67 @@ pub fn gpu_memw_aligned_table_builds() -> u64 {
 pub static GPU_MEMW_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_memw_table_builds() -> u64 {
     GPU_MEMW_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU BITWISE-table builds.
+pub static GPU_BITWISE_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_bitwise_table_builds() -> u64 {
+    GPU_BITWISE_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU PAGE-table builds (one per page).
+pub static GPU_PAGE_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_page_table_builds() -> u64 {
+    GPU_PAGE_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU BRANCH-table builds.
+pub static GPU_BRANCH_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_branch_table_builds() -> u64 {
+    GPU_BRANCH_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU COMMIT-table builds.
+pub static GPU_COMMIT_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_commit_table_builds() -> u64 {
+    GPU_COMMIT_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU REGISTER-table builds.
+pub static GPU_REGISTER_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_register_table_builds() -> u64 {
+    GPU_REGISTER_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU HALT-table builds.
+pub static GPU_HALT_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_halt_table_builds() -> u64 {
+    GPU_HALT_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU CPU32-table builds.
+pub static GPU_CPU32_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_cpu32_table_builds() -> u64 {
+    GPU_CPU32_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Convert a device column-major buffer into a host `TraceTable` (no device
+/// handle — for small/preprocessed-split tables that stay on the host commit
+/// path).
+fn device_to_host_table(
+    dev: math_cuda::trace::DeviceMainCols,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let (ncols, nrows) = (dev.ncols, dev.nrows);
+    let host = dev.to_host().ok()?;
+    let columns: Vec<Vec<FE>> = (0..ncols)
+        .map(|c| {
+            host[c * nrows..c * nrows + nrows]
+                .iter()
+                .map(|&v| FE::from(v))
+                .collect()
+        })
+        .collect();
+    Some(TraceTable::from_columns_main(columns, 1))
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -562,5 +630,231 @@ pub fn gpu_build_memw_trace_tables(
         tables.push(device_to_trace_table(dev)?);
     }
     GPU_MEMW_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// BITWISE table on GPU: the fixed 2^20-row lookup + the multiplicity histogram
+/// over `bitwise_ops` (atomic scatter-add). Replaces `generate_bitwise_trace` +
+/// `update_multiplicities`. Returns a host `TraceTable` with NO device handle —
+/// BITWISE has a preprocessed/multiplicity commit split handled on the host
+/// commit path, so we don't route it through the device-resident LDE seam.
+pub fn gpu_build_bitwise_table(
+    bitwise_ops: &[BitwiseOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    // Pack each lookup into x | y<<8 | z<<16 | type<<20 (type = enum discriminant
+    // 0..9, matching mu_col = 11 + type in the kernel / update_multiplicities).
+    let packed: Vec<u32> = bitwise_ops
+        .iter()
+        .map(|op| {
+            (op.x as u32)
+                | ((op.y as u32) << 8)
+                | ((op.z as u32) << 16)
+                | ((op.lookup_type as u32) << 20)
+        })
+        .collect();
+
+    let dev = trace::gpu_build_bitwise_trace(&packed).ok()?;
+    let (ncols, nrows) = (dev.ncols, dev.nrows);
+    let host = dev.to_host().ok()?;
+    let columns: Vec<Vec<FE>> = (0..ncols)
+        .map(|c| {
+            host[c * nrows..c * nrows + nrows]
+                .iter()
+                .map(|&v| FE::from(v))
+                .collect()
+        })
+        .collect();
+    let tt = TraceTable::from_columns_main(columns, 1);
+    GPU_BITWISE_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tt)
+}
+
+/// Build one PAGE table on GPU: dense fill (OFFSET, INIT, FINI=INIT, TS=0) +
+/// scatter of the page's touched cells. Returns a host `TraceTable` with no
+/// device handle (PAGE has a preprocessed OFFSET/INIT split on the host commit
+/// path). Mirrors `generate_page_trace`. `init_values` is the page's initial
+/// bytes (empty = all-zero page); `cells` are `(offset, value, timestamp)`.
+pub fn gpu_build_page_table(
+    init_values: &[u8],
+    page_size: usize,
+    cells: &[(u32, u8, u64)],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut offsets = Vec::with_capacity(cells.len());
+    let mut values = Vec::with_capacity(cells.len());
+    let mut timestamps = Vec::with_capacity(cells.len());
+    for &(off, val, ts) in cells {
+        offsets.push(off);
+        values.push(val);
+        timestamps.push(ts);
+    }
+    let dev =
+        trace::gpu_build_page_trace(init_values, page_size, &offsets, &values, &timestamps).ok()?;
+    let (ncols, nrows) = (dev.ncols, dev.nrows);
+    let host = dev.to_host().ok()?;
+    let columns: Vec<Vec<FE>> = (0..ncols)
+        .map(|c| {
+            host[c * nrows..c * nrows + nrows]
+                .iter()
+                .map(|&v| FE::from(v))
+                .collect()
+        })
+        .collect();
+    let tt = TraceTable::from_columns_main(columns, 1);
+    GPU_PAGE_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tt)
+}
+
+/// BRANCH tables on GPU. Dedup by (pc, offset, register, jalr) with summed
+/// multiplicity on the host (small table), then a per-row GPU fill (next_pc
+/// decomposition). Chunked like the CPU path. Mirrors `generate_branch_trace`.
+pub fn gpu_build_branch_trace_tables(
+    branch_ops: &[BranchOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if branch_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::BRANCH_STRIDE;
+    let mut tables = Vec::with_capacity(branch_ops.len().div_ceil(max_rows));
+    for chunk in branch_ops.chunks(max_rows) {
+        // Host dedup (same per-chunk grouping as generate_branch_trace).
+        let mut op_map: std::collections::HashMap<&BranchOperation, u64> =
+            std::collections::HashMap::new();
+        for op in chunk {
+            *op_map.entry(op).or_insert(0) += 1;
+        }
+        let n = op_map.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, (op, mult)) in op_map.into_iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.pc;
+            input[base + 1] = op.offset;
+            input[base + 2] = op.register;
+            input[base + 3] = op.jalr as u64;
+            input[base + 4] = mult;
+        }
+        let dev = trace::gpu_build_branch_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_BRANCH_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// COMMIT table on GPU (single table, no chunking; per-op fill, mu=1). Mirrors
+/// `generate_commit_trace`.
+pub fn gpu_build_commit_table(
+    commit_ops: &[CommitOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if commit_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::COMMIT_STRIDE;
+    let n = commit_ops.len();
+    let nrows = n.next_power_of_two().max(4);
+    let mut input = vec![0u64; n * stride];
+    for (i, op) in commit_ops.iter().enumerate() {
+        let base = i * stride;
+        input[base] = op.timestamp;
+        input[base + 1] = op.index;
+        input[base + 2] = op.address;
+        input[base + 3] = op.count;
+        input[base + 4] = op.first as u64;
+        input[base + 5] = op.end as u64;
+        input[base + 6] = op.value as u64;
+    }
+    let dev = trace::gpu_build_commit_trace(&input, n, nrows).ok()?;
+    device_to_trace_table(dev).inspect(|_| {
+        GPU_COMMIT_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// REGISTER table on GPU: dense fill (OFFSET/INIT/FINI/TS) + scatter of accessed
+/// register words. OFFSET/INIT are preprocessed → host TraceTable (no device
+/// handle). Mirrors `generate_register_trace`.
+pub fn gpu_build_register_table(
+    final_state: &FinalRegisterStateMap,
+    entry_point: u64,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let addr_list = register::register_word_address_list();
+    let init: Vec<u64> = addr_list
+        .iter()
+        .map(|&a| register::init_value_for_address(a, entry_point) as u64)
+        .collect();
+    let addrs: Vec<u64> = addr_list.to_vec();
+    let nrows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+
+    // Resolve each accessed word to its row (position in addr_list).
+    let mut row_of: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for (i, &a) in addr_list.iter().enumerate() {
+        row_of.insert(a, i as u32);
+    }
+    let mut rows = Vec::new();
+    let mut values = Vec::new();
+    let mut tss = Vec::new();
+    for (&word_addr, state) in final_state.iter() {
+        if let Some(&row) = row_of.get(&word_addr) {
+            rows.push(row);
+            values.push(state.value as u64);
+            tss.push(state.timestamp);
+        }
+    }
+
+    let dev = trace::gpu_build_register_trace(&addrs, &init, nrows, &rows, &values, &tss).ok()?;
+    device_to_host_table(dev).inspect(|_| {
+        GPU_REGISTER_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// HALT table on GPU (single row). Mirrors `generate_halt_trace`.
+pub fn gpu_build_halt_table(
+    timestamp: u64,
+    next_pc: u64,
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let dev = trace::gpu_build_halt_trace(timestamp, next_pc).ok()?;
+    device_to_host_table(dev).inspect(|_| {
+        GPU_HALT_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    })
+}
+
+/// CPU32 tables on GPU (delegated *W instructions). No dedup (one row per op);
+/// chunked like the CPU path. Mirrors `generate_cpu32_trace`.
+pub fn gpu_build_cpu32_trace_tables(
+    cpu32_ops: &[Cpu32Operation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if cpu32_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::CPU32_STRIDE;
+    let mut tables = Vec::with_capacity(cpu32_ops.len().div_ceil(max_rows));
+    for chunk in cpu32_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let b = i * stride;
+            input[b] = op.timestamp;
+            input[b + 1] = op.pc;
+            input[b + 2] = op.rs1 as u64;
+            input[b + 3] = op.read_register1 as u64;
+            input[b + 4] = op.rv1;
+            input[b + 5] = op.rs2 as u64;
+            input[b + 6] = op.read_register2 as u64;
+            input[b + 7] = op.rv2;
+            input[b + 8] = op.imm;
+            input[b + 9] = op.res;
+            input[b + 10] = op.rd as u64;
+            input[b + 11] = op.write_register as u64;
+            input[b + 12] = op.alu as u64;
+            input[b + 13] = op.alu_flags as u64;
+            input[b + 14] = op.add as u64;
+            input[b + 15] = op.sub as u64;
+            input[b + 16] = op.half_instruction_length as u64;
+        }
+        let dev = trace::gpu_build_cpu32_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_CPU32_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }
