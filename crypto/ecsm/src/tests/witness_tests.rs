@@ -83,7 +83,7 @@ fn shifted_quotient_satisfies_division_identity() {
     let num: crate::witness::I576 = pos.as_int().wrapping_sub(neg.as_int());
     let (q_opt, r) = num.checked_div_rem(&p_nz);
     assert_eq!(r, Int::<5>::ZERO, "2λyA - 3xA² must be divisible by p");
-    let q: crate::witness::I576 = q_opt.unwrap().into();
+    let q: crate::witness::I576 = q_opt.unwrap();
     // Final result q + 3p must be positive and fit in 33 bytes.
     let result: crate::witness::I576 = q.wrapping_add(r_3p.resize::<9>().as_int());
     let (result_abs, result_is_neg) = result.abs_sign();

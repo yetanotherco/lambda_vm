@@ -78,7 +78,7 @@ pub struct StepPts {
 /// Requires `k >= 1`.
 pub fn msb_position(k: &U256) -> u32 {
     debug_assert!(*k != U256::ZERO);
-    (k.bits_vartime() as u32) - 1
+    k.bits_vartime() - 1
 }
 
 // =========================================================================
@@ -122,13 +122,13 @@ fn batch_invert(xs: &[Fp]) -> Vec<Fp> {
     let mut acc = Fp::ONE;
     for x in xs {
         prefix.push(acc);
-        acc = acc * *x;
+        acc *= *x;
     }
     let mut inv = fp_invert(acc).expect("ECSM: batch denominator is nonzero");
     let mut out = vec![Fp::ONE; n];
     for i in (0..n).rev() {
         out[i] = prefix[i] * inv;
-        inv = inv * xs[i];
+        inv *= xs[i];
     }
     out
 }
