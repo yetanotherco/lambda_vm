@@ -99,6 +99,7 @@ const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const TRACE_CPU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_cpu.ptx"));
 const TRACE_LT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_lt.ptx"));
+const TRACE_ALU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_alu.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -174,6 +175,8 @@ pub struct Backend {
     // VM trace generation.
     pub trace_cpu_kernel: CudaFunction,
     pub trace_lt_kernel: CudaFunction,
+    pub trace_eq_kernel: CudaFunction,
+    pub trace_bytewise_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -198,6 +201,7 @@ impl Backend {
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let trace_cpu = ctx.load_module(Ptx::from_src(TRACE_CPU_PTX))?;
         let trace_lt = ctx.load_module(Ptx::from_src(TRACE_LT_PTX))?;
+        let trace_alu = ctx.load_module(Ptx::from_src(TRACE_ALU_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -269,6 +273,8 @@ impl Backend {
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
             trace_cpu_kernel: trace_cpu.load_function("trace_cpu_kernel")?,
             trace_lt_kernel: trace_lt.load_function("trace_lt_kernel")?,
+            trace_eq_kernel: trace_alu.load_function("trace_eq_kernel")?,
+            trace_bytewise_kernel: trace_alu.load_function("trace_bytewise_kernel")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

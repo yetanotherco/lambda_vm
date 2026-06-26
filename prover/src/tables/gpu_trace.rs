@@ -19,7 +19,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use stark::trace::TraceTable;
 
+use super::bytewise::{self, BytewiseOperation};
 use super::cpu::cols;
+use super::eq::{self, EqOperation};
 use super::lt::{self, LtOperation};
 use super::types::{DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 
@@ -39,6 +41,18 @@ pub static GPU_LT_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 /// Number of LT tables built on the GPU so far this process.
 pub fn gpu_lt_table_builds() -> u64 {
     GPU_LT_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU EQ-table builds.
+pub static GPU_EQ_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_eq_table_builds() -> u64 {
+    GPU_EQ_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU BYTEWISE-table builds.
+pub static GPU_BYTEWISE_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_bytewise_table_builds() -> u64 {
+    GPU_BYTEWISE_TABLE_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -177,5 +191,90 @@ pub fn gpu_build_lt_trace_tables(
     }
 
     GPU_LT_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// EQ tables on GPU (per-chunk host dedup → GPU fill). Mirrors generate_eq_trace.
+pub fn gpu_build_eq_trace_tables(
+    eq_ops: &[EqOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    use std::collections::HashMap;
+    if eq_ops.is_empty() {
+        return None;
+    }
+    let ncols = eq::cols::NUM_COLUMNS;
+    let mut tables = Vec::with_capacity(eq_ops.len().div_ceil(max_rows));
+    for chunk in eq_ops.chunks(max_rows) {
+        let mut map: HashMap<EqOperation, u64> = HashMap::new();
+        for op in chunk {
+            *map.entry(op.clone()).or_insert(0) += 1;
+        }
+        let unique: Vec<(EqOperation, u64)> = map.into_iter().collect();
+        let n = unique.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut a = vec![0u64; n];
+        let mut b = vec![0u64; n];
+        let mut flags = vec![0u64; n];
+        let mut mult = vec![0u64; n];
+        for (i, (op, m)) in unique.iter().enumerate() {
+            a[i] = op.a;
+            b[i] = op.b;
+            flags[i] = op.invert as u64;
+            mult[i] = *m;
+        }
+        let dev = trace::gpu_build_eq_trace(&a, &b, &flags, &mult, n, nrows).ok()?;
+        let host = dev.to_host().ok()?;
+        let columns: Vec<Vec<FE>> = (0..ncols)
+            .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
+            .collect();
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
+    }
+    GPU_EQ_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// BYTEWISE tables on GPU (per-chunk host dedup → GPU fill). Mirrors
+/// generate_bytewise_trace.
+pub fn gpu_build_bytewise_trace_tables(
+    bytewise_ops: &[BytewiseOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    use std::collections::HashMap;
+    if bytewise_ops.is_empty() {
+        return None;
+    }
+    let ncols = bytewise::cols::NUM_COLUMNS;
+    let mut tables = Vec::with_capacity(bytewise_ops.len().div_ceil(max_rows));
+    for chunk in bytewise_ops.chunks(max_rows) {
+        let mut map: HashMap<BytewiseOperation, u64> = HashMap::new();
+        for op in chunk {
+            *map.entry(op.clone()).or_insert(0) += 1;
+        }
+        let unique: Vec<(BytewiseOperation, u64)> = map.into_iter().collect();
+        let n = unique.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut a = vec![0u64; n];
+        let mut b = vec![0u64; n];
+        let mut op_col = vec![0u64; n];
+        let mut mult = vec![0u64; n];
+        for (i, (op, m)) in unique.iter().enumerate() {
+            a[i] = op.a;
+            b[i] = op.b;
+            op_col[i] = op.op as u64;
+            mult[i] = *m;
+        }
+        let dev = trace::gpu_build_bytewise_trace(&a, &b, &op_col, &mult, n, nrows).ok()?;
+        let host = dev.to_host().ok()?;
+        let columns: Vec<Vec<FE>> = (0..ncols)
+            .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
+            .collect();
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
+    }
+    GPU_BYTEWISE_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }

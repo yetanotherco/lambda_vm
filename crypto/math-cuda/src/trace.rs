@@ -21,6 +21,12 @@ pub const NUM_CPU_COLS: usize = 38;
 /// LT table column count (must match `prover::tables::lt::cols::NUM_COLUMNS`).
 pub const NUM_LT_COLS: usize = 17;
 
+/// EQ table column count (`prover::tables::eq::cols::NUM_COLUMNS`).
+pub const NUM_EQ_COLS: usize = 12;
+
+/// BYTEWISE table column count (`prover::tables::bytewise::cols::NUM_COLUMNS`).
+pub const NUM_BYTEWISE_COLS: usize = 26;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -213,6 +219,97 @@ pub fn gpu_build_lt_trace(
     Ok(DeviceMainCols {
         buf: Arc::new(cols),
         ncols: NUM_LT_COLS,
+        nrows,
+    })
+}
+
+/// Build the EQ trace table on device from deduped ops. SoA over `n` unique
+/// ops: `a`, `b`, `flags` (bit0=invert), `mult`. Padding rows stay zero.
+pub fn gpu_build_eq_trace(
+    a: &[u64],
+    b: &[u64],
+    flags: &[u64],
+    mult: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    build_alu4(&backend()?.trace_eq_kernel, a, b, flags, mult, n, nrows, NUM_EQ_COLS)
+}
+
+/// Build the BYTEWISE trace table on device from deduped ops. SoA over `n`
+/// unique ops: `a`, `b`, `op` (AND=0/OR=1/XOR=2), `mult`. Padding rows stay zero.
+pub fn gpu_build_bytewise_trace(
+    a: &[u64],
+    b: &[u64],
+    op: &[u64],
+    mult: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    build_alu4(
+        &backend()?.trace_bytewise_kernel,
+        a,
+        b,
+        op,
+        mult,
+        n,
+        nrows,
+        NUM_BYTEWISE_COLS,
+    )
+}
+
+/// Shared launcher for ALU kernels taking 4 SoA u64 inputs (a, b, c, mult) and
+/// producing an `ncols * nrows` column-major buffer. One thread per row.
+#[allow(clippy::too_many_arguments)]
+fn build_alu4(
+    kernel: &cudarc::driver::CudaFunction,
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    mult: &[u64],
+    n: usize,
+    nrows: usize,
+    ncols: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(a.len(), n);
+    assert_eq!(b.len(), n);
+    assert_eq!(c.len(), n);
+    assert_eq!(mult.len(), n);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let a_d = stream.clone_htod(a)?;
+    let b_d = stream.clone_htod(b)?;
+    let c_d = stream.clone_htod(c)?;
+    let mult_d = stream.clone_htod(mult)?;
+    let mut cols = stream.alloc_zeros::<u64>(ncols * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&c_d)
+            .arg(&mult_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols,
         nrows,
     })
 }

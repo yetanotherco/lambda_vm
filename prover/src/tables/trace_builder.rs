@@ -2904,6 +2904,18 @@ fn build_traces(
     )?;
 
     // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
+    #[cfg(feature = "cuda")]
+    let eqs = match super::gpu_trace::gpu_build_eq_trace_tables(&eq_ops, max_rows.eq) {
+        Some(t) => t,
+        None => chunk_and_generate::<eq::EqOperation>(
+            &eq_ops,
+            max_rows.eq,
+            eq::generate_eq_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let eqs = chunk_and_generate::<eq::EqOperation>(
         &eq_ops,
         max_rows.eq,
@@ -2911,6 +2923,20 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+
+    #[cfg(feature = "cuda")]
+    let bytewises =
+        match super::gpu_trace::gpu_build_bytewise_trace_tables(&bytewise_ops, max_rows.bytewise) {
+            Some(t) => t,
+            None => chunk_and_generate::<bytewise::BytewiseOperation>(
+                &bytewise_ops,
+                max_rows.bytewise,
+                bytewise::generate_bytewise_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )?,
+        };
+    #[cfg(not(feature = "cuda"))]
     let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
         &bytewise_ops,
         max_rows.bytewise,
