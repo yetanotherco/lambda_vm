@@ -5,7 +5,6 @@ use std::time::{Duration, Instant};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-#[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
 use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 use math::fft::two_half_fft::TwoHalfTwiddles;
@@ -293,9 +292,10 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     two_half_fwd: TwoHalfTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
     /// Composition half-extension (`decompose_and_extend_d2`): inverse twiddles for
-    /// the g²-coset halves of size `lde_size/2`, and weights `g⁻ʲ/(lde_size/2)`. The
-    /// forward FFT reuses `fwd` (size `lde_size`).
+    /// the g²-coset halves of size `lde_size/2`, forward twiddles for the full
+    /// g-coset of size `lde_size`, and weights `g⁻ʲ/(lde_size/2)`.
     comp_inv: LayerTwiddles<F>,
+    comp_fwd: LayerTwiddles<F>,
     comp_weights: Vec<FieldElement<F>>,
 }
 
@@ -324,10 +324,12 @@ impl<F: IsFFTField> LdeTwiddles<F> {
         // iFFT yields `n·cⱼ·(g²)ʲ` and these weights turn that into `cⱼ·gʲ` for the
         // forward FFT onto the g-coset.
         let half_size = lde_size / 2;
-        let half_size_inv = FieldElement::<F>::from(half_size as u64)
+        let half_size_fe = FieldElement::<F>::from(half_size as u64);
+        let inv_half_size_offset = (&half_size_fe * offset)
             .inv()
-            .expect("half_size is power of two");
-        let offset_inv = offset.inv().expect("coset offset is non-zero");
+            .expect("half_size and coset offset are non-zero");
+        let half_size_inv = offset * &inv_half_size_offset;
+        let offset_inv = &half_size_fe * &inv_half_size_offset;
         let comp_weights = {
             let mut w = Vec::with_capacity(half_size);
             let mut cur = half_size_inv;
@@ -352,6 +354,8 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             coset_weights,
             comp_inv: LayerTwiddles::<F>::new_inverse(half_size.trailing_zeros() as u64)
                 .expect("valid composition inverse twiddles"),
+            comp_fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
+                .expect("valid composition forward twiddles"),
             comp_weights,
         }
     }
@@ -1218,7 +1222,7 @@ pub trait IsStarkProver<
             2,
             &twiddles.comp_weights,
             &twiddles.comp_inv,
-            &twiddles.fwd,
+            &twiddles.comp_fwd,
         )
         .expect("coset extension")
     }
