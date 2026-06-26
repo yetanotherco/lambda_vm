@@ -109,18 +109,33 @@ jobs:
 
       - name: Pick a Vast offer
         id: offer
+        env:
+          # Retry the same query to ride out transient scarcity (datacenter RTX 5090s
+          # are a small, fast-churning pool). Total wait ~= ATTEMPTS * INTERVAL.
+          OFFER_ATTEMPTS: "10"
+          OFFER_INTERVAL: "30"
         run: |
-          # NB: cpu_ram is in MB (32 GB = 32 * 1024 = 32768); disk_space/cuda_max_good as named.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=32768 disk_space>=64 datacenter=true verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          # cpu_ram is the machine's TOTAL RAM in MB; a 1-GPU rental usually gets most of it.
+          # The ethrex_bench_20 GPU prove peaks at ~78 GB heap, so require >=96 GB
+          # (96 * 1024 = 98304) for headroom — a 32 GB box would OOM.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=98304 disk_space>=64 datacenter=true verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY"
-          vastai search offers "$QUERY" --raw -o dph_total > offers.json
-          OFFER_ID=$(jq -r 'sort_by(.dph_total) | .[0].id // empty' offers.json)
-          OFFER_PRICE=$(jq -r 'sort_by(.dph_total) | .[0].dph_total // empty' offers.json)
+          OFFER_ID=""
+          for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
+            vastai search offers "$QUERY" --raw -o dph_total > offers.json || true
+            OFFER_ID=$(jq -r 'sort_by(.dph_total) | .[0].id // empty' offers.json)
+            OFFER_PRICE=$(jq -r 'sort_by(.dph_total) | .[0].dph_total // empty' offers.json)
+            if [ -n "$OFFER_ID" ]; then
+              echo "Selected offer $OFFER_ID at \$${OFFER_PRICE}/hr (attempt $attempt)"
+              break
+            fi
+            echo "No matching offer (attempt $attempt/$OFFER_ATTEMPTS); retrying in ${OFFER_INTERVAL}s..."
+            sleep "$OFFER_INTERVAL"
+          done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No datacenter RTX 5090 offer matched (>=16 cores, >=32GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No datacenter RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
             exit 1
           fi
-          echo "Selected offer $OFFER_ID at \$${OFFER_PRICE}/hr"
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
           echo "price=$OFFER_PRICE" >> "$GITHUB_OUTPUT"
 
