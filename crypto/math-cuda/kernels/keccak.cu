@@ -159,8 +159,8 @@ extern "C" __global__ void keccak256_leaves_base_batched(
     uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_rows) return;
 
-    // Bit-reverse the row index so we read columns at `br` but write the
-    // hashed leaf at `tid` — matching the CPU `commit_columns_bit_reversed`.
+    // Bit-reverse the row index so we read columns at `br` but write the hashed
+    // leaf at `tid` — matching the CPU per-row `commit_bit_reversed(.., 1)`.
     uint64_t br = __brevll(tid) >> (64 - log_num_rows);
 
     uint64_t st[25];

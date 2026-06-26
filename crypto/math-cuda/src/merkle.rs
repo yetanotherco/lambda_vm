@@ -3,7 +3,7 @@
 //! Matches `FieldElementVectorBackend<F, Keccak256, 32>::hash_data` in
 //! `crypto/crypto/src/merkle_tree/backends/field_element_vector.rs`, combined
 //! with the `reverse_index` row read pattern used in
-//! `commit_columns_bit_reversed` at `crypto/stark/src/prover.rs`.
+//! `commit_bit_reversed` at `crypto/stark/src/commitment.rs`.
 //!
 //! Caller supplies base-field column slabs already laid out as
 //! `[col * col_stride + row]` (the same layout `coset_lde_batch_base_into`
@@ -38,6 +38,14 @@ pub fn keccak_leaves_base(
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    assert!(
+        num_rows >= rows_per_leaf,
+        "num_rows must be at least rows_per_leaf"
+    );
+    assert!(
+        num_rows >= 2,
+        "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
+    );
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
@@ -80,6 +88,14 @@ pub fn keccak_leaves_ext3(
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    assert!(
+        num_rows >= rows_per_leaf,
+        "num_rows must be at least rows_per_leaf"
+    );
+    assert!(
+        num_rows >= 2,
+        "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
+    );
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
