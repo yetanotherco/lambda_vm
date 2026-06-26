@@ -94,6 +94,79 @@ pub fn keccak_leaves_ext3(
     Ok(out)
 }
 
+/// Row-pair base-field leaf hashing: leaf `i` hashes bit-reversed rows `2i`,
+/// `2i+1`. Returns `num_rows/2 * 32` hash bytes. Parity entry point for the
+/// CPU `keccak_leaves_row_pair_bit_reversed` over base columns (the layout the
+/// trace commit uses).
+pub fn keccak_leaves_base_row_pair(
+    columns: &[u64],
+    col_stride: usize,
+    num_cols: usize,
+    num_rows: usize,
+) -> Result<Vec<u8>> {
+    assert!(num_rows.is_power_of_two());
+    assert!(num_rows >= 2);
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(col_stride)
+        .expect("num_cols * col_stride overflows usize");
+    assert!(columns.len() >= total);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / 2) * 32)?;
+    launch_keccak_base_row_pair(
+        stream.as_ref(),
+        &cols_dev,
+        col_stride as u64,
+        num_cols as u64,
+        num_rows as u64,
+        &mut out_dev.as_view_mut(),
+    )?;
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Row-pair ext3 variant. Returns `num_rows/2 * 32` hash bytes. Parity entry
+/// point for the CPU `keccak_leaves_row_pair_bit_reversed` over ext3 columns.
+pub fn keccak_leaves_ext3_row_pair(
+    columns: &[u64],
+    col_stride: usize,
+    num_cols: usize,
+    num_rows: usize,
+) -> Result<Vec<u8>> {
+    assert!(num_rows.is_power_of_two());
+    assert!(num_rows >= 2);
+    assert!(
+        col_stride >= num_rows,
+        "col_stride must be >= num_rows to keep per-column reads in-bounds"
+    );
+    let total = num_cols
+        .checked_mul(3)
+        .and_then(|v| v.checked_mul(col_stride))
+        .expect("num_cols * 3 * col_stride overflows usize");
+    assert!(columns.len() >= total);
+    let be = backend()?;
+    let stream = be.next_stream();
+    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / 2) * 32)?;
+    launch_keccak_ext3_row_pair(
+        stream.as_ref(),
+        &cols_dev,
+        col_stride as u64,
+        num_cols as u64,
+        num_rows as u64,
+        &mut out_dev.as_view_mut(),
+    )?;
+    let out = stream.clone_dtoh(&out_dev)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 /// Block size for Keccak kernels. Per-thread register footprint is ~60 regs
 /// (25-lane state + auxiliaries). The default 256 threads/block pushes the
 /// block register file past the hardware limit on sm_120 (Blackwell). 128
@@ -159,6 +232,66 @@ pub(crate) fn launch_keccak_base(
     unsafe {
         stream
             .launch_builder(&be.keccak256_leaves_base_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-pair base-field leaf hashing: leaf `i` hashes bit-reversed rows `2i`,
+/// `2i+1` (one Merkle path per FRI query). Writes `num_rows/2` leaves of 32
+/// bytes into `out_dev`. Base-field analog of the comp-poly ext3 path; matches
+/// the CPU `keccak_leaves_row_pair_bit_reversed`.
+pub(crate) fn launch_keccak_base_row_pair(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(num_rows >= 2, "keccak row-pair leaf kernel: num_rows must be >= 2");
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    // One thread per leaf (= row pair).
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_pair_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-pair ext3 leaf hashing for the aux trace: reuses the comp-poly kernel
+/// (`keccak_comp_poly_leaves_ext3`), which hashes bit-reversed rows `2i`, `2i+1`
+/// across all ext3 columns. Writes `num_rows/2` leaves of 32 bytes.
+pub(crate) fn launch_keccak_ext3_row_pair(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(num_rows >= 2, "keccak row-pair leaf kernel: num_rows must be >= 2");
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak_comp_poly_leaves_ext3)
             .arg(cols_dev)
             .arg(&col_stride)
             .arg(&num_cols)
