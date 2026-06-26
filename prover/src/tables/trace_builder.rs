@@ -2874,6 +2874,18 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    #[cfg(feature = "cuda")]
+    let shifts = match super::gpu_trace::gpu_build_shift_trace_tables(&shift_ops, max_rows.shift) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &shift_ops,
+            max_rows.shift,
+            shift::generate_shift_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let shifts = chunk_and_generate(
         &shift_ops,
         max_rows.shift,

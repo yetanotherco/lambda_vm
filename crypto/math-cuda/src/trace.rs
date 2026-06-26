@@ -27,6 +27,9 @@ pub const NUM_EQ_COLS: usize = 12;
 /// BYTEWISE table column count (`prover::tables::bytewise::cols::NUM_COLUMNS`).
 pub const NUM_BYTEWISE_COLS: usize = 26;
 
+/// SHIFT table column count (`prover::tables::shift::cols::NUM_COLUMNS`).
+pub const NUM_SHIFT_COLS: usize = 29;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -256,6 +259,57 @@ pub fn gpu_build_bytewise_trace(
         nrows,
         NUM_BYTEWISE_COLS,
     )
+}
+
+/// Build the SHIFT trace table on device. SHIFT does not dedup (one row per op,
+/// μ=1). SoA over `n` ops: `value` (4 input halves packed into a u64),
+/// `shift_amount` (full arg2), `flags` (bit0=direction, bit1=signed,
+/// bit2=word_instr). Padding rows set ZBS=1 (kernel-side).
+pub fn gpu_build_shift_trace(
+    value: &[u64],
+    shift_amount: &[u64],
+    flags: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(value.len(), n);
+    assert_eq!(shift_amount.len(), n);
+    assert_eq!(flags.len(), n);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let v_d = stream.clone_htod(value)?;
+    let sa_d = stream.clone_htod(shift_amount)?;
+    let f_d = stream.clone_htod(flags)?;
+    let mut cols = stream.alloc_zeros::<u64>(NUM_SHIFT_COLS * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.trace_shift_kernel)
+            .arg(&v_d)
+            .arg(&sa_d)
+            .arg(&f_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_SHIFT_COLS,
+        nrows,
+    })
 }
 
 /// Shared launcher for ALU kernels taking 4 SoA u64 inputs (a, b, c, mult) and

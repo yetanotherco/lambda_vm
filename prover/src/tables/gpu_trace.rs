@@ -23,6 +23,7 @@ use super::bytewise::{self, BytewiseOperation};
 use super::cpu::cols;
 use super::eq::{self, EqOperation};
 use super::lt::{self, LtOperation};
+use super::shift::{self, ShiftOperation};
 use super::types::{DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 
 /// Counts successful GPU CPU-table builds. Lets tests confirm the device path
@@ -53,6 +54,12 @@ pub fn gpu_eq_table_builds() -> u64 {
 pub static GPU_BYTEWISE_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_bytewise_table_builds() -> u64 {
     GPU_BYTEWISE_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU SHIFT-table builds.
+pub static GPU_SHIFT_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_shift_table_builds() -> u64 {
+    GPU_SHIFT_TABLE_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -276,5 +283,45 @@ pub fn gpu_build_bytewise_trace_tables(
         tables.push(tt);
     }
     GPU_BYTEWISE_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// SHIFT tables on GPU. No dedup (one row per op, μ=1); chunked like the CPU
+/// path. Mirrors generate_shift_trace + ShiftOperation::compute_aux.
+pub fn gpu_build_shift_trace_tables(
+    shift_ops: &[ShiftOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if shift_ops.is_empty() {
+        return None;
+    }
+    let ncols = shift::cols::NUM_COLUMNS;
+    let mut tables = Vec::with_capacity(shift_ops.len().div_ceil(max_rows));
+    for chunk in shift_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut value = vec![0u64; n];
+        let mut sa = vec![0u64; n];
+        let mut flags = vec![0u64; n];
+        for (i, op) in chunk.iter().enumerate() {
+            value[i] = (op.in_halves[0] as u64)
+                | ((op.in_halves[1] as u64) << 16)
+                | ((op.in_halves[2] as u64) << 32)
+                | ((op.in_halves[3] as u64) << 48);
+            sa[i] = op.shift_amount;
+            flags[i] = (op.direction as u64)
+                | ((op.signed as u64) << 1)
+                | ((op.word_instr as u64) << 2);
+        }
+        let dev = trace::gpu_build_shift_trace(&value, &sa, &flags, n, nrows).ok()?;
+        let host = dev.to_host().ok()?;
+        let columns: Vec<Vec<FE>> = (0..ncols)
+            .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
+            .collect();
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
+    }
+    GPU_SHIFT_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }
