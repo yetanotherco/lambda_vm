@@ -38,7 +38,7 @@ fn keccak_leaves_base_matches_cpu() {
                     flat[c * n + r] = *e.value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n, 1).unwrap();
             assert_eq!(gpu.len(), n * 32);
             for i in 0..n {
                 assert_eq!(
@@ -84,7 +84,7 @@ fn keccak_leaves_ext3_matches_cpu() {
                     flat[(c * 3 + 2) * n + r] = *e.value()[2].value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n, 1).unwrap();
             assert_eq!(gpu.len(), n * 32);
             for i in 0..n {
                 assert_eq!(
@@ -100,8 +100,8 @@ fn keccak_leaves_ext3_matches_cpu() {
 #[test]
 fn keccak_leaves_base_row_pair_matches_cpu() {
     // Row-pair (trace) commit: leaf `i` hashes bit-reversed rows `2i`, `2i+1`.
-    // GPU `keccak_leaves_base_row_pair` must match the CPU prover helper
-    // `keccak_leaves_row_pair_bit_reversed` over base columns.
+    // GPU `keccak_leaves_base(.., rows_per_leaf=2)` must match the CPU prover
+    // helper `keccak_leaves_row_pair_bit_reversed` over base columns.
     for log_n in [4u32, 6, 8, 10, 12] {
         for num_cols in [1usize, 5, 17, 41] {
             let n = 1 << log_n;
@@ -119,7 +119,7 @@ fn keccak_leaves_base_row_pair_matches_cpu() {
                     flat[c * n + r] = *e.value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_base_row_pair(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n, 2).unwrap();
             assert_eq!(gpu.len(), (n / 2) * 32);
             for i in 0..n / 2 {
                 assert_eq!(
@@ -165,7 +165,7 @@ fn keccak_leaves_ext3_row_pair_matches_cpu() {
                     flat[(c * 3 + 2) * n + r] = *e.value()[2].value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_ext3_row_pair(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n, 2).unwrap();
             assert_eq!(gpu.len(), (n / 2) * 32);
             for i in 0..n / 2 {
                 assert_eq!(

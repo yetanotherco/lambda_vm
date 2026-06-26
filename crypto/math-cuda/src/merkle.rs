@@ -25,15 +25,19 @@ use crate::lde::pack_ext3_to_pinned_slabs;
 /// Run GPU Keccak-256 leaf hashing on a base-field column buffer.
 ///
 /// `columns` must hold `num_cols * col_stride` u64s with column `c`'s data
-/// at `[c*col_stride .. c*col_stride + num_rows]`. Returns `num_rows * 32`
-/// hash bytes in natural (non-bit-reversed) row order.
+/// at `[c*col_stride .. c*col_stride + num_rows]`. `rows_per_leaf` selects the
+/// leaf layout: `1` = one leaf per bit-reversed row (`num_rows` leaves), `2` =
+/// one leaf per bit-reversed row pair `2i`,`2i+1` (`num_rows/2` leaves, the
+/// trace-commit layout). Returns `(num_rows / rows_per_leaf) * 32` hash bytes.
 pub fn keccak_leaves_base(
     columns: &[u64],
     col_stride: usize,
     num_cols: usize,
     num_rows: usize,
+    rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
+    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
@@ -45,8 +49,13 @@ pub fn keccak_leaves_base(
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
-    launch_keccak_base(
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
+    let launch = if rows_per_leaf == 2 {
+        launch_keccak_base_row_pair
+    } else {
+        launch_keccak_base
+    };
+    launch(
         stream.as_ref(),
         &cols_dev,
         col_stride as u64,
@@ -60,14 +69,17 @@ pub fn keccak_leaves_base(
 }
 
 /// Ext3 variant. Columns interleaved as three base slabs per ext3 column.
-/// `columns.len() >= num_cols * 3 * col_stride`.
+/// `columns.len() >= num_cols * 3 * col_stride`. `rows_per_leaf` as in
+/// [`keccak_leaves_base`].
 pub fn keccak_leaves_ext3(
     columns: &[u64],
     col_stride: usize,
     num_cols: usize,
     num_rows: usize,
+    rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
+    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
@@ -80,81 +92,13 @@ pub fn keccak_leaves_ext3(
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
-    launch_keccak_ext3(
-        stream.as_ref(),
-        &cols_dev,
-        col_stride as u64,
-        num_cols as u64,
-        num_rows as u64,
-        &mut out_dev.as_view_mut(),
-    )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
-    Ok(out)
-}
-
-/// Row-pair base-field leaf hashing: leaf `i` hashes bit-reversed rows `2i`,
-/// `2i+1`. Returns `num_rows/2 * 32` hash bytes. Parity entry point for the
-/// CPU `keccak_leaves_row_pair_bit_reversed` over base columns (the layout the
-/// trace commit uses).
-pub fn keccak_leaves_base_row_pair(
-    columns: &[u64],
-    col_stride: usize,
-    num_cols: usize,
-    num_rows: usize,
-) -> Result<Vec<u8>> {
-    assert!(num_rows.is_power_of_two());
-    assert!(num_rows >= 2);
-    assert!(
-        col_stride >= num_rows,
-        "col_stride must be >= num_rows to keep per-column reads in-bounds"
-    );
-    let total = num_cols
-        .checked_mul(col_stride)
-        .expect("num_cols * col_stride overflows usize");
-    assert!(columns.len() >= total);
-    let be = backend()?;
-    let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / 2) * 32)?;
-    launch_keccak_base_row_pair(
-        stream.as_ref(),
-        &cols_dev,
-        col_stride as u64,
-        num_cols as u64,
-        num_rows as u64,
-        &mut out_dev.as_view_mut(),
-    )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
-    Ok(out)
-}
-
-/// Row-pair ext3 variant. Returns `num_rows/2 * 32` hash bytes. Parity entry
-/// point for the CPU `keccak_leaves_row_pair_bit_reversed` over ext3 columns.
-pub fn keccak_leaves_ext3_row_pair(
-    columns: &[u64],
-    col_stride: usize,
-    num_cols: usize,
-    num_rows: usize,
-) -> Result<Vec<u8>> {
-    assert!(num_rows.is_power_of_two());
-    assert!(num_rows >= 2);
-    assert!(
-        col_stride >= num_rows,
-        "col_stride must be >= num_rows to keep per-column reads in-bounds"
-    );
-    let total = num_cols
-        .checked_mul(3)
-        .and_then(|v| v.checked_mul(col_stride))
-        .expect("num_cols * 3 * col_stride overflows usize");
-    assert!(columns.len() >= total);
-    let be = backend()?;
-    let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / 2) * 32)?;
-    launch_keccak_ext3_row_pair(
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
+    let launch = if rows_per_leaf == 2 {
+        launch_keccak_ext3_row_pair
+    } else {
+        launch_keccak_ext3
+    };
+    launch(
         stream.as_ref(),
         &cols_dev,
         col_stride as u64,
