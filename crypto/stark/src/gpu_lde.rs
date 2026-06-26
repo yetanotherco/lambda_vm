@@ -463,67 +463,8 @@ pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(Ordering::Relaxed)
 }
 
-/// Fused base-field path: LDE + Keccak-256 leaf hash + Merkle tree build,
-/// all on device, with the LDE buffer retained for R2–R4 GPU reuse. On
-/// success: `columns[c]` is resized to `lde_size` with the LDE output, and
-/// the returned `(tree, GpuLdeBase)` pair is the host-side tree plus a
-/// device-resident handle to the LDE buffer.
-pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
-    columns: &mut [Vec<FieldElement<E>>],
-    blowup_factor: usize,
-    weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeBase)>
-where
-    F: IsField + 'static,
-    E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
-{
-    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
-        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
-        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
-    };
-    let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
-
-    // SAFETY: layout-checked above.
-    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
-    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
-    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
-
-    GPU_LDE_CALLS.fetch_add(num_columns as u64, Ordering::Relaxed);
-    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
-    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-
-    let handle_result = {
-        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
-        math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
-            &slices,
-            blowup_factor,
-            &weights_u64,
-            &mut raw_outputs,
-            nodes_bytes,
-        )
-    };
-    let handle = match handle_result {
-        Ok(h) => h,
-        Err(_) => {
-            restore_columns_on_err(columns, n);
-            return None;
-        }
-    };
-
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
-    Some((tree, handle))
-}
-
 /// Row-major GPU path: single H2D → row-major NTT → row-major Keccak →
-/// Merkle → single D2H. Eliminates `extract_columns_main` and
-/// `columns_to_row_major` on the host — no column extraction, no transpose.
+/// Merkle → single D2H. No column extraction or CPU-side transpose.
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
     n: usize,
@@ -656,63 +597,6 @@ where
         .collect();
     let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
     Some((tree, handle, lde_out))
-}
-
-/// ext3 columns via the three-slab decomposition, with the ext3 LDE device
-/// buffer (de-interleaved 3-slab layout) retained for downstream GPU rounds.
-/// `B::Node = [u8; 32]` by construction for `BatchKeccak256Backend<Ext3>`.
-pub(crate) fn try_expand_leaf_and_tree_batched_ext3_keep<F, E, B>(
-    columns: &mut [Vec<FieldElement<E>>],
-    blowup_factor: usize,
-    weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3)>
-where
-    F: IsField + 'static,
-    E: IsField + 'static,
-    B: IsMerkleTreeBackend<Node = [u8; 32]>,
-{
-    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
-        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
-        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
-    };
-    let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
-
-    // SAFETY: layout-checked above.
-    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
-    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
-    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
-
-    GPU_LDE_CALLS.fetch_add((num_columns * 3) as u64, Ordering::Relaxed);
-    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
-    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-
-    let handle_result = {
-        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
-        math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
-            &slices,
-            n,
-            blowup_factor,
-            &weights_u64,
-            &mut raw_outputs,
-            nodes_bytes,
-        )
-    };
-    let handle = match handle_result {
-        Ok(h) => h,
-        Err(_) => {
-            restore_columns_on_err(columns, n);
-            return None;
-        }
-    };
-
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
-    Some((tree, handle))
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be

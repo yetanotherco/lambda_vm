@@ -418,32 +418,6 @@ where
     }
 }
 
-/// Interleave column-major data into a flat row-major buffer + its column
-/// count. Used only by the cuda fast path to materialize the GPU-expanded
-/// columns in the row-major layout the table expects (CPU paths read the
-/// already-row-major trace directly, with no transpose).
-#[cfg(feature = "cuda")]
-fn columns_to_row_major<E: IsField>(
-    columns: &[Vec<FieldElement<E>>],
-) -> (Vec<FieldElement<E>>, usize) {
-    let num_cols = columns.len();
-    let n = if num_cols > 0 { columns[0].len() } else { 0 };
-    // All columns must be the same length; otherwise `col[row]` below indexes
-    // out of bounds. The producers (CPU/GPU LDE) always emit uniform columns —
-    // this guards against a future regression cheaply (debug builds only).
-    debug_assert!(
-        columns.iter().all(|c| c.len() == n),
-        "columns_to_row_major requires all columns to have equal length"
-    );
-    let mut data = Vec::with_capacity(n * num_cols);
-    for row in 0..n {
-        for col in columns {
-            data.push(col[row].clone());
-        }
-    }
-    (data, num_cols)
-}
-
 /// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
 /// leaf per row, where each row is read at `reverse_index(row_idx)` and the
 /// columns are concatenated as big-endian bytes before hashing.

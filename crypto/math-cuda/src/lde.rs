@@ -1022,29 +1022,6 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
     .map(|_| ())
 }
 
-/// Fused LDE + leaf-hash + Merkle tree build. If `keep_device_buf` is true,
-/// returns an `Arc<CudaSlice<u64>>` wrapping the LDE device buffer so callers
-/// (R2–R4 GPU paths) can reuse the LDE without a re-H2D.
-pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
-    columns: &[&[u64]],
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<GpuLdeBase> {
-    let opt = coset_lde_batch_base_into_with_merkle_tree_inner(
-        columns,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        true,
-    )?;
-    let handle = opt.expect("keep_device_buf=true must return Some");
-    Ok(handle)
-}
-
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -1252,30 +1229,6 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
         false,
     )
     .map(|_| ())
-}
-
-/// Ext3 variant of [`coset_lde_batch_base_into_with_merkle_tree_keep`] —
-/// returns an `Arc<CudaSlice<u64>>` handle to the de-interleaved LDE device
-/// buffer.
-pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<GpuLdeExt3> {
-    let opt = coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        true,
-    )?;
-    Ok(opt.expect("keep_device_buf=true must return Some"))
 }
 
 #[allow(clippy::too_many_arguments)]
