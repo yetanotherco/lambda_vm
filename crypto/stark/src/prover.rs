@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
@@ -291,12 +291,50 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     two_half_inv: TwoHalfTwiddles<F>,
     two_half_fwd: TwoHalfTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
-    /// Composition half-extension (`decompose_and_extend_d2`): inverse twiddles for
-    /// the g²-coset halves of size `lde_size/2`, forward twiddles for the full
-    /// g-coset of size `lde_size`, and weights `g⁻ʲ/(lde_size/2)`.
-    comp_inv: LayerTwiddles<F>,
-    comp_fwd: LayerTwiddles<F>,
-    comp_weights: Vec<FieldElement<F>>,
+    /// Composition half-extension cache, initialized only when the degree-2
+    /// decomposition path actually runs on CPU.
+    composition: OnceLock<CompositionLdeTwiddles<F>>,
+}
+
+pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
+    /// Inverse twiddles for the g²-coset halves of size `lde_size/2`.
+    inv: LayerTwiddles<F>,
+    /// Forward twiddles for the full g-coset of size `lde_size`.
+    fwd: LayerTwiddles<F>,
+    /// Weights `g⁻ʲ/(lde_size/2)` for the composition half-extension.
+    weights: Vec<FieldElement<F>>,
+}
+
+impl<F: IsFFTField> CompositionLdeTwiddles<F> {
+    fn new(half_size: usize, offset: &FieldElement<F>) -> Self {
+        // Composition half-extension weights: g⁻ʲ / half_size. The constraint-
+        // quotient halves live on the g²-coset of size `half_size`; the unnormalized
+        // iFFT yields `n·cⱼ·(g²)ʲ` and these weights turn that into `cⱼ·gʲ` for the
+        // forward FFT onto the g-coset.
+        let half_size_fe = FieldElement::<F>::from(half_size as u64);
+        let inv_half_size_offset = (&half_size_fe * offset)
+            .inv()
+            .expect("half_size and coset offset are non-zero");
+        let half_size_inv = offset * &inv_half_size_offset;
+        let offset_inv = &half_size_fe * &inv_half_size_offset;
+        let weights = {
+            let mut w = Vec::with_capacity(half_size);
+            let mut cur = half_size_inv;
+            for _ in 0..half_size {
+                w.push(cur.clone());
+                cur = &cur * &offset_inv;
+            }
+            w
+        };
+
+        Self {
+            inv: LayerTwiddles::<F>::new_inverse(half_size.trailing_zeros() as u64)
+                .expect("valid composition inverse twiddles"),
+            fwd: LayerTwiddles::<F>::new((half_size * 2).trailing_zeros() as u64)
+                .expect("valid composition forward twiddles"),
+            weights,
+        }
+    }
 }
 
 impl<F: IsFFTField> LdeTwiddles<F> {
@@ -319,27 +357,6 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             w
         };
 
-        // Composition half-extension weights: g⁻ʲ / (lde_size/2). The constraint-
-        // quotient halves live on the g²-coset of size `lde_size/2`; the unnormalized
-        // iFFT yields `n·cⱼ·(g²)ʲ` and these weights turn that into `cⱼ·gʲ` for the
-        // forward FFT onto the g-coset.
-        let half_size = lde_size / 2;
-        let half_size_fe = FieldElement::<F>::from(half_size as u64);
-        let inv_half_size_offset = (&half_size_fe * offset)
-            .inv()
-            .expect("half_size and coset offset are non-zero");
-        let half_size_inv = offset * &inv_half_size_offset;
-        let offset_inv = &half_size_fe * &inv_half_size_offset;
-        let comp_weights = {
-            let mut w = Vec::with_capacity(half_size);
-            let mut cur = half_size_inv;
-            for _ in 0..half_size {
-                w.push(cur.clone());
-                cur = &cur * &offset_inv;
-            }
-            w
-        };
-
         Self {
             #[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
             inv: LayerTwiddles::<F>::new_inverse(domain_size.trailing_zeros() as u64)
@@ -352,12 +369,21 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
                 .expect("valid forward two-half twiddles"),
             coset_weights,
-            comp_inv: LayerTwiddles::<F>::new_inverse(half_size.trailing_zeros() as u64)
-                .expect("valid composition inverse twiddles"),
-            comp_fwd: LayerTwiddles::<F>::new(lde_size.trailing_zeros() as u64)
-                .expect("valid composition forward twiddles"),
-            comp_weights,
+            composition: OnceLock::new(),
         }
+    }
+
+    fn composition(&self, domain: &Domain<F>) -> &CompositionLdeTwiddles<F> {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let half_size = lde_size / 2;
+        debug_assert_eq!(self.coset_weights.len(), domain.interpolation_domain_size);
+        self.composition
+            .get_or_init(|| CompositionLdeTwiddles::new(half_size, &domain.coset_offset))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_composition_cache(&self) -> bool {
+        self.composition.get().is_some()
     }
 }
 
@@ -1194,9 +1220,10 @@ pub trait IsStarkProver<
             return vec![lde_h0, lde_h1];
         }
 
+        let composition_twiddles = twiddles.composition(domain);
         let (lde_h0, lde_h1) = crate::par::join(
-            || Self::extend_half_to_lde(&h0_evals, twiddles),
-            || Self::extend_half_to_lde(&h1_evals, twiddles),
+            || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
+            || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
         );
         vec![lde_h0, lde_h1]
     }
@@ -1206,23 +1233,23 @@ pub trait IsStarkProver<
     ///
     /// Fused: iFFT(n) → coset reshift g²→g → forward FFT(2n) in a single pass with no
     /// intermediate coefficient `Polynomial`. The twiddles and the weights `g⁻ʲ/n`
-    /// (which fold the 1/n normalization and the net g²→g shift) are precomputed once
-    /// per domain in [`LdeTwiddles`].
+    /// (which fold the 1/n normalization and the net g²→g shift) are cached lazily
+    /// once per domain in [`LdeTwiddles`].
     fn extend_half_to_lde(
         half_evals: &[FieldElement<FieldExtension>],
-        twiddles: &LdeTwiddles<Field>,
+        twiddles: &CompositionLdeTwiddles<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        debug_assert_eq!(half_evals.len(), twiddles.comp_weights.len());
+        debug_assert_eq!(half_evals.len(), twiddles.weights.len());
         Polynomial::coset_lde_full::<Field>(
             half_evals,
             2,
-            &twiddles.comp_weights,
-            &twiddles.comp_inv,
-            &twiddles.comp_fwd,
+            &twiddles.weights,
+            &twiddles.inv,
+            &twiddles.fwd,
         )
         .expect("coset extension")
     }

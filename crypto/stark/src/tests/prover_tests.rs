@@ -268,11 +268,15 @@ fn test_decompose_and_extend_d2_matches_original() {
         .collect();
 
     // --- New path: algebraic decomposition ---
+    let twiddles = LdeTwiddles::new(&domain);
+    assert!(!twiddles.has_composition_cache());
     let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
         &constraint_evaluations,
         &domain,
-        &LdeTwiddles::new(&domain),
+        &twiddles,
     );
+    #[cfg(not(feature = "cuda"))]
+    assert!(twiddles.has_composition_cache());
 
     assert_eq!(new_result.len(), 2);
     assert_eq!(new_result[0].len(), original[0].len());
