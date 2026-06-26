@@ -13,23 +13,28 @@
 use lambda_vm_prover::tables::gpu_trace::gpu_cpu_table_builds;
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
+use stark::gpu_lde::gpu_lde_from_device_calls;
 
 fn prove_verify(program: &str) {
     let elf = asm_elf_bytes(program);
 
-    let before = gpu_cpu_table_builds();
+    let builds_before = gpu_cpu_table_builds();
+    let lde_dev_before = gpu_lde_from_device_calls();
     let proof = prove(&elf).unwrap_or_else(|e| panic!("{program}: prove failed: {e:?}"));
-    let after = gpu_cpu_table_builds();
 
     assert!(
-        after > before,
-        "{program}: GPU CPU-table path did not fire (silent CPU fallback)"
+        gpu_cpu_table_builds() > builds_before,
+        "{program}: GPU CPU-table build did not fire (silent CPU fallback)"
+    );
+    assert!(
+        gpu_lde_from_device_calls() > lde_dev_before,
+        "{program}: device-resident LDE did not fire (fell back to host-input LDE)"
     );
     assert!(
         verify(&proof, &elf).expect("verify"),
-        "{program}: proof built with the GPU CPU table failed to verify"
+        "{program}: proof built with the GPU CPU table + device-resident LDE failed to verify"
     );
-    println!("{program}: prove+verify OK with GPU CPU table");
+    println!("{program}: prove+verify OK with GPU CPU table + device-resident LDE");
 }
 
 #[test]

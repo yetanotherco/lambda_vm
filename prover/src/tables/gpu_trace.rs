@@ -108,7 +108,11 @@ pub fn gpu_build_cpu_trace_tables(
         let columns: Vec<Vec<FE>> = (0..ncols)
             .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
             .collect();
-        tables.push(TraceTable::from_columns_main(columns, 1));
+        // Keep the host columns (for num_rows / CPU consumers) AND attach the
+        // resident device buffer so `commit_main_trace` runs the LDE from it.
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
     }
 
     GPU_CPU_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);

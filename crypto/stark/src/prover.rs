@@ -686,6 +686,33 @@ pub trait IsStarkProver<
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let mut columns = trace.extract_columns_main(lde_size);
 
+        // Device-resident path: when the trace was built on GPU, run the LDE
+        // straight from the resident buffer (no re-upload of the main columns).
+        #[cfg(feature = "cuda")]
+        if precomputed.is_none() {
+            if let Some(dev) = trace.gpu_main_input() {
+                #[cfg(feature = "instruments")]
+                let t_sub = Instant::now();
+                if let Some((tree, handle)) = crate::gpu_lde::try_lde_from_device_keep::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(
+                    dev, &mut columns, domain.blowup_factor, &twiddles.coset_weights
+                ) {
+                    #[cfg(feature = "instruments")]
+                    let main_lde_dur = t_sub.elapsed();
+                    #[cfg(feature = "instruments")]
+                    crate::instruments::accum_r1_main(main_lde_dur, main_lde_dur);
+                    let root = tree.root;
+                    return Ok((TableCommit::plain(tree, root), columns, Some(handle)));
+                }
+                // Device path declined/failed: `columns` may have been resized,
+                // so re-extract the trace for the host fallback below.
+                columns = trace.extract_columns_main(lde_size);
+            }
+        }
+
         // Fused GPU path is only wired for non-preprocessed mains today. The
         // preprocessed split runs the CPU pipeline below.
         #[cfg(feature = "cuda")]

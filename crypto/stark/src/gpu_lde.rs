@@ -74,11 +74,20 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
+    GPU_LDE_FROM_DEVICE_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// Incremented when the R1 main LDE+commit ran from a device-resident trace
+/// buffer (GPU trace-gen → no host re-upload). Lets tests confirm the resident
+/// path fired vs the host-input fallback.
+pub(crate) static GPU_LDE_FROM_DEVICE_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_lde_from_device_calls() -> u64 {
+    GPU_LDE_FROM_DEVICE_CALLS.load(Ordering::Relaxed)
 }
 
 // ============================================================================
@@ -506,6 +515,73 @@ where
     };
 
     let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    Some((tree, handle))
+}
+
+/// Device-resident main-trace LDE: like [`try_expand_leaf_and_tree_batched_keep`]
+/// but the input columns are already on device (`dev`, built by GPU trace-gen),
+/// so there is no host->device upload. Writes the host LDE into `columns` (still
+/// needed by the CPU constraint-eval / query phases), builds the Merkle tree,
+/// and returns the device-resident LDE handle. Returns `None` (caller falls back
+/// to the host path) below threshold, on a non-Goldilocks-base table, or on a
+/// math-cuda error.
+pub(crate) fn try_lde_from_device_keep<F, E, B>(
+    dev: &math_cuda::trace::DeviceMainCols,
+    columns: &mut [Vec<FieldElement<E>>],
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeBase)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<GoldilocksField>()
+    {
+        return None;
+    }
+    let n = dev.nrows;
+    if n == 0 || !n.is_power_of_two() {
+        return None;
+    }
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if columns.len() != dev.ncols || weights.len() != n {
+        return None;
+    }
+
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    let node_byte_len = total_nodes
+        .checked_mul(32)
+        .expect("node byte length overflow");
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add(dev.ncols as u64, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let handle_result = {
+        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
+        let nodes_bytes: &mut [u8] =
+            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
+        math_cuda::lde::coset_lde_from_device_with_merkle_tree_keep(
+            dev,
+            blowup_factor,
+            &weights_u64,
+            &mut raw_outputs,
+            nodes_bytes,
+        )
+    };
+    let handle = match handle_result {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+
+    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    GPU_LDE_FROM_DEVICE_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((tree, handle))
 }
 

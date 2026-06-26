@@ -26,6 +26,12 @@ where
     pub num_main_columns: usize,
     pub num_aux_columns: usize,
     pub step_size: usize,
+    /// Optional device-resident copy of the (pre-LDE) main columns, set when the
+    /// table was built on GPU. When present, `commit_main_trace` runs the LDE
+    /// straight from this buffer instead of re-uploading `main_table`. Goldilocks
+    /// base-field only; `None` otherwise.
+    #[cfg(feature = "cuda")]
+    pub gpu_main_input: Option<math_cuda::trace::DeviceMainCols>,
 }
 
 impl<F, E> TraceTable<F, E>
@@ -50,6 +56,8 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            gpu_main_input: None,
         }
     }
 
@@ -72,6 +80,8 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            gpu_main_input: None,
         }
     }
 
@@ -87,7 +97,22 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            gpu_main_input: None,
         }
+    }
+
+    /// Attach a device-resident copy of the (pre-LDE) main columns, so
+    /// `commit_main_trace` can run the LDE without re-uploading from host.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_main_input(&mut self, dev: math_cuda::trace::DeviceMainCols) {
+        self.gpu_main_input = Some(dev);
+    }
+
+    /// The device-resident main columns, if this table was built on GPU.
+    #[cfg(feature = "cuda")]
+    pub fn gpu_main_input(&self) -> Option<&math_cuda::trace::DeviceMainCols> {
+        self.gpu_main_input.as_ref()
     }
 
     pub fn num_rows(&self) -> usize {

@@ -55,6 +55,26 @@ pub struct DeviceMainCols {
     pub nrows: usize,
 }
 
+// `CudaSlice` implements none of these; provide structural impls so a handle can
+// live on `TraceTable` (which derives Debug/PartialEq/Eq). Equality is by shape
+// + buffer identity (Arc pointer), which is all callers need.
+impl std::fmt::Debug for DeviceMainCols {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceMainCols")
+            .field("ncols", &self.ncols)
+            .field("nrows", &self.nrows)
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for DeviceMainCols {
+    fn eq(&self, other: &Self) -> bool {
+        self.ncols == other.ncols
+            && self.nrows == other.nrows
+            && Arc::ptr_eq(&self.buf, &other.buf)
+    }
+}
+impl Eq for DeviceMainCols {}
+
 impl DeviceMainCols {
     /// Upload a host column-major buffer (`ncols * nrows`) to device. For tests
     /// / bring-up that build columns on host and want a resident handle.
