@@ -662,6 +662,18 @@ pub fn prove_continuation(
         if executor.pc() == 0 {
             break;
         }
+        // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 - init_epoch`)
+        // only spans `local_to_global::MAX_EPOCHS` epochs. Beyond that the IsB20 bus
+        // cannot balance, so an honest proof is impossible — fail fast with a clear
+        // error instead of building an unprovable trace. The verifier already
+        // rejects any such proof; this is a prover-side guard for a clean message.
+        if index >= local_to_global::MAX_EPOCHS {
+            return Err(Error::InvalidContinuationEpochSize(format!(
+                "execution needs more than {} continuation epochs (the IsB20 cross-epoch \
+                 ordering range); use a larger epoch size",
+                local_to_global::MAX_EPOCHS
+            )));
+        }
         let register_init: Vec<u32> = if index == 0 {
             register::register_init_from_entry_point(elf.entry_point)
         } else {

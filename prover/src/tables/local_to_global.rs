@@ -72,6 +72,16 @@ type Provenance = PagedMem<(u64, u64, u64)>;
 /// (1-based) epoch label, so `init_epoch < fini_epoch` holds for genesis cells.
 pub const GENESIS_EPOCH: u64 = 0;
 
+/// Maximum number of epochs a continuation run may have.
+///
+/// The cross-epoch ordering check proves `init_epoch < fini_epoch` via an `IsB20`
+/// (20-bit) lookup on `fini_epoch - 1 - init_epoch`. A genesis-sourced cell
+/// finalized in epoch `index` (0-based) has gap `index`, so every epoch must
+/// satisfy `index < 2^20`. A run needing more epochs cannot be proved — the
+/// IsB20 bus would not balance — so the driver rejects it up front (see
+/// `prove_continuation`).
+pub const MAX_EPOCHS: u64 = 1 << 20;
+
 /// A cell's state when an epoch first touches it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct InitClaim {
@@ -462,7 +472,7 @@ pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOpera
         // Ordering: IsB20[fini_epoch - 1 - init_epoch]. Honest rows have
         // init_epoch < fini_epoch, so the difference is a small non-negative value.
         let diff = b.fini.epoch - 1 - b.init.originating_epoch;
-        debug_assert!(diff < (1 << 20), "epoch gap exceeds IsB20 range");
+        debug_assert!(diff < MAX_EPOCHS, "epoch gap exceeds IsB20 range");
         ops.push(BitwiseOperation::b20(
             (diff & 0xFF) as u8,
             ((diff >> 8) & 0xFF) as u8,
