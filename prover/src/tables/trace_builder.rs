@@ -2824,6 +2824,21 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // MEMW/MEMW_A: GPU per-row fill over the (CPU) memory-model ops when cuda is
+    // on, else the CPU builder. One row per op (no dedup); ops already carry
+    // old/old_timestamp from the walk.
+    #[cfg(feature = "cuda")]
+    let memws = match super::gpu_trace::gpu_build_memw_trace_tables(&memw_ops, max_rows.memw) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &memw_ops,
+            max_rows.memw,
+            memw::generate_memw_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let memws = chunk_and_generate(
         &memw_ops,
         max_rows.memw,
@@ -2831,6 +2846,21 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    #[cfg(feature = "cuda")]
+    let memw_aligneds = match super::gpu_trace::gpu_build_memw_aligned_trace_tables(
+        &memw_aligned_ops,
+        max_rows.memw_aligned,
+    ) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let memw_aligneds = chunk_and_generate(
         &memw_aligned_ops,
         max_rows.memw_aligned,
@@ -2838,6 +2868,24 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // MEMW_R: GPU per-row fill over the (CPU) memory-model ops when cuda is on,
+    // else the CPU builder. One row per op (no dedup); ops already carry
+    // old/old_timestamp from the walk.
+    #[cfg(feature = "cuda")]
+    let memw_registers = match super::gpu_trace::gpu_build_memw_register_trace_tables(
+        &memw_register_ops,
+        max_rows.memw_register,
+    ) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &memw_register_ops,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let memw_registers = chunk_and_generate(
         &memw_register_ops,
         max_rows.memw_register,
@@ -2845,6 +2893,19 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // LOAD: GPU per-row fill when cuda is on, else the CPU builder (no dedup).
+    #[cfg(feature = "cuda")]
+    let loads = match super::gpu_trace::gpu_build_load_trace_tables(&load_ops, max_rows.load) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &load_ops,
+            max_rows.load,
+            load::generate_load_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let loads = chunk_and_generate(
         &load_ops,
         max_rows.load,
@@ -2980,6 +3041,19 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // STORE: GPU per-row fill when cuda is on, else the CPU builder (no dedup).
+    #[cfg(feature = "cuda")]
+    let stores = match super::gpu_trace::gpu_build_store_trace_tables(&store_ops, max_rows.store) {
+        Some(t) => t,
+        None => chunk_and_generate::<store::StoreOperation>(
+            &store_ops,
+            max_rows.store,
+            store::generate_store_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let stores = chunk_and_generate::<store::StoreOperation>(
         &store_ops,
         max_rows.store,

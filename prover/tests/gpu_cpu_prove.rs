@@ -12,7 +12,9 @@
 
 use lambda_vm_prover::tables::gpu_trace::{
     gpu_bytewise_table_builds, gpu_cpu_table_builds, gpu_dvrm_table_builds, gpu_eq_table_builds,
-    gpu_lt_table_builds, gpu_mul_table_builds, gpu_shift_table_builds,
+    gpu_load_table_builds, gpu_lt_table_builds, gpu_memw_aligned_table_builds,
+    gpu_memw_register_table_builds, gpu_memw_table_builds, gpu_mul_table_builds,
+    gpu_shift_table_builds, gpu_store_table_builds,
 };
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
@@ -55,15 +57,20 @@ fn gpu_alu_tables_prove_verify() {
     // all_instructions_64 exercises LT (SLT/BLT/BGE), EQ (BEQ/BNE/SEQ), and
     // BYTEWISE (AND/OR/XOR) → all three GPU ALU tables fire.
     let elf = asm_elf_bytes("all_instructions_64");
-    let (lt0, eq0, bw0, sh0, mul0, dv0) = (
+    let (lt0, eq0, bw0, sh0, mul0, dv0, mr0) = (
         gpu_lt_table_builds(),
         gpu_eq_table_builds(),
         gpu_bytewise_table_builds(),
         gpu_shift_table_builds(),
         gpu_mul_table_builds(),
         gpu_dvrm_table_builds(),
+        gpu_memw_register_table_builds(),
     );
     let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_memw_register_table_builds() > mr0,
+        "GPU MEMW_R table did not fire"
+    );
     assert!(gpu_lt_table_builds() > lt0, "GPU LT table did not fire");
     assert!(gpu_eq_table_builds() > eq0, "GPU EQ table did not fire");
     assert!(
@@ -79,5 +86,45 @@ fn gpu_alu_tables_prove_verify() {
     );
     println!(
         "all_instructions_64: prove+verify OK with GPU LT+EQ+BYTEWISE+SHIFT+MUL+DVRM tables"
+    );
+}
+
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_memory_tables_prove_verify() {
+    // all_loadstore_32 exercises register accesses (MEMW_R), aligned and
+    // general/unaligned memory writes (MEMW_A / MEMW), and load/store of every
+    // width (LOAD / STORE) → all five GPU memory tables fire. If any GPU-built
+    // memory table diverged from the CPU builder, the memory-argument bus would
+    // unbalance and verification would fail.
+    let elf = asm_elf_bytes("all_loadstore_32");
+    let (mr0, ma0, mw0, ld0, st0) = (
+        gpu_memw_register_table_builds(),
+        gpu_memw_aligned_table_builds(),
+        gpu_memw_table_builds(),
+        gpu_load_table_builds(),
+        gpu_store_table_builds(),
+    );
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_memw_register_table_builds() > mr0,
+        "GPU MEMW_R table did not fire"
+    );
+    assert!(
+        gpu_memw_aligned_table_builds() > ma0,
+        "GPU MEMW_A table did not fire"
+    );
+    assert!(gpu_memw_table_builds() > mw0, "GPU MEMW table did not fire");
+    assert!(gpu_load_table_builds() > ld0, "GPU LOAD table did not fire");
+    assert!(
+        gpu_store_table_builds() > st0,
+        "GPU STORE table did not fire"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "proof built with GPU MEMW_R/MEMW_A/MEMW/LOAD/STORE tables failed to verify"
+    );
+    println!(
+        "all_loadstore_32: prove+verify OK with GPU MEMW_R+MEMW_A+MEMW+LOAD+STORE tables"
     );
 }

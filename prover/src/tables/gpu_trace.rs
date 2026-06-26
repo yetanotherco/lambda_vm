@@ -23,8 +23,11 @@ use super::bytewise::BytewiseOperation;
 use super::cpu::cols;
 use super::dvrm::DvrmOperation;
 use super::eq::EqOperation;
+use super::load::LoadOperation;
 use super::lt::LtOperation;
+use super::memw::MemwOperation;
 use super::mul::MulOperation;
+use super::store::StoreOperation;
 use super::shift::ShiftOperation;
 use super::types::{DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 
@@ -74,6 +77,36 @@ pub fn gpu_mul_table_builds() -> u64 {
 pub static GPU_DVRM_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_dvrm_table_builds() -> u64 {
     GPU_DVRM_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU MEMW_R-table builds.
+pub static GPU_MEMW_REGISTER_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_memw_register_table_builds() -> u64 {
+    GPU_MEMW_REGISTER_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU LOAD-table builds.
+pub static GPU_LOAD_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_load_table_builds() -> u64 {
+    GPU_LOAD_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU STORE-table builds.
+pub static GPU_STORE_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_store_table_builds() -> u64 {
+    GPU_STORE_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU MEMW_A-table builds.
+pub static GPU_MEMW_ALIGNED_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_memw_aligned_table_builds() -> u64 {
+    GPU_MEMW_ALIGNED_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU MEMW-table builds.
+pub static GPU_MEMW_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_memw_table_builds() -> u64 {
+    GPU_MEMW_TABLE_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -354,5 +387,180 @@ pub fn gpu_build_dvrm_trace_tables(
         tables.push(device_to_trace_table(dev)?);
     }
     GPU_DVRM_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// MEMW_R (register memory) tables on GPU. No dedup (one row per op); chunked
+/// like the CPU path. The ops already carry `old`/`old_timestamp` from the
+/// (CPU) memory-model walk — this only moves the per-row fill to the device.
+/// Mirrors `generate_memw_register_trace`.
+pub fn gpu_build_memw_register_trace_tables(
+    memw_register_ops: &[MemwOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if memw_register_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::MEMW_REGISTER_STRIDE;
+    let mut tables = Vec::with_capacity(memw_register_ops.len().div_ceil(max_rows));
+    for chunk in memw_register_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.base_address;
+            input[base + 1] = op.timestamp;
+            input[base + 2] = op.value[0];
+            input[base + 3] = op.value[1];
+            input[base + 4] = op.old[0];
+            input[base + 5] = op.old[1];
+            input[base + 6] = op.old_timestamp[0];
+            input[base + 7] = op.is_read as u64;
+        }
+        let dev = trace::gpu_build_memw_register_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_MEMW_REGISTER_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// LOAD tables on GPU. No dedup (one row per op); chunked like the CPU path.
+/// Mirrors `generate_load_trace`.
+pub fn gpu_build_load_trace_tables(
+    load_ops: &[LoadOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if load_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::LOAD_STRIDE;
+    let mut tables = Vec::with_capacity(load_ops.len().div_ceil(max_rows));
+    for chunk in load_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.base_address;
+            input[base + 1] = op.timestamp;
+            input[base + 2] = op.width as u64;
+            input[base + 3] = op.signed as u64;
+            for j in 0..8 {
+                input[base + 4 + j] = op.res[j];
+            }
+        }
+        let dev = trace::gpu_build_load_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_LOAD_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// STORE tables on GPU. No dedup (one row per op); chunked like the CPU path.
+/// Mirrors `generate_store_trace`.
+pub fn gpu_build_store_trace_tables(
+    store_ops: &[StoreOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if store_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::STORE_STRIDE;
+    let mut tables = Vec::with_capacity(store_ops.len().div_ceil(max_rows));
+    for chunk in store_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.base_address;
+            input[base + 1] = op.timestamp;
+            input[base + 2] = op.value;
+            input[base + 3] =
+                (op.write2 as u64) | ((op.write4 as u64) << 1) | ((op.write8 as u64) << 2);
+        }
+        let dev = trace::gpu_build_store_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_STORE_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// MEMW_A (aligned memory) tables on GPU. No dedup (one row per op). Ops carry
+/// old/old_timestamp from the (CPU) memory-model walk. Mirrors
+/// `generate_memw_aligned_trace`.
+pub fn gpu_build_memw_aligned_trace_tables(
+    memw_aligned_ops: &[MemwOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if memw_aligned_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::MEMW_ALIGNED_STRIDE;
+    let mut tables = Vec::with_capacity(memw_aligned_ops.len().div_ceil(max_rows));
+    for chunk in memw_aligned_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.is_register as u64;
+            input[base + 1] = op.base_address;
+            for j in 0..8 {
+                input[base + 2 + j] = op.value[j];
+            }
+            input[base + 10] = op.timestamp;
+            input[base + 11] = op.width as u64;
+            for j in 0..8 {
+                input[base + 12 + j] = op.old[j];
+            }
+            input[base + 20] = op.old_timestamp[0];
+            input[base + 21] = op.is_read as u64;
+        }
+        let dev = trace::gpu_build_memw_aligned_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_MEMW_ALIGNED_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// MEMW (general memory) tables on GPU. No dedup (one row per op). Ops carry
+/// old/old_timestamp (per-byte) from the (CPU) memory-model walk. Mirrors
+/// `generate_memw_trace`.
+pub fn gpu_build_memw_trace_tables(
+    memw_ops: &[MemwOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if memw_ops.is_empty() {
+        return None;
+    }
+    let stride = math_cuda::trace::MEMW_STRIDE;
+    let mut tables = Vec::with_capacity(memw_ops.len().div_ceil(max_rows));
+    for chunk in memw_ops.chunks(max_rows) {
+        let n = chunk.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut input = vec![0u64; n * stride];
+        for (i, op) in chunk.iter().enumerate() {
+            let base = i * stride;
+            input[base] = op.is_register as u64;
+            input[base + 1] = op.base_address;
+            for j in 0..8 {
+                input[base + 2 + j] = op.value[j];
+            }
+            input[base + 10] = op.timestamp;
+            input[base + 11] = op.width as u64;
+            for j in 0..8 {
+                input[base + 12 + j] = op.old[j];
+            }
+            for j in 0..8 {
+                input[base + 20 + j] = op.old_timestamp[j];
+            }
+            input[base + 28] = op.is_read as u64;
+        }
+        let dev = trace::gpu_build_memw_trace(&input, n, nrows).ok()?;
+        tables.push(device_to_trace_table(dev)?);
+    }
+    GPU_MEMW_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }

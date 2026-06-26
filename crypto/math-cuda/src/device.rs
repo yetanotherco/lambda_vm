@@ -102,6 +102,10 @@ const TRACE_LT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_lt.ptx"
 const TRACE_ALU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_alu.ptx"));
 const TRACE_SHIFT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_shift.ptx"));
 const TRACE_MULREM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_mulrem.ptx"));
+const TRACE_MEMW_REGISTER_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/trace_memw_register.ptx"));
+const TRACE_LDST_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_ldst.ptx"));
+const TRACE_MEMW_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_memw.ptx"));
 const TRACE_DEDUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_dedup.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
@@ -183,6 +187,11 @@ pub struct Backend {
     pub trace_shift_kernel: CudaFunction,
     pub trace_mul_kernel: CudaFunction,
     pub trace_dvrm_kernel: CudaFunction,
+    pub trace_memw_register_kernel: CudaFunction,
+    pub trace_load_kernel: CudaFunction,
+    pub trace_store_kernel: CudaFunction,
+    pub trace_memw_aligned_kernel: CudaFunction,
+    pub trace_memw_kernel: CudaFunction,
     pub dedup_init: CudaFunction,
     pub dedup_insert: CudaFunction,
     pub dedup_compact: CudaFunction,
@@ -213,6 +222,9 @@ impl Backend {
         let trace_alu = ctx.load_module(Ptx::from_src(TRACE_ALU_PTX))?;
         let trace_shift = ctx.load_module(Ptx::from_src(TRACE_SHIFT_PTX))?;
         let trace_mulrem = ctx.load_module(Ptx::from_src(TRACE_MULREM_PTX))?;
+        let trace_memw_register = ctx.load_module(Ptx::from_src(TRACE_MEMW_REGISTER_PTX))?;
+        let trace_ldst = ctx.load_module(Ptx::from_src(TRACE_LDST_PTX))?;
+        let trace_memw = ctx.load_module(Ptx::from_src(TRACE_MEMW_PTX))?;
         let trace_dedup = ctx.load_module(Ptx::from_src(TRACE_DEDUP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
@@ -289,6 +301,13 @@ impl Backend {
             trace_bytewise_kernel: trace_alu.load_function("trace_bytewise_kernel")?,
             trace_shift_kernel: trace_shift.load_function("trace_shift_kernel")?,
             trace_mul_kernel: trace_mulrem.load_function("trace_mul_kernel")?,
+            trace_memw_register_kernel: trace_memw_register
+                .load_function("trace_memw_register_kernel")?,
+            trace_load_kernel: trace_ldst.load_function("trace_load_kernel")?,
+            trace_store_kernel: trace_ldst.load_function("trace_store_kernel")?,
+            trace_memw_aligned_kernel: trace_memw
+                .load_function("trace_memw_aligned_kernel")?,
+            trace_memw_kernel: trace_memw.load_function("trace_memw_kernel")?,
             trace_dvrm_kernel: trace_mulrem.load_function("trace_dvrm_kernel")?,
             dedup_init: trace_dedup.load_function("dedup_init")?,
             dedup_insert: trace_dedup.load_function("dedup_insert")?,

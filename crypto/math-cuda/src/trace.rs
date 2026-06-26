@@ -36,6 +36,32 @@ pub const NUM_MUL_COLS: usize = 26;
 /// DVRM table column count (`prover::tables::dvrm::cols::NUM_COLUMNS`).
 pub const NUM_DVRM_COLS: usize = 34;
 
+/// MEMW_R table column count (`prover::tables::memw_register::cols::NUM_COLUMNS`).
+pub const NUM_MEMW_REGISTER_COLS: usize = 10;
+
+/// MEMW_R per-op input stride (must match `trace_memw_register.cu` `MR_STRIDE`).
+pub const MEMW_REGISTER_STRIDE: usize = 8;
+
+/// LOAD table column count (`prover::tables::load::cols::NUM_COLUMNS`).
+pub const NUM_LOAD_COLS: usize = 18;
+/// LOAD per-op input stride (must match `trace_ldst.cu` `LOAD_STRIDE`).
+pub const LOAD_STRIDE: usize = 12;
+
+/// STORE table column count (`prover::tables::store::cols::NUM_COLUMNS`).
+pub const NUM_STORE_COLS: usize = 16;
+/// STORE per-op input stride (must match `trace_ldst.cu` `STORE_STRIDE`).
+pub const STORE_STRIDE: usize = 4;
+
+/// MEMW_A table column count (`prover::tables::memw_aligned::cols::NUM_COLUMNS`).
+pub const NUM_MEMW_ALIGNED_COLS: usize = 29;
+/// MEMW_A per-op input stride (must match `trace_memw.cu` `MA_STRIDE`).
+pub const MEMW_ALIGNED_STRIDE: usize = 22;
+
+/// MEMW table column count (`prover::tables::memw::cols::NUM_COLUMNS`).
+pub const NUM_MEMW_COLS: usize = 49;
+/// MEMW per-op input stride (must match `trace_memw.cu` `MW_STRIDE`).
+pub const MEMW_STRIDE: usize = 29;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -316,6 +342,161 @@ pub fn gpu_build_shift_trace(
         ncols: NUM_SHIFT_COLS,
         nrows,
     })
+}
+
+/// Build the MEMW_R (register memory) trace table on device. No dedup (one row
+/// per op). `input` is interleaved with stride `MEMW_REGISTER_STRIDE`:
+/// `[base_address, timestamp, value0, value1, old0, old1, old_timestamp0,
+/// is_read]` per op. Padding rows (r >= n) stay zero. Mirrors
+/// `generate_memw_register_trace`.
+pub fn gpu_build_memw_register_trace(
+    input: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(input.len(), n * MEMW_REGISTER_STRIDE);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let in_d = stream.clone_htod(input)?;
+    let mut cols = stream.alloc_zeros::<u64>(NUM_MEMW_REGISTER_COLS * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.trace_memw_register_kernel)
+            .arg(&in_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_MEMW_REGISTER_COLS,
+        nrows,
+    })
+}
+
+/// Shared launcher for the per-op memory fills (LOAD/STORE/MEMW_A/MEMW). Each
+/// kernel reads an interleaved `input` (stride bytes per op) and writes a
+/// column-major `ncols × nrows` buffer; padding rows (r >= n) stay zero.
+fn launch_interleaved_fill(
+    kernel: &cudarc::driver::CudaFunction,
+    input: &[u64],
+    stride: usize,
+    n: usize,
+    nrows: usize,
+    ncols: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(input.len(), n * stride);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let in_d = stream.clone_htod(input)?;
+    let mut cols = stream.alloc_zeros::<u64>(ncols * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(&in_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols,
+        nrows,
+    })
+}
+
+/// Build the LOAD trace on device. `input` interleaved, stride `LOAD_STRIDE`:
+/// `[base_address, timestamp, width, signed, res0..res7]`. Mirrors
+/// `generate_load_trace`.
+pub fn gpu_build_load_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_load_kernel,
+        input,
+        LOAD_STRIDE,
+        n,
+        nrows,
+        NUM_LOAD_COLS,
+    )
+}
+
+/// Build the STORE trace on device. `input` interleaved, stride `STORE_STRIDE`:
+/// `[base_address, timestamp, value, write_flags]`. Mirrors
+/// `generate_store_trace`.
+pub fn gpu_build_store_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_store_kernel,
+        input,
+        STORE_STRIDE,
+        n,
+        nrows,
+        NUM_STORE_COLS,
+    )
+}
+
+/// Build the MEMW_A (aligned) trace on device. `input` interleaved, stride
+/// `MEMW_ALIGNED_STRIDE`: `[is_register, base_address, value0..value7,
+/// timestamp, width, old0..old7, old_timestamp0, is_read]`. Mirrors
+/// `generate_memw_aligned_trace`.
+pub fn gpu_build_memw_aligned_trace(
+    input: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_memw_aligned_kernel,
+        input,
+        MEMW_ALIGNED_STRIDE,
+        n,
+        nrows,
+        NUM_MEMW_ALIGNED_COLS,
+    )
+}
+
+/// Build the MEMW (general) trace on device. `input` interleaved, stride
+/// `MEMW_STRIDE`: `[is_register, base_address, value0..value7, timestamp,
+/// width, old0..old7, old_timestamp0..old_timestamp7, is_read]`. Mirrors
+/// `generate_memw_trace`.
+pub fn gpu_build_memw_trace(input: &[u64], n: usize, nrows: usize) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    launch_interleaved_fill(
+        &be.trace_memw_kernel,
+        input,
+        MEMW_STRIDE,
+        n,
+        nrows,
+        NUM_MEMW_COLS,
+    )
 }
 
 /// Build the MUL trace table on device from deduped ops. SoA over `n` unique
