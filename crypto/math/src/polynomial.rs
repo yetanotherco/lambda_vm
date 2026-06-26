@@ -554,11 +554,14 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             return Err(FFTError::InputError(weights.len()));
         }
 
-        // 1/n is folded into the coset-weight pass (step 2 below).
+        // 1. iFFT on rows[..n] (cache-blocked two-half; natural→natural, no 1/n
+        //    — the 1/n is folded into the coset-weight pass below). Replaces the
+        //    flat-Bowers iFFT, which cache-thrashes at large n.
         let prefix_len = n * num_cols;
         fft_batch_two_half::<F, E>(&mut buffer[..prefix_len], num_cols, inv_twiddles)?;
 
-        // Scale by coset weights — one weight per row, applied to all M columns.
+        // 2. Scale by coset weights — one weight per row, multiply M elements
+        //    of that row by it. Each row is independent → parallelizable.
         #[cfg(feature = "parallel")]
         {
             use rayon::prelude::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
@@ -583,30 +586,15 @@ impl<E: IsField> Polynomial<FieldElement<E>> {
             }
         }
 
+        // 3. Zero-pad rows to lde_n.
         buffer.resize(lde_n * num_cols, FieldElement::zero());
+
+        // 4. Forward FFT (cache-blocked two-half; natural-order output, replaces
+        //    the flat Bowers fwd-FFT(2n) + bit-reverse — the cache-bound step).
         fft_batch_two_half::<F, E>(buffer, num_cols, fwd_twiddles)?;
 
         Ok(())
     }
-}
-
-#[cfg(test)]
-pub fn compose_fft<F, E>(
-    poly_1: &Polynomial<FieldElement<E>>,
-    poly_2: &Polynomial<FieldElement<E>>,
-) -> Polynomial<FieldElement<E>>
-where
-    F: IsFFTField + IsSubFieldOf<E>,
-    E: IsField + Send + Sync,
-{
-    let poly_2_evaluations = Polynomial::evaluate_fft::<F>(poly_2, 1, None).unwrap();
-
-    let values: Vec<_> = poly_2_evaluations
-        .iter()
-        .map(|value| poly_1.evaluate(value))
-        .collect();
-
-    Polynomial::interpolate_fft::<F>(values.as_slice()).unwrap()
 }
 
 fn evaluate_fft_cpu_raw<F, E>(

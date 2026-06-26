@@ -199,8 +199,10 @@ where
     let bitrev_tw = &tw.bitrev_tw;
     let mid = log_n.div_ceil(2);
 
+    // Step 1: bit-reverse rows.
     in_place_bit_reverse_permute_row_major(buf, m);
 
+    // Step 2: first half — layers 0..mid within 2^mid-row chunks (all identical).
     let first_chunk = (1usize << mid) * m;
     #[cfg(feature = "parallel")]
     let it = buf.par_chunks_mut(first_chunk);
@@ -212,8 +214,10 @@ where
         }
     });
 
+    // Step 3: bit-reverse rows.
     in_place_bit_reverse_permute_row_major(buf, m);
 
+    // Step 4: second half — layers mid..log_n within 2^(log_n-mid)-row chunks.
     let second_chunk = (1usize << (log_n - mid)) * m;
     #[cfg(feature = "parallel")]
     let it2 = buf.par_chunks_mut(second_chunk).enumerate();
@@ -225,6 +229,7 @@ where
         }
     });
 
+    // Step 5: final bit-reverse to natural order.
     in_place_bit_reverse_permute_row_major(buf, m);
 
     Ok(())

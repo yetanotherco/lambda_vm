@@ -1,11 +1,10 @@
 use std::marker::PhantomData;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
-#[cfg(any(test, feature = "test-utils", feature = "debug-checks"))]
 use math::fft::bowers_fft::LayerTwiddles;
 use math::fft::errors::FFTError;
 use math::fft::two_half_fft::TwoHalfTwiddles;
@@ -292,11 +291,55 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     two_half_inv: TwoHalfTwiddles<F>,
     two_half_fwd: TwoHalfTwiddles<F>,
     coset_weights: Vec<FieldElement<F>>,
+    /// Composition half-extension cache, initialized only when the degree-2
+    /// decomposition path actually runs on CPU.
+    composition: OnceLock<CompositionLdeTwiddles<F>>,
+}
+
+pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
+    /// Inverse twiddles for the g²-coset halves of size `lde_size/2`.
+    inv: LayerTwiddles<F>,
+    /// Forward twiddles for the full g-coset of size `lde_size`.
+    fwd: LayerTwiddles<F>,
+    /// Weights `g⁻ʲ/(lde_size/2)` for the composition half-extension.
+    weights: Vec<FieldElement<F>>,
+}
+
+impl<F: IsFFTField> CompositionLdeTwiddles<F> {
+    fn new(half_size: usize, offset: &FieldElement<F>) -> Self {
+        // Composition half-extension weights: g⁻ʲ / half_size. The constraint-
+        // quotient halves live on the g²-coset of size `half_size`; the unnormalized
+        // iFFT yields `n·cⱼ·(g²)ʲ` and these weights turn that into `cⱼ·gʲ` for the
+        // forward FFT onto the g-coset.
+        let half_size_fe = FieldElement::<F>::from(half_size as u64);
+        let inv_half_size_offset = (&half_size_fe * offset)
+            .inv()
+            .expect("half_size and coset offset are non-zero");
+        let half_size_inv = offset * &inv_half_size_offset;
+        let offset_inv = &half_size_fe * &inv_half_size_offset;
+        let weights = {
+            let mut w = Vec::with_capacity(half_size);
+            let mut cur = half_size_inv;
+            for _ in 0..half_size {
+                w.push(cur.clone());
+                cur = &cur * &offset_inv;
+            }
+            w
+        };
+
+        Self {
+            inv: LayerTwiddles::<F>::new_inverse(half_size.trailing_zeros() as u64)
+                .expect("valid composition inverse twiddles"),
+            fwd: LayerTwiddles::<F>::new((half_size * 2).trailing_zeros() as u64)
+                .expect("valid composition forward twiddles"),
+            weights,
+        }
+    }
 }
 
 impl<F: IsFFTField> LdeTwiddles<F> {
     /// Construct twiddles and coset weights for a domain of the given size and blowup factor.
-    fn new(domain: &Domain<F>) -> Self {
+    pub(crate) fn new(domain: &Domain<F>) -> Self {
         let domain_size = domain.interpolation_domain_size;
         let lde_size = domain_size * domain.blowup_factor;
 
@@ -326,7 +369,21 @@ impl<F: IsFFTField> LdeTwiddles<F> {
             two_half_fwd: TwoHalfTwiddles::<F>::new(lde_size.trailing_zeros() as usize, false)
                 .expect("valid forward two-half twiddles"),
             coset_weights,
+            composition: OnceLock::new(),
         }
+    }
+
+    fn composition(&self, domain: &Domain<F>) -> &CompositionLdeTwiddles<F> {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let half_size = lde_size / 2;
+        debug_assert_eq!(self.coset_weights.len(), domain.interpolation_domain_size);
+        self.composition
+            .get_or_init(|| CompositionLdeTwiddles::new(half_size, &domain.coset_offset))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_composition_cache(&self) -> bool {
+        self.composition.get().is_some()
     }
 }
 
@@ -416,6 +473,32 @@ where
         1 => Ok(evaluations),
         _ => Ok(evaluations.into_iter().step_by(step).collect()),
     }
+}
+
+/// Interleave column-major data into a flat row-major buffer + its column
+/// count. Used only by the cuda fast path to materialize the GPU-expanded
+/// columns in the row-major layout the table expects (CPU paths read the
+/// already-row-major trace directly, with no transpose).
+#[cfg(feature = "cuda")]
+fn columns_to_row_major<E: IsField>(
+    columns: &[Vec<FieldElement<E>>],
+) -> (Vec<FieldElement<E>>, usize) {
+    let num_cols = columns.len();
+    let n = if num_cols > 0 { columns[0].len() } else { 0 };
+    // All columns must be the same length; otherwise `col[row]` below indexes
+    // out of bounds. The producers (CPU/GPU LDE) always emit uniform columns —
+    // this guards against a future regression cheaply (debug builds only).
+    debug_assert!(
+        columns.iter().all(|c| c.len() == n),
+        "columns_to_row_major requires all columns to have equal length"
+    );
+    let mut data = Vec::with_capacity(n * num_cols);
+    for row in 0..n {
+        for col in columns {
+            data.push(col[row].clone());
+        }
+    }
+    (data, num_cols)
 }
 
 /// Compute Keccak-256 leaf hashes for `commit_columns_bit_reversed`: one
@@ -1105,6 +1188,7 @@ pub trait IsStarkProver<
     fn decompose_and_extend_d2(
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1135,9 +1219,8 @@ pub trait IsStarkProver<
             (&two_inv * &sum, &inv_2x[i] * &diff)
         });
 
-        // Step 3: Extend each part from N evals on g²-coset to 2N evals on g-coset.
-        // The squared coset offset is g² (= coset_offset²).
-        let coset_offset_squared = &domain.coset_offset * &domain.coset_offset;
+        // Step 3: Extend each part from n evals on the g²-coset to 2n evals on the
+        // g-coset (the full LDE domain).
 
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
         // `cuda` feature and a qualifying size. Falls through to CPU when not.
@@ -1148,36 +1231,38 @@ pub trait IsStarkProver<
             return vec![lde_h0, lde_h1];
         }
 
+        let composition_twiddles = twiddles.composition(domain);
         let (lde_h0, lde_h1) = crate::par::join(
-            || Self::extend_half_to_lde(&h0_evals, &coset_offset_squared, domain),
-            || Self::extend_half_to_lde(&h1_evals, &coset_offset_squared, domain),
+            || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
+            || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
         );
         vec![lde_h0, lde_h1]
     }
 
-    /// Given N evaluations of a degree-<N polynomial on the g²-coset,
-    /// extend to 2N evaluations on the g-coset (the full LDE domain).
-    /// This is: iFFT(N, offset=g²) → coefficients → FFT(2N, offset=g).
+    /// Extend `half_evals` — `n = lde_size/2` evaluations of a degree-`<n` polynomial
+    /// on the g²-coset — to `2n` evaluations on the g-coset (the full LDE domain).
+    ///
+    /// Fused: iFFT(n) → coset reshift g²→g → forward FFT(2n) in a single pass with no
+    /// intermediate coefficient `Polynomial`. The twiddles and the weights `g⁻ʲ/n`
+    /// (which fold the 1/n normalization and the net g²→g shift) are cached lazily
+    /// once per domain in [`LdeTwiddles`].
     fn extend_half_to_lde(
         half_evals: &[FieldElement<FieldExtension>],
-        squared_offset: &FieldElement<Field>,
-        domain: &Domain<Field>,
+        twiddles: &CompositionLdeTwiddles<Field>,
     ) -> Vec<FieldElement<FieldExtension>>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        // iFFT on the N-point squared coset to get coefficients
-        let poly = Polynomial::interpolate_offset_fft(half_evals, squared_offset)
-            .expect("iFFT should succeed");
-        // Evaluate on the full LDE domain (2N points on the g-coset)
-        evaluate_polynomial_on_lde_domain(
-            &poly,
-            domain.blowup_factor,
-            domain.interpolation_domain_size,
-            &domain.coset_offset,
+        debug_assert_eq!(half_evals.len(), twiddles.weights.len());
+        Polynomial::coset_lde_full::<Field>(
+            half_evals,
+            2,
+            &twiddles.weights,
+            &twiddles.inv,
+            &twiddles.fwd,
         )
-        .expect("LDE evaluation should succeed")
+        .expect("coset extension")
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
@@ -1185,6 +1270,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
@@ -1227,7 +1313,7 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain)
+            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -2359,6 +2445,7 @@ pub trait IsStarkProver<
                         &round_1_result,
                         table_transcript,
                         domain,
+                        &twiddle_caches[idx],
                     )?;
 
                     #[cfg(feature = "instruments")]
@@ -2446,6 +2533,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -2486,6 +2574,7 @@ pub trait IsStarkProver<
             air,
             pub_inputs,
             domain,
+            twiddles,
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
