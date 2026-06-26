@@ -1627,6 +1627,7 @@ dependencies = [
  "executor",
  "log",
  "math",
+ "math-cuda",
  "rayon",
  "serde",
  "sha3",

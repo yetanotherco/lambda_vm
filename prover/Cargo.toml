@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
-cuda = ["stark/cuda"]
+cuda = ["stark/cuda", "dep:math-cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
@@ -15,6 +15,7 @@ disk-spill = ["stark/disk-spill"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
+math-cuda = { path = "../crypto/math-cuda", optional = true }
 crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }

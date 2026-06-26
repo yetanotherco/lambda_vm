@@ -3734,7 +3734,8 @@ impl Traces {
         );
 
         // Phases 3-5
-        build_traces(
+        #[allow(unused_mut)]
+        let mut traces = build_traces(
             ops,
             Some(elf),
             &memory_state,
@@ -3746,7 +3747,28 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             storage_mode,
             private_input,
-        )
+        )?;
+
+        // GPU CPU-table fast path: rebuild the CPU table(s) on device
+        // (byte-identical to the CPU builder, chunked the same way) and swap
+        // them in. The CPU op-vector was still built above (downstream phases
+        // consume it); this only replaces the CPU *table*. Falls back to the
+        // CPU-built tables on any GPU error or a chunk-count mismatch.
+        #[cfg(feature = "cuda")]
+        if let Some(gpu_cpus) =
+            super::gpu_trace::gpu_build_cpu_trace_tables(logs, &instructions, max_rows.cpu)
+        {
+            if gpu_cpus.len() == traces.cpus.len() {
+                log::info!(
+                    "[gpu-trace] CPU table built on device ({} ops, {} chunks)",
+                    logs.len(),
+                    gpu_cpus.len()
+                );
+                traces.cpus = gpu_cpus;
+            }
+        }
+
+        Ok(traces)
     }
 
     /// Generates all traces from execution logs (legacy API).

@@ -32,6 +32,8 @@ pub mod dvrm;
 pub mod ec_scalar;
 pub mod ecdas;
 pub mod ecsm;
+#[cfg(feature = "cuda")]
+pub mod gpu_trace;
 pub mod eq;
 pub mod halt;
 pub mod keccak;

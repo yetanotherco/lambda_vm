@@ -667,6 +667,139 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
     Ok(handle)
 }
 
+/// Like [`coset_lde_batch_base_into_with_merkle_tree_keep`], but reads the input
+/// trace columns from an already-resident [`crate::trace::DeviceMainCols`]
+/// instead of host slices — so the GPU-built trace feeds the LDE with **no
+/// host round-trip** (the column data never leaves VRAM between trace-gen and
+/// LDE). Same fused pipeline (iNTT → coset scale → NTT → per-row Keccak leaves
+/// → inner tree, FullTree) and the same outputs:
+/// - `outputs`: the host LDE columns (still needed by the CPU constraint-eval /
+///   query phases until those move to GPU; the D2H is temporary scaffolding).
+/// - `nodes_out`: the `(2*lde_size - 1) * 32`-byte Merkle node buffer.
+/// - returns the device-resident LDE as a [`GpuLdeBase`] for R2–R4 reuse.
+///
+/// `cols.nrows` is the (power-of-two) trace length `n`; `weights.len() == n`.
+pub fn coset_lde_from_device_with_merkle_tree_keep(
+    cols: &crate::trace::DeviceMainCols,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    nodes_out: &mut [u8],
+) -> Result<GpuLdeBase> {
+    let m = cols.ncols;
+    let n = cols.nrows;
+    assert_eq!(outputs.len(), m, "outputs must match column count");
+    assert!(n.is_power_of_two() && n > 0, "nrows must be a power of two");
+    assert_eq!(weights.len(), n, "weights length must match nrows");
+    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_from_device lde_size");
+    for o in outputs.iter() {
+        assert_eq!(o.len(), lde_size, "each output must be lde_size u64s");
+    }
+    let nodes_dev_bytes = (2 * lde_size - 1) * 32; // FullTree
+    assert_eq!(nodes_out.len(), nodes_dev_bytes);
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+    let staging_slot = be.pinned_staging();
+    let mut staging = staging_slot.lock().unwrap();
+    staging.ensure_capacity(m * lde_size, &be.ctx)?;
+    let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
+
+    // Device-to-device: copy each resident trace column into the first `n` slots
+    // of its `lde_size` slab (the rest stays zero). Replaces the host path's
+    // pack + H2D — no PCIe transfer of the trace.
+    let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
+    for c in 0..m {
+        let src = cols.buf.slice(c * n..c * n + n);
+        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+        stream.memcpy_dtod(&src, &mut dst)?;
+    }
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let m_u32 = m as u32;
+
+    // iNTT
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, m_u32)?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        m_u32,
+    )?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        m_u32,
+    )?;
+    // forward NTT at LDE size
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        m_u32,
+    )?;
+
+    // Per-row Keccak leaves (lde_size leaves) + inner tree.
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
+    {
+        let leaves_offset_bytes = (lde_size - 1) * 32;
+        let mut leaves_view =
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
+        launch_keccak_base(
+            stream.as_ref(),
+            &buf,
+            col_stride_u64,
+            m as u64,
+            lde_u64,
+            &mut leaves_view,
+        )?;
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+
+    // D2H the LDE (for host consumers) + the tree nodes via pinned staging.
+    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
+    for (c, dst) in outputs.iter_mut().enumerate() {
+        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+    }
+    drop(staging);
+
+    Ok(GpuLdeBase {
+        buf: Arc::new(buf),
+        m,
+        lde_size,
+    })
+}
+
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
