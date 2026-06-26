@@ -540,7 +540,6 @@ fn prove_global(
                 global_memory::FiniState {
                     value: (b.fini.value & 0xFF) as u8,
                     epoch: b.fini.epoch,
-                    timestamp: b.fini.timestamp,
                 },
             );
         }

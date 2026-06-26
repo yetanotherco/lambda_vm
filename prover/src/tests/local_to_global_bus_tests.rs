@@ -31,19 +31,18 @@ use crate::test_utils::multi_prove_ram;
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 
-/// Columns of an anchor trace: one GlobalMemory token `(address, value, epoch,
-/// timestamp)` per row, packed in the same order as the L2G init/fini tokens.
+/// Columns of an anchor trace: one GlobalMemory token `(address, value, epoch)`
+/// per row, packed in the same order as the L2G init/fini tokens (no timestamp —
+/// the cross-epoch chain is ordered by epoch).
 mod anchor_cols {
     pub const ADDR_LO: usize = 0;
     pub const ADDR_HI: usize = 1;
     pub const VAL: usize = 2;
     pub const EPOCH: usize = 3;
-    pub const TS_LO: usize = 4;
-    pub const TS_HI: usize = 5;
-    pub const NUM_COLUMNS: usize = 6;
+    pub const NUM_COLUMNS: usize = 4;
 }
 
-type Token = (u64, u64, u64, u64);
+type Token = (u64, u64, u64);
 
 fn l2g_air(
     proof_options: &ProofOptions,
@@ -83,14 +82,6 @@ fn anchor_air(
             start_column: anchor_cols::EPOCH,
             packing: Packing::Direct,
         },
-        BusValue::Packed {
-            start_column: anchor_cols::TS_LO,
-            packing: Packing::Direct,
-        },
-        BusValue::Packed {
-            start_column: anchor_cols::TS_HI,
-            packing: Packing::Direct,
-        },
     ];
     let interaction = if is_sender {
         BusInteraction::sender(BusId::GlobalMemory, Multiplicity::One, values)
@@ -111,14 +102,12 @@ fn anchor_air(
 fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
     let num_rows = tokens.len().next_power_of_two().max(4);
     let mut data = vec![FE::zero(); num_rows * anchor_cols::NUM_COLUMNS];
-    for (i, &(addr, value, epoch, ts)) in tokens.iter().enumerate() {
+    for (i, &(addr, value, epoch)) in tokens.iter().enumerate() {
         let base = i * anchor_cols::NUM_COLUMNS;
         data[base + anchor_cols::ADDR_LO] = FE::from(addr & 0xFFFF_FFFF);
         data[base + anchor_cols::ADDR_HI] = FE::from(addr >> 32);
         data[base + anchor_cols::VAL] = FE::from(value & 0xFF);
         data[base + anchor_cols::EPOCH] = FE::from(epoch);
-        data[base + anchor_cols::TS_LO] = FE::from(ts & 0xFFFF_FFFF);
-        data[base + anchor_cols::TS_HI] = FE::from(ts >> 32);
     }
     TraceTable::new_main(data, anchor_cols::NUM_COLUMNS, 1)
 }
@@ -300,14 +289,7 @@ pub(crate) fn prove_global(boundaries: &[Vec<CellBoundary>]) -> MultiProof<F, E,
     let genesis: Vec<Token> = all
         .iter()
         .filter(|b| b.init.originating_epoch == GENESIS_EPOCH)
-        .map(|b| {
-            (
-                b.address,
-                b.init.value,
-                b.init.originating_epoch,
-                b.init.timestamp,
-            )
-        })
+        .map(|b| (b.address, b.init.value, b.init.originating_epoch))
         .collect();
 
     // Program-end anchor: a RECEIVE token for each cell's final fini (epochs are
@@ -315,10 +297,7 @@ pub(crate) fn prove_global(boundaries: &[Vec<CellBoundary>]) -> MultiProof<F, E,
     let mut final_fini: HashMap<u64, Token> = HashMap::new();
     for epoch in boundaries {
         for b in epoch {
-            final_fini.insert(
-                b.address,
-                (b.address, b.fini.value, b.fini.epoch, b.fini.timestamp),
-            );
+            final_fini.insert(b.address, (b.address, b.fini.value, b.fini.epoch));
         }
     }
     let program_end: Vec<Token> = final_fini.into_values().collect();
@@ -500,23 +479,13 @@ fn prove_and_verify_global_with_traces(
     let genesis: Vec<Token> = all
         .iter()
         .filter(|b| b.init.originating_epoch == GENESIS_EPOCH)
-        .map(|b| {
-            (
-                b.address,
-                b.init.value,
-                b.init.originating_epoch,
-                b.init.timestamp,
-            )
-        })
+        .map(|b| (b.address, b.init.value, b.init.originating_epoch))
         .collect();
 
     let mut final_fini: HashMap<u64, Token> = HashMap::new();
     for epoch in boundaries {
         for b in epoch {
-            final_fini.insert(
-                b.address,
-                (b.address, b.fini.value, b.fini.epoch, b.fini.timestamp),
-            );
+            final_fini.insert(b.address, (b.address, b.fini.value, b.fini.epoch));
         }
     }
     let program_end: Vec<Token> = final_fini.into_values().collect();
