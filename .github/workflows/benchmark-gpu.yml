@@ -38,7 +38,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Vast offer search: RTX 5090, >=16 cores, >=64GB RAM, >=64GB disk, verified +
+  # Vast offer search: RTX 5090, >=16 cores, >=96GB RAM, >=64GB disk, verified +
   # rentable, Blackwell-capable driver, <= cap.
   GPU_NAME: RTX_5090
   PRICE_CAP: "3"
@@ -140,9 +140,9 @@ jobs:
           OFFER_ATTEMPTS: "10"
           OFFER_INTERVAL: "30"
         run: |
-          # cpu_ram is per-instance allocated RAM in MB; use 64000 (not 65536) because the
-          # "64 GB" boxes report ~64467 MB.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=64000 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          # cpu_ram in the search filter is GB (the returned .cpu_ram field is MB — different
+          # units), so >=96 means 96 GB. >=96000 would mean 96000 GB and match nothing.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=96 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY"
           OFFER_ID=""
           for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
@@ -157,7 +157,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=64GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
