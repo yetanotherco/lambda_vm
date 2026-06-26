@@ -90,7 +90,8 @@ def experiment(iters: int, nr_pos_pairs: int, nr_neg_pairs: int, plot_individual
     
     # combined plot
     plt.hist([a for b in carries_per_limb for a in b], bins=100)
-    plt.vlines(2**20, 0, 30000, color='0')
+    plt.vlines(0.9*2**20, 0, iters, color='0')
+    plt.vlines(-0.1*2**20, 0, iters, color='0')
     ax = plt.gca()
     ax.set_xlabel("carry value")
     ax.set_ylabel("frequency")
@@ -99,4 +100,7 @@ def experiment(iters: int, nr_pos_pairs: int, nr_neg_pairs: int, plot_individual
     plt.clf()
 
 if __name__ == "__main__":
-    experiment(50_000, 4, 2, False)
+    experiment(250_000, 3, 4, False)
+    experiment(250_000, 3, 3, False)
+    experiment(250_000, 2, 1, False)
+    experiment(250_000, 2, 2, False)
