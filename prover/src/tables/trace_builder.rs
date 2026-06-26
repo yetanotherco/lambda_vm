@@ -1926,6 +1926,10 @@ pub fn epoch_touched_cells<I: ImageSource>(
     let mut register_state = RegisterState::from_init(register_init);
     let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
+    Ok(touched_cells_from_memory_state(&memory_state))
+}
+
+fn touched_cells_from_memory_state(memory_state: &MemoryState) -> local_to_global::EpochTouches {
     let mut touched: Vec<(u64, u64, u64)> = memory_state
         .cells
         .iter()
@@ -1933,7 +1937,7 @@ pub fn epoch_touched_cells<I: ImageSource>(
         .map(|(addr, cell)| (addr, cell.0 as u64, cell.1))
         .collect();
     touched.sort_by_key(|&(addr, _, _)| addr);
-    Ok(touched)
+    touched
 }
 
 /// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
@@ -2573,9 +2577,13 @@ pub struct Traces {
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     /// Local-to-global boundary table for continuation epochs. Empty unless the
-    /// epoch is built with `l2g_memory_bookend` (then it bookends the Memory bus
-    /// for touched RAM bytes; see [`local_to_global`]).
+    /// continuation driver fills it with the boundary derived from
+    /// `touched_memory_cells`.
     pub local_to_global: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// Touched cells observed while replaying this epoch's logs, each as
+    /// `(address, end_value, end_timestamp)`. Populated only for continuation
+    /// epochs that use the L2G memory bookend.
+    pub touched_memory_cells: local_to_global::EpochTouches,
     // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
     pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3270,26 +3278,15 @@ fn build_traces<I: ImageSource + Sync>(
         }
     }
 
-    // Local-to-global boundary table. Built only for continuation epochs that use
-    // L2G as the Memory-bus bookend; it claims each touched RAM byte's epoch-start
-    // value (init, at ts 0) and epoch-end value/timestamp (fini), derived from the
-    // SAME `memory_state.cells` (timestamp > 0) that PAGE just excluded.
-    let local_to_global = match (l2g_memory_bookend, initial_image) {
-        (true, Some(image)) => {
-            let mut touched: Vec<(u64, u64, u64)> = memory_state
-                .cells
-                .iter()
-                .filter(|(_, cell)| cell.1 > 0)
-                .map(|(addr, (value, ts))| (addr, value as u64, ts))
-                .collect();
-            touched.sort_by_key(|&(addr, _, _)| addr);
-            let initial_memory: HashMap<u64, u64> =
-                image.image_iter().map(|(a, v)| (a, v as u64)).collect();
-            let boundaries = local_to_global::epoch_boundaries(&initial_memory, &[touched]);
-            local_to_global::generate_local_to_global_trace(&boundaries[0])
-        }
-        _ => local_to_global::generate_local_to_global_trace(&[]),
+    // Continuation callers derive the real cross-epoch boundary from this set and
+    // install its L2G trace after provenance is applied. Avoid building a
+    // throwaway genesis-only L2G trace here.
+    let touched_memory_cells = if l2g_memory_bookend {
+        touched_cells_from_memory_state(memory_state)
+    } else {
+        Vec::new()
     };
+    let local_to_global = local_to_global::generate_local_to_global_trace(&[]);
 
     Ok(Traces {
         cpus,
@@ -3317,6 +3314,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecdas: ecdas_trace,
         memw_registers,
         local_to_global,
+        touched_memory_cells,
         eqs,
         bytewises,
         stores,
@@ -3622,6 +3620,7 @@ impl Traces {
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
+            touched_memory_cells: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -3754,6 +3753,7 @@ impl Traces {
             page_configs: _,
             public_output_bytes: _,
             local_to_global: _,
+            touched_memory_cells: _,
         } = self;
 
         let mut total: u64 = 0;

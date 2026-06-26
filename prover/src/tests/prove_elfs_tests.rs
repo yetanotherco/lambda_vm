@@ -3349,6 +3349,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     use crate::tables::register;
     use crate::tables::trace_builder::build_initial_image;
     use crate::test_utils::asm_elf_bytes;
+    use std::collections::HashMap;
 
     let _ = env_logger::builder().is_test(true).try_init();
     let elf_bytes = asm_elf_bytes("all_loadstore_32");
@@ -3379,6 +3380,10 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
+    let initial_memory: HashMap<u64, u64> = image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries =
+        local_to_global::epoch_boundaries(&initial_memory, &[traces.touched_memory_cells.clone()]);
+    traces.local_to_global = local_to_global::generate_local_to_global_trace(&boundaries[0]);
 
     let proof_options = ProofOptions::default_test_options();
     let table_counts = traces.table_counts();
