@@ -186,6 +186,8 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Continuation epoch size exponent is invalid.
+    InvalidContinuationEpochSize(String),
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
@@ -202,6 +204,9 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::InvalidContinuationEpochSize(msg) => {
+                write!(f, "invalid continuation epoch size: {msg}")
+            }
             Error::HaltInNonFinalEpoch => {
                 write!(
                     f,

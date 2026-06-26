@@ -621,25 +621,34 @@ fn verify_global(
 }
 
 /// Prove a full continuation and return a self-contained [`ContinuationProof`]
-/// (prove half only — no verification). Splits the execution into `epoch_size`-cycle
-/// epochs, proves each, and proves the one cross-epoch global-memory linkage.
+/// (prove half only — no verification). Splits the execution into `2^epoch_size_log2`
+/// cycle epochs, proves each, and proves the one cross-epoch global-memory linkage.
 ///
-/// Epoch size is rounded up to a power of two (min 4). An intermediate epoch runs
-/// exactly `epoch_size` cycles, so a power-of-two size gives its CPU table a
-/// power-of-two row count and therefore zero padding rows — important because CPU
-/// padding rows participate in the inline-PC `memory` chain (carrying pc=1) which is
-/// only anchored by the HALT chip's emit_pc/consume_pc, and intermediate epochs
-/// exclude HALT. With padding rows present and no HALT their pc=1 tokens dangle and
-/// the Memory bus fails to balance; zero padding rows sidestep that. The final epoch
-/// keeps its remainder and its HALT, so its padding chain is anchored as usual. A
-/// program that fits in one epoch runs as a single final (monolithic-style) epoch.
+/// Intermediate epochs run exactly `2^epoch_size_log2` cycles, so their CPU tables
+/// have power-of-two row counts and therefore zero padding rows — important because
+/// CPU padding rows participate in the inline-PC `memory` chain (carrying pc=1)
+/// which is only anchored by the HALT chip's emit_pc/consume_pc, and intermediate
+/// epochs exclude HALT. With padding rows present and no HALT their pc=1 tokens
+/// dangle and the Memory bus fails to balance; zero padding rows sidestep that. The
+/// final epoch keeps its remainder and its HALT, so its padding chain is anchored as
+/// usual. A program that fits in one epoch runs as a single final (monolithic-style)
+/// epoch.
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
-    epoch_size: usize,
+    epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
-    let epoch_size = epoch_size.next_power_of_two().max(4);
+    if epoch_size_log2 < 2 {
+        return Err(Error::InvalidContinuationEpochSize(
+            "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
+        ));
+    }
+    let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+        Error::InvalidContinuationEpochSize(format!(
+            "epoch_size_log2 {epoch_size_log2} is too large for this platform"
+        ))
+    })?;
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
@@ -844,10 +853,10 @@ pub fn verify_continuation(
 pub fn prove_and_verify_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
-    epoch_size: usize,
+    epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size, opts)?;
+    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size_log2, opts)?;
     verify_continuation(elf_bytes, &bundle, opts)
 }
 
@@ -874,30 +883,26 @@ mod tests {
             .logs
             .len();
 
-        // Both commits in a single epoch (x254 starts at 0).
+        // Both commits in a single 64-cycle epoch (x254 starts at 0).
         let single = prove_and_verify_continuation(
             &elf_bytes,
             &[],
-            total,
+            6,
             &ProofOptions::default_test_options(),
         )
         .unwrap();
         assert_eq!(single.as_deref(), Some(&expected_output[..]));
+        assert!(total <= (1 << 6), "single-epoch log2 must cover the run");
 
         // The late commit (only `halt` follows it) lands past the midpoint, so a
-        // half-sized epoch forces it into a later epoch where x254 is already 2.
+        // 16-cycle epoch forces it into a later epoch where x254 is already 2.
         // Prove first so we can assert the run actually split into >1 epoch — without
         // this the test would silently pass even if it degraded to a single epoch.
-        let bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            (total / 2).max(1),
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.num_epochs() > 1,
-            "a half-sized epoch must split the run into multiple epochs"
+            "16-cycle epochs must split the run into multiple epochs"
         );
         let split = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
             .unwrap();
@@ -909,12 +914,13 @@ mod tests {
     }
 
     // A memory-heavy multi-epoch continuation. `all_loadstore_32` is ~34 cycles, so
-    // a power-of-two `epoch_size` of 8 yields several intermediate epochs (each an
+    // `epoch_size_log2 = 3` (8 cycles) yields several intermediate epochs (each an
     // exact power-of-two cycle count → no CPU padding rows) plus a final epoch.
     #[test]
     fn test_prove_and_verify_continuation() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let epoch_size_log2 = 3;
         let epoch_size = 8;
         // Guard against silent degradation: the program must be longer than one
         // epoch, otherwise this collapses to a single final epoch and stops testing
@@ -933,7 +939,7 @@ mod tests {
             prove_and_verify_continuation(
                 &elf_bytes,
                 &[],
-                epoch_size,
+                epoch_size_log2,
                 &ProofOptions::default_test_options()
             )
             .unwrap()
@@ -944,8 +950,9 @@ mod tests {
     // Regression for the `epoch_touched_cells` fresh-register bug. A syscall whose
     // operand pointers live in registers (ECSM reads a0/a1/a2) can have those
     // registers set in an EARLIER epoch than the call. `test_ecsm_split` sets
-    // a0/a1/a2 at the very start and runs the ECSM ~46 cycles later; epoch_size 32
-    // puts the pointer setup in epoch 0 and the ecall in epoch 1. The per-epoch
+    // a0/a1/a2 at the very start and runs the ECSM ~46 cycles later;
+    // `epoch_size_log2 = 5` (32 cycles) puts the pointer setup in epoch 0 and the
+    // ecall in epoch 1. The per-epoch
     // touched-cell pass must carry registers across the boundary — otherwise it
     // reads the pointers as 0, mispredicts the touched cells (and the ECSM
     // operands), and the epoch cannot verify.
@@ -963,7 +970,7 @@ mod tests {
         let out = prove_and_verify_continuation(
             &elf_bytes,
             &[],
-            32,
+            5,
             &ProofOptions::default_test_options(),
         )
         .unwrap();
@@ -973,25 +980,29 @@ mod tests {
         );
     }
 
-    // Guards the power-of-two epoch-size rounding in `prove_and_verify_continuation`.
-    // A non-power-of-two `epoch_size` (10) must still verify: the driver rounds it up
-    // to 16, so intermediate epochs have no CPU padding rows. Without the rounding
-    // this returns `Ok(None)` (dangling padding pc=1 tokens). 16-cycle epochs over
-    // the 33-cycle `test_commit_split` also put its two commits in different epochs,
-    // exercising the cross-epoch x254 carry; asserting the exact aggregated output
-    // keeps this test from silently degrading to a trivial pass.
+    // Guards that the continuation API takes `epoch_size_log2` directly. A log2 of
+    // 4 produces 16-cycle epochs over the 33-cycle `test_commit_split`, putting its
+    // two commits in different epochs and exercising the cross-epoch x254 carry.
     #[test]
-    fn test_continuation_non_power_of_two_epoch_size() {
+    fn test_continuation_epoch_size_log2() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let out = prove_and_verify_continuation(
             &elf_bytes,
             &[],
-            10,
+            4,
             &ProofOptions::default_test_options(),
         )
         .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
+    }
+
+    #[test]
+    fn test_continuation_rejects_too_small_epoch_size_log2() {
+        assert!(matches!(
+            prove_continuation(&[], &[], 1, &ProofOptions::default_test_options()),
+            Err(Error::InvalidContinuationEpochSize(_))
+        ));
     }
 
     // ---- Standalone (split) prover/verifier ----
@@ -1003,7 +1014,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let bundle =
-            prove_continuation(&elf_bytes, &[], 10, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
         let out = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
             .unwrap();
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
@@ -1016,7 +1027,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let bundle =
-            prove_continuation(&elf_bytes, &[], 10, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
 
         let bytes = bincode::serialize(&bundle).unwrap();
         let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
@@ -1034,7 +1045,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.pop();
         assert!(
@@ -1052,7 +1063,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(bundle.epochs.len() >= 3, "need multiple epochs");
         bundle.epochs.swap(0, 1);
         assert!(
@@ -1071,7 +1082,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need a second epoch to chain into"
@@ -1094,7 +1105,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(!bundle.epochs.is_empty());
         bundle.epochs[0].reg_fini.pop();
         assert!(
@@ -1182,7 +1193,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"
