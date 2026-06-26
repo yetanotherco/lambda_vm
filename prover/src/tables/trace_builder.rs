@@ -176,26 +176,25 @@ impl RegisterState {
         }
     }
 
-    /// Seed register state from a register init map (word address -> value), so
-    /// the first access in a continuation epoch reads the epoch's boundary
-    /// register values as `old_value`. All initial timestamps are 1, matching the
-    /// REGISTER table's init token. Mirrors `MemoryState::from_image`.
-    fn from_init_map(init: &HashMap<u64, u32>) -> Self {
-        let word = |addr: u64| init.get(&addr).copied().unwrap_or(0) as u64;
+    /// Seed register state from a register init vector (one value per row, in
+    /// `register_word_address_list` order), so the first access in a continuation
+    /// epoch reads the epoch's boundary register values as `old_value`. All initial
+    /// timestamps are 1, matching the REGISTER table's init token. Mirrors
+    /// `MemoryState::from_image`.
+    fn from_init(init: &[u32]) -> Self {
+        let word = |pos: usize| init.get(pos).copied().unwrap_or(0) as u64;
         let mut regs = [(0u64, 1u64); 32];
-        for reg in 0..32u64 {
+        for (reg, slot) in regs.iter_mut().enumerate() {
             let base = reg * 2;
-            regs[reg as usize] = (word(base) | (word(base + 1) << 32), 1);
+            *slot = (word(base) | (word(base + 1) << 32), 1);
         }
         Self {
             regs,
-            index_register: (
-                init.get(&register::register_base_address(254))
-                    .copied()
-                    .unwrap_or(0),
+            index_register: (init.get(register::X254_INDEX).copied().unwrap_or(0), 1),
+            pc_register: (
+                word(register::PC_LO_INDEX) | (word(register::PC_HI_INDEX) << 32),
                 1,
             ),
-            pc_register: (word(510) | (word(511) << 32), 1),
         }
     }
 
@@ -1918,7 +1917,7 @@ pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> Page
 pub fn epoch_touched_cells<I: ImageSource>(
     elf: &Elf,
     initial_image: &I,
-    register_init: &HashMap<u64, u32>,
+    register_init: &[u32],
     logs: &[Log],
 ) -> Result<Vec<(u64, u64, u64)>, Error> {
     let instructions = decode::instructions_from_elf(elf)
@@ -1926,7 +1925,7 @@ pub fn epoch_touched_cells<I: ImageSource>(
     let cpu_ops = collect_cpu_ops(logs, &instructions)?;
 
     let mut memory_state = MemoryState::from_image(initial_image);
-    let mut register_state = RegisterState::from_init_map(register_init);
+    let mut register_state = RegisterState::from_init(register_init);
     let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
     let mut touched: Vec<(u64, u64, u64)> = memory_state
@@ -2812,7 +2811,7 @@ fn build_traces<I: ImageSource + Sync>(
     ops: CollectedOps,
     initial_image: Option<&I>,
     memory_state: &MemoryState,
-    register_init: &HashMap<u64, u32>,
+    register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
     decode_pc_to_row: HashMap<u64, usize>,
     mut register_state: RegisterState,
@@ -3873,7 +3872,7 @@ impl Traces {
     pub fn from_image_and_logs<I: ImageSource + Sync>(
         elf: &Elf,
         initial_image: &I,
-        register_init: &HashMap<u64, u32>,
+        register_init: &[u32],
         logs: &[Log],
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
@@ -3901,7 +3900,7 @@ impl Traces {
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
-        let mut register_state = RegisterState::from_init_map(register_init);
+        let mut register_state = RegisterState::from_init(register_init);
         let (
             memw_ops,
             load_ops,

@@ -437,7 +437,7 @@ impl VmAirs {
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
         include_halt: bool,
-        register_init: Option<&std::collections::HashMap<u64, u32>>,
+        register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
@@ -490,7 +490,7 @@ impl VmAirs {
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
         let register_init = register_init
-            .cloned()
+            .map(<[u32]>::to_vec)
             .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
         let ecsm = create_ecsm_air(proof_options);
         let ec_scalar = create_ec_scalar_air(proof_options);

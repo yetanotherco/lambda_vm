@@ -3213,7 +3213,7 @@ fn test_continuation_pipeline_end_to_end() {
     // Pass 1: each epoch's starting state + the cells it touches. Epoch 0 starts
     // from the program image; epoch i>0 from epoch i-1's boundary snapshot.
     let mut images: Vec<HashMap<u64, u8>> = Vec::with_capacity(epochs.len());
-    let mut register_inits: Vec<HashMap<u64, u32>> = Vec::with_capacity(epochs.len());
+    let mut register_inits: Vec<Vec<u32>> = Vec::with_capacity(epochs.len());
     let mut all_touched: Vec<Vec<(u64, u64, u64)>> = Vec::with_capacity(epochs.len());
     for (i, epoch) in epochs.iter().enumerate() {
         let (image_i, register_init_i) = if i == 0 {
@@ -3261,7 +3261,7 @@ fn test_continuation_pipeline_end_to_end() {
         let register_init_arg = if i == 0 {
             None
         } else {
-            Some(&register_inits[i])
+            Some(register_inits[i].as_slice())
         };
         let airs = VmAirs::new(
             &elf,

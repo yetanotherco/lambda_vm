@@ -56,8 +56,7 @@ use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
 use crate::tables::trace_builder::{
-    Traces, build_init_page_data, build_initial_image, build_initial_image_paged,
-    epoch_touched_cells,
+    Traces, build_init_page_data, build_initial_image_paged, epoch_touched_cells,
 };
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
@@ -204,7 +203,7 @@ fn global_memory_configs(
     elf: &Elf,
     private_inputs: &[u8],
 ) -> Vec<PageConfig> {
-    let image = build_initial_image(elf, private_inputs);
+    let image = build_initial_image_paged(elf, private_inputs);
     let init_page_data = build_init_page_data(&image);
     let touched_pages: std::collections::BTreeSet<u64> = boundaries
         .iter()
@@ -225,7 +224,7 @@ fn global_memory_configs(
 /// it is not re-snapshotted or cloned per epoch.
 struct EpochStart<'a> {
     image: &'a PagedMem<u8>,
-    register_init: HashMap<u64, u32>,
+    register_init: Vec<u32>,
     is_first: bool,
     /// This epoch's 1-based table label (the `fini_epoch` constant).
     label: u64,
@@ -294,7 +293,7 @@ fn build_epoch_airs(
     opts: &ProofOptions,
     page_configs: &[PageConfig],
     table_counts: &TableCounts,
-    register_init: &HashMap<u64, u32>,
+    register_init: &[u32],
     reg_fini: &[u32],
     is_first: bool,
     is_final: bool,
@@ -442,7 +441,7 @@ fn prove_epoch(
 /// `register_init` (epoch 0: from the ELF; epoch i>0: from the previous epoch's
 /// `reg_fini`), `is_first`, `is_final`, and `label`. Rebuilds the AIRs and transcript
 /// from the bundle's statement values and indexes commits from the carried x254
-/// (`register_init[508]`), never from the prover's memory. PAGE is skipped for
+/// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is skipped for
 /// continuation epochs, so the AIRs are built with no page configs (the bundle does
 /// not get to supply any). Returns `true` iff the proof verifies and its committed
 /// L2G root matches the claimed one.
@@ -451,7 +450,7 @@ fn verify_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
     epoch: &EpochProof,
-    register_init: &HashMap<u64, u32>,
+    register_init: &[u32],
     is_first: bool,
     is_final: bool,
     label: u64,
@@ -490,7 +489,7 @@ fn verify_epoch(
     // Start the commit index from the carried x254 (the derived INIT), not a free
     // input — this is what binds the per-epoch commit slice to its global position.
     let commit_start_index = register_init
-        .get(&register::register_base_address(254))
+        .get(register::X254_INDEX)
         .copied()
         .unwrap_or(0) as u64;
 
@@ -646,8 +645,8 @@ pub fn prove_continuation(
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
     let mut image = build_initial_image_paged(&elf, private_inputs);
-    let initial_memory: HashMap<u64, u64> = image.iter().map(|(a, v)| (a, v as u64)).collect();
-    let mut provenance = local_to_global::genesis_provenance(&initial_memory);
+    let mut provenance =
+        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
     let mut epochs: Vec<EpochProof> = Vec::new();
     // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
@@ -659,14 +658,14 @@ pub fn prove_continuation(
         if executor.pc() == 0 {
             break;
         }
-        let register_init = if index == 0 {
+        let register_init: Vec<u32> = if index == 0 {
             register::register_init_from_entry_point(elf.entry_point)
         } else {
-            register::register_init_from_fini(
-                prev_fini
-                    .as_ref()
-                    .expect("prev_fini is set after the first epoch"),
-            )
+            // Epoch i+1's init is epoch i's bound fini, reused directly (same
+            // `register_word_address_list` order) — the cross-epoch register binding.
+            prev_fini
+                .clone()
+                .expect("prev_fini is set after the first epoch")
         };
 
         // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
@@ -801,7 +800,7 @@ pub fn verify_continuation(
         public_output.extend_from_slice(&epoch.public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
-        register_init = register::register_init_from_fini(&epoch.reg_fini);
+        register_init = epoch.reg_fini.clone();
     }
 
     // Cross-epoch global memory: genesis rebuilt FROM THE ELF (+ private inputs),

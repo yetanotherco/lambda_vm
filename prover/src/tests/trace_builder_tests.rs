@@ -938,7 +938,7 @@ fn test_build_traces_for_all_epochs() {
     for (i, epoch) in epochs.iter().enumerate() {
         // Epoch 0 starts from the program-start image; later epochs from the
         // previous epoch's ending memory + register snapshot.
-        let (image, register_init): (HashMap<u64, u8>, HashMap<u64, u32>) = if i == 0 {
+        let (image, register_init): (HashMap<u64, u8>, Vec<u32>) = if i == 0 {
             (
                 build_initial_image(&program, &[]),
                 crate::tables::register::register_init_from_entry_point(program.entry_point),

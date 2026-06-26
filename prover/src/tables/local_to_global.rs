@@ -124,7 +124,7 @@ pub fn epoch_boundaries(
     epochs: &[EpochTouches],
 ) -> Vec<Vec<CellBoundary>> {
     // provenance[addr] = (last_writer_epoch, value, timestamp)
-    let mut provenance = genesis_provenance(initial_memory);
+    let mut provenance = genesis_provenance(initial_memory.iter().map(|(&a, &v)| (a, v)));
 
     let mut result = Vec::with_capacity(epochs.len());
     for (epoch, touched) in epochs.iter().enumerate() {
@@ -169,10 +169,12 @@ pub fn epoch_boundary(
     boundaries
 }
 
-/// Seed the provenance store from the program's initial memory (genesis cells).
-pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> Provenance {
+/// Seed the provenance store from the program's initial memory (genesis cells),
+/// supplied as an `(address, value)` iterator. The continuation prover feeds the
+/// paged genesis image directly, avoiding an intermediate address→value map.
+pub fn genesis_provenance(genesis: impl IntoIterator<Item = (u64, u64)>) -> Provenance {
     let mut provenance = Provenance::new((GENESIS_EPOCH, 0, 0));
-    for (&addr, &value) in initial_memory {
+    for (addr, value) in genesis {
         provenance.set(addr, (GENESIS_EPOCH, value, 0));
     }
     provenance
