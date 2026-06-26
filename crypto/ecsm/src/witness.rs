@@ -16,31 +16,11 @@
 //! negative; the chip range-checks `c_i + offset` as a halfword. We reproduce the exact
 //! integer recurrence here; the prover converts the resulting integers to field elements.
 
-use crypto_bigint::{NonZero, U256, U512, U1024};
+use crypto_bigint::{Int, NonZero, U256, U512, Uint};
 
-/// Widens a U512 to U1024 by zero-extending.
-#[inline(always)]
-fn w1024(v: U512) -> U1024 {
-    let mut b = [0u8; 128];
-    b[..64].copy_from_slice(&v.to_le_bytes());
-    U1024::from_le_slice(&b)
-}
-
-/// `p²` as a `U1024` constant (`p = 2^256 - 2^32 - 977`).
-pub(crate) const P_SQ: U1024 = U1024::from_be_hex(
-    "0000000000000000000000000000000000000000000000000000000000000000\
-     0000000000000000000000000000000000000000000000000000000000000000\
-     fffffffffffffffffffffffffffffffffffffffffffffffffffffffdfffff85e\
-     000000000000000000000000000000000000000000000001000007a2000e90a1",
-);
-
-/// `3p²` as a `U1024` constant.
-pub(crate) const THREE_P_SQ: U1024 = U1024::from_be_hex(
-    "0000000000000000000000000000000000000000000000000000000000000000\
-     0000000000000000000000000000000000000000000000000000000000000002\
-     fffffffffffffffffffffffffffffffffffffffffffffffffffffff9ffffe91a\
-     000000000000000000000000000000000000000000000003000016e6002bb1e3",
-);
+// 9 limbs = 576 bits — just wide enough to hold pos or neg (each < p² < 2^512)
+// and their signed difference (< 2^513 in magnitude).
+pub(crate) type I576 = Int<9>;
 
 use crate::curve::{StepPts, replay_double_and_add};
 use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare};
@@ -276,25 +256,30 @@ fn to_le_33(relation: &str, v: &U512) -> [u8; 33] {
 
 /// Computes `r_offset + (pos - neg) / p` where `pos - neg` is divisible by `p`.
 ///
-/// Both `pos` and `neg` are U512 (products of 256-bit values, each < p²).
-/// Since `pos ≡ neg mod p`, dividing each by p gives quotients whose difference
-/// equals `(pos - neg)/p`. Handles the case where `pos < neg` (signed result) by
-/// using `r_offset` (= p or 3p) to keep the final result positive.
-/// Computes `(offset + pos - neg) / p` as U1024 arithmetic, returns quotient as U512.
-/// `offset` is `p²` or `3p²` (chosen so the expression is always positive).
+/// `pos` and `neg` are U512 products of 256-bit values (each < p²).
+/// Uses signed 576-bit (`Int<9>`) arithmetic: `pos - neg` fits in 513 bits
+/// so 576 bits is sufficient. Divides by `p` as a signed 256-bit value,
+/// then adds `r_offset` (= p or 3p as U256) to produce a positive ~264-bit result.
 fn shifted_quotient(
     relation: &str,
-    pos: U1024,
-    neg: U1024,
-    p1024: &NonZero<U1024>,
-    offset: U1024,
+    pos: Uint<9>,
+    neg: Uint<9>,
+    p_nz: &NonZero<Int<5>>,
+    r_offset: Uint<5>,  // p or 3p; both fit in 320 bits
 ) -> U512 {
-    let total = offset.wrapping_add(&pos).wrapping_sub(&neg);
-    let (q, r) = total.div_rem(p1024);
-    assert!(r == U1024::ZERO, "ECSM witness {relation}: numerator not divisible by p");
-    let q_bytes = q.to_le_bytes();
-    assert!(q_bytes[64..].iter().all(|&b| b == 0), "ECSM witness {relation}: quotient exceeds U512");
-    U512::from_le_slice(&q_bytes[..64])
+    let num: I576 = pos.as_int().wrapping_sub(neg.as_int());
+    let (q_opt, r) = num.checked_div_rem(p_nz);
+    let q: I576 = q_opt.expect("divisor is nonzero").into();
+    assert!(r == Int::<5>::ZERO, "ECSM witness {relation}: numerator not divisible by p");
+    // q ∈ [-2, 2]; add r_offset (p or 3p) widened to I576 to get a positive result.
+    let offset: I576 = *r_offset.resize::<9>().as_int();
+    let result: I576 = q.wrapping_add(&offset);
+    // Result is positive and fits in U512 (≤ 3p + 2 < 2^265).
+    let (abs, is_neg) = result.abs_sign();
+    assert!(!bool::from(is_neg), "ECSM witness {relation}: quotient unexpectedly negative");
+    let result_bytes = abs.to_le_bytes();
+    assert!(result_bytes[64..].iter().all(|&b| b == 0), "ECSM witness {relation}: quotient exceeds U512");
+    U512::from_le_slice(&result_bytes[..64])
 }
 
 // =========================================================================
@@ -306,13 +291,12 @@ fn shifted_quotient(
 pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
 
-    // NonZero<U512> of p for the x2 div_rem; NonZero<U1024> of p for shifted_quotient.
+    // NonZero<U512> of p for the x2 div_rem.
     let mut p_le64 = [0u8; 64];
     p_le64[..32].copy_from_slice(&P_BYTES);
     let p512 = NonZero::new(U512::from_le_slice(&p_le64)).expect("p != 0");
-    let mut p_le128 = [0u8; 128];
-    p_le128[..32].copy_from_slice(&P_BYTES);
-    let p1024 = NonZero::new(U1024::from_le_slice(&p_le128)).expect("p != 0");
+    // p as Int<5> (320-bit signed): p < 2^256 < 2^320, so it's positive as Int<5>.
+    let p_int: NonZero<Int<5>> = NonZero::new(*p().resize::<5>().as_int()).expect("p != 0");
 
     // Common zero-extended constants for carry builders.
     let pp = ext64(&P_BYTES);
@@ -340,11 +324,11 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     // --- ECSM: yG relation, quotient q1 = (yG^2 − xG·x2 − b)/p + p ---
     // pos = yG^2, neg = xG·x2 + b. r_offset = p.
     let (yg_sq_lo, yg_sq_hi) = g.y.widening_mul(&g.y);
-    let yg_sq = yg_sq_lo.concat(&yg_sq_hi);
+    let yg_sq: Uint<9> = yg_sq_lo.concat(&yg_sq_hi).resize();
     let (xg_x2_lo, xg_x2_hi) = g.x.widening_mul(&x2);
-    let xg_x2 = xg_x2_lo.concat(&xg_x2_hi);
-    let neg_yg = xg_x2.wrapping_add(&U512::from(B));
-    let q1_512 = shifted_quotient("yG", w1024(yg_sq), w1024(neg_yg), &p1024, P_SQ);
+    let xg_x2: Uint<9> = xg_x2_lo.concat(&xg_x2_hi).resize();
+    let neg_yg: Uint<9> = xg_x2.wrapping_add(&Uint::<9>::from(B));
+    let q1_512 = shifted_quotient("yG", yg_sq, neg_yg, &p_int, p().resize::<5>());
     let q1_b = to_le_33("yG", &q1_512);
     let c1 = carries_yg(
         &ext64(&yg_b),
@@ -369,7 +353,8 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 
     let steps = steps_pts
         .iter()
-        .map(|s| build_step(s, &p1024, THREE_P_SQ, &r_ext, &pp))
+        .map(|s| build_step(s, &p_int, &r_ext, &pp))
+
         .collect();
 
     Ok(EcsmWitness {
@@ -393,11 +378,16 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 /// Builds one ECDAS step witness (λ, quotients, carries) from a point-level step.
 fn build_step(
     s: &StepPts,
-    p1024: &NonZero<U1024>,
-    r_offset: U1024,
+    p_nz: &NonZero<Int<5>>,
     r_ext: &[i128; 64],
     pp: &[i128; 64],
 ) -> EcdasStep {
+    // r_offset for step quotients = 3p as Uint<5> (320 bits), loaded from R_BYTES (33 LE bytes).
+    let r_3p: Uint<5> = {
+        let mut b = [0u8; 40];
+        b[..33].copy_from_slice(&R_BYTES);
+        Uint::<5>::from_le_slice(&b)
+    };
     // λ is precomputed (batched) during the double-and-add replay.
     let lam_b: [u8; 32] = s.lambda.to_le_bytes().into();
     let xa_b: [u8; 32] = s.a.x.to_le_bytes().into();
@@ -417,51 +407,48 @@ fn build_step(
         ext64(&yr_b),
     );
 
-    // Multiply two U256 values, result as U512.
+    // Multiply two U256 values, result as U512 (no overflow: product < p² < 2^512).
     let mul512 = |a: &U256, b: &U256| -> U512 {
         let (lo, hi) = a.widening_mul(b);
         lo.concat(&hi)
     };
-
-    // Widen a U256 to U512 (zero-extend into high half).
-    let wide = |v: &U256| -> U512 {
-        v.concat(&U256::ZERO)
-    };
+    // Widen a U256 or U512 to Uint<9> = 576 bits, avoiding overflow on 2x/3x sums.
+    let w9_u256 = |v: &U256| -> Uint<9> { v.resize::<9>() };
+    let w9_u512 = |v: U512| -> Uint<9> { v.resize::<9>() };
 
     // q0: λ relation.
-    //   add: num0 = λ*xG + yA  -  λ*xA - yG     (= (xG-xA)*λ - yG + yA)
-    //   dbl: num0 = 2*λ*yA     -  3*xA²
-    // Products fit in U512; sums (2x or 3x) are done in U1024 to avoid overflow.
+    //   add: pos = λ*xG + yA,  neg = λ*xA + yG       (each < p²+p < 2^513)
+    //   dbl: pos = 2*λ*yA,     neg = 3*xA²            (each < 2p² < 2^513)
+    // Work in Uint<9> (576 bits) so 2x/3x multiplications don't overflow.
     let (pos0, neg0) = if s.op == 1 {
-        let lam_xg = w1024(mul512(&s.lambda, &s.g.x));
-        let lam_xa = w1024(mul512(&s.lambda, &s.a.x));
-        (lam_xg.wrapping_add(&w1024(wide(&s.a.y))), lam_xa.wrapping_add(&w1024(wide(&s.g.y))))
+        let lam_xg = w9_u512(mul512(&s.lambda, &s.g.x));
+        let lam_xa = w9_u512(mul512(&s.lambda, &s.a.x));
+        (lam_xg.wrapping_add(&w9_u256(&s.a.y)), lam_xa.wrapping_add(&w9_u256(&s.g.y)))
     } else {
-        let lam_ya = w1024(mul512(&s.lambda, &s.a.y));
-        let xa_sq  = w1024(mul512(&s.a.x, &s.a.x));
+        let lam_ya = w9_u512(mul512(&s.lambda, &s.a.y));
+        let xa_sq  = w9_u512(mul512(&s.a.x, &s.a.x));
         (lam_ya.wrapping_add(&lam_ya), xa_sq.wrapping_add(&xa_sq).wrapping_add(&xa_sq))
     };
-    let q0_512 = shifted_quotient("lambda", pos0, neg0, p1024, r_offset);
+    let q0_512 = shifted_quotient("lambda", pos0, neg0, p_nz, r_3p);
     let q0_b = to_le_33("lambda", &q0_512);
 
     // q1: xR relation.
-    //   add: num1 = λ²  -  xA + xG + xR
-    //   dbl: num1 = λ²  -  2*xA + xR
-    let lam_sq = mul512(&s.lambda, &s.lambda);
+    //   add: pos = λ²,  neg = xA + xG + xR             (neg < 3p, no overflow)
+    //   dbl: pos = λ²,  neg = 2*xA + xR
+    let lam_sq = w9_u512(mul512(&s.lambda, &s.lambda));
     let (pos1, neg1) = if s.op == 1 {
-        (lam_sq, wide(&s.a.x).wrapping_add(&wide(&s.g.x)).wrapping_add(&wide(&s.r.x)))
+        (lam_sq, w9_u256(&s.a.x).wrapping_add(&w9_u256(&s.g.x)).wrapping_add(&w9_u256(&s.r.x)))
     } else {
-        (lam_sq, wide(&s.a.x).wrapping_add(&wide(&s.a.x)).wrapping_add(&wide(&s.r.x)))
+        (lam_sq, w9_u256(&s.a.x).wrapping_add(&w9_u256(&s.a.x)).wrapping_add(&w9_u256(&s.r.x)))
     };
-    let q1_512 = shifted_quotient("xR", w1024(pos1), w1024(neg1), p1024, r_offset);
+    let q1_512 = shifted_quotient("xR", pos1, neg1, p_nz, r_3p);
     let q1_b = to_le_33("xR", &q1_512);
 
-    // q2: yR relation — num2 = λ*(xA - xR) - yA - yR
-    //   pos = λ*xA,  neg = λ*xR + yA + yR
-    let lam_xa = w1024(mul512(&s.lambda, &s.a.x));
-    let lam_xr = w1024(mul512(&s.lambda, &s.r.x));
-    let neg2 = lam_xr.wrapping_add(&w1024(wide(&s.a.y))).wrapping_add(&w1024(wide(&s.r.y)));
-    let q2_512 = shifted_quotient("yR", lam_xa, neg2, p1024, r_offset);
+    // q2: yR relation — pos = λ*xA,  neg = λ*xR + yA + yR
+    let lam_xa2 = w9_u512(mul512(&s.lambda, &s.a.x));
+    let lam_xr  = w9_u512(mul512(&s.lambda, &s.r.x));
+    let neg2 = lam_xr.wrapping_add(&w9_u256(&s.a.y)).wrapping_add(&w9_u256(&s.r.y));
+    let q2_512 = shifted_quotient("yR", lam_xa2, neg2, p_nz, r_3p);
     let q2_b = to_le_33("yR", &q2_512);
 
     let c0 = carries_lambda(

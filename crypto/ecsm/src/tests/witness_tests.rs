@@ -55,25 +55,41 @@ fn witness_works_near_curve_order() {
     assert_eq!(w.len_k, 255);
 }
 
-/// Verifies that P_SQ and THREE_P_SQ match the values computed from p at runtime.
+/// Verifies the shifted_quotient identity: (pos - neg) is divisible by p,
+/// and the result q + 3p is positive and fits in 33 bytes.
+/// Uses the double case (2λyA - 3xA²) from k=5's first step as a concrete example.
 #[test]
-fn p_sq_constants_match_computed() {
-    use crate::witness::{P_SQ, THREE_P_SQ};
-    use crate::p;
+fn shifted_quotient_satisfies_division_identity() {
+    use crypto_bigint::{Int, NonZero, Uint};
+    use crate::{p, R_BYTES};
+    use crate::curve::{recover_y_canonical, replay_double_and_add};
 
-    // Compute p² at runtime.
-    let (p_sq_lo, p_sq_hi) = p().widening_mul(&p());
-    let mut computed_p_sq = [0u8; 128];
-    let lo_bytes: [u8; 32] = p_sq_lo.to_le_bytes().into();
-    let hi_bytes: [u8; 32] = p_sq_hi.to_le_bytes().into();
-    computed_p_sq[..32].copy_from_slice(&lo_bytes);
-    computed_p_sq[32..64].copy_from_slice(&hi_bytes);
-    let computed_p_sq = U1024::from_le_slice(&computed_p_sq);
-    assert_eq!(computed_p_sq, P_SQ, "P_SQ does not match p*p");
+    let gx = U256::from_be_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798");
+    let g = crate::curve::AffinePoint { x: gx, y: recover_y_canonical(&gx).unwrap() };
+    let (steps, _) = replay_double_and_add(&U256::from(5u32), &g);
+    let s = &steps[0]; // first step: double (op=0)
+    assert_eq!(s.op, 0);
 
-    // Verify THREE_P_SQ == 3 * P_SQ.
-    let three_p_sq = P_SQ.wrapping_add(&P_SQ).wrapping_add(&P_SQ);
-    assert_eq!(three_p_sq, THREE_P_SQ, "THREE_P_SQ does not match 3*p²");
+    let mul512 = |a: &U256, b: &U256| -> U512 { let (lo, hi) = a.widening_mul(b); lo.concat(&hi) };
+    // Work in Uint<9> to avoid overflow on 2x/3x sums.
+    let pos: Uint<9> = { let t: Uint<9> = mul512(&s.lambda, &s.a.y).resize(); t.wrapping_add(&t) };
+    let neg: Uint<9> = { let t: Uint<9> = mul512(&s.a.x, &s.a.x).resize(); t.wrapping_add(&t).wrapping_add(&t) };
+
+    // p as Int<5>: p < 2^256 < 2^320, so positive as signed Int<5>.
+    let p_nz: NonZero<Int<5>> = NonZero::new(*p().resize::<5>().as_int()).unwrap();
+    // 3p as Uint<5> from R_BYTES.
+    let r_3p: Uint<5> = { let mut b = [0u8; 40]; b[..33].copy_from_slice(&R_BYTES); Uint::<5>::from_le_slice(&b) };
+
+    let num: crate::witness::I576 = pos.as_int().wrapping_sub(neg.as_int());
+    let (q_opt, r) = num.checked_div_rem(&p_nz);
+    assert_eq!(r, Int::<5>::ZERO, "2λyA - 3xA² must be divisible by p");
+    let q: crate::witness::I576 = q_opt.unwrap().into();
+    // Final result q + 3p must be positive and fit in 33 bytes.
+    let result: crate::witness::I576 = q.wrapping_add(r_3p.resize::<9>().as_int());
+    let (result_abs, result_is_neg) = result.abs_sign();
+    assert!(!bool::from(result_is_neg), "final quotient must be positive");
+    let result_bytes = result_abs.to_le_bytes();
+    assert!(result_bytes[33..].iter().all(|&b| b == 0), "quotient must fit in 33 bytes");
 }
 
 /// Cross-checks the shifted_quotient result for the lambda double case.
