@@ -472,6 +472,10 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     // Transpose row-major buf → column-major for the handle. Downstream kernels
     // (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
+    // Synchronize before returning: the handle crosses stream boundaries — downstream
+    // consumers call be.next_stream() and read handle.buf on a different stream.
+    // Without this, a barycentric or DEEP kernel can start before the transpose finishes.
+    stream.synchronize()?;
 
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
@@ -580,6 +584,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
 
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m3, lde_u64)?;
+    stream.synchronize()?;
 
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),
