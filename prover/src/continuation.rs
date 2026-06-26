@@ -226,7 +226,6 @@ fn global_memory_configs_from_init_page_data(
 /// Per-epoch register state and label.
 struct EpochStart<'a> {
     register_init: &'a [u32],
-    is_first: bool,
     /// This epoch's 1-based table label (the `fini_epoch` constant).
     label: u64,
 }
@@ -292,7 +291,6 @@ impl ContinuationProof {
 /// preprocessed to INIT = `register_init` and FINI = `reg_fini`. Continuation epochs
 /// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
-#[allow(clippy::too_many_arguments)]
 fn build_epoch_airs(
     elf: &Elf,
     opts: &ProofOptions,
@@ -300,10 +298,8 @@ fn build_epoch_airs(
     table_counts: &TableCounts,
     register_init: &[u32],
     reg_fini: &[u32],
-    is_first: bool,
     is_final: bool,
 ) -> VmAirs {
-    let register_init_arg = if is_first { None } else { Some(register_init) };
     // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
     // final register file is a verifier-known public value bound by the REG-C2
     // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
@@ -320,7 +316,7 @@ fn build_epoch_airs(
         table_counts,
         None,
         is_final,
-        register_init_arg,
+        None,
         None,
         register_preprocessed,
     )
@@ -375,7 +371,6 @@ fn prove_epoch(
         &table_counts,
         start.register_init,
         &reg_fini,
-        start.is_first,
         is_final,
     );
 
@@ -429,19 +424,17 @@ fn prove_epoch(
 
 /// Verify one epoch using ONLY the [`EpochProof`] bundle plus the verifier-derived
 /// `register_init` (epoch 0: from the ELF; epoch i>0: from the previous epoch's
-/// `reg_fini`), `is_first`, `is_final`, and `label`. Rebuilds the AIRs and transcript
+/// `reg_fini`), `is_final`, and `label`. Rebuilds the AIRs and transcript
 /// from the bundle's statement values and indexes commits from the carried x254
 /// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is skipped for
 /// continuation epochs, so the AIRs are built with no page configs (the bundle does
 /// not get to supply any). Returns `true` iff the proof verifies and its committed
 /// L2G root matches the claimed one.
-#[allow(clippy::too_many_arguments)]
 fn verify_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
     epoch: &EpochProof,
     register_init: &[u32],
-    is_first: bool,
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
@@ -471,7 +464,6 @@ fn verify_epoch(
         &epoch.table_counts,
         register_init,
         &epoch.reg_fini,
-        is_first,
         is_final,
     );
     let l2g_air = l2g_memory_air(opts, label);
@@ -719,7 +711,6 @@ pub fn prove_continuation(
 
         let start = EpochStart {
             register_init: &register_init,
-            is_first: index == 0,
             label,
         };
         let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
@@ -803,7 +794,6 @@ pub fn verify_continuation(
     let mut public_output: Vec<u8> = Vec::new();
 
     for (index, epoch) in bundle.epochs.iter().enumerate() {
-        let is_first = index == 0;
         let is_final = index == n - 1;
         let label = local_to_global::epoch_label(index as u64);
 
@@ -812,7 +802,6 @@ pub fn verify_continuation(
             elf_bytes,
             epoch,
             &register_init,
-            is_first,
             is_final,
             label,
             opts,
@@ -949,15 +938,14 @@ mod tests {
         );
     }
 
-    // Regression for the `epoch_touched_cells` fresh-register bug. A syscall whose
-    // operand pointers live in registers (ECSM reads a0/a1/a2) can have those
+    // Regression for touched-cell prediction from carried registers. A syscall
+    // whose operand pointers live in registers (ECSM reads a0/a1/a2) can have those
     // registers set in an EARLIER epoch than the call. `test_ecsm_split` sets
     // a0/a1/a2 at the very start and runs the ECSM ~46 cycles later;
     // `epoch_size_log2 = 5` (32 cycles) puts the pointer setup in epoch 0 and the
-    // ecall in epoch 1. The per-epoch
-    // touched-cell pass must carry registers across the boundary — otherwise it
-    // reads the pointers as 0, mispredicts the touched cells (and the ECSM
-    // operands), and the epoch cannot verify.
+    // ecall in epoch 1. The per-epoch touched-cell pass must carry registers across
+    // the boundary — otherwise it reads the pointers as 0, mispredicts the touched
+    // cells (and the ECSM operands), and the epoch cannot verify.
     #[test]
     fn test_ecsm_across_epochs_verifies() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1058,7 +1046,7 @@ mod tests {
     }
 
     // Negative: reordering epochs must be rejected — each epoch proof is bound to its
-    // 1-based label (and is_first/chain), so a swapped epoch fails to verify. Guards
+    // 1-based label (and register chain), so a swapped epoch fails to verify. Guards
     // the trusted-enumeration ordering.
     #[test]
     fn test_split_verify_rejects_reordered_epochs() {

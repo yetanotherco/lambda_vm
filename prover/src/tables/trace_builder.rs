@@ -1899,20 +1899,10 @@ pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> Page
     image
 }
 
-/// Return the memory cells (bytes) an epoch touched, as `(address, end_value,
-/// end_timestamp)` — the per-epoch input for the local-to-global table.
-///
-/// The epoch's `MemoryState` is seeded from `initial_image` at timestamp 0, and
-/// the epoch's accesses set real timestamps (which start at 4). So cells with a
-/// non-zero timestamp are exactly the ones this epoch read or wrote. The register
-/// file is seeded from `register_init` (the carried registers), matching the real
-/// epoch trace pass: a syscall can read its operand pointers from registers (e.g.
-/// ECSM reads a0/a1/a2), so with a fresh register file those pointers would be wrong
-/// for any epoch after the first, mispredicting the touched cells.
-///
-/// Reuses the early phases of [`Traces::from_image_and_logs`] read-only; sharing
-/// a single path with it is left to a later step.
-pub fn epoch_touched_cells<I: ImageSource>(
+/// Test helper for computing one epoch's local-to-global touched cells without
+/// building every trace table.
+#[cfg(test)]
+pub(crate) fn epoch_touched_cells<I: ImageSource>(
     elf: &Elf,
     initial_image: &I,
     register_init: &[u32],

@@ -5,8 +5,7 @@ main:
 	# are set at the very START and never rewritten before the ecall. With a small
 	# continuation epoch size the ecall lands in a LATER epoch than the one that set
 	# the pointers, so the per-epoch touched-cell pass must carry registers across
-	# the boundary to compute the right addresses. (Regression for the
-	# epoch_touched_cells fresh-register bug.)
+	# the boundary to compute the right addresses.
 	addi	sp, sp, -96
 	addi	a0, sp, 64
 	addi	a1, sp, 0
