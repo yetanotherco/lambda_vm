@@ -19,7 +19,6 @@
 //! |--------|------|-------------|
 //! | offset | RowIndex | 0, 1, ..., page_size-1 (preprocessed) |
 //! | init | Byte | Genesis value (from ELF or 0) (preprocessed) |
-//! | init_epoch | Epoch | Genesis sentinel (always `GENESIS_EPOCH`) |
 //! | fini | Byte | Value after the last touching epoch |
 //! | fini_epoch | Epoch | Last touching epoch (`GENESIS_EPOCH` if untouched) |
 //!
@@ -58,20 +57,21 @@ pub mod cols {
     /// init: Genesis byte value (from ELF or 0) - preprocessed
     pub const INIT: usize = 1;
 
-    /// init_epoch: Genesis sentinel (always `GENESIS_EPOCH`)
-    pub const INIT_EPOCH: usize = 2;
+    // Note: there is no init-epoch column. The genesis token always carries
+    // `GENESIS_EPOCH`, so the GM-GENESIS sender emits it as a constant (like L2G's
+    // `fini_epoch`), saving a column and removing a prover-chosen value.
 
     /// fini: Final byte value after the last touching epoch
-    pub const FINI: usize = 3;
+    pub const FINI: usize = 2;
 
     /// fini_epoch: Last epoch that touched the cell (`GENESIS_EPOCH` if untouched)
-    pub const FINI_EPOCH: usize = 4;
+    pub const FINI_EPOCH: usize = 3;
 
     // Note: no fini-timestamp column. The GlobalMemory bus carries no timestamp
     // (the cross-epoch chain is ordered by epoch); timestamps are epoch-local.
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 4;
 }
 
 /// Number of preprocessed columns (OFFSET, INIT). Identical to PAGE's preprocessed
@@ -133,11 +133,6 @@ pub fn generate_global_trace(
             .unwrap_or(0);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
-        // Genesis epoch carried as a COLUMN, matching the value the L2G init token
-        // reconstructs for a genesis-origin cell. `GENESIS_EPOCH = 0` (below every
-        // 1-based real epoch label), so `FE::from(0)` here equals L2G's `0`.
-        data[base + cols::INIT_EPOCH] = FE::from(GENESIS_EPOCH);
-
         // Final state: if touched use it, otherwise the cell stays at genesis
         // (fini=init, epoch=GENESIS) so its genesis/finalization tokens cancel.
         let (fini_value, fini_epoch) = match final_state.get(&byte_addr) {
@@ -193,10 +188,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                     start_column: cols::INIT,
                     packing: Packing::Direct,
                 },
-                BusValue::Packed {
-                    start_column: cols::INIT_EPOCH,
-                    packing: Packing::Direct,
-                },
+                BusValue::constant(GENESIS_EPOCH),
             ],
         ),
         // GM-FINAL: receive the finalization token [address, fini, fini_epoch].
