@@ -182,7 +182,7 @@
   let LOG_ID_RADIX = 5
   let RADIX = calc.pow(2, LOG_ID_RADIX)
   assert(ID_CHAR_SET.len() == RADIX, message: "ID_CHAR_SET <> RADIX mismatch")
-  assert(ID_CHAR_LEN * LOG_ID_RADIX <= 64, message: "ID_CHAR_LEN and RADIX incompatible")
+  assert(ID_CHAR_LEN * LOG_ID_RADIX <= 64, message: "digest size too small for configured ID entropy")
   
   // Map hash digest to ID
   let MIN_DIGEST_BYTES = calc.ceil((LOG_ID_RADIX * ID_CHAR_LEN) / 8)
@@ -205,8 +205,7 @@
     .variables
     .pairs()
     .map(((group, variables)) => variables
-      .enumerate()
-      .map(((idx, var)) => (var.name: digest((chip.name, group, idx, var.type))))
+      .map(var => (var.name: digest((chip.name, group, var.name, var.type))))
       .sum(default: (:))
     ).sum(default: (:))
 

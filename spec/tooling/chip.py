@@ -994,7 +994,7 @@ class Chip:
             isinstance(self.name, str), f"name is not a string: {self.name!r}"
         )
         reporter.asserts(self.name.isidentifier(), f"Invalid identifier: {self.name!r}")
-        self.code = data.get("code", "")
+        self.code = data.get("code", self.name)
         if self.code:
             reporter.asserts(
                 isinstance(self.code, str), f"code is not a string: {self.code!r}"
