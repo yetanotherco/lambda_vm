@@ -280,8 +280,9 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
             for num_cols in [1usize, 3, 8] {
                 let n = 1usize << log_n;
                 let log_lde = (n * blowup).trailing_zeros() as usize;
-                let mut rng =
-                    ChaCha8Rng::seed_from_u64((log_n * 1000 + blowup * 100 + num_cols) as u64 + 10000);
+                let mut rng = ChaCha8Rng::seed_from_u64(
+                    (log_n * 1000 + blowup * 100 + num_cols) as u64 + 10000,
+                );
 
                 let row_major: Vec<u64> = (0..n * num_cols).map(|_| rng.r#gen::<u64>()).collect();
 
@@ -294,7 +295,11 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
 
                 let (nodes, _handle, _lde) =
                     math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
-                        &row_major, n, num_cols, blowup, &weights_u64,
+                        &row_major,
+                        n,
+                        num_cols,
+                        blowup,
+                        &weights_u64,
                     )
                     .expect("new row-major GPU pipeline");
                 let mut gpu_root = [0u8; 32];
@@ -338,10 +343,10 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
 
                 let mut row_major: Vec<u64> = Vec::with_capacity(n * num_cols * 3);
                 for r in 0..n {
-                    for c in 0..num_cols {
-                        row_major.push(*columns[c][r].value()[0].value());
-                        row_major.push(*columns[c][r].value()[1].value());
-                        row_major.push(*columns[c][r].value()[2].value());
+                    for col in &columns {
+                        row_major.push(*col[r].value()[0].value());
+                        row_major.push(*col[r].value()[1].value());
+                        row_major.push(*col[r].value()[2].value());
                     }
                 }
 
@@ -354,7 +359,11 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
 
                 let (nodes, _handle, _lde) =
                     math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
-                        &row_major, n, num_cols, blowup, &weights_u64,
+                        &row_major,
+                        n,
+                        num_cols,
+                        blowup,
+                        &weights_u64,
                     )
                     .expect("new ext3 row-major GPU pipeline");
                 let mut gpu_root = [0u8; 32];
