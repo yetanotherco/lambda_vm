@@ -368,6 +368,120 @@ pub fn gpu_build_dvrm_trace(
     )
 }
 
+/// Unique keys + accumulated multiplicity counters from a GPU hash group-by.
+pub struct DedupResult {
+    pub a: Vec<u64>,
+    pub b: Vec<u64>,
+    pub c: Vec<u64>,
+    pub mu0: Vec<u64>,
+    pub mu1: Vec<u64>,
+}
+
+/// GPU dedup (hash group-by) of key triples `(a, b, c)`. `sel[i]` selects the
+/// counter (0 -> mu0, 1 -> mu1); pass an all-zero `sel` for single-counter
+/// tables. Returns the unique keys + summed counters (host side), arbitrary
+/// order. Replaces the CPU `HashMap` dedup.
+pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupResult> {
+    let n = a.len();
+    assert_eq!(b.len(), n);
+    assert_eq!(c.len(), n);
+    assert_eq!(sel.len(), n);
+    if n == 0 {
+        return Ok(DedupResult {
+            a: vec![],
+            b: vec![],
+            c: vec![],
+            mu0: vec![],
+            mu1: vec![],
+        });
+    }
+    // Load factor <= 0.5 guarantees a free slot (probe loop terminates).
+    let m = (2 * n).next_power_of_two().max(4);
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let a_d = stream.clone_htod(a)?;
+    let b_d = stream.clone_htod(b)?;
+    let c_d = stream.clone_htod(c)?;
+    let sel_d = stream.clone_htod(sel)?;
+
+    let mut slot = stream.alloc_zeros::<u64>(m)?;
+    let mut mu0 = stream.alloc_zeros::<u64>(m)?;
+    let mut mu1 = stream.alloc_zeros::<u64>(m)?;
+
+    let m_u64 = m as u64;
+    let n_u64 = n as u64;
+    let blk = |x: usize| LaunchConfig {
+        grid_dim: ((x as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+
+    unsafe {
+        stream
+            .launch_builder(&be.dedup_init)
+            .arg(&mut slot)
+            .arg(&mut mu0)
+            .arg(&mut mu1)
+            .arg(&m_u64)
+            .launch(blk(m))?;
+    }
+    unsafe {
+        stream
+            .launch_builder(&be.dedup_insert)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&c_d)
+            .arg(&sel_d)
+            .arg(&n_u64)
+            .arg(&m_u64)
+            .arg(&mut slot)
+            .arg(&mut mu0)
+            .arg(&mut mu1)
+            .launch(blk(n))?;
+    }
+
+    let mut out_a = stream.alloc_zeros::<u64>(m)?;
+    let mut out_b = stream.alloc_zeros::<u64>(m)?;
+    let mut out_c = stream.alloc_zeros::<u64>(m)?;
+    let mut out_mu0 = stream.alloc_zeros::<u64>(m)?;
+    let mut out_mu1 = stream.alloc_zeros::<u64>(m)?;
+    let mut out_count = stream.alloc_zeros::<u64>(1)?;
+    unsafe {
+        stream
+            .launch_builder(&be.dedup_compact)
+            .arg(&slot)
+            .arg(&mu0)
+            .arg(&mu1)
+            .arg(&m_u64)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&c_d)
+            .arg(&mut out_a)
+            .arg(&mut out_b)
+            .arg(&mut out_c)
+            .arg(&mut out_mu0)
+            .arg(&mut out_mu1)
+            .arg(&mut out_count)
+            .launch(blk(m))?;
+    }
+    stream.synchronize()?;
+
+    let nu = stream.clone_dtoh(&out_count)?[0] as usize;
+    let a_h = stream.clone_dtoh(&out_a)?;
+    let b_h = stream.clone_dtoh(&out_b)?;
+    let c_h = stream.clone_dtoh(&out_c)?;
+    let mu0_h = stream.clone_dtoh(&out_mu0)?;
+    let mu1_h = stream.clone_dtoh(&out_mu1)?;
+    Ok(DedupResult {
+        a: a_h[..nu].to_vec(),
+        b: b_h[..nu].to_vec(),
+        c: c_h[..nu].to_vec(),
+        mu0: mu0_h[..nu].to_vec(),
+        mu1: mu1_h[..nu].to_vec(),
+    })
+}
+
 /// Shared launcher for kernels taking 5 SoA u64 inputs (a, b, c, d, e) — e.g.
 /// MUL/DVRM with dual multiplicity counters. One thread per row.
 #[allow(clippy::too_many_arguments)]

@@ -102,6 +102,7 @@ const TRACE_LT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_lt.ptx"
 const TRACE_ALU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_alu.ptx"));
 const TRACE_SHIFT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_shift.ptx"));
 const TRACE_MULREM_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_mulrem.ptx"));
+const TRACE_DEDUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_dedup.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -182,6 +183,9 @@ pub struct Backend {
     pub trace_shift_kernel: CudaFunction,
     pub trace_mul_kernel: CudaFunction,
     pub trace_dvrm_kernel: CudaFunction,
+    pub dedup_init: CudaFunction,
+    pub dedup_insert: CudaFunction,
+    pub dedup_compact: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -209,6 +213,7 @@ impl Backend {
         let trace_alu = ctx.load_module(Ptx::from_src(TRACE_ALU_PTX))?;
         let trace_shift = ctx.load_module(Ptx::from_src(TRACE_SHIFT_PTX))?;
         let trace_mulrem = ctx.load_module(Ptx::from_src(TRACE_MULREM_PTX))?;
+        let trace_dedup = ctx.load_module(Ptx::from_src(TRACE_DEDUP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -285,6 +290,9 @@ impl Backend {
             trace_shift_kernel: trace_shift.load_function("trace_shift_kernel")?,
             trace_mul_kernel: trace_mulrem.load_function("trace_mul_kernel")?,
             trace_dvrm_kernel: trace_mulrem.load_function("trace_dvrm_kernel")?,
+            dedup_init: trace_dedup.load_function("dedup_init")?,
+            dedup_insert: trace_dedup.load_function("dedup_insert")?,
+            dedup_compact: trace_dedup.load_function("dedup_compact")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

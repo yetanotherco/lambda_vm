@@ -120,4 +120,5 @@ fn main() {
     compile_ptx("trace_alu.cu", "trace_alu.ptx", have_nvcc);
     compile_ptx("trace_shift.cu", "trace_shift.ptx", have_nvcc);
     compile_ptx("trace_mulrem.cu", "trace_mulrem.ptx", have_nvcc);
+    compile_ptx("trace_dedup.cu", "trace_dedup.ptx", have_nvcc);
 }
