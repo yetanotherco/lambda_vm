@@ -56,11 +56,17 @@ fn row_view(
 #[test]
 fn r_bytes_is_three_p() {
     // 3·p as 33 little-endian bytes, cross-checked against the ecsm field modulus.
-    let p = ecsm::p();
-    let three_p = &p * 3u32;
-    let mut bytes = three_p.to_bytes_le();
-    bytes.resize(33, 0);
-    assert_eq!(&bytes[..], &R_BYTES[..]);
+    // R_BYTES encodes 3p as 33 LE bytes; compute 3*P_BYTES using u128 carry arithmetic.
+    let p = ecsm::P_BYTES;
+    let mut three_p = [0u8; 33];
+    let mut carry: u16 = 0;
+    for i in 0..32 {
+        let s = p[i] as u16 * 3 + carry;
+        three_p[i] = s as u8;
+        carry = s >> 8;
+    }
+    three_p[32] = carry as u8;
+    assert_eq!(&three_p[..], &R_BYTES[..]);
 }
 
 /// Every ECDAS constraint evaluates to zero on a generated trace across many scalars

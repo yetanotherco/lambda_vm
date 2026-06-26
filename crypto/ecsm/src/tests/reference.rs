@@ -1,17 +1,17 @@
-//! Spec-faithful reference double-and-add over secp256k1 in affine `BigUint`
+//! Spec-faithful reference double-and-add over secp256k1 in affine `U256`
 //! arithmetic. Test-only: it cross-checks the production k256-backed
 //! [`replay_double_and_add`](crate::curve::replay_double_and_add) fast path,
 //! which the parity test pins to this reference.
 
-use num_bigint::BigUint;
+use crypto_bigint::U256;
 
 use crate::curve::{AffinePoint, StepPts, msb_position};
 use crate::tests::reference_field::Fp;
 
 /// `2·a` on the curve. Requires `a.y != 0` (always true on secp256k1).
 pub fn point_double(a: &AffinePoint) -> AffinePoint {
-    let x = Fp::new(a.x.clone());
-    let y = Fp::new(a.y.clone());
+    let x = Fp::new(a.x);
+    let y = Fp::new(a.y);
     // λ = 3x² / 2y
     let three_x2 = x.mul(&x).mul(&Fp::from_u64(3));
     let two_y = y.add(&y);
@@ -25,10 +25,10 @@ pub fn point_double(a: &AffinePoint) -> AffinePoint {
 
 /// `a + g` on the curve. Requires `a.x != g.x` (always true in the chip's add steps).
 pub fn point_add(a: &AffinePoint, g: &AffinePoint) -> AffinePoint {
-    let xa = Fp::new(a.x.clone());
-    let ya = Fp::new(a.y.clone());
-    let xg = Fp::new(g.x.clone());
-    let yg = Fp::new(g.y.clone());
+    let xa = Fp::new(a.x);
+    let ya = Fp::new(a.y);
+    let xg = Fp::new(g.x);
+    let yg = Fp::new(g.y);
     // λ = (yg - ya) / (xg - xa)
     let lambda = yg.sub(&ya).mul(&xg.sub(&xa).inv());
     // xr = λ² - xa - xg
@@ -38,14 +38,14 @@ pub fn point_add(a: &AffinePoint, g: &AffinePoint) -> AffinePoint {
     AffinePoint { x: xr.0, y: yr.0 }
 }
 
-/// Reference slope `lambda` for one step, computed in `BigUint` `F_p`.
+/// Reference slope `lambda` for one step, computed in `U256` `F_p`.
 /// Used by the reference replay.
-pub fn step_lambda(a: &AffinePoint, g: &AffinePoint, op: u8) -> BigUint {
-    let xa = Fp::new(a.x.clone());
-    let ya = Fp::new(a.y.clone());
+pub fn step_lambda(a: &AffinePoint, g: &AffinePoint, op: u8) -> U256 {
+    let xa = Fp::new(a.x);
+    let ya = Fp::new(a.y);
     if op == 1 {
-        let xg = Fp::new(g.x.clone());
-        let yg = Fp::new(g.y.clone());
+        let xg = Fp::new(g.x);
+        let yg = Fp::new(g.y);
         yg.sub(&ya).mul(&xg.sub(&xa).inv()).0
     } else {
         let three_x2 = xa.mul(&xa).mul(&Fp::from_u64(3));
@@ -64,7 +64,7 @@ pub fn step_lambda(a: &AffinePoint, g: &AffinePoint, op: u8) -> BigUint {
 /// the round. The MSB itself is represented by the initial `A = g` (consumed by ECSM via
 /// the `BIT[len_k]` interaction), so it is never processed as an add here.
 pub fn replay_double_and_add_reference(
-    k: &BigUint,
+    k: &U256,
     g: &AffinePoint,
 ) -> (Vec<StepPts>, AffinePoint) {
     let m = msb_position(k) as i64; // len_k
@@ -76,7 +76,7 @@ pub fn replay_double_and_add_reference(
     while round >= 0 {
         let (r, next_op) = if op == 0 {
             let r = point_double(&a);
-            let bit = if k.bit(round as u64) { 1u8 } else { 0u8 };
+            let bit = if k.bit_vartime(round as u32) { 1u8 } else { 0u8 };
             (r, bit)
         } else {
             let r = point_add(&a, g);

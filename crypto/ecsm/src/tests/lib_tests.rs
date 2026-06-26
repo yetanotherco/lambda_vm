@@ -1,42 +1,38 @@
 //! Unit tests for the crate's public entry points (relocated from `lib.rs`).
 
-use num_bigint::BigUint;
+use crypto_bigint::{NonZero, U256, U512};
 
-use crate::{B, EcsmError, n, p, recover_y_canonical, scalar_mul_x, to_le_32};
-
-/// Parses a big-endian hex string into a `BigUint`.
-fn be_hex(s: &str) -> BigUint {
-    BigUint::parse_bytes(s.as_bytes(), 16).expect("valid hex literal")
-}
+use crate::{B, EcsmError, n, p, recover_y_canonical, scalar_mul_x};
 
 // secp256k1 generator G.
 const GX_HEX: &str = "79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798";
 const GY_HEX: &str = "483ADA7726A3C4655DA4FBFC0E1108A8FD17B448A68554199C47D08FFB10D4B8";
 
-fn gx() -> BigUint {
-    be_hex(GX_HEX)
+fn gx() -> U256 {
+    U256::from_be_hex(GX_HEX)
 }
 
 #[test]
 fn constants_match_known_secp256k1_values() {
     assert_eq!(
         p(),
-        be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F")
+        U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F")
     );
     assert_eq!(
         n(),
-        be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
+        U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
     );
     // p ≡ 3 mod 4 (a known secp256k1 property).
-    assert_eq!(&p() % 4u32, BigUint::from(3u8));
+    let four = NonZero::new(U256::from(4u32)).expect("4 != 0");
+    assert_eq!(p().div_rem(&four).1, U256::from(3u32));
 }
 
 #[test]
 fn generator_is_on_curve_and_y_is_canonical() {
     // Gy ends in 0xB8 (even), so the canonical (even) root is Gy itself.
     let y = recover_y_canonical(&gx()).expect("G is on the curve");
-    assert_eq!(y, be_hex(GY_HEX));
-    assert!(!y.bit(0), "canonical root must be even");
+    assert_eq!(y, U256::from_be_hex(GY_HEX));
+    assert!(!y.bit_vartime(0), "canonical root must be even");
 }
 
 #[test]
@@ -47,14 +43,25 @@ fn recover_y_handles_residues_and_non_residues() {
     let mut saw_none = false;
     let mut saw_some = false;
     for x in 1u32..40 {
-        let xb = BigUint::from(x);
+        let xb = U256::from(x);
         match recover_y_canonical(&xb) {
             Some(y) => {
                 saw_some = true;
-                assert!(!y.bit(0), "recovered y must be even");
-                // y^2 == x^3 + b mod p
-                let lhs = (&y * &y) % p();
-                let rhs = (&xb * &xb % p() * &xb + BigUint::from(B)) % p();
+                assert!(!y.bit_vartime(0), "recovered y must be even");
+                // y^2 == x^3 + b mod p  (using U512 for the products)
+                let (yy_lo, yy_hi) = y.widening_mul(&y);
+                let yy: U512 = yy_lo.concat(&yy_hi);
+                let mut p_le64 = [0u8; 64];
+                p_le64[..32].copy_from_slice(&p().to_le_bytes());
+                let p512 = NonZero::new(U512::from_le_slice(&p_le64)).expect("p != 0");
+                let lhs = yy.div_rem(&p512).1;
+                let (xx_lo, xx_hi) = xb.widening_mul(&xb);
+                let xx: U512 = xx_lo.concat(&xx_hi);
+                let x2_512 = xx.div_rem(&p512).1;
+                let x2 = U256::from_le_slice(&x2_512.to_le_bytes()[..32]);
+                let (x3_lo, x3_hi) = xb.widening_mul(&x2);
+                let x3: U512 = x3_lo.concat(&x3_hi);
+                let rhs = x3.wrapping_add(&U512::from(B)).div_rem(&p512).1;
                 assert_eq!(lhs, rhs);
             }
             None => saw_none = true,
@@ -68,51 +75,52 @@ fn recover_y_handles_residues_and_non_residues() {
 
 #[test]
 fn scalar_mul_one_is_identity() {
-    let k = to_le_32(&BigUint::from(1u8));
-    let xg = to_le_32(&gx());
+    let k: [u8; 32] = U256::ONE.to_le_bytes().into();
+    let xg: [u8; 32] = gx().to_le_bytes().into();
     assert_eq!(scalar_mul_x(&k, &xg).expect("1·G is valid"), xg);
 }
 
 #[test]
 fn scalar_mul_two_matches_known_2g() {
-    // x(2G) for secp256k1.
-    let expected = be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5");
-    let k = to_le_32(&BigUint::from(2u8));
-    let xg = to_le_32(&gx());
+    let expected =
+        U256::from_be_hex("C6047F9441ED7D6D3045406E95C07CD85C778E4B8CEF3CA7ABAC09B95C709EE5");
+    let k: [u8; 32] = U256::from(2u32).to_le_bytes().into();
+    let xg: [u8; 32] = gx().to_le_bytes().into();
     assert_eq!(
         scalar_mul_x(&k, &xg).expect("2·G is valid"),
-        to_le_32(&expected)
+        <[u8; 32]>::from(expected.to_le_bytes())
     );
 }
 
 #[test]
 fn scalar_mul_three_matches_known_3g() {
-    let expected = be_hex("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9");
-    let k = to_le_32(&BigUint::from(3u8));
-    let xg = to_le_32(&gx());
+    let expected =
+        U256::from_be_hex("F9308A019258C31049344F85F89D5229B531C845836F99B08601F113BCE036F9");
+    let k: [u8; 32] = U256::from(3u32).to_le_bytes().into();
+    let xg: [u8; 32] = gx().to_le_bytes().into();
     assert_eq!(
         scalar_mul_x(&k, &xg).expect("3·G is valid"),
-        to_le_32(&expected)
+        <[u8; 32]>::from(expected.to_le_bytes())
     );
 }
 
 #[test]
 fn scalar_mul_n_minus_one_shares_x_with_g() {
     // (N-1)·G = -G, which has the same x-coordinate as G.
-    let k = to_le_32(&(n() - BigUint::from(1u8)));
-    let xg = to_le_32(&gx());
+    let k: [u8; 32] = n().wrapping_sub(&U256::ONE).to_le_bytes().into();
+    let xg: [u8; 32] = gx().to_le_bytes().into();
     assert_eq!(scalar_mul_x(&k, &xg).expect("(N-1)·G is valid"), xg);
 }
 
 #[test]
 fn rejects_zero_and_out_of_range_scalars() {
-    let xg = to_le_32(&gx());
+    let xg: [u8; 32] = gx().to_le_bytes().into();
     assert_eq!(
-        scalar_mul_x(&to_le_32(&BigUint::from(0u8)), &xg),
+        scalar_mul_x(&U256::ZERO.to_le_bytes().into(), &xg),
         Err(EcsmError::ScalarIsZero)
     );
     assert_eq!(
-        scalar_mul_x(&to_le_32(&n()), &xg),
+        scalar_mul_x(&n().to_le_bytes().into(), &xg),
         Err(EcsmError::ScalarOutOfRange)
     );
 }
@@ -122,10 +130,10 @@ fn rejects_non_canonical_xg() {
     // xG = p and xG = p + 1 (the alias of x = 1) must be rejected, not
     // silently reduced: with k = 1 the input bytes would be echoed back as
     // xR, which the prover's xR < p range check cannot prove.
-    let k = to_le_32(&BigUint::from(1u8));
-    for delta in [0u8, 1] {
+    let k: [u8; 32] = U256::ONE.to_le_bytes().into();
+    for delta in [0u32, 1] {
         assert_eq!(
-            scalar_mul_x(&k, &to_le_32(&(p() + BigUint::from(delta)))),
+            scalar_mul_x(&k, &p().wrapping_add(&U256::from(delta)).to_le_bytes().into()),
             Err(EcsmError::CoordinateOutOfRange),
             "xG = p + {delta} must be rejected"
         );
@@ -133,7 +141,7 @@ fn rejects_non_canonical_xg() {
     // p − 1 is below the bound, so it must NOT hit the canonicity check
     // (it is not on the curve, which is a different error).
     assert_eq!(
-        scalar_mul_x(&k, &to_le_32(&(p() - BigUint::from(1u8)))),
+        scalar_mul_x(&k, &p().wrapping_sub(&U256::ONE).to_le_bytes().into()),
         Err(EcsmError::NotOnCurve)
     );
 }
