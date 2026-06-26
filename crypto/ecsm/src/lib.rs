@@ -49,13 +49,21 @@ pub const R_BYTES: [u8; 33] = [
 ];
 
 /// The prime field modulus `p` as a `U256`.
+pub const P: U256 =
+    U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+
+/// The curve group order `N` as a `U256`.
+pub const N: U256 =
+    U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+
+/// The prime field modulus `p` as a `U256`.
 pub const fn p() -> U256 {
-    U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F")
+    P
 }
 
 /// The curve order `N` as a `U256`.
 pub const fn n() -> U256 {
-    U256::from_be_hex("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141")
+    N
 }
 
 /// Errors that prevent a sound ECSM witness from existing for the given inputs.

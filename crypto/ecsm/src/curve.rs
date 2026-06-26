@@ -34,9 +34,8 @@ fn u256_from_fe(f: &Fp) -> U256 {
 }
 
 fn fp_invert(f: Fp) -> Option<Fp> {
-    let exp = crate::p().wrapping_sub(&U256::from(2u32));
-    let inv = f.pow(&exp);
-    if inv.retrieve() == U256::ZERO { None } else { Some(inv) }
+    // safegcd inversion; `None` for a zero input (which has no inverse).
+    Option::from(f.invert())
 }
 
 /// Recovers the canonical (even) `y` for a given `x` such that `y^2 = x^3 + b mod p`.
