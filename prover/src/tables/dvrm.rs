@@ -36,9 +36,11 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use std::collections::HashMap;
+
 use super::types::{
-    BusId, FE, FxHashMap, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32,
-    NEG_INV_2_48, NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
+    BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
+    NEG_INV_2_64, SHIFT_16, VmTable, alu_op,
 };
 
 // =========================================================================
@@ -286,7 +288,7 @@ pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
-    let mut op_map: FxHashMap<DvrmOperation, DvrmMultiplicities> = FxHashMap::default();
+    let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
 
     for (op, wants_remainder) in operations {
         let entry = op_map.entry(op.clone()).or_default();

@@ -968,11 +968,6 @@ impl DecodeEntry {
     }
 }
 
-/// Op-dedup map using Rust's default keyed hasher. This keeps collision
-/// resistance for untrusted prover inputs while preserving the existing call
-/// sites from the trace-builder speedup.
-pub type FxHashMap<K, V> = std::collections::HashMap<K, V>;
-
 /// The fully sign-extended 64-bit immediate for an instruction (0 when none).
 fn imm_from_instruction(instruction: Instruction) -> u64 {
     match instruction {
