@@ -21,7 +21,7 @@
 use alloc::vec;
 use alloc::vec::Vec;
 #[cfg(feature = "prove")]
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;

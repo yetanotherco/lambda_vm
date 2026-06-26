@@ -1,5 +1,5 @@
 use lambda_vm_syscalls as syscalls;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 const ITERATIONS: usize = 100;
 const MAP_SIZE: usize = 100;

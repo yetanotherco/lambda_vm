@@ -1,4 +1,5 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
+compile-recursion-elfs clean-recursion-elfs \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover \
 test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
@@ -45,6 +46,16 @@ RUST_ARTIFACTS := $(addprefix $(RUST_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RUST_P
 BENCH_PROGRAM_DIRS := $(dir $(wildcard $(BENCH_PROGRAMS_DIR)/*/Cargo.toml))
 BENCH_PROGRAMS := $(notdir $(basename $(BENCH_PROGRAM_DIRS:%/=%)))
 BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENCH_PROGRAMS)))
+
+# Recursion smoke-test guests. They live in bench_vs/lambda/ (shared with
+# bench_vs/run.sh) rather than executor/programs/, and each builds a binary
+# named <name>-bench. The recursion guest cross-compiles the whole prover stack
+# for riscv (the in-VM STARK verifier), so it is slow to build — kept OUT of the
+# default compile-programs and wired only into the test target that runs them.
+RECURSION_GUESTS_DIR=./bench_vs/lambda
+RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
+RECURSION_GUESTS := empty fibonacci recursion
+RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -171,6 +182,26 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: $(BENCH_PROGRAMS_DIR)/%/Cargo.toml | prepare-sysro
 			-Z json-target-spec
 	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
 
+compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS)
+
+$(RECURSION_ARTIFACTS_DIR):
+	mkdir -p $@
+
+# Recursion-suite guests: same standard guest flags as compile-bench (std-inclusive
+# build-std works fine for these no_std guests). The crate's binary is <name>-bench;
+# copy it to <name>.elf so prover tests read prebuilt artifacts like every other
+# program (see prover/src/tests/recursion_smoke_test.rs), instead of shelling out.
+$(RECURSION_ARTIFACTS_DIR)/%.elf: $(RECURSION_GUESTS_DIR)/%/Cargo.toml | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	cd $(RECURSION_GUESTS_DIR)/$* && \
+		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
+		rustup run nightly-2026-02-01 cargo build --release \
+			--target $(RV64_TARGET_SPEC) \
+			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
+			-Z build-std-features=compiler-builtins-mem \
+			-Z json-target-spec
+	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$*-bench $@
+
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
 
@@ -183,7 +214,10 @@ clean-bench:
 clean-shared:
 	-rm -rf $(SHARED_TARGET_DIR)
 
-clean: clean-asm clean-rust clean-bench clean-shared
+clean-recursion-elfs:
+	-rm -rf $(RECURSION_ARTIFACTS_DIR)
+
+clean: clean-asm clean-rust clean-bench clean-shared clean-recursion-elfs
 
 test-executor: compile-programs
 	cargo test -p executor
@@ -225,8 +259,9 @@ test-fast:
 test-prover:
 	cargo test -p lambda-vm-prover
 
-# Prover tests including slow ones
-test-prover-all:
+# Prover tests including slow ones. The recursion smoke tests (currently #[ignore]d)
+# read prebuilt guest ELFs, so build them first.
+test-prover-all: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -- --include-ignored
 
 # Prover tests with debug-checks (shows bus balance report)

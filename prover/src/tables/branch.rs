@@ -161,8 +161,7 @@ impl BranchOperation {
 pub fn generate_branch_trace(
     operations: &[BranchOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    #[cfg(feature = "prove")]
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     // Deduplicate operations: (pc, offset, register, jalr) -> multiplicity
     let mut op_map: HashMap<BranchOperation, u64> = HashMap::new();

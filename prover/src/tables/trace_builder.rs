@@ -25,13 +25,13 @@
 //! // Use traces.cpus, traces.bitwise, traces.lts, traces.memws, traces.loads
 //! ```
 
-use alloc::vec::Vec;
 use alloc::format;
 use alloc::vec;
+use alloc::vec::Vec;
 #[cfg(feature = "prove")]
-use std::collections::HashMap;
+use hashbrown::HashMap;
 #[cfg(feature = "disk-spill")]
-use std::collections::HashSet;
+use hashbrown::HashSet;
 
 use executor::elf::Elf;
 #[cfg(feature = "prove")]
@@ -1911,8 +1911,7 @@ fn collect_bitwise_from_page(
     memory_state: &MemoryState,
     private_input: &[u8],
 ) -> Vec<BitwiseOperation> {
-    #[cfg(feature = "prove")]
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
     let mut bitwise_ops = Vec::new();
@@ -2401,8 +2400,7 @@ fn generate_page_tables(
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
 ) {
-    #[cfg(feature = "prove")]
-    use std::collections::BTreeSet;
+    use alloc::collections::BTreeSet;
 
     // Collect init data from ELF segments + private input region
     let init_page_data = build_init_page_data(elf, private_input);

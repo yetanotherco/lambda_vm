@@ -32,8 +32,6 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-#[cfg(feature = "prove")]
-use std::collections::HashMap;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -299,6 +297,8 @@ impl MulOperation {
 pub fn generate_mul_trace(
     operations: &[(MulOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    use hashbrown::HashMap;
+
     // Deduplicate: (lhs, lhs_signed, rhs, rhs_signed) -> (mu_lo, mu_hi)
     let mut op_map: HashMap<MulOperation, MulMultiplicities> = HashMap::new();
 

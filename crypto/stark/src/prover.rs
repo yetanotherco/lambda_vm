@@ -2396,7 +2396,7 @@ fn print_bus_balance_report<FieldExtension>(
 ) where
     FieldExtension: IsField,
 {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     let has_logup = all_bus_public_inputs.iter().any(|r| r.is_some());
     if !has_logup {

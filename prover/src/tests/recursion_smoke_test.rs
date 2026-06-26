@@ -7,13 +7,14 @@
 //! 4. Proves the recursion guest's execution.
 //! 5. Verifies the outer proof.
 //!
-//! The ELFs are built on demand by `bench_vs/build_recursion_elfs.sh`.
+//! The guest ELFs are built by `make compile-recursion-elfs` (which the
+//! `test-prover-all` make target depends on) and read from
+//! `executor/program_artifacts/recursion/`, like every other program test.
 //!
 //! Tests are `#[ignore]`d because the outer proof runs the full STARK verifier
 //! inside the VM (minutes per run, large memory footprint).
 
 use std::path::PathBuf;
-use std::process::Command;
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -22,25 +23,15 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn build_elfs(root: &std::path::Path) {
-    let status = Command::new("bash")
-        .arg(root.join("bench_vs/build_recursion_elfs.sh"))
-        .status()
-        .expect("failed to spawn build helper");
-    assert!(status.success(), "ELF build script failed");
-}
-
-/// Path to a guest ELF artifact from a bench_vs/lambda/<name>/ build.
-fn guest_elf_path(root: &std::path::Path, name: &str, bin_name: &str) -> PathBuf {
-    root.join(format!(
-        "bench_vs/lambda/{name}/target/riscv64im-lambda-vm-elf/release/{bin_name}"
-    ))
-}
-
-/// Read a guest ELF artifact from a bench_vs/lambda/<name>/ build.
-fn read_guest_elf(root: &std::path::Path, name: &str, bin_name: &str) -> Vec<u8> {
-    let path = guest_elf_path(root, name, bin_name);
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
+/// Read a recursion-suite guest ELF artifact, built by `make compile-recursion-elfs`.
+fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
+    let path = root.join(format!("executor/program_artifacts/recursion/{name}.elf"));
+    std::fs::read(&path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read {} — run `make compile-recursion-elfs`: {e}",
+            path.display()
+        )
+    })
 }
 
 /// Minimum-security FRI parameters: blowup=2, a single FRI query. Security is
@@ -79,8 +70,8 @@ fn prove_inner_and_encode_blob(
     )
     .expect("inner prove should succeed");
 
-    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf, opts))
-        .expect("postcard encode failed");
+    let blob =
+        postcard::to_allocvec(&(&inner_proof, &inner_elf, opts)).expect("postcard encode failed");
     eprintln!("[{tag}] postcard blob: {} bytes", blob.len());
     (inner_proof, blob)
 }
@@ -95,15 +86,24 @@ fn run_recursion_pipeline_with_options(
     inner_proof_options: stark::proof::options::ProofOptions,
 ) {
     let root = workspace_root();
-    build_elfs(&root);
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion", "recursion-bench");
+    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
 
-    let (inner_proof, blob) =
-        prove_inner_and_encode_blob(label, inner_elf_bytes, inner_private_input, &inner_proof_options);
+    let (inner_proof, blob) = prove_inner_and_encode_blob(
+        label,
+        inner_elf_bytes,
+        inner_private_input,
+        &inner_proof_options,
+    );
 
     assert!(
-        crate::verify_with_options(&inner_proof, inner_elf_bytes, &inner_proof_options, None, None)
-            .expect("inner verify errored"),
+        crate::verify_with_options(
+            &inner_proof,
+            inner_elf_bytes,
+            &inner_proof_options,
+            None,
+            None
+        )
+        .expect("inner verify errored"),
         "inner proof must verify on host"
     );
     assert!(
@@ -148,8 +148,7 @@ fn run_recursion_pipeline(label: &str, inner_elf_bytes: &[u8], inner_private_inp
 #[ignore = "slow: runs the full STARK verifier inside the VM"]
 fn test_recursion_smoke_empty() {
     let root = workspace_root();
-    build_elfs(&root);
-    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
     run_recursion_pipeline("recursion-empty", &empty_elf_bytes, &[]);
 }
 
@@ -161,8 +160,7 @@ fn test_recursion_smoke_empty() {
 #[ignore = "slow: runs the full STARK verifier inside the VM"]
 fn test_recursion_smoke_1query() {
     let root = workspace_root();
-    build_elfs(&root);
-    let empty_elf_bytes = read_guest_elf(&root, "empty", "empty-bench");
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
 
     run_recursion_pipeline_with_options(
         "recursion-1query",
@@ -177,8 +175,7 @@ fn test_recursion_smoke_1query() {
 #[ignore = "slow: runs the full STARK verifier inside the VM"]
 fn test_recursion_smoke() {
     let root = workspace_root();
-    build_elfs(&root);
-    let fib_elf_bytes = read_guest_elf(&root, "fibonacci", "fibonacci-bench");
+    let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
 
     let n: u64 = 10;
     let inner_private_input = n.to_le_bytes().to_vec();

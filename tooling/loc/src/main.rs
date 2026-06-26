@@ -2,7 +2,8 @@
 use clap::Parser;
 use report::{LinesOfCodeReport, LinesOfCodeReporterOptions, shell_summary};
 use spinoff::{Color, Spinner, spinners::Dots};
-use std::{collections::HashMap, fs::DirEntry, path::PathBuf};
+use hashbrown::HashMap;
+use std::{fs::DirEntry, path::PathBuf};
 use tokei::{Config, Language, LanguageType, Languages};
 
 mod report;

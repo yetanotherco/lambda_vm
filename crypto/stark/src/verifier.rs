@@ -16,6 +16,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::marker::PhantomData;
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
+use hashbrown::HashMap;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -28,7 +29,6 @@ use math::{
     },
     traits::AsBytes,
 };
-use hashbrown::HashMap;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 

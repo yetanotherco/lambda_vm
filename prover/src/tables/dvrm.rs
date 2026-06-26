@@ -31,8 +31,6 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
-#[cfg(feature = "prove")]
-use std::collections::HashMap;
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
@@ -291,6 +289,8 @@ impl DvrmOperation {
 pub fn generate_dvrm_trace(
     operations: &[(DvrmOperation, bool)],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    use hashbrown::HashMap;
+
     // Deduplicate: (n, d, signed) -> (mu_q, mu_r)
     let mut op_map: HashMap<DvrmOperation, DvrmMultiplicities> = HashMap::new();
 

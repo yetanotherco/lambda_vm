@@ -7,7 +7,7 @@
 //! - Border cases: Edge values (0, MAX, signed boundaries) work
 
 #[cfg(feature = "prove")]
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;

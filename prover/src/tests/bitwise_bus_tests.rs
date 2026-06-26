@@ -5,7 +5,7 @@
 //! - Soundness: Invalid lookups to BITWISE are rejected
 
 #[cfg(feature = "prove")]
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;

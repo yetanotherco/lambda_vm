@@ -1,6 +1,6 @@
 #![no_main]
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use lambda_vm_syscalls as syscalls;
 
 #[unsafe(export_name = "main")]

@@ -164,8 +164,7 @@ impl LtOperation {
 pub fn generate_lt_trace(
     operations: &[LtOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    #[cfg(feature = "prove")]
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     // Deduplicate operations: (lhs, rhs, signed) -> multiplicity
     let mut op_map: HashMap<LtOperation, u64> = HashMap::new();

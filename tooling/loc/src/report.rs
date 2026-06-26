@@ -3,7 +3,7 @@ use clap::Parser;
 use colored::Colorize;
 use prettytable::{Table, row};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 #[derive(Parser)]
 pub struct LinesOfCodeReporterOptions {

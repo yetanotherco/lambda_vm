@@ -3,7 +3,7 @@
 //! Tracks function calls during execution and outputs folded stack format
 //! compatible with flamegraph.pl and inferno.
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::io::{self, Write};
 
 use rustc_demangle::demangle as rustc_demangle;

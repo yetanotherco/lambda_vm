@@ -18,7 +18,7 @@
 //!
 //! - stderr - Mismatch report summary
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::fmt::{Debug, Display};
 use std::sync::{LazyLock, Mutex};
 

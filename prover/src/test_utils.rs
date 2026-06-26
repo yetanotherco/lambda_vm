@@ -15,20 +15,12 @@ use alloc::format;
 use alloc::vec;
 use alloc::vec::Vec;
 
-#[cfg(feature = "prove")]
-use std::path::PathBuf;
-
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 #[cfg(feature = "prove")]
-use executor::elf::Elf;
-#[cfg(feature = "prove")]
-use executor::vm::execution::Executor;
-#[cfg(feature = "prove")]
-use executor::vm::instruction::decoding::Instruction;
-#[cfg(feature = "prove")]
-use executor::vm::logs::Log;
-#[cfg(feature = "prove")]
-use executor::vm::memory::U64HashMap;
+use executor::{
+    elf::Elf,
+    vm::{execution::Executor, instruction::decoding::Instruction, logs::Log, memory::U64HashMap},
+};
 use math::field::element::FieldElement;
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::debug::validate_trace;
@@ -222,7 +214,7 @@ pub fn is_halfword_sender_columns(interactions: &[BusInteraction]) -> Vec<usize>
 /// Returns the raw ELF bytes for an assembly test program.
 #[cfg(feature = "prove")]
 pub fn asm_elf_bytes(name: &str) -> Vec<u8> {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir
         .parent()
         .expect("Failed to get workspace root from CARGO_MANIFEST_DIR");
@@ -277,7 +269,6 @@ pub fn collect_lt_lookups_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<LtOperation> {
-    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::{ArithOp, Comparison};
 
     let mut lookups = Vec::new();
@@ -378,7 +369,6 @@ pub fn collect_load_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
 ) -> Vec<crate::tables::load::LoadOperation> {
-    #[cfg(feature = "prove")]
     use executor::vm::instruction::decoding::LoadStoreWidth;
 
     let mut load_ops = Vec::new();
@@ -522,8 +512,7 @@ pub fn collect_bitwise_ops_from_load(
 /// The verifier expects the full deterministic 2^20 row public table.
 #[cfg(feature = "prove")]
 pub fn generate_minimal_bitwise_trace(ops: &[BitwiseOperation]) -> TraceTable<F, E> {
-    #[cfg(feature = "prove")]
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     // Collect unique (lo_byte, hi_byte, shift) tuples and count multiplicities per lookup type
     let mut row_data: HashMap<(u8, u8, u8), [u64; 10]> = HashMap::new();
