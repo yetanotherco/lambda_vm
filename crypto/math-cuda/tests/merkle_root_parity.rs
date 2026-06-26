@@ -268,3 +268,106 @@ fn gpu_and_cpu_ext3_merkle_roots_match() {
         }
     }
 }
+
+// ── New row-major pipeline tests ─────────────────────────────────────────────
+
+#[test]
+fn new_row_major_pipeline_base_root_matches_cpu() {
+    const COSET_OFFSET: u64 = 7;
+
+    for log_n in [4usize, 6, 8, 10] {
+        for blowup in [2usize, 4] {
+            for num_cols in [1usize, 3, 8] {
+                let n = 1usize << log_n;
+                let log_lde = (n * blowup).trailing_zeros() as usize;
+                let mut rng =
+                    ChaCha8Rng::seed_from_u64((log_n * 1000 + blowup * 100 + num_cols) as u64 + 10000);
+
+                let row_major: Vec<u64> = (0..n * num_cols).map(|_| rng.r#gen::<u64>()).collect();
+
+                let weights_u64 = coset_weights_u64(n, COSET_OFFSET);
+                let weights_fp = coset_weights(n, COSET_OFFSET);
+                let inv_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_n, true).expect("inv twiddles");
+                let fwd_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
+
+                let (nodes, _handle, _lde) =
+                    math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+                        &row_major, n, num_cols, blowup, &weights_u64,
+                    )
+                    .expect("new row-major GPU pipeline");
+                let mut gpu_root = [0u8; 32];
+                gpu_root.copy_from_slice(&nodes[0..32]);
+
+                let cpu_root = cpu_row_major_merkle_root(
+                    &(0..num_cols)
+                        .map(|c| (0..n).map(|r| row_major[r * num_cols + c]).collect())
+                        .collect::<Vec<Vec<u64>>>(),
+                    blowup,
+                    &weights_fp,
+                    &inv_tw,
+                    &fwd_tw,
+                );
+
+                assert_eq!(
+                    gpu_root, cpu_root,
+                    "new row-major pipeline root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn new_row_major_pipeline_ext3_root_matches_cpu() {
+    const COSET_OFFSET: u64 = 7;
+
+    for log_n in [4usize, 6, 8] {
+        for blowup in [2usize, 4] {
+            for num_cols in [1usize, 3, 5] {
+                let n = 1usize << log_n;
+                let log_lde = (n * blowup).trailing_zeros() as usize;
+                let mut rng = ChaCha8Rng::seed_from_u64(
+                    (log_n * 1000 + blowup * 100 + num_cols) as u64 + 20000,
+                );
+
+                let columns: Vec<Vec<Fp3>> = (0..num_cols)
+                    .map(|_| (0..n).map(|_| rand_ext3(&mut rng)).collect())
+                    .collect();
+
+                let mut row_major: Vec<u64> = Vec::with_capacity(n * num_cols * 3);
+                for r in 0..n {
+                    for c in 0..num_cols {
+                        row_major.push(*columns[c][r].value()[0].value());
+                        row_major.push(*columns[c][r].value()[1].value());
+                        row_major.push(*columns[c][r].value()[2].value());
+                    }
+                }
+
+                let weights_u64 = coset_weights_u64(n, COSET_OFFSET);
+                let weights_fp = coset_weights(n, COSET_OFFSET);
+                let inv_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_n, true).expect("inv twiddles");
+                let fwd_tw =
+                    TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
+
+                let (nodes, _handle, _lde) =
+                    math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
+                        &row_major, n, num_cols, blowup, &weights_u64,
+                    )
+                    .expect("new ext3 row-major GPU pipeline");
+                let mut gpu_root = [0u8; 32];
+                gpu_root.copy_from_slice(&nodes[0..32]);
+
+                let cpu_root =
+                    cpu_ext3_row_major_merkle_root(&columns, blowup, &weights_fp, &inv_tw, &fwd_tw);
+
+                assert_eq!(
+                    gpu_root, cpu_root,
+                    "new ext3 row-major pipeline root mismatch: log_n={log_n} blowup={blowup} num_cols={num_cols}"
+                );
+            }
+        }
+    }
+}
