@@ -1,12 +1,14 @@
 name: Benchmark GPU (PR)
 
-# Rent an RTX 5090 on Vast.ai (hourly), run the SAME headline ethrex prover
-# benchmark as benchmark-pr.yml but with the CUDA path enabled, post the absolute
-# GPU numbers back to the PR, then always destroy the instance.
+# Rent an RTX 5090 on Vast.ai (hourly) and run the drift-free A/B/B/A (ABBA) paired
+# prover benchmark — the same method as the CPU `/bench-abba` (scripts/bench_abba.sh) —
+# but with the CUDA prover path enabled (BENCH_FEATURES=jemalloc-stats,prover/cuda).
+# It builds the cli at the PR head and at main, runs N interleaved pairs on the GPU,
+# posts the paired-t + Wilcoxon verdict back to the PR, then ALWAYS destroys the box.
 #
-# Triggered by a "/bench-gpu [N]" comment on a PR (N = prove iterations, default 3),
-# or via workflow_dispatch. The orchestration runs on a GitHub-hosted runner; all the
-# GPU work happens on the rented Vast box (provisioned by the template onstart).
+# Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 10) or via
+# workflow_dispatch. Orchestration runs on a GitHub-hosted runner; all GPU work happens
+# on the rented Vast box (provisioned by the template onstart).
 #
 # Requires repo secrets:
 #   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
@@ -15,79 +17,102 @@ name: Benchmark GPU (PR)
 on:
   workflow_dispatch:
     inputs:
-      runs:
-        description: "Number of prove iterations"
-        default: "3"
+      pairs:
+        description: "Number of A/B/B/A pairs"
+        default: "10"
   issue_comment:
     types: [created]
+  # TEMP(testing): lets the workflow run from this branch before it's on the default
+  # branch (push uses the branch's own definition; issue_comment/workflow_dispatch do
+  # not). REMOVE this push trigger before merging.
+  push:
+    branches: [gpu_benchmarks]
 
 permissions:
   contents: read
   pull-requests: write
+  issues: write
 
 concurrency:
   group: benchmark-gpu-${{ github.event.issue.number || github.run_id }}
   cancel-in-progress: true
 
 env:
-  # Vast offer search: datacenter RTX 5090, >=16 cores, >=32GB RAM, >=64GB disk,
-  # verified + rentable, Blackwell-capable driver, under the price cap ($/hr).
+  # Vast offer search: datacenter RTX 5090, >=16 cores, >=96GB RAM (the ABBA prove
+  # peaks ~78 GB), >=64GB disk, verified + rentable, Blackwell-capable driver, <= cap.
   GPU_NAME: RTX_5090
   PRICE_CAP: "3"
   VAST_IMAGE_DISK: "64"
+  # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
+  BENCH_FEATURES: "jemalloc-stats,prover/cuda"
 
 jobs:
   benchmark-gpu:
     runs-on: ubuntu-latest
     # Skip unless: workflow_dispatch, or a "/bench-gpu" comment from a privileged author.
+    # TEMP(testing): `github.event_name == 'push'` lets branch pushes run it pre-merge.
+    # REMOVE the push clause before merging.
     if: >-
+      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench-gpu') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+    # ABBA on the GPU: dual cuda build (~15-30 min) + 2*pairs proves (~77s each).
+    timeout-minutes: 180
     steps:
-      - name: React to comment
-        if: github.event_name == 'issue_comment'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            await github.rest.reactions.createForIssueComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              comment_id: context.payload.comment.id,
-              content: 'eyes'
-            });
-
-      - name: Resolve PR ref + run count
+      - name: Resolve PR ref + pair count
         id: config
         env:
           GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           PR_NUM: ${{ github.event.issue.number }}
-          DISPATCH_RUNS: ${{ github.event.inputs.runs }}
+          DISPATCH_PAIRS: ${{ github.event.inputs.pairs }}
           DISPATCH_REF: ${{ github.ref_name }}
         run: |
           if [ "$EVENT_NAME" = "issue_comment" ]; then
-            SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
-            echo "pr_num=$PR_NUM" >> "$GITHUB_OUTPUT"
-            echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-            # "/bench-gpu 5" -> 5 iterations; otherwise default.
+            # Pin the head SHA (works for fork PRs; avoids a force-push race mid-run).
+            HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+            OUT_PR_NUM="$PR_NUM"; OUT_HEAD_SHA="$HEAD_SHA"; OUT_BRANCH=""
+            # "/bench-gpu 20" -> 20 pairs; otherwise default.
             N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-gpu[[:space:]]*\([0-9]\+\).*|\1|p')
-            RUNS=${N:-3}
+            PAIRS=${N:-10}
           else
-            echo "pr_num=" >> "$GITHUB_OUTPUT"
-            echo "sha=$DISPATCH_REF" >> "$GITHUB_OUTPUT"
-            RUNS=${DISPATCH_RUNS:-3}
+            # workflow_dispatch / push: compare this branch vs main.
+            OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
+            PAIRS=${DISPATCH_PAIRS:-10}
           fi
-          # Clamp to [1,10].
-          if [ "$RUNS" -lt 1 ] 2>/dev/null || [ "$RUNS" -gt 10 ] 2>/dev/null; then
-            echo "::warning::run count out of range, defaulting to 3"
-            RUNS=3
+          # Clamp to [2,40] (even is ideal so AB/BA orders balance).
+          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 40 ] 2>/dev/null; then
+            echo "::warning::pair count out of range [2,40], defaulting to 10"
+            PAIRS=10
           fi
-          echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-          echo "Using $RUNS prove iteration(s)"
+          {
+            echo "pr_num=$OUT_PR_NUM"
+            echo "head_sha=$OUT_HEAD_SHA"
+            echo "branch=$OUT_BRANCH"
+            echo "pairs=$PAIRS"
+          } >> "$GITHUB_OUTPUT"
+          echo "Using $PAIRS A/B/B/A pairs"
+
+      - name: Acknowledge (react + occupancy notice)
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          PAIRS: ${{ steps.config.outputs.pairs }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `⏳ **GPU ABBA started** — renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) on the CUDA prover path. This takes ~1 hr; results will be posted here.`
+            });
 
       - name: Install Vast CLI
         env:
@@ -226,94 +251,76 @@ jobs:
           echo "::error::onstart provisioning did not complete in time"
           exit 1
 
-      - name: Check out PR source on the box
-        env:
-          HOST: ${{ steps.ssh.outputs.host }}
-          PORT: ${{ steps.ssh.outputs.port }}
-          KEY: ${{ steps.sshkey.outputs.key_path }}
-          PR_NUM: ${{ steps.config.outputs.pr_num }}
-          SHA: ${{ steps.config.outputs.sha }}
-        run: |
-          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
-          if [ -n "$PR_NUM" ]; then
-            # Fetch the PR head via the base repo's pull ref (works for fork PRs too).
-            $SSH "cd /workspace/lambda_vm && git fetch --force origin 'refs/pull/${PR_NUM}/head' && git checkout --force '$SHA'"
-          else
-            # workflow_dispatch: check out the requested branch.
-            $SSH "cd /workspace/lambda_vm && git fetch --force origin '$SHA' && git checkout --force FETCH_HEAD"
-          fi
-          $SSH "cd /workspace/lambda_vm && git --no-pager log -1 --oneline"
-
-      - name: Run GPU benchmark
+      - name: Run GPU ABBA benchmark
         id: bench
         env:
           HOST: ${{ steps.ssh.outputs.host }}
           PORT: ${{ steps.ssh.outputs.port }}
           KEY: ${{ steps.sshkey.outputs.key_path }}
-          RUNS: ${{ steps.config.outputs.runs }}
+          PR_NUM: ${{ steps.config.outputs.pr_num }}
+          HEAD_SHA: ${{ steps.config.outputs.head_sha }}
+          BRANCH: ${{ steps.config.outputs.branch }}
+          PAIRS: ${{ steps.config.outputs.pairs }}
         run: |
           SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
-          # bash -l so ~/.bashrc (cargo env) is sourced; the script also sources it itself.
-          $SSH "bash -lc 'cd /workspace/lambda_vm && bash infra/gpu_bench.sh $RUNS'" | tee bench.log
 
-          # Parse per-run metrics (same format as the CPU bench: "Proving time:" / "Peak heap:").
-          mapfile -t TIMES < <(grep -o 'Proving time: [0-9.]*' bench.log | awk '{print $3}')
-          mapfile -t HEAPS < <(grep -o 'Peak heap: [0-9]*'   bench.log | awk '{print $3}')
-          if [ "${#TIMES[@]}" -eq 0 ] || [ "${#HEAPS[@]}" -eq 0 ]; then
-            echo "::error::Failed to parse any GPU metrics from the bench output"
-            exit 1
+          # Resolve the PR side (REF_A) and the fetch needed to make it resolvable on the box.
+          if [ -n "$PR_NUM" ]; then
+            FETCH="git fetch --force origin refs/pull/$PR_NUM/head"
+            REF_A="$HEAD_SHA"
+          else
+            FETCH="git fetch --force origin $BRANCH"
+            REF_A="origin/$BRANCH"
           fi
-          MED_POS=$(( (${#TIMES[@]} + 1) / 2 ))
-          TIME_MED=$(printf '%s\n' "${TIMES[@]}" | sort -n | awk "NR==$MED_POS")
-          HEAP_MED=$(printf '%s\n' "${HEAPS[@]}" | sort -n | awk "NR==$MED_POS")
-          ALL_TIMES=$(printf '%s\n' "${TIMES[@]}" | paste -sd '/' -)
-          ALL_HEAPS=$(printf '%s\n' "${HEAPS[@]}" | paste -sd '/' -)
-          {
-            echo "time_s=$TIME_MED"
-            echo "peak_mb=$HEAP_MED"
-            echo "all_times=$ALL_TIMES"
-            echo "all_heaps=$ALL_HEAPS"
-          } >> "$GITHUB_OUTPUT"
 
-      - name: Comment on PR
-        if: github.event_name == 'issue_comment'
+          # bench_abba.sh builds the cli at REF_A and origin/main (isolated worktree),
+          # runs PAIRS interleaved A/B/B/A proves, and prints the paired-t CI + Wilcoxon
+          # verdict. BENCH_FEATURES routes the build through the CUDA prover path.
+          REMOTE="set -e; cd /workspace/lambda_vm; \
+            command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
+            git fetch --force origin main; $FETCH; \
+            SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            scripts/bench_abba.sh $REF_A origin/main $PAIRS"
+
+          $SSH "bash -lc \"$REMOTE\"" | tee "$RUNNER_TEMP/abba_out.txt"
+          # Extract the result section for the PR comment (same marker bench-abba.yml uses).
+          sed -n '/=== ABBA paired result/,$p' "$RUNNER_TEMP/abba_out.txt" > "$RUNNER_TEMP/abba_result.txt"
+
+      - name: Comment ABBA result on PR
+        if: always() && github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         env:
-          TIME_S: ${{ steps.bench.outputs.time_s }}
-          PEAK_MB: ${{ steps.bench.outputs.peak_mb }}
-          ALL_TIMES: ${{ steps.bench.outputs.all_times }}
-          ALL_HEAPS: ${{ steps.bench.outputs.all_heaps }}
-          RUNS: ${{ steps.config.outputs.runs }}
+          HEAD_SHA: ${{ steps.config.outputs.head_sha }}
+          PAIRS: ${{ steps.config.outputs.pairs }}
+          OUTCOME: ${{ steps.bench.outcome }}
           GPU_NAME: ${{ env.GPU_NAME }}
           OFFER_PRICE: ${{ steps.offer.outputs.price }}
-          COMMIT_SHA: ${{ steps.config.outputs.sha }}
         with:
           script: |
-            const time = process.env.TIME_S;
-            const peak = process.env.PEAK_MB;
-            const runs = parseInt(process.env.RUNS || '1');
-            const allTimes = (process.env.ALL_TIMES || '').split('/').map(t => `${t}s`).join(' / ');
-            const allHeaps = (process.env.ALL_HEAPS || '').split('/').map(h => `${h} MB`).join(' / ');
-            const nLabel = runs > 1 ? ` (median of ${runs})` : '';
-            const sha = (process.env.COMMIT_SHA || '').substring(0, 8);
+            const fs = require('fs');
+            const tmp = process.env.RUNNER_TEMP;
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+            const head = (process.env.HEAD_SHA || '').slice(0, 10);
+            const pairs = process.env.PAIRS;
+            const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
+            const price = process.env.OFFER_PRICE;
 
-            let body = `## Benchmark (GPU) — ethrex 20 transfers${nLabel}\n\n`;
-            body += `<sub>GPU: ${process.env.GPU_NAME.replace('_', ' ')} · Vast.ai datacenter @ \$${process.env.OFFER_PRICE}/hr · \`prover/cuda\`</sub>\n\n`;
-            body += `| Metric | GPU |\n`;
-            body += `|--------|-----|\n`;
-            body += `| **Prove time** | ${time}s |\n`;
-            body += `| **Peak heap** | ${peak} MB |\n`;
-            if (runs > 1) {
-              body += `\n<sub>Runs — time: ${allTimes} · heap: ${allHeaps}</sub>\n`;
+            let body = `## GPU Benchmark (ABBA) — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · drift-free A/B/B/A</sub>\n\n`;
+            if (process.env.OUTCOME === 'success') {
+              const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
+              body += '```\n' + res + '\n```\n';
+              body += '\n<sub>+ = PR faster. Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+            } else {
+              const tail = read(`${tmp}/abba_out.txt`).split('\n').slice(-30).join('\n');
+              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
             }
-            body += `\n<sub>Commit: ${sha} · Runner: Vast.ai RTX 5090</sub>\n`;
 
             const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+              owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-            const marker = 'Benchmark (GPU) — ethrex';
+            const marker = 'GPU Benchmark (ABBA)';
             const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
             if (existing) {
               await github.rest.issues.updateComment({

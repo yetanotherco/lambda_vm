@@ -27,6 +27,8 @@
 #     REF_B    baseline   (default: origin/main)
 #     N_PAIRS  pairs      (default: 20 -> 40 runs, ~33 min on ethrex)
 #   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
+#        BENCH_FEATURES=<list> cargo features for the cli build (default: jemalloc-stats).
+#          The GPU ABBA workflow passes "jemalloc-stats,prover/cuda" to bench the GPU path.
 #
 #   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
 #   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
@@ -45,6 +47,9 @@ fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
 N_PAIRS="${3:-20}"
+# cli build features. Default matches the CPU bench; the GPU ABBA workflow overrides
+# with "jemalloc-stats,prover/cuda" to exercise the CUDA prover path.
+BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 INPUT_REL="executor/tests/ethrex_bench_20.bin"
@@ -102,9 +107,9 @@ if [ "$need_build" = "1" ]; then
   echo "==> Building both prover binaries in isolated worktree $WT"
   git worktree add --detach "$WT" "$SHA_B" >/dev/null
   build_cli() {  # $1=sha $2=out (shared target dir -> 2nd build is incremental)
-    echo "==> Building cli @ ${1:0:10} -> $2"
+    echo "==> Building cli @ ${1:0:10} -> $2  (features: $BENCH_FEATURES)"
     git -C "$WT" checkout --quiet "$1"
-    if ! ( cd "$WT" && cargo build --release -p cli --features jemalloc-stats >"$WORK/build_$2.log" 2>&1 ); then
+    if ! ( cd "$WT" && cargo build --release -p cli --features "$BENCH_FEATURES" >"$WORK/build_$2.log" 2>&1 ); then
       echo "ERROR: cargo build failed for $2 (@ ${1:0:10}). Tail of $WORK/build_$2.log:" >&2
       tail -40 "$WORK/build_$2.log" >&2
       exit 1
