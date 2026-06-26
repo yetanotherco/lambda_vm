@@ -2852,6 +2852,21 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    // LT table: GPU per-row fill over host-deduped ops when cuda is on, else the
+    // CPU builder. Same per-chunk dedup; row order may differ (the LT lookup bus
+    // is permutation-invariant).
+    #[cfg(feature = "cuda")]
+    let lts = match super::gpu_trace::gpu_build_lt_trace_tables(&lt_ops, max_rows.lt) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &lt_ops,
+            max_rows.lt,
+            lt::generate_lt_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let lts = chunk_and_generate(
         &lt_ops,
         max_rows.lt,

@@ -18,6 +18,9 @@ use crate::device::backend;
 /// CPU table column count (must match `prover::tables::cpu::cols::NUM_COLUMNS`).
 pub const NUM_CPU_COLS: usize = 38;
 
+/// LT table column count (must match `prover::tables::lt::cols::NUM_COLUMNS`).
+pub const NUM_LT_COLS: usize = 17;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -153,6 +156,63 @@ pub fn gpu_build_cpu_trace(
     Ok(DeviceMainCols {
         buf: Arc::new(cols),
         ncols: NUM_CPU_COLS,
+        nrows,
+    })
+}
+
+/// Build the LT trace table on device from already-deduped operations,
+/// column-major. Inputs are SoA over `n` unique ops: `lhs`, `rhs`, `flags`
+/// (bit0=signed, bit1=invert), `mult` (summed multiplicity). `nrows` is the
+/// padded power-of-two row count (`n.next_power_of_two().max(4)`); padding rows
+/// stay zero.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_build_lt_trace(
+    lhs: &[u64],
+    rhs: &[u64],
+    flags: &[u64],
+    mult: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(lhs.len(), n);
+    assert_eq!(rhs.len(), n);
+    assert_eq!(flags.len(), n);
+    assert_eq!(mult.len(), n);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let lhs_d = stream.clone_htod(lhs)?;
+    let rhs_d = stream.clone_htod(rhs)?;
+    let flags_d = stream.clone_htod(flags)?;
+    let mult_d = stream.clone_htod(mult)?;
+    let mut cols = stream.alloc_zeros::<u64>(NUM_LT_COLS * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.trace_lt_kernel)
+            .arg(&lhs_d)
+            .arg(&rhs_d)
+            .arg(&flags_d)
+            .arg(&mult_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols: NUM_LT_COLS,
         nrows,
     })
 }
