@@ -38,8 +38,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Vast offer search: datacenter RTX 5090, >=16 cores, >=96GB RAM (the ABBA prove
-  # peaks ~78 GB), >=64GB disk, verified + rentable, Blackwell-capable driver, <= cap.
+  # Vast offer search: datacenter RTX 5090, >=16 cores, >=64GB RAM, >=64GB disk,
+  # verified + rentable, Blackwell-capable driver, <= cap.
   GPU_NAME: RTX_5090
   PRICE_CAP: "3"
   VAST_IMAGE_DISK: "64"
@@ -140,10 +140,10 @@ jobs:
           OFFER_ATTEMPTS: "10"
           OFFER_INTERVAL: "30"
         run: |
-          # cpu_ram is the machine's TOTAL RAM in MB; a 1-GPU rental usually gets most of it.
-          # The ethrex_bench_20 GPU prove peaks at ~78 GB heap, so require >=96 GB
-          # (96 * 1024 = 98304) for headroom — a 32 GB box would OOM.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=98304 disk_space>=64 datacenter=true verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          # cpu_ram is the per-instance allocated RAM in MB. Require ~64 GB; use 64000
+          # (not 65536) because the "64 GB" datacenter boxes report ~64467 MB. Peak heap
+          # scales with table parallelism (~cores/3), so a 32-core/64 GB box fits the prove.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=64000 disk_space>=64 datacenter=true verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY"
           OFFER_ID=""
           for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
@@ -158,7 +158,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No datacenter RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No datacenter RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=64GB RAM, >=64GB disk, <= \$${PRICE_CAP}/hr)"
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
