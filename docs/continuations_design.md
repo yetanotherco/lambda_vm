@@ -69,19 +69,25 @@ makes the proof fail.
 
 ```
    ┌──────────┬───────────────────────────┬───────────────────────────┐
-   │ address  │ init: value, epoch, time  │ fini: value, epoch, time  │
+   │ address  │ init: value, epoch        │ fini: value, time         │
    └──────────┴───────────────────────────┴───────────────────────────┘
      which       what it was when this        what it is at this
-     cell         epoch first saw it, and       epoch's end, and this
-                  which epoch wrote it          epoch's number
+     cell         epoch first saw it, and       epoch's end (its last
+                  which epoch wrote it          access timestamp)
 ```
 
-Column layout (13 columns): `address_lo/hi` (32-bit), `init_value` (byte),
-`init_epoch` (two 16-bit halfwords), `init_timestamp` (four halfwords),
-`fini_value` (byte), `fini_timestamp_lo/hi` (32-bit), `MU` (selector).
+Column layout (9 columns): `address_lo/hi` (32-bit), `init_value` (byte),
+`init_epoch` (two 16-bit halfwords), `fini_value` (byte),
+`fini_timestamp_lo/hi` (32-bit), `MU` (selector).
 
 Note: **`fini_epoch` is NOT a column** — it is supplied as a per-table constant
 (see §4.2).
+
+Note: there is **no `init_timestamp`**. Timestamps are epoch-local (each epoch's
+clock restarts; the Memory-bus seed is `ts = 0`) and order accesses only *within*
+an epoch. The cross-epoch chain is ordered by the **epoch number** (§3.3), so the
+GlobalMemory bus carries no timestamp at all (see §2 telescoping). `fini_timestamp`
+stays only because the epoch-local **Memory bus** needs it (matched against MEMW).
 
 ### Cross-epoch telescoping
 
@@ -96,7 +102,7 @@ For a cell touched in epochs 1, 2, 3, the GlobalMemory bus checks:
                                                                     (last value)
 
    each  "fini ───► init"  is one matched token:
-   epoch i's fini == epoch (i+1)'s init  (same address, value, epoch, timestamp)
+   epoch i's fini == epoch (i+1)'s init  (same address, value, epoch — no timestamp)
 ```
 
 The bus balances **iff** every `fini` is consumed by the next-touching epoch's
@@ -122,11 +128,11 @@ Principle: **only check what nothing else already checks.**
 - `address`, `fini_timestamp`, the value bytes — these travel on the Memory bus
   and are matched against **MEMW**, which already range-checks them (exactly how
   PAGE relied on MEMW). No extra check.
-- The **cross-epoch-only** fields (`init_epoch`, `init_timestamp`) have no MEMW
-  partner, so L2G checks them itself: store as 16-bit halfwords, check each with
-  the `IsHalfword` lookup, and rebuild the value as `lo + 2^16·hi`. Because only
-  the range-checked halfwords feed the reconstruction, no extra AIR constraint is
-  needed.
+- The **cross-epoch-only** field `init_epoch` has no MEMW partner, so L2G checks it
+  itself: store as 16-bit halfwords, check each with the `IsHalfword` lookup, and
+  rebuild the value as `lo + 2^16·hi`. Because only the range-checked halfwords feed
+  the reconstruction, no extra AIR constraint is needed. (There is no
+  `init_timestamp` to check — the GlobalMemory bus carries no timestamp; see §2.)
 
 The value bytes get PAGE's batched `AreBytes` check (the `init` value is a
 trusted source and must be checked).

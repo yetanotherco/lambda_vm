@@ -19,23 +19,20 @@
 //! |--------|------|-------------|
 //! | offset | RowIndex | 0, 1, ..., page_size-1 (preprocessed) |
 //! | init | Byte | Genesis value (from ELF or 0) (preprocessed) |
-//! | init_epoch | Epoch | Genesis sentinel (always `GENESIS_EPOCH`) |
 //! | fini | Byte | Value after the last touching epoch |
 //! | fini_epoch | Epoch | Last touching epoch (`GENESIS_EPOCH` if untouched) |
-//! | fini_timestamp_lo | Word | Last access timestamp low word (0 if untouched) |
-//! | fini_timestamp_hi | Word | Last access timestamp high word (0 if untouched) |
 //!
 //! Virtual: `address = page_base + offset`, `page_base` constant per instance.
 //!
 //! ## Bus Interactions
 //!
-//! GlobalMemory token: `[address_lo, address_hi, value, epoch, ts_lo, ts_hi]`
-//! (same order as `local_to_global::bus_interactions`).
+//! GlobalMemory token: `[address_lo, address_hi, value, epoch]` (same order as
+//! `local_to_global::bus_interactions`; no timestamp — the chain is ordered by epoch).
 //!
 //! | Tag | Bus | Token | Multiplicity |
 //! |-----|-----|-------|--------------|
-//! | GM-GENESIS | GlobalMemory | `[address, init, GENESIS, 0, 0]` | 1 (sender) |
-//! | GM-FINAL   | GlobalMemory | `[address, fini, fini_epoch, fini_ts]` | 1 (receiver) |
+//! | GM-GENESIS | GlobalMemory | `[address, init, GENESIS]` | 1 (sender) |
+//! | GM-FINAL   | GlobalMemory | `[address, fini, fini_epoch]` | 1 (receiver) |
 
 use std::collections::HashMap;
 
@@ -60,23 +57,21 @@ pub mod cols {
     /// init: Genesis byte value (from ELF or 0) - preprocessed
     pub const INIT: usize = 1;
 
-    /// init_epoch: Genesis sentinel (always `GENESIS_EPOCH`)
-    pub const INIT_EPOCH: usize = 2;
+    // Note: there is no init-epoch column. The genesis token always carries
+    // `GENESIS_EPOCH`, so the GM-GENESIS sender emits it as a constant (like L2G's
+    // `fini_epoch`), saving a column and removing a prover-chosen value.
 
     /// fini: Final byte value after the last touching epoch
-    pub const FINI: usize = 3;
+    pub const FINI: usize = 2;
 
     /// fini_epoch: Last epoch that touched the cell (`GENESIS_EPOCH` if untouched)
-    pub const FINI_EPOCH: usize = 4;
+    pub const FINI_EPOCH: usize = 3;
 
-    /// fini_timestamp[0]: Last access timestamp low word (0 if untouched)
-    pub const FINI_TIMESTAMP_LO: usize = 5;
-
-    /// fini_timestamp[1]: Last access timestamp high word
-    pub const FINI_TIMESTAMP_HI: usize = 6;
+    // Note: no fini-timestamp column. The GlobalMemory bus carries no timestamp
+    // (the cross-epoch chain is ordered by epoch); timestamps are epoch-local.
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 7;
+    pub const NUM_COLUMNS: usize = 4;
 }
 
 /// Number of preprocessed columns (OFFSET, INIT). Identical to PAGE's preprocessed
@@ -95,8 +90,6 @@ pub struct FiniState {
     pub value: u8,
     /// Index of the last epoch that touched the cell.
     pub epoch: u64,
-    /// Last access timestamp.
-    pub timestamp: u64,
 }
 
 /// Map from byte address to final state, for the bytes touched across all epochs.
@@ -140,22 +133,15 @@ pub fn generate_global_trace(
             .unwrap_or(0);
         data[base + cols::INIT] = FE::from(init_value as u64);
 
-        // Genesis epoch carried as a COLUMN, matching the value the L2G init token
-        // reconstructs for a genesis-origin cell. `GENESIS_EPOCH = 0` (below every
-        // 1-based real epoch label), so `FE::from(0)` here equals L2G's `0`.
-        data[base + cols::INIT_EPOCH] = FE::from(GENESIS_EPOCH);
-
         // Final state: if touched use it, otherwise the cell stays at genesis
-        // (fini=init, epoch=GENESIS, ts=0) so its genesis/finalization tokens cancel.
-        let (fini_value, fini_epoch, timestamp) = match final_state.get(&byte_addr) {
-            Some(state) => (state.value, state.epoch, state.timestamp),
-            None => (init_value, GENESIS_EPOCH, 0),
+        // (fini=init, epoch=GENESIS) so its genesis/finalization tokens cancel.
+        let (fini_value, fini_epoch) = match final_state.get(&byte_addr) {
+            Some(state) => (state.value, state.epoch),
+            None => (init_value, GENESIS_EPOCH),
         };
 
         data[base + cols::FINI] = FE::from(fini_value as u64);
         data[base + cols::FINI_EPOCH] = FE::from(fini_epoch);
-        data[base + cols::FINI_TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
-        data[base + cols::FINI_TIMESTAMP_HI] = FE::from(timestamp >> 32);
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -168,12 +154,13 @@ pub fn generate_global_trace(
 /// Creates the GlobalMemory bus interactions for a GLOBAL_MEMORY table.
 ///
 /// The token order matches `local_to_global::bus_interactions` exactly:
-/// `[address_lo, address_hi, value, epoch, ts_lo, ts_hi]`. The address is
-/// computed as `page_base + offset` via a linear combination, like PAGE.
+/// `[address_lo, address_hi, value, epoch]` (no timestamp — the cross-epoch chain
+/// is ordered by epoch). The address is computed as `page_base + offset` via a
+/// linear combination, like PAGE.
 ///
-/// - GM-GENESIS: sends `[address, init, GENESIS, 0, 0]` — the token an L2G
+/// - GM-GENESIS: sends `[address, init, GENESIS]` — the token an L2G
 ///   init-receiver consumes for a genesis-origin cell.
-/// - GM-FINAL: receives `[address, fini, fini_epoch, fini_ts]` — the token the
+/// - GM-FINAL: receives `[address, fini, fini_epoch]` — the token the
 ///   last touching epoch's L2G fini-sender produces.
 pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let page_base_lo = page_base & 0xFFFF_FFFF;
@@ -189,7 +176,8 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // GM-GENESIS: send the genesis token [address, init, GENESIS, 0, 0].
+        // GM-GENESIS: send the genesis token [address, init, GENESIS]. No timestamp:
+        // the GlobalMemory chain is ordered by epoch (timestamps are epoch-local).
         BusInteraction::sender(
             BusId::GlobalMemory,
             Multiplicity::One,
@@ -200,15 +188,10 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                     start_column: cols::INIT,
                     packing: Packing::Direct,
                 },
-                BusValue::Packed {
-                    start_column: cols::INIT_EPOCH,
-                    packing: Packing::Direct,
-                },
-                BusValue::constant(0),
-                BusValue::constant(0),
+                BusValue::constant(GENESIS_EPOCH),
             ],
         ),
-        // GM-FINAL: receive the finalization token [address, fini, fini_epoch, fini_ts].
+        // GM-FINAL: receive the finalization token [address, fini, fini_epoch].
         BusInteraction::receiver(
             BusId::GlobalMemory,
             Multiplicity::One,
@@ -221,14 +204,6 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                 },
                 BusValue::Packed {
                     start_column: cols::FINI_EPOCH,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI_TIMESTAMP_HI,
                     packing: Packing::Direct,
                 },
             ],

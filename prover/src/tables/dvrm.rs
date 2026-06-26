@@ -29,14 +29,14 @@
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
 //! - Receiver: DVRM (×2 for quotient and remainder results)
 
-use std::collections::HashMap;
-
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
+
+use std::collections::HashMap;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48,
