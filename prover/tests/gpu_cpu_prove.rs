@@ -12,7 +12,7 @@
 
 use lambda_vm_prover::tables::gpu_trace::{
     gpu_bytewise_table_builds, gpu_cpu_table_builds, gpu_eq_table_builds, gpu_lt_table_builds,
-    gpu_shift_table_builds,
+    gpu_mul_table_builds, gpu_shift_table_builds,
 };
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
@@ -55,11 +55,12 @@ fn gpu_alu_tables_prove_verify() {
     // all_instructions_64 exercises LT (SLT/BLT/BGE), EQ (BEQ/BNE/SEQ), and
     // BYTEWISE (AND/OR/XOR) → all three GPU ALU tables fire.
     let elf = asm_elf_bytes("all_instructions_64");
-    let (lt0, eq0, bw0, sh0) = (
+    let (lt0, eq0, bw0, sh0, mul0) = (
         gpu_lt_table_builds(),
         gpu_eq_table_builds(),
         gpu_bytewise_table_builds(),
         gpu_shift_table_builds(),
+        gpu_mul_table_builds(),
     );
     let proof = prove(&elf).expect("prove");
     assert!(gpu_lt_table_builds() > lt0, "GPU LT table did not fire");
@@ -68,13 +69,13 @@ fn gpu_alu_tables_prove_verify() {
         gpu_bytewise_table_builds() > bw0,
         "GPU BYTEWISE table did not fire"
     );
-    assert!(
-        gpu_shift_table_builds() > sh0,
-        "GPU SHIFT table did not fire"
-    );
+    assert!(gpu_shift_table_builds() > sh0, "GPU SHIFT table did not fire");
+    assert!(gpu_mul_table_builds() > mul0, "GPU MUL table did not fire");
     assert!(
         verify(&proof, &elf).expect("verify"),
-        "proof built with GPU LT/EQ/BYTEWISE/SHIFT tables failed to verify"
+        "proof built with GPU LT/EQ/BYTEWISE/SHIFT/MUL tables failed to verify"
     );
-    println!("all_instructions_64: prove+verify OK with GPU LT + EQ + BYTEWISE + SHIFT tables");
+    println!(
+        "all_instructions_64: prove+verify OK with GPU LT + EQ + BYTEWISE + SHIFT + MUL tables"
+    );
 }

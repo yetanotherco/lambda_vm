@@ -2893,6 +2893,18 @@ fn build_traces(
         #[cfg(feature = "disk-spill")]
         storage_mode,
     )?;
+    #[cfg(feature = "cuda")]
+    let muls = match super::gpu_trace::gpu_build_mul_trace_tables(&mul_ops, max_rows.mul) {
+        Some(t) => t,
+        None => chunk_and_generate(
+            &mul_ops,
+            max_rows.mul,
+            mul::generate_mul_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?,
+    };
+    #[cfg(not(feature = "cuda"))]
     let muls = chunk_and_generate(
         &mul_ops,
         max_rows.mul,

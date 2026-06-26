@@ -30,6 +30,9 @@ pub const NUM_BYTEWISE_COLS: usize = 26;
 /// SHIFT table column count (`prover::tables::shift::cols::NUM_COLUMNS`).
 pub const NUM_SHIFT_COLS: usize = 29;
 
+/// MUL table column count (`prover::tables::mul::cols::NUM_COLUMNS`).
+pub const NUM_MUL_COLS: usize = 26;
+
 /// `PackedDecode` stride: u64s per program PC (must match `trace_cpu.cu`).
 pub const DEC_STRIDE: usize = 8;
 
@@ -308,6 +311,91 @@ pub fn gpu_build_shift_trace(
     Ok(DeviceMainCols {
         buf: Arc::new(cols),
         ncols: NUM_SHIFT_COLS,
+        nrows,
+    })
+}
+
+/// Build the MUL trace table on device from deduped ops. SoA over `n` unique
+/// ops: `lhs`, `rhs`, `flags` (bit0=lhs_signed, bit1=rhs_signed), `mu_lo`,
+/// `mu_hi`. Padding rows stay zero.
+pub fn gpu_build_mul_trace(
+    lhs: &[u64],
+    rhs: &[u64],
+    flags: &[u64],
+    mu_lo: &[u64],
+    mu_hi: &[u64],
+    n: usize,
+    nrows: usize,
+) -> Result<DeviceMainCols> {
+    build_alu5(
+        &backend()?.trace_mul_kernel,
+        lhs,
+        rhs,
+        flags,
+        mu_lo,
+        mu_hi,
+        n,
+        nrows,
+        NUM_MUL_COLS,
+    )
+}
+
+/// Shared launcher for kernels taking 5 SoA u64 inputs (a, b, c, d, e) — e.g.
+/// MUL/DVRM with dual multiplicity counters. One thread per row.
+#[allow(clippy::too_many_arguments)]
+fn build_alu5(
+    kernel: &cudarc::driver::CudaFunction,
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    d: &[u64],
+    e: &[u64],
+    n: usize,
+    nrows: usize,
+    ncols: usize,
+) -> Result<DeviceMainCols> {
+    assert_eq!(a.len(), n);
+    assert_eq!(b.len(), n);
+    assert_eq!(c.len(), n);
+    assert_eq!(d.len(), n);
+    assert_eq!(e.len(), n);
+    assert!(nrows >= n, "nrows must be >= n");
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let a_d = stream.clone_htod(a)?;
+    let b_d = stream.clone_htod(b)?;
+    let c_d = stream.clone_htod(c)?;
+    let d_d = stream.clone_htod(d)?;
+    let e_d = stream.clone_htod(e)?;
+    let mut cols = stream.alloc_zeros::<u64>(ncols * nrows)?;
+
+    let n_u64 = n as u64;
+    let nrows_u64 = nrows as u64;
+    let cfg = LaunchConfig {
+        grid_dim: ((nrows as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(&a_d)
+            .arg(&b_d)
+            .arg(&c_d)
+            .arg(&d_d)
+            .arg(&e_d)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(cfg)?;
+    }
+    stream.synchronize()?;
+
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols,
         nrows,
     })
 }

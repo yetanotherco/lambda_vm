@@ -23,6 +23,7 @@ use super::bytewise::{self, BytewiseOperation};
 use super::cpu::cols;
 use super::eq::{self, EqOperation};
 use super::lt::{self, LtOperation};
+use super::mul::{self, MulOperation};
 use super::shift::{self, ShiftOperation};
 use super::types::{DecodeEntry, FE, GoldilocksExtension, GoldilocksField};
 
@@ -60,6 +61,12 @@ pub fn gpu_bytewise_table_builds() -> u64 {
 pub static GPU_SHIFT_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_shift_table_builds() -> u64 {
     GPU_SHIFT_TABLE_BUILDS.load(Ordering::Relaxed)
+}
+
+/// Counts successful GPU MUL-table builds.
+pub static GPU_MUL_TABLE_BUILDS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_mul_table_builds() -> u64 {
+    GPU_MUL_TABLE_BUILDS.load(Ordering::Relaxed)
 }
 
 /// Build the dense `PackedDecode` array (`DEC_STRIDE` u64 per PC, indexed by
@@ -323,5 +330,58 @@ pub fn gpu_build_shift_trace_tables(
         tables.push(tt);
     }
     GPU_SHIFT_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
+    Some(tables)
+}
+
+/// MUL tables on GPU (per-chunk host dedup with dual mu_lo/mu_hi counters →
+/// GPU fill). Mirrors generate_mul_trace. Input is (op, wants_hi) pairs.
+pub fn gpu_build_mul_trace_tables(
+    mul_ops: &[(MulOperation, bool)],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    use std::collections::HashMap;
+    if mul_ops.is_empty() {
+        return None;
+    }
+    let ncols = mul::cols::NUM_COLUMNS;
+    let mut tables = Vec::with_capacity(mul_ops.len().div_ceil(max_rows));
+    for chunk in mul_ops.chunks(max_rows) {
+        // Dedup by (lhs, lhs_signed, rhs, rhs_signed); wants_hi selects counter.
+        let mut map: HashMap<(u64, bool, u64, bool), (u64, u64)> = HashMap::new();
+        for (op, wants_hi) in chunk {
+            let e = map
+                .entry((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed))
+                .or_default();
+            if *wants_hi {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        let unique: Vec<((u64, bool, u64, bool), (u64, u64))> = map.into_iter().collect();
+        let n = unique.len();
+        let nrows = n.next_power_of_two().max(4);
+        let mut lhs = vec![0u64; n];
+        let mut rhs = vec![0u64; n];
+        let mut flags = vec![0u64; n];
+        let mut mu_lo = vec![0u64; n];
+        let mut mu_hi = vec![0u64; n];
+        for (i, ((l, ls, rr, rs), (mlo, mhi))) in unique.iter().enumerate() {
+            lhs[i] = *l;
+            rhs[i] = *rr;
+            flags[i] = (*ls as u64) | ((*rs as u64) << 1);
+            mu_lo[i] = *mlo;
+            mu_hi[i] = *mhi;
+        }
+        let dev = trace::gpu_build_mul_trace(&lhs, &rhs, &flags, &mu_lo, &mu_hi, n, nrows).ok()?;
+        let host = dev.to_host().ok()?;
+        let columns: Vec<Vec<FE>> = (0..ncols)
+            .map(|c| host[c * nrows..c * nrows + nrows].iter().map(|&v| FE::from(v)).collect())
+            .collect();
+        let mut tt = TraceTable::from_columns_main(columns, 1);
+        tt.set_gpu_main_input(dev);
+        tables.push(tt);
+    }
+    GPU_MUL_TABLE_BUILDS.fetch_add(1, Ordering::Relaxed);
     Some(tables)
 }
