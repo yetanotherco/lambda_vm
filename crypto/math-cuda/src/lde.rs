@@ -37,11 +37,11 @@ fn assert_u32_domain(n: usize, what: &str) {
 /// Output shape requested from the fused LDE + Keccak entry points.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum KeccakCommit {
-    /// Only the `lde_size` keccak-256 leaves; no inner-tree build. Caller
-    /// receives `lde_size * 32` bytes.
+    /// Only the keccak-256 leaves; no inner-tree build. Caller receives
+    /// `num_leaves * 32` bytes.
     LeavesOnly,
     /// Full Merkle tree: leaves at the tail + inner nodes built on-device.
-    /// Caller receives `(2*lde_size - 1) * 32` bytes.
+    /// Caller receives `(2*num_leaves - 1) * 32` bytes.
     FullTree,
 }
 
@@ -595,12 +595,12 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
-/// Fused LDE + Keccak-256 leaf hashing. Caller receives the `lde_size * 32`
-/// bytes of leaf hashes in `hashed_leaves_out` (one 32-byte digest per output
-/// row, in natural row order; leaves are computed reading columns at
-/// bit-reversed rows, matching `commit_columns_bit_reversed` on the CPU
-/// side). Thin wrapper over `coset_lde_batch_base_into_with_merkle_tree_inner`
-/// with `LeavesOnly` — no inner-tree build, no device handle.
+/// Fused LDE + row-pair Keccak-256 leaf hashing. Caller receives
+/// `(lde_size / 2) * 32` bytes of leaf hashes in `hashed_leaves_out` (one
+/// 32-byte digest per bit-reversed row pair, in natural leaf order, matching
+/// `commit_bit_reversed(.., 2)` on the CPU side). Thin wrapper over
+/// `coset_lde_batch_base_into_with_merkle_tree_inner` with `LeavesOnly` — no
+/// inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -616,14 +616,15 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
-        1,
+        2,
     )
     .map(|_| ())
 }
 
 /// Like `coset_lde_batch_base_into_with_leaf_hash`, but also builds the full
-/// Merkle tree on device and returns the `2*lde_size - 1` node buffer back
-/// to the caller in `merkle_nodes_out` (byte length `(2*lde_size - 1) * 32`).
+/// row-pair Merkle tree on device and returns the `2*(lde_size/2) - 1` node
+/// buffer back to the caller in `merkle_nodes_out` (byte length
+/// `(2*(lde_size/2) - 1) * 32`).
 ///
 /// The leaf hashes are never exposed to the caller — they stay on device and
 /// feed straight into the pair-hash tree kernel, avoiding the
@@ -644,7 +645,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         false,
-        1,
+        2,
     )
     .map(|_| ())
 }
@@ -799,8 +800,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     )?;
 
     // Allocate the device output buffer. In `LeavesOnly` mode this is just
-    // `lde_size * 32` bytes (the leaves themselves); in `FullTree` mode it's
-    // `(2*lde_size - 1) * 32` bytes (leaves in the tail + inner nodes filled
+    // `num_leaves * 32` bytes (the leaves themselves); in `FullTree` mode it's
+    // `(2*num_leaves - 1) * 32` bytes (leaves in the tail + inner nodes filled
     // below). `alloc` (not `alloc_zeros`) is safe because every byte is
     // written before any reader sees it: the keccak kernel fills the
     // leaves slab, the inner-tree pass (when present) fills the head.
@@ -857,8 +858,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 }
 
-/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused
-/// LDE + Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
+/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused LDE +
+/// row-pair Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
 /// `coset_lde_batch_ext3_into_with_merkle_tree_inner` with `LeavesOnly`.
 pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     columns: &[&[u64]],
@@ -877,14 +878,14 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
-        1,
+        2,
     )
     .map(|_| ())
 }
 
 /// Ext3 variant of the fused `coset_lde_batch_base_into_with_merkle_tree`.
 /// LDE + leaf hashing + inner-tree build, all on device; D2Hs only the LDE
-/// evaluations and the full `2*lde_size - 1` node buffer.
+/// evaluations and the full `2*(lde_size/2) - 1` row-pair node buffer.
 pub fn coset_lde_batch_ext3_into_with_merkle_tree(
     columns: &[&[u64]],
     n: usize,
@@ -902,7 +903,7 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         false,
-        1,
+        2,
     )
     .map(|_| ())
 }
@@ -1055,8 +1056,8 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         mb_u32,
     )?;
 
-    // Allocate device output buffer (LeavesOnly → lde_size*32; FullTree →
-    // (2*lde_size - 1)*32). Leaf kernel writes to the leaves slab; the
+    // Allocate device output buffer (LeavesOnly -> num_leaves*32; FullTree ->
+    // (2*num_leaves - 1)*32). Leaf kernel writes to the leaves slab; the
     // inner-tree pass (when present) fills the head.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
     let leaves_offset_bytes = commit.leaves_offset_bytes(num_leaves);
