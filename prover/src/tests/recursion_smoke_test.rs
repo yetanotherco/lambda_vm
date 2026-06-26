@@ -38,8 +38,8 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         grinding_factor: 1,
     };
 
-/// Prove `inner_elf` under `opts` and postcard-encode `(proof, elf, opts)` into
-/// the guest's private-input blob. Returns the proof and the blob.
+/// Prove `inner_elf` under `opts` and postcard-encode `(proof, elf, opts, vkey)`
+/// into the guest's private-input blob. Returns the proof and the blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
@@ -58,8 +58,16 @@ fn prove_inner_and_encode_blob(
     )
     .expect("inner prove should succeed");
 
-    let blob =
-        postcard::to_allocvec(&(&inner_proof, &inner_elf, opts)).expect("postcard encode failed");
+    let elf_for_vkey = executor::elf::Elf::load(inner_elf).expect("ELF load failed");
+    let page_configs = crate::tables::trace_builder::Traces::page_configs_from_elf_and_runtime(
+        &elf_for_vkey,
+        &inner_proof.runtime_page_ranges,
+        inner_proof.num_private_input_pages,
+    );
+    let vkey =
+        crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, opts, None, &page_configs);
+    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf, opts, &vkey))
+        .expect("postcard encode failed");
     eprintln!("[{tag}] postcard blob: {} bytes", blob.len());
     (inner_proof, blob)
 }
