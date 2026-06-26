@@ -124,7 +124,7 @@ pub fn epoch_boundaries(
     epochs: &[EpochTouches],
 ) -> Vec<Vec<CellBoundary>> {
     // provenance[addr] = (last_writer_epoch, value, timestamp)
-    let mut provenance = genesis_provenance(initial_memory);
+    let mut provenance = genesis_provenance(initial_memory.iter().map(|(&a, &v)| (a, v)));
 
     let mut result = Vec::with_capacity(epochs.len());
     for (epoch, touched) in epochs.iter().enumerate() {
@@ -169,10 +169,12 @@ pub fn epoch_boundary(
     boundaries
 }
 
-/// Seed the provenance store from the program's initial memory (genesis cells).
-pub fn genesis_provenance(initial_memory: &HashMap<u64, u64>) -> Provenance {
+/// Seed the provenance store from the program's initial memory (genesis cells),
+/// supplied as an `(address, value)` iterator. The continuation prover feeds the
+/// paged genesis image directly, avoiding an intermediate address→value map.
+pub fn genesis_provenance(genesis: impl IntoIterator<Item = (u64, u64)>) -> Provenance {
     let mut provenance = Provenance::new((GENESIS_EPOCH, 0, 0));
-    for (&addr, &value) in initial_memory {
+    for (addr, value) in genesis {
         provenance.set(addr, (GENESIS_EPOCH, value, 0));
     }
     provenance
@@ -204,46 +206,27 @@ pub mod cols {
     pub const INIT_EPOCH_0: usize = 3;
     pub const INIT_EPOCH_1: usize = 4;
 
-    // Init timestamp — GlobalMemory-bus only (the Memory-bus init token is seeded
-    // at ts=0), range-checked: four halfwords (`ts_lo = T0 + 2^16·T1`, etc.).
-    pub const INIT_TS_0: usize = 5;
-    pub const INIT_TS_1: usize = 6;
-    pub const INIT_TS_2: usize = 7;
-    pub const INIT_TS_3: usize = 8;
+    // Note: there is no init-timestamp column. Timestamps are epoch-local ordering
+    // scratch (the Memory-bus init token is seeded at ts=0); across epochs the chain
+    // is ordered by `init_epoch < fini_epoch`, so the GlobalMemory bus carries no
+    // timestamp at all (see `bus_interactions`).
 
     /// Fini value: a single byte.
-    pub const FINI_VALUE: usize = 9;
+    pub const FINI_VALUE: usize = 5;
 
     /// fini_timestamp_lo: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_LO: usize = 10;
+    pub const FINI_TIMESTAMP_LO: usize = 6;
     /// fini_timestamp_hi: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_HI: usize = 11;
+    pub const FINI_TIMESTAMP_HI: usize = 7;
 
     /// MU: real-row selector / LogUp multiplicity (1 on real rows, 0 on padding).
-    pub const MU: usize = 12;
+    pub const MU: usize = 8;
 
-    pub const NUM_COLUMNS: usize = 13;
+    pub const NUM_COLUMNS: usize = 9;
 
     /// The halfword columns (cross-epoch-only quantities), in order — every column
     /// that is `IsHalfword`-checked.
-    pub const RANGE_CHECKED_HALFWORDS: [usize; 6] = [
-        INIT_EPOCH_0,
-        INIT_EPOCH_1,
-        INIT_TS_0,
-        INIT_TS_1,
-        INIT_TS_2,
-        INIT_TS_3,
-    ];
-}
-
-/// Little-endian 16-bit halfwords of a 64-bit value: `[bits 0-15, 16-31, 32-47, 48-63]`.
-fn halfwords64(v: u64) -> [u64; 4] {
-    [
-        v & 0xFFFF,
-        (v >> 16) & 0xFFFF,
-        (v >> 32) & 0xFFFF,
-        (v >> 48) & 0xFFFF,
-    ]
+    pub const RANGE_CHECKED_HALFWORDS: [usize; 2] = [INIT_EPOCH_0, INIT_EPOCH_1];
 }
 
 /// The two halfwords of an epoch label (genesis `0` or a small 1-based index, all
@@ -268,7 +251,6 @@ pub fn generate_local_to_global_trace(
 
     for (row, b) in boundaries.iter().enumerate() {
         let base = row * cols::NUM_COLUMNS;
-        let init_ts = halfwords64(b.init.timestamp);
         let init_epoch = epoch_halfwords(b.init.originating_epoch);
 
         // Plain 32-bit columns (MEMW-checked on the Memory bus).
@@ -279,13 +261,9 @@ pub fn generate_local_to_global_trace(
         // Byte values (AreBytes-checked).
         data[base + cols::INIT_VALUE] = FE::from(b.init.value & 0xFF);
         data[base + cols::FINI_VALUE] = FE::from(b.fini.value & 0xFF);
-        // Cross-epoch-only quantities as IsHalfword-checked halfwords.
+        // Cross-epoch-only quantity as IsHalfword-checked halfwords.
         data[base + cols::INIT_EPOCH_0] = FE::from(init_epoch[0]);
         data[base + cols::INIT_EPOCH_1] = FE::from(init_epoch[1]);
-        data[base + cols::INIT_TS_0] = FE::from(init_ts[0]);
-        data[base + cols::INIT_TS_1] = FE::from(init_ts[1]);
-        data[base + cols::INIT_TS_2] = FE::from(init_ts[2]);
-        data[base + cols::INIT_TS_3] = FE::from(init_ts[3]);
         // Real-row selector.
         data[base + cols::MU] = FE::one();
     }
@@ -324,21 +302,23 @@ fn mu() -> Multiplicity {
 }
 
 /// Cross-epoch memory bus interactions, two per row (one touched cell):
-/// - **receive** the `init` token `(address, value, originating_epoch, timestamp)`
-///   left by the epoch that last wrote the cell;
-/// - **send** the `fini` token `(address, value, epoch_label, timestamp)` for the
-///   next epoch that touches the cell.
+/// - **receive** the `init` token `(address, value, originating_epoch)` left by the
+///   epoch that last wrote the cell;
+/// - **send** the `fini` token `(address, value, epoch_label)` for the next epoch
+///   that touches the cell.
 ///
-/// `fini_epoch` is the per-table constant `epoch_label`; `init_epoch` and `init`
-/// timestamp come from the range-checked halfword columns via [`word`]; `address`
-/// and `fini` timestamp are direct 32-bit columns.
+/// `fini_epoch` is the per-table constant `epoch_label`; `init_epoch` comes from the
+/// range-checked halfword columns via [`word`]; `address` is direct 32-bit columns.
+/// No timestamp is carried: the chain is ordered by epoch, and timestamps are
+/// epoch-local (only the Memory bus, not this one, uses them).
 ///
 /// These tokens are matched ACROSS epochs by the final aggregation LogUp (step 4),
 /// so within a single epoch's table the GlobalMemory bus is deliberately
 /// unbalanced (real rows have `init != fini`). Padding rows fire nothing (`MU = 0`).
 pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     vec![
-        // init: receive the token left by the originating epoch.
+        // init: receive the token left by the originating epoch. No timestamp: the
+        // chain is ordered by epoch, and timestamps are epoch-local (see cols).
         BusInteraction::receiver(
             BusId::GlobalMemory,
             mu(),
@@ -347,8 +327,6 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
                 direct(cols::ADDRESS_HI),
                 direct(cols::INIT_VALUE),
                 word(cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
-                word(cols::INIT_TS_0, cols::INIT_TS_1),
-                word(cols::INIT_TS_2, cols::INIT_TS_3),
             ],
         ),
         // fini: send the token for the next epoch to consume.
@@ -360,8 +338,6 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
                 direct(cols::ADDRESS_HI),
                 direct(cols::FINI_VALUE),
                 BusValue::constant(epoch_label),
-                direct(cols::FINI_TIMESTAMP_LO),
-                direct(cols::FINI_TIMESTAMP_HI),
             ],
         ),
     ]
@@ -481,11 +457,7 @@ pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOpera
             (b.fini.value & 0xFF) as u8,
         ));
         let init_epoch = epoch_halfwords(b.init.originating_epoch);
-        let init_ts = halfwords64(b.init.timestamp);
         for v in init_epoch {
-            push_halfword(&mut ops, v);
-        }
-        for v in init_ts {
             push_halfword(&mut ops, v);
         }
         // Ordering: IsB20[fini_epoch - 1 - init_epoch]. Honest rows have
@@ -656,8 +628,8 @@ mod tests {
 
     #[test]
     fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 13);
-        assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 6);
+        assert_eq!(cols::NUM_COLUMNS, 9);
+        assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 2);
     }
 
     #[test]
@@ -680,15 +652,7 @@ mod tests {
         // Values are stored as single bytes.
         assert_eq!(at(cols::INIT_VALUE), byte(b.init.value));
         assert_eq!(at(cols::FINI_VALUE), byte(b.fini.value));
-        // The cross-epoch-only quantities reconstruct from their halfwords.
-        assert_eq!(
-            word_value(&trace, cols::INIT_TS_0, cols::INIT_TS_1),
-            lo32(b.init.timestamp)
-        );
-        assert_eq!(
-            word_value(&trace, cols::INIT_TS_2, cols::INIT_TS_3),
-            hi32(b.init.timestamp)
-        );
+        // The cross-epoch-only quantity reconstructs from its halfwords.
         // Genesis init epoch reconstructs to 0 (== GENESIS_EPOCH).
         assert_eq!(
             word_value(&trace, cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
@@ -737,10 +701,11 @@ mod tests {
         assert_eq!(init.bus_id, global_memory);
         assert_eq!(fini.bus_id, global_memory);
 
-        // Both tokens have the same 6-element shape so they can match across
-        // epochs: address(lo,hi), value(byte), epoch, timestamp(lo,hi).
-        assert_eq!(init.values.len(), 6);
-        assert_eq!(fini.values.len(), 6);
+        // Both tokens have the same 4-element shape so they can match across
+        // epochs: address(lo,hi), value(byte), epoch. No timestamp — the chain is
+        // ordered by epoch, and timestamps are epoch-local.
+        assert_eq!(init.values.len(), 4);
+        assert_eq!(fini.values.len(), 4);
     }
 
     #[test]

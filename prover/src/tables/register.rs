@@ -127,6 +127,16 @@ fn register_word_address_list() -> [u64; NUM_REGISTER_ADDRESSES] {
     addrs
 }
 
+// Positions of the non-general-purpose registers within a register-init vector
+// (indexed in `register_word_address_list` order). x0-x31 occupy positions 0..63
+// (position `i` is word address `i`), so register `r`'s two words are at `2r`, `2r+1`.
+/// Position of x254 (synthetic commit index, word address 508).
+pub(crate) const X254_INDEX: usize = 64;
+/// Position of x255 (PC) low word (word address 510).
+pub(crate) const PC_LO_INDEX: usize = 65;
+/// Position of x255 (PC) high word (word address 511).
+pub(crate) const PC_HI_INDEX: usize = 66;
+
 /// Compute the initial value for a register Word address.
 ///
 /// This is the **program-start** register image, so it only applies to the first
@@ -147,13 +157,14 @@ fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
     }
 }
 
-/// Build the register init map (word address -> initial value) for a program
-/// starting at `entry_point` (the program-start register image). A continuation
-/// epoch would instead supply its boundary register snapshot.
-pub(crate) fn register_init_from_entry_point(entry_point: u64) -> HashMap<u64, u32> {
+/// Build the register init vector (one initial value per row, in
+/// `register_word_address_list` order) for a program starting at `entry_point`
+/// (the program-start register image). A continuation epoch would instead supply
+/// its boundary register snapshot.
+pub(crate) fn register_init_from_entry_point(entry_point: u64) -> Vec<u32> {
     register_word_address_list()
         .iter()
-        .map(|&addr| (addr, init_value_for_address(addr, entry_point)))
+        .map(|&addr| init_value_for_address(addr, entry_point))
         .collect()
 }
 
@@ -166,25 +177,25 @@ pub(crate) fn register_init_from_entry_point(entry_point: u64) -> HashMap<u64, u
 /// init comes from epoch i's *bound* fini (`fini_from_trace`, carried as the next
 /// epoch's preprocessed INIT), not a trusted executor snapshot.
 #[cfg(test)]
-pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> HashMap<u64, u32> {
-    let mut init = HashMap::new();
+pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Vec<u32> {
+    let mut init = vec![0u32; NUM_REGISTER_ADDRESSES];
     for reg in 0u8..32 {
         let value = if reg == 0 {
             0
         } else {
             registers.read(reg as u32).unwrap_or(0)
         };
-        let base = (reg as u64) * 2;
-        init.insert(base, (value & 0xFFFF_FFFF) as u32);
-        init.insert(base + 1, (value >> 32) as u32);
+        let base = (reg as usize) * 2;
+        init[base] = (value & 0xFFFF_FFFF) as u32;
+        init[base + 1] = (value >> 32) as u32;
     }
     // x254 synthetic commit index, hardcoded to 0 in this test-only helper, so it
     // is only correct for an epoch with no preceding COMMIT. The production path
-    // carries x254 across epochs via `register_init_from_fini` (the bound FINI),
-    // not this snapshot helper.
-    init.insert(508, 0);
-    init.insert(510, (pc & 0xFFFF_FFFF) as u32);
-    init.insert(511, (pc >> 32) as u32);
+    // carries x254 across epochs via the previous epoch's bound FINI vector, not
+    // this snapshot helper.
+    init[X254_INDEX] = 0;
+    init[PC_LO_INDEX] = (pc & 0xFFFF_FFFF) as u32;
+    init[PC_HI_INDEX] = (pc >> 32) as u32;
     init
 }
 
@@ -197,15 +208,15 @@ pub(crate) fn register_init_from_snapshot(registers: &Registers, pc: u64) -> Has
 /// ## Arguments
 ///
 /// * `final_state` - Map from register Word address to final (timestamp, value)
-/// * `init` - Map from register Word address to initial value (program-start
-///   image, or an epoch's boundary register snapshot)
+/// * `init` - Initial value per row, in `register_word_address_list` order
+///   (program-start image, or an epoch's boundary register snapshot)
 ///
 /// ## Returns
 ///
 /// The trace table for registers.
 pub fn generate_register_trace(
     final_state: &FinalRegisterStateMap,
-    init: &HashMap<u64, u32>,
+    init: &[u32],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let mut trace = TraceTable::new_main(
@@ -220,7 +231,7 @@ pub fn generate_register_trace(
         // Offset = actual Word address in register space
         table.set_u64(row, cols::OFFSET, word_addr);
 
-        let init_value = init.get(&word_addr).copied().unwrap_or(0);
+        let init_value = init.get(row).copied().unwrap_or(0);
         table.set_word(row, cols::INIT, init_value);
 
         // Final state: if accessed use final, otherwise use initial (timestamp 1)
@@ -257,18 +268,6 @@ pub fn fini_from_trace(trace: &TraceTable<GoldilocksField, GoldilocksExtension>)
         .collect()
 }
 
-/// Expand a fini vector (the 67 final values in `register_word_address_list`
-/// order, as produced by `fini_from_trace`) into the address-keyed register-init
-/// map the trace builder consumes. Used to chain the previous epoch's fini into
-/// the next epoch's init — the register analog of `register_init_from_entry_point`.
-pub(crate) fn register_init_from_fini(fini: &[u32]) -> HashMap<u64, u32> {
-    register_word_address_list()
-        .iter()
-        .zip(fini)
-        .map(|(&addr, &value)| (addr, value))
-        .collect()
-}
-
 // =========================================================================
 // Preprocessed commitment
 // =========================================================================
@@ -278,10 +277,7 @@ pub(crate) fn register_init_from_fini(fini: &[u32]) -> HashMap<u64, u32> {
 /// Program-dependent: x255 (PC) init = entry_point.
 /// OFFSET encodes the Word address (0..63 for x0-x31, 508 for x254, 510-511 for x255).
 /// INIT holds the initial value (SP=STACK_TOP, PC=entry_point, rest=0).
-pub fn compute_precomputed_commitment(
-    options: &ProofOptions,
-    init: &HashMap<u64, u32>,
-) -> Commitment {
+pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
 
@@ -289,9 +285,8 @@ pub fn compute_precomputed_commitment(
     let mut init_col = vec![FE::zero(); num_rows];
 
     for i in 0..NUM_REGISTER_ADDRESSES {
-        let word_addr = addr_list[i];
-        offset_col[i] = FE::from(word_addr);
-        init_col[i] = FE::from(init.get(&word_addr).copied().unwrap_or(0) as u64);
+        offset_col[i] = FE::from(addr_list[i]);
+        init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
     }
 
     commit_register_columns(options, vec![offset_col, init_col])
@@ -306,7 +301,7 @@ pub fn compute_precomputed_commitment(
 /// rows is 0 (as the trace builds it).
 pub fn compute_precomputed_commitment_with_fini(
     options: &ProofOptions,
-    init: &HashMap<u64, u32>,
+    init: &[u32],
     fini: &[u32],
 ) -> Commitment {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
@@ -318,9 +313,8 @@ pub fn compute_precomputed_commitment_with_fini(
     let mut fini_col = vec![FE::zero(); num_rows];
 
     for i in 0..NUM_REGISTER_ADDRESSES {
-        let word_addr = addr_list[i];
-        offset_col[i] = FE::from(word_addr);
-        init_col[i] = FE::from(init.get(&word_addr).copied().unwrap_or(0) as u64);
+        offset_col[i] = FE::from(addr_list[i]);
+        init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
         fini_col[i] = FE::from(fini[i] as u64);
     }
 
@@ -363,7 +357,7 @@ fn commit_register_columns(options: &ProofOptions, columns: Vec<Vec<FE>>) -> Com
 /// Returns the preprocessed commitment for the REGISTER table.
 ///
 /// Program-dependent (entry_point varies per ELF), so not globally cached.
-pub fn preprocessed_commitment(options: &ProofOptions, init: &HashMap<u64, u32>) -> Commitment {
+pub fn preprocessed_commitment(options: &ProofOptions, init: &[u32]) -> Commitment {
     compute_precomputed_commitment(options, init)
 }
 
