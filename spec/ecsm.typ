@@ -1,4 +1,4 @@
-#import "/book.typ": book-page, aside, attention, et
+#import "/book.typ": book-page, aside, attention
 #import "/src.typ": load_config, load_chip
 #import "/chip.typ": (
   render_chip_variable_table,
@@ -63,7 +63,7 @@ The accelerator comprises two chips:
 - *`ECSM` (Elliptic Curve Scalar Multiply)*.
     This chip is responsible for 
     - loading $k$ from memory and verifying that it is contained in $[1, N)$,
-    - loading inputs $x_G$ and reconstructing $y_G$,
+    - loading inputs $x_G$, verifying $x_G < p$, and reconstructing $y_G$,
     - verifying $(k times G)_x < p$, and
     - writing $(k times G)_x$ to memory.
     It interacts with the `ECDAS` chip, sending $k$ and $G$ as input, and receiving $k times G$ as result.
@@ -344,7 +344,7 @@ Selecting $#`carry_offsets` = (33657,8416,16830)$, we arrive at
 $
   #`c0`_i + #`carry_offsets[0]` &in [0, 58899] subset.eq [2^16],\
   #`c1`_i + #`carry_offsets[1]` &in [0, 25244] subset.eq [2^16],text("and")\
-  #`c2`_i + #`carry_offsets[2]` &in [0, 33688] subset.eq [2^16].
+  #`c2`_i + #`carry_offsets[2]` &in [0, 33658] subset.eq [2^16].
 $
 
 == Padding
@@ -363,5 +363,7 @@ $
 - `addr_xG[0]`, `addr_k[0]` and `addr_xR[0]` could be `DWordWL`s rather than `HL`s.
   We use `HL`s as conventient notation.
   This modification saves 6 columns.
-- the design of these chip is generic, and makes no assumptions on the parameters $b$, $p$ and $N$.
+- the design of these chip is generic, and makes no assumptions on the parameters $a$, $b$, $p$ and $N$.
   It might be possible to arrive at more compact design by making some assumptions on these values.
+- Constraints @ec:c:c1_0 and @ec:c:c1_i can be simplified to degree-2 constraints by padding `q1` to `p` rather than `0`. 
+  Note: this requires a non-trivial modification to the padding verification tooling.

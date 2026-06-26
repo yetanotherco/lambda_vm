@@ -725,7 +725,7 @@ kind = "interaction"
 tag = "BIT"
 input = ["timestamp", "i"]
 iter = ["i", 0, 255]
-multiplicity = ["idx", "k", "i"]
+multiplicity = ["-", ["idx", "k", "i"]]
 
 [[constraints.delegate]]
 kind = "arith"
