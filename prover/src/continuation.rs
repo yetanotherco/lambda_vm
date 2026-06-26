@@ -340,10 +340,6 @@ fn prove_epoch(
     boundary: &[CellBoundary],
     opts: &ProofOptions,
 ) -> Result<EpochProof, Error> {
-    // Use the cross-epoch boundary so this epoch's L2G table is identical to the
-    // one the global proof commits (the commitment binding compares their roots).
-    traces.local_to_global = local_to_global::generate_local_to_global_trace(boundary);
-
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
     crate::tables::bitwise::update_multiplicities(
@@ -396,10 +392,10 @@ fn prove_epoch(
     };
 
     let l2g_air = l2g_memory_air(opts, label);
-    let mut l2g_trace = std::mem::replace(
-        &mut traces.local_to_global,
-        local_to_global::generate_local_to_global_trace(&[]),
-    );
+    // Build this epoch's L2G table from the cross-epoch boundary so it is identical
+    // to the one the global proof commits (the commitment binding compares their
+    // roots). It is appended to the proof below, not through `air_trace_pairs`.
+    let mut l2g_trace = local_to_global::generate_local_to_global_trace(boundary);
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
