@@ -62,6 +62,7 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         true,
         None,
         None,
+        None,
     );
 
     // Build air_trace_pairs for all tables
@@ -116,6 +117,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         true,
         None,
         None,
+        None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
     let proof = multi_prove_ram(
@@ -156,6 +158,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &vm_proof.table_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -1348,6 +1351,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         true,
         None,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -1365,6 +1369,7 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -2102,6 +2107,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         true,
         None,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2118,6 +2124,7 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -2173,6 +2180,7 @@ fn test_deep_stack_missing_pages_rejected() {
         true,
         None,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2189,6 +2197,7 @@ fn test_deep_stack_missing_pages_rejected() {
         &table_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -2279,6 +2288,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         true,
         None,
         None,
+        None,
     );
     let proof = multi_prove_ram(
         prover_airs.air_trace_pairs(&mut traces),
@@ -2295,6 +2305,7 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &table_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -2463,6 +2474,7 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         &zero_counts,
         None,
         true,
+        None,
         None,
         None,
     );
@@ -2947,6 +2959,7 @@ fn test_prove_first_epoch_without_halt() {
         false,
         None,
         None,
+        None,
     );
 
     let multi_proof = multi_prove_ram(
@@ -3029,6 +3042,7 @@ fn test_prove_second_epoch_from_snapshot() {
         None,
         false,
         Some(&register_init),
+        None,
         None,
     );
 
@@ -3118,6 +3132,7 @@ fn test_epoch_proof_commits_l2g() {
         &table_counts,
         None,
         false,
+        None,
         None,
         None,
     );
@@ -3273,6 +3288,7 @@ fn test_continuation_pipeline_end_to_end() {
             is_final,
             register_init_arg,
             None,
+            None,
         );
 
         let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
@@ -3395,6 +3411,7 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         &table_counts,
         None,
         false,
+        None,
         None,
         None,
     );

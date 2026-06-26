@@ -57,8 +57,8 @@ cargo run -p cli --release -- prove <PROGRAM.elf> -o proof.bin [flags]
 | `--private-input <FILE>` | Pass private input bytes to the guest. |
 | `--blowup <N>` | FRI blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving. [default: 2] |
 | `--time` | Print total proving time. |
-| `--cycles` | Run one extra execution outside the timer and print the dynamic instruction count. |
-| `--elements` | Build traces and print main-trace and aux-trace field element counts. |
+| `--cycles` | Run one extra execution outside the timer and print the dynamic instruction count. Also supported with `--continuations`. |
+| `--elements` | Build traces and print main-trace and aux-trace field element counts. Monolithic proving only; conflicts with `--continuations`. |
 | `--continuations` | Prove as a continuation bundle split into fixed-size epochs. |
 | `--epoch-size-log2 <N>` | Continuation epoch size as `2^N` cycles. Requires `--continuations`. Defaults to `20`; values below `18` are rejected. |
 
@@ -76,7 +76,8 @@ cargo run -p cli --release -- verify <PROOF> <PROGRAM.elf> [flags]
 | `--time` | Print verification time. |
 | `--continuations` | Verify a continuation proof bundle produced by `prove --continuations`. |
 
-Returns exit code `0` on successful verification, `1` on failure.
+Returns exit code `0` on successful verification, `1` on failure. `--blowup` must
+match the value used during proving.
 
 ### Count Elements
 
@@ -103,6 +104,9 @@ cargo run -p cli --release -- verify /tmp/proof.bin executor/program_artifacts/a
 cargo run -p cli --release -- prove program.elf -o /tmp/cont.bin --continuations --epoch-size-log2 20
 cargo run -p cli --release -- verify /tmp/cont.bin program.elf --continuations
 
+# Generate a continuation proof and print total dynamic instruction count
+cargo run -p cli --release -- prove program.elf -o /tmp/cont.bin --continuations --cycles
+
 # Prove with private input and print metrics
 cargo run -p cli --release -- prove program.elf -o /tmp/proof.bin --private-input input.bin --time --cycles
 ```
@@ -113,6 +117,11 @@ As rough ethrex 10-transfer distinct-account reference points from a local sweep
 `19` used about 6.9 GB peak heap, `20` about 9.5 GB, `21` about 15.8 GB, and `22`
 about 26.8 GB. For a new workload, use the highest value the machine can run
 without swapping.
+
+Continuation proof bundles are self-contained for standalone verification. When
+`--private-input` is used, the serialized continuation proof includes the raw
+private input bytes so the verifier can rebuild the genesis memory commitment.
+Do not treat continuation proof files as confidential-input hiding artifacts.
 
 ## Guest Program Flamegraphs
 

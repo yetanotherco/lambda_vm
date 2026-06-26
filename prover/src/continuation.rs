@@ -11,11 +11,11 @@
 //!
 //! The local-to-global columns are range-checked in the epoch proof (which
 //! carries the BITWISE provider): values are bytes, and the cross-epoch-only
-//! quantities (epoch, init-timestamp) are built from `IsHalfword`-checked
-//! halfwords. Address and fini-timestamp need no extra check — they are matched
-//! against MEMW on the epoch-local Memory bus, exactly as PAGE relies on MEMW.
-//! The global proof commits the identical trace, so it inherits the guarantee
-//! via the commitment binding.
+//! `init_epoch` is built from `IsHalfword`-checked halfwords. Address and
+//! fini-timestamp need no extra check — they are matched against MEMW on the
+//! epoch-local Memory bus, exactly as PAGE relies on MEMW. The global proof
+//! commits the identical trace, so it inherits the guarantee via the commitment
+//! binding. There is no cross-epoch timestamp; the chain is ordered by epoch.
 //!
 //! Cross-epoch registers are bound the same way: each continuation epoch
 //! preprocesses its REGISTER `FINI` column to the epoch's final register file
@@ -39,6 +39,7 @@ use std::collections::HashMap;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
+use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
@@ -57,8 +58,8 @@ use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_i
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
-    Error, RuntimePageRange, TableCounts, VmAirs, compute_expected_commit_bus_balance,
-    verify_l2g_commitment_binding,
+    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
+    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
 };
 
 type F = GoldilocksField;
@@ -247,7 +248,11 @@ struct EpochProof {
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
     table_counts: TableCounts,
+    /// Always zero for continuation epochs: PAGE is replaced by L2G, and private
+    /// input genesis is carried by the continuation bundle for global verification.
     num_private_input_pages: usize,
+    /// Always empty for continuation epochs: PAGE tables are skipped, so runtime
+    /// pages are not part of the epoch AIR statement.
     runtime_page_ranges: Vec<RuntimePageRange>,
     /// The epoch's final register file `R_{i+1}` (its preprocessed FINI), which the
     /// driver/verifier reuses as the next epoch's derived INIT — the cross-epoch
@@ -299,7 +304,15 @@ fn build_epoch_airs(
     is_final: bool,
 ) -> VmAirs {
     let register_init_arg = if is_first { None } else { Some(register_init) };
-    let mut airs = VmAirs::new(
+    // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
+    // final register file is a verifier-known public value bound by the REG-C2
+    // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
+    // init(epoch i+1) == fini(epoch i).
+    let register_preprocessed = Some((
+        register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
+        register::NUM_PREPROCESSED_COLS_WITH_FINI,
+    ));
+    VmAirs::new(
         elf,
         opts,
         false,
@@ -309,16 +322,8 @@ fn build_epoch_airs(
         is_final,
         register_init_arg,
         None,
-    );
-    // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
-    // final register file is a verifier-known public value bound by the REG-C2
-    // Memory-bus token; reusing the same R_{i+1} as the next epoch's INIT binds
-    // init(epoch i+1) == fini(epoch i).
-    airs.register = crate::test_utils::create_register_air(opts).with_preprocessed(
-        register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
-        register::NUM_PREPROCESSED_COLS_WITH_FINI,
-    );
-    airs
+        register_preprocessed,
+    )
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -444,6 +449,19 @@ fn verify_epoch(
 ) -> bool {
     // Reject degenerate table counts (mirrors the monolithic verifier).
     if epoch.table_counts.validate().is_err() {
+        return false;
+    }
+
+    // Cross-check table_counts before building AIRs from bundle data. Continuation
+    // epochs have no PAGE proofs, and append one epoch-local L2G proof after the VM
+    // tables. HALT is present only on the final epoch.
+    let fixed_tables = if is_final {
+        FIXED_TABLE_COUNT
+    } else {
+        FIXED_TABLE_COUNT - 1
+    };
+    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 1;
+    if expected_proof_count != epoch.proof.proofs.len() {
         return false;
     }
 
@@ -742,6 +760,13 @@ pub fn verify_continuation(
     bundle: &ContinuationProof,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
+    if bundle.private_inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
+        return Err(Error::InvalidTableCounts(format!(
+            "private input size ({}) exceeds max ({MAX_PRIVATE_INPUT_SIZE})",
+            bundle.private_inputs.len()
+        )));
+    }
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
     let n = bundle.epochs.len();
@@ -1077,6 +1102,67 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    // Negative: table_counts are bundle data. Inflating a positive count must be
+    // rejected before the verifier builds AIRs from the malformed shape.
+    #[test]
+    fn test_split_verify_rejects_inflated_epoch_table_count() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+        bundle.epochs[0].table_counts.cpu += 1;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Negative: the verifier rebuilds private-input genesis from bundle bytes.
+    // Changing those bytes after proving changes the global-memory preprocessed
+    // genesis commitment, so the standalone verifier must reject.
+    #[test]
+    fn test_split_verify_rejects_tampered_private_input_genesis() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let private_inputs: Vec<u8> = (0u8..16).collect();
+        let mut bundle = prove_continuation(
+            &elf_bytes,
+            &private_inputs,
+            4,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "baseline must verify before tampering"
+        );
+
+        bundle.private_inputs[4] ^= 0xFF;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // Negative: verifier-side private inputs are deserialized/untrusted, so reject
+    // oversized bundles before rebuilding genesis page configs from them.
+    #[test]
+    fn test_split_verify_rejects_oversized_private_inputs() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
+        bundle.private_inputs = vec![0; MAX_PRIVATE_INPUT_SIZE as usize + 1];
+        assert!(matches!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
+            Err(Error::InvalidTableCounts(_))
+        ));
     }
 
     // The bundle's `boundary` field is used only to rebuild the global AIRs' touched-

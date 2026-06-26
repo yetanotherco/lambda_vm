@@ -439,6 +439,7 @@ impl VmAirs {
         include_halt: bool,
         register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
+        register_preprocessed: Option<(Commitment, usize)>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -489,16 +490,20 @@ impl VmAirs {
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         );
-        let register_init = register_init
-            .map(<[u32]>::to_vec)
-            .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
         let ecsm = create_ecsm_air(proof_options);
         let ec_scalar = create_ec_scalar_air(proof_options);
         let ecdas = create_ecdas_air(proof_options);
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, &register_init),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register = if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
+            create_register_air(proof_options).with_preprocessed(commitment, num_preprocessed_cols)
+        } else {
+            let register_init = register_init
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+            create_register_air(proof_options).with_preprocessed(
+                register::preprocessed_commitment(proof_options, &register_init),
+                register::NUM_PREPROCESSED_COLS,
+            )
+        };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -826,6 +831,7 @@ pub fn prove_with_options_and_inputs(
         true,
         None,
         None,
+        None,
     );
 
     #[cfg(feature = "instruments")]
@@ -987,6 +993,7 @@ pub fn verify_with_options(
         true,
         None,
         page_commitments,
+        None,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
