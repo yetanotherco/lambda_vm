@@ -627,7 +627,7 @@ fn cmd_prove_continuation(
     let bundle = match prover::continuation::prove_continuation(
         &elf_data,
         &private_inputs,
-        epoch_size,
+        epoch_size_log2,
         &opts,
     ) {
         Ok(b) => b,

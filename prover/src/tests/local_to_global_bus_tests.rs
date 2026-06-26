@@ -1015,8 +1015,8 @@ fn test_l2g_design_y_orphan_mu_zero_rejects() {
 /// epoch boundaries) and the resulting multi-epoch L2G chain verifies end-to-end.
 ///
 /// The fixture reads 16 bytes of private input from 0xFF000000, then commits
-/// bytes 4..12 (8 bytes after the 4-byte length prefix). With epoch_size=4
-/// the 11-cycle program spans three epochs: epoch 0 reads the private-input
+/// bytes 4..12 (8 bytes after the 4-byte length prefix). With `epoch_size_log2=2`
+/// (4 cycles) the 11-cycle program spans three epochs: epoch 0 reads the private-input
 /// page (touching 0xFF000000..), epoch 1 performs the commit syscall, epoch 2
 /// halts. The private-input page's L2G entry (epoch 0 fini → epoch 1+ init)
 /// is the cross-epoch link under test.
@@ -1042,7 +1042,7 @@ fn test_continuation_private_input_spans_epochs() {
     let result = crate::continuation::prove_and_verify_continuation(
         &elf_bytes,
         &input,
-        4,
+        2,
         &ProofOptions::default_test_options(),
     );
 

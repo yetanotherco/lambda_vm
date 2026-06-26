@@ -112,22 +112,25 @@ fn main() {
             println!("main prove ok ({} bytes ELF)", elf.len());
         }
         "cont" => {
-            let epoch_size: usize = args
+            let epoch_size_log2: u32 = args
                 .get(3)
-                .map(|s| s.parse().expect("bad epoch_size"))
-                .unwrap_or(65536);
+                .map(|s| s.parse().expect("bad epoch_size_log2"))
+                .unwrap_or(16);
             // Match the monolithic `main` mode's options (blowup 2) for a fair comparison.
             let opts = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(2)
                 .expect("blowup=2 is always valid");
             let output = lambda_vm_prover::continuation::prove_and_verify_continuation(
                 &elf,
                 &private_inputs,
-                epoch_size,
+                epoch_size_log2,
                 &opts,
             )
             .expect("continuation failed");
             assert!(output.is_some(), "continuation did not verify");
-            println!("cont prove+verify ok (epoch_size={epoch_size})");
+            println!(
+                "cont prove+verify ok (epoch_size_log2={epoch_size_log2}, epoch_size={})",
+                1usize << epoch_size_log2
+            );
         }
         other => {
             eprintln!("unknown mode {other:?}; use count|footprint|main|cont");

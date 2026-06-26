@@ -220,12 +220,12 @@ dangle — no HALT to anchor them, and the REGISTER FINI carries the real next P
 not `1` — and the Memory bus would not balance. The honest prover could not produce
 a verifying proof.
 
-Fix: **epoch size is rounded up to a power of two** (`next_power_of_two().max(4)`).
-An intermediate epoch runs *exactly* `epoch_size` cycles, so its CPU table already
-has a power-of-two row count and therefore **zero padding rows** — nothing to
-dangle. The final epoch keeps its remainder *and* its HALT, so its padding chain is
-anchored as usual. A program shorter than one epoch runs as a single final
-(monolithic-style) epoch.
+Fix: **epoch size is expressed as `epoch_size_log2`**, so the driver slices at
+exactly `2^epoch_size_log2` cycles. An intermediate epoch runs that exact
+power-of-two number of cycles, so its CPU table already has a power-of-two row
+count and therefore **zero padding rows** — nothing to dangle. The final epoch
+keeps its remainder *and* its HALT, so its padding chain is anchored as usual. A
+program shorter than one epoch runs as a single final (monolithic-style) epoch.
 
 This is a **completeness** fix: it changes no constraint and nothing the verifier
 accepts — only how the driver slices cycles. A debug-assert enforces the
@@ -553,9 +553,9 @@ recursion/aggregation layer (deferred).
   `verify_continuation` and the `ContinuationProof` bundle; the per-epoch
   `prove_epoch` / `verify_epoch` with the shared `build_epoch_airs` helper; the
   global proof (`prove_global` / `verify_global`); the per-epoch AIRs
-  (`l2g_memory_air` / `l2g_global_air`); the power-of-two epoch rounding
-  (`next_power_of_two().max(4)`); the register-FINI preprocessing; the transcript
-  seeding; and `prove_and_verify_continuation` (the thin integrated wrapper).
+  (`l2g_memory_air` / `l2g_global_air`); the power-of-two epoch sizing from
+  `epoch_size_log2`; the register-FINI preprocessing; the transcript seeding; and
+  `prove_and_verify_continuation` (the thin integrated wrapper).
 - `prover/src/lib.rs` — `verify_l2g_commitment_binding` (epoch L2G root ↔ global
   sub-table root) and the commit-bus offset/balance helpers
   (`compute_commit_bus_offset`, `compute_expected_commit_bus_balance`) that take the
