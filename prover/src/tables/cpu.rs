@@ -26,6 +26,9 @@
 
 use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
+use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "prove")]
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
     logs::Log,
@@ -216,6 +219,7 @@ impl CpuOperation {
     }
 
     /// Creates a CpuOperation from an executor Log and a DecodeEntry.
+    #[cfg(feature = "prove")]
     pub fn from_log(log: &Log, timestamp: u64, decode: DecodeEntry) -> Self {
         let f = decode.fields;
         // Real byte length: the column stores half.
@@ -228,8 +232,7 @@ impl CpuOperation {
         } else {
             (0, 0)
         };
-        let ecall_keccak =
-            f.ecall && log.src1_val == executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
+        let ecall_keccak = f.ecall && log.src1_val == executor::constants::KECCAK_SYSCALL_NUMBER;
         let keccak_state_addr = if ecall_keccak { log.src2_val } else { 0 };
         // The ECSM operand addresses (x10/x11/x12) are recovered from the register state
         // in the trace builder.
@@ -377,6 +380,7 @@ impl CpuOperation {
     }
 
     /// Creates a CpuOperation from Log and Instruction (convenience).
+    #[cfg(feature = "prove")]
     pub fn from_log_and_instruction(log: &Log, timestamp: u64, instruction: Instruction) -> Self {
         let decode = DecodeEntry::from_instruction(log.current_pc, instruction, 4);
         Self::from_log(log, timestamp, decode)
@@ -555,6 +559,7 @@ pub fn generate_cpu_trace(
 }
 
 /// Generates the CPU trace table directly from executor logs.
+#[cfg(feature = "prove")]
 pub fn generate_cpu_trace_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,
@@ -582,6 +587,7 @@ pub fn collect_bitwise_ops(operations: &[CpuOperation]) -> Vec<super::bitwise::B
 }
 
 /// Collects all BITWISE lookups from executor logs.
+#[cfg(feature = "prove")]
 pub fn collect_bitwise_ops_from_logs(
     logs: &[Log],
     instructions: &U64HashMap<Instruction>,

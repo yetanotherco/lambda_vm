@@ -1,5 +1,7 @@
 use crate::domain::{Domain, DomainConstants};
 use crate::table::Table;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::field::{element::FieldElement, traits::IsFFTField};
 use math::polynomial::barycentric_inv_denoms;

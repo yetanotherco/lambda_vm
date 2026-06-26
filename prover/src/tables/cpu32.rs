@@ -17,6 +17,9 @@
 //!
 //! Register reads use the cast-to-`DWordWL` encoding.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
@@ -280,7 +283,7 @@ fn register_dword(lo0: usize, lo1: usize, hi: usize) -> Vec<BusValue> {
             packing: Packing::Direct,
         },
     ];
-    v.extend(std::iter::repeat_n(BusValue::constant(0), 6));
+    v.extend(core::iter::repeat_n(BusValue::constant(0), 6));
     v
 }
 
@@ -349,7 +352,7 @@ fn reg_write(
             packing: Packing::Direct,
         },
     ];
-    values.extend(std::iter::repeat_n(BusValue::constant(0), 6)); // value[2..8]
+    values.extend(core::iter::repeat_n(BusValue::constant(0), 6)); // value[2..8]
     values.extend(timestamp_plus(ts_offset));
     values.push(BusValue::constant(1)); // write2 = 1
     values.push(BusValue::constant(0)); // write4

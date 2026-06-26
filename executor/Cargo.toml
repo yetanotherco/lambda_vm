@@ -4,10 +4,19 @@ version = "0.1.0"
 edition = "2024"
 license.workspace = true
 
+[features]
+default = ["std"]
+std = ["thiserror/std", "dep:rustc-demangle", "ecsm/std"]
+
+[[bin]]
+name = "executor"
+required-features = ["std"]
+
 [dependencies]
-thiserror = "1.0.68"
-rustc-demangle = "0.1"
-ecsm = { path = "../crypto/ecsm" }
+thiserror = { version = "2.0", default-features = false }
+rustc-demangle = { version = "0.1", optional = true }
+hashbrown = { version = "0.14", default-features = false, features = ["inline-more", "ahash"] }
+ecsm = { path = "../crypto/ecsm", default-features = false }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

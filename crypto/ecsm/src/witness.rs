@@ -16,6 +16,8 @@
 //! negative; the chip range-checks `c_i + offset` as a halfword. We reproduce the exact
 //! integer recurrence here; the prover converts the resulting integers to field elements.
 
+use alloc::vec::Vec;
+
 use num_bigint::{BigInt, BigUint};
 use num_traits::{Signed, Zero};
 

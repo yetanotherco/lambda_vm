@@ -1,5 +1,6 @@
-use std::collections::HashMap;
-use std::hash::{BuildHasher, Hasher};
+use alloc::vec::Vec;
+use core::hash::{BuildHasher, Hasher};
+use hashbrown::HashMap;
 
 /// Fast hasher for u64 keys - uses the key directly as the hash value.
 /// This avoids the overhead of SipHash for integer keys.
@@ -42,13 +43,12 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
-/// Maximum size of the private input memory region (in bytes).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
-/// Fixed high address where private input is mapped. Guest programs can read
-/// directly from this address (ZisK-style memory-mapped input).
-/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
-/// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
-pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+/// Private-input region size cap and mapped base address. Re-exported from
+/// `constants` (the canonical definitions) rather than redeclared here — the
+/// old local `MAX_PRIVATE_INPUT_SIZE = 6.7 MiB` shadowed the 64 MiB constant
+/// and rejected larger recursion blobs (e.g. multi-query / high-blowup inner
+/// proofs) with `PrivateInputSizeExceeded`.
+pub use crate::constants::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
 
 #[derive(Default, Debug)]
 pub struct Memory {
@@ -232,7 +232,7 @@ impl Memory {
             let aligned = addr - (addr % 4);
             let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
             let offset = (addr % 4) as usize;
-            let take = std::cmp::min(4 - offset, (end - addr) as usize);
+            let take = core::cmp::min(4 - offset, (end - addr) as usize);
             result.extend_from_slice(&bytes[offset..offset + take]);
             addr += take as u64;
         }

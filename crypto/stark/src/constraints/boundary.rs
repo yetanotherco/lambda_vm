@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use math::field::{element::FieldElement, traits::IsField};
 
 /// Represents a boundary constraint that must hold in an execution trace:

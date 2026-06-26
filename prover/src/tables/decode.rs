@@ -31,6 +31,8 @@
 //!
 //! - **Receiver**: DECODE bus - receives lookups from CPU table
 
+use alloc::vec;
+use alloc::vec::Vec;
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
@@ -85,7 +87,7 @@ pub const NUM_PRECOMPUTED_COLS: usize = 5;
 // Trace generation
 // =========================================================================
 
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Map from PC to row index in the DECODE trace table.
 pub type PcToRow = HashMap<u64, usize>;
@@ -176,6 +178,7 @@ pub fn generate_decode_trace(
 /// Updates multiplicities in the DECODE trace table.
 ///
 /// For each PC in `lookups`, increments the MU column in the corresponding row.
+#[cfg(feature = "prove")]
 pub fn update_multiplicities(
     trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
     pc_to_row: &PcToRow,
@@ -349,6 +352,7 @@ pub fn commitment_from_elf(
 // =========================================================================
 
 /// Result of ELF processing for DECODE table.
+#[cfg(feature = "prove")]
 pub struct ElfTables {
     /// DECODE trace table
     pub decode: TraceTable<GoldilocksField, GoldilocksExtension>,
@@ -364,6 +368,7 @@ pub struct ElfTables {
 /// - `pc_to_row`: Map from PC to row index for DECODE multiplicity updates
 ///
 /// Table has multiplicities initialized to 0.
+#[cfg(feature = "prove")]
 pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     let mut decode_entries = Vec::new();
     let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
@@ -387,6 +392,7 @@ pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
 }
 
 /// Build DECODE trace table from entries.
+#[cfg(feature = "prove")]
 fn build_decode_table(
     entries: Vec<DecodeEntry>,
     pc_to_row: &mut PcToRow,

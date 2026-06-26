@@ -18,6 +18,9 @@
 //! | fini | Word | Final value after execution |
 //! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
 
+use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "prove")]
 use std::collections::HashMap;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
@@ -91,6 +94,7 @@ pub struct FinalRegisterWordState {
 }
 
 /// Map from register Word address to final state.
+#[cfg(feature = "prove")]
 pub type FinalRegisterStateMap = HashMap<u64, FinalRegisterWordState>;
 
 // =========================================================================
@@ -144,6 +148,7 @@ fn init_value_for_address(word_addr: u64, entry_point: u64) -> u32 {
 /// ## Returns
 ///
 /// The trace table for registers.
+#[cfg(feature = "prove")]
 pub fn generate_register_trace(
     final_state: &FinalRegisterStateMap,
     entry_point: u64,

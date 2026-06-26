@@ -8,6 +8,7 @@ use math::field::element::FieldElement;
 use math::field::{
     extensions_goldilocks::Degree3GoldilocksExtensionField, goldilocks::GoldilocksField,
 };
+use minicbor_serde;
 
 use crate::constraints::transition::TransitionConstraintEvaluator;
 use crate::lookup::{
@@ -142,13 +143,13 @@ fn test_verify_serialized_multi_table_proofs() {
     // NETWORK TRANSMISSION - Serialize and deserialize (using CBOR binary format)
     // =========================================================================
 
-    let serialized = serde_cbor::to_vec(&proofs).expect("Failed to serialize proofs");
+    let serialized = minicbor_serde::to_vec(&proofs).expect("Failed to serialize proofs");
 
     // At this point, the prover's data is dropped (out of scope above)
     // The verifier only has the serialized data
 
     let received_proofs: MultiProof<F, E, ()> =
-        serde_cbor::from_slice(&serialized).expect("Failed to deserialize proofs");
+        minicbor_serde::from_slice(&serialized).expect("Failed to deserialize proofs");
 
     // =========================================================================
     // VERIFIER SIDE - Reconstruct AIRs and verify

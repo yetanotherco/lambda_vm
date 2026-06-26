@@ -30,7 +30,10 @@
 //! | PAGE-C3    | Memory  | `[0, address, 0, init]` | -1 (receiver) |
 //! | PAGE-C4    | Memory  | `[0, address, timestamp, fini]` | 1 (sender) |
 
-use std::collections::HashMap;
+use alloc::vec;
+use alloc::vec::Vec;
+#[cfg(feature = "prove")]
+use hashbrown::HashMap;
 
 use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
@@ -50,7 +53,7 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
 /// Stack top address (where SP starts). Re-exported from executor.
-pub use executor::vm::registers::STACK_TOP;
+pub use executor::constants::STACK_TOP;
 
 // =========================================================================
 // Column indices for PAGE table
@@ -98,6 +101,7 @@ pub struct FinalByteState {
 }
 
 /// Map from byte address to final state.
+#[cfg(feature = "prove")]
 pub type FinalStateMap = HashMap<u64, FinalByteState>;
 
 /// Configuration for a single PAGE table instance.
@@ -163,6 +167,7 @@ impl PageConfig {
 /// ## Returns
 ///
 /// The trace table for this page.
+#[cfg(feature = "prove")]
 pub fn generate_page_trace(
     config: &PageConfig,
     final_state: &FinalStateMap,

@@ -6,6 +6,9 @@
 //! `k in [1, N)` (see `ecsm.typ` "Point at infinity" / ECDAS soundness argument), so the
 //! affine formulas below are always well defined.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 use num_bigint::BigUint;
 
 /// An affine curve point. Never the point at infinity.

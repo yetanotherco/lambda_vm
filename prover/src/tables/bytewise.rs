@@ -16,6 +16,8 @@
 //! - `res`: DWordBL (8 bytes) — output
 //! - `μ`: multiplicity
 
+use alloc::vec;
+use alloc::vec::Vec;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -97,7 +99,7 @@ impl BytewiseOperation {
 pub fn generate_bytewise_trace(
     operations: &[BytewiseOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use std::collections::HashMap;
+    use hashbrown::HashMap;
 
     let mut op_map: HashMap<BytewiseOperation, u64> = HashMap::new();
     for op in operations {

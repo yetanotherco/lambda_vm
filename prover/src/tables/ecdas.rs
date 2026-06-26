@@ -10,6 +10,9 @@
 //! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
 //! to `r` and `op = 0`, which makes every relation hold with zero carries.
 
+use alloc::boxed::Box;
+use alloc::vec;
+use alloc::vec::Vec;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};

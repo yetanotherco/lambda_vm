@@ -4,6 +4,7 @@ use super::trace::TraceTable;
 use super::traits::{AIR, TransitionEvaluationContext};
 use crate::lookup::{LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::{frame::Frame, trace::LDETraceTable};
+use alloc::vec::Vec;
 use log::{error, info};
 use math::field::traits::IsSubFieldOf;
 use math::{
@@ -91,7 +92,7 @@ pub fn validate_trace<
     // --------- VALIDATE TRANSITION CONSTRAINTS -----------
     let n_transition_constraints = air.context().num_transition_constraints;
     let exemption_steps: Vec<usize> =
-        std::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
+        core::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
             .zip(air.transition_constraints())
             .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
             .collect();

@@ -15,6 +15,10 @@
 //!
 //! Curve: secp256k1, `y^2 = x^3 + 7 mod p`, `p = 2^256 - 2^32 - 977`, order `N`.
 
+#![cfg_attr(not(feature = "std"), no_std)]
+
+extern crate alloc;
+
 pub mod curve;
 pub mod witness;
 
@@ -84,7 +88,7 @@ impl core::fmt::Display for EcsmError {
     }
 }
 
-impl std::error::Error for EcsmError {}
+impl core::error::Error for EcsmError {}
 
 /// Converts a `BigUint` to 32 little-endian bytes (zero-padded / truncated to 32).
 pub fn to_le_32(v: &BigUint) -> [u8; 32] {

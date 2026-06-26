@@ -1,6 +1,8 @@
 //! Helpers that abstract over `cfg(feature = "parallel")` for patterns
 //! that recur across the prover.
 
+use alloc::vec::Vec;
+
 /// Run `f(i)` for `i in 0..n` and return the unzipped pair of result vecs.
 /// Parallel when `feature = "parallel"`, sequential otherwise.
 pub(crate) fn map_unzip<A, B, F>(n: usize, f: F) -> (Vec<A>, Vec<B>)
