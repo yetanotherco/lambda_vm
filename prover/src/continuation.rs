@@ -352,12 +352,13 @@ fn prove_epoch(
     );
 
     // Continuation epochs use the L2G bookend, so PAGE is skipped: page_configs is
-    // empty. The verifier hard-codes this (passes `&[]`); assert the prover agrees so
+    // empty. The verifier hard-codes this (passes `&[]`); check the prover agrees so
     // the two sides build identical AIRs.
-    debug_assert!(
-        traces.page_configs.is_empty(),
-        "continuation epoch must have no PAGE configs (L2G bookend replaces PAGE)"
-    );
+    if !traces.page_configs.is_empty() {
+        return Err(Error::ContinuationInvariant(
+            "continuation epoch must have no PAGE configs (L2G bookend replaces PAGE)".to_string(),
+        ));
+    }
 
     // R_{i+1}, read from the committed REGISTER trace (FINI, bound to the last write).
     let reg_fini = register::fini_from_trace(&traces.register);
@@ -413,7 +414,9 @@ fn prove_epoch(
     let l2g_root = proof
         .proofs
         .last()
-        .expect("epoch proof has at least the L2G sub-table")
+        .ok_or_else(|| {
+            Error::ContinuationInvariant("epoch proof is missing the L2G sub-table".to_string())
+        })?
         .lde_trace_main_merkle_root;
 
     Ok(EpochProof {
@@ -676,9 +679,11 @@ pub fn prove_continuation(
         } else {
             // Epoch i+1's init is epoch i's bound fini, reused directly (same
             // `register_word_address_list` order) — the cross-epoch register binding.
-            prev_fini
-                .clone()
-                .expect("prev_fini is set after the first epoch")
+            prev_fini.clone().ok_or_else(|| {
+                Error::ContinuationInvariant(
+                    "previous epoch final registers are missing after the first epoch".to_string(),
+                )
+            })?
         };
 
         // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
@@ -693,11 +698,12 @@ pub fn prove_continuation(
 
         // Invariant: a non-final epoch ran the full `epoch_size` (a power of two),
         // so its CPU table has no padding rows.
-        debug_assert!(
-            is_final || logs.len().is_power_of_two(),
-            "intermediate epoch must run a power-of-two number of cycles (got {})",
-            logs.len()
-        );
+        if !is_final && logs.len() != epoch_size {
+            return Err(Error::ContinuationInvariant(format!(
+                "intermediate epoch ran {} cycles, expected {epoch_size}",
+                logs.len()
+            )));
+        }
 
         let label = local_to_global::epoch_label(index);
         let traces = Traces::from_image_and_logs(
