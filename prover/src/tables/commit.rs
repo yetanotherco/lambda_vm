@@ -52,7 +52,7 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::{AddConstraint, AddOperand};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Column indices for COMMIT table
@@ -164,32 +164,29 @@ pub fn generate_commit_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-
         // Timestamp (DWordWL)
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // Index (BaseField)
-        data[base + cols::INDEX] = FE::from(op.index);
+        table.set_u64(row_idx, cols::INDEX, op.index);
 
         // Address (DWordWL)
-        data[base + cols::ADDRESS_0] = FE::from(op.address & 0xFFFF_FFFF);
-        data[base + cols::ADDRESS_1] = FE::from(op.address >> 32);
+        table.set_dword_wl(row_idx, cols::ADDRESS_0, op.address);
 
         // address_incr = address + 1 (DWordHL: 4 halfwords)
         let address_incr = op.address.wrapping_add(1);
-        data[base + cols::ADDRESS_INCR_0] = FE::from(address_incr & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_1] = FE::from((address_incr >> 16) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_2] = FE::from((address_incr >> 32) & 0xFFFF);
-        data[base + cols::ADDRESS_INCR_3] = FE::from((address_incr >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::ADDRESS_INCR_0, address_incr);
 
         // Count (DWordWL)
-        data[base + cols::COUNT_0] = FE::from(op.count & 0xFFFF_FFFF);
-        data[base + cols::COUNT_1] = FE::from(op.count >> 32);
+        table.set_dword_wl(row_idx, cols::COUNT_0, op.count);
 
         // count_decr: if count == 0, use 0xFFFF_FFFF_FFFF_FFFF; else count - 1
         let count_decr = if op.count == 0 {
@@ -197,37 +194,33 @@ pub fn generate_commit_trace(
         } else {
             op.count - 1
         };
-        data[base + cols::COUNT_DECR_0] = FE::from(count_decr & 0xFFFF);
-        data[base + cols::COUNT_DECR_1] = FE::from((count_decr >> 16) & 0xFFFF);
-        data[base + cols::COUNT_DECR_2] = FE::from((count_decr >> 32) & 0xFFFF);
-        data[base + cols::COUNT_DECR_3] = FE::from((count_decr >> 48) & 0xFFFF);
+        table.set_dword_hl(row_idx, cols::COUNT_DECR_0, count_decr);
 
         // Control bits
-        data[base + cols::FIRST] = FE::from(op.first as u64);
-        data[base + cols::END] = FE::from(op.end as u64);
+        table.set_bool(row_idx, cols::FIRST, op.first);
+        table.set_bool(row_idx, cols::END, op.end);
 
         // Value
-        data[base + cols::VALUE] = FE::from(op.value as u64);
+        table.set_byte(row_idx, cols::VALUE, op.value);
 
         // mu = 1 for all real rows (first, middle, and end rows)
-        data[base + cols::MU] = FE::one();
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows: spec requires count=1 and address_incr=[1,0,0,0] so
     // the unconditional ADD/SUB templates have valid carry values.
     // count=1 → count_decr=0 (all halfwords zero), address=0 → address_incr=1.
     for row_idx in n..num_rows {
-        let base = row_idx * cols::NUM_COLUMNS;
         // count = 1 (low word)
-        data[base + cols::COUNT_0] = FE::one();
+        table.set_fe(row_idx, cols::COUNT_0, FE::one());
         // address_incr halfword 0 = 1 (address=0, so address+1 = 1)
-        data[base + cols::ADDRESS_INCR_0] = FE::one();
+        table.set_fe(row_idx, cols::ADDRESS_INCR_0, FE::one());
         // All other fields remain zero: timestamp=0, address=0, count_1=0,
         // count_decr=[0,0,0,0], first=0, end=0, value=0, mu=0,
         // address_incr_1..3=0
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

@@ -1452,8 +1452,15 @@ fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
 /// IS_HALF lookups for lhs/rhs input and lo/hi output range checks,
 /// and IS_B20 lookups for carry range checks.
 ///
+/// IS_HALF and IS_B20 are emitted once per raw op. MSB16 is deduplicated
+/// per `max_rows_mul` chunk, mirroring `chunk_and_generate` — a unique signed
+/// op that spans two instances is sent twice and must be tallied twice.
+///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_mul(
+    mul_ops: &[(MulOperation, bool)],
+    max_rows_mul: usize,
+) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(mul_ops.len() * 20);
 
     // IS_HALF and IS_B20: one set per raw op (multiplicity Sum(MU_LO, MU_HI))
@@ -1504,28 +1511,28 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
         }
     }
 
-    // MSB16: one per unique signed op (multiplicity Column(LHS_SIGNED) / Column(RHS_SIGNED))
-    // The MUL table sends MSB16 with multiplicity = value of the SIGNED column (0 or 1)
-    // per unique row, so we must generate exactly one MSB16 per unique MUL operation,
-    // not per raw op.
-    let mut msb16_seen = std::collections::HashSet::new();
-    for (op, _wants_hi) in mul_ops {
-        if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
-            if op.lhs_signed {
-                let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::Msb16,
-                    (lhs_3 & 0xFF) as u8,
-                    (lhs_3 >> 8) as u8,
-                ));
-            }
-            if op.rhs_signed {
-                let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
-                bitwise_ops.push(BitwiseOperation::halfword(
-                    BitwiseOperationType::Msb16,
-                    (rhs_3 & 0xFF) as u8,
-                    (rhs_3 >> 8) as u8,
-                ));
+    // MSB16: dedup per chunk — the MUL AIR sends Msb16 once per unique signed row
+    // per instance, so the collector must mirror the same chunk boundary.
+    for chunk in mul_ops.chunks(max_rows_mul) {
+        let mut msb16_seen = std::collections::HashSet::new();
+        for (op, _wants_hi) in chunk {
+            if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
+                if op.lhs_signed {
+                    let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::Msb16,
+                        (lhs_3 & 0xFF) as u8,
+                        (lhs_3 >> 8) as u8,
+                    ));
+                }
+                if op.rhs_signed {
+                    let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::Msb16,
+                        (rhs_3 & 0xFF) as u8,
+                        (rhs_3 >> 8) as u8,
+                    ));
+                }
             }
         }
     }
@@ -1536,14 +1543,21 @@ fn collect_bitwise_from_mul(mul_ops: &[(MulOperation, bool)]) -> Vec<BitwiseOper
 /// Collects bitwise lookups from DVRM operations.
 ///
 /// Generates: IS_HALF (×20: n, d, r, n_sub_r, q) and ZERO (×2) per raw op, plus
-/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op.
+/// MSB16 (up to ×3) and NEG ZERO (up to ×4) per unique signed op per chunk.
 ///
 /// DVRM-A1 (IS_HALF[n]) and DVRM-A2 (IS_HALF[d]) are range-checked by the DVRM
 /// table itself (n/d IS_HALF senders in dvrm::bus_interactions), so their lookups
 /// are collected here alongside the constraint-level ones.
 ///
+/// IS_HALF and ZERO (C8/C20) are emitted once per raw op. MSB16 and the
+/// NEG-template ZERO lookups (C3/C5) are deduplicated per `max_rows_dvrm`
+/// chunk, mirroring `chunk_and_generate`.
+///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_dvrm(
+    dvrm_ops: &[(DvrmOperation, bool)],
+    max_rows_dvrm: usize,
+) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(dvrm_ops.len() * 24);
 
     for (op, _wants_remainder) in dvrm_ops {
@@ -1624,77 +1638,77 @@ fn collect_bitwise_from_dvrm(dvrm_ops: &[(DvrmOperation, bool)]) -> Vec<BitwiseO
         bitwise_ops.push(BitwiseOperation::zero(d_sum));
     }
 
-    // MSB16 lookups: one per unique signed op (not per raw op).
-    // The DVRM bus interaction uses Multiplicity::Column(SIGNED)=1, so we
-    // must emit exactly one MSB16 per unique signed (n, d) combo.
-    let mut msb16_seen = std::collections::HashSet::new();
-    for (op, _wants_remainder) in dvrm_ops {
-        if op.signed && msb16_seen.insert(op.clone()) {
-            let r = op.compute_remainder();
+    // MSB16: same per-chunk dedup as MUL (Column(SIGNED) is a bit, not a count).
+    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
+        let mut msb16_seen = std::collections::HashSet::new();
+        for (op, _wants_remainder) in chunk {
+            if op.signed && msb16_seen.insert(op.clone()) {
+                let r = op.compute_remainder();
 
-            // MSB16[n[3]]
-            let n_3 = ((op.n >> 48) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
-                (n_3 & 0xFF) as u8,
-                (n_3 >> 8) as u8,
-            ));
+                // MSB16[n[3]]
+                let n_3 = ((op.n >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (n_3 & 0xFF) as u8,
+                    (n_3 >> 8) as u8,
+                ));
 
-            // MSB16[r[3]]
-            let r_3 = ((r >> 48) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
-                (r_3 & 0xFF) as u8,
-                (r_3 >> 8) as u8,
-            ));
+                // MSB16[r[3]]
+                let r_3 = ((r >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (r_3 & 0xFF) as u8,
+                    (r_3 >> 8) as u8,
+                ));
 
-            // MSB16[d[3]]
-            let d_3 = ((op.d >> 48) & 0xFFFF) as u16;
-            bitwise_ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::Msb16,
-                (d_3 & 0xFF) as u8,
-                (d_3 >> 8) as u8,
-            ));
+                // MSB16[d[3]]
+                let d_3 = ((op.d >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (d_3 & 0xFF) as u8,
+                    (d_3 >> 8) as u8,
+                ));
+            }
         }
     }
 
-    // ZERO lookups for NEG template: one per unique op where sign is set.
-    // C3 uses Multiplicity::Column(SIGN_R) = 1 per unique row where sign_r = 1.
-    // C5 uses Multiplicity::Column(SIGN_D) = 1 per unique row where sign_d = 1.
-    let mut zero_seen = std::collections::HashSet::new();
-    for (op, _wants_remainder) in dvrm_ops {
-        if zero_seen.insert(op.clone()) {
-            // C3: NEG for r (when sign_r = 1)
-            if op.sign_r() {
-                let r = op.compute_remainder();
-                let r_halves: [u32; 4] = [
-                    (r & 0xFFFF) as u32,
-                    ((r >> 16) & 0xFFFF) as u32,
-                    ((r >> 32) & 0xFFFF) as u32,
-                    ((r >> 48) & 0xFFFF) as u32,
-                ];
-                // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
-                bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
-                // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
-                bitwise_ops.push(BitwiseOperation::zero(
-                    r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
-                ));
-            }
+    // ZERO (NEG template): same — SIGN_R/SIGN_D are bits, dedup per chunk.
+    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
+        let mut zero_seen = std::collections::HashSet::new();
+        for (op, _wants_remainder) in chunk {
+            if zero_seen.insert(op.clone()) {
+                // C3: NEG for r (when sign_r = 1)
+                if op.sign_r() {
+                    let r = op.compute_remainder();
+                    let r_halves: [u32; 4] = [
+                        (r & 0xFFFF) as u32,
+                        ((r >> 16) & 0xFFFF) as u32,
+                        ((r >> 32) & 0xFFFF) as u32,
+                        ((r >> 48) & 0xFFFF) as u32,
+                    ];
+                    // C3a: ZERO[1-carry_r[0]; r[0]+r[1]]
+                    bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
+                    // C3b: ZERO[1-carry_r[1]; r[0]+r[1]+r[2]+r[3]]
+                    bitwise_ops.push(BitwiseOperation::zero(
+                        r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
+                    ));
+                }
 
-            // C5: NEG for d (when sign_d = 1)
-            if op.sign_d() {
-                let d_halves: [u32; 4] = [
-                    (op.d & 0xFFFF) as u32,
-                    ((op.d >> 16) & 0xFFFF) as u32,
-                    ((op.d >> 32) & 0xFFFF) as u32,
-                    ((op.d >> 48) & 0xFFFF) as u32,
-                ];
-                // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
-                bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
-                // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
-                bitwise_ops.push(BitwiseOperation::zero(
-                    d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
-                ));
+                // C5: NEG for d (when sign_d = 1)
+                if op.sign_d() {
+                    let d_halves: [u32; 4] = [
+                        (op.d & 0xFFFF) as u32,
+                        ((op.d >> 16) & 0xFFFF) as u32,
+                        ((op.d >> 32) & 0xFFFF) as u32,
+                        ((op.d >> 48) & 0xFFFF) as u32,
+                    ];
+                    // C5a: ZERO[1-carry_d[0]; d[0]+d[1]]
+                    bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
+                    // C5b: ZERO[1-carry_d[1]; d[0]+d[1]+d[2]+d[3]]
+                    bitwise_ops.push(BitwiseOperation::zero(
+                        d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
+                    ));
+                }
             }
         }
     }
@@ -2737,8 +2751,11 @@ fn build_traces(
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
     bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops));
-    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops));
+    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
+    // the same chunk size used to split them into instances (see chunk_and_generate
+    // below) so the BITWISE multiplicity matches the per-instance sends.
+    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops, max_rows.mul));
+    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops, max_rows.dvrm));
     bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
     bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
     // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
@@ -3797,76 +3814,5 @@ impl Traces {
             StorageMode::Ram,
             &[],
         )
-    }
-
-    /// Generates all traces with a trimmed bitwise table (TEST ONLY).
-    ///
-    /// # WARNING: UNSOUND FOR PRODUCTION
-    ///
-    /// This function generates the full 2^20 row bitwise table, updates multiplicities,
-    /// then removes rows where all multiplicity columns are zero. This is **unsound**
-    /// because:
-    ///
-    /// 1. The bitwise table is NOT preprocessed - the verifier checks the prover's
-    ///    commitment instead of a hardcoded trusted commitment
-    /// 2. A malicious prover could provide incorrect bitwise results and the
-    ///    verifier would accept them (e.g., claim 5 AND 3 = 7)
-    /// 3. The table structure differs from production (row indices don't match)
-    ///
-    /// This is acceptable for tests because we're testing:
-    /// - Bus interaction balancing (sends = receives)
-    /// - Constraint satisfaction
-    /// - LogUp protocol correctness
-    ///
-    /// The full preprocessed bitwise verification is tested separately in the
-    /// comprehensive `test_prove_elfs_all_instructions_64_full` test.
-    #[cfg(test)]
-    pub fn from_logs_trimmed(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-        max_rows: &super::MaxRowsConfig,
-    ) -> Result<Self, Error> {
-        // Generate full traces (including full 2^20 bitwise table with multiplicities)
-        let mut traces = Self::from_logs(logs, instructions, max_rows)?;
-
-        // Trim the bitwise table to only rows with non-zero multiplicities
-        traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
-
-        Ok(traces)
-    }
-
-    /// Generates all traces with a minimal bitwise table (TEST ONLY).
-    ///
-    /// Alias for `from_logs_trimmed` for backwards compatibility.
-    #[cfg(test)]
-    pub fn from_logs_minimal(
-        logs: &[Log],
-        instructions: U64HashMap<Instruction>,
-        max_rows: &super::MaxRowsConfig,
-    ) -> Result<Self, Error> {
-        Self::from_logs_trimmed(logs, instructions, max_rows)
-    }
-
-    /// Like [`from_elf_and_logs`] but trims the bitwise table (TEST ONLY).
-    ///
-    /// Produces PAGE and REGISTER tables (requires ELF) while keeping the
-    /// bitwise table small. Same unsoundness caveats as [`from_logs_trimmed`].
-    #[cfg(test)]
-    pub fn from_elf_and_logs_minimal(
-        elf: &Elf,
-        logs: &[Log],
-        max_rows: &super::MaxRowsConfig,
-        private_input: &[u8],
-    ) -> Result<Self, Error> {
-        let mut traces = Self::from_elf_and_logs(
-            elf,
-            logs,
-            max_rows,
-            private_input,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )?;
-        traces.bitwise = bitwise::trim_zero_rows(traces.bitwise);
-        Ok(traces)
     }
 }

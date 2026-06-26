@@ -726,6 +726,17 @@ pub trait IsStarkVerifier<
         // trust the prover). For normal tables, use the commitment from the proof.
 
         for (idx, (air, proof)) in airs.iter().zip(&multi_proof.proofs).enumerate() {
+            // Soundness: the number of composition-poly parts is fixed by the AIR's
+            // degree bound, NOT chosen by the prover. Deriving it from the proof would
+            // let a malicious prover inflate the part count, widening the composition
+            // polynomial's degree space and weakening the low-degree test. Reject any
+            // proof whose advertised part count disagrees with the AIR.
+            if proof.trace_length == 0
+                || proof.composition_poly_parts_ood_evaluation.len()
+                    != air.composition_poly_degree_bound(proof.trace_length) / proof.trace_length
+            {
+                return false;
+            }
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.

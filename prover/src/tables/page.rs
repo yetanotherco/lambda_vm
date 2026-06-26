@@ -40,7 +40,7 @@ use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 // =========================================================================
 // Constants
@@ -177,14 +177,18 @@ pub fn generate_page_trace(
     );
 
     let num_rows = page_size; // One row per byte in the page
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for offset in 0..page_size {
         let byte_addr = page_base + (offset as u64);
-        let base = offset * cols::NUM_COLUMNS;
 
         // Offset (preprocessed) - address is virtual: page_base + offset
-        data[base + cols::OFFSET] = FE::from(offset as u64);
+        table.set_u64(offset, cols::OFFSET, offset as u64);
 
         // Initial value (init_values may be shorter than the page → trailing zeros)
         let init_value = config
@@ -192,7 +196,7 @@ pub fn generate_page_trace(
             .as_ref()
             .and_then(|v| v.get(offset).copied())
             .unwrap_or(0);
-        data[base + cols::INIT] = FE::from(init_value as u64);
+        table.set_byte(offset, cols::INIT, init_value);
 
         // Final state: if accessed use final, otherwise use initial
         let (timestamp, fini_value) = if let Some(state) = final_state.get(&byte_addr) {
@@ -202,12 +206,11 @@ pub fn generate_page_trace(
             (0, init_value)
         };
 
-        data[base + cols::FINI] = FE::from(fini_value as u64);
-        data[base + cols::TIMESTAMP_LO] = FE::from(timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_HI] = FE::from(timestamp >> 32);
+        table.set_byte(offset, cols::FINI, fini_value);
+        table.set_dword_wl(offset, cols::TIMESTAMP_LO, timestamp);
     }
 
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

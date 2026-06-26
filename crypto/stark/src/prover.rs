@@ -793,7 +793,8 @@ pub trait IsStarkProver<
         // Compute entirely in base field — mixed F×E multiplication when used with extension values.
         let two_base = FieldElement::<Field>::from(2u64);
         let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
-            .map(|i| &two_base * &domain.lde_roots_of_unity_coset[i])
+            // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
+            .map(|i| domain.lde_roots_of_unity_coset[i].double())
             .collect();
         FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
 

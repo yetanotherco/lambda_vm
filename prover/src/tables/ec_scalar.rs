@@ -23,7 +23,7 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::new_is_bit_constraints;
 
 // =========================================================================
@@ -87,25 +87,27 @@ pub fn generate_ec_scalar_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        let base = row_idx * cols::NUM_COLUMNS;
-        data[base + cols::TIMESTAMP_0] = FE::from(op.timestamp & 0xFFFF_FFFF);
-        data[base + cols::TIMESTAMP_1] = FE::from(op.timestamp >> 32);
-        data[base + cols::PTR_0] = FE::from(op.ptr & 0xFFFF_FFFF);
-        data[base + cols::PTR_1] = FE::from(op.ptr >> 32);
-        data[base + cols::OFFSET] = FE::from(op.offset as u64);
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_dword_wl(row_idx, cols::PTR_0, op.ptr);
+        table.set_byte(row_idx, cols::OFFSET, op.offset);
         for i in 0..8 {
-            data[base + cols::limb_bit(i)] = FE::from(((op.limb >> i) & 1) as u64);
+            table.set_bool(row_idx, cols::limb_bit(i), ((op.limb >> i) & 1) != 0);
         }
-        data[base + cols::LAST_LIMB] = FE::from(op.last_limb as u64);
-        data[base + cols::MU] = FE::one();
+        table.set_bool(row_idx, cols::LAST_LIMB, op.last_limb);
+        table.set_fe(row_idx, cols::MU, FE::one());
     }
 
     // Padding rows keep every field 0: all IS_BIT constraints hold (0 is a bit) and the
     // implication constraints (a·b = 0) hold trivially.
-    TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
+    trace
 }
 
 // =========================================================================

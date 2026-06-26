@@ -199,7 +199,10 @@ pub(crate) fn launch_keccak_base_row_pair(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
-    debug_assert!(num_rows >= 2, "keccak row-pair leaf kernel: num_rows must be >= 2");
+    debug_assert!(
+        num_rows >= 2,
+        "keccak row-pair leaf kernel: num_rows must be >= 2"
+    );
     let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     // One thread per leaf (= row pair).
@@ -229,7 +232,10 @@ pub(crate) fn launch_keccak_ext3_row_pair(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
-    debug_assert!(num_rows >= 2, "keccak row-pair leaf kernel: num_rows must be >= 2");
+    debug_assert!(
+        num_rows >= 2,
+        "keccak row-pair leaf kernel: num_rows must be >= 2"
+    );
     let be = backend()?;
     let log_num_rows = num_rows.trailing_zeros() as u64;
     let cfg = keccak_launch_cfg(num_rows >> 1);
