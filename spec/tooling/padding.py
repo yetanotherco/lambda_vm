@@ -35,30 +35,42 @@ limbs = list[int]
 pair = tuple[limbs, limbs]
 pairs = tuple[list[pair], list[pair]]
 
-def carries_from_sum_of_products(inp: tuple[list[int], list[int]]) -> int:
+def carries_from_sum_of_products(inp: pairs) -> int:
     """Given pairs of integers `(a, b)`, compute the maximum carry encountered 
     when computing the sum of the products of their limb decompositions."""
-    raw_prods = [limb_prod(*pair) for pair in inp]
-    raw_prod_limbs = [sum(elts) for elts in zip(*raw_prods)]    
-    
+    pos, neg = inp
+    pos_raw_prods = [limb_prod(*pair) for pair in pos]
+    neg_raw_prods = [limb_prod(*pair) for pair in neg]
+    pos_raw_prod_limbs = [sum(elts) for elts in zip(*pos_raw_prods)]    
+    neg_raw_prod_limbs = [sum(elts) for elts in zip(*neg_raw_prods)]    
+    raw_prod_limbs = [a - b for a, b in zip(pos_raw_prod_limbs, neg_raw_prod_limbs)]
+
     carry, carries = 0, []
     for limb in raw_prod_limbs:
         carry = (limb + carry) >> LOG_L
         carries.append(carry)
     return carries
 
-def experiment(iters: int, nr_pairs: int, plot_individual: bool):
+def experiment(iters: int, nr_pos_pairs: int, nr_neg_pairs: int, plot_individual: bool):
     carries_per_limb = [[] for _ in range(2*N)]
     for _ in range(iters):
-        pairs = [
+        pos_pairs = [
             (
                 [fastrand.pcg32bounded(L) for _ in range(N)] + [0] * N,
                 [fastrand.pcg32bounded(L) for _ in range(N)] + [0] * N
             )
-            for _ in range(nr_pairs)
+            for _ in range(nr_pos_pairs)
         ]
         
-        carries = carries_from_sum_of_products(pairs)
+        neg_pairs = [
+            (
+                [fastrand.pcg32bounded(L) for _ in range(N)] + [0] * N,
+                [fastrand.pcg32bounded(L) for _ in range(N)] + [0] * N
+            )
+            for _ in range(nr_neg_pairs)
+        ]
+        
+        carries = carries_from_sum_of_products((pos_pairs, neg_pairs))
         for limb_idx in range(2*N):
             carries_per_limb[limb_idx].append(carries[limb_idx])
 
@@ -72,8 +84,8 @@ def experiment(iters: int, nr_pairs: int, plot_individual: bool):
             ax = plt.gca()
             ax.set_xlabel("carry value")
             ax.set_ylabel("frequency")
-            ax.set_title(f"Frequency carry c_{limb_idx} ({LOG_L=}, {N=}, μ={nr_pairs})")
-            plt.savefig(f"tooling/figures/max_carries/{iters=}_{nr_pairs=}_{limb_idx=}.png")
+            ax.set_title(f"Frequency carry c_{limb_idx} ({LOG_L=}, {N=}, μ={nr_pos_pairs}-{nr_neg_pairs})")
+            plt.savefig(f"tooling/figures/max_carries/{iters=}_{nr_pos_pairs=}-{nr_neg_pairs=}_{limb_idx=}.png")
             plt.clf()
     
     # combined plot
@@ -82,10 +94,9 @@ def experiment(iters: int, nr_pairs: int, plot_individual: bool):
     ax = plt.gca()
     ax.set_xlabel("carry value")
     ax.set_ylabel("frequency")
-    ax.set_title(f"Combined frequency of all carries ({LOG_L=}, {N=}, μ={nr_pairs})")
-    plt.savefig(f"tooling/figures/max_carries/{iters=}_{nr_pairs=}_combined.png")
+    ax.set_title(f"Combined frequency of all carries ({LOG_L=}, {N=}, μ={nr_pos_pairs}-{nr_neg_pairs})")
+    plt.savefig(f"tooling/figures/max_carries/{iters=}_{nr_pos_pairs=}-{nr_neg_pairs=}_combined.png")
     plt.clf()
 
 if __name__ == "__main__":
-    for i in range(1, 5):
-        experiment(50_000, i, False)
+    experiment(50_000, 4, 2, False)
