@@ -21,7 +21,7 @@ pub mod witness;
 #[cfg(test)]
 mod tests;
 
-use crypto_bigint::{Encoding, U256};
+use crypto_bigint::U256;
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
 pub use witness::{EcdasStep, EcsmWitness, compute_witness};
@@ -114,5 +114,5 @@ pub(crate) fn prepare(
 /// to guest memory at `addr_xR`.
 pub fn scalar_mul_x(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<[u8; 32], EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
-    Ok(curve::scalar_mul_affine_x(&k, &g).to_le_bytes())
+    Ok(curve::scalar_mul_affine_x(&k, &g).to_le_bytes().into())
 }

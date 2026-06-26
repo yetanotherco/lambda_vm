@@ -3,14 +3,18 @@
 //! Elements are stored as `U256` always reduced into `[0, p)`. This is test-only
 //! reference arithmetic for cross-checking the k256-backed witness generator.
 
-use crypto_bigint::modular::runtime_mod::{DynResidue, DynResidueParams};
+use crypto_bigint::modular::ConstMontyForm;
 use crypto_bigint::{NonZero, U256};
 
 use crate::p;
 
-fn params() -> DynResidueParams<4> {
-    DynResidueParams::new(&p())
-}
+crypto_bigint::const_monty_params!(
+    Secp256k1Field,
+    U256,
+    "fffffffffffffffffffffffffffffffffffffffffffffffffffffffefffffc2f"
+);
+
+type FpMonty = ConstMontyForm<Secp256k1Field, 4>;
 
 /// An element of the secp256k1 base field, kept reduced into `[0, p)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,33 +33,21 @@ impl Fp {
     }
 
     pub(crate) fn add(&self, other: &Fp) -> Fp {
-        let pm = params();
-        let a = DynResidue::new(&self.0, pm);
-        let b = DynResidue::new(&other.0, pm);
-        Fp((a + b).retrieve())
+        Fp((FpMonty::new(&self.0) + FpMonty::new(&other.0)).retrieve())
     }
 
     pub(crate) fn sub(&self, other: &Fp) -> Fp {
-        let pm = params();
-        let a = DynResidue::new(&self.0, pm);
-        let b = DynResidue::new(&other.0, pm);
-        Fp((a - b).retrieve())
+        Fp((FpMonty::new(&self.0) - FpMonty::new(&other.0)).retrieve())
     }
 
     pub(crate) fn mul(&self, other: &Fp) -> Fp {
-        let pm = params();
-        let a = DynResidue::new(&self.0, pm);
-        let b = DynResidue::new(&other.0, pm);
-        Fp((a * b).retrieve())
+        Fp((FpMonty::new(&self.0) * FpMonty::new(&other.0)).retrieve())
     }
 
     /// Multiplicative inverse via Fermat's little theorem (`p` is prime): `self^(p-2)`.
     /// Returns zero for a zero input (which never occurs for valid curve arithmetic).
     pub(crate) fn inv(&self) -> Fp {
-        let pm = params();
-        let a = DynResidue::new(&self.0, pm);
-        // exponent = p - 2
         let exp = p().wrapping_sub(&U256::from(2u32));
-        Fp(a.pow(&exp).retrieve())
+        Fp(FpMonty::new(&self.0).pow(&exp).retrieve())
     }
 }

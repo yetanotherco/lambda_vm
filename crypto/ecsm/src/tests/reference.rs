@@ -76,7 +76,7 @@ pub fn replay_double_and_add_reference(
     while round >= 0 {
         let (r, next_op) = if op == 0 {
             let r = point_double(&a);
-            let bit = if k.bit_vartime(round as usize) { 1u8 } else { 0u8 };
+            let bit = if k.bit_vartime(round as u32) { 1u8 } else { 0u8 };
             (r, bit)
         } else {
             let r = point_add(&a, g);

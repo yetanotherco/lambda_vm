@@ -16,7 +16,7 @@
 //! negative; the chip range-checks `c_i + offset` as a halfword. We reproduce the exact
 //! integer recurrence here; the prover converts the resulting integers to field elements.
 
-use crypto_bigint::{Encoding, NonZero, U256, U512, U1024};
+use crypto_bigint::{NonZero, U256, U512, U1024};
 
 /// Widens a U512 to U1024 by zero-extending.
 #[inline(always)]
@@ -326,23 +326,23 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 
     // --- ECSM: x2 = xG^2 mod p, quotient q0 ---
     // xg_sq = xG * xG as U512 (widening multiply).
-    let (xg_sq_lo, xg_sq_hi) = g.x.mul_wide(&g.x);
-    let xg_sq = xg_sq_hi.concat(&xg_sq_lo);
+    let (xg_sq_lo, xg_sq_hi) = g.x.widening_mul(&g.x);
+    let xg_sq = xg_sq_lo.concat(&xg_sq_hi);
     let (q0_512, x2_512) = xg_sq.div_rem(&p512);
     let x2 = U256::from_le_slice(&x2_512.to_le_bytes()[..32]);
     let q0 = U256::from_le_slice(&q0_512.to_le_bytes()[..32]);
-    let xg_b = g.x.to_le_bytes();
-    let yg_b = g.y.to_le_bytes();
-    let x2_b = x2.to_le_bytes();
-    let q0_b = q0.to_le_bytes();
+    let xg_b: [u8; 32] = g.x.to_le_bytes().into();
+    let yg_b: [u8; 32] = g.y.to_le_bytes().into();
+    let x2_b: [u8; 32] = x2.to_le_bytes().into();
+    let q0_b: [u8; 32] = q0.to_le_bytes().into();
     let c0 = carries_x2(&ext64(&xg_b), &ext64(&x2_b), &ext64(&q0_b), &pp);
 
     // --- ECSM: yG relation, quotient q1 = (yG^2 − xG·x2 − b)/p + p ---
     // pos = yG^2, neg = xG·x2 + b. r_offset = p.
-    let (yg_sq_lo, yg_sq_hi) = g.y.mul_wide(&g.y);
-    let yg_sq = yg_sq_hi.concat(&yg_sq_lo);
-    let (xg_x2_lo, xg_x2_hi) = g.x.mul_wide(&x2);
-    let xg_x2 = xg_x2_hi.concat(&xg_x2_lo);
+    let (yg_sq_lo, yg_sq_hi) = g.y.widening_mul(&g.y);
+    let yg_sq = yg_sq_lo.concat(&yg_sq_hi);
+    let (xg_x2_lo, xg_x2_hi) = g.x.widening_mul(&x2);
+    let xg_x2 = xg_x2_lo.concat(&xg_x2_hi);
     let neg_yg = xg_x2.wrapping_add(&U512::from(B));
     let q1_512 = shifted_quotient("yG", w1024(yg_sq), w1024(neg_yg), &p1024, P_SQ);
     let q1_b = to_le_33("yG", &q1_512);
@@ -358,14 +358,14 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     // --- scalar range data ---
     let len_k = crate::curve::msb_position(&k) as u8;
     // k_sub_n = (k - N) mod 2^256; since k < N this wraps: 2^256 + k - N.
-    let k_sub_n = k.wrapping_sub(&n()).to_le_bytes();
+    let k_sub_n: [u8; 32] = k.wrapping_sub(&n()).to_le_bytes().into();
 
     // --- double/add replay ---
     let (steps_pts, result) = replay_double_and_add(&k, &g);
-    let x_r = result.x.to_le_bytes();
-    let y_r = result.y.to_le_bytes();
+    let x_r: [u8; 32] = result.x.to_le_bytes().into();
+    let y_r: [u8; 32] = result.y.to_le_bytes().into();
     // x_r_sub_p = (xR - p) mod 2^256; since xR < p this wraps: 2^256 + xR - p.
-    let x_r_sub_p = result.x.wrapping_sub(&p()).to_le_bytes();
+    let x_r_sub_p: [u8; 32] = result.x.wrapping_sub(&p()).to_le_bytes().into();
 
     let steps = steps_pts
         .iter()
@@ -399,13 +399,13 @@ fn build_step(
     pp: &[i128; 64],
 ) -> EcdasStep {
     // λ is precomputed (batched) during the double-and-add replay.
-    let lam_b = s.lambda.to_le_bytes();
-    let xa_b = s.a.x.to_le_bytes();
-    let ya_b = s.a.y.to_le_bytes();
-    let xg_b = s.g.x.to_le_bytes();
-    let yg_b = s.g.y.to_le_bytes();
-    let xr_b = s.r.x.to_le_bytes();
-    let yr_b = s.r.y.to_le_bytes();
+    let lam_b: [u8; 32] = s.lambda.to_le_bytes().into();
+    let xa_b: [u8; 32] = s.a.x.to_le_bytes().into();
+    let ya_b: [u8; 32] = s.a.y.to_le_bytes().into();
+    let xg_b: [u8; 32] = s.g.x.to_le_bytes().into();
+    let yg_b: [u8; 32] = s.g.y.to_le_bytes().into();
+    let xr_b: [u8; 32] = s.r.x.to_le_bytes().into();
+    let yr_b: [u8; 32] = s.r.y.to_le_bytes().into();
 
     let (lam_ext, xa_ext, ya_ext, xg_ext, yg_ext, xr_ext, yr_ext) = (
         ext64(&lam_b),
@@ -419,14 +419,13 @@ fn build_step(
 
     // Multiply two U256 values, result as U512.
     let mul512 = |a: &U256, b: &U256| -> U512 {
-        let (lo, hi) = a.mul_wide(b);
-        hi.concat(&lo)
+        let (lo, hi) = a.widening_mul(b);
+        lo.concat(&hi)
     };
 
     // Widen a U256 to U512 (zero-extend into high half).
     let wide = |v: &U256| -> U512 {
-        let (lo, hi) = (v, &U256::ZERO);
-        hi.concat(lo)
+        v.concat(&U256::ZERO)
     };
 
     // q0: λ relation.

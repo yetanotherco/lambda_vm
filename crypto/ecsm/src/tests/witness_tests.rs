@@ -1,12 +1,12 @@
 //! Unit tests for ECSM/ECDAS witness generation (relocated from `witness.rs`).
 
-use crypto_bigint::{Encoding, U256};
+use crypto_bigint::{NonZero, U256, U512, U1024};
 
 use crate::witness::compute_witness;
 use crate::{n, scalar_mul_x};
 
 fn gx_le() -> [u8; 32] {
-    U256::from_be_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").to_le_bytes()
+    U256::from_be_hex("79BE667EF9DCBBAC55A06295CE870B07029BFCDB2DCE28D959F2815B16F81798").to_le_bytes().into()
 }
 
 /// Drives `compute_witness` (whose internal asserts validate every carry/quotient)
@@ -17,7 +17,7 @@ fn witness_is_self_consistent_for_many_scalars() {
     // small scalars plus bit patterns that exercise add/double scheduling
     let scalars: &[u64] = &[1, 2, 3, 4, 5, 7, 8, 0xFF, 0x101, 0xABCD, 0xFFFF, 123456789];
     for &kv in scalars {
-        let k = U256::from(kv).to_le_bytes();
+        let k: [u8; 32] = U256::from(kv).to_le_bytes().into();
         let w = compute_witness(&k, &gx).expect("witness");
         // final point matches reference
         assert_eq!(
@@ -32,7 +32,7 @@ fn witness_is_self_consistent_for_many_scalars() {
 
 #[test]
 fn k_one_has_no_ecdas_steps() {
-    let w = compute_witness(&U256::ONE.to_le_bytes(), &gx_le()).expect("witness");
+    let w = compute_witness(&U256::ONE.to_le_bytes().into(), &gx_le()).expect("witness");
     assert!(w.steps.is_empty());
     assert_eq!(w.x_r, w.x_g); // 1·G = G
     assert_eq!(w.len_k, 0);
@@ -41,7 +41,7 @@ fn k_one_has_no_ecdas_steps() {
 #[test]
 fn ecdas_step_schedule_matches_double_and_add() {
     // k = 5 = 0b101: double(G)->2G [bit1=0], double(2G)->4G [bit0=1], add(4G,G)->5G.
-    let w = compute_witness(&U256::from(5u32).to_le_bytes(), &gx_le()).expect("witness");
+    let w = compute_witness(&U256::from(5u32).to_le_bytes().into(), &gx_le()).expect("witness");
     assert_eq!(w.len_k, 2);
     let ops: Vec<(u8, u8, u8)> = w.steps.iter().map(|s| (s.round, s.op, s.next_op)).collect();
     assert_eq!(ops, vec![(1, 0, 0), (0, 0, 1), (0, 1, 0)]);
@@ -50,7 +50,7 @@ fn ecdas_step_schedule_matches_double_and_add() {
 #[test]
 fn witness_works_near_curve_order() {
     let gx = gx_le();
-    let w = compute_witness(&n().wrapping_sub(&U256::ONE).to_le_bytes(), &gx).expect("witness");
+    let w = compute_witness(&n().wrapping_sub(&U256::ONE).to_le_bytes().into(), &gx).expect("witness");
     assert_eq!(w.x_r, gx); // (N-1)·G = -G shares x with G
     assert_eq!(w.len_k, 255);
 }
@@ -58,15 +58,16 @@ fn witness_works_near_curve_order() {
 /// Verifies that P_SQ and THREE_P_SQ match the values computed from p at runtime.
 #[test]
 fn p_sq_constants_match_computed() {
-    use crypto_bigint::{Encoding, U1024};
     use crate::witness::{P_SQ, THREE_P_SQ};
     use crate::p;
 
     // Compute p² at runtime.
-    let (p_sq_lo, p_sq_hi) = p().mul_wide(&p());
+    let (p_sq_lo, p_sq_hi) = p().widening_mul(&p());
     let mut computed_p_sq = [0u8; 128];
-    computed_p_sq[..32].copy_from_slice(&p_sq_lo.to_le_bytes());
-    computed_p_sq[32..64].copy_from_slice(&p_sq_hi.to_le_bytes());
+    let lo_bytes: [u8; 32] = p_sq_lo.to_le_bytes().into();
+    let hi_bytes: [u8; 32] = p_sq_hi.to_le_bytes().into();
+    computed_p_sq[..32].copy_from_slice(&lo_bytes);
+    computed_p_sq[32..64].copy_from_slice(&hi_bytes);
     let computed_p_sq = U1024::from_le_slice(&computed_p_sq);
     assert_eq!(computed_p_sq, P_SQ, "P_SQ does not match p*p");
 
@@ -81,7 +82,6 @@ fn p_sq_constants_match_computed() {
 /// divisibility and that the quotient round-trips correctly through U1024 division.
 #[test]
 fn shifted_quotient_double_matches_identity() {
-    use crypto_bigint::{Encoding, NonZero, U256, U512, U1024};
     use crate::P_BYTES;
     use crate::curve::{recover_y_canonical, replay_double_and_add};
 
@@ -95,14 +95,23 @@ fn shifted_quotient_double_matches_identity() {
     p_le128[..32].copy_from_slice(&P_BYTES);
     let p1024 = NonZero::new(U1024::from_le_slice(&p_le128)).unwrap();
 
-    let mul512 = |a: &U256, b: &U256| -> U512 { let (lo, hi) = a.mul_wide(b); hi.concat(&lo) };
+    let mul512 = |a: &U256, b: &U256| -> U512 { let (lo, hi) = a.widening_mul(b); lo.concat(&hi) };
     let widen = |v: U512| -> U1024 { let mut b = [0u8; 128]; b[..64].copy_from_slice(&v.to_le_bytes()); U1024::from_le_slice(&b) };
 
     let pos = { let t = mul512(&s.lambda, &s.a.y); t.wrapping_add(&t) }; // 2λ*yA
     let neg = { let t = mul512(&s.a.x, &s.a.x); t.wrapping_add(&t).wrapping_add(&t) }; // 3xA²
 
-    let (p_sq_lo, p_sq_hi) = crate::p().mul_wide(&crate::p());
-    let p_sq: U1024 = { let mut b = [0u8; 128]; b[..64].copy_from_slice(&p_sq_hi.concat(&p_sq_lo).to_le_bytes()); U1024::from_le_slice(&b) };
+    let (p_sq_lo, p_sq_hi) = crate::p().widening_mul(&crate::p());
+    let p_sq: U1024 = {
+        let mut b = [0u8; 128];
+        let lo_bytes: [u8; 32] = p_sq_lo.to_le_bytes().into();
+        let hi_bytes: [u8; 32] = p_sq_hi.to_le_bytes().into();
+        let mut lo64 = [0u8; 64];
+        lo64[..32].copy_from_slice(&lo_bytes);
+        lo64[32..64].copy_from_slice(&hi_bytes);
+        b[..64].copy_from_slice(&lo64);
+        U1024::from_le_slice(&b)
+    };
     let r_3p_sq = p_sq.wrapping_add(&p_sq).wrapping_add(&p_sq);
 
     let total = r_3p_sq.wrapping_add(&widen(pos)).wrapping_sub(&widen(neg));
