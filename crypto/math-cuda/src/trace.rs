@@ -377,26 +377,27 @@ pub struct DedupResult {
     pub mu1: Vec<u64>,
 }
 
-/// GPU dedup (hash group-by) of key triples `(a, b, c)`. `sel[i]` selects the
-/// counter (0 -> mu0, 1 -> mu1); pass an all-zero `sel` for single-counter
-/// tables. Returns the unique keys + summed counters (host side), arbitrary
-/// order. Replaces the CPU `HashMap` dedup.
-pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupResult> {
+/// Device-resident dedup output: unique keys + counters stay in VRAM. Only the
+/// first `n_unique` entries of each (capacity-`M`) buffer are valid.
+pub struct DeviceDedup {
+    pub a: CudaSlice<u64>,
+    pub b: CudaSlice<u64>,
+    pub c: CudaSlice<u64>,
+    pub mu0: CudaSlice<u64>,
+    pub mu1: CudaSlice<u64>,
+    pub n_unique: usize,
+}
+
+/// GPU dedup (hash group-by) of key triples `(a, b, c)`, keeping the unique
+/// keys + summed counters resident in VRAM. `sel[i]` selects the counter
+/// (0 -> mu0, 1 -> mu1); pass an all-zero `sel` for single-counter tables.
+pub fn gpu_dedup_device(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DeviceDedup> {
     let n = a.len();
     assert_eq!(b.len(), n);
     assert_eq!(c.len(), n);
     assert_eq!(sel.len(), n);
-    if n == 0 {
-        return Ok(DedupResult {
-            a: vec![],
-            b: vec![],
-            c: vec![],
-            mu0: vec![],
-            mu1: vec![],
-        });
-    }
     // Load factor <= 0.5 guarantees a free slot (probe loop terminates).
-    let m = (2 * n).next_power_of_two().max(4);
+    let m = (2 * n.max(1)).next_power_of_two().max(4);
     let be = backend()?;
     let stream = be.next_stream();
 
@@ -412,7 +413,7 @@ pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupRe
     let m_u64 = m as u64;
     let n_u64 = n as u64;
     let blk = |x: usize| LaunchConfig {
-        grid_dim: ((x as u32).div_ceil(256), 1, 1),
+        grid_dim: ((x.max(1) as u32).div_ceil(256), 1, 1),
         block_dim: (256, 1, 1),
         shared_mem_bytes: 0,
     };
@@ -426,19 +427,21 @@ pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupRe
             .arg(&m_u64)
             .launch(blk(m))?;
     }
-    unsafe {
-        stream
-            .launch_builder(&be.dedup_insert)
-            .arg(&a_d)
-            .arg(&b_d)
-            .arg(&c_d)
-            .arg(&sel_d)
-            .arg(&n_u64)
-            .arg(&m_u64)
-            .arg(&mut slot)
-            .arg(&mut mu0)
-            .arg(&mut mu1)
-            .launch(blk(n))?;
+    if n > 0 {
+        unsafe {
+            stream
+                .launch_builder(&be.dedup_insert)
+                .arg(&a_d)
+                .arg(&b_d)
+                .arg(&c_d)
+                .arg(&sel_d)
+                .arg(&n_u64)
+                .arg(&m_u64)
+                .arg(&mut slot)
+                .arg(&mut mu0)
+                .arg(&mut mu1)
+                .launch(blk(n))?;
+        }
     }
 
     let mut out_a = stream.alloc_zeros::<u64>(m)?;
@@ -466,20 +469,229 @@ pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupRe
             .launch(blk(m))?;
     }
     stream.synchronize()?;
+    let n_unique = stream.clone_dtoh(&out_count)?[0] as usize;
 
-    let nu = stream.clone_dtoh(&out_count)?[0] as usize;
-    let a_h = stream.clone_dtoh(&out_a)?;
-    let b_h = stream.clone_dtoh(&out_b)?;
-    let c_h = stream.clone_dtoh(&out_c)?;
-    let mu0_h = stream.clone_dtoh(&out_mu0)?;
-    let mu1_h = stream.clone_dtoh(&out_mu1)?;
-    Ok(DedupResult {
-        a: a_h[..nu].to_vec(),
-        b: b_h[..nu].to_vec(),
-        c: c_h[..nu].to_vec(),
-        mu0: mu0_h[..nu].to_vec(),
-        mu1: mu1_h[..nu].to_vec(),
+    Ok(DeviceDedup {
+        a: out_a,
+        b: out_b,
+        c: out_c,
+        mu0: out_mu0,
+        mu1: out_mu1,
+        n_unique,
     })
+}
+
+/// Host-returning dedup (for tests / debugging). See [`gpu_dedup_device`].
+pub fn gpu_dedup(a: &[u64], b: &[u64], c: &[u64], sel: &[u64]) -> Result<DedupResult> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nu = dd.n_unique;
+    let be = backend()?;
+    let stream = be.next_stream();
+    let pull = |buf: &CudaSlice<u64>| -> Result<Vec<u64>> {
+        Ok(stream.clone_dtoh(buf)?[..nu].to_vec())
+    };
+    Ok(DedupResult {
+        a: pull(&dd.a)?,
+        b: pull(&dd.b)?,
+        c: pull(&dd.c)?,
+        mu0: pull(&dd.mu0)?,
+        mu1: pull(&dd.mu1)?,
+    })
+}
+
+// Launch config for a per-row kernel covering `nrows` rows.
+fn rows_cfg(nrows: usize) -> LaunchConfig {
+    LaunchConfig {
+        grid_dim: ((nrows.max(1) as u32).div_ceil(256), 1, 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    }
+}
+
+/// Device-input fill for 4-input ALU kernels `(a, b, c, mu, n, nrows, cols)`
+/// (lt/eq/bytewise). Reads already-resident device buffers — no H2D.
+fn fill_dev4(
+    kernel: &cudarc::driver::CudaFunction,
+    a: &CudaSlice<u64>,
+    b: &CudaSlice<u64>,
+    c: &CudaSlice<u64>,
+    mu: &CudaSlice<u64>,
+    n: usize,
+    nrows: usize,
+    ncols: usize,
+) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut cols = stream.alloc_zeros::<u64>(ncols * nrows)?;
+    let (n_u64, nrows_u64) = (n as u64, nrows as u64);
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(a)
+            .arg(b)
+            .arg(c)
+            .arg(mu)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(rows_cfg(nrows))?;
+    }
+    stream.synchronize()?;
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols,
+        nrows,
+    })
+}
+
+/// Device-input fill for 5-input ALU kernels `(a, b, c, mu0, mu1, n, nrows,
+/// cols)` (mul/dvrm). Reads already-resident device buffers — no H2D.
+#[allow(clippy::too_many_arguments)]
+fn fill_dev5(
+    kernel: &cudarc::driver::CudaFunction,
+    a: &CudaSlice<u64>,
+    b: &CudaSlice<u64>,
+    c: &CudaSlice<u64>,
+    mu0: &CudaSlice<u64>,
+    mu1: &CudaSlice<u64>,
+    n: usize,
+    nrows: usize,
+    ncols: usize,
+) -> Result<DeviceMainCols> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut cols = stream.alloc_zeros::<u64>(ncols * nrows)?;
+    let (n_u64, nrows_u64) = (n as u64, nrows as u64);
+    unsafe {
+        stream
+            .launch_builder(kernel)
+            .arg(a)
+            .arg(b)
+            .arg(c)
+            .arg(mu0)
+            .arg(mu1)
+            .arg(&n_u64)
+            .arg(&nrows_u64)
+            .arg(&mut cols)
+            .launch(rows_cfg(nrows))?;
+    }
+    stream.synchronize()?;
+    Ok(DeviceMainCols {
+        buf: Arc::new(cols),
+        ncols,
+        nrows,
+    })
+}
+
+// --- Fused dedup + fill: GPU group-by then device-resident column fill, no
+// host round-trip. Inputs are the raw (un-deduped) op SoA; `sel` is all-zero
+// for single-counter tables, or the counter selector for dual ones. ---
+
+/// LT (single counter). Key = (lhs, rhs, flags); `sel` all-zero.
+pub fn gpu_build_lt_trace_deduped(
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    sel: &[u64],
+) -> Result<DeviceMainCols> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nrows = dd.n_unique.next_power_of_two().max(4);
+    fill_dev4(
+        &backend()?.trace_lt_kernel,
+        &dd.a,
+        &dd.b,
+        &dd.c,
+        &dd.mu0,
+        dd.n_unique,
+        nrows,
+        NUM_LT_COLS,
+    )
+}
+
+/// EQ (single counter). Key = (a, b, flags=invert); `sel` all-zero.
+pub fn gpu_build_eq_trace_deduped(
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    sel: &[u64],
+) -> Result<DeviceMainCols> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nrows = dd.n_unique.next_power_of_two().max(4);
+    fill_dev4(
+        &backend()?.trace_eq_kernel,
+        &dd.a,
+        &dd.b,
+        &dd.c,
+        &dd.mu0,
+        dd.n_unique,
+        nrows,
+        NUM_EQ_COLS,
+    )
+}
+
+/// BYTEWISE (single counter). Key = (a, b, op); `sel` all-zero.
+pub fn gpu_build_bytewise_trace_deduped(
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    sel: &[u64],
+) -> Result<DeviceMainCols> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nrows = dd.n_unique.next_power_of_two().max(4);
+    fill_dev4(
+        &backend()?.trace_bytewise_kernel,
+        &dd.a,
+        &dd.b,
+        &dd.c,
+        &dd.mu0,
+        dd.n_unique,
+        nrows,
+        NUM_BYTEWISE_COLS,
+    )
+}
+
+/// MUL (dual counters). Key = (lhs, rhs, flags); `sel` = wants_hi.
+pub fn gpu_build_mul_trace_deduped(
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    sel: &[u64],
+) -> Result<DeviceMainCols> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nrows = dd.n_unique.next_power_of_two().max(4);
+    fill_dev5(
+        &backend()?.trace_mul_kernel,
+        &dd.a,
+        &dd.b,
+        &dd.c,
+        &dd.mu0,
+        &dd.mu1,
+        dd.n_unique,
+        nrows,
+        NUM_MUL_COLS,
+    )
+}
+
+/// DVRM (dual counters). Key = (n, d, flags=signed); `sel` = wants_remainder.
+pub fn gpu_build_dvrm_trace_deduped(
+    a: &[u64],
+    b: &[u64],
+    c: &[u64],
+    sel: &[u64],
+) -> Result<DeviceMainCols> {
+    let dd = gpu_dedup_device(a, b, c, sel)?;
+    let nrows = dd.n_unique.next_power_of_two().max(4);
+    fill_dev5(
+        &backend()?.trace_dvrm_kernel,
+        &dd.a,
+        &dd.b,
+        &dd.c,
+        &dd.mu0,
+        &dd.mu1,
+        dd.n_unique,
+        nrows,
+        NUM_DVRM_COLS,
+    )
 }
 
 /// Shared launcher for kernels taking 5 SoA u64 inputs (a, b, c, d, e) — e.g.
