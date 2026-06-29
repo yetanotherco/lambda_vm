@@ -317,6 +317,37 @@ extern "C" __global__ void keccak_fri_leaves_ext3(
 //     children: nodes[parent_begin + n_pairs .. parent_begin + 3 * n_pairs]
 //     parents:  nodes[parent_begin .. parent_begin + n_pairs]
 //
+// Each thread hashes one child pair → one parent. Keccak-256 of the
+// concatenation of two 32-byte siblings, identical to
+// `FieldElementVectorBackend::hash_new_parent` on host.
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak_merkle_level(
+    uint8_t *nodes,
+    uint64_t parent_begin,     // node index (counted in 32-byte nodes)
+    uint64_t n_pairs) {
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (tid >= n_pairs) return;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    // `nodes` comes from cuMemAlloc (256-byte aligned); each 32-byte node
+    // sits at a 32-byte-aligned offset, so the u64 cast is safe.
+    const uint64_t *left = reinterpret_cast<const uint64_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid) * 32);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, left[i]);
+
+    const uint64_t *right = reinterpret_cast<const uint64_t *>(
+        nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32);
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
+
+    finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
+}
+
 // ---------------------------------------------------------------------------
 // Row-major base leaf hashing.
 //
@@ -349,35 +380,4 @@ extern "C" __global__ void keccak256_leaves_base_row_major(
         absorb_lane(st, rate_pos, lane);
     }
     finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
-}
-
-// Each thread hashes one child pair → one parent. Keccak-256 of the
-// concatenation of two 32-byte siblings, identical to
-// `FieldElementVectorBackend::hash_new_parent` on host.
-// ---------------------------------------------------------------------------
-extern "C" __global__ void keccak_merkle_level(
-    uint8_t *nodes,
-    uint64_t parent_begin,     // node index (counted in 32-byte nodes)
-    uint64_t n_pairs) {
-    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (tid >= n_pairs) return;
-
-    uint64_t st[25];
-    #pragma unroll
-    for (int i = 0; i < 25; ++i) st[i] = 0;
-
-    uint32_t rate_pos = 0;
-    // `nodes` comes from cuMemAlloc (256-byte aligned); each 32-byte node
-    // sits at a 32-byte-aligned offset, so the u64 cast is safe.
-    const uint64_t *left = reinterpret_cast<const uint64_t *>(
-        nodes + (parent_begin + n_pairs + 2 * tid) * 32);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, left[i]);
-
-    const uint64_t *right = reinterpret_cast<const uint64_t *>(
-        nodes + (parent_begin + n_pairs + 2 * tid + 1) * 32);
-    #pragma unroll
-    for (int i = 0; i < 4; ++i) absorb_lane(st, rate_pos, right[i]);
-
-    finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
 }
