@@ -357,11 +357,12 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 /// A chunk grows until it reaches `k` tables (the core/RAM-bound limit) **or**
 /// its summed VRAM estimate would exceed `budget` — whichever comes first. A
 /// single table larger than `budget` forms its own chunk (it runs solo rather
-/// than being excluded). With `budget == u64::MAX` this degrades exactly to
-/// fixed chunks of `k`, identical to the previous `step_by(k)` scheme — so on
-/// non-cuda builds and when VRAM isn't the binding constraint, scheduling (and
-/// therefore the proof) is unchanged. Returns `(start, end)` half-open ranges
-/// covering `0..estimates.len()` in order.
+/// than being excluded). With `budget == u64::MAX` the VRAM constraint is never
+/// binding for any realistic estimate (a chunk's summed estimate can't approach
+/// `u64::MAX`), so chunks fall back to fixed size `k` — identical to the previous
+/// `step_by(k)` scheme. So on non-cuda builds and when VRAM isn't the binding
+/// constraint, scheduling (and therefore the proof) is unchanged. Returns
+/// `(start, end)` half-open ranges covering `0..estimates.len()` in order.
 fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
     let n = estimates.len();
     let k = k.max(1);

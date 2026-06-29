@@ -271,29 +271,6 @@ fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: u
     }
 }
 
-/// Allocate the `[u8; 32]` Merkle node buffer for a tree of `lde_size` leaves
-/// and return the node `Vec` (length-initialised, contents undefined) together
-/// with its node count `total_nodes` (`2 * lde_size - 1`). Returns `None` if
-/// the layout would be invalid (`lde_size < 2` or `total_nodes * 32` overflows
-/// `usize`). The caller builds the `&mut [u8]` byte view of length
-/// `total_nodes * 32` and must overwrite every byte via the GPU D2H.
-fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
-    if lde_size < 2 {
-        return None;
-    }
-    let total_nodes = 2usize.saturating_mul(lde_size).checked_sub(1)?;
-    let _byte_len = total_nodes.checked_mul(32)?;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    // SAFETY: every byte will be overwritten via the GPU D2H before the
-    // contents are read. The caller computes the byte-length view from the
-    // returned `nodes` Vec using `total_nodes.checked_mul(32)`.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        nodes.set_len(total_nodes)
-    };
-    Some((nodes, total_nodes))
-}
-
 /// Try to GPU-batch all columns in one pass.
 ///
 /// Engaged for Goldilocks-base and ext3 tables whose LDE size is above the
