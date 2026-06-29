@@ -323,6 +323,59 @@ pub fn table_parallelism() -> usize {
     }
 }
 
+/// Heuristic peak device working-set for one table, in bytes.
+///
+/// Counts the LDE columns that are co-resident on the GPU — `main` in the base
+/// field (8 B) and `aux` in the ext3 field (24 B) — times a scratch multiplier
+/// for the Merkle / NTT / composition transients allocated alongside them. It
+/// is deliberately a conservative over-estimate: it gates a safety ceiling, not
+/// a precise allocator. Pass `aux_cols == 0` for phases where the aux LDE is
+/// not yet resident (the R1 main commit).
+fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+    const BYTES_PER_BASE: u64 = 8;
+    const EXT3_BYTES: u64 = 24;
+    const SCRATCH_FACTOR: u64 = 2;
+    let per_row = (main_cols as u64).saturating_mul(BYTES_PER_BASE)
+        + (aux_cols as u64).saturating_mul(EXT3_BYTES);
+    (lde_size as u64)
+        .saturating_mul(per_row)
+        .saturating_mul(SCRATCH_FACTOR)
+}
+
+/// Plan contiguous table chunks for parallel proving.
+///
+/// A chunk grows until it reaches `k` tables (the core/RAM-bound limit) **or**
+/// its summed VRAM estimate would exceed `budget` — whichever comes first. A
+/// single table larger than `budget` forms its own chunk (it runs solo rather
+/// than being excluded). With `budget == u64::MAX` this degrades exactly to
+/// fixed chunks of `k`, identical to the previous `step_by(k)` scheme — so on
+/// non-cuda builds and when VRAM isn't the binding constraint, scheduling (and
+/// therefore the proof) is unchanged. Returns `(start, end)` half-open ranges
+/// covering `0..estimates.len()` in order.
+fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
+    let n = estimates.len();
+    let k = k.max(1);
+    let budget = budget as u128;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let mut end = start;
+        let mut acc: u128 = 0;
+        while end < n {
+            let next = estimates[end] as u128;
+            // Always admit at least one table per chunk (oversized → solo).
+            if end > start && (end - start >= k || acc + next > budget) {
+                break;
+            }
+            acc += next;
+            end += 1;
+        }
+        chunks.push((start, end));
+        start = end;
+    }
+    chunks
+}
+
 /// A container for the results of the second round of the STARK Prove protocol.
 pub(crate) struct Round2<F>
 where
@@ -1726,6 +1779,33 @@ pub trait IsStarkProver<
 
         let k = table_parallelism().min(num_airs).max(1);
 
+        // VRAM-budgeted admission. The budget caps the summed device working-set
+        // of the tables proved concurrently so large blocks don't exhaust VRAM.
+        // It is an *additional* ceiling on top of `k` (it never raises
+        // concurrency): on non-cuda builds, or when the budget can't be queried,
+        // it is `u64::MAX` and chunking falls back to fixed size `k`.
+        #[cfg(feature = "cuda")]
+        let vram_budget = math_cuda::device::backend()
+            .map(|b| b.vram_budget_bytes())
+            .unwrap_or(u64::MAX);
+        #[cfg(not(feature = "cuda"))]
+        let vram_budget = u64::MAX;
+
+        // R1 main commit: only the main LDE (+ its Merkle scratch) is resident,
+        // so the aux columns contribute nothing to this phase's working-set.
+        let main_chunks = {
+            let estimates: Vec<u64> = air_trace_pairs
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, trace, _))| {
+                    let lde_size = domains[idx].interpolation_domain_size
+                        * domains[idx].blowup_factor;
+                    estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+                })
+                .collect();
+            plan_table_chunks(&estimates, k, vram_budget)
+        };
+
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
@@ -1770,8 +1850,7 @@ pub trait IsStarkProver<
         let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
             Vec::with_capacity(num_airs);
 
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
+        for &(chunk_start, chunk_end) in &main_chunks {
             let chunk_range = chunk_start..chunk_end;
 
             #[cfg(feature = "parallel")]
@@ -1929,8 +2008,28 @@ pub trait IsStarkProver<
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
 
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
+        // R1 aux commit and rounds 2–4 share the peak working-set: the main and
+        // aux LDEs are co-resident, plus the composition / Merkle transients
+        // (folded into the scratch factor). `num_aux_columns` is now populated
+        // by the aux build above, so this estimate is accurate for both phases.
+        let peak_chunks = {
+            let estimates: Vec<u64> = air_trace_pairs
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, trace, _))| {
+                    let lde_size = domains[idx].interpolation_domain_size
+                        * domains[idx].blowup_factor;
+                    estimate_table_vram_bytes(
+                        trace.num_main_columns,
+                        trace.num_aux_columns,
+                        lde_size,
+                    )
+                })
+                .collect();
+            plan_table_chunks(&estimates, k, vram_budget)
+        };
+
+        for &(chunk_start, chunk_end) in &peak_chunks {
             let chunk_range = chunk_start..chunk_end;
 
             #[cfg(feature = "parallel")]
@@ -2113,8 +2212,7 @@ pub trait IsStarkProver<
 
         let mut proofs = Vec::with_capacity(num_airs);
         let mut lde_drain = cached_ldes.into_iter();
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
+        for &(chunk_start, chunk_end) in &peak_chunks {
             let chunk_size = chunk_end - chunk_start;
 
             let chunk_ldes: Vec<Lde<Field, FieldExtension>> =

@@ -118,6 +118,9 @@ pub struct Backend {
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
+    /// VRAM budget (bytes) for table-session admission control. See
+    /// [`detect_vram_budget_bytes`].
+    vram_budget_bytes: u64,
 
     // arith.ptx
     pub vector_add_u64: CudaFunction,
@@ -202,6 +205,38 @@ fn retain_default_mempool(ctx: &CudaContext) {
     }
 }
 
+/// Device VRAM budget (bytes) for table-session admission control.
+///
+/// `LAMBDA_VM_VRAM_BUDGET_MB` overrides it explicitly — used to force-exercise
+/// the throttle in tests/benchmarks. Otherwise it is 80% of total device
+/// memory, leaving headroom for the context, module code, and the pool's
+/// retained blocks. On any query failure it returns `u64::MAX`, which disables
+/// budgeting: admission then falls back to the core-bound chunk size alone.
+fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
+    if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB") {
+        if let Ok(mb) = mb.parse::<u64>() {
+            return mb.saturating_mul(1024 * 1024);
+        }
+    }
+    use cudarc::driver::sys;
+    // SAFETY: raw driver query writing into two stack slots. The caller's
+    // context is already current (it was just created in `init`). Any error
+    // falls through to the budgeting-disabled sentinel.
+    unsafe {
+        let _ = ctx;
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+            .result()
+            .is_err()
+        {
+            return u64::MAX;
+        }
+        // 80% of total, computed to avoid intermediate overflow.
+        (total as u64) / 5 * 4
+    }
+}
+
 impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
@@ -259,6 +294,8 @@ impl Backend {
         // Length = TWO_ADICITY + 1 to allow indexing at log_n = TWO_ADICITY.
         let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
 
+        let vram_budget_bytes = detect_vram_budget_bytes(&ctx);
+
         Ok(Self {
             vector_add_u64: arith.load_function("vector_add_u64")?,
             gl_add: arith.load_function("gl_add_kernel")?,
@@ -308,7 +345,14 @@ impl Backend {
             pinned_hashes,
             util_stream,
             next: AtomicUsize::new(0),
+            vram_budget_bytes,
         })
+    }
+
+    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// when budgeting is disabled (query failed). See the field docs.
+    pub fn vram_budget_bytes(&self) -> u64 {
+        self.vram_budget_bytes
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
