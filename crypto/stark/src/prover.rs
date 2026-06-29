@@ -388,13 +388,6 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
-    /// Device-resident de-interleaved LDE handle from the R2 fused GPU path
-    /// (`try_evaluate_parts_on_lde_gpu_keep`). When present, R4 DEEP skips
-    /// the `num_parts * 3 * lde_size * 8` byte H2D and reads parts on
-    /// device. `None` when the GPU R2 path didn't run (number_of_parts <= 2,
-    /// below threshold, or any CPU fallback).
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -1037,7 +1030,7 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
         domain: &Domain<Field>,
-        round_1_result: &Round1<Field, FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
     ) -> Result<Round2<FieldExtension>, ProvingError>
@@ -1160,12 +1153,18 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
+        // Fold the R2 device composition-parts handle into the per-table session
+        // (resident R2→R4). The host evaluations remain in `Round2` as the
+        // mirror R4 openings still read; `composition_host_mirror` flags that.
+        #[cfg(feature = "cuda")]
+        if let Some(handle) = gpu_composition_parts {
+            round_1_result.lde_trace.set_gpu_composition_parts(handle);
+        }
+
         Ok(Round2 {
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
-            #[cfg(feature = "cuda")]
-            gpu_composition_parts,
         })
     }
 
@@ -1425,11 +1424,12 @@ pub trait IsStarkProver<
                     &domain.lde_roots_of_unity_coset,
                     &z_scalars,
                     math_cuda::inverse::DenomSign::XMinusZ,
+                    lde_trace.bound_stream(),
                 )
                 && let Some(deep_evals) =
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
-                        round_2_result.gpu_composition_parts.as_ref(),
+                        lde_trace.gpu_composition_parts(),
                         &round_2_result.lde_composition_poly_evaluations,
                         h_ood,
                         &trace_ood_columns,
@@ -1465,7 +1465,7 @@ pub trait IsStarkProver<
             if let Some(deep_evals) =
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
-                    round_2_result.gpu_composition_parts.as_ref(),
+                    lde_trace.gpu_composition_parts(),
                     &round_2_result.lde_composition_poly_evaluations,
                     h_ood,
                     &trace_ood_columns,
@@ -2244,7 +2244,7 @@ pub trait IsStarkProver<
                     let table_start = Instant::now();
 
                     // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result =
+                    let mut round_1_result =
                         commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
 
                     if let Some(ref bpi) = round_1_result.bus_public_inputs {
@@ -2254,7 +2254,7 @@ pub trait IsStarkProver<
                     let proof = Self::prove_rounds_2_to_4(
                         *air,
                         *pub_inputs,
-                        &round_1_result,
+                        &mut round_1_result,
                         table_transcript,
                         domain,
                     )?;
@@ -2343,7 +2343,7 @@ pub trait IsStarkProver<
     fn prove_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
-        round_1_result: &Round1<Field, FieldExtension>,
+        round_1_result: &mut Round1<Field, FieldExtension>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         domain: &Domain<Field>,
     ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>

@@ -1421,13 +1421,18 @@ pub(crate) fn try_inv_denoms_dev_with_stream<F, E>(
     coset_base: &[FieldElement<F>],
     z_scalars: &[FieldElement<E>],
     sign: math_cuda::inverse::DenomSign,
+    bound_stream: Option<Arc<CudaStream>>,
 ) -> Option<(CudaSlice<u64>, Arc<CudaStream>)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    let be = math_cuda::device::backend().ok()?;
-    let stream = be.next_stream();
+    // Use the caller's per-table session stream when provided, so this table's
+    // R3/R4 device chain serialises on one queue; otherwise grab a pool stream.
+    let stream = match bound_stream {
+        Some(s) => s,
+        None => math_cuda::device::backend().ok()?.next_stream(),
+    };
     let handle =
         try_compute_and_invert_inv_denoms_dev::<F, E>(coset_base, z_scalars, sign, &stream)?;
     Some((handle, stream))
@@ -1456,6 +1461,7 @@ pub(crate) struct R3DevContext {
 pub(crate) fn try_prep_r3_dev_context<F, E>(
     coset_base: &[FieldElement<F>],
     z_scalars: &[FieldElement<E>],
+    bound_stream: Option<Arc<CudaStream>>,
 ) -> Option<R3DevContext>
 where
     F: IsField + 'static,
@@ -1477,8 +1483,12 @@ where
         return None;
     }
 
-    let be = math_cuda::device::backend().ok()?;
-    let stream = be.next_stream();
+    // Per-table session stream when provided (shares the queue with R4 DEEP for
+    // this table); otherwise a pool stream.
+    let stream = match bound_stream {
+        Some(s) => s,
+        None => math_cuda::device::backend().ok()?.next_stream(),
+    };
 
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.

@@ -7,6 +7,8 @@ use math::polynomial::barycentric_inv_denoms;
 use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, OnceLock};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -224,12 +226,29 @@ pub(crate) struct GpuTableSession {
     main_lde: Option<math_cuda::lde::GpuLdeBase>,
     /// Aux-trace LDE (ext3 de-interleaved layout on device), resident R1→R4.
     aux_lde: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Composition-poly parts LDE (ext3 de-interleaved on device), produced in
+    /// R2 and resident R2→R4 so R4 DEEP reads the parts on-device instead of a
+    /// `num_parts * 3 * lde_size * 8` byte H2D. `None` when the R2 GPU path
+    /// didn't run (number_of_parts <= 2, below threshold, or CPU fallback).
+    composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
     /// Whether the main-trace host columns currently mirror `main_lde`.
     /// Always `true` today; CPU consumers depend on it.
     main_host_mirror: bool,
     /// Whether the aux-trace host columns currently mirror `aux_lde`.
     /// Always `true` today; CPU consumers depend on it.
     aux_host_mirror: bool,
+    /// Whether the host composition-parts evaluations (`Round2`) mirror
+    /// `composition_parts`. Always `true` today; R4 openings read host.
+    composition_host_mirror: bool,
+    /// Stream bound to this table's GPU work, acquired lazily from the backend
+    /// pool on first use and cached for the session's lifetime. The R3/R4
+    /// device-resident chain (inv_denoms → barycentric/OOD → DEEP) runs on it
+    /// today; the heavy LDE/Merkle ops join once they thread a stream. Binding
+    /// one stream per table serialises a table's kernels on a single queue and
+    /// gives distinct tables distinct streams — the prerequisite for cross-table
+    /// overlap once the host mirrors drop (Steps 4–5). `None` is cached if the
+    /// backend is unavailable, so callers fall back to the CPU path.
+    stream: OnceLock<Option<Arc<math_cuda::CudaStream>>>,
 }
 
 #[cfg(feature = "cuda")]
@@ -238,11 +257,14 @@ impl GpuTableSession {
         Self {
             main_lde: None,
             aux_lde: None,
+            composition_parts: None,
             // Host columns are always materialised today; the CPU consumers
             // (constraint eval, OOD, openings) read them. Steps 5/6 flip these
             // off as each consumer moves to reading the device buffer.
             main_host_mirror: true,
             aux_host_mirror: true,
+            composition_host_mirror: true,
+            stream: OnceLock::new(),
         }
     }
 }
@@ -309,6 +331,37 @@ where
     #[cfg(feature = "cuda")]
     pub fn aux_host_mirror(&self) -> bool {
         self.gpu_session.aux_host_mirror
+    }
+
+    /// Attach the device-resident composition-poly parts LDE produced in R2.
+    /// Read by R4 DEEP so the parts aren't re-uploaded H2D.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_composition_parts(&mut self, h: math_cuda::lde::GpuLdeExt3) {
+        self.gpu_session.composition_parts = Some(h);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_composition_parts(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
+        self.gpu_session.composition_parts.as_ref()
+    }
+
+    /// Whether the host composition-parts evaluations mirror the device buffer.
+    /// Always `true` today; see [`Self::main_host_mirror`].
+    #[cfg(feature = "cuda")]
+    pub fn composition_host_mirror(&self) -> bool {
+        self.gpu_session.composition_host_mirror
+    }
+
+    /// The stream bound to this table's GPU work. Acquired lazily from the
+    /// backend pool on first call and cached for the session's lifetime, so all
+    /// of a table's stream-threaded ops share one queue. Returns `None` (cached)
+    /// when the backend is unavailable; callers then fall back to the CPU path.
+    #[cfg(feature = "cuda")]
+    pub fn bound_stream(&self) -> Option<Arc<math_cuda::CudaStream>> {
+        self.gpu_session
+            .stream
+            .get_or_init(|| math_cuda::device::backend().ok().map(|b| b.next_stream()))
+            .clone()
     }
 
     /// Consume self and return the owned column vectors.
@@ -438,7 +491,11 @@ where
     // both via offset, with no per-eval-point or per-{main,aux} H2D.
     #[cfg(feature = "cuda")]
     let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
-        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(&dc.points, &evaluation_points);
+        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(
+            &dc.points,
+            &evaluation_points,
+            lde_trace.bound_stream(),
+        );
     #[allow(unused_variables)]
     #[cfg(not(feature = "cuda"))]
     let r3_ctx: Option<()> = None;
