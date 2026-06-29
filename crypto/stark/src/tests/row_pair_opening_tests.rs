@@ -6,7 +6,7 @@
 //! tests restore it — an implementation that ignored `evaluations_sym` or the
 //! authentication path would otherwise pass every other test.
 
-use super::small_trace_tests::make_valid_simple_proof;
+use crate::tests::trace_test_helpers::make_valid_simple_proof;
 use crate::verifier::{IsStarkVerifier, Verifier};
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::{element::FieldElement, goldilocks::GoldilocksField};
