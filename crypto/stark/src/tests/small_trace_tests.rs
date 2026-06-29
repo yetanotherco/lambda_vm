@@ -11,36 +11,12 @@ use crate::{
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
+    tests::trace_test_helpers::make_valid_simple_proof,
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
 };
 
 type Felt = FieldElement<GoldilocksField>;
-
-pub(crate) fn make_valid_simple_proof() -> (
-    SimpleAdditionAIR<GoldilocksField>,
-    crate::proof::stark::StarkProof<
-        GoldilocksField,
-        GoldilocksField,
-        SimpleAdditionPublicInputs<GoldilocksField>,
-    >,
-) {
-    let mut trace = simple_addition_trace::<GoldilocksField>(2);
-    let proof_options = ProofOptions::default_test_options();
-    let pub_inputs = SimpleAdditionPublicInputs {
-        a: Felt::from(1u64),
-        b: Felt::from(2u64),
-    };
-    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
-    let proof = Prover::prove(
-        &air,
-        &mut trace,
-        &pub_inputs,
-        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
-    )
-    .unwrap();
-    (air, proof)
-}
 
 /// Test STARK prove/verify with a single-row trace.
 /// This exercises the FRI protocol with 0 FRI layers (trace_length=1, number_layers=0).
