@@ -5,6 +5,7 @@ compile_error!("the `disk-spill` feature requires memmap2, which does not compil
 
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
+pub mod commitment;
 pub mod constraints;
 pub mod context;
 pub mod debug;

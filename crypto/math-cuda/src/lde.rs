@@ -16,7 +16,10 @@ use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::{Backend, backend};
-use crate::merkle::{keccak_launch_cfg, launch_keccak_base, launch_keccak_ext3};
+use crate::merkle::{
+    keccak_launch_cfg, launch_keccak_base, launch_keccak_base_row_pair, launch_keccak_ext3,
+    launch_keccak_ext3_row_pair,
+};
 use crate::ntt::run_ntt_body;
 
 /// Goldilocks `TWO_ADICITY = 32` puts the theoretical domain ceiling at
@@ -34,26 +37,26 @@ fn assert_u32_domain(n: usize, what: &str) {
 /// Output shape requested from the fused LDE + Keccak entry points.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum KeccakCommit {
-    /// Only the `lde_size` keccak-256 leaves; no inner-tree build. Caller
-    /// receives `lde_size * 32` bytes.
+    /// Only the keccak-256 leaves; no inner-tree build. Caller receives
+    /// `num_leaves * 32` bytes.
     LeavesOnly,
     /// Full Merkle tree: leaves at the tail + inner nodes built on-device.
-    /// Caller receives `(2*lde_size - 1) * 32` bytes.
+    /// Caller receives `(2*num_leaves - 1) * 32` bytes.
     FullTree,
 }
 
 impl KeccakCommit {
-    fn total_nodes_bytes(self, lde_size: usize) -> usize {
+    fn total_nodes_bytes(self, num_leaves: usize) -> usize {
         match self {
-            KeccakCommit::LeavesOnly => lde_size * 32,
-            KeccakCommit::FullTree => (2 * lde_size - 1) * 32,
+            KeccakCommit::LeavesOnly => num_leaves * 32,
+            KeccakCommit::FullTree => (2 * num_leaves - 1) * 32,
         }
     }
 
-    fn leaves_offset_bytes(self, lde_size: usize) -> usize {
+    fn leaves_offset_bytes(self, num_leaves: usize) -> usize {
         match self {
             KeccakCommit::LeavesOnly => 0,
-            KeccakCommit::FullTree => (lde_size - 1) * 32,
+            KeccakCommit::FullTree => (num_leaves - 1) * 32,
         }
     }
 }
@@ -592,12 +595,12 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
-/// Fused LDE + Keccak-256 leaf hashing. Caller receives the `lde_size * 32`
-/// bytes of leaf hashes in `hashed_leaves_out` (one 32-byte digest per output
-/// row, in natural row order; leaves are computed reading columns at
-/// bit-reversed rows, matching `commit_columns_bit_reversed` on the CPU
-/// side). Thin wrapper over `coset_lde_batch_base_into_with_merkle_tree_inner`
-/// with `LeavesOnly` — no inner-tree build, no device handle.
+/// Fused LDE + row-pair Keccak-256 leaf hashing. Caller receives
+/// `(lde_size / 2) * 32` bytes of leaf hashes in `hashed_leaves_out` (one
+/// 32-byte digest per bit-reversed row pair, in natural leaf order, matching
+/// `commit_bit_reversed(.., 2)` on the CPU side). Thin wrapper over
+/// `coset_lde_batch_base_into_with_merkle_tree_inner` with `LeavesOnly` — no
+/// inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -613,13 +616,15 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
+        2,
     )
     .map(|_| ())
 }
 
 /// Like `coset_lde_batch_base_into_with_leaf_hash`, but also builds the full
-/// Merkle tree on device and returns the `2*lde_size - 1` node buffer back
-/// to the caller in `merkle_nodes_out` (byte length `(2*lde_size - 1) * 32`).
+/// row-pair Merkle tree on device and returns the `2*(lde_size/2) - 1` node
+/// buffer back to the caller in `merkle_nodes_out` (byte length
+/// `(2*(lde_size/2) - 1) * 32`).
 ///
 /// The leaf hashes are never exposed to the caller — they stay on device and
 /// feed straight into the pair-hash tree kernel, avoiding the
@@ -640,6 +645,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         false,
+        2,
     )
     .map(|_| ())
 }
@@ -662,11 +668,15 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         true,
+        // Trace commit: one leaf per bit-reversed row pair, matching the CPU
+        // `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and `verify_opening_pair`.
+        2,
     )?;
     let handle = opt.expect("keep_device_buf=true must return Some");
     Ok(handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -675,6 +685,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     nodes_out: &mut [u8],
     commit: KeccakCommit,
     keep_device_buf: bool,
+    // 1 = one leaf per bit-reversed row; 2 = one leaf per row pair (2i, 2i+1),
+    // matching the CPU `commit_bit_reversed(.., 2)` used for the trace commit.
+    rows_per_leaf: usize,
 ) -> Result<Option<GpuLdeBase>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
@@ -698,7 +711,13 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size);
     }
-    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    assert_eq!(lde_size % rows_per_leaf, 0);
+    let num_leaves = lde_size / rows_per_leaf;
+    let nodes_dev_bytes = commit.total_nodes_bytes(num_leaves);
     assert_eq!(nodes_out.len(), nodes_dev_bytes);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
@@ -781,28 +800,39 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     )?;
 
     // Allocate the device output buffer. In `LeavesOnly` mode this is just
-    // `lde_size * 32` bytes (the leaves themselves); in `FullTree` mode it's
-    // `(2*lde_size - 1) * 32` bytes (leaves in the tail + inner nodes filled
+    // `num_leaves * 32` bytes (the leaves themselves); in `FullTree` mode it's
+    // `(2*num_leaves - 1) * 32` bytes (leaves in the tail + inner nodes filled
     // below). `alloc` (not `alloc_zeros`) is safe because every byte is
     // written before any reader sees it: the keccak kernel fills the
     // leaves slab, the inner-tree pass (when present) fills the head.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
-    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
+    let leaves_offset_bytes = commit.leaves_offset_bytes(num_leaves);
     {
         let mut leaves_view =
-            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        launch_keccak_base(
-            stream.as_ref(),
-            &buf,
-            col_stride_u64,
-            m as u64,
-            lde_u64,
-            &mut leaves_view,
-        )?;
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        if rows_per_leaf == 2 {
+            launch_keccak_base_row_pair(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        } else {
+            launch_keccak_base(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        }
     }
 
     if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
     // D2H the LDE and the tree/leaves nodes via pinned staging.
@@ -828,8 +858,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 }
 
-/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused
-/// LDE + Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
+/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused LDE +
+/// row-pair Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
 /// `coset_lde_batch_ext3_into_with_merkle_tree_inner` with `LeavesOnly`.
 pub fn coset_lde_batch_ext3_into_with_leaf_hash(
     columns: &[&[u64]],
@@ -848,13 +878,14 @@ pub fn coset_lde_batch_ext3_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
+        2,
     )
     .map(|_| ())
 }
 
 /// Ext3 variant of the fused `coset_lde_batch_base_into_with_merkle_tree`.
 /// LDE + leaf hashing + inner-tree build, all on device; D2Hs only the LDE
-/// evaluations and the full `2*lde_size - 1` node buffer.
+/// evaluations and the full `2*(lde_size/2) - 1` row-pair node buffer.
 pub fn coset_lde_batch_ext3_into_with_merkle_tree(
     columns: &[&[u64]],
     n: usize,
@@ -872,6 +903,7 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         false,
+        2,
     )
     .map(|_| ())
 }
@@ -896,6 +928,9 @@ pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         true,
+        // Trace commit: one leaf per bit-reversed row pair, matching the CPU
+        // `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and `verify_opening_pair`.
+        2,
     )?;
     Ok(opt.expect("keep_device_buf=true must return Some"))
 }
@@ -910,6 +945,9 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     nodes_out: &mut [u8],
     commit: KeccakCommit,
     keep_device_buf: bool,
+    // 1 = one leaf per bit-reversed row; 2 = one leaf per row pair (2i, 2i+1),
+    // matching the CPU `commit_bit_reversed(.., 2)` used for the trace commit.
+    rows_per_leaf: usize,
 ) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
@@ -935,7 +973,13 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), 3 * lde_size);
     }
-    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    assert_eq!(lde_size % rows_per_leaf, 0);
+    let num_leaves = lde_size / rows_per_leaf;
+    let nodes_dev_bytes = commit.total_nodes_bytes(num_leaves);
     assert_eq!(nodes_out.len(), nodes_dev_bytes);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
@@ -1012,26 +1056,37 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         mb_u32,
     )?;
 
-    // Allocate device output buffer (LeavesOnly → lde_size*32; FullTree →
-    // (2*lde_size - 1)*32). Leaf kernel writes to the leaves slab; the
+    // Allocate device output buffer (LeavesOnly -> num_leaves*32; FullTree ->
+    // (2*num_leaves - 1)*32). Leaf kernel writes to the leaves slab; the
     // inner-tree pass (when present) fills the head.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
-    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
+    let leaves_offset_bytes = commit.leaves_offset_bytes(num_leaves);
     {
         let mut leaves_view =
-            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        launch_keccak_ext3(
-            stream.as_ref(),
-            &buf,
-            col_stride_u64,
-            m as u64,
-            lde_u64,
-            &mut leaves_view,
-        )?;
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        if rows_per_leaf == 2 {
+            launch_keccak_ext3_row_pair(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        } else {
+            launch_keccak_ext3(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        }
     }
 
     if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
     // D2H LDE (mb * lde_size u64) and tree/leaves nodes.

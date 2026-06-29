@@ -269,17 +269,17 @@ fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: u
     }
 }
 
-/// Allocate the `[u8; 32]` Merkle node buffer for a tree of `lde_size` leaves
+/// Allocate the `[u8; 32]` Merkle node buffer for a tree of `num_leaves` leaves
 /// and return the node `Vec` (length-initialised, contents undefined) together
-/// with its node count `total_nodes` (`2 * lde_size - 1`). Returns `None` if
-/// the layout would be invalid (`lde_size < 2` or `total_nodes * 32` overflows
+/// with its node count `total_nodes` (`2 * num_leaves - 1`). Returns `None` if
+/// the layout would be invalid (`num_leaves < 2` or `total_nodes * 32` overflows
 /// `usize`). The caller builds the `&mut [u8]` byte view of length
 /// `total_nodes * 32` and must overwrite every byte via the GPU D2H.
-fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
-    if lde_size < 2 {
+fn alloc_merkle_nodes(num_leaves: usize) -> Option<(Vec<[u8; 32]>, usize)> {
+    if num_leaves < 2 {
         return None;
     }
-    let total_nodes = 2usize.saturating_mul(lde_size).checked_sub(1)?;
+    let total_nodes = 2usize.saturating_mul(num_leaves).checked_sub(1)?;
     let _byte_len = total_nodes.checked_mul(32)?;
     let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
     // SAFETY: every byte will be overwritten via the GPU D2H before the
@@ -471,7 +471,11 @@ where
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
     let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair, so the
+    // tree has `lde_size / ROWS_PER_LEAF` leaves (matches the CPU
+    // `commit_bit_reversed(.., ROWS_PER_LEAF)` and `verify_opening_pair`).
+    let num_leaves = lde_size / crate::commitment::ROWS_PER_LEAF;
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(num_leaves)?;
     let node_byte_len = total_nodes
         .checked_mul(32)
         .expect("node byte length overflow");
@@ -528,7 +532,11 @@ where
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
     let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
+    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair, so the
+    // tree has `lde_size / ROWS_PER_LEAF` leaves (matches the CPU
+    // `commit_bit_reversed(.., ROWS_PER_LEAF)` and `verify_opening_pair`).
+    let num_leaves = lde_size / crate::commitment::ROWS_PER_LEAF;
+    let (mut nodes, total_nodes) = alloc_merkle_nodes(num_leaves)?;
     let node_byte_len = total_nodes
         .checked_mul(32)
         .expect("node byte length overflow");
@@ -733,8 +741,8 @@ where
 /// host-side ext3 LDE eval Vecs produced by
 /// [`try_evaluate_parts_on_lde_gpu_keep`] (or the CPU path). Uses the same
 /// row-pair leaf pattern as the CPU
-/// `commit_composition_polynomial`: each leaf hashes 2 consecutive
-/// bit-reversed rows.
+/// `commit_bit_reversed` (composition-polynomial commit path): each leaf hashes
+/// 2 consecutive bit-reversed rows.
 ///
 /// Returns `None` to fall through to the CPU path when the type or size
 /// conditions don't hold; returns `None` on a math-cuda `Err` so the caller
