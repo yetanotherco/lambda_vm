@@ -1687,15 +1687,30 @@ where
     if fri_layers.is_empty() {
         return None;
     }
-    let stream = math_cuda::device::backend().ok()?.next_stream();
+    // The GPU FRI commit sets `gpu_tree` on every layer as a group; the CPU
+    // commit sets none. If the layers are host trees, fall back to the host
+    // walk. If they're device-resident, the host trees are root-only — so the
+    // gather below MUST succeed (a failure is a hard abort, not a silent walk).
+    if fri_layers[0].gpu_tree.is_none() {
+        return None;
+    }
+    let stream = math_cuda::device::backend()
+        .expect("cuda backend for device-resident FRI query")
+        .next_stream();
     let num_layers = fri_layers.len();
 
     // Batched gather: one call per layer over all queries.
     let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(num_layers);
     for (l, layer) in fri_layers.iter().enumerate() {
-        let tree = layer.gpu_tree.as_ref()?;
+        let tree = layer
+            .gpu_tree
+            .as_ref()
+            .expect("FRI layers are device-resident as a group");
         let positions: Vec<usize> = iotas.iter().map(|&iota| (iota >> l) >> 1).collect();
-        per_layer_proofs.push(gather_proofs_dev(tree, &positions, &stream)?);
+        per_layer_proofs.push(
+            gather_proofs_dev(tree, &positions, &stream)
+                .expect("device FRI-layer gather failed; resident tree has no host fallback"),
+        );
     }
 
     // Reassemble per-query decommitments, matching the host walk's order.

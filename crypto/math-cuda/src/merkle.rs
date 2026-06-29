@@ -241,6 +241,13 @@ pub fn gather_merkle_paths_dev(
         "leaves_len must be a power of two >= 2"
     );
     let depth = leaves_len.trailing_zeros() as usize;
+    // Guard the kernel's device reads: an out-of-range position would walk off
+    // the node buffer (OOB device read). Positions are valid by construction;
+    // this catches any caller bug before it becomes UB.
+    assert!(
+        positions.iter().all(|&p| (p as usize) < leaves_len),
+        "gather_merkle_paths_dev: leaf position >= leaves_len"
+    );
     let be = backend()?;
 
     let pos_dev = stream.clone_htod(positions)?;

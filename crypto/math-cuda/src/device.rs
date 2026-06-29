@@ -196,7 +196,15 @@ fn retain_default_mempool(ctx: &CudaContext) {
         {
             return;
         }
-        let threshold: u64 = u64::MAX;
+        // Default: retain freed stream-ordered blocks indefinitely (u64::MAX)
+        // for reuse. `LAMBDA_VM_MEMPOOL_RELEASE_MB` overrides the cap (bytes the
+        // pool keeps before returning memory to the OS) when retained-pool
+        // growth needs bounding.
+        let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(u64::MAX);
         let _ = sys::cuMemPoolSetAttribute(
             pool,
             sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,

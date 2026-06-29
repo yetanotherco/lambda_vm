@@ -327,21 +327,29 @@ pub fn table_parallelism() -> usize {
 
 /// Heuristic peak device working-set for one table, in bytes.
 ///
-/// Counts the LDE columns that are co-resident on the GPU — `main` in the base
-/// field (8 B) and `aux` in the ext3 field (24 B) — times a scratch multiplier
-/// for the Merkle / NTT / composition transients allocated alongside them. It
-/// is deliberately a conservative over-estimate: it gates a safety ceiling, not
-/// a precise allocator. Pass `aux_cols == 0` for phases where the aux LDE is
-/// not yet resident (the R1 main commit).
+/// Two contributions:
+/// 1. **LDE columns** co-resident on the GPU — `main` in the base field (8 B)
+///    and `aux` in the ext3 field (24 B) — times a scratch multiplier for the
+///    NTT / leaf-hash transients allocated alongside them.
+/// 2. **Resident Merkle trees** — main, aux, composition, and FRI-layer trees
+///    are now kept on device R1→R4 (no whole-tree D2H). Each full tree is
+///    `~2*lde_size` nodes × 32 B = `64*lde_size`; co-resident at the R4 peak
+///    they sum to a few × that, so `~256 B × lde_size` covers them conservatively.
+///
+/// It is deliberately a conservative over-estimate: it gates a safety ceiling,
+/// not a precise allocator. Pass `aux_cols == 0` for phases where the aux LDE
+/// is not yet resident (the R1 main commit).
 fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
     const BYTES_PER_BASE: u64 = 8;
     const EXT3_BYTES: u64 = 24;
     const SCRATCH_FACTOR: u64 = 2;
+    const RESIDENT_TREE_BYTES_PER_LDE: u64 = 256;
+    let lde = lde_size as u64;
     let per_row = (main_cols as u64).saturating_mul(BYTES_PER_BASE)
         + (aux_cols as u64).saturating_mul(EXT3_BYTES);
-    (lde_size as u64)
-        .saturating_mul(per_row)
-        .saturating_mul(SCRATCH_FACTOR)
+    let lde_term = lde.saturating_mul(per_row).saturating_mul(SCRATCH_FACTOR);
+    let tree_term = lde.saturating_mul(RESIDENT_TREE_BYTES_PER_LDE);
+    lde_term.saturating_add(tree_term)
 }
 
 /// Plan contiguous table chunks for parallel proving.
@@ -1734,39 +1742,61 @@ pub trait IsStarkProver<
         // proofs (guarded by the `merkle_gather` parity test). Only the
         // non-preprocessed main carries a device tree today; on any miss this is
         // `None` and openings fall back to the host tree below.
+        // `*_dev_proofs` is `Some` exactly when the corresponding tree is
+        // device-resident (so the host tree is a root-only placeholder). In that
+        // case the gather MUST succeed — there is no host tree to fall back to,
+        // so a gather error is a hard abort (not a silent walk of an empty
+        // tree). When the tree is *not* device-resident the value is `None` and
+        // the openings below walk the full host tree as usual.
         #[cfg(feature = "cuda")]
-        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = (!is_preprocessed)
-            .then(|| {
-                let tree = lde_trace.gpu_main()?.tree.as_ref()?;
-                let stream = lde_trace.bound_stream()?;
-                let positions: Vec<usize> = indexes_to_open
-                    .iter()
-                    .flat_map(|&c| [c * 2, c * 2 + 1])
-                    .collect();
-                crate::gpu_lde::gather_proofs_dev(tree, &positions, &stream)
-            })
-            .flatten();
+        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = if is_preprocessed {
+            None
+        } else {
+            lde_trace
+                .gpu_main()
+                .and_then(|h| h.tree.as_ref())
+                .map(|tree| {
+                    let stream = lde_trace
+                        .bound_stream()
+                        .expect("bound stream for device-resident main-tree opening");
+                    let positions: Vec<usize> = indexes_to_open
+                        .iter()
+                        .flat_map(|&c| [c * 2, c * 2 + 1])
+                        .collect();
+                    crate::gpu_lde::gather_proofs_dev(tree, &positions, &stream).expect(
+                        "device main-tree gather failed; resident tree has no host fallback",
+                    )
+                })
+        };
 
         // Same for the aux-trace tree, when it is device-resident.
         #[cfg(feature = "cuda")]
-        let aux_dev_proofs: Option<Vec<Proof<Commitment>>> =
-            round_1_result.aux.as_ref().and_then(|_aux| {
-                let tree = lde_trace.gpu_aux()?.tree.as_ref()?;
-                let stream = lde_trace.bound_stream()?;
+        let aux_dev_proofs: Option<Vec<Proof<Commitment>>> = round_1_result
+            .aux
+            .as_ref()
+            .and_then(|_aux| lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()))
+            .map(|tree| {
+                let stream = lde_trace
+                    .bound_stream()
+                    .expect("bound stream for device-resident aux-tree opening");
                 let positions: Vec<usize> = indexes_to_open
                     .iter()
                     .flat_map(|&c| [c * 2, c * 2 + 1])
                     .collect();
                 crate::gpu_lde::gather_proofs_dev(tree, &positions, &stream)
+                    .expect("device aux-tree gather failed; resident tree has no host fallback")
             });
 
         // Composition tree: openings open a single position `index` (row-pair
         // leaf), so gather one proof per query challenge from the device tree.
         #[cfg(feature = "cuda")]
         let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
-            round_2_result.gpu_composition_tree.as_ref().and_then(|tree| {
-                let stream = lde_trace.bound_stream()?;
+            round_2_result.gpu_composition_tree.as_ref().map(|tree| {
+                let stream = lde_trace
+                    .bound_stream()
+                    .expect("bound stream for device-resident composition-tree opening");
                 crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
+                    .expect("device composition-tree gather failed; resident tree has no host fallback")
             });
 
         for (qi, index) in indexes_to_open.iter().enumerate() {
