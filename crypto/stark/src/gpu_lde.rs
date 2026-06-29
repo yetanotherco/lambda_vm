@@ -303,6 +303,7 @@ fn alloc_merkle_nodes(num_leaves: usize) -> Option<(Vec<[u8; 32]>, usize)> {
 /// Returns `Some(())` if the batch was handled on GPU and `columns` now holds
 /// the LDE evaluations, or if there were no columns to expand. Returns `None`
 /// to let the caller run the per-column CPU fallback.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 pub(crate) fn try_expand_columns_batched<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -582,6 +583,7 @@ where
 /// transform uses only base-field twiddles and coset weights, which act
 /// componentwise on ext3, so the per-component result equals the ext3 LDE the
 /// CPU path computes.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 fn try_expand_columns_batched_ext3<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
