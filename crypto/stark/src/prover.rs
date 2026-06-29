@@ -488,32 +488,6 @@ where
     }
 }
 
-/// Interleave column-major data into a flat row-major buffer + its column
-/// count. Used only by the cuda fast path to materialize the GPU-expanded
-/// columns in the row-major layout the table expects (CPU paths read the
-/// already-row-major trace directly, with no transpose).
-#[cfg(feature = "cuda")]
-fn columns_to_row_major<E: IsField>(
-    columns: &[Vec<FieldElement<E>>],
-) -> (Vec<FieldElement<E>>, usize) {
-    let num_cols = columns.len();
-    let n = if num_cols > 0 { columns[0].len() } else { 0 };
-    // All columns must be the same length; otherwise `col[row]` below indexes
-    // out of bounds. The producers (CPU/GPU LDE) always emit uniform columns —
-    // this guards against a future regression cheaply (debug builds only).
-    debug_assert!(
-        columns.iter().all(|c| c.len() == n),
-        "columns_to_row_major requires all columns to have equal length"
-    );
-    let mut data = Vec::with_capacity(n * num_cols);
-    for row in 0..n {
-        for col in columns {
-            data.push(col[row].clone());
-        }
-    }
-    (data, num_cols)
-}
-
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -751,29 +725,40 @@ pub trait IsStarkProver<
     {
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-        // Fused GPU path (cuda only): extract columns and try the on-device
-        // pipeline; on success it returns the LDE + tree directly.
+        // Fused GPU path (cuda only): row-major NTT — single H2D from the
+        // already-row-major trace, no column extraction, no transpose.
+        // Falls back to CPU if GPU path returns None.
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
-            let mut columns = trace.extract_columns_main(lde_size);
+            let (trace_slice, num_cols) = trace.main_data_row_major();
+            let n = if num_cols > 0 {
+                trace_slice.len() / num_cols
+            } else {
+                0
+            };
             #[cfg(feature = "instruments")]
             let t_sub = Instant::now();
-            if let Some((tree, handle)) =
-                crate::gpu_lde::try_expand_leaf_and_tree_batched_keep::<
+            if let Some((tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep::<
                     Field,
                     Field,
                     BatchedMerkleTreeBackend<Field>,
-                >(&mut columns, domain.blowup_factor, &twiddles.coset_weights)
+                >(
+                    trace_slice,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
             {
                 #[cfg(feature = "instruments")]
                 let main_lde_dur = t_sub.elapsed();
                 let root = tree.root;
                 #[cfg(feature = "instruments")]
-                crate::instruments::accum_r1_main(main_lde_dur, main_lde_dur);
-                let (main_data, total_cols) = columns_to_row_major(&columns);
+                crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
                 return Ok((
                     TableCommit::plain(tree, root),
-                    (main_data, total_cols),
+                    (main_data, num_cols),
                     Some(handle),
                 ));
             }
@@ -2040,20 +2025,29 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
-                        // Fused GPU path (cuda only): extract columns and try the
-                        // on-device ext3 pipeline; on success it returns directly.
+                        // Fused GPU path (cuda only): row-major ext3 NTT — single
+                        // H2D, no column extraction, no CPU transpose.
                         #[cfg(feature = "cuda")]
                         {
-                            let mut columns = trace.extract_columns_aux(lde_size);
+                            let (trace_slice, num_cols) = trace.aux_data_row_major();
+                            let n = if num_cols > 0 {
+                                trace_slice.len() / num_cols
+                            } else {
+                                0
+                            };
                             #[cfg(feature = "instruments")]
                             let t_sub = Instant::now();
-                            if let Some((tree, handle)) =
-                                crate::gpu_lde::try_expand_leaf_and_tree_batched_ext3_keep::<
+                            if let Some((tree, handle, aux_data)) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep::<
                                     Field,
                                     FieldExtension,
                                     BatchedMerkleTreeBackend<FieldExtension>,
                                 >(
-                                    &mut columns, domain.blowup_factor, &twiddles.coset_weights
+                                    trace_slice,
+                                    n,
+                                    num_cols,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
                                 )
                             {
                                 #[cfg(feature = "instruments")]
@@ -2061,10 +2055,9 @@ pub trait IsStarkProver<
                                 let root = tree.root;
                                 #[cfg(feature = "instruments")]
                                 crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
-                                let (aux_data, total_cols) = columns_to_row_major(&columns);
                                 return Ok((
                                     Some(TableCommit::plain(tree, root)),
-                                    (aux_data, total_cols),
+                                    (aux_data, num_cols),
                                     Some(handle),
                                 ));
                             }

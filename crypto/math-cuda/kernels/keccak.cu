@@ -392,3 +392,51 @@ extern "C" __global__ void keccak_merkle_level(
 
     finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
 }
+
+// ---------------------------------------------------------------------------
+// Row-major ROW-PAIR leaf hashing.
+//
+// Row-major analog of `keccak256_leaves_base_row_pair_batched` (which reads a
+// column-major slab): each leaf hashes TWO consecutive bit-reversed rows.
+// Leaf `tid` hashes row `reverse_index(2*tid)` followed by row
+// `reverse_index(2*tid + 1)`, each as `m` canonical big-endian lanes read from
+// the contiguous row-major buffer (`data + br * m`). `num_leaves = num_rows/2`;
+// writes 32 bytes to `hashed_leaves_out[tid*32 ..]`.
+//
+// `m` is the row stride in u64s: base trace = num columns; ext3 trace = 3 *
+// num columns (an ext3 element's components c0,c1,c2 are consecutive, matching
+// the CPU `write_bytes_be`). Byte layout therefore equals the CPU
+// `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and the verifier's
+// `verify_opening_pair` (queried row ‖ its symmetric counterpart, one leaf).
+// ---------------------------------------------------------------------------
+extern "C" __global__ void keccak256_leaves_base_row_major_row_pair(
+    const uint64_t *data,
+    uint64_t m,
+    uint64_t num_rows,
+    uint64_t log_num_rows,
+    uint8_t *hashed_leaves_out)
+{
+    uint64_t tid = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_leaves = num_rows >> 1;
+    if (tid >= num_leaves) return;
+
+    uint64_t br_0 = __brevll(2 * tid) >> (64 - log_num_rows);
+    uint64_t br_1 = __brevll(2 * tid + 1) >> (64 - log_num_rows);
+    const uint64_t *row_0 = data + br_0 * m;
+    const uint64_t *row_1 = data + br_1 * m;
+
+    uint64_t st[25];
+    #pragma unroll
+    for (int i = 0; i < 25; ++i) st[i] = 0;
+
+    uint32_t rate_pos = 0;
+    // First row (br_0): cols 0..m-1.
+    for (uint64_t c = 0; c < m; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_0[c])));
+    }
+    // Second row (br_1): cols 0..m-1.
+    for (uint64_t c = 0; c < m; ++c) {
+        absorb_lane(st, rate_pos, bswap64(goldilocks::canonical(row_1[c])));
+    }
+    finalize_keccak256(st, rate_pos, hashed_leaves_out + tid * 32);
+}
