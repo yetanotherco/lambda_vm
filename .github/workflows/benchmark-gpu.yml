@@ -336,11 +336,15 @@ jobs:
           # binaries (PTX is compiled for the detected arch); never trust a cached binary.
           # TEMP(testing): checks out $REF_A (the branch harness) so the GPU path is exercised
           # pre-merge; main's harness lacks BENCH_FEATURES. RESTORE to `origin/main` before merging.
+          # CUDARC_PIN: pin cudarc to a fixed CUDA version so it doesn't bind symbols newer
+          # than the box's driver (the boxes are CUDA 13.0; fallback-latest requested a symbol
+          # they don't export). nvidia-smi is logged for diagnosing driver issues.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
+            nvidia-smi || true; \
             git fetch --force origin main; $FETCH; \
             git checkout -f $REF_A; \
-            REBUILD=1 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
           # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the

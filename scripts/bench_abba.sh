@@ -110,7 +110,17 @@ if [ "$need_build" = "1" ]; then
   git worktree add --detach "$WT" "$SHA_B" >/dev/null
   build_cli() {  # $1=sha $2=out (shared target dir -> 2nd build is incremental)
     echo "==> Building cli @ ${1:0:10} -> $2  (features: $BENCH_FEATURES)"
-    git -C "$WT" checkout --quiet "$1"
+    # -f: discard any prior worktree edit (e.g. the CUDARC_PIN sed below) before switching
+    # refs, so the checkout can't conflict.
+    git -C "$WT" checkout --quiet -f "$1"
+    # CUDARC_PIN: pin math-cuda's cudarc to a fixed CUDA version and drop fallback-latest, so
+    # cudarc binds a known driver-symbol set instead of its newest (which can request symbols
+    # the rented box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
+    if [ -n "${CUDARC_PIN:-}" ]; then
+      sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
+        "$WT/crypto/math-cuda/Cargo.toml"
+      echo "    cudarc pinned to ${CUDARC_PIN}"
+    fi
     if ! ( cd "$WT" && cargo build --release -p cli --features "$BENCH_FEATURES" >"$WORK/build_$2.log" 2>&1 ); then
       echo "ERROR: cargo build failed for $2 (@ ${1:0:10}). Tail of $WORK/build_$2.log:" >&2
       tail -40 "$WORK/build_$2.log" >&2
