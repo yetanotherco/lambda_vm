@@ -11,8 +11,8 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_batch_invert_calls, gpu_deep_calls, gpu_fri_calls, gpu_lde_calls,
-    reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
+    gpu_fri_calls, gpu_lde_calls, reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -36,11 +36,22 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // The R2 parts-LDE and comp-poly-tree GPU dispatches are obsolete since
+    // R2 parts-LDE (try_evaluate_parts_on_lde_gpu_keep) is obsolete: since
     // #699/#700 routed degree-3 tables through the 2-part decompose_and_extend_d2
-    // + fused coset_lde_full path: no VM AIR has number_of_parts > 2 anymore, so
-    // try_evaluate_parts_on_lde_gpu_keep (and its paired tree build) no longer
-    // fire. (These assertions bit-rotted against the fused composition LDE.)
+    // + fused coset_lde_full path, no VM AIR has number_of_parts > 2, so that
+    // dispatch lives only in the dead `> 2` fallback. We intentionally do NOT
+    // assert gpu_parts_lde_calls() here.
+    //
+    // The comp-poly-tree build is NOT obsolete, though: try_build_comp_poly_tree_gpu
+    // is called unconditionally after the parts-count branch (prover.rs round 2),
+    // so it fires for the common number_of_parts == 2 (degree-3) case. A silent
+    // CPU fallback here would still verify, so the end-to-end check below cannot
+    // catch it — this counter assertion is what guards the GPU comp-poly-tree
+    // dispatch.
+    assert!(
+        gpu_comp_poly_tree_calls() > 0,
+        "R2 GPU comp-poly tree did not fire"
+    );
 
     // DEEP fires once per table that took the R1 GPU path.
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");

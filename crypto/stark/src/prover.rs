@@ -88,11 +88,16 @@ pub enum ProvingError {
     /// out of disk space, fd exhaustion, or mmap failure.
     #[cfg(feature = "disk-spill")]
     DiskSpill(String),
+    /// An internal FFT/LDE computation failed (e.g. domain size exceeds the
+    /// field's two-adicity, or a degenerate coset offset). Distinct from
+    /// `WrongParameter` because the cause is internal prover machinery, not a
+    /// caller-supplied parameter. Carries the underlying `FFTError`'s message.
+    Fft(String),
 }
 
 impl From<FFTError> for ProvingError {
     fn from(e: FFTError) -> Self {
-        ProvingError::WrongParameter(format!("{e}"))
+        ProvingError::Fft(format!("{e}"))
     }
 }
 
@@ -573,7 +578,8 @@ pub trait IsStarkProver<
             "num_rows must be a power of two for reverse_index"
         );
 
-        const ROWS_PER_LEAF: usize = crate::commitment::ROWS_PER_LEAF; // = 2
+        // Local alias for the canonical constant, used several times below.
+        const ROWS_PER_LEAF: usize = crate::commitment::ROWS_PER_LEAF;
         let num_leaves = num_rows / ROWS_PER_LEAF;
         let subset_cols = col_end - col_start;
         let byte_len = <FieldElement<E> as ByteConversion>::BYTE_LEN;
@@ -882,28 +888,6 @@ pub trait IsStarkProver<
                 .map_err(|e| ProvingError::DiskSpill(format!("{label}: {e}")))?;
         }
         Ok(())
-    }
-
-    /// Commit an already-LDE-expanded plain column set: build the row-paired
-    /// Merkle tree, spill it to disk if requested, and wrap it as a plain
-    /// `TableCommit`. Shared by the main-trace (non-preprocessed) and aux-trace
-    /// commit paths.
-    fn commit_plain<C>(
-        columns: &[Vec<FieldElement<C>>],
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-        #[cfg(feature = "disk-spill")] spill_label: &str,
-    ) -> Result<TableCommit<C>, ProvingError>
-    where
-        C: IsField,
-        FieldElement<C>: AsBytes + Sync + Send + math::traits::ByteConversion,
-    {
-        #[allow(unused_mut)]
-        let (mut tree, root) =
-            crate::commitment::commit_bit_reversed(columns, crate::commitment::ROWS_PER_LEAF)
-                .ok_or(ProvingError::EmptyCommitment)?;
-        #[cfg(feature = "disk-spill")]
-        Self::spill_tree(&mut tree, storage_mode, spill_label)?;
-        Ok(TableCommit::plain(tree, root))
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
