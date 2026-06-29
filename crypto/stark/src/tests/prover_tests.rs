@@ -274,7 +274,8 @@ fn test_decompose_and_extend_d2_matches_original() {
         &constraint_evaluations,
         &domain,
         &twiddles,
-    );
+    )
+    .evals;
     #[cfg(not(feature = "cuda"))]
     assert!(twiddles.has_composition_cache());
 

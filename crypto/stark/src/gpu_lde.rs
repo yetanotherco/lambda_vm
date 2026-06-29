@@ -349,101 +349,101 @@ where
     Some(())
 }
 
-/// GPU path for `Prover::extend_half_to_lde`.
+/// GPU fused `_keep` path for `Prover::decompose_and_extend_d2` (R2 quotient
+/// decomposition).
 ///
-/// Inside `decompose_and_extend_d2` (R2 quotient decomposition) the prover
-/// does `rayon::join` of two calls: `iFFT(N on g²-coset) → FFT(2N on g-coset)`
-/// over ext3 halves H0 and H1. They share the same domain/offset and sizes,
-/// so we batch them into a single GPU call with M=2 ext3 columns.
+/// Extends both ext3 halves H0/H1 from `N` evals on the g²-coset to `2N` on the
+/// g-coset, hashes the row-pair Keccak leaves, builds the composition Merkle
+/// tree, AND retains the de-interleaved device buffer as a `GpuLdeExt3` handle —
+/// all in one GPU call. The kept handle lets R4 DEEP read the composition LDE
+/// straight from device memory (no `2 * 3 * lde_size * 8` byte re-H2D), and the
+/// returned tree IS the composition commitment (no separate
+/// `try_build_comp_poly_tree_gpu` round-trip).
 ///
-/// Weights = `[1/N, g^(-1)/N, g^(-2)/N, …, g^(-(N-1))/N]`. This bakes the
-/// `(g²)^(-k)` input-coset-undo from `interpolate_offset_fft` together with
-/// the `g^k` forward-coset-shift from `evaluate_polynomial_on_lde_domain` —
-/// net is `g^(-k)` — plus the `1/N` iFFT normalisation.
+/// `columns` must be `[H0, H1]`, each `N` ext3 evals on the g²-coset; on success
+/// they are expanded in place to `lde_size`. Weights are built here as
+/// `[1/N, g^(-1)/N, …, g^(-(N-1))/N]` (the same construction the prior D2H
+/// `try_extend_two_halves_gpu` used, hence known-correct on CUDA): this bakes the
+/// `(g²)^(-k)` input-coset-undo from `interpolate_offset_fft`, the `g^k` forward
+/// coset-shift from `evaluate_polynomial_on_lde_domain` (net `g^(-k)`), and the
+/// `1/N` iFFT normalisation. They are NOT reused from `CompositionLdeTwiddles`
+/// because the CPU `coset_lde_full` and the GPU `coset_lde_batch` need not share
+/// a weight-application convention.
 ///
-/// Returns `None` when the GPU path doesn't apply (too small, or CPU path
-/// should be used); in that case the caller runs its existing rayon::join.
-#[allow(clippy::type_complexity)]
-pub(crate) fn try_extend_two_halves_gpu<F, E>(
-    h0: &[FieldElement<E>],
-    h1: &[FieldElement<E>],
+/// Returns `None` when the GPU path doesn't apply (too small / non-ext3 / non-
+/// Goldilocks — all checked by `check_ext3_layout` inside the delegate, which
+/// also restores `columns` to their original `N`-length contents on any failure);
+/// the caller then runs the CPU `rayon::join`.
+pub(crate) fn try_extend_two_halves_gpu_keep<F, E>(
+    columns: &mut [Vec<FieldElement<E>>],
     domain: &Domain<F>,
-) -> Option<(Vec<FieldElement<E>>, Vec<FieldElement<E>>)>
+) -> Option<math_cuda::lde::GpuLdeExt3>
 where
     F: IsFFTField + IsField + 'static,
     E: IsField + 'static,
     F: IsSubFieldOf<E>,
 {
-    if h0.len() != h1.len() {
-        return None;
-    }
-    let n = h0.len();
-    let blowup = 2; // extend_half_to_lde extends N → 2N always
-    let lde_size = n * blowup;
-    if lde_size < gpu_lde_threshold() {
-        return None;
-    }
-    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
-    }
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
-    }
-    GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
-    // Weights are built from `g = domain.coset_offset` directly: the
-    // CPU caller previously passed `g²` redundantly. See the
-    // `g^(-k) / N` weight loop below.
-
-    // Flatten ext3 slices to raw 3*n u64 buffers.
-    let to_u64 = |col: &[FieldElement<E>]| -> Vec<u64> {
-        let len = col.len() * 3;
-        let ptr = col.as_ptr() as *const u64;
-        unsafe { from_raw_parts(ptr, len) }.to_vec()
+    // Self-guards size / threshold / Goldilocks-ext3 / equal-length. blowup = 2
+    // (extend_half_to_lde always extends N -> 2N).
+    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, 2) {
+        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
+        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
-    let h0_raw = to_u64(h0);
-    let h1_raw = to_u64(h1);
 
-    // weights[k] = g^(-k) / N as a u64.
+    // weights[k] = g^(-k) / N (g = domain.coset_offset): bakes the (g^2)^(-k)
+    // input-coset-undo, the g^k output-coset-shift (net g^(-k)) and the 1/N iFFT
+    // normalisation. Identical to CompositionLdeTwiddles::weights and to the
+    // prior D2H path (known-correct on CUDA).
     let inv_n = FieldElement::<F>::from(n as u64).inv().expect("N nonzero");
-    let g = &domain.coset_offset;
-    let g_inv = g.inv().expect("g nonzero");
-    let mut weights_u64 = Vec::with_capacity(n);
-    let mut w = inv_n.clone();
+    let g_inv = domain.coset_offset.inv().expect("g nonzero");
+    let mut weights = Vec::with_capacity(n);
+    let mut w = inv_n;
     for _ in 0..n {
-        // F == GoldilocksField by TypeId check above, so value is u64.
-        let v: u64 = unsafe { *(w.value() as *const _ as *const u64) };
-        weights_u64.push(v);
+        weights.push(w.clone());
         w *= &g_inv;
     }
 
-    // Pre-allocate outputs.
-    let mut lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
-    let mut lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
+    // SAFETY: layout checked above. `columns_to_u64_ext3` copies the N input
+    // values out before we presize, so input and output don't alias.
+    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(&weights) };
+    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    // Two ext3 columns (h0 + h1), each composed of 3 base-field components.
-    const NUM_COLS: usize = 2;
-    GPU_LDE_CALLS.fetch_add((NUM_COLS * 3) as u64, Ordering::Relaxed);
-    {
-        let inputs: [&[u64]; 2] = [&h0_raw, &h1_raw];
-        // View each output Vec<FieldElement<E>> as &mut [u64] of length 3*lde_size.
-        let out0_ptr = lde_h0.as_mut_ptr() as *mut u64;
-        let out1_ptr = lde_h1.as_mut_ptr() as *mut u64;
-        // SAFETY: ext3 FieldElement is [u64; 3] in memory, and the Vec has len
-        // = lde_size so the backing is 3*lde_size u64s.
-        let ext3_len = lde_size
-            .checked_mul(3)
-            .expect("ext3 output length overflow");
-        let out0_slice = unsafe { from_raw_parts_mut(out0_ptr, ext3_len) };
-        let out1_slice = unsafe { from_raw_parts_mut(out1_ptr, ext3_len) };
-        let mut outputs: [&mut [u64]; 2] = [out0_slice, out1_slice];
-        if math_cuda::lde::coset_lde_batch_ext3_into(&inputs, n, blowup, &weights_u64, &mut outputs)
-            .is_err()
-        {
-            return None;
+    // `presize_and_view_ext3` does `set_len(lde_size)` in place, so each column
+    // needs `capacity >= lde_size`. H0/H1 come from `map_unzip` with capacity N.
+    for col in columns.iter_mut() {
+        if col.capacity() < lde_size {
+            col.reserve_exact(lde_size - col.len());
         }
     }
 
-    Some((lde_h0, lde_h1))
+    GPU_LDE_CALLS.fetch_add((columns.len() * 3) as u64, Ordering::Relaxed);
+
+    // No-tree keep variant: writes the LDE into `columns` (presized in place) and
+    // retains the de-interleaved device buffer as a `GpuLdeExt3` handle for R4
+    // DEEP. The composition Merkle tree is built separately by
+    // `try_build_comp_poly_tree_gpu` (the keep pipeline's on-device tree is in the
+    // wrong order for the composition's commitment).
+    let handle = {
+        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
+        math_cuda::lde::coset_lde_batch_ext3_into_keep(
+            &slices,
+            n,
+            2,
+            &weights_u64,
+            &mut raw_outputs,
+        )
+    };
+    match handle {
+        Ok(Some(h)) => {
+            GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
+            Some(h)
+        }
+        Ok(None) | Err(_) => {
+            restore_columns_on_err(columns, n);
+            None
+        }
+    }
 }
 
 pub(crate) static GPU_LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);

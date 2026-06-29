@@ -1296,15 +1296,40 @@ pub fn coset_lde_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    coset_lde_batch_ext3_into_inner(columns, n, blowup_factor, weights, outputs, false).map(|_| ())
+}
+
+/// Same as [`coset_lde_batch_ext3_into`] but RETAINS the de-interleaved device
+/// LDE buffer as a [`GpuLdeExt3`] handle for downstream on-device reuse (e.g. R4
+/// DEEP), instead of freeing it. No Merkle tree is built. Returns `None` when
+/// the input is empty (`columns.is_empty()` or `n == 0`).
+pub fn coset_lde_batch_ext3_into_keep(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<Option<GpuLdeExt3>> {
+    coset_lde_batch_ext3_into_inner(columns, n, blowup_factor, weights, outputs, true)
+}
+
+fn coset_lde_batch_ext3_into_inner(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    keep_device_buf: bool,
+) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let m = columns.len();
     assert_eq!(outputs.len(), m, "outputs must match columns count");
     // Empty domain must short-circuit before the power-of-two assert
     // (is_power_of_two returns false for 0).
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1408,7 +1433,16 @@ pub fn coset_lde_batch_ext3_into(
     // ext3-per-element layout.
     unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
-    Ok(())
+    if keep_device_buf {
+        Ok(Some(GpuLdeExt3 {
+            buf: std::sync::Arc::new(buf),
+            m,
+            lde_size,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched

@@ -11,8 +11,8 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_deep_calls, gpu_extend_halves_calls, gpu_fri_calls,
+    gpu_lde_calls, reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -36,15 +36,23 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 ext3 LDE of composition-poly parts. Only fires when an AIR's
-    // `number_of_parts > 2`. The branch and shift tables have degree-3
-    // transition constraints, so this triggers on any non-trivial prove.
-    assert!(gpu_parts_lde_calls() > 0, "R2 GPU parts LDE did not fire");
-
-    // R2 comp-poly Merkle tree build, paired with the parts LDE above.
+    // R2 fused composition LDE + tree + keep. After #699/#700 every VM AIR's
+    // composition poly has `number_of_parts == 2`, so the degree-2 quotient
+    // decomposition routes through `try_extend_two_halves_gpu_keep`: one call
+    // does the LDE of both halves, builds the composition Merkle tree, and
+    // retains the device handle for R4 DEEP. A silent fallback to the host
+    // `commit_composition_polynomial` (or the CPU `extend_half_to_lde`) would
+    // drop this to zero. (Replaces the `gpu_parts_lde_calls` /
+    // `gpu_comp_poly_tree_calls` >2-part assertions, dead since no AIR has
+    // number_of_parts > 2.)
+    // R2 fused composition LDE + no-tree keep. After #699/#700 every VM AIR's
+    // composition poly has `number_of_parts == 2`, so the degree-2 quotient
+    // decomposition routes through `try_extend_two_halves_gpu_keep`: one call does
+    // the LDE of both halves and retains the device handle for R4 DEEP. A silent
+    // fallback to the CPU `extend_half_to_lde` would drop this to zero.
     assert!(
-        gpu_comp_poly_tree_calls() > 0,
-        "R2 GPU comp-poly tree did not fire"
+        gpu_extend_halves_calls() > 0,
+        "R2 fused composition LDE keep path did not fire"
     );
 
     // DEEP fires once per table that took the R1 GPU path.

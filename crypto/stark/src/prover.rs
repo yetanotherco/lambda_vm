@@ -421,13 +421,27 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
-    /// Device-resident de-interleaved LDE handle from the R2 fused GPU path
-    /// (`try_evaluate_parts_on_lde_gpu_keep`). When present, R4 DEEP skips
-    /// the `num_parts * 3 * lde_size * 8` byte H2D and reads parts on
-    /// device. `None` when the GPU R2 path didn't run (number_of_parts <= 2,
-    /// below threshold, or any CPU fallback).
+    /// Device-resident de-interleaved LDE handle from an R2 fused GPU `_keep`
+    /// path: the 2-part `try_extend_two_halves_gpu_keep` (the common case, after
+    /// the degree-2 quotient decomposition) or the >2-part
+    /// `try_evaluate_parts_on_lde_gpu_keep`. When present, R4 DEEP skips the
+    /// `num_parts * 3 * lde_size * 8` byte H2D and reads parts on device. `None`
+    /// when the GPU R2 path didn't run (single-part AIR, below threshold, or any
+    /// CPU fallback).
     #[cfg(feature = "cuda")]
     pub(crate) gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
+}
+
+/// Output of [`Prover::decompose_and_extend_d2`]: the two composition-poly part
+/// LDE evaluation vectors, plus (under `cuda`) the retained `GpuLdeExt3` device
+/// handle when the GPU no-tree keep path ran (consumed by R4 DEEP to avoid the
+/// composition-LDE re-H2D). `gpu_keep` is `None` on the CPU fallback. The
+/// composition Merkle tree is built separately (the keep pipeline's on-device
+/// tree is in the wrong order for the composition commitment).
+pub(crate) struct D2Result<E: IsField> {
+    pub(crate) evals: Vec<Vec<FieldElement<E>>>,
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_keep: Option<math_cuda::lde::GpuLdeExt3>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -1178,7 +1192,7 @@ pub trait IsStarkProver<
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
-    ) -> Vec<Vec<FieldElement<FieldExtension>>>
+    ) -> D2Result<FieldExtension>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
@@ -1211,21 +1225,48 @@ pub trait IsStarkProver<
         // Step 3: Extend each part from n evals on the g²-coset to 2n evals on the
         // g-coset (the full LDE domain).
 
-        // GPU fast path: batch both halves into one ext3 LDE call. Requires
-        // `cuda` feature and a qualifying size. Falls through to CPU when not.
+        // GPU fast path (no-tree `_keep`): one on-device call does the LDE of BOTH
+        // halves and retains the de-interleaved device buffer as a `GpuLdeExt3`
+        // handle, which feeds R4 DEEP and eliminates the composition-LDE re-H2D.
+        // (The composition Merkle tree is built separately below — the keep
+        // pipeline's on-device tree is in the wrong order for the composition.)
+        // Falls through to the CPU `rayon::join` when the GPU path doesn't apply
+        // (`try_extend_two_halves_gpu_keep` restores `cols` to [H0, H1] on `None`).
         #[cfg(feature = "cuda")]
-        if let Some((lde_h0, lde_h1)) =
-            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
         {
-            return vec![lde_h0, lde_h1];
+            let mut cols = vec![h0_evals, h1_evals];
+            if let Some(handle) = crate::gpu_lde::try_extend_two_halves_gpu_keep::<
+                Field,
+                FieldExtension,
+            >(&mut cols, domain)
+            {
+                return D2Result {
+                    evals: cols,
+                    gpu_keep: Some(handle),
+                };
+            }
+            let composition_twiddles = twiddles.composition(domain);
+            let (lde_h0, lde_h1) = crate::par::join(
+                || Self::extend_half_to_lde(&cols[0], composition_twiddles),
+                || Self::extend_half_to_lde(&cols[1], composition_twiddles),
+            );
+            return D2Result {
+                evals: vec![lde_h0, lde_h1],
+                gpu_keep: None,
+            };
         }
 
-        let composition_twiddles = twiddles.composition(domain);
-        let (lde_h0, lde_h1) = crate::par::join(
-            || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
-            || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
-        );
-        vec![lde_h0, lde_h1]
+        #[cfg(not(feature = "cuda"))]
+        {
+            let composition_twiddles = twiddles.composition(domain);
+            let (lde_h0, lde_h1) = crate::par::join(
+                || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
+                || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
+            );
+            D2Result {
+                evals: vec![lde_h0, lde_h1],
+            }
+        }
     }
 
     /// Extend `half_evals` — `n = lde_size/2` evaluations of a degree-`<n` polynomial
@@ -1302,7 +1343,14 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            let d2 = Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles);
+            #[cfg(feature = "cuda")]
+            if let Some(handle) = d2.gpu_keep {
+                // Kept composition-LDE device buffer: R4 DEEP reads it on-device
+                // instead of re-H2D'ing the composition parts.
+                gpu_composition_parts = Some(handle);
+            }
+            d2.evals
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
