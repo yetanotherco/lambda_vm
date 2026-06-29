@@ -1,5 +1,5 @@
 name = "SHA256ROUND"
-code = "SHR"
+code = "SHD"
 
 [[variables.input]]
 name = "timestamp"
