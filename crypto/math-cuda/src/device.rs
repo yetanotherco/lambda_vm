@@ -213,10 +213,10 @@ fn retain_default_mempool(ctx: &CudaContext) {
 /// retained blocks. On any query failure it returns `u64::MAX`, which disables
 /// budgeting: admission then falls back to the core-bound chunk size alone.
 fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
-    if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB") {
-        if let Ok(mb) = mb.parse::<u64>() {
-            return mb.saturating_mul(1024 * 1024);
-        }
+    if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB")
+        && let Ok(mb) = mb.parse::<u64>()
+    {
+        return mb.saturating_mul(1024 * 1024);
     }
     use cudarc::driver::sys;
     // SAFETY: raw driver query writing into two stack slots. The caller's
