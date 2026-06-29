@@ -584,6 +584,10 @@ where
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
     let lde_out: Vec<FieldElement<E>> = unsafe {
         let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
         Vec::from_raw_parts(
             v.as_mut_ptr() as *mut FieldElement<E>,
             v.len() / 3,
