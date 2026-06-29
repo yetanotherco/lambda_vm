@@ -27,6 +27,7 @@ use math::traits::AsBytes;
 use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
+use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::trace::LDETraceTable;
 
@@ -1620,7 +1621,7 @@ where
         let zeta_ptr = &zeta as *const FieldElement<E> as *const u64;
         let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-        let (root, layer_evals_u64, nodes_bytes) = match state.fold_and_commit_layer(zeta_raw) {
+        let (layer_evals_u64, dev_tree) = match state.fold_and_commit_layer(zeta_raw) {
             Ok(v) => v,
             Err(_) => {
                 *transcript = transcript_snapshot.clone();
@@ -1628,23 +1629,18 @@ where
             }
         };
 
-        // Build the FriLayer: ext3 evals + Merkle tree from precomputed nodes.
+        // Build the FriLayer: ext3 evals + a root-only host tree (the layer tree
+        // stays resident on device in `gpu_tree`; query openings gather paths
+        // from it via `gather_proofs_dev`).
         let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
-
-        debug_assert!(nodes_bytes.len().is_multiple_of(32));
-        let nodes: Vec<[u8; 32]> = nodes_bytes
-            .chunks_exact(32)
-            .map(|c| c.try_into().expect("chunks_exact(32) yields 32 bytes"))
-            .collect();
-        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_precomputed_nodes(nodes)
-            .expect("FRI commit: precomputed nodes form a valid tree");
-
-        fri_layer_list.push(FriLayer::new(&evaluation, merkle_tree));
+        let root = dev_tree.root;
+        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+        let mut layer = FriLayer::new(&evaluation, merkle_tree);
+        layer.gpu_tree = Some(dev_tree);
+        fri_layer_list.push(layer);
 
         // >>>> Send commitment: [p_k]
-        let mut root_arr = [0u8; 32];
-        root_arr.copy_from_slice(&root);
-        transcript.append_bytes(&root_arr);
+        transcript.append_bytes(&root);
     }
 
     // <<<< Receive challenge zeta_{n-1}
@@ -1670,4 +1666,56 @@ where
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((last_value, fri_layer_list))
+}
+
+/// GPU FRI query phase: gather each layer's authentication paths on device
+/// instead of walking host trees. For layer `l` and query `iota`, the opened
+/// position is `(iota >> l) >> 1` — matching [`crate::fri::query_phase`]. Paths
+/// for all queries are gathered in one batched call per layer. The layer
+/// evaluations (`evaluation[index ^ 1]`) are read from the host Vecs as before.
+///
+/// Returns `None` if there are no layers or any layer lacks a device tree (a
+/// CPU-committed layer), so the caller falls back to the host walk.
+pub(crate) fn try_fri_query_phase_gpu<E>(
+    fri_layers: &[FriLayer<E, FriLayerMerkleTreeBackend<E>>],
+    iotas: &[usize],
+) -> Option<Vec<FriDecommitment<E>>>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if fri_layers.is_empty() {
+        return None;
+    }
+    let stream = math_cuda::device::backend().ok()?.next_stream();
+    let num_layers = fri_layers.len();
+
+    // Batched gather: one call per layer over all queries.
+    let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(num_layers);
+    for (l, layer) in fri_layers.iter().enumerate() {
+        let tree = layer.gpu_tree.as_ref()?;
+        let positions: Vec<usize> = iotas.iter().map(|&iota| (iota >> l) >> 1).collect();
+        per_layer_proofs.push(gather_proofs_dev(tree, &positions, &stream)?);
+    }
+
+    // Reassemble per-query decommitments, matching the host walk's order.
+    let decommits = iotas
+        .iter()
+        .enumerate()
+        .map(|(q, &iota)| {
+            let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+            let mut layers_auth_paths = Vec::with_capacity(num_layers);
+            let mut index = iota;
+            for (l, layer) in fri_layers.iter().enumerate() {
+                layers_evaluations_sym.push(layer.evaluation[index ^ 1].clone());
+                layers_auth_paths.push(per_layer_proofs[l][q].clone());
+                index >>= 1;
+            }
+            FriDecommitment {
+                layers_auth_paths,
+                layers_evaluations_sym,
+            }
+        })
+        .collect();
+    Some(decommits)
 }
