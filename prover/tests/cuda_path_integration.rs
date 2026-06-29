@@ -66,3 +66,24 @@ fn gpu_path_fires_end_to_end() {
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
+
+/// Focused validation of the GPU FRI early-termination commit: proves a large
+/// trace (which exceeds the GPU FRI threshold), confirms the GPU FRI commit
+/// path fired, and verifies the resulting proof. Independent of the per-round
+/// counter assertions in `gpu_path_fires_end_to_end` (some of which are
+/// sensitive to AIR/LDE shape and may bit-rot across LDE reworks).
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_fri_commit_produces_verifiable_proof() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_fri_calls() > 0,
+        "GPU FRI commit path did not fire on a 1M-row trace"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (early-termination FRI) failed verification"
+    );
+}

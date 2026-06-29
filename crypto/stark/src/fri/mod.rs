@@ -1,6 +1,7 @@
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
+pub(crate) mod terminal;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::element::FieldElement;
@@ -16,25 +17,30 @@ use self::fri_functions::{
 };
 
 /// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
-/// initial FFT. Use this when the caller already has the evaluation vector
-/// (e.g. from a fused LDE pipeline).
+/// initial FFT. Stops folding when the remaining codeword encodes a polynomial
+/// of degree < 2^`final_poly_log_degree` with blowup 2^`blowup_log`, and
+/// returns the coefficient vector of that terminal polynomial.
 ///
 /// The `T: Clone` and `F/E: 'static` bounds are required by the cuda GPU
 /// fast path (`try_fri_commit_gpu` snapshots the transcript and TypeId-
 /// checks the field types). They are present unconditionally (including
 /// in builds without the `cuda` feature) to keep one stable signature.
+#[allow(clippy::type_complexity)]
 pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
+    E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
 >(
-    number_layers: usize,
+    // `_number_layers`: retained for signature stability with the cuda fast path; termination is now driven by blowup_log + final_poly_log_degree.
+    _number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
 ) -> (
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
@@ -50,27 +56,39 @@ where
     // had never been tried.
     #[cfg(feature = "cuda")]
     {
+        // GPU FRI commit is disabled unconditionally (see `try_fri_commit_gpu`
+        // in gpu_lde.rs for the full explanation). The CPU fallback below
+        // handles all cases correctly, including early termination.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
-            number_layers,
+            _number_layers,
             &evals,
             transcript,
             coset_offset,
             domain_size,
+            blowup_log,
+            final_poly_log_degree,
         ) {
             return result;
         }
     }
 
+    // Determine how many total folds are needed to reach the terminal codeword.
+    // terminal_len = 2^(blowup_log + k), clamped to initial_len for tiny inputs.
+    let initial_len = evals.len();
+    let k = final_poly_log_degree as usize;
+    let terminal_len = ((1usize << blowup_log) << k).min(initial_len);
+    let total_folds = (initial_len / terminal_len).trailing_zeros() as usize;
+    let num_committed = total_folds.saturating_sub(1);
+
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+    let mut fri_layer_list = Vec::with_capacity(num_committed);
+    // Track the coset offset as it squares with each fold (needed for iFFT in terminal).
+    let mut terminal_offset = coset_offset.clone();
 
-    // The loop commits `number_layers - 1` folded layers; the final fold below
-    // produces the (uncommitted) last value.
-    let num_committed_layers = number_layers.saturating_sub(1);
-    let mut fri_layer_list = Vec::with_capacity(num_committed_layers);
-
-    for _ in 0..num_committed_layers {
-        // <<<< Receive challenge 𝜁ₖ₋₁
+    // Commit `num_committed` folded layers to the transcript.
+    for _ in 0..num_committed {
+        // <<<< Receive challenge 𝜁ₖ
         let zeta = transcript.sample_field_element();
 
         // Fold evaluations in-place (no FFT needed).
@@ -89,25 +107,42 @@ where
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&root);
 
-        // Update twiddles for the next level.
+        // Update twiddles and offset for the next level.
         update_twiddles_in_place(&mut inv_twiddles);
+        terminal_offset = terminal_offset.square();
     }
 
-    // <<<< Receive challenge: 𝜁ₙ₋₁
-    let zeta = transcript.sample_field_element();
+    // One final fold to reach the terminal codeword (size terminal_len), unless
+    // already there (total_folds == 0 means initial_len == terminal_len).
+    if total_folds > 0 {
+        // <<<< Receive challenge: 𝜁_final
+        let zeta = transcript.sample_field_element();
+        fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+        terminal_offset = terminal_offset.square();
+    }
+    debug_assert_eq!(evals.len(), terminal_len, "terminal codeword size mismatch");
 
-    // Final fold.
-    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+    // Recover the low-degree polynomial coefficients from the terminal codeword
+    // and send them to the verifier.
+    //
+    // The number of coefficients is determined by the *actual* terminal codeword,
+    // not the requested `final_poly_log_degree`: for tiny inputs `terminal_len`
+    // is clamped to `initial_len`, so the terminal polynomial has degree
+    // < terminal_len / 2^blowup_log = 2^(log2(terminal_len) - blowup_log). Using
+    // this clamped exponent keeps the coefficient count in lockstep with what the
+    // verifier reconstructs (`expected_k = min(k, trace_bits)`); passing the raw
+    // `final_poly_log_degree` would over-pad with zeros and break the round-trip.
+    let effective_log_degree = terminal_len.trailing_zeros() - blowup_log;
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &evals,
+        &terminal_offset,
+        effective_log_degree,
+    );
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
 
-    let last_value = evals
-        .first()
-        .expect("FRI evals are non-empty after folding")
-        .clone();
-
-    // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
-
-    (last_value, fri_layer_list)
+    (final_poly_coeffs, fri_layer_list)
 }
 
 pub fn query_phase<F: IsField>(

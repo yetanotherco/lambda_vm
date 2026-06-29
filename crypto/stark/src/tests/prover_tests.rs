@@ -71,6 +71,7 @@ fn test_domain_constructor() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor,
+        fri_final_poly_log_degree: 7,
     };
 
     let domain = Domain::new(
@@ -162,6 +163,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -233,6 +235,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
@@ -298,12 +301,14 @@ fn test_multi_prove_mixed_coset_offsets() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
     let proof_options_7 = ProofOptions {
         blowup_factor: 2,
         fri_number_of_queries: 3,
         coset_offset: 7,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
     // Both AIRs have the same trace length and blowup, but different coset offsets.
@@ -368,6 +373,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -458,6 +464,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);

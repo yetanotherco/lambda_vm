@@ -45,22 +45,31 @@ fn state_after_absorb(
     counts: &TableCounts,
     priv_pages: usize,
     ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
 ) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(&mut t, elf, out, counts, priv_pages, ranges);
+    absorb_statement(
+        &mut t,
+        elf,
+        out,
+        counts,
+        priv_pages,
+        ranges,
+        fri_final_poly_log_degree,
+    );
     t.state()
 }
 
 #[test]
 fn state_is_deterministic() {
-    let a = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges());
-    let b = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges());
+    let a = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges(), 7);
+    let b = state_after_absorb(b"elf", b"out", &sample_counts(), 3, &sample_ranges(), 7);
     assert_eq!(a, b);
 }
 
 #[test]
 fn state_depends_on_every_field() {
-    let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges());
+    let baseline = state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 7);
 
     assert_ne!(
         baseline,
@@ -69,7 +78,8 @@ fn state_depends_on_every_field() {
             b"out",
             &sample_counts(),
             1,
-            &sample_ranges()
+            &sample_ranges(),
+            7,
         ),
         "state must depend on elf",
     );
@@ -80,7 +90,8 @@ fn state_depends_on_every_field() {
             b"different-output",
             &sample_counts(),
             1,
-            &sample_ranges()
+            &sample_ranges(),
+            7,
         ),
         "state must depend on public_output",
     );
@@ -89,20 +100,26 @@ fn state_depends_on_every_field() {
     counts2.branch += 1;
     assert_ne!(
         baseline,
-        state_after_absorb(b"elf", b"out", &counts2, 1, &sample_ranges()),
+        state_after_absorb(b"elf", b"out", &counts2, 1, &sample_ranges(), 7),
         "state must depend on table_counts",
     );
 
     assert_ne!(
         baseline,
-        state_after_absorb(b"elf", b"out", &sample_counts(), 2, &sample_ranges()),
+        state_after_absorb(b"elf", b"out", &sample_counts(), 2, &sample_ranges(), 7),
         "state must depend on num_private_input_pages",
     );
 
     assert_ne!(
         baseline,
-        state_after_absorb(b"elf", b"out", &sample_counts(), 1, &[]),
+        state_after_absorb(b"elf", b"out", &sample_counts(), 1, &[], 7),
         "state must depend on runtime_page_ranges",
+    );
+
+    assert_ne!(
+        baseline,
+        state_after_absorb(b"elf", b"out", &sample_counts(), 1, &sample_ranges(), 8),
+        "state must depend on fri_final_poly_log_degree",
     );
 }
 
@@ -116,7 +133,7 @@ fn public_output_length_prefix_prevents_collision() {
     let mut counts_b = sample_counts();
     counts_b.cpu = 0;
     assert_ne!(
-        state_after_absorb(b"elf", b"", &counts_a, 0, &[]),
-        state_after_absorb(b"elf", b"\x41", &counts_b, 0, &[]),
+        state_after_absorb(b"elf", b"", &counts_a, 0, &[], 7),
+        state_after_absorb(b"elf", b"\x41", &counts_b, 0, &[], 7),
     );
 }

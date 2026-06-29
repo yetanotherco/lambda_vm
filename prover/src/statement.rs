@@ -5,9 +5,9 @@
 //! (`DefaultTranscript`), so a single hash suffices — no external digest
 //! needed beyond the ELF.
 //!
-//! All three call sites (prove, verify, bus-balance replay) must absorb
-//! identical bytes; any divergence makes every derived challenge differ and
-//! verification reject.
+//! Both call sites (prove, verify) must absorb identical bytes; the bus-balance
+//! replay inherits the post-absorb transcript via clone(). Any divergence makes
+//! every derived challenge differ and verification reject.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use sha3::{Digest, Keccak256};
@@ -16,7 +16,7 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V2";
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
 fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
@@ -31,6 +31,7 @@ pub(crate) fn absorb_statement(
     table_counts: &TableCounts,
     num_private_input_pages: usize,
     runtime_page_ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
 ) {
     t.append_bytes(DOMAIN_TAG);
 
@@ -80,6 +81,9 @@ pub(crate) fn absorb_statement(
     }
 
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+
+    // fri_final_poly_log_degree: single byte, no endianness concern.
+    t.append_bytes(&[fri_final_poly_log_degree]);
 
     // runtime_page_ranges: count-prefixed; each entry fixed width.
     t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
