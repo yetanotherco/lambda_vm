@@ -645,22 +645,6 @@ where
     Table::new(table_data, table_width)
 }
 
-pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
-where
-    F: Clone,
-{
-    let num_rows = columns[0].len();
-    let num_cols = columns.len();
-
-    (0..num_rows)
-        .map(|row_index| {
-            (0..num_cols)
-                .map(|col_index| columns[col_index][row_index].clone())
-                .collect()
-        })
-        .collect()
-}
-
 pub(crate) fn compute_frame_evaluation_points<F, E>(
     x: &FieldElement<E>,
     frame_offsets: &[usize],

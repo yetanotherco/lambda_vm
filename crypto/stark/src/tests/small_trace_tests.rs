@@ -17,7 +17,7 @@ use crate::{
 
 type Felt = FieldElement<GoldilocksField>;
 
-fn make_valid_simple_proof() -> (
+pub(crate) fn make_valid_simple_proof() -> (
     SimpleAdditionAIR<GoldilocksField>,
     crate::proof::stark::StarkProof<
         GoldilocksField,
