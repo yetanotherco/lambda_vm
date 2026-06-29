@@ -1,0 +1,15 @@
+[workspace]
+
+[package]
+name = "recursion-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The in-VM STARK verifier. `default-features = false` drops `parallel` (no
+# threads in-guest) and `sysinfo`; the prove-side code compiles but is dead-code
+# eliminated since this guest only calls `verify_with_options`. A plain std guest
+# (build-std includes std) — no no_std plumbing needed.
+lambda-vm-prover = { path = "../../../prover", default-features = false }
+lambda-vm-syscalls = { path = "../../../syscalls" }
+postcard = { version = "1.0", features = ["alloc"] }

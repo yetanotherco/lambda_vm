@@ -200,16 +200,7 @@ fn test_serde() {
 
 #[test]
 fn test_random() {
-    let result = run_program_without_expect("./program_artifacts/rust/random.elf", vec![]);
-    assert!(result.is_err());
-    if let Err(executor::vm::execution::ExecutorError::ExecutionError(
-        executor::vm::instruction::execution::ExecutionError::Panic(msg),
-    )) = result
-    {
-        assert_eq!(msg, "getrandom is not supported");
-    } else {
-        panic!("Expected rand error");
-    }
+    run_program_and_check_public_output("./program_artifacts/rust/random.elf", vec![116], vec![]);
 }
 
 #[test]
