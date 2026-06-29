@@ -49,14 +49,11 @@ for both prover and verifier. The GPU runs this same IR, so it must be complete 
 
 ---
 
-## Phase 3 — Device field primitives (GPU prerequisite) 🔜
+## Phase 3 — Device field primitives 🟢 ALREADY EXIST
 
-3.1 Audit `crypto/math-cuda/` for Goldilocks **base** ops (present — LDE uses them) and **degree-3 extension** ops (likely partial — `gpu_lde.rs` falls back to CPU for ext columns). Implement the missing device ops: ext3 `add/sub/mul/neg`, and mixed `base×ext` (= 3 base muls). One field, so bounded.
+Verified: `crypto/math-cuda/kernels/ext3.cuh` provides `ext3::Fe3` + `ext3::{add, sub, mul, mul_base}` (`mul_base` = base×ext, the subfield mul), and `kernels/goldilocks.cuh` the base ops — already used by the GPU FRI / inverse / barycentric / deep kernels. The constraint interpreter **reuses these directly**; there is no new field math to build. (The `gpu_lde.rs` "CPU fallback for extension columns" is about LDE column *dispatch*, not the arithmetic — ext3 LDE itself runs on GPU.)
 
-3.2 Unit-test each device op against the CPU `FieldElement<Goldilocks>`/`<Ext3>` arithmetic (reuse math-cuda's existing kernel test harness).
-
-**Milestone / test:** device field-op parity tests green.
-**Risk:** ext3 device math volume is unknown until the audit. *Mitigation:* it's a small, well-specified surface (one extension, schoolbook degree-3 mul).
+Remaining: trivial — confirm a `neg` exists (else `ext3::sub(zero, x)`) and include the header. Treat as part of Phase 4.
 
 ---
 
@@ -102,18 +99,18 @@ Runs on **GPU hardware** (not in this dev sandbox — I'll hand you the commands
 ```
 Phase 1 (full capture + LogUp)      ~4–6 d   ┐
 Phase 2 (wire CPU + validate)       ~3–4 d   ├─ CPU end-to-end correct
-Phase 3 (device field ops)          ~3–6 d   ┐
-Phase 4 (GPU kernel + dispatch)     ~6–10 d  ├─ GPU path runs
+Phase 3 (device field ops)          ~0  (already exist — reuse ext3.cuh)
+Phase 4 (GPU kernel + dispatch)     ~5–8 d   ┐  reuses existing primitives
 Phase 5 (parity + e2e on GPU)       ~2–4 d   ┘  ← "working on GPU"
 Phase 6 (optimize)                  as needed
 ```
 
-~3–5 weeks to a working, validated GPU constraint evaluator (Phase 6 optional, perf-driven).
+~2.5–4 weeks to a working, validated GPU constraint evaluator (Phase 6 optional, perf-driven). Phase 3 dropping out is the main saving — the device field arithmetic is already there.
 
 ## What I can do here vs on your hardware
 
 - **Phases 1–2** are CPU — I can implement and validate them in this repo directly.
-- **Phases 3–4** (CUDA) I can write, and compile-check under the `cuda` feature, but I **cannot run** GPU kernels in this sandbox.
+- **Phase 4** (CUDA kernel) I can write, and compile-check under the `cuda` feature, but I **cannot run** GPU kernels in this sandbox. (Phase 3 needs nothing — the primitives exist.)
 - **Phase 5** (parity + e2e + bench) runs on your **GPU box / bench server** — I'll provide exact commands; you run and report, I iterate.
 
 ## Decision points to confirm before/while building
