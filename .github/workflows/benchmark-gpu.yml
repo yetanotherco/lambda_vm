@@ -41,7 +41,7 @@ env:
   # Vast offer search: RTX 5090, >=16 cores, >=64GB RAM, >=64GB disk, verified +
   # rentable, Blackwell-capable driver, <= cap.
   GPU_NAME: RTX_5090
-  PRICE_CAP: "3"
+  PRICE_CAP: "1"
   VAST_IMAGE_DISK: "64"
   # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
   BENCH_FEATURES: "jemalloc-stats,prover/cuda"
@@ -142,12 +142,13 @@ jobs:
           # because vast can't numerically compare the driver_version string server-side.
           MIN_DRIVER: "580"
         run: |
-          # cpu_ram in the search filter is GB (the returned .cpu_ram field is MB — different
-          # units), so >=64 means 64 GB. >=64000 would mean 64000 GB and match nothing.
+          # cpu_ram filter is in GB.
           QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=64 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
-          # Keep only offers whose driver major >= MIN_DRIVER, then cheapest first.
-          SELECT="map(select((.driver_version|split(\".\")[0]|tonumber) >= ${MIN_DRIVER})) | sort_by(.dph_total)"
+          # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
+          # (within the price cap) — premium hosts have faster disks/network (quicker image
+          # pulls) and better reliability; the cheapest boxes were flaky.
+          SELECT="map(select((.driver_version|split(\".\")[0]|tonumber) >= ${MIN_DRIVER})) | sort_by(.dph_total) | reverse"
           OFFER_ID=""
           for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
             vastai search offers "$QUERY" --raw -o dph_total > offers.json || true
@@ -214,7 +215,8 @@ jobs:
         run: |
           echo "Waiting for instance $IID to reach 'running' with SSH endpoint..."
           HOST=""; PORT=""
-          for _ in $(seq 1 60); do   # ~10 min
+          # The base CUDA image is large; some hosts sit in 'loading' (image pull) a while.
+          for _ in $(seq 1 180); do   # ~30 min
             vastai show instance "$IID" --raw > inst.json || true
             STATUS=$(jq -r '.actual_status // empty' inst.json)
             # We create with --direct, so SSH straight to the public IP + the host port
