@@ -60,6 +60,7 @@ jobs:
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench') &&
        !startsWith(github.event.comment.body, '/bench-abba') &&
+       !startsWith(github.event.comment.body, '/bench-gpu') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       - name: React to comment
