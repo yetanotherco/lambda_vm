@@ -1,5 +1,10 @@
 # Plan: GPU-ready constraint evaluation via a "Symbolic field" capture
 
+> **Status:** the CPU spike from this plan is **implemented** (PR #737, branch
+> `spike/constraint-ir-symfield`). For the as-built state and the detailed,
+> checkbox continuation plan, see **[`roadmap.md`](./roadmap.md)** — that is the
+> execution / handoff doc. This file remains the full design rationale.
+
 **Approach:** keep the ~29 constraint bodies UNCHANGED; introduce a recording
 field type `SymField`/`SymExt` whose field operations build an expression graph
 instead of computing. Run each constraint's existing generic

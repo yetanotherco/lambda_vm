@@ -1,120 +1,148 @@
-# Roadmap: from the CPU spike to working GPU constraint evaluation
+# GPU constraint evaluation — implementation status & execution plan
 
-Goal: evaluate STARK transition constraints **on the GPU**, end-to-end, producing the
-composition-polynomial evaluations on-device (so the LDE never round-trips to host) — and
-have it verified by a real prove→verify on GPU hardware.
-
-Approach: **Plan A (symbolic field)** capture → single-field Goldilocks IR → interpreter,
-on CPU and GPU. Backend modeled on OpenVM's `cuda-backend` (`others/openvm-stark-backend`).
-
-The IR + interpreter is the contract: **validate it fully on CPU first**, then run the
-*same* IR on GPU. Every phase ends in a green test.
-
-Legend: 🟢 done · 🔜 critical path to "GPU working" · ⏭ optimization (after working).
+**Handoff doc.** Self-contained enough to continue without the originating discussion.
+Describes the code as currently built, the decisions already made, and a detailed
+checkbox plan to take it to a working, GPU-validated constraint evaluator.
 
 ---
 
-## Phase 0 — CPU spike 🟢 DONE (PR #737)
+## Goal & motivation
 
-`SymField`/`SymExt` + IR + CPU interpreter + diff test for base-field algebraic
-constraints. Proves capture is feasible and the IR matches `evaluate` bit-for-bit.
+Evaluate STARK **transition constraints on the GPU**, end-to-end, producing the
+composition-polynomial evaluations **on-device**. The point is **data residency**, not
+constraint-eval speed (constraints are not the prover bottleneck): once LDE/Merkle/FRI run
+on the GPU, evaluating constraints on the CPU forces a D2H round-trip of the (large) LDE
+trace, which dominates. Keeping eval on-device removes that transfer.
 
----
+## Architecture (decided)
 
-## Phase 1 — Full CPU capture coverage 🔜
+Capture each table's constraints **once** into a flat, single-field **Goldilocks IR**
+(typed `Dim1`=base `u64` / `Dim3`=degree-3 extension `[u64;3]` op-DAG), then **interpret**
+that IR on CPU and GPU. One universal kernel; the per-table difference is data. Modeled on
+OpenVM's `cuda-backend` (cloned at `others/openvm-stark-backend`, the closest reference —
+same FRI-STARK / LDE-quotient protocol; better-matched than SP1).
 
-Make the IR cover **every** constraint of a real table (all 33 algebraic + the 2 LogUp),
-for both prover and verifier. The GPU runs this same IR, so it must be complete here.
-
-1.1 **Object-safe capture entry.** Add `fn capture(&self, ctx: &SymCaptureCtx, base: &mut Vec<SymId>, ext: &mut Vec<SymId>)` to `TransitionConstraintEvaluator` (`crypto/stark/src/constraints/transition.rs`). Default impl runs the verifier-shaped body symbolically; `TransitionConstraintAdapter` override runs `self.0.evaluate::<SymField,SymExt>`. Lets us capture by iterating the AIR's existing `Vec<Box<dyn …>>`.
-
-1.2 **LogUp capture (the crux).** Build a symbolic `TransitionEvaluationContext::Prover` whose `rap_challenges`/`logup_alpha_powers`/`logup_table_offset`/`packing_shifts`/`periodic_values` are `Leaf` nodes, and a 2-step symbolic `Frame` (for the accumulated constraint's next-row `aux(1,·)` reads). Override `capture` on `LookupBatchedTermConstraint`/`LookupAccumulatedConstraint` (`crypto/stark/src/lookup.rs`) to run their already-generic inner fns under `SymField`/`SymExt`. Extend the IR `Op::Var` to carry `offset∈{0,1}` and `aux` flag; add `Leaf` variants for the uniforms.
-
-1.3 **Per-table program.** `AIR::constraint_program(&self) -> ConstraintProgram` default method that captures all constraints, with `roots[constraint_idx]` and `num_base` aligned to `num_base_transition_constraints()`.
-
-1.4 **Full CPU interpreter.** Extend `interp.rs` to: resolve all leaf kinds; handle Dim1/Dim3 with auto-embed; output the per-constraint `Cᵢ` (base buffer + ext buffer), matching the `compute_transition_prover` contract. Add a verifier entry (all-D3 frame at the OOD point).
-
-**Milestone / test:** capture the full program for the CPU table (and 1–2 others incl. a LogUp-heavy one), interpret per-row over a real LDE, and `assert_eq!` against `air.compute_transition_prover(...)` bit-for-bit; same for the verifier at the OOD point.
-**Risk:** LogUp context construction. *Mitigation:* the inner fns are already field-generic (verified); the spike proves the recording machinery. If it fights, fall back to hand-emitting the 2 LogUp programs (they're fixed, table-independent).
-
----
-
-## Phase 2 — Wire interpreter into prover/verifier (CPU), behind a toggle 🔜
-
-2.1 In `ConstraintEvaluator::evaluate_transitions` (`crypto/stark/src/constraints/evaluator.rs`), replace the `air.compute_transition_prover(...)` call with the IR interpreter, behind a feature/runtime toggle; keep the boxed path as default + oracle. Build/cache the `ConstraintProgram` once (in `ConstraintEvaluator::new`).
-
-2.2 Verifier: same swap at `crypto/stark/src/verifier.rs` (`compute_transition`).
-
-**Milestone / test:** full prove→verify suite passes with the interpreter as the live path, across **all** tables (CPU, MEMW, LOAD, DECODE, MUL, BRANCH, REGISTER, PAGE, BITWISE, LT, HALT, EC*, keccak, …). This is the **CPU end-to-end** checkpoint — the IR is now proven complete and correct, independent of any GPU work.
+### Decisions already made (don't relitigate without reason)
+- **Capture front-end = Plan A (symbolic field)**: a recording field type whose ops build
+  IR nodes; running a constraint's *existing* generic `evaluate::<SymField,SymExt>` emits
+  the IR with **zero edits to constraint bodies**. (Plan B = rewrite each body to a builder;
+  kept as fallback in `plan-builder-rewrite.md`. Stay on A unless LogUp capture gets messy.)
+- **Backend = interpreter, not codegen** for v1. Codegen stays available later from the same IR.
+- **GPU value array = global memory, no register allocation** to start (simplest, works for
+  all program sizes). Add register allocation only if profiling needs it (Phase 6).
+- **Keep the existing boxed CPU path** as the default + differential oracle behind a toggle.
+- **Device field arithmetic already exists** — reuse `crypto/math-cuda/kernels/ext3.cuh`
+  (`ext3::{add,sub,mul,mul_base}`, where `mul_base` = base×ext) and `kernels/goldilocks.cuh`.
+  Do **not** build new field math.
 
 ---
 
-## Phase 3 — Device field primitives 🟢 ALREADY EXIST
+## Phase 0 — CPU spike  ✅ DONE (PR #737, branch `spike/constraint-ir-symfield`)
 
-Verified: `crypto/math-cuda/kernels/ext3.cuh` provides `ext3::Fe3` + `ext3::{add, sub, mul, mul_base}` (`mul_base` = base×ext, the subfield mul), and `kernels/goldilocks.cuh` the base ops — already used by the GPU FRI / inverse / barycentric / deep kernels. The constraint interpreter **reuses these directly**; there is no new field math to build. (The `gpu_lde.rs` "CPU fallback for extension columns" is about LDE column *dispatch*, not the arithmetic — ext3 LDE itself runs on GPU.)
+Implemented and validated (builds, fmt/clippy clean, diff test green). Covers **base-field
+algebraic constraints only**, single step (offset 0, row 0), main columns only — no aux,
+no next-row, no LogUp, no uniforms, not wired into the prover, no GPU.
 
-Remaining: trivial — confirm a `neg` exists (else `ext3::sub(zero, x)`) and include the header. Treat as part of Phase 4.
+Files (all new under `crypto/stark/src/symbolic/`):
+- `ir.rs` — `enum Dim { D1, D3 }`; `enum Op { Const1(u64), Const3([u64;3]), Var { main: bool, offset: u8, row: u8, col: u16 }, Add(u32,u32), Sub(u32,u32), Mul(u32,u32), Neg(u32), Embed(u32) }`; `struct ConstraintProgram { nodes: Vec<Op>, dims: Vec<Dim>, roots: Vec<u32> }`. Typing: `(D1,D1)->D1`, any `D3` operand -> `D3` (auto-embed); `Embed: D1->D3`.
+- `sym_field.rs` — `SymField` (records `D1`), `SymExt` (records `D3`), `SymId { id: u32, dim: Dim }` (= `BaseType` for both). Thread-local `Arena { nodes, dims, cse: HashMap<(Op,Dim),u32> }` with hash-consing; `with_arena(f) -> (nodes, dims, R)`, `record`/`record_leaf`, `leaf_base`/`leaf_ext`. Node id 0 reserved = `Const1(0)` so `SymId::default()` is base-zero. `impl IsField for SymField`/`SymExt` (ops record nodes; `inv`/`div` = `unimplemented!()`; `eq` = `false`; `from_u64` folds the real Goldilocks reduction). `impl IsSubFieldOf<SymExt> for SymField` (mixed ops -> `D3`, `embed` -> `Embed`). `impl ByteConversion for SymId` = `unimplemented!()` stubs.
+- `capture.rs` — `capture_constraint<T: TransitionConstraint<GoldilocksField, GoldilocksExtension>>(c: &T, num_main_cols: usize) -> ConstraintProgram`: builds a symbolic `TableView<SymField,SymExt>` (1 step, 1 row, `num_main_cols` `Var{main:true}` leaves; aux empty), runs `c.evaluate::<SymField,SymExt>(step)`, snapshots the arena, root = result id.
+- `interp.rs` — `eval_program_base(prog, main_row: &[FieldElement<GoldilocksField>]) -> FieldElement<GoldilocksField>`: forward pass over nodes into a `Value { D1 | D3 }` array, reusing real `FieldElement` arithmetic; resolves `Var{col}` from `main_row`.
+- `mod.rs` — wires submodules; re-exports `capture_constraint`, `eval_program_base`.
 
----
+Also: `crypto/stark/src/lib.rs` (`pub mod symbolic;`); test `prover/src/tests/symbolic_ir_tests.rs` (+ registered in `prover/src/tests/mod.rs`) — captures `IsBit` (cond/uncond), `AddConstraint` (both carries), `ProductZero`, asserts the interpreter == real `evaluate` bit-for-bit over 1000 random rows (deterministic SplitMix64).
 
-## Phase 4 — GPU interpreter kernel 🔜
+**Key fact this proved:** `SymField` only needs `IsField` + `IsSubFieldOf<SymExt>` (capture
+never instantiates `AIR<Field=SymField>`); `IsFFTField`/`IsPrimeField`/`inv`/`div`/real
+`ByteConversion` are all unreachable. Per-constraint IR is a handful of real nodes (the test
+pads with 64 unused column leaves — a `capture_constraint` artifact; see Phase 1).
 
-Start **stripped** (OpenVM's `GLOBAL=true` shape, no register allocation, no bit-packing).
-
-4.1 **Device IR layout.** Serialize `ConstraintProgram` to a `#[repr(C)]` flat node array (`{op_tag, a, b, dim}`) + constants table + roots + `num_base`. Plus per-proof uniform buffers (rap challenges, alpha powers, table_offset, periodic columns, shift consts).
-
-4.2 **Kernel** (`crypto/math-cuda/.../constraint_interp.cu` + Rust wrapper): one thread per LDE row (tiled), forward pass over nodes into a **per-thread value array in global memory** (one slot/node — works for all program sizes), resolving `Main/Aux{offset,col}` from the device-resident LDE columns (`GpuLdeBase`/`GpuLdeExt3` keep-handles), Dim1/Dim3 ops via Phase-3 primitives. **Fused accumulation:** Horner `Σ αⁱ·Cᵢ` + `× inv_zeroifier` → write the composition-poly evaluation per row. Output stays on device.
-
-4.3 **Host dispatch** (`crypto/stark/src/symbolic/gpu_interp.rs`): TypeId-gate on `GoldilocksField`/`Degree3…` + size threshold (mirror `gpu_lde.rs`), upload program + uniforms once, launch, leave output device-resident; fall back to the CPU interpreter otherwise.
-
-4.4 **Pipeline integration.** Feed the on-device composition-poly evals straight into the existing GPU Merkle commit (no D2H). Likely needs a whole-table GPU entry (`air.compute_transitions_batched(lde) -> Option<…>`) that `evaluate_transitions` tries before the per-row CPU loop. Keep `Σ βᵢ·Cᵢ·Zᵢ⁻¹`/boundary accounting consistent with the CPU path.
-
-**Milestone:** kernel compiles under the `cuda` feature; host dispatch wired.
-
----
-
-## Phase 5 — "Working on GPU" ✅ (the target) 🔜
-
-Runs on **GPU hardware** (not in this dev sandbox — I'll hand you the commands; per project convention these run on the GPU/bench box).
-
-5.1 **GPU↔CPU parity test** (extend `prover/tests/cuda_path_integration.rs` / `cuda_fallback_tests.rs`): composition-poly evals on GPU == CPU interpreter == boxed path, per table, on real traces.
-
-5.2 **End-to-end GPU prove→verify** on a real ELF with the GPU constraint path enabled (`--features cuda`). A passing verify = **the deliverable** ("test on GPU and it works").
-
-5.3 **Benchmark** (bench server): prove time with GPU constraints vs CPU constraints — confirm the data-residency win (no LDE D2H for constraint eval).
+Run: `cargo test -p lambda-vm-prover symbolic_ir -- --nocapture`
 
 ---
 
-## Phase 6 — Optimizations ⏭ (only if a profile demands)
+## Phase 1 — Full CPU capture coverage (all constraints, prover + verifier)
 
-6.1 **Register allocation** — port OpenVM's transpiler liveness/linear-scan (`crates/cuda-backend/src/transpiler/mod.rs`) to shrink the per-thread value array → small programs in registers/local, big ones (Dvrm/Shift/ecsm) in a smaller global buffer. First optimization you'll likely need.
-6.2 **DCE / const-fold peephole** — drop unused column leaves; fold `×Const(0)` left by the `eq=false` zero-skip.
-6.3 **Bit-packed codec** — only if H2D bandwidth shows up (it won't early).
-6.4 **Selective codegen** — given few-but-large tables, codegen the 1–3 hottest tables (nvcc does register allocation, no dispatch) if interpreter overhead is material. Hybrid: interpreter baseline + codegen the hot ones.
+Goal: capture **every** constraint of a real table into one `ConstraintProgram`, validated
+on CPU. The GPU runs this same IR, so completeness/correctness must be nailed here first.
+
+- [ ] **Extend the IR** (`ir.rs`): add leaf `Op` variants for the per-proof/per-row uniforms — `Periodic { idx }` (D1), `RapChallenge { idx }` (D3), `AlphaPow { idx }` (D3), `TableOffset` (D3), `Shift { which: u8 }` (D1). `Op::Var` already carries `offset`/`row`/`main` for next-row + aux reads.
+- [ ] **Object-safe capture on the evaluator trait** (`crypto/stark/src/constraints/transition.rs`): add `fn capture(&self, ctx: &SymCaptureCtx, base: &mut Vec<SymId>, ext: &mut Vec<SymId>)` to `TransitionConstraintEvaluator` (object-safe: no generics in the signature; concrete sym types). Adapter (`TransitionConstraintAdapter`) override runs `self.0.evaluate::<SymField,SymExt>` → push a `D1` root for base constraints (`idx < num_base`), else `D3`.
+- [ ] **Symbolic capture context** (`crypto/stark/src/symbolic/capture.rs`): build a `TransitionEvaluationContext::Prover` over sym types — a 2-step `Frame<SymField,SymExt>` of `Var` leaves at offsets `{0,1}` (main + aux), and uniform slices (`rap_challenges`, `logup_alpha_powers`, `logup_table_offset`, `packing_shifts`, `periodic_values`) filled with the new `Leaf` nodes.
+- [ ] **Capture the LogUp constraints** (`crypto/stark/src/lookup.rs`): override `capture` for `LookupBatchedTermConstraint` (~line 1741) and `LookupAccumulatedConstraint` (~1868) to run their already-field-generic inner fns (`compute_fingerprint_from_step`, `compute_multiplicity_from_step`, the `evaluate_*_constraint` fns) under the sym context. The accumulated constraint reads aux at offset 0 **and** 1 → the 2-step symbolic frame handles it. `is_sender` is a compile-time bool → resolves at capture. (Fallback if this fights: hand-emit the 2 fixed LogUp programs; they're table-independent.)
+- [ ] **Per-table program** (`crypto/stark/src/traits.rs`): `fn constraint_program(&self) -> ConstraintProgram` default that iterates `self.transition_constraints()`, captures all (inside one `with_arena`), writes `roots[constraint_idx()]`, sets `num_base = num_base_transition_constraints()`.
+- [ ] **Full interpreter** (`interp.rs`): generalize to `eval_program(prog, inputs) -> (base: Vec<FE<F>>, ext: Vec<FE<E>>)` matching the `compute_transition_prover` contract — resolve all leaf kinds + offsets + aux; Dim1/Dim3 with auto-embed; add a verifier entry (all-D3 frame at the OOD point). Fix the `capture_constraint` leaf padding (record a `Var` leaf only when a column is actually read, or DCE unused leaves).
+- [ ] **Acceptance test:** for the CPU table + ≥1 LogUp-heavy table, capture the full program, interpret per-row over a real LDE, and `assert_eq!` against `air.compute_transition_prover(...)` bit-for-bit; same for the verifier vs `air.compute_transition(...)` at the OOD point.
 
 ---
 
-## Critical path & rough effort
+## Phase 2 — Wire interpreter into prover/verifier (CPU), behind a toggle
 
-```
-Phase 1 (full capture + LogUp)      ~4–6 d   ┐
-Phase 2 (wire CPU + validate)       ~3–4 d   ├─ CPU end-to-end correct
-Phase 3 (device field ops)          ~0  (already exist — reuse ext3.cuh)
-Phase 4 (GPU kernel + dispatch)     ~5–8 d   ┐  reuses existing primitives
-Phase 5 (parity + e2e on GPU)       ~2–4 d   ┘  ← "working on GPU"
-Phase 6 (optimize)                  as needed
-```
+- [ ] Add a `symbolic-interp` Cargo feature (or runtime env toggle) in `crypto/stark/Cargo.toml`.
+- [ ] Cache the `ConstraintProgram` once in `ConstraintEvaluator::new` (`crypto/stark/src/constraints/evaluator.rs`).
+- [ ] In `evaluate_transitions` (same file), behind the toggle, replace the `air.compute_transition_prover(&ctx, base_buf, transition_buf)` call (~line 100) with the IR interpreter; keep the boxed path as default + oracle. Leave the `Σ βᵢ·Cᵢ·Zᵢ⁻¹ + boundary` accumulation untouched.
+- [ ] Verifier: same swap at `crypto/stark/src/verifier.rs` (`air.compute_transition`).
+- [ ] **Acceptance:** full prove→verify suite passes with the toggle ON, across all tables — `cargo test --release -p lambda-vm-prover` (incl. `test_prove_elfs_*`). This is the **CPU end-to-end** checkpoint; the IR is now proven complete and correct independent of GPU.
 
-~2.5–4 weeks to a working, validated GPU constraint evaluator (Phase 6 optional, perf-driven). Phase 3 dropping out is the main saving — the device field arithmetic is already there.
+---
 
-## What I can do here vs on your hardware
+## Phase 3 — Device field primitives  ✅ ALREADY EXIST
 
-- **Phases 1–2** are CPU — I can implement and validate them in this repo directly.
-- **Phase 4** (CUDA kernel) I can write, and compile-check under the `cuda` feature, but I **cannot run** GPU kernels in this sandbox. (Phase 3 needs nothing — the primitives exist.)
-- **Phase 5** (parity + e2e + bench) runs on your **GPU box / bench server** — I'll provide exact commands; you run and report, I iterate.
+Reuse `crypto/math-cuda/kernels/ext3.cuh` (`ext3::Fe3`, `ext3::{add,sub,mul,mul_base}`) and
+`kernels/goldilocks.cuh`. Already used by the GPU FRI/inverse/barycentric/deep kernels.
+Only remaining: confirm a `neg` (else `ext3::sub(zero, x)`) and include the header — do it
+as part of Phase 4.
 
-## Decision points to confirm before/while building
+---
 
-- Keep **Plan A** (symbolic field) for full capture (spike validated it), or switch to Plan B's explicit `capture()` for the cleaner end-state? (Recommendation: stay Plan A through Phase 2; revisit only if LogUp capture is unexpectedly messy.)
-- GPU value array: start **global-memory** (simplest, all tables) — defer register allocation to Phase 6 unless Phase 4 node-count data says otherwise.
-- CPU path after Phase 2: keep the boxed path as the default oracle (toggle), or commit the interpreter as the CPU default too?
+## Phase 4 — GPU interpreter kernel
+
+Start **stripped** (mirror OpenVM's `GLOBAL=true` kernel: global-memory value array, no
+register allocation, no bit-packed codec). Reference: `others/openvm-stark-backend/crates/cuda-backend/cuda/src/quotient.cu` (`cukernel_quotient`) and `cuda/include/codec.cuh`.
+
+- [ ] **Device IR layout** (`crypto/stark/src/symbolic/` + `crypto/math-cuda`): serialize `ConstraintProgram` to a `#[repr(C)]` flat node array (`{ op_tag: u32, a: u32, b: u32, dim: u32 }`) + a constants table + `roots` + `num_base`. Plus per-proof uniform device buffers (rap challenges, alpha powers, table_offset, periodic columns, shift consts).
+- [ ] **Kernel** (`crypto/math-cuda/kernels/constraint_interp.cu` + Rust wrapper in `crypto/math-cuda/src/`): one thread per LDE row (tiled). Forward pass over the node array into a **per-thread value array in global memory** (one slot per node, strided per thread). Resolve `Var{main/aux, offset, col}` from the device-resident LDE columns (`GpuLdeBase`/`GpuLdeExt3` keep-handles from `trace.gpu_main()`/`gpu_aux()`). Dim1 ops via `goldilocks.cuh`, Dim3 via `ext3.cuh` (`mul_base` for D1×D3). **Fused accumulation:** Horner `acc = acc*alpha + Cᵢ` over the `roots` flagged as constraints, then `acc *= inv_zeroifier[row]` → write the composition-poly evaluation. Output stays on device.
+- [ ] **Host dispatch** (`crypto/stark/src/symbolic/gpu_interp.rs`): `try_eval_program_gpu<F,E>(...) -> Option<...>` gated on `TypeId::of::<F>() == GoldilocksField && TypeId::of::<E>() == Degree3GoldilocksExtensionField` + a size threshold (mirror `crypto/stark/src/gpu_lde.rs:119-152`). Upload program + uniforms once; launch; leave output device-resident. Fall back to the CPU interpreter / boxed path otherwise.
+- [ ] **Pipeline integration:** add a whole-table GPU entry (e.g. `AIR::compute_transitions_batched(lde) -> Option<DeviceBuf>` tried by `evaluate_transitions` before the per-row loop) so the composition-poly evals are produced on-device and feed the existing GPU Merkle commit with **no D2H of the `Cᵢ` matrix**. Reconcile zerofier/boundary accounting with the CPU semantics.
+- [ ] **Acceptance:** compiles under `cargo build -p lambda-vm-prover --features cuda`.
+
+---
+
+## Phase 5 — "Working on GPU" (the deliverable) — runs on the CUDA machine
+
+- [ ] **GPU↔CPU parity test** (extend `prover/tests/cuda_path_integration.rs` / `cuda_fallback_tests.rs`): composition-poly evals on GPU == CPU interpreter == boxed path, per table, on real traces.
+- [ ] **End-to-end GPU prove→verify** on a real ELF with `--features cuda`. A passing verify is the goal.
+- [ ] **Benchmark** (bench server): prove time with GPU constraints vs CPU constraints — confirm the data-residency win (no LDE D2H for constraint eval).
+
+---
+
+## Phase 6 — Optimizations (only if a profile demands)
+
+- [ ] **Register allocation** — port OpenVM's transpiler liveness + linear-scan (`others/openvm-stark-backend/crates/cuda-backend/src/transpiler/mod.rs`) to shrink the per-thread value array (local `FpExt[N]` for small programs, smaller global buffer for large ones like Dvrm/Shift/ecsm).
+- [ ] **DCE / const-fold peephole** — drop unused column leaves; fold `×Const(0)`/`+Const(0)` left by the `eq=false` zero-skip.
+- [ ] **Bit-packed codec** — only if H2D bandwidth shows up (unlikely; the rule stream is tiny and uploaded once).
+- [ ] **Selective codegen** — given few-but-large tables, codegen the 1–3 hottest tables (nvcc does register allocation, no per-op dispatch) if interpreter overhead is material. Hybrid: interpreter baseline + codegen the hot ones.
+
+---
+
+## Gotchas / invariants
+
+- **Single field:** Goldilocks base + degree-3 extension only. The IR's `Dim1`/`Dim3` and
+  the `ext3.cuh` primitives cover everything.
+- **Object safety:** generic methods can't live on `Box<dyn TransitionConstraintEvaluator>`.
+  Capture runs once at setup (where concrete types exist), via the non-generic `capture`
+  method. The per-row hot path only interprets the (data) IR.
+- **`eq = false`:** defeats the runtime "skip zero term" optimization during capture, so the
+  IR always emits the multiply — value-identical (×0 / +0 is a no-op), just unoptimized.
+  A DCE/const-fold peephole (Phase 6) recovers it.
+- **Don't D2H the `Cᵢ` matrix:** fuse the accumulation in the GPU kernel so only the
+  (small) composition-poly evaluation crosses on-device into Merkle.
+- **LDE columns are already device-resident** (`GpuLdeBase`/`GpuLdeExt3`); read them in place.
+
+## Reference material (in-repo)
+
+- `others/openvm-stark-backend/crates/cuda-backend/` — `src/transpiler/{mod.rs,codec.rs}`, `src/quotient/`, `cuda/src/quotient.cu`, `cuda/include/codec.cuh`. The closest working reference (BabyBear; for Goldilocks the only deltas are 64-bit constants needing a side table, degree-3 ext, and they run all-FpExt with no base/ext split).
+- `crypto/stark/src/gpu_lde.rs` — the TypeId+transmute generic→concrete-Goldilocks GPU seam to mirror.
+- `thoughts/gpu-constraint-eval/plan-symbolic-field.md` — the full Plan A design (this is what Phase 0 implemented; Phases 1+ detail its remaining sections).
+- `thoughts/gpu-constraint-eval/plan-builder-rewrite.md` — Plan B (fallback capture front-end).
+- `thoughts/gpu-constraint-eval/README.md` — motivation + the SP1/OpenVM/zisk survey.
