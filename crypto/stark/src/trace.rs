@@ -214,9 +214,8 @@ where
 /// steps flip: once a consumer reads from the device buffer instead, the
 /// corresponding mirror is dropped and the H2D/D2H copy elided.
 ///
-/// Scope: this owns the main/aux trace LDE (resident R1→R4). The composition
-/// parts (`Round2`, R2→R4) and the bound stream are folded in by the control-
-/// plane commit, where the R2→R4 borrow chain becomes mutable. The R4-local
+/// Scope: this owns the main/aux trace LDE (resident R1→R4), the composition
+/// parts (`Round2`, R2→R4), and the per-table bound stream. The R4-local
 /// `inv_denoms`/FRI state are created and consumed within R4 and stay local.
 #[cfg(feature = "cuda")]
 pub(crate) struct GpuTableSession {
