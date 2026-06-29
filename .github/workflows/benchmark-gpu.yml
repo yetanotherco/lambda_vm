@@ -19,14 +19,9 @@ on:
     inputs:
       pairs:
         description: "Number of A/B/B/A pairs"
-        default: "1"   # TEMP(testing): fast runs; restore to "10" before merge
+        default: "14"
   issue_comment:
     types: [created]
-  # TEMP(testing): lets the workflow run from this branch before it's on the default
-  # branch (push uses the branch's own definition; issue_comment/workflow_dispatch do
-  # not). REMOVE this push trigger before merging.
-  push:
-    branches: [gpu_benchmarks]
 
 permissions:
   contents: read
@@ -50,10 +45,7 @@ jobs:
   benchmark-gpu:
     runs-on: ubuntu-latest
     # Skip unless: workflow_dispatch, or a "/bench-gpu" comment from a privileged author.
-    # TEMP(testing): `github.event_name == 'push'` lets branch pushes run it pre-merge.
-    # REMOVE the push clause before merging.
     if: >-
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
@@ -78,16 +70,16 @@ jobs:
             OUT_PR_NUM="$PR_NUM"; OUT_HEAD_SHA="$HEAD_SHA"; OUT_BRANCH=""
             # "/bench-gpu 20" -> 20 pairs; otherwise default.
             N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-gpu[[:space:]]*\([0-9]\+\).*|\1|p')
-            PAIRS=${N:-1}   # TEMP(testing): default 1; restore to 10 before merge
+            PAIRS=${N:-14}
           else
-            # workflow_dispatch / push: compare this branch vs main.
+            # workflow_dispatch: compare this branch vs main.
             OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
-            PAIRS=${DISPATCH_PAIRS:-1}   # TEMP(testing): default 1; restore to 10 before merge
+            PAIRS=${DISPATCH_PAIRS:-14}
           fi
-          # TEMP(testing): clamp floor lowered to 1 for fast runs; restore to [2,40] before merge.
-          if [ "$PAIRS" -lt 1 ] 2>/dev/null || [ "$PAIRS" -gt 40 ] 2>/dev/null; then
-            echo "::warning::pair count out of range [1,40], defaulting to 1"
-            PAIRS=1
+          # Clamp to [2,40] (even is ideal so AB/BA orders balance). 14 ~ resolves a 2% delta.
+          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 40 ] 2>/dev/null; then
+            echo "::warning::pair count out of range [2,40], defaulting to 14"
+            PAIRS=14
           fi
           {
             echo "pr_num=$OUT_PR_NUM"
@@ -297,17 +289,20 @@ jobs:
             REF_A="origin/$BRANCH"
           fi
 
-          # The template clones the repo at the DEFAULT branch (main), so check out the PR
-          # ref first — otherwise we'd run main's bench_abba.sh (no BENCH_FEATURES => CPU
-          # build). bench_abba.sh then builds the cli at REF_A and origin/main (isolated
-          # worktree), runs PAIRS interleaved A/B/B/A proves, and prints the paired-t CI +
-          # Wilcoxon verdict. BENCH_FEATURES routes the build through the CUDA prover path.
+          # Run main's bench_abba.sh — the harness is the pinned measurement methodology, so a
+          # PR can't alter how its own benchmark is computed. (The template clones the default
+          # branch, so checking out origin/main is also what's already there; this makes it
+          # explicit and robust to the template default changing.) The harness still builds the
+          # cli at REF_A (the PR) and origin/main in isolated worktrees, runs PAIRS interleaved
+          # A/B/B/A proves, and prints the paired-t CI + Wilcoxon verdict. BENCH_FEATURES routes
+          # the build through the CUDA prover path. NOTE: requires this PR's bench_abba.sh change
+          # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
           # binaries (PTX is compiled for the detected arch); never trust a cached binary.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             git fetch --force origin main; $FETCH; \
-            git checkout -f $REF_A; \
+            git checkout -f origin/main; \
             REBUILD=1 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
@@ -315,8 +310,8 @@ jobs:
           # Extract the result section for the PR comment (same marker bench-abba.yml uses).
           sed -n '/=== ABBA paired result/,$p' "$RUNNER_TEMP/abba_out.txt" > "$RUNNER_TEMP/abba_result.txt"
 
-          # Surface the result in the Actions run summary too (push/workflow_dispatch
-          # runs have no PR to comment on).
+          # Surface the result in the Actions run summary too (workflow_dispatch runs
+          # have no PR to comment on).
           {
             echo "## GPU ABBA — ethrex 20 transfers (vs main)"
             echo '```'
