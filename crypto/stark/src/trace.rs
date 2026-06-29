@@ -195,58 +195,31 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// Per-table GPU residency session: owns the device-resident trace LDE
-    /// buffers (main + aux) and tracks, per buffer, whether a host mirror is
-    /// live. Created on the CPU path too (all buffers `None`, mirrors present);
-    /// populated when the R1 fused GPU pipeline runs. Threaded R1→R4 because
-    /// `LDETraceTable` is borrowed through every round.
+    /// Per table GPU residency session: owns this table's device LDE buffers
+    /// and bound stream. Threaded R1 to R4. Empty on the CPU path.
     #[cfg(feature = "cuda")]
     pub(crate) gpu_session: GpuTableSession,
 }
 
-/// Per-table GPU residency session.
+/// Per table GPU residency session.
 ///
-/// Owns the device-resident buffers for a single trace table and tracks, per
-/// buffer, whether a host mirror is currently materialised. Today every buffer
-/// produced on the GPU is *also* copied to host columns, because the remaining
-/// CPU consumers (R2 constraint evaluation, R3 barycentric OOD, R4 query
-/// openings) read from host. The `*_host_mirror` flags are the seam those later
-/// steps flip: once a consumer reads from the device buffer instead, the
-/// corresponding mirror is dropped and the H2D/D2H copy elided.
-///
-/// Scope: this owns the main/aux trace LDE (resident R1→R4), the composition
-/// parts (`Round2`, R2→R4), and the per-table bound stream. The R4-local
-/// `inv_denoms`/FRI state are created and consumed within R4 and stay local.
+/// Owns the device buffers for one trace table: the main and aux trace LDE
+/// (resident R1 to R4), the composition parts LDE (R2 to R4), and a bound
+/// stream. The R4 local inv_denoms and FRI state stay local to R4.
 #[cfg(feature = "cuda")]
 pub(crate) struct GpuTableSession {
-    /// Main-trace LDE, resident from the R1 fused pipeline through R4. `None`
-    /// when the GPU LDE didn't run for this table (below the size threshold or
-    /// any CPU fallback: preprocessed main, non-Goldilocks, or GPU error).
+    /// Main trace LDE, resident from the R1 fused pipeline through R4. None
+    /// when the GPU LDE did not run (below threshold, preprocessed main, not
+    /// Goldilocks, or a GPU error).
     main_lde: Option<math_cuda::lde::GpuLdeBase>,
-    /// Aux-trace LDE (ext3 de-interleaved layout on device), resident R1→R4.
+    /// Aux trace LDE (ext3, deinterleaved on device), resident R1 to R4.
     aux_lde: Option<math_cuda::lde::GpuLdeExt3>,
-    /// Composition-poly parts LDE (ext3 de-interleaved on device), produced in
-    /// R2 and resident R2→R4 so R4 DEEP reads the parts on-device instead of a
-    /// `num_parts * 3 * lde_size * 8` byte H2D. `None` when the R2 GPU path
-    /// didn't run (number_of_parts <= 2, below threshold, or CPU fallback).
+    /// Composition parts LDE (ext3, deinterleaved on device), produced in R2
+    /// and resident R2 to R4 so R4 DEEP reads them on device. None when the R2
+    /// GPU path did not run.
     composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
-    /// Whether the main-trace host columns currently mirror `main_lde`.
-    /// Always `true` today; CPU consumers depend on it.
-    main_host_mirror: bool,
-    /// Whether the aux-trace host columns currently mirror `aux_lde`.
-    /// Always `true` today; CPU consumers depend on it.
-    aux_host_mirror: bool,
-    /// Whether the host composition-parts evaluations (`Round2`) mirror
-    /// `composition_parts`. Always `true` today; R4 openings read host.
-    composition_host_mirror: bool,
     /// Stream bound to this table's GPU work, acquired lazily from the backend
-    /// pool on first use and cached for the session's lifetime. The R3/R4
-    /// device-resident chain (inv_denoms → barycentric/OOD → DEEP) runs on it
-    /// today; the heavy LDE/Merkle ops join once they thread a stream. Binding
-    /// one stream per table serialises a table's kernels on a single queue and
-    /// gives distinct tables distinct streams — the prerequisite for cross-table
-    /// overlap once the host mirrors drop (Steps 4–5). `None` is cached if the
-    /// backend is unavailable, so callers fall back to the CPU path.
+    /// pool and cached. None is cached when the backend is unavailable.
     stream: OnceLock<Option<Arc<math_cuda::CudaStream>>>,
 }
 
@@ -257,12 +230,6 @@ impl GpuTableSession {
             main_lde: None,
             aux_lde: None,
             composition_parts: None,
-            // Host columns are always materialised today; the CPU consumers
-            // (constraint eval, OOD, openings) read them. Steps 5/6 flip these
-            // off as each consumer moves to reading the device buffer.
-            main_host_mirror: true,
-            aux_host_mirror: true,
-            composition_host_mirror: true,
             stream: OnceLock::new(),
         }
     }
@@ -293,9 +260,8 @@ where
         }
     }
 
-    /// Attach an already-populated device LDE handle for the main columns.
-    /// Only set when the GPU fused pipeline produced the LDE. Callers that
-    /// ran the CPU path should leave this alone.
+    /// Attach the device LDE handle for the main columns, produced by the GPU
+    /// fused pipeline. Leave unset on the CPU path.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
         self.gpu_session.main_lde = Some(h);
@@ -317,23 +283,8 @@ where
         self.gpu_session.aux_lde.as_ref()
     }
 
-    /// Whether the main-trace host columns currently mirror the device LDE.
-    /// Always `true` today (CPU consumers read host); the source-agnostic seam
-    /// steps 5/6 flip when the main consumer reads the device buffer instead.
-    #[cfg(feature = "cuda")]
-    pub fn main_host_mirror(&self) -> bool {
-        self.gpu_session.main_host_mirror
-    }
-
-    /// Whether the aux-trace host columns currently mirror the device LDE.
-    /// Always `true` today; see [`Self::main_host_mirror`].
-    #[cfg(feature = "cuda")]
-    pub fn aux_host_mirror(&self) -> bool {
-        self.gpu_session.aux_host_mirror
-    }
-
-    /// Attach the device-resident composition-poly parts LDE produced in R2.
-    /// Read by R4 DEEP so the parts aren't re-uploaded H2D.
+    /// Attach the composition parts LDE produced in R2. Read by R4 DEEP so the
+    /// parts are not re-uploaded.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_composition_parts(&mut self, h: math_cuda::lde::GpuLdeExt3) {
         self.gpu_session.composition_parts = Some(h);
@@ -344,17 +295,9 @@ where
         self.gpu_session.composition_parts.as_ref()
     }
 
-    /// Whether the host composition-parts evaluations mirror the device buffer.
-    /// Always `true` today; see [`Self::main_host_mirror`].
-    #[cfg(feature = "cuda")]
-    pub fn composition_host_mirror(&self) -> bool {
-        self.gpu_session.composition_host_mirror
-    }
-
     /// The stream bound to this table's GPU work. Acquired lazily from the
-    /// backend pool on first call and cached for the session's lifetime, so all
-    /// of a table's stream-threaded ops share one queue. Returns `None` (cached)
-    /// when the backend is unavailable; callers then fall back to the CPU path.
+    /// backend pool on first call and cached, so all of a table's stream ops
+    /// share one queue. Returns None (cached) when the backend is unavailable.
     #[cfg(feature = "cuda")]
     pub fn bound_stream(&self) -> Option<Arc<math_cuda::CudaStream>> {
         self.gpu_session

@@ -1,7 +1,7 @@
 //! Parity: GPU `gather_merkle_paths_dev` must produce, for each leaf position,
-//! the exact `merkle_path` the CPU `MerkleTree::get_proof_by_pos` returns —
-//! same sibling-from-leaf-to-root order, byte-for-byte. This is the gate for
-//! gathering R4 query openings on device instead of D2H'ing the whole tree.
+//! the exact `merkle_path` the CPU `MerkleTree::get_proof_by_pos` returns: the
+//! same sibling order from leaf to root, byte for byte. This is the gate for
+//! gathering R4 query openings on device instead of copying the whole tree.
 
 use crypto::merkle_tree::backends::field_element_vector::FieldElementVectorBackend;
 use crypto::merkle_tree::merkle::MerkleTree;

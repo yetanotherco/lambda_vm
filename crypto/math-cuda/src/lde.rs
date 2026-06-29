@@ -220,10 +220,9 @@ fn launch_pointwise_mul_batched(
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
 ///
-/// `tree` optionally carries the main-trace Merkle tree kept resident on device
-/// (populated by the keep path), so R4 query openings can gather authentication
-/// paths on device instead of D2H'ing the whole tree to host. `None` on the CPU
-/// path or when the tree wasn't retained.
+/// `tree` optionally carries the main trace Merkle tree kept resident on device
+/// (the keep path), so R4 query openings gather paths on device instead of
+/// copying the whole tree to host. None on the CPU path.
 #[derive(Clone)]
 pub struct GpuLdeBase {
     pub buf: Arc<CudaSlice<u64>>,
@@ -240,24 +239,22 @@ pub struct GpuLdeExt3 {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
-    /// Optionally the aux/composition Merkle tree kept resident on device (the
-    /// keep path), so R4 openings gather paths on device instead of D2H'ing the
-    /// whole tree. `None` on the CPU path or when not retained.
+    /// Optionally the aux or composition Merkle tree kept resident on device
+    /// (the keep path), so R4 openings gather paths on device. None otherwise.
     pub tree: Option<GpuMerkleTree>,
 }
 
-/// Handle to a Merkle tree kept live on device after a commit, so query
-/// openings can gather authentication paths on device instead of D2H'ing the
-/// whole tree to host. Node layout matches the CPU tree
-/// (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]` are inner nodes
-/// (root at index 0), `nodes[leaves_len-1..]` are the leaves; each node is 32
+/// Merkle tree kept resident on device after a commit, so query openings gather
+/// paths on device instead of copying the whole tree to host. Node layout
+/// matches the CPU tree (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]`
+/// are inner nodes (root at 0), `nodes[leaves_len-1..]` are the leaves, each 32
 /// bytes. Freed when the `nodes` Arc drops.
 #[derive(Clone)]
 pub struct GpuMerkleTree {
     pub nodes: Arc<CudaSlice<u8>>,
     pub leaves_len: usize,
-    /// The Merkle root (node 0), copied to host at build time (32 bytes) so the
-    /// commitment is available without D2H'ing the whole tree.
+    /// The Merkle root (node 0), copied to host at build time so the commitment
+    /// is available without copying the whole tree.
     pub root: [u8; 32],
 }
 
@@ -643,41 +640,11 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     .map(|_| ())
 }
 
-/// Like `coset_lde_batch_base_into_with_leaf_hash`, but also builds the full
-/// Merkle tree on device and returns the `2*lde_size - 1` node buffer back
-/// to the caller in `merkle_nodes_out` (byte length `(2*lde_size - 1) * 32`).
-///
-/// The leaf hashes are never exposed to the caller — they stay on device and
-/// feed straight into the pair-hash tree kernel, avoiding the
-/// pinned→pageable→pinned round-trip that the separate-step GPU tree build
-/// would pay.
-pub fn coset_lde_batch_base_into_with_merkle_tree(
-    columns: &[&[u64]],
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_base_into_with_merkle_tree_inner(
-        columns,
-        blowup_factor,
-        weights,
-        outputs,
-        Some(merkle_nodes_out),
-        KeccakCommit::FullTree,
-        false,
-        false,
-    )
-    .map(|_| ())
-}
-
-/// Fused LDE + leaf-hash + Merkle tree build, keeping **both** the LDE buffer
-/// and the Merkle tree resident on device (returned in `GpuLdeBase` + its
-/// `tree`, including the root). The host tree is **not** materialised — there is
-/// no `merkle_nodes_out` — so the whole-tree Device→Host copy is eliminated.
-/// Callers gather query authentication paths from the device tree instead
-/// (`crate::merkle::gather_merkle_paths_dev`) and use a root-only host tree for
-/// the commitment.
+/// Fused LDE, leaf hash, and Merkle tree build that keeps both the LDE buffer
+/// and the Merkle tree (with root) resident on device, returned in `GpuLdeBase`.
+/// The host tree is not built (no `merkle_nodes_out`), so the whole tree copy to
+/// host is eliminated. Callers gather query paths from the device tree
+/// (`crate::merkle::gather_merkle_paths_dev`) and use a root only host tree.
 pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -840,20 +807,20 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
     }
 
-    // D2H the LDE columns via pinned staging (still read on host by constraint
-    // eval / openings). The full tree nodes are D2H'd only when the caller asks
-    // for a host tree (`nodes_out`); the device-resident path passes `None` and
-    // keeps the tree on device, eliminating the whole-tree D2H.
+    // Copy the LDE columns to host via pinned staging (constraint eval and
+    // openings still read them). The full tree is copied only when the caller
+    // wants a host tree (`nodes_out`); the resident path passes None and keeps
+    // the tree on device.
     stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
     if let Some(no) = nodes_out {
         d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, no)?;
     }
-    // Ensure the (async) LDE D2H above has landed before reading `pinned`.
-    // Previously the tree D2H's `synchronize` covered this; the device-resident
-    // path skips that D2H, so synchronize explicitly.
+    // Make sure the async LDE copy above landed before reading `pinned`. The
+    // tree copy used to provide this sync; the resident path skips it, so sync
+    // here.
     stream.synchronize()?;
 
-    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
+    // Copy pinned into caller outputs. Runs under the pinned staging lock,
     // where rayon can deadlock. See `Backend::pinned_staging`.
     for (c, dst) in outputs.iter_mut().enumerate() {
         dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
@@ -861,11 +828,11 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     drop(staging);
 
     if keep_device_buf {
-        // Retain the device tree nodes for on-device opening (FullTree only; in
-        // LeavesOnly mode there are no inner nodes to gather paths from).
+        // Retain the device tree for on device opening (FullTree only; LeavesOnly
+        // has no inner nodes to gather paths from).
         let tree = if keep_tree && commit == KeccakCommit::FullTree {
-            // Copy just the 32-byte root (node 0) so the commitment is available
-            // without D2H'ing the whole tree.
+            // Copy just the 32 byte root (node 0) so the commitment is available
+            // without copying the whole tree.
             let mut root = [0u8; 32];
             stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
             stream.synchronize()?;
@@ -891,60 +858,10 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     }
 }
 
-/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused
-/// LDE + Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
-/// `coset_lde_batch_ext3_into_with_merkle_tree_inner` with `LeavesOnly`.
-pub fn coset_lde_batch_ext3_into_with_leaf_hash(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    hashed_leaves_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        Some(hashed_leaves_out),
-        KeccakCommit::LeavesOnly,
-        false,
-        false,
-    )
-    .map(|_| ())
-}
-
-/// Ext3 variant of the fused `coset_lde_batch_base_into_with_merkle_tree`.
-/// LDE + leaf hashing + inner-tree build, all on device; D2Hs only the LDE
-/// evaluations and the full `2*lde_size - 1` node buffer.
-pub fn coset_lde_batch_ext3_into_with_merkle_tree(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        Some(merkle_nodes_out),
-        KeccakCommit::FullTree,
-        false,
-        false,
-    )
-    .map(|_| ())
-}
-
 /// Ext3 variant of [`coset_lde_batch_base_into_with_merkle_tree_keep`]: keeps
-/// both the de-interleaved LDE buffer and the Merkle tree (with root) resident
-/// on device. The host tree is **not** materialised (no `merkle_nodes_out`), so
-/// the whole-tree D2H is eliminated; openings gather paths from the device tree.
+/// both the deinterleaved LDE buffer and the Merkle tree (with root) resident on
+/// device. No host tree is built, so the whole tree copy to host is eliminated;
+/// openings gather paths from the device tree.
 pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
     columns: &[&[u64]],
     n: usize,
@@ -1103,15 +1020,15 @@ fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
     }
 
-    // D2H the LDE columns. The full tree nodes are D2H'd only when the caller
-    // asks for a host tree (`nodes_out`); the device-resident path passes `None`
-    // and keeps the tree on device, eliminating the whole-tree D2H.
+    // Copy the LDE columns to host. The full tree is copied only when the caller
+    // wants a host tree (`nodes_out`); the resident path passes None and keeps
+    // the tree on device.
     stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
     if let Some(no) = nodes_out {
         d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, no)?;
     }
-    // Ensure the (async) LDE D2H has landed before reading `pinned` (the tree
-    // D2H's synchronize used to cover this; the device-resident path skips it).
+    // Make sure the async LDE copy landed before reading `pinned` (the tree copy
+    // used to provide this sync; the resident path skips it).
     stream.synchronize()?;
 
     unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);

@@ -221,11 +221,10 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
 /// Gather Merkle authentication paths on device for `positions` (leaf indices)
 /// against the resident tree `nodes_dev` (standard layout, `2*leaves_len-1`
 /// nodes of 32 bytes). Returns `positions.len() * depth * 32` bytes, where
-/// `depth = log2(leaves_len)`: query `q`'s path occupies bytes
-/// `[q*depth*32 .. (q+1)*depth*32]`, each 32-byte node a sibling from leaf to
-/// root — byte-for-byte the same nodes the CPU `MerkleTree::get_proof_by_pos`
-/// (`build_merkle_path`) collects. Runs on the caller's `stream` (pass the
-/// table's session stream so it shares the queue with the rest of R4).
+/// `depth = log2(leaves_len)`. Query `q`'s path is `[q*depth*32 ..
+/// (q+1)*depth*32]`, each 32 byte node a sibling from leaf to root. These are
+/// the same nodes the CPU `MerkleTree::get_proof_by_pos` collects. Runs on the
+/// caller's `stream` (pass the table's session stream).
 pub fn gather_merkle_paths_dev(
     nodes_dev: &CudaSlice<u8>,
     leaves_len: usize,
@@ -241,9 +240,9 @@ pub fn gather_merkle_paths_dev(
         "leaves_len must be a power of two >= 2"
     );
     let depth = leaves_len.trailing_zeros() as usize;
-    // Guard the kernel's device reads: an out-of-range position would walk off
-    // the node buffer (OOB device read). Positions are valid by construction;
-    // this catches any caller bug before it becomes UB.
+    // Guard the kernel's device reads: a position past leaves_len would walk
+    // off the node buffer. Positions are valid by construction; this catches a
+    // caller bug before it becomes an out of bounds device read.
     assert!(
         positions.iter().all(|&p| (p as usize) < leaves_len),
         "gather_merkle_paths_dev: leaf position >= leaves_len"
@@ -286,9 +285,9 @@ pub fn gather_merkle_paths_dev(
 ///
 /// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
 /// layout (root at byte offset 0, leaves in the tail).
-/// Build the composition-poly Merkle tree on device (leaves hash row-pairs, so
-/// `num_leaves = lde_size / 2`). Returns the device node buffer, the leaf count,
-/// and the stream it was built on. Shared by the host-D2H and device-keep
+/// Build the composition Merkle tree on device. Leaves hash row pairs, so
+/// `num_leaves = lde_size / 2`. Returns the device node buffer, the leaf count,
+/// and the stream it was built on. Shared by the host copy and device keep
 /// wrappers below.
 fn build_comp_poly_tree_nodes_dev(
     parts_interleaved: &[&[u64]],
@@ -366,8 +365,8 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
 
 /// Like [`build_comp_poly_tree_from_evals_ext3`] but keeps the tree nodes on
 /// device (returned as a [`crate::lde::GpuMerkleTree`] with its root), so R4
-/// composition openings gather authentication paths on device instead of
-/// D2H'ing the whole tree. `leaves_len = lde_size / 2` (row-pair leaves).
+/// composition openings gather paths on device instead of copying the whole
+/// tree to host. `leaves_len = lde_size / 2` (row pair leaves).
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
 ) -> Result<crate::lde::GpuMerkleTree> {

@@ -325,20 +325,14 @@ pub fn table_parallelism() -> usize {
     }
 }
 
-/// Heuristic peak device working-set for one table, in bytes.
-///
-/// Two contributions:
-/// 1. **LDE columns** co-resident on the GPU — `main` in the base field (8 B)
-///    and `aux` in the ext3 field (24 B) — times a scratch multiplier for the
-///    NTT / leaf-hash transients allocated alongside them.
-/// 2. **Resident Merkle trees** — main, aux, composition, and FRI-layer trees
-///    are now kept on device R1→R4 (no whole-tree D2H). Each full tree is
-///    `~2*lde_size` nodes × 32 B = `64*lde_size`; co-resident at the R4 peak
-///    they sum to a few × that, so `~256 B × lde_size` covers them conservatively.
-///
-/// It is deliberately a conservative over-estimate: it gates a safety ceiling,
-/// not a precise allocator. Pass `aux_cols == 0` for phases where the aux LDE
-/// is not yet resident (the R1 main commit).
+/// Heuristic peak device working set for one table, in bytes. Two parts: the
+/// LDE columns co-resident on the GPU (main base field at 8 B, aux ext3 at
+/// 24 B) times a scratch factor for the NTT and leaf hash transients, plus the
+/// resident Merkle trees (main, aux, composition, FRI layers) kept on device R1
+/// to R4. Each full tree is about `2*lde_size` nodes of 32 B (`64*lde_size`);
+/// together at the R4 peak about 256 B per `lde_size` covers them. A deliberate
+/// over estimate that gates a safety ceiling, not a precise allocator. Pass
+/// `aux_cols == 0` where the aux LDE is not yet resident (R1 main commit).
 fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
     const BYTES_PER_BASE: u64 = 8;
     const EXT3_BYTES: u64 = 24;
@@ -354,15 +348,14 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
 
 /// Plan contiguous table chunks for parallel proving.
 ///
-/// A chunk grows until it reaches `k` tables (the core/RAM-bound limit) **or**
-/// its summed VRAM estimate would exceed `budget` — whichever comes first. A
+/// A chunk grows until it reaches `k` tables (the core and RAM bound limit) or
+/// its summed VRAM estimate would exceed `budget`, whichever comes first. A
 /// single table larger than `budget` forms its own chunk (it runs solo rather
 /// than being excluded). With `budget == u64::MAX` the VRAM constraint is never
-/// binding for any realistic estimate (a chunk's summed estimate can't approach
-/// `u64::MAX`), so chunks fall back to fixed size `k` — identical to the previous
-/// `step_by(k)` scheme. So on non-cuda builds and when VRAM isn't the binding
-/// constraint, scheduling (and therefore the proof) is unchanged. Returns
-/// `(start, end)` half-open ranges covering `0..estimates.len()` in order.
+/// binding for any realistic estimate, so chunks fall back to fixed size `k`,
+/// the same as the previous `step_by(k)` scheme. So on non-cuda builds and when
+/// VRAM is not binding, scheduling (and therefore the proof) is unchanged.
+/// Returns `(start, end)` half open ranges covering `0..estimates.len()` in order.
 fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
     let n = estimates.len();
     let k = k.max(1);
@@ -399,10 +392,10 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
-    /// The composition-poly Merkle tree kept resident on device (when the R2
-    /// GPU tree path ran), so R4 openings gather authentication paths on device
-    /// instead of walking a host tree. When set, `composition_poly_merkle_tree`
-    /// is a root-only placeholder. `None` on the CPU path.
+    /// The composition Merkle tree kept resident on device (when the R2 GPU tree
+    /// path ran), so R4 openings gather paths on device instead of walking a host
+    /// tree. When set, `composition_poly_merkle_tree` is a root only placeholder.
+    /// `None` on the CPU path.
     #[cfg(feature = "cuda")]
     pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }
@@ -1148,9 +1141,9 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
         // leaves + device-side inner tree, both wrapping the host eval Vecs.
-        // GPU path keeps the composition tree resident on device (no whole-tree
-        // D2H) and returns a root-only host tree; the device tree is threaded to
-        // R4 in `Round2.gpu_composition_tree`.
+        // GPU path keeps the composition tree resident on device (no whole tree
+        // copy) and returns a root only host tree. The device tree is threaded
+        // to R4 in `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
         let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
             match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
@@ -1179,9 +1172,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
-        // Fold the R2 device composition-parts handle into the per-table session
-        // (resident R2→R4). The host evaluations remain in `Round2` as the
-        // mirror R4 openings still read; `composition_host_mirror` flags that.
+        // Fold the R2 device composition parts handle into the session (resident
+        // R2 to R4). The host evaluations stay in `Round2` for R4 openings.
         #[cfg(feature = "cuda")]
         if let Some(handle) = gpu_composition_parts {
             round_1_result.lde_trace.set_gpu_composition_parts(handle);
@@ -1690,10 +1682,10 @@ pub trait IsStarkProver<
 
     /// Like [`Self::open_polys_with`], but uses Merkle proofs already gathered
     /// from the resident device tree (see [`crate::gpu_lde::gather_proofs_dev`])
-    /// instead of walking a host tree. The evaluations are still gathered from
-    /// the host-resident LDE columns via `gather`. `proof` is for leaf position
-    /// `challenge * 2`, `proof_sym` for `challenge * 2 + 1` — the same positions
-    /// `open_polys_with` opens.
+    /// instead of walking a host tree. Evaluations still come from the host LDE
+    /// columns via `gather`. `proof` is for leaf position `challenge * 2`,
+    /// `proof_sym` for `challenge * 2 + 1`, the same positions `open_polys_with`
+    /// opens.
     #[cfg(feature = "cuda")]
     fn open_polys_with_proofs<C, G>(
         domain: &Domain<Field>,
@@ -1737,18 +1729,14 @@ pub trait IsStarkProver<
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        // R4 main-trace proofs from the resident device tree, when present:
-        // gathered in one batch over all query positions (`c*2`, `c*2+1` per
-        // query) instead of walking the host tree. Byte-identical to the host
-        // proofs (guarded by the `merkle_gather` parity test). Only the
-        // non-preprocessed main carries a device tree today; on any miss this is
-        // `None` and openings fall back to the host tree below.
-        // `*_dev_proofs` is `Some` exactly when the corresponding tree is
-        // device-resident (so the host tree is a root-only placeholder). In that
-        // case the gather MUST succeed — there is no host tree to fall back to,
-        // so a gather error is a hard abort (not a silent walk of an empty
-        // tree). When the tree is *not* device-resident the value is `None` and
-        // the openings below walk the full host tree as usual.
+        // R4 trace proofs from the resident device trees, gathered in one batch
+        // over all query positions instead of walking the host trees (byte
+        // identical to the host proofs, guarded by the `merkle_gather` test).
+        // `*_dev_proofs` is `Some` exactly when the tree is device resident (so
+        // the host tree is a root only placeholder). In that case the gather
+        // must succeed: there is no host tree to fall back to, so a gather error
+        // is a hard abort. When the tree is not device resident the value is
+        // `None` and the openings below walk the full host tree.
         #[cfg(feature = "cuda")]
         let main_dev_proofs: Option<Vec<Proof<Commitment>>> = if is_preprocessed {
             None
@@ -1770,7 +1758,7 @@ pub trait IsStarkProver<
                 })
         };
 
-        // Same for the aux-trace tree, when it is device-resident.
+        // Same for the aux trace tree, when it is device resident.
         #[cfg(feature = "cuda")]
         let aux_dev_proofs: Option<Vec<Proof<Commitment>>> = round_1_result
             .aux
@@ -1788,7 +1776,7 @@ pub trait IsStarkProver<
                     .expect("device aux-tree gather failed; resident tree has no host fallback")
             });
 
-        // Composition tree: openings open a single position `index` (row-pair
+        // Composition tree: openings open a single position `index` (row pair
         // leaf), so gather one proof per query challenge from the device tree.
         #[cfg(feature = "cuda")]
         let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
@@ -2002,11 +1990,11 @@ pub trait IsStarkProver<
 
         let k = table_parallelism().min(num_airs).max(1);
 
-        // VRAM-budgeted admission. The budget caps the summed device working-set
+        // VRAM budgeted admission. The budget caps the summed device working set
         // of the tables proved concurrently so large blocks don't exhaust VRAM.
-        // It is an *additional* ceiling on top of `k` (it never raises
-        // concurrency): on non-cuda builds, or when the budget can't be queried,
-        // it is `u64::MAX` and chunking falls back to fixed size `k`.
+        // It is an extra ceiling on top of `k` (it never raises concurrency). On
+        // non-cuda builds, or when the budget can't be queried, it is `u64::MAX`
+        // and chunking falls back to fixed size `k`.
         #[cfg(feature = "cuda")]
         let vram_budget = math_cuda::device::backend()
             .map(|b| b.vram_budget_bytes())
@@ -2014,8 +2002,8 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "cuda"))]
         let vram_budget = u64::MAX;
 
-        // R1 main commit: only the main LDE (+ its Merkle scratch) is resident,
-        // so the aux columns contribute nothing to this phase's working-set.
+        // R1 main commit: only the main LDE and its Merkle scratch are resident,
+        // so the aux columns add nothing to this phase's working set.
         let main_chunks = {
             let estimates: Vec<u64> = air_trace_pairs
                 .iter()
@@ -2231,10 +2219,10 @@ pub trait IsStarkProver<
         #[allow(clippy::type_complexity)]
         let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
 
-        // R1 aux commit and rounds 2–4 share the peak working-set: the main and
-        // aux LDEs are co-resident, plus the composition / Merkle transients
-        // (folded into the scratch factor). `num_aux_columns` is now populated
-        // by the aux build above, so this estimate is accurate for both phases.
+        // R1 aux commit and rounds 2 to 4 share the peak working set: the main
+        // and aux LDEs are co-resident, plus the composition and Merkle
+        // transients (in the scratch factor). `num_aux_columns` is populated by
+        // the aux build above, so this estimate is accurate for both phases.
         let peak_chunks = {
             let estimates: Vec<u64> = air_trace_pairs
                 .iter()

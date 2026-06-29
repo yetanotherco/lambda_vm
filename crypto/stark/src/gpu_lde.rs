@@ -430,13 +430,12 @@ pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(Ordering::Relaxed)
 }
 
-/// Fused base-field path: LDE + Keccak-256 leaf hash + Merkle tree build, all
-/// on device, keeping **both** the LDE buffer and the Merkle tree resident on
-/// device. On success: `columns[c]` is resized to `lde_size` with the LDE
-/// output, and the returned `GpuLdeBase` carries the device LDE buffer plus the
-/// device tree (`.tree`). The returned `MerkleTree` is **root-only** — the host
-/// tree nodes are never materialised (no whole-tree D2H); query openings gather
-/// authentication paths from the device tree via [`gather_proofs_dev`].
+/// Fused base field path: LDE, leaf hash, and Merkle tree build, all on device,
+/// keeping both the LDE buffer and the tree resident. On success `columns[c]` is
+/// resized to `lde_size` with the LDE output, and the returned `GpuLdeBase`
+/// carries the device LDE buffer plus the device tree (`.tree`). The returned
+/// `MerkleTree` is root only (no host tree, no whole tree copy); query openings
+/// gather paths from the device tree via [`gather_proofs_dev`].
 pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -749,9 +748,9 @@ where
         })
         .collect();
 
-    // Keep the composition tree resident on device; the whole-tree D2H is
-    // eliminated. R4 composition openings gather paths from the device tree
-    // (`gather_proofs_dev`); the returned host tree is root-only.
+    // Keep the composition tree resident on device, so the whole tree copy to
+    // host is eliminated. R4 composition openings gather paths from the device
+    // tree (`gather_proofs_dev`); the returned host tree is root only.
     let dev_tree = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts) {
         Ok(t) => t,
         Err(_) => return None,
@@ -1606,9 +1605,9 @@ where
             }
         };
 
-        // Build the FriLayer: ext3 evals + a root-only host tree (the layer tree
-        // stays resident on device in `gpu_tree`; query openings gather paths
-        // from it via `gather_proofs_dev`).
+        // Build the FriLayer: ext3 evals and a root only host tree. The layer
+        // tree stays resident on device in `gpu_tree`; query openings gather
+        // paths from it via `gather_proofs_dev`.
         let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
         let root = dev_tree.root;
         let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
@@ -1645,14 +1644,14 @@ where
     Some((last_value, fri_layer_list))
 }
 
-/// GPU FRI query phase: gather each layer's authentication paths on device
-/// instead of walking host trees. For layer `l` and query `iota`, the opened
-/// position is `(iota >> l) >> 1` — matching [`crate::fri::query_phase`]. Paths
-/// for all queries are gathered in one batched call per layer. The layer
-/// evaluations (`evaluation[index ^ 1]`) are read from the host Vecs as before.
+/// GPU FRI query phase: gather each layer's paths on device instead of walking
+/// host trees. For layer `l` and query `iota` the opened position is
+/// `(iota >> l) >> 1`, matching [`crate::fri::query_phase`]. Paths for all
+/// queries are gathered in one batched call per layer. The layer evaluations
+/// (`evaluation[index ^ 1]`) are read from the host Vecs as before.
 ///
-/// Returns `None` if there are no layers or any layer lacks a device tree (a
-/// CPU-committed layer), so the caller falls back to the host walk.
+/// Returns None when there are no layers or the layers are host trees (CPU
+/// commit), so the caller falls back to the host walk.
 pub(crate) fn try_fri_query_phase_gpu<E>(
     fri_layers: &[FriLayer<E, FriLayerMerkleTreeBackend<E>>],
     iotas: &[usize],
@@ -1665,9 +1664,9 @@ where
         return None;
     }
     // The GPU FRI commit sets `gpu_tree` on every layer as a group; the CPU
-    // commit sets none. If the layers are host trees, fall back to the host
-    // walk. If they're device-resident, the host trees are root-only — so the
-    // gather below MUST succeed (a failure is a hard abort, not a silent walk).
+    // commit sets none. Host trees fall back to the host walk. When the layers
+    // are device resident the host trees are root only, so the gather below must
+    // succeed (a failure is a hard abort, not a silent walk).
     if fri_layers[0].gpu_tree.is_none() {
         return None;
     }

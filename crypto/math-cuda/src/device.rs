@@ -214,13 +214,13 @@ fn retain_default_mempool(ctx: &CudaContext) {
     }
 }
 
-/// Device VRAM budget (bytes) for table-session admission control.
+/// Device VRAM budget in bytes for table session admission control.
 ///
-/// `LAMBDA_VM_VRAM_BUDGET_MB` overrides it explicitly — used to force-exercise
-/// the throttle in tests/benchmarks. Otherwise it is 80% of total device
-/// memory, leaving headroom for the context, module code, and the pool's
-/// retained blocks. On any query failure it returns `u64::MAX`, which disables
-/// budgeting: admission then falls back to the core-bound chunk size alone.
+/// LAMBDA_VM_VRAM_BUDGET_MB overrides it (used to force the throttle in tests).
+/// Otherwise it is 80% of total device memory, leaving headroom for the
+/// context, module code, and retained pool blocks. Returns u64::MAX on any
+/// query failure, which disables budgeting (chunks fall back to the core bound
+/// size alone).
 fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
     if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB")
         && let Ok(mb) = mb.parse::<u64>()
@@ -255,17 +255,15 @@ impl Backend {
         // before returning), so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
 
-        // Retain freed device memory in the stream-ordered pool for reuse.
+        // Retain freed device memory in the stream ordered pool for reuse.
         //
-        // cudarc routes `CudaStream::alloc*` through `cuMemAllocAsync`, which
-        // draws from the device's default memory pool. That pool's release
-        // threshold defaults to 0, so every freed buffer is handed back to the
-        // OS at the next sync — meaning the prover's large, repeatedly-shaped
-        // LDE / FRI buffers are re-malloc'd from scratch each op. Raising the
-        // threshold to "unbounded" keeps freed blocks resident in the pool so
-        // subsequent allocations of the same size are satisfied without a real
-        // driver allocation. Best-effort: on any error (no pool support, sync
-        // allocator) we silently keep the current behaviour.
+        // cudarc routes CudaStream::alloc* through cuMemAllocAsync, drawing from
+        // the device default memory pool. Its release threshold defaults to 0,
+        // so every freed buffer goes back to the OS at the next sync and the
+        // prover's large LDE/FRI buffers are rebuilt from scratch each op.
+        // Raising the threshold keeps freed blocks in the pool so a same size
+        // allocation skips a real driver allocation. Best effort: on any error
+        // we keep the current behaviour.
         retain_default_mempool(&ctx);
 
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;

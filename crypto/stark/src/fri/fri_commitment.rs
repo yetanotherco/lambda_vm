@@ -15,7 +15,7 @@ where
     pub merkle_tree: MerkleTree<B>,
     /// The layer's Merkle tree kept resident on device (GPU FRI commit path),
     /// so R4 query openings gather authentication paths on device. When set,
-    /// `merkle_tree` is a root-only placeholder. `None` on the CPU path.
+    /// `merkle_tree` is a root only placeholder. `None` on the CPU path.
     #[cfg(feature = "cuda")]
     pub gpu_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }

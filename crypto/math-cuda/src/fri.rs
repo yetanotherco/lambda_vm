@@ -215,7 +215,7 @@ impl FriCommitState {
         };
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
-        // R4 query openings gather paths on device instead of D2H'ing the tree.
+        // R4 query openings gather paths on device instead of copying the tree.
         let mut root = [0u8; 32];
         self.stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
         self.stream.synchronize()?;

@@ -168,10 +168,9 @@ where
         })
     }
 
-    /// Create a root-only Merkle tree placeholder: stores the commitment root
-    /// but no nodes. Used when the tree's authentication paths are gathered from
-    /// a device-resident copy (GPU) instead of this host tree, so the host nodes
-    /// are never materialised (saving the full-tree Device→Host copy).
+    /// Create a root only Merkle tree placeholder: stores the commitment root
+    /// but no nodes. Used when paths are gathered from a device resident copy
+    /// (GPU) instead of this host tree, so the host nodes are never built.
     /// [`get_proof_by_pos`](Self::get_proof_by_pos) must NOT be called on it.
     pub fn from_root(root: B::Node) -> Self {
         MerkleTree {
@@ -255,9 +254,9 @@ where
     /// For example, give me an inclusion proof for the 3rd element in the
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
-        // A root-only tree (from `from_root`) has no nodes to walk — callers
-        // must gather paths from the device-resident copy instead. Catch the
-        // misuse early in debug builds rather than returning a misleading `None`.
+        // A root only tree (from `from_root`) has no nodes to walk. Callers must
+        // gather paths from the device resident copy instead. Catch the misuse
+        // early in debug builds rather than returning a misleading None.
         debug_assert!(
             !self.nodes.is_empty(),
             "get_proof_by_pos called on a root-only MerkleTree (no nodes)"

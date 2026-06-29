@@ -8,17 +8,18 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 // Wall-clock span timeline (the trustworthy per-step measurement)
 // =========================================================================
 //
-// Nested wall-clock spans opened/closed on the driving (main) thread at phase
-// boundaries. Unlike the `accum_*` / thread-local sub-timers below — which sum
-// per-worker CPU time across rayon threads and over-count (percentages > 100%) —
-// these spans are non-overlapping and sum to their parent, so the tree is a true
-// latency breakdown. Parallel regions are measured as a single span around the
-// blocking call (that IS their latency); their internal split is reported
-// separately as CPU-time, never mixed into the wall tree.
+// Nested wall clock spans opened and closed on the driving (main) thread at
+// phase boundaries. Unlike the `accum_*` thread local sub timers below (which
+// sum per worker CPU time across rayon threads and over count, so percentages
+// exceed 100%), these spans do not overlap and sum to their parent, so the tree
+// is a true latency breakdown. Parallel regions are measured as a single span
+// around the blocking call (that is their latency); their internal split is
+// reported separately as CPU time, never mixed into the wall tree.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
 //
-// `Instant::now()` is ~20 ns — fine at phase granularity; never inside per-op loops.
+// `Instant::now()` is about 20 ns, fine at phase granularity; never put it
+// inside per op loops.
 
 #[derive(Clone, Debug)]
 pub struct SpanRecord {
@@ -27,8 +28,8 @@ pub struct SpanRecord {
     pub wall: Duration,
     /// Open-order, so the tree reconstructs in start-order (records push on close).
     pub order: u32,
-    /// Wall-clock epoch (ns) when the span opened — for aligning with external
-    /// samplers (e.g. nvidia-smi GPU-util) to attribute device-busy time per step.
+    /// Wall clock epoch (ns) when the span opened, for aligning with external
+    /// samplers (e.g. nvidia-smi GPU util) to attribute device busy time per step.
     pub start_ns: u128,
 }
 
@@ -269,8 +270,8 @@ pub fn take_r1_sub() -> Round1SubOps {
 /// Reset all instrument state. Call at the start of `multi_prove` to avoid
 /// stale data from a previous run in the same process.
 ///
-/// Note: thread-local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
-/// for the calling thread. Rayon worker threads are not reset — stale data is
+/// Note: thread local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
+/// for the calling thread. Rayon worker threads are not reset, so stale data is
 /// possible if a previous run panicked without consuming stored values.
 /// In practice this is safe because store/take pairs always execute within the
 /// same rayon task closure.
