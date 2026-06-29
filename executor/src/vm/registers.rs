@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 pub const STACK_TOP: u64 = 0xFFFFFFFFFFFFFFF0; // 64-bit max (Multiple of 16 for RV64 ABI)
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 /// Holds the current value of all 32 registers
 /// Register zero is implicit as it cannot hold any value other than zero
 pub struct Registers([u64; 31]);
