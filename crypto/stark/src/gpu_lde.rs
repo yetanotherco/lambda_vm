@@ -269,29 +269,6 @@ fn restore_columns_on_err<E: IsField>(columns: &mut [Vec<FieldElement<E>>], n: u
     }
 }
 
-/// Allocate the `[u8; 32]` Merkle node buffer for a tree of `lde_size` leaves
-/// and return the node `Vec` (length-initialised, contents undefined) together
-/// with its node count `total_nodes` (`2 * lde_size - 1`). Returns `None` if
-/// the layout would be invalid (`lde_size < 2` or `total_nodes * 32` overflows
-/// `usize`). The caller builds the `&mut [u8]` byte view of length
-/// `total_nodes * 32` and must overwrite every byte via the GPU D2H.
-fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
-    if lde_size < 2 {
-        return None;
-    }
-    let total_nodes = 2usize.saturating_mul(lde_size).checked_sub(1)?;
-    let _byte_len = total_nodes.checked_mul(32)?;
-    let mut nodes: Vec<[u8; 32]> = Vec::with_capacity(total_nodes);
-    // SAFETY: every byte will be overwritten via the GPU D2H before the
-    // contents are read. The caller computes the byte-length view from the
-    // returned `nodes` Vec using `total_nodes.checked_mul(32)`.
-    #[allow(clippy::uninit_vec)]
-    unsafe {
-        nodes.set_len(total_nodes)
-    };
-    Some((nodes, total_nodes))
-}
-
 /// Try to GPU-batch all columns in one pass.
 ///
 /// Engaged for Goldilocks-base and ext3 tables whose LDE size is above the
@@ -303,6 +280,7 @@ fn alloc_merkle_nodes(lde_size: usize) -> Option<(Vec<[u8; 32]>, usize)> {
 /// Returns `Some(())` if the batch was handled on GPU and `columns` now holds
 /// the LDE evaluations, or if there were no columns to expand. Returns `None`
 /// to let the caller run the per-column CPU fallback.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 pub(crate) fn try_expand_columns_batched<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -598,6 +576,7 @@ where
 /// transform uses only base-field twiddles and coset weights, which act
 /// componentwise on ext3, so the per-component result equals the ext3 LDE the
 /// CPU path computes.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 fn try_expand_columns_batched_ext3<F, E>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -757,8 +736,8 @@ where
 /// host-side ext3 LDE eval Vecs produced by
 /// [`try_evaluate_parts_on_lde_gpu_keep`] (or the CPU path). Uses the same
 /// row-pair leaf pattern as the CPU
-/// `commit_composition_polynomial`: each leaf hashes 2 consecutive
-/// bit-reversed rows.
+/// `commit_bit_reversed` (composition-polynomial commit path): each leaf hashes
+/// 2 consecutive bit-reversed rows.
 ///
 /// Returns `None` to fall through to the CPU path when the type or size
 /// conditions don't hold; returns `None` on a math-cuda `Err` so the caller

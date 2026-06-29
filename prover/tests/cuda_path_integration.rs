@@ -47,7 +47,10 @@ fn gpu_path_fires_end_to_end() {
         "R2 GPU composition LDE did not fire (neither two-halves d2 nor parts>2 path)"
     );
 
-    // R2 comp-poly Merkle tree build, paired with the parts LDE above.
+    // R2 comp-poly Merkle tree build. Dispatched unconditionally (independent of
+    // the parts-count branch above), so it fires for the common degree-2 case
+    // too; a silent CPU fallback would still verify, so this counter is what
+    // guards the GPU comp-poly-tree dispatch.
     assert!(
         gpu_comp_poly_tree_calls() > 0,
         "R2 GPU comp-poly tree did not fire"
@@ -71,4 +74,25 @@ fn gpu_path_fires_end_to_end() {
     // actually satisfies the verifier.
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
+}
+
+/// Focused validation of the GPU row-pair trace commitment: proves a large
+/// trace with the GPU path and verifies the resulting proof. Independent of the
+/// per-round counter assertions in `gpu_path_fires_end_to_end` (the R2 parts-LDE
+/// assertion bit-rotted on main and cuts off before the verify). A wrong GPU
+/// trace-commit leaf layout (1-row vs the new row-pair) would fail verification.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_proof_verifies_row_pair_commitment() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_lde_calls() > 0,
+        "GPU LDE path did not fire (silent CPU fallback would not test the GPU commit)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (row-pair commitment) failed verification"
+    );
 }

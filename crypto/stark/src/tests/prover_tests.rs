@@ -564,7 +564,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
 }
 
 #[test]
-fn commit_rows_bit_reversed_matches_commit_columns_bit_reversed() {
+fn commit_rows_bit_reversed_matches_commit_bit_reversed() {
     type F = GoldilocksField;
     type FE = FieldElement<F>;
 
@@ -588,8 +588,12 @@ fn commit_rows_bit_reversed_matches_commit_columns_bit_reversed() {
                 }
             }
 
-            let (_, root_col) = Prover::<F, F, ()>::commit_columns_bit_reversed(&columns)
-                .expect("column-major commit must succeed");
+            // Both commits are row-pair (ROWS_PER_LEAF=2): the column-major
+            // `commitment` path and the row-major prover path must produce the
+            // same Merkle root (identical leaf bytes, only the read pattern differs).
+            let (_, root_col) =
+                crate::commitment::commit_bit_reversed(&columns, crate::commitment::ROWS_PER_LEAF)
+                    .expect("column-major commit must succeed");
             let (_, root_row) = Prover::<F, F, ()>::commit_rows_bit_reversed(&row_major, num_cols)
                 .expect("row-major commit must succeed");
 

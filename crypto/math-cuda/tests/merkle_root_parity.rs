@@ -55,7 +55,9 @@ fn gpu_merkle_root(columns: &[Vec<u64>], blowup: usize, weights: &[u64]) -> [u8;
         }
     }
 
-    let gpu_leaves = math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde)
+    // Per-row leaves (rows_per_leaf = 1): this parity test compares the generic
+    // keccak-leaves + Merkle primitives against a per-row CPU reference.
+    let gpu_leaves = math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde, 1)
         .expect("GPU keccak leaves");
     let nodes =
         math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");
@@ -190,7 +192,7 @@ fn gpu_ext3_merkle_root(columns: &[Vec<Fp3>], blowup: usize, weights: &[u64]) ->
     }
 
     let gpu_leaves =
-        math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size)
+        math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size, 1)
             .expect("GPU ext3 keccak leaves");
     let nodes =
         math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");

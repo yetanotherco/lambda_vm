@@ -181,7 +181,7 @@ pub fn print_report(
             let mut sub_ops: Vec<(&str, Duration)> = vec![
                 ("R2  evaluate", total_constraints),
                 ("R2  decompose_and_extend_d2", total_comp_decompose),
-                ("R2  commit_composition_poly", total_comp_commit),
+                ("R2  commit_bit_reversed (comp-poly)", total_comp_commit),
                 ("R3  OOD evaluation", total_ood),
                 ("R4  deep_composition_poly_evals", total_deep_comp),
                 ("R4  interpolate+evaluate_fft", total_deep_extend),
