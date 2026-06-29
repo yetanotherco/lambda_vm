@@ -27,6 +27,8 @@
 #     REF_B    baseline   (default: origin/main)
 #     N_PAIRS  pairs      (default: 20 -> 40 runs, ~33 min on ethrex)
 #   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
+#        BENCH_FEATURES=<list> cargo features for the cli build (default: jemalloc-stats).
+#          The GPU ABBA workflow passes "jemalloc-stats,prover/cuda" to bench the GPU path.
 #
 #   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
 #   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
@@ -45,6 +47,9 @@ fi
 REF_A="$1"
 REF_B="${2:-origin/main}"
 N_PAIRS="${3:-20}"
+# cli build features. Default matches the CPU bench; the GPU ABBA workflow overrides
+# with "jemalloc-stats,prover/cuda" to exercise the CUDA prover path.
+BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 INPUT_REL="executor/tests/ethrex_bench_20.bin"
@@ -89,10 +94,12 @@ INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
 need_build=0
 if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$WORK/cli_A" ] || [ ! -x "$WORK/cli_B" ]; then
   need_build=1
-elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A" ] || [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B" ]; then
-  # Cache persists on the self-hosted runner; rebuild if it's for different refs
-  # (a different PR, or main advanced) so we never benchmark stale binaries.
-  echo "==> Cached binaries are for different refs; rebuilding."
+elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A $BENCH_FEATURES" ] || \
+     [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B $BENCH_FEATURES" ]; then
+  # Cache persists on the self-hosted runner; rebuild if it's for different refs (a
+  # different PR, or main advanced) OR a different feature set (e.g. CPU vs prover/cuda),
+  # so we never benchmark stale binaries. The marker stores "<sha> <features>".
+  echo "==> Cached binaries are for different refs/features; rebuilding."
   need_build=1
 fi
 if [ "$need_build" = "1" ]; then
@@ -102,23 +109,34 @@ if [ "$need_build" = "1" ]; then
   echo "==> Building both prover binaries in isolated worktree $WT"
   git worktree add --detach "$WT" "$SHA_B" >/dev/null
   build_cli() {  # $1=sha $2=out (shared target dir -> 2nd build is incremental)
-    echo "==> Building cli @ ${1:0:10} -> $2"
-    git -C "$WT" checkout --quiet "$1"
-    if ! ( cd "$WT" && cargo build --release -p cli --features jemalloc-stats >"$WORK/build_$2.log" 2>&1 ); then
+    echo "==> Building cli @ ${1:0:10} -> $2  (features: $BENCH_FEATURES)"
+    # -f: discard any prior worktree edit (e.g. the CUDARC_PIN sed below) before switching
+    # refs, so the checkout can't conflict.
+    git -C "$WT" checkout --quiet -f "$1"
+    # CUDARC_PIN: pin math-cuda's cudarc to a fixed CUDA version and drop fallback-latest, so
+    # cudarc binds a known driver-symbol set instead of its newest (which can request symbols
+    # the rented box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
+    if [ -n "${CUDARC_PIN:-}" ]; then
+      sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
+        "$WT/crypto/math-cuda/Cargo.toml"
+      echo "    cudarc pinned to ${CUDARC_PIN}"
+    fi
+    if ! ( cd "$WT" && cargo build --release -p cli --features "$BENCH_FEATURES" >"$WORK/build_$2.log" 2>&1 ); then
       echo "ERROR: cargo build failed for $2 (@ ${1:0:10}). Tail of $WORK/build_$2.log:" >&2
       tail -40 "$WORK/build_$2.log" >&2
       exit 1
     fi
     cp "$WT/target/release/cli" "$WORK/$2"
-    echo "$1" > "$WORK/$2.sha"
+    # Marker = "<sha> <features>" so the cache invalidates on either changing.
+    echo "$1 $BENCH_FEATURES" > "$WORK/$2.sha"
   }
   build_cli "$SHA_B" cli_B
   build_cli "$SHA_A" cli_A
   cleanup
   trap - EXIT
 else
-  echo "==> Reusing cached binaries (SHAs match requested refs; REBUILD=1 to force):"
-  echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}"
+  echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
+  echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
