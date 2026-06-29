@@ -409,6 +409,11 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
 /// trace, so its columns inherit the same guarantee via the commitment binding.
 /// Keep this in sync with [`collect_bitwise_from_l2g`].
 pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
+    // `epoch_label` is a 1-based fini epoch, never `GENESIS_EPOCH` (0): genesis is
+    // only ever an `init`/originating epoch, never a fini. The ordering term below
+    // computes `epoch_label - 1 - init_epoch`, so a 0 label would make the constant
+    // `-1` (field `p-1`) and no honest prover could satisfy the IsB20 check.
+    debug_assert!(epoch_label >= 1, "epoch_label must be a 1-based fini epoch");
     let mut interactions = Vec::with_capacity(2 + cols::RANGE_CHECKED_HALFWORDS.len());
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,

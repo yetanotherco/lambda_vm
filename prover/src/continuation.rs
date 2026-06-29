@@ -123,6 +123,14 @@ fn l2g_constraints()
 ///
 /// `epoch_label` is this epoch's 1-based label; it is the `fini_epoch` constant
 /// the fini token carries (not a trace column, since it's the same for every row).
+///
+/// Uses `empty_constraints()` deliberately: the MU boolean (`MU·(1-MU)=0`), the
+/// column range checks, and the `init_epoch < fini_epoch` ordering are NOT
+/// re-asserted here. They are enforced once in the epoch proof's `l2g_memory_air`,
+/// and `verify_l2g_commitment_binding` ties this global L2G sub-table to the *same*
+/// committed trace (equal Merkle roots). So under collision resistance the trace the
+/// global bus runs over already satisfies all those constraints — do not add them
+/// here (it would be redundant, not a missing check).
 fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,

@@ -189,6 +189,10 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             ],
         ),
         // GM-FINAL: receive the finalization token [address, fini, fini_epoch].
+        // Note: FINI has no explicit AreBytes range check here (unlike PAGE's fini).
+        // It's byte-checked transitively: this receiver must match an L2G fini token
+        // on the GlobalMemory bus, and L2G already AreBytes-checks its fini value. So
+        // a non-byte FINI could never balance. Do not "add a missing AreBytes" here.
         BusInteraction::receiver(
             BusId::GlobalMemory,
             Multiplicity::One,
