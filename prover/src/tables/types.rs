@@ -307,6 +307,13 @@ pub enum BusId {
     /// Scalar-bit bus: EC_SCALAR sends one per set bit (timestamp, bit_index);
     /// ECDAS receives one per add, ECSM receives the MSB.
     Bit = 30,
+
+    // =========================================================================
+    // Continuations
+    // =========================================================================
+    /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
+    /// boundary claims, matched across epochs by the final aggregation LogUp.
+    GlobalMemory = 31,
 }
 
 impl BusId {
@@ -336,6 +343,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::ServeK => "ServeK",
             BusId::Bit => "Bit",
+            BusId::GlobalMemory => "GlobalMemory",
         }
     }
 }
@@ -368,6 +376,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             29 => Ok(BusId::ServeK),
             30 => Ok(BusId::Bit),
+            31 => Ok(BusId::GlobalMemory),
             other => Err(other),
         }
     }

@@ -102,26 +102,51 @@ jobs:
           cargo test --release -p executor test_ethrex -- --ignored
           cargo test --release -p executor test_ckzg -- --ignored
 
+  test-cli:
+    name: CLI tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-cli-test"
+          cache-all-crates: "true"
+
+      - name: Run CLI tests
+        run: cargo test -p cli
+
   # "Test" is a required check — keep this name to avoid branch protection changes.
-  # This gate job passes only when executor tests AND all prover shards succeed.
+  # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-prover, test-disk-spill]
+    needs: [test-executor, test-cli, test-prover, test-disk-spill]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
         run: |
           executor="${{ needs.test-executor.result }}"
+          cli="${{ needs.test-cli.result }}"
           prover="${{ needs.test-prover.result }}"
           disk_spill="${{ needs.test-disk-spill.result }}"
 
           echo "test-executor: $executor"
+          echo "test-cli: $cli"
           echo "test-prover: $prover"
           echo "test-disk-spill: $disk_spill"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$cli" != "success" && "$cli" != "skipped" ]]; then
             exit 1
           fi
           if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then

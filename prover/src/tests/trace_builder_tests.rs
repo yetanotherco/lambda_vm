@@ -823,3 +823,278 @@ mod routing_tests {
         );
     }
 }
+
+/// `from_image_and_logs` is a faithful generalization of `from_elf_and_logs`:
+/// fed the ELF-derived image, it must produce identical traces.
+#[test]
+fn test_from_image_and_logs_matches_from_elf_and_logs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+    let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
+    let max_rows = MaxRowsConfig::default();
+
+    let from_elf = Traces::from_elf_and_logs(
+        &program,
+        &logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    let image = build_initial_image(&program, &[]);
+    let register_init =
+        crate::tables::register::register_init_from_entry_point(program.entry_point);
+    let from_image = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &register_init,
+        &logs,
+        &max_rows,
+        &[],
+        true,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .unwrap();
+
+    assert_eq!(
+        from_elf.total_field_elements(),
+        from_image.total_field_elements()
+    );
+    assert_eq!(
+        format!("{:?}", from_elf.table_counts()),
+        format!("{:?}", from_image.table_counts())
+    );
+}
+
+/// A memory snapshot at an epoch boundary converts into a non-empty initial
+/// image (the input `from_image_and_logs` consumes for the next epoch).
+#[test]
+fn test_epoch_end_memory_converts_to_image() {
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let image: HashMap<u64, u8> = epochs[0].end_memory.iter_bytes().collect();
+    assert!(!image.is_empty());
+}
+
+/// Every epoch builds traces: intermediate epochs (`is_final = false`) skip HALT
+/// and start from the previous epoch's memory; the last epoch terminates.
+#[test]
+fn test_build_traces_for_all_epochs() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::trace_builder::build_initial_image;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let max_rows = MaxRowsConfig::default();
+    let last = epochs.len() - 1;
+
+    for (i, epoch) in epochs.iter().enumerate() {
+        // Epoch 0 starts from the program-start image; later epochs from the
+        // previous epoch's ending memory + register snapshot.
+        let (image, register_init): (HashMap<u64, u8>, Vec<u32>) = if i == 0 {
+            (
+                build_initial_image(&program, &[]),
+                crate::tables::register::register_init_from_entry_point(program.entry_point),
+            )
+        } else {
+            (
+                epochs[i - 1].end_memory.iter_bytes().collect(),
+                crate::tables::register::register_init_from_snapshot(
+                    &epochs[i - 1].end_registers,
+                    epochs[i - 1].end_pc,
+                ),
+            )
+        };
+
+        let traces = Traces::from_image_and_logs(
+            &program,
+            &image,
+            &register_init,
+            &epoch.logs,
+            &max_rows,
+            &[],
+            i == last,
+            false,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )
+        .unwrap_or_else(|e| panic!("epoch {i} (is_final={}) failed to build: {e:?}", i == last));
+
+        assert!(
+            traces.table_counts().cpu > 0,
+            "epoch {i} produced an empty CPU trace"
+        );
+    }
+}
+
+/// A non-final epoch carrying the program-terminating instruction is rejected
+/// (rather than silently producing an unverifiable proof).
+#[test]
+fn test_terminating_epoch_rejected_when_not_final() {
+    use crate::tables::MaxRowsConfig;
+    use crate::tables::register::register_init_from_snapshot;
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    let elf_bytes = asm_elf_bytes("basic_program");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    // The last epoch holds the terminating instruction; building it as a
+    // non-final epoch (is_final = false) must error.
+    let last = epochs.len() - 1;
+    let image: HashMap<u64, u8> = epochs[last - 1].end_memory.iter_bytes().collect();
+    let register_init =
+        register_init_from_snapshot(&epochs[last - 1].end_registers, epochs[last - 1].end_pc);
+
+    let result = Traces::from_image_and_logs(
+        &program,
+        &image,
+        &register_init,
+        &epochs[last].logs,
+        &MaxRowsConfig::default(),
+        &[],
+        false,
+        false,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+
+    assert!(
+        matches!(result, Err(crate::Error::HaltInNonFinalEpoch)),
+        "expected HaltInNonFinalEpoch error for a non-final terminating epoch"
+    );
+}
+
+/// End to end: extract real per-epoch touched cells from execution, feed them
+/// through the local-to-global boundary logic, and render each epoch's trace.
+#[test]
+fn test_local_to_global_traces_from_real_execution() {
+    use crate::tables::local_to_global::{epoch_boundaries, generate_local_to_global_trace};
+    use crate::tables::trace_builder::{build_initial_image, epoch_touched_cells};
+    use crate::test_utils::asm_elf_bytes;
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+    use std::collections::HashMap;
+
+    // A program that exercises memory (loads/stores), so some cells are touched.
+    let elf_bytes = asm_elf_bytes("all_loadstore_32");
+    let program = Elf::load(&elf_bytes).unwrap();
+
+    let total = Executor::new(&program, vec![])
+        .unwrap()
+        .run()
+        .unwrap()
+        .logs
+        .len();
+    let epoch_size = (total / 3).max(1);
+    let epochs = Executor::new(&program, vec![])
+        .unwrap()
+        .run_epochs(epoch_size)
+        .unwrap();
+    assert!(epochs.len() >= 2);
+
+    let elf_image = build_initial_image(&program, &[]);
+    let total_memory = elf_image.len();
+
+    // Per-epoch touched cells from real execution (epoch 0 from the ELF image,
+    // later epochs from the previous epoch's ending memory).
+    let mut per_epoch_touches: Vec<Vec<(u64, u64, u64)>> = Vec::new();
+    for (i, epoch) in epochs.iter().enumerate() {
+        let image: HashMap<u64, u8> = if i == 0 {
+            elf_image.clone()
+        } else {
+            epochs[i - 1].end_memory.iter_bytes().collect()
+        };
+        let register_init = if i == 0 {
+            crate::tables::register::register_init_from_entry_point(program.entry_point)
+        } else {
+            crate::tables::register::register_init_from_snapshot(
+                &epochs[i - 1].end_registers,
+                epochs[i - 1].end_pc,
+            )
+        };
+        per_epoch_touches
+            .push(epoch_touched_cells(&program, &image, &register_init, &epoch.logs).unwrap());
+    }
+
+    // The program touches memory somewhere, and every per-epoch touched set is
+    // sparse (far smaller than the whole memory image).
+    let total_touched: usize = per_epoch_touches.iter().map(Vec::len).sum();
+    assert!(total_touched > 0);
+    for touched in &per_epoch_touches {
+        assert!(touched.len() < total_memory);
+    }
+
+    // Boundary claims + rendered L2G trace per epoch.
+    let initial_memory: HashMap<u64, u64> =
+        elf_image.iter().map(|(&a, &v)| (a, v as u64)).collect();
+    let boundaries = epoch_boundaries(&initial_memory, &per_epoch_touches);
+
+    for (i, boundary_set) in boundaries.iter().enumerate() {
+        let trace = generate_local_to_global_trace(boundary_set);
+        let expected_rows = per_epoch_touches[i].len().next_power_of_two().max(1);
+        assert_eq!(trace.num_rows(), expected_rows);
+    }
+}
