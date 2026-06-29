@@ -451,120 +451,144 @@ pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(Ordering::Relaxed)
 }
 
-/// Fused base-field path: LDE + Keccak-256 leaf hash + Merkle tree build,
-/// all on device, with the LDE buffer retained for R2–R4 GPU reuse. On
-/// success: `columns[c]` is resized to `lde_size` with the LDE output, and
-/// the returned `(tree, GpuLdeBase)` pair is the host-side tree plus a
-/// device-resident handle to the LDE buffer.
-pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
-    columns: &mut [Vec<FieldElement<E>>],
+/// Row-major GPU path: single H2D → row-major NTT → row-major Keccak →
+/// Merkle → single D2H. No column extraction or CPU-side transpose.
+pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeBase)>
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    let (n, lde_size) = match check_base_layout::<F, E>(columns, blowup_factor) {
-        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
-        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
-    };
-    let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
 
-    // SAFETY: layout-checked above.
-    let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
-    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    GPU_LDE_CALLS.fetch_add(num_columns as u64, Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    let handle_result = {
-        let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
-        math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
-            &slices,
-            blowup_factor,
-            &weights_u64,
-            &mut raw_outputs,
-            nodes_bytes,
+    let (nodes_bytes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
         )
     };
-    let handle = match handle_result {
-        Ok(h) => h,
-        Err(_) => {
-            restore_columns_on_err(columns, n);
-            return None;
-        }
-    };
 
+    let nodes: Vec<[u8; 32]> = nodes_bytes
+        .chunks_exact(32)
+        .map(|c| c.try_into().expect("32-byte chunk"))
+        .collect();
     let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
-    Some((tree, handle))
+    Some((tree, handle, lde_out))
 }
 
-/// Fused ext3 path: LDE + Keccak-256 leaf hash + Merkle tree build over
-/// ext3 columns via the three-slab decomposition, with the ext3 LDE device
-/// buffer (de-interleaved 3-slab layout) retained for downstream GPU rounds.
-/// `B::Node = [u8; 32]` by construction for `BatchKeccak256Backend<Ext3>`.
-pub(crate) fn try_expand_leaf_and_tree_batched_ext3_keep<F, E, B>(
-    columns: &mut [Vec<FieldElement<E>>],
+/// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
+/// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
+/// Same optimization as the base-field path: no extract_columns, no CPU transpose.
+pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3)>
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeExt3,
+    Vec<FieldElement<E>>,
+)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
 {
-    let (n, lde_size) = match check_ext3_layout::<F, E>(columns, blowup_factor) {
-        LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
-        LayoutDispatch::Run { n, lde_size } => (n, lde_size),
-    };
-    let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
 
-    // SAFETY: layout-checked above.
-    let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
+    // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
+    let m3 = m * 3;
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m3) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
-    let slices: Vec<&[u64]> = raw_columns.iter().map(|c| c.as_slice()).collect();
 
-    GPU_LDE_CALLS.fetch_add((num_columns * 3) as u64, Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add((m * 3) as u64, Ordering::Relaxed);
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    let handle_result = {
-        let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
-        math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
-            &slices,
+    let (nodes_bytes, handle, lde_u64) =
+        math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
+            raw,
             n,
+            m,
             blowup_factor,
             &weights_u64,
-            &mut raw_outputs,
-            nodes_bytes,
+        )
+        .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
         )
     };
-    let handle = match handle_result {
-        Ok(h) => h,
-        Err(_) => {
-            restore_columns_on_err(columns, n);
-            return None;
-        }
-    };
 
+    let nodes: Vec<[u8; 32]> = nodes_bytes
+        .chunks_exact(32)
+        .map(|c| c.try_into().expect("32-byte chunk"))
+        .collect();
     let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
-    Some((tree, handle))
+    Some((tree, handle, lde_out))
 }
 
 /// Ext3 specialisation of [`try_expand_columns_batched`]. `E` is known to be
