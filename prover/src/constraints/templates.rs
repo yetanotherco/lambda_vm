@@ -13,6 +13,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::{constraints::transition::TransitionConstraint, table::TableView};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
@@ -107,6 +108,28 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
     }
 }
 
+impl Capture for IsBitConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // Mirrors `evaluate`: x = main(value_col), one - x, then the product.
+        let x = b.main(0, self.value_col);
+        let one = b.one();
+        let one_minus_x = b.sub(one, x);
+
+        let root = match self.cond_col {
+            Some(cond_col) => {
+                // cond * x * (1 - x), left-associated like `&cond * &x * (one - x)`.
+                let cond = b.main(0, cond_col);
+                let cond_x = b.mul(cond, x);
+                b.mul(cond_x, one_minus_x)
+            }
+            // x * (1 - x)
+            None => b.mul(x, one_minus_x),
+        };
+
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 // =========================================================================
 // ADD Template (Embedded Carry Approach)
 // =========================================================================
@@ -177,6 +200,22 @@ impl AddLinearTerm {
             AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
         }
     }
+
+    /// Capture this term into builder nodes, mirroring [`Self::eval`].
+    fn capture(&self, b: &mut IrBuilder) -> Expr {
+        match self {
+            AddLinearTerm::Column {
+                coefficient,
+                column,
+            } => {
+                // `col_val * FieldElement::from(coeff)`: column on the left.
+                let col = b.main(0, *column);
+                let coeff = b.const_signed(*coefficient);
+                b.mul(col, coeff)
+            }
+            AddLinearTerm::Constant(value) => b.const_signed(*value),
+        }
+    }
 }
 
 /// Evaluate a slice of terms as a sum.
@@ -192,6 +231,24 @@ where
             .iter()
             .map(|t| t.eval(step))
             .fold(FieldElement::zero(), |acc, x| acc + x)
+    }
+}
+
+/// Capture a slice of terms as a sum, mirroring [`eval_terms`].
+///
+/// Empty -> `0`; otherwise `0 + t0 + t1 + ...` (same fold seed and order as
+/// `eval_terms`, so the captured node tree matches bit-for-bit).
+fn capture_terms(terms: &[AddLinearTerm], b: &mut IrBuilder) -> Expr {
+    let zero = b.const_base(0);
+    if terms.is_empty() {
+        zero
+    } else {
+        let mut acc = zero;
+        for t in terms {
+            let term = t.capture(b);
+            acc = b.add(acc, term);
+        }
+        acc
     }
 }
 
@@ -221,6 +278,22 @@ impl AddOperand {
                 .get_main_evaluation_element(0, *start_column + 1)
                 .clone(),
             AddOperand::Linear { hi, .. } => eval_terms(hi, step),
+        }
+    }
+
+    /// Capture the low word, mirroring [`Self::eval_lo`].
+    pub fn capture_lo(&self, b: &mut IrBuilder) -> Expr {
+        match self {
+            AddOperand::DWordWL { start_column } => b.main(0, *start_column),
+            AddOperand::Linear { lo, .. } => capture_terms(lo, b),
+        }
+    }
+
+    /// Capture the high word, mirroring [`Self::eval_hi`].
+    pub fn capture_hi(&self, b: &mut IrBuilder) -> Expr {
+        match self {
+            AddOperand::DWordWL { start_column } => b.main(0, *start_column + 1),
+            AddOperand::Linear { hi, .. } => capture_terms(hi, b),
         }
     }
 
@@ -482,6 +555,68 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstrain
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl AddConstraint {
+    /// Capture carry_0, mirroring [`Self::compute_carry_0`].
+    fn capture_carry_0(&self, b: &mut IrBuilder) -> Expr {
+        let lhs_lo = self.lhs.capture_lo(b);
+        let rhs_lo = self.rhs.capture_lo(b);
+        let sum_lo = self.sum.capture_lo(b);
+        let inv = b.const_base(INV_SHIFT_32);
+
+        // ((lhs_lo + rhs_lo) - sum_lo) * inv_2_32
+        let s = b.add(lhs_lo, rhs_lo);
+        let s = b.sub(s, sum_lo);
+        b.mul(s, inv)
+    }
+
+    /// Capture carry_1, mirroring [`Self::compute_carry_1`].
+    fn capture_carry_1(&self, b: &mut IrBuilder) -> Expr {
+        let lhs_hi = self.lhs.capture_hi(b);
+        let rhs_hi = self.rhs.capture_hi(b);
+        let sum_hi = self.sum.capture_hi(b);
+        let carry_0 = self.capture_carry_0(b);
+        let inv = b.const_base(INV_SHIFT_32);
+
+        // (((lhs_hi + rhs_hi) + carry_0) - sum_hi) * inv_2_32
+        let s = b.add(lhs_hi, rhs_hi);
+        let s = b.add(s, carry_0);
+        let s = b.sub(s, sum_hi);
+        b.mul(s, inv)
+    }
+}
+
+impl Capture for AddConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+
+        let carry = match self.carry_idx {
+            0 => self.capture_carry_0(b),
+            1 => self.capture_carry_1(b),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
+        };
+
+        let root = if self.cond_cols.is_empty() {
+            // Unconditional: carry * (1 - carry)
+            let one_minus_carry = b.sub(one, carry);
+            b.mul(carry, one_minus_carry)
+        } else {
+            // Conditional: cond * carry * (1 - carry), left-associated like
+            // `cond * &carry * (one - carry)`.
+            // cond = fold over cond_cols starting from zero: 0 + col0 + col1 + ...
+            let mut cond = b.const_base(0);
+            for &col in &self.cond_cols {
+                let c = b.main(0, col);
+                cond = b.add(cond, c);
+            }
+            let one_minus_carry = b.sub(one, carry);
+            let cond_carry = b.mul(cond, carry);
+            b.mul(cond_carry, one_minus_carry)
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

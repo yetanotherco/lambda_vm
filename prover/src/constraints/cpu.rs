@@ -17,6 +17,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::table::TableView;
 
@@ -109,6 +110,16 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ProductZeroC
     {
         step.get_main_evaluation_element(0, self.col_a)
             * step.get_main_evaluation_element(0, self.col_b)
+    }
+}
+
+impl Capture for ProductZeroConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // col_a * col_b
+        let a = b.main(0, self.col_a);
+        let b_col = b.main(0, self.col_b);
+        let root = b.mul(a, b_col);
+        b.emit(self.constraint_idx, root);
     }
 }
 
