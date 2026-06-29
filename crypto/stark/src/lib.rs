@@ -25,6 +25,7 @@ pub mod prover;
 pub mod r4_denoms;
 #[cfg(feature = "disk-spill")]
 pub mod storage_mode;
+pub mod symbolic;
 pub mod table;
 pub mod trace;
 pub mod traits;

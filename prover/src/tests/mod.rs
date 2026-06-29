@@ -69,6 +69,8 @@ pub mod static_commitments_tests;
 #[cfg(test)]
 pub mod store_tests;
 #[cfg(test)]
+pub mod symbolic_ir_tests;
+#[cfg(test)]
 pub mod templates_tests;
 #[cfg(test)]
 pub mod trace_builder_tests;
