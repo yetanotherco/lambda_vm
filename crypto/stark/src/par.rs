@@ -58,6 +58,9 @@ pub(crate) fn par_map_collect<R: Send>(
 
 /// Run `f(&mut item)` for each element of `slice`. Parallel when
 /// `feature = "parallel"`, sequential otherwise (ordering is irrelevant).
+// Only called from the `debug-checks`-gated column-LDE reconstruct path
+// (production LDE is row-major); keep it available without warning otherwise.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
 pub(crate) fn par_for_each_mut<T: Send>(slice: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
     #[cfg(feature = "parallel")]
     {
