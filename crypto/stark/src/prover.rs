@@ -509,7 +509,6 @@ fn columns_to_row_major<E: IsField>(
     (data, num_cols)
 }
 
-
 /// The functionality of a STARK prover providing methods to run the STARK Prove protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 /// The default implementation is complete and is compatible with Stone prover
@@ -614,7 +613,6 @@ pub trait IsStarkProver<
         let root = tree.root;
         Some((tree, root))
     }
-
 
     /// Compute the LDE commitment for a subset of columns from a trace (for testing).
     ///
@@ -2120,8 +2118,9 @@ pub trait IsStarkProver<
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
                         #[allow(unused_mut)]
-                        let (mut tree, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)
-                            .ok_or(ProvingError::EmptyCommitment)?;
+                        let (mut tree, root) =
+                            Self::commit_rows_bit_reversed(&aux_data, total_cols)
+                                .ok_or(ProvingError::EmptyCommitment)?;
                         #[cfg(feature = "disk-spill")]
                         Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
                         let commit = TableCommit::plain(tree, root);
