@@ -2750,6 +2750,8 @@ fn build_traces(
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p4_bitwise_collect");
     bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
     // the same chunk size used to split them into instances (see chunk_and_generate
@@ -2795,10 +2797,14 @@ fn build_traces(
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p5_generate_tables");
 
     // Extract halt timestamp from the last ECALL instruction
     let halt_op = cpu_ops
@@ -3027,6 +3033,8 @@ fn build_traces(
         }
     }
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     Ok(Traces {
         cpus,
         bitwise,
@@ -3692,17 +3700,27 @@ impl Traces {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p0_decode");
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 1: Logs → CPU operations
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p1_cpu_ops");
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_elf(elf);
         memory_state.add_private_input(private_input);
         let mut register_state = RegisterState::new(elf.entry_point);
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2a_collect_cpu");
         let (
             memw_ops,
             load_ops,
@@ -3716,7 +3734,11 @@ impl Traces {
             ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
             cpu_ops,
             memw_ops,
@@ -3732,9 +3754,13 @@ impl Traces {
             ecdas_ops,
             &mut register_state,
         );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phases 3-5
-        build_traces(
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p3to5_build_traces");
+        let result = build_traces(
             ops,
             Some(elf),
             &memory_state,
@@ -3746,7 +3772,10 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             storage_mode,
             private_input,
-        )
+        );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        result
     }
 
     /// Generates all traces from execution logs (legacy API).

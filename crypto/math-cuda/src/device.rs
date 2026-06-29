@@ -174,6 +174,34 @@ pub struct Backend {
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
 }
 
+/// Raise the device default memory pool's release threshold so freed
+/// stream-ordered allocations are kept for reuse instead of returned to the OS
+/// at each sync. Best-effort: any failure (e.g. a device/driver without
+/// stream-ordered allocator support) leaves the default behaviour untouched.
+fn retain_default_mempool(ctx: &CudaContext) {
+    use cudarc::driver::sys;
+    // SAFETY: raw CUDA driver calls. `ctx.cu_device()` is a valid device for
+    // the just-created context; the out-pointers are valid stack slots; the
+    // threshold is read as a u64 by the driver. Errors are swallowed.
+    unsafe {
+        let dev = ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        let threshold: u64 = u64::MAX;
+        let _ = sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const u64 as *mut core::ffi::c_void,
+        )
+        .result();
+    }
+}
+
 impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
@@ -182,6 +210,19 @@ impl Backend {
         // slices across streams (every call scopes its own buffers and syncs
         // before returning), so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
+
+        // Retain freed device memory in the stream-ordered pool for reuse.
+        //
+        // cudarc routes `CudaStream::alloc*` through `cuMemAllocAsync`, which
+        // draws from the device's default memory pool. That pool's release
+        // threshold defaults to 0, so every freed buffer is handed back to the
+        // OS at the next sync — meaning the prover's large, repeatedly-shaped
+        // LDE / FRI buffers are re-malloc'd from scratch each op. Raising the
+        // threshold to "unbounded" keeps freed blocks resident in the pool so
+        // subsequent allocations of the same size are satisfied without a real
+        // driver allocation. Best-effort: on any error (no pool support, sync
+        // allocator) we silently keep the current behaviour.
+        retain_default_mempool(&ctx);
 
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;

@@ -1682,6 +1682,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_prepass");
 
         // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
         // Many tables share the same domain size (e.g., 7+ tables at 2^20).
@@ -1740,6 +1742,8 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
         if let Some(s) = crate::instruments::snap("After pool alloc") {
@@ -1754,6 +1758,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_main_commit");
 
         let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
         let mut main_ldes: Vec<Vec<Vec<FieldElement<Field>>>> = Vec::with_capacity(num_airs);
@@ -1811,6 +1817,8 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let main_commits_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
         if let Some(s) = crate::instruments::snap("After main commits") {
@@ -1845,6 +1853,8 @@ pub trait IsStarkProver<
         // but outer parallelism over 12 tables also helps on high-core-count machines.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_aux_build");
 
         #[cfg(feature = "parallel")]
         let aux_iter = air_trace_pairs.par_iter_mut();
@@ -1878,6 +1888,8 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
         if let Some(s) = crate::instruments::snap("After aux build") {
@@ -1888,6 +1900,8 @@ pub trait IsStarkProver<
         // Each table gets its own transcript fork.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_aux_commit");
 
         // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
         let mut table_transcripts: Vec<_> = (0..num_airs)
@@ -2067,6 +2081,8 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
         let aux_commit_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
         if let Some(s) = crate::instruments::snap("After aux commit") {
@@ -2085,6 +2101,8 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("rounds_2to4");
         #[cfg(feature = "instruments")]
         let mut table_timings: Vec<(
             String,
@@ -2173,6 +2191,8 @@ pub trait IsStarkProver<
             }
         }
 
+        #[cfg(feature = "instruments")]
+        drop(__sp);
         #[cfg(feature = "instruments")]
         {
             // Store timing data for the top-level report in prove_with_options.
