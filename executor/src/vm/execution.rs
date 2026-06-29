@@ -30,6 +30,17 @@ pub struct ExecutionResult {
 /// Size of each log chunk - balances memory usage vs callback overhead
 const CHUNK_SIZE: usize = 100_000;
 
+/// Result of executing one continuation epoch: the logs produced during the
+/// epoch and the VM state at the epoch boundary. The boundary state is the
+/// starting state of the next epoch.
+#[derive(Debug)]
+pub struct EpochExecution {
+    pub logs: Vec<Log>,
+    pub end_pc: u64,
+    pub end_registers: Registers,
+    pub end_memory: Memory,
+}
+
 /// Executor state for chunked execution
 pub struct Executor {
     memory: Memory,
@@ -57,13 +68,34 @@ impl Executor {
 
     /// Resume execution and return next logs. Returns None when program is finished.
     pub fn resume(&mut self) -> Result<Option<&[Log]>, ExecutorError> {
+        self.resume_with_limit(CHUNK_SIZE)
+    }
+
+    /// Current program counter (0 once the program has halted).
+    pub fn pc(&self) -> u64 {
+        self.pc
+    }
+
+    /// Current register state.
+    pub fn registers(&self) -> &Registers {
+        &self.registers
+    }
+
+    /// Current memory state.
+    pub fn memory(&self) -> &Memory {
+        &self.memory
+    }
+
+    /// Resume execution, running at most `limit` cycles, and return the logs
+    /// produced. Returns None when the program is finished.
+    pub fn resume_with_limit(&mut self, limit: usize) -> Result<Option<&[Log]>, ExecutorError> {
         if self.pc == 0 {
             return Ok(None);
         }
 
         self.logs.clear();
 
-        while self.pc != 0 && self.logs.len() < CHUNK_SIZE {
+        while self.pc != 0 && self.logs.len() < limit {
             if !self.pc.is_multiple_of(4) {
                 return Err(ExecutorError::InstructionAddressMisaligned(self.pc));
             }
@@ -116,6 +148,29 @@ impl Executor {
             logs,
             instructions: self.instructions.into_instruction_map(),
         })
+    }
+
+    /// Run to completion, splitting execution into epochs of at most `epoch_size`
+    /// cycles. Each epoch captures its logs and the VM state at the epoch
+    /// boundary, which is the starting state of the next epoch. Consumes the
+    /// executor.
+    ///
+    /// Test/bench helper — the production continuation prover streams epochs via
+    /// `resume_with_limit` directly.
+    pub fn run_epochs(mut self, epoch_size: usize) -> Result<Vec<EpochExecution>, ExecutorError> {
+        assert!(epoch_size > 0, "epoch_size must be greater than zero");
+
+        let mut epochs = Vec::new();
+        while let Some(logs) = self.resume_with_limit(epoch_size)? {
+            let logs = logs.to_vec();
+            epochs.push(EpochExecution {
+                logs,
+                end_pc: self.pc,
+                end_registers: self.registers.clone(),
+                end_memory: self.memory.clone(),
+            });
+        }
+        Ok(epochs)
     }
 }
 
