@@ -22,9 +22,6 @@ on:
         default: "14"
   issue_comment:
     types: [created]
-  # TEMP(testing): run from this branch pre-merge. REMOVE before merging.
-  push:
-    branches: [gpu_benchmarks]
 
 permissions:
   contents: read
@@ -53,9 +50,7 @@ jobs:
   benchmark-gpu:
     runs-on: ubuntu-latest
     # Skip unless: workflow_dispatch, or a "/bench-gpu" comment from a privileged author.
-    # TEMP(testing): the `push` clause lets branch pushes run it pre-merge. REMOVE before merging.
     if: >-
-      github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
@@ -84,7 +79,7 @@ jobs:
           else
             # workflow_dispatch: compare this branch vs main.
             OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
-            PAIRS=${DISPATCH_PAIRS:-2}   # TEMP(testing): 2 pairs for a fast push test; restore to 14 before merging
+            PAIRS=${DISPATCH_PAIRS:-14}
           fi
           # Clamp to [2,40] (even is ideal so AB/BA orders balance). 14 ~ resolves a 2% delta.
           if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 40 ] 2>/dev/null; then
@@ -334,8 +329,6 @@ jobs:
           # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
           # binaries (PTX is compiled for the detected arch); never trust a cached binary.
-          # TEMP(testing): checks out $REF_A (the branch harness) so the GPU path is exercised
-          # pre-merge; main's harness lacks BENCH_FEATURES. RESTORE to `origin/main` before merging.
           # CUDARC_PIN: pin cudarc to a fixed CUDA version so it doesn't bind symbols newer
           # than the box's driver (the boxes are CUDA 13.0; fallback-latest requested a symbol
           # they don't export). nvidia-smi is logged for diagnosing driver issues.
@@ -343,7 +336,7 @@ jobs:
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \
             git fetch --force origin main; $FETCH; \
-            git checkout -f $REF_A; \
+            git checkout -f origin/main; \
             REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
