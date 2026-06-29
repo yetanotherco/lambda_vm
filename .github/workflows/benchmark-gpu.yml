@@ -56,8 +56,10 @@ jobs:
        github.event.issue.pull_request &&
        startsWith(github.event.comment.body, '/bench-gpu') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
-    # ABBA on the GPU: dual cuda build (~15-30 min) + 2*pairs proves (~77s each).
-    timeout-minutes: 180
+    # ABBA on the GPU: provisioning + dual cuda build (~30 min) + 2*pairs proves
+    # (~95s each). At the max 32 pairs (64 proves) a slow-provision box runs ~3 hr,
+    # so allow headroom over that; teardown still always destroys the box.
+    timeout-minutes: 210
     steps:
       - name: Resolve PR ref + pair count
         id: config
@@ -81,10 +83,17 @@ jobs:
             OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
             PAIRS=${DISPATCH_PAIRS:-14}
           fi
-          # Clamp to [2,40] (even is ideal so AB/BA orders balance). 14 ~ resolves a 2% delta.
-          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 40 ] 2>/dev/null; then
-            echo "::warning::pair count out of range [2,40], defaulting to 14"
+          # Clamp to [2,32]; out-of-range -> default. 14 ~ resolves a 2% delta. The ceiling
+          # keeps the worst-case run (64 proves + provisioning + dual build) under the job
+          # timeout above.
+          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 32 ] 2>/dev/null; then
+            echo "::warning::pair count out of range [2,32], defaulting to 14"
             PAIRS=14
+          fi
+          # Even is ideal so the AB/BA orders balance; round an odd request up by one.
+          if [ "$((PAIRS % 2))" -ne 0 ]; then
+            PAIRS=$((PAIRS + 1))
+            echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
           fi
           {
             echo "pr_num=$OUT_PR_NUM"
@@ -198,7 +207,9 @@ jobs:
             --disk "$VAST_IMAGE_DISK" \
             --label "$RUN_LABEL" \
             --ssh --direct --raw > create.json
-          cat create.json
+          # Log only the fields we need rather than the full --raw response, which could carry
+          # an unexpected sensitive field into the (collaborator-/world-readable) run log.
+          jq '{success, new_contract: (.new_contract // .instances.new_contract)}' create.json
           IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json)
           if [ -z "$IID" ]; then
             echo "::error::Failed to create Vast instance"
@@ -315,6 +326,12 @@ jobs:
             FETCH="git fetch --force origin refs/pull/$PR_NUM/head"
             REF_A="$HEAD_SHA"
           else
+            # Reject anything outside the git-ref-safe charset before it reaches the remote
+            # `bash -lc` (defense-in-depth; workflow_dispatch is write-access only, but never
+            # interpolate an unvalidated ref into a remote shell command).
+            case "$BRANCH" in
+              ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid branch name: '$BRANCH'"; exit 1 ;;
+            esac
             FETCH="git fetch --force origin $BRANCH"
             REF_A="origin/$BRANCH"
           fi
@@ -329,9 +346,13 @@ jobs:
           # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
           # binaries (PTX is compiled for the detected arch); never trust a cached binary.
-          # CUDARC_PIN: pin cudarc to a fixed CUDA version so it doesn't bind symbols newer
-          # than the box's driver (the boxes are CUDA 13.0; fallback-latest requested a symbol
-          # they don't export). nvidia-smi is logged for diagnosing driver issues.
+          # CUDARC_PIN: pin cudarc to a fixed CUDA version (cuda-12080 = CUDA 12.8, matching the
+          # cuda_max_good>=12.8 offer floor) and drop fallback-latest, so cudarc binds a known
+          # symbol set instead of its newest. With fallback-latest cudarc requested a symbol the
+          # box's driver doesn't export (e.g. cuDevSmResourceSplit) -> runtime panic. This is the
+          # too-new end of the same compatibility window that MIN_DRIVER>=580 guards at the
+          # too-old end (older drivers lack cuCtxGetDevice_v2 and the GPU path falls back to CPU).
+          # nvidia-smi is logged for diagnosing driver issues.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \
@@ -347,13 +368,25 @@ jobs:
           # Extract the result section for the PR comment (same marker bench-abba.yml uses).
           sed -n '/=== ABBA paired result/,$p' "$RUNNER_TEMP/abba_out.txt" > "$RUNNER_TEMP/abba_result.txt"
 
-          # Surface the result in the Actions run summary too (workflow_dispatch runs
-          # have no PR to comment on).
+      - name: Write run summary
+        # Always run so a failure (incl. workflow_dispatch, which has no PR comment step) is
+        # visible in the Actions run summary instead of only the raw step log.
+        if: always() && (steps.bench.outcome == 'success' || steps.bench.outcome == 'failure')
+        env:
+          OUTCOME: ${{ steps.bench.outcome }}
+        run: |
           {
             echo "## GPU ABBA — ethrex 20 transfers (vs main)"
-            echo '```'
-            cat "$RUNNER_TEMP/abba_result.txt"
-            echo '```'
+            if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
+              echo '```'
+              cat "$RUNNER_TEMP/abba_result.txt"
+              echo '```'
+            else
+              echo "❌ Run outcome: ${OUTCOME:-unknown}. Last log lines:"
+              echo '```'
+              tail -n 30 "$RUNNER_TEMP/abba_out.txt" 2>/dev/null || echo "(no output captured)"
+              echo '```'
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Comment ABBA result on PR
@@ -408,18 +441,38 @@ jobs:
       - name: Destroy instance
         if: always()
         run: |
-          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
-            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
-            echo "Destroying instance $IID"
-            # Retry transient failures (network/auth) so a paid box isn't stranded.
-            # --yes: skip the interactive [y/N] confirm (CI has no tty).
-            destroyed=""
+          # Retry transient failures (network/auth) so a paid box isn't stranded.
+          # --yes: skip the interactive [y/N] confirm (CI has no tty).
+          destroy() {
+            iid="$1"; destroyed=""
             for attempt in 1 2 3; do
-              if vastai destroy instance "$IID" --yes; then destroyed=1; break; fi
+              if vastai destroy instance "$iid" --yes; then destroyed=1; break; fi
               echo "destroy attempt $attempt failed; retrying in 10s..."
               sleep 10
             done
-            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $IID after 3 attempts — check the Vast console (label $RUN_LABEL)"
+            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $iid after 3 attempts — check the Vast console (label $RUN_LABEL)"
+          }
+          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
+            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
+            echo "Destroying instance $IID"
+            destroy "$IID"
           else
-            echo "No instance id recorded; nothing to destroy."
+            # The id file is written only AFTER create succeeds AND its JSON parses, so a box can
+            # exist unrecorded if the run was cancelled in that window (concurrency cancel) or the
+            # parse failed. Fall back to destroying by our unique RUN_LABEL so the box can't leak
+            # (bill indefinitely). RUN_LABEL is unique per run, so this never touches another run's box.
+            echo "No instance id recorded; searching Vast for any box labelled $RUN_LABEL..."
+            vastai show instances --raw > all_inst.json 2>/dev/null || echo '[]' > all_inst.json
+            # Tolerate either a bare array or {instances:[...]}; match our exact label.
+            LEAKED=$(jq -r --arg L "$RUN_LABEL" \
+              '(if type=="array" then . else (.instances // []) end) | .[] | select(.label == $L) | .id' \
+              all_inst.json 2>/dev/null || true)
+            if [ -z "$LEAKED" ]; then
+              echo "No instance labelled $RUN_LABEL found; nothing to destroy."
+            else
+              for IID in $LEAKED; do
+                echo "Destroying leaked instance $IID (label $RUN_LABEL)"
+                destroy "$IID"
+              done
+            fi
           fi
