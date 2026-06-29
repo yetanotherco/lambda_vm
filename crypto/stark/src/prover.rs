@@ -390,6 +390,12 @@ where
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
     pub(crate) composition_poly_root: Commitment,
+    /// The composition-poly Merkle tree kept resident on device (when the R2
+    /// GPU tree path ran), so R4 openings gather authentication paths on device
+    /// instead of walking a host tree. When set, `composition_poly_merkle_tree`
+    /// is a root-only placeholder. `None` on the CPU path.
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -1133,22 +1139,31 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
         // leaves + device-side inner tree, both wrapping the host eval Vecs.
+        // GPU path keeps the composition tree resident on device (no whole-tree
+        // D2H) and returns a root-only host tree; the device tree is threaded to
+        // R4 in `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
-        let gpu_tree = crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-            FieldExtension,
-            BatchedMerkleTreeBackend<FieldExtension>,
-        >(&lde_composition_poly_parts_evaluations);
+        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
+            match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                FieldExtension,
+                BatchedMerkleTreeBackend<FieldExtension>,
+            >(&lde_composition_poly_parts_evaluations)
+            {
+                Some((host_tree, dev_tree)) => {
+                    let root = host_tree.root;
+                    (host_tree, root, Some(dev_tree))
+                }
+                None => {
+                    let (tree, root) =
+                        Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
+                            .ok_or(ProvingError::EmptyCommitment)?;
+                    (tree, root, None)
+                }
+            };
         #[cfg(not(feature = "cuda"))]
-        let gpu_tree: Option<BatchedMerkleTree<FieldExtension>> = None;
-
-        let (composition_poly_merkle_tree, composition_poly_root) = match gpu_tree {
-            Some(tree) => {
-                let root = tree.root;
-                (tree, root)
-            }
-            None => Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
-                .ok_or(ProvingError::EmptyCommitment)?,
-        };
+        let (composition_poly_merkle_tree, composition_poly_root) =
+            Self::commit_composition_polynomial(&lde_composition_poly_parts_evaluations)
+                .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -1167,6 +1182,8 @@ pub trait IsStarkProver<
             lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
             composition_poly_merkle_tree,
             composition_poly_root,
+            #[cfg(feature = "cuda")]
+            gpu_composition_tree,
         })
     }
 
@@ -1595,6 +1612,47 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Like [`Self::open_composition_poly`] but uses a Merkle proof already
+    /// gathered from the resident device composition tree
+    /// ([`crate::gpu_lde::gather_proofs_dev`]) instead of walking a host tree.
+    /// Same single-position opening (`proof_sym == proof`); evaluations come
+    /// from the host eval Vecs as before.
+    #[cfg(feature = "cuda")]
+    fn open_composition_poly_with_proof(
+        proof: Proof<Commitment>,
+        lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
+        index: usize,
+    ) -> PolynomialOpenings<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
+            .iter()
+            .flat_map(|part| {
+                vec![
+                    part[reverse_index(index * 2, part.len() as u64)].clone(),
+                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
+                ]
+            })
+            .collect();
+
+        PolynomialOpenings {
+            proof: proof.clone(),
+            proof_sym: proof,
+            evaluations: lde_composition_poly_parts_evaluation
+                .clone()
+                .into_iter()
+                .step_by(2)
+                .collect(),
+            evaluations_sym: lde_composition_poly_parts_evaluation
+                .into_iter()
+                .skip(1)
+                .step_by(2)
+                .collect(),
+        }
+    }
+
     /// Computes values and validity proofs of the evaluations of trace polynomials at
     /// the FRI query challenge `challenge` and its symmetric counterpart. The caller
     /// supplies a `gather` closure that pulls the row data from the column-major LDE
@@ -1689,6 +1747,28 @@ pub trait IsStarkProver<
             })
             .flatten();
 
+        // Same for the aux-trace tree, when it is device-resident.
+        #[cfg(feature = "cuda")]
+        let aux_dev_proofs: Option<Vec<Proof<Commitment>>> =
+            round_1_result.aux.as_ref().and_then(|_aux| {
+                let tree = lde_trace.gpu_aux()?.tree.as_ref()?;
+                let stream = lde_trace.bound_stream()?;
+                let positions: Vec<usize> = indexes_to_open
+                    .iter()
+                    .flat_map(|&c| [c * 2, c * 2 + 1])
+                    .collect();
+                crate::gpu_lde::gather_proofs_dev(tree, &positions, &stream)
+            });
+
+        // Composition tree: openings open a single position `index` (row-pair
+        // leaf), so gather one proof per query challenge from the device tree.
+        #[cfg(feature = "cuda")]
+        let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
+            round_2_result.gpu_composition_tree.as_ref().and_then(|tree| {
+                let stream = lde_trace.bound_stream()?;
+                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
+            });
+
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
@@ -1730,16 +1810,56 @@ pub trait IsStarkProver<
                 })
             });
 
-            let composition_openings = Self::open_composition_poly(
-                &round_2_result.composition_poly_merkle_tree,
-                &round_2_result.lde_composition_poly_evaluations,
-                *index,
-            );
+            let composition_openings = {
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(proofs) = &comp_dev_proofs {
+                        Self::open_composition_poly_with_proof(
+                            proofs[qi].clone(),
+                            &round_2_result.lde_composition_poly_evaluations,
+                            *index,
+                        )
+                    } else {
+                        Self::open_composition_poly(
+                            &round_2_result.composition_poly_merkle_tree,
+                            &round_2_result.lde_composition_poly_evaluations,
+                            *index,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_composition_poly(
+                        &round_2_result.composition_poly_merkle_tree,
+                        &round_2_result.lde_composition_poly_evaluations,
+                        *index,
+                    )
+                }
+            };
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                    lde_trace.gather_aux_row(row)
-                })
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(proofs) = &aux_dev_proofs {
+                        Self::open_polys_with_proofs(
+                            domain,
+                            proofs[qi * 2].clone(),
+                            proofs[qi * 2 + 1].clone(),
+                            *index,
+                            |row| lde_trace.gather_aux_row(row),
+                        )
+                    } else {
+                        Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                            lde_trace.gather_aux_row(row)
+                        })
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                        lde_trace.gather_aux_row(row)
+                    })
+                }
             });
 
             openings.push(DeepPolynomialOpening {

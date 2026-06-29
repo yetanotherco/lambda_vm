@@ -279,7 +279,13 @@ pub fn gather_merkle_paths_dev(
 ///
 /// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
 /// layout (root at byte offset 0, leaves in the tail).
-pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Result<Vec<u8>> {
+/// Build the composition-poly Merkle tree on device (leaves hash row-pairs, so
+/// `num_leaves = lde_size / 2`). Returns the device node buffer, the leaf count,
+/// and the stream it was built on. Shared by the host-D2H and device-keep
+/// wrappers below.
+fn build_comp_poly_tree_nodes_dev(
+    parts_interleaved: &[&[u64]],
+) -> Result<(CudaSlice<u8>, usize, Arc<CudaStream>)> {
     assert!(!parts_interleaved.is_empty());
     let m = parts_interleaved.len();
     let ext3_elems = parts_interleaved[0].len() / 3;
@@ -308,9 +314,13 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
 
     pack_ext3_to_pinned_slabs(parts_interleaved, pinned, lde_size);
 
-    // H2D the de-interleaved parts.
+    // H2D the de-interleaved parts, then release the staging lock (the kernels
+    // below read the device `buf`, not `pinned`). Synchronize first so the
+    // async H2D has consumed `pinned` before it is freed/reused.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+    stream.synchronize()?;
+    drop(staging);
 
     // Leaves into tail of a tight node buffer.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
@@ -337,11 +347,32 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     }
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+    Ok((nodes_dev, num_leaves, stream))
+}
 
+pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Result<Vec<u8>> {
+    let (nodes_dev, _num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
-    drop(staging);
     Ok(out)
+}
+
+/// Like [`build_comp_poly_tree_from_evals_ext3`] but keeps the tree nodes on
+/// device (returned as a [`crate::lde::GpuMerkleTree`] with its root), so R4
+/// composition openings gather authentication paths on device instead of
+/// D2H'ing the whole tree. `leaves_len = lde_size / 2` (row-pair leaves).
+pub fn build_comp_poly_tree_from_evals_ext3_keep(
+    parts_interleaved: &[&[u64]],
+) -> Result<crate::lde::GpuMerkleTree> {
+    let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    stream.synchronize()?;
+    Ok(crate::lde::GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    })
 }
 
 /// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval

@@ -452,11 +452,13 @@ pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(Ordering::Relaxed)
 }
 
-/// Fused base-field path: LDE + Keccak-256 leaf hash + Merkle tree build,
-/// all on device, with the LDE buffer retained for R2–R4 GPU reuse. On
-/// success: `columns[c]` is resized to `lde_size` with the LDE output, and
-/// the returned `(tree, GpuLdeBase)` pair is the host-side tree plus a
-/// device-resident handle to the LDE buffer.
+/// Fused base-field path: LDE + Keccak-256 leaf hash + Merkle tree build, all
+/// on device, keeping **both** the LDE buffer and the Merkle tree resident on
+/// device. On success: `columns[c]` is resized to `lde_size` with the LDE
+/// output, and the returned `GpuLdeBase` carries the device LDE buffer plus the
+/// device tree (`.tree`). The returned `MerkleTree` is **root-only** — the host
+/// tree nodes are never materialised (no whole-tree D2H); query openings gather
+/// authentication paths from the device tree via [`gather_proofs_dev`].
 pub(crate) fn try_expand_leaf_and_tree_batched_keep<F, E, B>(
     columns: &mut [Vec<FieldElement<E>>],
     blowup_factor: usize,
@@ -471,11 +473,8 @@ where
         LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
+    let _ = lde_size;
     let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
 
     // SAFETY: layout-checked above.
     let raw_columns = unsafe { columns_to_u64_base::<E>(columns) };
@@ -488,14 +487,11 @@ where
 
     let handle_result = {
         let mut raw_outputs = unsafe { presize_and_view_base::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
         math_cuda::lde::coset_lde_batch_base_into_with_merkle_tree_keep(
             &slices,
             blowup_factor,
             &weights_u64,
             &mut raw_outputs,
-            nodes_bytes,
         )
     };
     let handle = match handle_result {
@@ -506,7 +502,10 @@ where
         }
     };
 
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
+    // serves openings; only the commitment root lives on host.
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle))
 }
 
@@ -528,11 +527,8 @@ where
         LayoutDispatch::Empty | LayoutDispatch::Skip => return None,
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
+    let _ = lde_size;
     let num_columns = columns.len();
-    let (mut nodes, total_nodes) = alloc_merkle_nodes(lde_size)?;
-    let node_byte_len = total_nodes
-        .checked_mul(32)
-        .expect("node byte length overflow");
 
     // SAFETY: layout-checked above.
     let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
@@ -545,15 +541,12 @@ where
 
     let handle_result = {
         let mut raw_outputs = unsafe { presize_and_view_ext3::<E>(columns, lde_size) };
-        let nodes_bytes: &mut [u8] =
-            unsafe { from_raw_parts_mut(nodes.as_mut_ptr() as *mut u8, node_byte_len) };
         math_cuda::lde::coset_lde_batch_ext3_into_with_merkle_tree_keep(
             &slices,
             n,
             blowup_factor,
             &weights_u64,
             &mut raw_outputs,
-            nodes_bytes,
         )
     };
     let handle = match handle_result {
@@ -564,7 +557,10 @@ where
         }
     };
 
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
+    // serves openings; only the commitment root lives on host.
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle))
 }
 
@@ -742,7 +738,7 @@ where
 /// recomputes on CPU.
 pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
     lde_parts: &[Vec<FieldElement<E>>],
-) -> Option<MerkleTree<B>>
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
@@ -775,29 +771,17 @@ where
         })
         .collect();
 
-    let nodes_bytes = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3(&raw_parts) {
-        Ok(v) => v,
+    // Keep the composition tree resident on device; the whole-tree D2H is
+    // eliminated. R4 composition openings gather paths from the device tree
+    // (`gather_proofs_dev`); the returned host tree is root-only.
+    let dev_tree = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts) {
+        Ok(t) => t,
         Err(_) => return None,
     };
-
-    // lde_size is an even power of two >= 2, so 2*num_leaves == lde_size and
-    // tight_total_nodes = lde_size - 1 >= 1. No overflow or underflow possible.
-    let tight_total_nodes = lde_size - 1;
-    let expected_byte_len = tight_total_nodes
-        .checked_mul(32)
-        .expect("comp-poly node byte length overflow");
-    debug_assert_eq!(nodes_bytes.len(), expected_byte_len);
-
-    let nodes: Vec<[u8; 32]> = nodes_bytes
-        .chunks_exact(32)
-        .map(|c| {
-            c.try_into()
-                .expect("chunks_exact(32) yields exactly 32 bytes")
-        })
-        .collect();
+    debug_assert_eq!(dev_tree.leaves_len, lde_size / 2);
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    // Falls back to CPU on `None`, matching the R1 paths (lines 496, 557).
-    MerkleTree::<B>::from_precomputed_nodes(nodes)
+    let host = MerkleTree::<B>::from_root(dev_tree.root);
+    Some((host, dev_tree))
 }
 
 /// R3 GPU dispatch: batched strided barycentric OOD evaluation over the main

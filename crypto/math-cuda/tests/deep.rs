@@ -184,6 +184,7 @@ fn run_parity(
             buf: Arc::new(aux_dev),
             m: num_aux,
             lde_size,
+            tree: None,
         })
     } else {
         drop(aux_dev);
