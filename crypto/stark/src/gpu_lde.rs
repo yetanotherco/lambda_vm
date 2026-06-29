@@ -16,6 +16,7 @@ use math_cuda::{CudaSlice, CudaStream};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
+use crypto::merkle_tree::proof::Proof;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -23,7 +24,7 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::FriLayerMerkleTreeBackend;
+use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_functions::compute_coset_twiddles_inv;
@@ -1436,6 +1437,44 @@ where
     let handle =
         try_compute_and_invert_inv_denoms_dev::<F, E>(coset_base, z_scalars, sign, &stream)?;
     Some((handle, stream))
+}
+
+/// Gather Merkle authentication paths on device for `positions` (leaf indices),
+/// returning one [`Proof`] per position in the same order. Byte-identical to
+/// the host `MerkleTree::get_proof_by_pos` (guarded by the `merkle_gather`
+/// parity test), so R4 query openings can source proofs from the resident
+/// device tree instead of the host tree. Returns `None` on any cudarc error
+/// (the caller then falls back to the host tree).
+pub(crate) fn gather_proofs_dev(
+    tree: &math_cuda::lde::GpuMerkleTree,
+    positions: &[usize],
+    stream: &Arc<CudaStream>,
+) -> Option<Vec<Proof<Commitment>>> {
+    if positions.is_empty() {
+        return Some(Vec::new());
+    }
+    let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+    let bytes = math_cuda::merkle::gather_merkle_paths_dev(
+        &tree.nodes,
+        tree.leaves_len,
+        &positions_u32,
+        stream,
+    )
+    .ok()?;
+    let depth = tree.leaves_len.trailing_zeros() as usize;
+    debug_assert_eq!(bytes.len(), positions.len() * depth * 32);
+    let mut proofs = Vec::with_capacity(positions.len());
+    for q in 0..positions.len() {
+        let mut merkle_path = Vec::with_capacity(depth);
+        for level in 0..depth {
+            let off = (q * depth + level) * 32;
+            let mut node: Commitment = [0u8; 32];
+            node.copy_from_slice(&bytes[off..off + 32]);
+            merkle_path.push(node);
+        }
+        proofs.push(Proof { merkle_path });
+    }
+    Some(proofs)
 }
 
 /// R3 OOD device-side context: bundles the inverted denominators, the

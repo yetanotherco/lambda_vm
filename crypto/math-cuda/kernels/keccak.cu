@@ -347,3 +347,37 @@ extern "C" __global__ void keccak_merkle_level(
 
     finalize_keccak256(st, rate_pos, nodes + (parent_begin + tid) * 32);
 }
+
+// Gather Merkle authentication paths for a batch of leaf positions, reading the
+// resident tree `nodes` (32-byte nodes; layout: inner nodes [0..leaves_len-1],
+// root at 0, leaves at [leaves_len-1..]). One thread per query walks leaf->root,
+// writing each sibling node into the output. This mirrors the CPU
+// `build_merkle_path` exactly (sibling_index / parent_index in
+// crypto/crypto/src/merkle_tree/utils.rs):
+//   leaf node = pos + leaves_len - 1
+//   sibling   = node even ? node-1 : node+1
+//   parent    = node even ? (node-1)/2 : node/2
+// so `out[(q*depth + level)*32 .. +32]` is the level-th sibling for query q.
+extern "C" __global__ void merkle_gather_paths(
+    const uint8_t *nodes,
+    const uint32_t *positions,   // leaf positions, length num_queries
+    uint32_t num_queries,
+    uint64_t leaves_len,
+    uint32_t depth,              // = log2(leaves_len)
+    uint8_t *out) {              // num_queries * depth * 32 bytes
+    uint32_t q = blockIdx.x * blockDim.x + threadIdx.x;
+    if (q >= num_queries) return;
+
+    uint64_t node = (uint64_t)positions[q] + leaves_len - 1;
+    for (uint32_t level = 0; level < depth; ++level) {
+        uint64_t sib = (node & 1ull) ? (node + 1ull) : (node - 1ull);
+        // 32-byte nodes at 32-byte-aligned offsets (cuMemAlloc 256-aligned),
+        // so the u64 copy is safe.
+        const uint64_t *src = reinterpret_cast<const uint64_t *>(nodes + sib * 32);
+        uint64_t *dst = reinterpret_cast<uint64_t *>(
+            out + ((uint64_t)q * depth + level) * 32);
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) dst[i] = src[i];
+        node = (node & 1ull) ? (node >> 1) : ((node - 1ull) >> 1);
+    }
+}

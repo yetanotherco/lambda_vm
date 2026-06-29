@@ -219,11 +219,17 @@ fn launch_pointwise_mul_batched(
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
+///
+/// `tree` optionally carries the main-trace Merkle tree kept resident on device
+/// (populated by the keep path), so R4 query openings can gather authentication
+/// paths on device instead of D2H'ing the whole tree to host. `None` on the CPU
+/// path or when the tree wasn't retained.
 #[derive(Clone)]
 pub struct GpuLdeBase {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+    pub tree: Option<GpuMerkleTree>,
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -234,6 +240,18 @@ pub struct GpuLdeExt3 {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+}
+
+/// Handle to a Merkle tree kept live on device after a commit, so query
+/// openings can gather authentication paths on device instead of D2H'ing the
+/// whole tree to host. Node layout matches the CPU tree
+/// (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]` are inner nodes
+/// (root at index 0), `nodes[leaves_len-1..]` are the leaves; each node is 32
+/// bytes. Freed when the `nodes` Arc drops.
+#[derive(Clone)]
+pub struct GpuMerkleTree {
+    pub nodes: Arc<CudaSlice<u8>>,
+    pub leaves_len: usize,
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
@@ -613,6 +631,7 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
+        false,
     )
     .map(|_| ())
 }
@@ -640,6 +659,7 @@ pub fn coset_lde_batch_base_into_with_merkle_tree(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         false,
+        false,
     )
     .map(|_| ())
 }
@@ -654,6 +674,10 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<GpuLdeBase> {
+    // `keep_tree = true`: the main-trace tree nodes are retained on device
+    // (inside the returned `GpuLdeBase.tree`) so R4 openings can gather paths on
+    // device. The host `merkle_nodes_out` is still filled, so host-tree openings
+    // keep working until a later step drops the host tree.
     let opt = coset_lde_batch_base_into_with_merkle_tree_inner(
         columns,
         blowup_factor,
@@ -662,11 +686,13 @@ pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
         merkle_nodes_out,
         KeccakCommit::FullTree,
         true,
+        true,
     )?;
     let handle = opt.expect("keep_device_buf=true must return Some");
     Ok(handle)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -675,6 +701,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     nodes_out: &mut [u8],
     commit: KeccakCommit,
     keep_device_buf: bool,
+    keep_tree: bool,
 ) -> Result<Option<GpuLdeBase>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
@@ -817,13 +844,26 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     drop(staging);
 
     if keep_device_buf {
+        // Retain the device tree nodes for on-device opening (FullTree only; in
+        // LeavesOnly mode there are no inner nodes to gather paths from).
+        let tree = if keep_tree && commit == KeccakCommit::FullTree {
+            Some(GpuMerkleTree {
+                nodes: Arc::new(nodes_dev),
+                leaves_len: lde_size,
+            })
+        } else {
+            drop(nodes_dev);
+            None
+        };
         Ok(Some(GpuLdeBase {
             buf: Arc::new(buf),
             m,
             lde_size,
+            tree,
         }))
     } else {
         drop(buf);
+        drop(nodes_dev);
         Ok(None)
     }
 }

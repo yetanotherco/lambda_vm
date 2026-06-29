@@ -35,6 +35,8 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
+#[cfg(feature = "cuda")]
+use crypto::merkle_tree::proof::Proof;
 use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
@@ -1619,6 +1621,36 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Like [`Self::open_polys_with`], but uses Merkle proofs already gathered
+    /// from the resident device tree (see [`crate::gpu_lde::gather_proofs_dev`])
+    /// instead of walking a host tree. The evaluations are still gathered from
+    /// the host-resident LDE columns via `gather`. `proof` is for leaf position
+    /// `challenge * 2`, `proof_sym` for `challenge * 2 + 1` — the same positions
+    /// `open_polys_with` opens.
+    #[cfg(feature = "cuda")]
+    fn open_polys_with_proofs<C, G>(
+        domain: &Domain<Field>,
+        proof: Proof<Commitment>,
+        proof_sym: Proof<Commitment>,
+        challenge: usize,
+        gather: G,
+    ) -> PolynomialOpenings<C>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
+    {
+        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        let index = challenge * 2;
+        let index_sym = challenge * 2 + 1;
+        PolynomialOpenings {
+            proof,
+            proof_sym,
+            evaluations: gather(reverse_index(index, domain_size)),
+            evaluations_sym: gather(reverse_index(index_sym, domain_size)),
+        }
+    }
+
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
@@ -1638,7 +1670,28 @@ pub trait IsStarkProver<
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        for index in indexes_to_open.iter() {
+        // R4 main-trace proofs from the resident device tree, when present:
+        // gathered in one batch over all query positions (`c*2`, `c*2+1` per
+        // query) instead of walking the host tree. Byte-identical to the host
+        // proofs (guarded by the `merkle_gather` parity test). Only the
+        // non-preprocessed main carries a device tree today; on any miss this is
+        // `None` and openings fall back to the host tree below.
+        #[cfg(feature = "cuda")]
+        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = (!is_preprocessed)
+            .then(|| {
+                let tree = lde_trace.gpu_main()?.tree.as_ref()?;
+                let stream = lde_trace.bound_stream()?;
+                let positions: Vec<usize> = indexes_to_open
+                    .iter()
+                    .flat_map(|&c| [c * 2, c * 2 + 1])
+                    .collect();
+                crate::gpu_lde::gather_proofs_dev(tree, &positions, &stream)
+            })
+            .flatten();
+
+        for (qi, index) in indexes_to_open.iter().enumerate() {
+            #[cfg(not(feature = "cuda"))]
+            let _ = qi;
             // For preprocessed tables, open the main split (multiplicities only);
             // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
@@ -1646,9 +1699,28 @@ pub trait IsStarkProver<
                     lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                 })
             } else {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row(row)
-                })
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(proofs) = &main_dev_proofs {
+                        Self::open_polys_with_proofs(
+                            domain,
+                            proofs[qi * 2].clone(),
+                            proofs[qi * 2 + 1].clone(),
+                            *index,
+                            |row| lde_trace.gather_main_row(row),
+                        )
+                    } else {
+                        Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                            lde_trace.gather_main_row(row)
+                        })
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                        lde_trace.gather_main_row(row)
+                    })
+                }
             };
 
             // For preprocessed tables, also open the precomputed-columns tree.

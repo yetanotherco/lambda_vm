@@ -17,6 +17,7 @@
 //! to match `FieldElement::<Ext3>::write_bytes_be`.
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
+use std::sync::Arc;
 
 use crate::Result;
 use crate::device::{Backend, backend};
@@ -215,6 +216,61 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     let out = stream.clone_dtoh(&nodes_dev)?;
     stream.synchronize()?;
     Ok(out)
+}
+
+/// Gather Merkle authentication paths on device for `positions` (leaf indices)
+/// against the resident tree `nodes_dev` (standard layout, `2*leaves_len-1`
+/// nodes of 32 bytes). Returns `positions.len() * depth * 32` bytes, where
+/// `depth = log2(leaves_len)`: query `q`'s path occupies bytes
+/// `[q*depth*32 .. (q+1)*depth*32]`, each 32-byte node a sibling from leaf to
+/// root — byte-for-byte the same nodes the CPU `MerkleTree::get_proof_by_pos`
+/// (`build_merkle_path`) collects. Runs on the caller's `stream` (pass the
+/// table's session stream so it shares the queue with the rest of R4).
+pub fn gather_merkle_paths_dev(
+    nodes_dev: &CudaSlice<u8>,
+    leaves_len: usize,
+    positions: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u8>> {
+    let num_queries = positions.len();
+    if num_queries == 0 {
+        return Ok(Vec::new());
+    }
+    assert!(
+        leaves_len.is_power_of_two() && leaves_len >= 2,
+        "leaves_len must be a power of two >= 2"
+    );
+    let depth = leaves_len.trailing_zeros() as usize;
+    let be = backend()?;
+
+    let pos_dev = stream.clone_htod(positions)?;
+    // SAFETY: every byte of `out` is written by the kernel below (one 32-byte
+    // node per (query, level)) before the D2H reads it back.
+    let mut out = unsafe { stream.alloc::<u8>(num_queries * depth * 32) }?;
+
+    let grid = (num_queries as u32).div_ceil(KECCAK_BLOCK_DIM);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (KECCAK_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_queries_u32 = num_queries as u32;
+    let leaves_len_u64 = leaves_len as u64;
+    let depth_u32 = depth as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.merkle_gather_paths)
+            .arg(nodes_dev)
+            .arg(&pos_dev)
+            .arg(&num_queries_u32)
+            .arg(&leaves_len_u64)
+            .arg(&depth_u32)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
 }
 
 /// Row-pair Keccak leaf + Merkle tree build for R2 composition-polynomial

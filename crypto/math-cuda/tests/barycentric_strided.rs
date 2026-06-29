@@ -49,6 +49,7 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
         buf: Arc::new(lde_dev),
         m: num_cols,
         lde_size,
+        tree: None,
     };
 
     // Pre-strided buffer for non-strided reference: trace-size picks of each col.
