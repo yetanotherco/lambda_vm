@@ -6,7 +6,7 @@ name: Benchmark GPU (PR)
 # It builds the cli at the PR head and at main, runs N interleaved pairs on the GPU,
 # posts the paired-t + Wilcoxon verdict back to the PR, then ALWAYS destroys the box.
 #
-# Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 10) or via
+# Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 14) or via
 # workflow_dispatch. Orchestration runs on a GitHub-hosted runner; all GPU work happens
 # on the rented Vast box (provisioned by the template onstart).
 #
@@ -40,6 +40,11 @@ env:
   VAST_IMAGE_DISK: "64"
   # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
   BENCH_FEATURES: "jemalloc-stats,prover/cuda"
+  # Unique per-run label set on the instance, for easy identification in the Vast console.
+  RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"
+  # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
+  # hash can't) — avoids pulling untrusted code at run time.
+  VAST_CLI_COMMIT: "28494d92c6c03d887f8375085243c22eb68c5874"
 
 jobs:
   benchmark-gpu:
@@ -100,18 +105,38 @@ jobs:
               owner: context.repo.owner, repo: context.repo.repo,
               comment_id: context.payload.comment.id, content: 'eyes'
             });
-            await github.rest.issues.createComment({
+            // Post the "started" notice under the SAME marker the result step uses, so the
+            // result updates this comment in place (and re-runs reuse it rather than stacking).
+            const marker = 'GPU Benchmark (ABBA)';
+            const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) on the CUDA prover path. This takes ~1 hr; the result will replace this comment.`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `⏳ **GPU ABBA started** — renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) on the CUDA prover path. This takes ~1 hr; results will be posted here.`
+              issue_number: context.issue.number, per_page: 100,
             });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
 
       - name: Install Vast CLI
+        # No secrets in this step's env: install-time code can't read the API key during pip
+        # install. Pinned to an immutable commit (see VAST_CLI_COMMIT) for the same reason.
+        # --break-system-packages: the ephemeral runner's Python may be PEP-668 "externally
+        # managed"; safe to override on a disposable runner.
+        run: pip install --quiet --break-system-packages "git+https://github.com/vast-ai/vast-cli.git@${VAST_CLI_COMMIT}"
+
+      - name: Authenticate Vast CLI
         env:
           VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
-        run: |
-          pip install --quiet --upgrade vastai
-          vastai set api-key "$VAST_API_KEY"
+        run: vastai set api-key "$VAST_API_KEY"
 
       - name: Generate ephemeral SSH key
         id: sshkey
@@ -140,7 +165,9 @@ jobs:
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
           # (within the price cap) — premium hosts have faster disks/network (quicker image
           # pulls) and better reliability; the cheapest boxes were flaky.
-          SELECT="map(select((.driver_version|split(\".\")[0]|tonumber) >= ${MIN_DRIVER})) | sort_by(.dph_total) | reverse"
+          # `try ... catch 0` so a malformed/null driver_version on one offer is treated as 0
+          # (filtered out) rather than erroring the whole jq and wasting the attempt.
+          SELECT="map(select((try (.driver_version|split(\".\")[0]|tonumber) catch 0) >= ${MIN_DRIVER})) | sort_by(.dph_total) | reverse"
           OFFER_ID=""
           for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
             vastai search offers "$QUERY" --raw -o dph_total > offers.json || true
@@ -169,6 +196,7 @@ jobs:
           vastai create instance "$OFFER_ID" \
             --template_hash "$VAST_TEMPLATE_HASH" \
             --disk "$VAST_IMAGE_DISK" \
+            --label "$RUN_LABEL" \
             --ssh --direct --raw > create.json
           cat create.json
           IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json)
@@ -179,7 +207,7 @@ jobs:
           # Persist immediately so teardown runs even if later steps fail.
           echo "$IID" > "$RUNNER_TEMP/vast_instance_id"
           echo "id=$IID" >> "$GITHUB_OUTPUT"
-          echo "Created instance $IID"
+          echo "Created instance $IID (label $RUN_LABEL)"
 
       - name: Attach SSH key to instance
         env:
@@ -255,11 +283,13 @@ jobs:
             if $SSH 'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null'; then
               echo "onstart reported done"; exit 0
             fi
-            # shellcheck disable=SC2016  # $HOME/$(...) must expand on the remote box, not the runner
+            # Fallback if the log marker isn't found: the late-stage artifacts (cargo + the
+            # sysroot + the cloned repo) imply the earlier Rust/LLVM/toolchain install finished.
+            # Deliberately no toolchain-date check — it would go stale when the repo bumps nightly.
+            # shellcheck disable=SC2016  # $HOME must expand on the remote box, not the runner
             if $SSH 'test -x "$HOME/.cargo/bin/cargo" \
                   && test -f /opt/lambda-vm-sysroot/include/stdlib.h \
-                  && test -d /workspace/lambda_vm/.git \
-                  && "$HOME/.cargo/bin/rustup" toolchain list 2>/dev/null | grep -q nightly-2026-02-01'; then
+                  && test -d /workspace/lambda_vm/.git'; then
               echo "provisioning artifacts present"; exit 0
             fi
             sleep 10
@@ -306,6 +336,9 @@ jobs:
             REBUILD=1 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
             scripts/bench_abba.sh $REF_A origin/main $PAIRS"
 
+          # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
+          # tee pipe and fails this step, instead of being masked by tee's exit 0.
+          set -o pipefail
           $SSH "bash -lc \"$REMOTE\"" | tee "$RUNNER_TEMP/abba_out.txt"
           # Extract the result section for the PR comment (same marker bench-abba.yml uses).
           sed -n '/=== ABBA paired result/,$p' "$RUNNER_TEMP/abba_out.txt" > "$RUNNER_TEMP/abba_result.txt"
@@ -349,9 +382,9 @@ jobs:
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
             }
 
-            const { data: comments } = await github.rest.issues.listComments({
+            const comments = await github.paginate(github.rest.issues.listComments, {
               owner: context.repo.owner, repo: context.repo.repo,
-              issue_number: context.issue.number,
+              issue_number: context.issue.number, per_page: 100,
             });
             const marker = 'GPU Benchmark (ABBA)';
             const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
@@ -374,8 +407,15 @@ jobs:
           if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
             IID=$(cat "$RUNNER_TEMP/vast_instance_id")
             echo "Destroying instance $IID"
+            # Retry transient failures (network/auth) so a paid box isn't stranded.
             # --yes: skip the interactive [y/N] confirm (CI has no tty).
-            vastai destroy instance "$IID" --yes || echo "::warning::destroy instance $IID failed — check the Vast console"
+            destroyed=""
+            for attempt in 1 2 3; do
+              if vastai destroy instance "$IID" --yes; then destroyed=1; break; fi
+              echo "destroy attempt $attempt failed; retrying in 10s..."
+              sleep 10
+            done
+            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $IID after 3 attempts — check the Vast console (label $RUN_LABEL)"
           else
             echo "No instance id recorded; nothing to destroy."
           fi

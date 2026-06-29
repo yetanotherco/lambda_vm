@@ -94,10 +94,12 @@ INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
 need_build=0
 if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$WORK/cli_A" ] || [ ! -x "$WORK/cli_B" ]; then
   need_build=1
-elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A" ] || [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B" ]; then
-  # Cache persists on the self-hosted runner; rebuild if it's for different refs
-  # (a different PR, or main advanced) so we never benchmark stale binaries.
-  echo "==> Cached binaries are for different refs; rebuilding."
+elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A $BENCH_FEATURES" ] || \
+     [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B $BENCH_FEATURES" ]; then
+  # Cache persists on the self-hosted runner; rebuild if it's for different refs (a
+  # different PR, or main advanced) OR a different feature set (e.g. CPU vs prover/cuda),
+  # so we never benchmark stale binaries. The marker stores "<sha> <features>".
+  echo "==> Cached binaries are for different refs/features; rebuilding."
   need_build=1
 fi
 if [ "$need_build" = "1" ]; then
@@ -115,15 +117,16 @@ if [ "$need_build" = "1" ]; then
       exit 1
     fi
     cp "$WT/target/release/cli" "$WORK/$2"
-    echo "$1" > "$WORK/$2.sha"
+    # Marker = "<sha> <features>" so the cache invalidates on either changing.
+    echo "$1 $BENCH_FEATURES" > "$WORK/$2.sha"
   }
   build_cli "$SHA_B" cli_B
   build_cli "$SHA_A" cli_A
   cleanup
   trap - EXIT
 else
-  echo "==> Reusing cached binaries (SHAs match requested refs; REBUILD=1 to force):"
-  echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}"
+  echo "==> Reusing cached binaries (refs + features match; REBUILD=1 to force):"
+  echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
