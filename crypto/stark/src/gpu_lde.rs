@@ -41,25 +41,13 @@ use crate::trace::LDETraceTable;
 const DEFAULT_GPU_LDE_THRESHOLD: usize = 1 << 19;
 
 fn gpu_lde_threshold() -> usize {
-    // In test builds re-read the env var on every call so tests can switch
-    // between GPU and CPU paths in the same process (OnceLock can't be reset).
-    #[cfg(test)]
-    {
+    static CACHED: OnceLock<usize> = OnceLock::new();
+    *CACHED.get_or_init(|| {
         std::env::var("LAMBDA_VM_GPU_LDE_THRESHOLD")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
-    }
-    #[cfg(not(test))]
-    {
-        static CACHED: OnceLock<usize> = OnceLock::new();
-        *CACHED.get_or_init(|| {
-            std::env::var("LAMBDA_VM_GPU_LDE_THRESHOLD")
-                .ok()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(DEFAULT_GPU_LDE_THRESHOLD)
-        })
-    }
+    })
 }
 
 /// Incremented by the `try_expand_*` functions per base-field column handed to

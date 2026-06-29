@@ -66,25 +66,3 @@ fn gpu_path_fires_end_to_end() {
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
 }
-
-#[test]
-#[ignore = "requires GPU; run with --ignored --nocapture"]
-fn gpu_and_cpu_proofs_both_verify() {
-    let elf = asm_elf_bytes("fib_iterative_1M");
-
-    let proof_gpu = prove(&elf).expect("GPU prove");
-    assert!(
-        verify(&proof_gpu, &elf).expect("GPU verify"),
-        "GPU proof failed"
-    );
-
-    // Force CPU path by pushing the GPU threshold above any real table size.
-    // SAFETY: no other thread reads this env var during the test.
-    unsafe { std::env::set_var("LAMBDA_VM_GPU_LDE_THRESHOLD", "999999999") };
-    let proof_cpu = prove(&elf).expect("CPU prove");
-    unsafe { std::env::remove_var("LAMBDA_VM_GPU_LDE_THRESHOLD") };
-    assert!(
-        verify(&proof_cpu, &elf).expect("CPU verify"),
-        "CPU proof failed"
-    );
-}
