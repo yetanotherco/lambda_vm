@@ -193,17 +193,58 @@ where
     pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// If the main trace was LDE'd on the GPU via the fused pipeline,
-    /// the device buffer is retained here so downstream GPU rounds can
-    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
-    /// for this table (below the size threshold or any CPU fallback:
-    /// preprocessed main, non-Goldilocks, or GPU error).
+    /// Per-table GPU residency session: owns the device-resident trace LDE
+    /// buffers (main + aux) and tracks, per buffer, whether a host mirror is
+    /// live. Created on the CPU path too (all buffers `None`, mirrors present);
+    /// populated when the R1 fused GPU pipeline runs. Threaded R1→R4 because
+    /// `LDETraceTable` is borrowed through every round.
     #[cfg(feature = "cuda")]
-    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
-    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
-    /// layout on device).
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+    pub(crate) gpu_session: GpuTableSession,
+}
+
+/// Per-table GPU residency session.
+///
+/// Owns the device-resident buffers for a single trace table and tracks, per
+/// buffer, whether a host mirror is currently materialised. Today every buffer
+/// produced on the GPU is *also* copied to host columns, because the remaining
+/// CPU consumers (R2 constraint evaluation, R3 barycentric OOD, R4 query
+/// openings) read from host. The `*_host_mirror` flags are the seam those later
+/// steps flip: once a consumer reads from the device buffer instead, the
+/// corresponding mirror is dropped and the H2D/D2H copy elided.
+///
+/// Scope: this owns the main/aux trace LDE (resident R1→R4). The composition
+/// parts (`Round2`, R2→R4) and the bound stream are folded in by the control-
+/// plane commit, where the R2→R4 borrow chain becomes mutable. The R4-local
+/// `inv_denoms`/FRI state are created and consumed within R4 and stay local.
+#[cfg(feature = "cuda")]
+pub(crate) struct GpuTableSession {
+    /// Main-trace LDE, resident from the R1 fused pipeline through R4. `None`
+    /// when the GPU LDE didn't run for this table (below the size threshold or
+    /// any CPU fallback: preprocessed main, non-Goldilocks, or GPU error).
+    main_lde: Option<math_cuda::lde::GpuLdeBase>,
+    /// Aux-trace LDE (ext3 de-interleaved layout on device), resident R1→R4.
+    aux_lde: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Whether the main-trace host columns currently mirror `main_lde`.
+    /// Always `true` today; CPU consumers depend on it.
+    main_host_mirror: bool,
+    /// Whether the aux-trace host columns currently mirror `aux_lde`.
+    /// Always `true` today; CPU consumers depend on it.
+    aux_host_mirror: bool,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuTableSession {
+    fn new() -> Self {
+        Self {
+            main_lde: None,
+            aux_lde: None,
+            // Host columns are always materialised today; the CPU consumers
+            // (constraint eval, OOD, openings) read them. Steps 5/6 flip these
+            // off as each consumer moves to reading the device buffer.
+            main_host_mirror: true,
+            aux_host_mirror: true,
+        }
+    }
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -227,9 +268,7 @@ where
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
-            gpu_main: None,
-            #[cfg(feature = "cuda")]
-            gpu_aux: None,
+            gpu_session: GpuTableSession::new(),
         }
     }
 
@@ -238,23 +277,38 @@ where
     /// ran the CPU path should leave this alone.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
-        self.gpu_main = Some(h);
+        self.gpu_session.main_lde = Some(h);
     }
 
     /// Attach an already-populated device LDE handle for the aux columns.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
-        self.gpu_aux = Some(h);
+        self.gpu_session.aux_lde = Some(h);
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
-        self.gpu_main.as_ref()
+        self.gpu_session.main_lde.as_ref()
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
-        self.gpu_aux.as_ref()
+        self.gpu_session.aux_lde.as_ref()
+    }
+
+    /// Whether the main-trace host columns currently mirror the device LDE.
+    /// Always `true` today (CPU consumers read host); the source-agnostic seam
+    /// steps 5/6 flip when the main consumer reads the device buffer instead.
+    #[cfg(feature = "cuda")]
+    pub fn main_host_mirror(&self) -> bool {
+        self.gpu_session.main_host_mirror
+    }
+
+    /// Whether the aux-trace host columns currently mirror the device LDE.
+    /// Always `true` today; see [`Self::main_host_mirror`].
+    #[cfg(feature = "cuda")]
+    pub fn aux_host_mirror(&self) -> bool {
+        self.gpu_session.aux_host_mirror
     }
 
     /// Consume self and return the owned column vectors.
