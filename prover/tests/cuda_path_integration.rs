@@ -12,7 +12,8 @@ use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls,
+    reset_all_gpu_call_counters,
 };
 
 #[test]
@@ -36,10 +37,15 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 ext3 LDE of composition-poly parts. Only fires when an AIR's
-    // `number_of_parts > 2`. The branch and shift tables have degree-3
-    // transition constraints, so this triggers on any non-trivial prove.
-    assert!(gpu_parts_lde_calls() > 0, "R2 GPU parts LDE did not fire");
+    // R2 GPU composition-poly LDE. Fires via one of two paths depending on the
+    // AIR's `number_of_parts`: the fused two-halves quotient decomposition for
+    // the common degree-2 case (`== 2`, counted by `gpu_extend_halves_calls`),
+    // or the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`).
+    // fib_iterative_1M only exercises the degree-2 path, so assert on either.
+    assert!(
+        gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
+        "R2 GPU composition LDE did not fire (neither two-halves d2 nor parts>2 path)"
+    );
 
     // R2 comp-poly Merkle tree build, paired with the parts LDE above.
     assert!(
