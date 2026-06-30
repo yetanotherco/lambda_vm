@@ -366,19 +366,19 @@ jobs:
               BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
               if [ -n "$BASELINE_FILE" ]; then
                 echo "found=true" >> "$GITHUB_OUTPUT"
-                echo "peak_mb=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_s=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_spread=$(grep 'time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "heap_spread=$(grep 'heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_times=$(grep 'all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_heaps=$(grep 'all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "runs=$(grep 'runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_heaps=$(grep 'growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_times=$(grep 'growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_slope_mb=$(grep 'growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_r2=$(grep 'growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "verify_time_s=$(grep 'verify_time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "verify_time_spread=$(grep 'verify_time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "peak_mb=$(grep '^peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_s=$(grep '^time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_spread=$(grep '^time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "heap_spread=$(grep '^heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_times=$(grep '^all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_heaps=$(grep '^all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "runs=$(grep '^runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_heaps=$(grep '^growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_times=$(grep '^growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_slope_mb=$(grep '^growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_r2=$(grep '^growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "verify_time_s=$(grep '^verify_time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "verify_time_spread=$(grep '^verify_time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
