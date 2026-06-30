@@ -36,15 +36,6 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 fused composition LDE + tree + keep. After #699/#700 every VM AIR's
-    // composition poly has `number_of_parts == 2`, so the degree-2 quotient
-    // decomposition routes through `try_extend_two_halves_gpu_keep`: one call
-    // does the LDE of both halves, builds the composition Merkle tree, and
-    // retains the device handle for R4 DEEP. A silent fallback to the host
-    // `commit_composition_polynomial` (or the CPU `extend_half_to_lde`) would
-    // drop this to zero. (Replaces the `gpu_parts_lde_calls` /
-    // `gpu_comp_poly_tree_calls` >2-part assertions, dead since no AIR has
-    // number_of_parts > 2.)
     // R2 fused composition LDE + no-tree keep. After #699/#700 every VM AIR's
     // composition poly has `number_of_parts == 2`, so the degree-2 quotient
     // decomposition routes through `try_extend_two_halves_gpu_keep`: one call does
@@ -73,4 +64,25 @@ fn gpu_path_fires_end_to_end() {
     // actually satisfies the verifier.
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
+}
+
+/// Focused validation of the GPU row-pair trace commitment: proves a large
+/// trace with the GPU path and verifies the resulting proof. Independent of the
+/// per-round counter assertions in `gpu_path_fires_end_to_end` (the R2 parts-LDE
+/// assertion bit-rotted on main and cuts off before the verify). A wrong GPU
+/// trace-commit leaf layout (1-row vs the new row-pair) would fail verification.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_proof_verifies_row_pair_commitment() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_lde_calls() > 0,
+        "GPU LDE path did not fire (silent CPU fallback would not test the GPU commit)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (row-pair commitment) failed verification"
+    );
 }

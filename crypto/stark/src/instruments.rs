@@ -33,7 +33,7 @@ pub struct TableSubOps {
     pub constraints: Duration,
     /// decompose_and_extend_d2
     pub comp_decompose: Duration,
-    /// commit_composition_polynomial
+    /// commit_bit_reversed (composition-polynomial commit step)
     pub comp_commit: Duration,
     /// Round 3: barycentric OOD evaluation
     pub ood: Duration,
@@ -52,11 +52,11 @@ pub struct TableSubOps {
 pub struct Round1SubOps {
     /// Main trace: expand_columns_to_lde (LDE/FFT)
     pub main_lde: Duration,
-    /// Main trace: commit_columns_bit_reversed (Merkle)
+    /// Main trace: commit_bit_reversed (Merkle)
     pub main_merkle: Duration,
     /// Aux trace: expand_columns_to_lde (LDE/FFT)
     pub aux_lde: Duration,
-    /// Aux trace: commit_columns_bit_reversed (Merkle)
+    /// Aux trace: commit_bit_reversed (Merkle)
     pub aux_merkle: Duration,
 }
 
