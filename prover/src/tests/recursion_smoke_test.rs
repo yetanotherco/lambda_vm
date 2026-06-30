@@ -1,16 +1,7 @@
-//! End-to-end naive recursion pipeline smoke tests.
-//!
-//! Each test:
-//! 1. Proves an inner program on the host.
-//! 2. Serializes `(VmProof, inner_elf)` with postcard.
-//! 3. Hands that as private input to the recursion guest.
-//! 4. Either **proves** the recursion guest's execution (memory-bounded via
-//!    continuations) and verifies the outer proof (`OuterMode::Prove`), or
-//!    merely **executes** the guest in-VM and reads the committed marker
-//!    straight off the executor's memory (`OuterMode::ExecuteOnly`) — a cheaper
-//!    tier that skips the LDE/FRI that dominate the full pipeline.
-//!
-//! The guest ELFs are assumed built by `make compile-recursion-elfs`.
+//! End-to-end naive recursion pipeline smoke tests: prove an inner program,
+//! hand `(VmProof, elf, opts)` to the in-VM verifier guest, then either prove
+//! the guest's execution (`OuterMode::Prove`) or just execute it
+//! (`OuterMode::ExecuteOnly`). Guest ELFs come from `make compile-recursion-elfs`.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -33,11 +24,8 @@ fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
     })
 }
 
-/// Minimum-security FRI parameters: blowup=2, a single FRI query. Security is
-/// intentionally terrible — used by the capacity-probing test and every cheap
-/// diagnostic below, where the goal is the smallest possible inner proof, not
-/// a sound one. (`GoldilocksCubicProofOptions::with_blowup` derives a query
-/// count from a 128-bit target, far more than we want here.)
+/// Smallest possible inner proof (blowup=2, 1 query). Intentionally insecure —
+/// for the cheap diagnostics, not soundness.
 const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
     stark::proof::options::ProofOptions {
         blowup_factor: 2,
@@ -46,11 +34,8 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         grinding_factor: 1,
     };
 
-/// Prove `inner_elf` (fed `inner_input`) under `opts`, then package
-/// `(proof, elf, opts)` into the postcard blob the recursion and
-/// deserialize-only guests consume as their private input. `tag` prefixes the
-/// progress lines. Returns the inner proof — callers that re-verify it on the
-/// host need it — next to the encoded blob.
+/// Prove `inner_elf` under `opts` and postcard-encode `(proof, elf, opts)` into
+/// the guest's private-input blob. Returns the proof and the blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
@@ -75,29 +60,17 @@ fn prove_inner_and_encode_blob(
     (inner_proof, blob)
 }
 
-/// How far to take the recursion guest after it has been handed the inner
-/// proof. The guest under test is the verifier either way — this only chooses
-/// whether we also prove the guest's own execution.
+/// Whether to also prove the guest's own execution after handing it the proof.
 #[derive(Clone, Copy, Debug)]
 enum OuterMode {
-    /// Execute the guest in-VM and read the committed marker straight off the
-    /// executor's memory. Streams logs via `Executor::resume()` and never
-    /// builds a `Traces`, so footprint stays bounded to the VM's touched
-    /// memory + instruction cache. Skips the LDE/FRI of the full pipeline entirely.
+    /// Execute in-VM, read the committed marker off memory; no LDE/FRI.
     ExecuteOnly,
-    /// Prove the guest's execution via continuations, then verify the outer
-    /// proof on the host. `prove_and_verify_continuation` retains every epoch's
-    /// STARK proof in the bundle before verifying, so peak RAM grows with epoch
-    /// count. Heavy — excluded from CI, run manually. A future verify-one-and-
-    /// discard API extension would make this memory-friendlier.
+    /// Prove the execution (memory-bounded via continuations) and verify on host.
     Prove,
 }
 
-/// Execute the recursion guest in-VM on `blob` and return the bytes it
-/// committed (the success marker the in-VM verifier emits).
-///
-/// Streams execution via `Executor::resume()`. The committed marker is
-/// read directly off the executor's memory. This avoids OOMs.
+/// Execute the recursion guest in-VM on `blob` and return its committed bytes,
+/// read straight off the executor's memory after a streamed run.
 fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
@@ -127,9 +100,8 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
 /// trace+LDE stays under the ~16GiB CI runners.
 const OUTER_EPOCH_SIZE_LOG2: u32 = 16;
 
-/// Prove the recursion guest's execution on `blob` memory-bounded via
-/// continuations and verify the bundle on the host, returning the bytes the
-/// guest committed.
+/// Prove the guest's execution via continuations, verify on host, return the
+/// committed bytes.
 fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
     let opts =
         crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
@@ -149,15 +121,9 @@ fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) 
     committed
 }
 
-/// Stream a guest's execution via `Executor::resume()`, calling `on_log` for
-/// every `Log` without ever buffering the full log stream (`Executor::run`
-/// would accumulate tens of millions of `Log`s and OOM even a 125 GB box).
-/// `on_log` returns `ControlFlow::Break(())` to stop the run early (e.g. once a
-/// cycle budget is hit); `Continue(())` to keep going. `on_progress(chunks,
-/// total_cycles, elapsed)` fires once per resumed chunk; callers throttle and
-/// format their own progress lines. Returns `(total_cycles, wall_time)` —
-/// `total_cycles` counts logs actually visited, so it is exact even when a run
-/// breaks mid-chunk.
+/// Stream a guest's execution via `Executor::resume()` without buffering the log
+/// stream. `on_log` returns `Break` to stop early; `on_progress` fires per chunk.
+/// Returns `(total_cycles, wall_time)`, exact even on an early break.
 fn drive_executor(
     executor: &mut executor::vm::execution::Executor,
     mut on_log: impl FnMut(&executor::vm::logs::Log) -> ControlFlow<()>,
@@ -184,12 +150,8 @@ fn drive_executor(
     (total_cycles, start.elapsed())
 }
 
-/// Shared preamble for every execute-only diagnostic below: build the standard
-/// recursion private-input blob (an `empty`-program inner proof produced under
-/// `opts`), load guest `guest_name`, and stand up an executor over it. Returns
-/// the guest's raw ELF bytes (callers that resolve PCs pass them to
-/// [`executor::elf::SymbolTable::parse`]), the loaded program, and the
-/// ready-to-drive executor.
+/// Shared preamble: build the blob (an `empty` inner proof under `opts`), load
+/// `guest_name`, and stand up an executor. Returns `(elf_bytes, program, executor)`.
 fn setup_guest_run(
     label: &str,
     guest_name: &str,
@@ -215,12 +177,7 @@ fn setup_guest_run(
     (guest_elf_bytes, program, executor)
 }
 
-/// A `drive_executor` progress callback that prints the throttled
-/// `[label]   ... N chunks, M cycles, T elapsed` line every `stride` chunks —
-/// the readout the counting diagnostics share. Tests that need extra live state
-/// (unique PC count, active step bucket) keep their own closure instead. Takes
-/// `impl Into<String>` so it works with both `&'static` tags and a run's
-/// dynamic `label`.
+/// A `drive_executor` progress callback printing one line every `stride` chunks.
 fn log_progress(label: impl Into<String>, stride: usize) -> impl FnMut(usize, u64, std::time::Duration) {
     let label = label.into();
     move |chunks, cycles, elapsed| {
@@ -230,11 +187,8 @@ fn log_progress(label: impl Into<String>, stride: usize) -> impl FnMut(usize, u6
     }
 }
 
-/// Resolve a guest PC to its (demangled) enclosing function name using the
-/// ELF's own symbol table — the same data `executor::flamegraph` resolves
-/// against. `<unknown>` when no function symbol covers the PC (e.g. PLT stubs
-/// or a release build that dropped symbols). No file:line: the symbol table
-/// carries function ranges only, not DWARF line info.
+/// Demangled enclosing-function name for a PC via the ELF symbol table;
+/// `<unknown>` if none covers it. No file:line (symtab has no DWARF).
 fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
     symbols.lookup(pc).map_or_else(
         || "<unknown>".to_string(),
@@ -242,10 +196,8 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
     )
 }
 
-/// Verifier sub-routines in execution order. LLVM inlines the step bodies, but
-/// closures inside each keep the method name in their mangled symbol, so
-/// `run_profile` advances the step bucket by substring-matching the enclosing
-/// symbol. A step with no matching symbol merges into the previous bucket.
+/// Verifier sub-routines in execution order; `run_profile` buckets cycles by
+/// substring-matching the enclosing symbol (a missing step merges into the prior).
 const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
     "replay_rounds_after_round_1",
     "step_2_verify_claimed_composition_polynomial",
@@ -253,15 +205,12 @@ const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
     "step_4_verify_trace_and_composition_openings",
 ];
 
-/// `blowup=8` inner-proof options: the security-derived multi-query count (tens
-/// of queries, 128-bit) used by every `multiquery` profiling variant.
+/// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
 fn blowup8() -> stark::proof::options::ProofOptions {
     crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
 }
 
-/// Fold the PC histogram by enclosing function and print the top-25 by cycles.
-/// Folded because an inlined kernel spreads across many PCs; no per-address
-/// table since a bare PC isn't actionable without file:line.
+/// Print the top-25 functions by cycles, folding the PC histogram by symbol.
 fn print_function_table(
     symbols: &executor::elf::SymbolTable,
     pc_hist: std::collections::HashMap<u64, u64>,
@@ -297,9 +246,7 @@ fn print_function_table(
     }
 }
 
-/// Print the monotonic per-verifier-step cycle bucketing. `buckets[0]` is
-/// pre-step-1 setup (alloc + postcard decode + `VmAirs::new`); `buckets[i]` is
-/// verifier step i (with a missing step's cycles merged into the previous one).
+/// Print the monotonic per-verifier-step cycle bucketing (`buckets[0]` = setup).
 fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
     let labels = [
         "0. setup (alloc + postcard decode + VmAirs::new + pre-step-1)",
@@ -321,12 +268,9 @@ fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
     }
 }
 
-/// Single-pass execute-only profiler. Always prints total cycles + wall time +
-/// a rough trace/LDE size estimate. With `detailed`, the same pass also builds
-/// the PC histogram and verifier-step bucketing and prints the top-25 functions
-/// and the per-step breakdown (the two always come together); `!detailed` does
-/// no per-log work, so it's just a fast cycle counter. `progress_stride`
-/// throttles the readout (recursion large, the deserialize-only control small).
+/// Single-pass execute-only profiler. Always prints total cycles + a rough
+/// trace/LDE estimate; with `detailed`, also the top-25 functions + per-step
+/// breakdown (one streamed pass). `!detailed` does no per-log work.
 fn run_profile(
     guest_name: &str,
     progress_stride: usize,
@@ -441,10 +385,8 @@ fn run_profile(
     eprintln!("============================================================");
 }
 
-/// Core pipeline: prove an inner program with the given options, hand the
-/// proof+ELF+options to the recursion guest, then take the guest to `mode`
-/// (execute-only or full prove) and assert it committed the `[1]` success
-/// marker — i.e. the in-VM verifier accepted the inner proof.
+/// Core pipeline: prove the inner program, run the guest to `mode`, assert it
+/// committed `[1]` (the in-VM verifier accepted the proof).
 fn run_recursion_pipeline_with_options(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -491,8 +433,7 @@ fn run_recursion_pipeline_with_options(
     eprintln!("[{label}] guest committed [1]: in-VM verify accepted ✓");
 }
 
-/// Convenience wrapper using `blowup=8` for the inner proof — the default for
-/// the `empty` and `fibonacci` cases, chosen to keep outer-prove memory tractable.
+/// `run_recursion_pipeline_with_options` with `blowup=8` (the `empty`/`fibonacci` default).
 fn run_recursion_pipeline(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -510,9 +451,8 @@ fn run_recursion_pipeline(
     );
 }
 
-/// Reproduce the recursion guest's EXACT path on the host — decode the postcard
-/// blob into `(VmProof, Vec<u8>, ProofOptions)` and call `verify_with_options`.
-/// Cheap regression guard.
+/// Decode the blob on the host and verify — a cheap guard on the encode/decode
+/// contract without running the VM.
 #[test]
 #[ignore = "needs prebuilt guest ELF (make compile-recursion-elfs)"]
 fn test_recursion_blob_decodes_and_verifies_on_host() {
@@ -545,8 +485,7 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 
 // === Execute-only tier ========================================================
 
-/// Execute-only mirror of `test_recursion_prove_empty`: verify a `blowup=8`
-/// proof of the empty program in-VM.
+/// Execute-only: verify a `blowup=8` proof of the empty program in-VM.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_empty() {
@@ -560,8 +499,7 @@ fn test_recursion_execute_empty() {
     );
 }
 
-/// Execute-only mirror of `test_recursion_prove_1query`: smallest possible
-/// inner proof (blowup=2, 1 query) → least guest work.
+/// Execute-only: smallest inner proof (blowup=2, 1 query) → least guest work.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_1query() {
@@ -576,8 +514,7 @@ fn test_recursion_execute_1query() {
     );
 }
 
-/// Execute-only mirror of `test_recursion_prove`: verify a `blowup=8` proof of
-/// fibonacci(10) in-VM.
+/// Execute-only: verify a `blowup=8` proof of fibonacci(10) in-VM.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute() {
@@ -597,8 +534,7 @@ fn test_recursion_execute() {
 
 // === Full-prove tier ==========================================================
 
-/// Inner program: empty (halt immediately). Useful for measuring the
-/// verifier's intrinsic recursion overhead.
+/// Inner program: empty — the verifier's intrinsic recursion overhead.
 #[test]
 #[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_empty() {
@@ -612,8 +548,7 @@ fn test_recursion_prove_empty() {
     );
 }
 
-/// Inner program: empty, but with the absolute-minimum FRI parameters
-/// (blowup=2, **fri_number_of_queries=1**). For quick profiling only.
+/// Inner program: empty, blowup=2/1-query. Quick profiling only.
 #[test]
 #[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_1query() {
@@ -629,18 +564,8 @@ fn test_recursion_prove_1query() {
     );
 }
 
-/// Diagnostic: build the inner proof and dump the recursion guest's private-input
-/// blob to `/tmp/recursion_input.bin` so the CLI's `execute --flamegraph` can
-/// consume it.
-///
-/// Usage after running this test:
-/// ```
-/// cargo run -p cli --release -- execute \
-///     bench_vs/lambda/recursion/target/riscv64im-lambda-vm-elf/release/recursion-bench \
-///     --private-input /tmp/recursion_input.bin \
-///     --flamegraph /tmp/recursion_folded.txt
-/// cat /tmp/recursion_folded.txt | inferno-flamegraph > /tmp/recursion_flamegraph.svg
-/// ```
+/// Dump the guest's private-input blob to `/tmp/recursion_input.bin` for the
+/// CLI's `execute --flamegraph`.
 #[test]
 #[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
 fn test_dump_recursion_input() {
@@ -669,8 +594,7 @@ fn test_recursion_cycles_multiquery() {
     run_profile("recursion", 500, blowup8(), false);
 }
 
-/// Full profile (top-25 functions + per-step breakdown) of the 1-query run —
-/// the cheapest verifier run, dominated by fixed setup.
+/// Full profile (top-25 + per-step) of the 1-query run.
 #[test]
 #[ignore = "diagnostic: ~8 min; recursion guest histogram + steps (1 query)"]
 fn test_recursion_profile_1query() {
@@ -684,27 +608,8 @@ fn test_recursion_profile_multiquery() {
     run_profile("recursion", 500, blowup8(), true);
 }
 
-/// Diagnostic: count the distinct 4 KB memory pages the recursion guest
-/// touches when verifying a small inner proof.
-///
-/// We suspect the outer prover's 125 GB OOM wall is dominated by per-page
-/// PAGE-table overhead. The number of PAGE tables the prover would build
-/// equals the number of distinct 4 KB pages the executor touches — code,
-/// heap, private input, and stack. This test surfaces that count without
-/// running the prover.
-///
-/// Layout (per `executor::constants` + `bench_vs/lambda/recursion/src/main.rs`):
-/// - Code/static: whatever PT_LOAD segments the recursion ELF carries.
-/// - Heap: `_end .. 0xC000_0000` (`MAX_MEMORY_SIZE`); `TlsfHeap` scatters
-///   allocations across this region.
-/// - Private input: starts at `PRIVATE_INPUT_START_INDEX = 0xFF000000`.
-/// - Stack: top of address space (down from `STACK_TOP = 0xFFFFFFFFFFFFFFF0`).
-///
-/// Interpretation (rough):
-/// - <1,000 pages: PAGE-table overhead is not the bottleneck.
-/// - 10k-100k pages: TLSF heap fragmentation; design a tighter bump allocator
-///   and re-measure.
-/// - >100k pages: postcard decode dominates; consider streaming decode.
+/// Count the distinct 4 KB pages the guest touches (code/heap/input/stack) — a
+/// proxy for the prover's per-page PAGE-table overhead, without running it.
 #[test]
 #[ignore = "diagnostic: counts distinct 4 KB memory pages touched by the recursion guest"]
 fn test_recursion_page_count() {
@@ -807,39 +712,19 @@ fn test_recursion_page_count() {
     eprintln!("============================================================");
 }
 
-/// Diagnostic: build a **sampled** call-stack histogram of the recursion guest.
-///
-/// Like `test_recursion_pc_histogram` but groups by full call stack (not PC).
-/// To stay fast, only every `SAMPLE_RATE`-th log is recorded into the histogram.
-/// The call stack itself is updated on every log (skipping would corrupt it).
-///
-/// Output is written to `/tmp/recursion_folded_sampled.txt` in
-/// inferno-flamegraph "folded stacks" format. Pipe it through:
-///
-///     cat /tmp/recursion_folded_sampled.txt | inferno-flamegraph > svg.svg
-///
-/// Expect ~10-20 minutes for SAMPLE_RATE=100 on a 40B-cycle guest.
+/// Sampled call-stack flamegraph of the recursion guest, written to
+/// `/tmp/recursion_folded_sampled.txt` (inferno "folded stacks" format).
 #[test]
 #[ignore = "diagnostic: sampled flamegraph for the verifier-in-VM"]
 fn test_recursion_sampled_flamegraph() {
     use executor::flamegraph::FlamegraphGenerator;
     use std::io::BufWriter;
 
-    /// 1 in N logs is fed to `process_logs`, which both updates the call
-    /// stack and records a sample. At 1, every cycle goes through — the call
-    /// stack stays exactly in sync with execution so frame widths are
-    /// trustworthy, but the per-cycle cost (~57µs) limits how many cycles
-    /// we can cover within a wall-clock budget.
-    ///
-    /// At SAMPLE_RATE > 1, every CALL/RETURN that lands on a skipped cycle
-    /// silently desyncs the stack, producing the "stuck-in-visit_seq" effect
-    /// we saw at 1:1000. Use values > 1 only when stack accuracy is
-    /// expendable.
+    /// 1-in-N logs sampled. >1 desyncs the call stack on skipped CALL/RETURNs,
+    /// so keep at 1 unless stack accuracy is expendable.
     const SAMPLE_RATE: usize = 1;
 
-    /// Stop the executor early once we've covered this many cycles.
-    /// Set to 0 to run to completion (40B+ cycles, hours at SAMPLE_RATE=1).
-    /// At SAMPLE_RATE=1, ~57µs per cycle means 5M cycles ≈ 5 min wall time.
+    /// Stop after this many cycles (0 = run to completion).
     const CYCLE_BUDGET: u64 = 5_000_000;
 
     let (recursion_elf_bytes, program, mut executor) =
@@ -935,20 +820,8 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!("============================================================");
 }
 
-/// Diagnostic: host-side per-step timings for the verifier.
-///
-/// Runs an inner prove (empty guest, blowup=2, 1 query) and then verifies it
-/// on the host. When built with `--features stark/instruments`, the verifier
-/// prints `Time spent: ...` for each of the four steps (replay challenges,
-/// composition polynomial, FRI, DEEP openings) plus the step-1-replay it
-/// does before step 2. Lets us see the host-side split in seconds, without
-/// running anything inside the VM.
-///
-/// Usage:
-/// ```
-/// cargo test --release -p lambda-vm-prover --features stark/instruments \
-///   --lib test_host_verify_step_timings -- --ignored --nocapture
-/// ```
+/// Host-side per-step verifier timings (build with `--features stark/instruments`
+/// for the `Time spent:` lines). No VM execution.
 #[test]
 #[ignore = "diagnostic: prints host-side verifier step timings"]
 fn test_host_verify_step_timings() {
