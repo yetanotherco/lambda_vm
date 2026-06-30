@@ -787,7 +787,7 @@ fn test_recursion_sampled_flamegraph() {
             // body. Skipped logs lose stack accuracy — acceptable diagnostic
             // quality at higher rates.
             #[allow(clippy::modulo_one)]
-            let take = i % SAMPLE_RATE == 0;
+            let take = i.is_multiple_of(SAMPLE_RATE);
             if take {
                 generator
                     .borrow_mut()
