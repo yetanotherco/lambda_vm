@@ -234,11 +234,11 @@ test-flamegraph:
 
 test-profile-recursion: test-profile-recursion-single test-profile-recursion-multi
 
-test-profile-recursion-single: compile-programs-rust
-	cargo test --package lambda-vm-prover --lib test_recursion_pc_histogram_1query -- --ignored --nocapture
+test-profile-recursion-single: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_1query -- --ignored --nocapture
 
-test-profile-recursion-multi: compile-programs-rust
-	cargo test --package lambda-vm-prover --lib test_recursion_pc_histogram_multiquery -- --ignored --nocapture
+test-profile-recursion-multi: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_multiquery -- --ignored --nocapture
 
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
 # Run after bumping the ethrex rev; README checksums are refreshed automatically.
