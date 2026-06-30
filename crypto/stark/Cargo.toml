@@ -54,6 +54,11 @@ cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
+# Swaps the captured constraint_ir interpreter into the prover/verifier
+# transition-constraint evaluation, in place of the boxed
+# Vec<Box<dyn TransitionConstraintEvaluator>> dispatch loop. The boxed path
+# stays the default + differential oracle (see crypto/stark/src/constraint_ir/).
+constraint-ir = []
 
 
 [package.metadata.wasm-pack.profile.dev]

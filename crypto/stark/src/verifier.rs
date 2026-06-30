@@ -40,8 +40,8 @@ pub struct Verifier<
 }
 
 impl<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: IsField + Send + Sync + 'static,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 {
@@ -78,8 +78,8 @@ pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 pub trait IsStarkVerifier<
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
     PI,
 >
 {
@@ -206,7 +206,7 @@ pub trait IsStarkVerifier<
             &packing_shifts,
         );
         let transition_ood_frame_evaluations =
-            air.compute_transition(&transition_evaluation_context);
+            Self::step_2_compute_transitions(air, &transition_evaluation_context);
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
@@ -236,6 +236,35 @@ pub trait IsStarkVerifier<
             });
 
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
+    }
+
+    /// Computes the transition-constraint evaluations at the OOD point: the
+    /// boxed `air.compute_transition(...)` dispatch by default, or (behind
+    /// the `constraint-ir` feature) the captured IR program interpreted via
+    /// `crate::constraint_ir::bridge`, falling back to the boxed path if the
+    /// type tower isn't the lambda_vm Goldilocks one.
+    #[cfg(not(feature = "constraint-ir"))]
+    fn step_2_compute_transitions(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        ctx: &TransitionEvaluationContext<Field, FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>> {
+        air.compute_transition(ctx)
+    }
+
+    #[cfg(feature = "constraint-ir")]
+    fn step_2_compute_transitions(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        ctx: &TransitionEvaluationContext<Field, FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>> {
+        let prog = air.constraint_program();
+        let mut evals =
+            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
+        let ran = crate::constraint_ir::bridge::try_eval_program_verifier(&prog, ctx, &mut evals);
+        if ran {
+            evals
+        } else {
+            air.compute_transition(ctx)
+        }
     }
 
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided

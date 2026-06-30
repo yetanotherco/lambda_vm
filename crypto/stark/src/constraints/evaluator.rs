@@ -21,12 +21,17 @@ pub struct ConstraintEvaluator<
 > {
     boundary_constraints: BoundaryConstraints<FieldExtension>,
     logup_table_offset: FieldElement<FieldExtension>,
+    /// Captured once per proof (behind the `constraint-ir` feature): the flat
+    /// IR program for every transition constraint, interpreted in place of
+    /// the boxed dispatch loop. See `crate::constraint_ir`.
+    #[cfg(feature = "constraint-ir")]
+    constraint_program: crate::constraint_ir::ConstraintProgram,
     phantom: PhantomData<(Field, PI)>,
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
 where
-    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
+    FieldExtension: Send + Sync + IsField + 'static,
 {
     /// Evaluate transition + boundary constraints across the entire LDE domain.
     ///
@@ -45,6 +50,8 @@ where
         num_periodic: usize,
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
+        #[cfg(feature = "constraint-ir")]
+        constraint_program: &crate::constraint_ir::ConstraintProgram,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
         let num_base = air.num_base_transition_constraints();
@@ -97,6 +104,19 @@ where
                 logup_table_offset,
                 &packing_shifts,
             );
+            #[cfg(feature = "constraint-ir")]
+            {
+                let ran = crate::constraint_ir::bridge::try_eval_program_prover(
+                    constraint_program,
+                    &ctx,
+                    base_buf,
+                    transition_buf,
+                );
+                if !ran {
+                    air.compute_transition_prover(&ctx, base_buf, transition_buf);
+                }
+            }
+            #[cfg(not(feature = "constraint-ir"))]
             air.compute_transition_prover(&ctx, base_buf, transition_buf);
 
             let acc_transition = if is_uniform {
@@ -209,6 +229,8 @@ where
         Self {
             boundary_constraints,
             logup_table_offset,
+            #[cfg(feature = "constraint-ir")]
+            constraint_program: air.constraint_program(),
             phantom: PhantomData::<(Field, PI)> {},
         }
     }
@@ -313,6 +335,8 @@ where
             num_periodic,
             offsets,
             &self.logup_table_offset,
+            #[cfg(feature = "constraint-ir")]
+            &self.constraint_program,
         )
     }
 }
