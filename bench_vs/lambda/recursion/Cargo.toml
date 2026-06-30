@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "recursion-bench"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-prover = { path = "../../../prover", default-features = false }
+lambda-vm-syscalls = { path = "../../../syscalls" }
+postcard = { version = "1.0", features = ["alloc"] }
