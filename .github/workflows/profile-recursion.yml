@@ -84,7 +84,7 @@ jobs:
           # test triggers picks this up via the Makefile's `SYSROOT_DIR ?=`.
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
-          make test-profile-recursion-$TEST
+          make test-profile-recursion-$TEST 2>&1 | tee /tmp/hist.log
 
       - name: Aggregate into a per-function fragment
         if: always()
