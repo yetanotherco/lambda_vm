@@ -58,7 +58,9 @@ use crate::test_utils::{
     create_register_air, create_shift_air, create_store_air,
 };
 
-use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+// Re-exported so downstream verifier guests (e.g. the in-VM recursion guest) can
+// name the proof-options type carried in their private input alongside `VmProof`.
+pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
@@ -959,7 +961,7 @@ pub fn verify_with_options(
     vm_proof.table_counts.validate()?;
 
     // Bound num_private_input_pages before allocating PageConfigs.
-    // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
+    // MAX_PRIVATE_INPUT_SIZE fits in ~257 pages of DEFAULT_PAGE_SIZE.
     {
         use crate::tables::page::DEFAULT_PAGE_SIZE;
         use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
