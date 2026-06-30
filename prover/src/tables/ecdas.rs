@@ -133,12 +133,10 @@ pub fn generate_ecdas_trace(
         table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    // Padding rows: q0 = q1 = q2 = r, op = 0, everything else 0. This makes every
-    // (unconditional) convolution relation hold with zero carries.
+    // Padding rows: q0 = q1 = q2 = 0, op = 1 (add), everything else 0. The μ-gated R·P
+    // term vanishes (μ=0), so all convolution relations hold with zero carries.
     for row_idx in n..num_rows {
-        table.set_bytes(row_idx, cols::Q0, &R_BYTES);
-        table.set_bytes(row_idx, cols::Q1, &R_BYTES);
-        table.set_bytes(row_idx, cols::Q2, &R_BYTES);
+        table.set_byte(row_idx, cols::OP, 1);
     }
 
     trace
@@ -313,15 +311,20 @@ impl ConvCarry {
         let xr = |j: usize| b(cols::XR, 32, j);
         let yr = |j: usize| b(cols::YR, 32, j);
         let op = col(cols::OP);
+        let mu = col(cols::MU);
         let one = FieldElement::<F>::one();
 
-        // r·P − q·P convolution (shared structure across all three relations).
+        // μ·R·P − q·P convolution (shared structure across all three relations).
+        // R and P are constants, so μ·R·P is degree 1. The μ-gate makes the term
+        // vanish on padding rows (μ=0, q=0), keeping all relations at zero carries.
         let rq = |qbase: usize| -> FieldElement<F> {
-            let mut s = FieldElement::<F>::zero();
+            let mut r_p = FieldElement::<F>::zero();
+            let mut q_p = FieldElement::<F>::zero();
             for j in 0..=i {
-                s += (r_byte::<F>(j) - b(qbase, 33, j)) * p_byte::<F>(i - j);
+                r_p += r_byte::<F>(j) * p_byte::<F>(i - j);
+                q_p += b(qbase, 33, j) * p_byte::<F>(i - j);
             }
-            s
+            mu.clone() * r_p - q_p
         };
 
         match self.relation {
