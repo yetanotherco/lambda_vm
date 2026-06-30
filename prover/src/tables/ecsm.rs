@@ -469,7 +469,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::X2, 32, &mut out);
     is_byte(cols::Q0, 32, &mut out);
     is_byte(cols::YG, 32, &mut out);
-    is_byte(cols::Q1, 32, &mut out); // q1[0..31]; q1[32] is an IS_BIT constraint
+    is_byte(cols::Q1, 33, &mut out); // q1[0..32] (all 33 bytes)
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
     // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
@@ -885,7 +885,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
     }
 }
 
-/// Creates all ECSM transition constraints (412 total: 1 mu + 256 k bits + 8 xG<p + 147 others).
+/// Creates all ECSM transition constraints (411 total: 1 mu + 256 k bits + 8 xG<p + 146 others).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -949,10 +949,6 @@ pub fn create_constraints(
         }
         .boxed(),
     );
-    idx += 1;
-
-    // IS_BIT(q1[32])
-    constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
     idx += 1;
 
     // xG < p: 7 carry bits + overflow-required.

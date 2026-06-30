@@ -2118,13 +2118,14 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG, q1[0..31].
+        // IS_BYTE on x2, q0, yG, q1[0..32].
         for i in 0..32 {
             out.push(is_byte_op(w.x2[i]));
             out.push(is_byte_op(w.q0[i]));
             out.push(is_byte_op(w.y_g[i]));
             out.push(is_byte_op(w.q1[i]));
         }
+        out.push(is_byte_op(w.q1[32]));
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
