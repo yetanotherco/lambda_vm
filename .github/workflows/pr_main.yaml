@@ -308,9 +308,6 @@ jobs:
         with:
           name: prover-tests
 
-      # The un-ignored recursion execute-only smoke tests read prebuilt guest
-      # ELFs from executor/program_artifacts/recursion/ at runtime, so build
-      # them before the test run (cached on the guest sources + toolchain spec).
       - name: Cache compiled recursion guest ELF artifacts
         id: cache-recursion-elfs
         uses: actions/cache@v4
@@ -393,9 +390,6 @@ jobs:
         with:
           name: prover-tests
 
-      # The #[ignore]d recursion full-prove smoke tests (run only here, via
-      # --run-ignored) read prebuilt guest ELFs from
-      # executor/program_artifacts/recursion/ at runtime, so build them first.
       - name: Cache compiled recursion guest ELF artifacts
         id: cache-recursion-elfs
         uses: actions/cache@v4
