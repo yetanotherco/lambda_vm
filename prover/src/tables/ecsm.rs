@@ -591,8 +591,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out
 }
 
-/// Builds the ECDAS bus tuple `[ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32),
-/// round, op]`. Shared so the ECSM sender and the ECDAS receiver/sender pack it identically.
+/// Builds the ECDAS bus tuple `[id, ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32),
+/// round, op]`. `id` is the curve identifier (0 = secp256k1). Shared so the ECSM sender and
+/// the ECDAS receiver/sender pack it identically.
 #[allow(clippy::too_many_arguments)]
 pub fn ecdas_tuple(
     acc_x: usize,
@@ -604,7 +605,8 @@ pub fn ecdas_tuple(
     ts_lo: BusValue,
     ts_hi: BusValue,
 ) -> Vec<BusValue> {
-    let mut v = Vec::with_capacity(2 + 4 * 32 + 2);
+    let mut v = Vec::with_capacity(1 + 2 + 4 * 32 + 2);
+    v.push(BusValue::constant(0)); // id = 0 (secp256k1)
     v.push(ts_lo);
     v.push(ts_hi);
     v.extend(point_coord_busvalues(acc_x));

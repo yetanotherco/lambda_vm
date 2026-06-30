@@ -159,7 +159,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let ts_hi = || packed(cols::TIMESTAMP_1);
     let mut out = Vec::new();
 
-    // Receive [ts, xA, yA, xG, yG, round, op].
+    // Receive [id, ts, xA, yA, xG, yG, round, op].
     out.push(BusInteraction::receiver(
         BusId::Ecdas,
         mu(),
@@ -224,7 +224,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![ts_lo(), ts_hi(), packed(cols::ROUND)],
     ));
 
-    // Send the updated accumulator: [ts, xR, yR, xG, yG, round - 1 + next_op, next_op].
+    // Send the updated accumulator: [id, ts, xR, yR, xG, yG, round - 1 + next_op, next_op].
     out.push(BusInteraction::sender(
         BusId::Ecdas,
         mu(),
