@@ -39,7 +39,7 @@ jobs:
             test: single
             title: "Single query (blowup=2, 1 query)"
           - name: multi-query
-            test: single
+            test: multi
             title: "Multi query (blowup=8, 128-bit)"
     steps:
       - name: React to comment
