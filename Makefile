@@ -141,8 +141,10 @@ compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
 compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 
-# NOTE: recursion ELFs are temporarily unused by the main tests due to long running time.
-# We compile them anyway to ensure they keep building until their tests are fast enough to run on the CI.
+# NOTE: the recursion smoke tests are #[ignore]d (not run by `make test` /
+# `test-executor`) because they're too slow for CI today; only `test-prover-all`
+# runs them. We still compile their guest ELFs on every build so they keep
+# compiling until the tests are fast enough to run in CI.
 compile-programs: compile-programs-asm compile-programs-rust compile-bench compile-recursion-elfs
 
 compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS)
@@ -163,6 +165,24 @@ $(BENCH_ARTIFACTS_DIR):
 .PHONY: FORCE
 FORCE:
 
+# The guest .elf rules all share one canned recipe: the cargo build invocation is
+# identical across the rust, bench, and recursion guests. They differ only in the
+# source directory ($(1)) and the built-binary name suffix ($(2): empty when the
+# binary == crate name, `-bench` for the recursion suite, whose crates are named
+# <name>-bench). cargo owns the dep graph (see FORCE above), so the recipe always
+# runs and lets cargo decide what to actually rebuild.
+define build_guest_elf
+cd $(1)/$* && \
+	CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
+	CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
+	rustup run nightly-2026-02-01 cargo build --release \
+		--target $(RV64_TARGET_SPEC) \
+		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
+		-Z build-std-features=compiler-builtins-mem \
+		-Z json-target-spec
+cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$*$(2) $@
+endef
+
 # Compile rust (64-bit)
 # Order-only `| prepare-sysroot` so a direct `make .../foo.elf` provisions the sysroot
 # first (the aggregate compile-programs-rust/compile-bench targets already do, but a
@@ -170,43 +190,18 @@ FORCE:
 # and fail to compile guest C dependencies). Order-only because prepare-sysroot is
 # .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
 $(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
-	cd $(RUST_PROGRAMS_DIR)/$* && \
-		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
-		rustup run nightly-2026-02-01 cargo build --release \
-			--target $(RV64_TARGET_SPEC) \
-			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem \
-			-Z json-target-spec
-	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
+	$(call build_guest_elf,$(RUST_PROGRAMS_DIR),)
 
 # Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
-	cd $(BENCH_PROGRAMS_DIR)/$* && \
-		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
-		rustup run nightly-2026-02-01 cargo build --release \
-			--target $(RV64_TARGET_SPEC) \
-			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem \
-			-Z json-target-spec
-	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$* $@
+	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR),)
 
-# Recursion-suite guests: same standard guest flags as compile-bench (std-inclusive
-# build-std works for both the no_std inner guests and the std recursion verifier).
-# The crate's binary is <name>-bench; copy it to <name>.elf so prover tests read
-# prebuilt artifacts like every other program (see
-# prover/src/tests/recursion_smoke_test.rs), instead of shelling out.
+# Recursion-suite guests (bench_vs/lambda/): the crate's binary is <name>-bench, so
+# copy <name>-bench -> <name>.elf. std-inclusive build-std covers both the no_std
+# inner guests and the std recursion verifier. Prover tests read these prebuilt
+# artifacts like every other program (see prover/src/tests/recursion_smoke_test.rs).
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	cd $(RECURSION_GUESTS_DIR)/$* && \
-		CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
-		CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
-		rustup run nightly-2026-02-01 cargo build --release \
-			--target $(RV64_TARGET_SPEC) \
-			-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
-			-Z build-std-features=compiler-builtins-mem \
-			-Z json-target-spec
-	cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$*-bench $@
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR),-bench)
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

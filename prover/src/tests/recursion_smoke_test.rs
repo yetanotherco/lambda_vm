@@ -176,7 +176,7 @@ fn run_recursion_pipeline_with_options(
         "inner proof must verify on host"
     );
     assert!(
-        blob.len() < executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
+        blob.len() <= executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
         "recursion input exceeds MAX_PRIVATE_INPUT_SIZE"
     );
 
