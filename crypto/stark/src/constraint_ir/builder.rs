@@ -46,6 +46,13 @@ pub struct IrBuilder {
     cse: HashMap<(Op, Dim), u32>,
     const_cache: HashMap<u64, u32>,
     roots: Vec<u32>,
+    /// Set by [`Self::mark_unsupported`] when a constraint couldn't be
+    /// captured (the default `TransitionConstraintEvaluator::capture` body
+    /// calls this instead of panicking). Propagated to
+    /// [`ConstraintProgram::complete`] so callers can fall back to the boxed
+    /// evaluator for AIRs that aren't fully capture-capable (e.g. the
+    /// `examples/` and test-only AIRs, not part of the IR migration).
+    complete: bool,
 }
 
 impl Default for IrBuilder {
@@ -63,12 +70,21 @@ impl IrBuilder {
             cse: HashMap::new(),
             const_cache: HashMap::new(),
             roots: Vec::new(),
+            complete: true,
         };
         // Reserve id 0 = Const1(0). `const_base(0)` will hash-cons to this.
         let zero = b.push(Op::Const1(0), Dim::D1);
         debug_assert_eq!(zero.id, 0);
         b.const_cache.insert(0, 0);
         b
+    }
+
+    /// Record that the constraint currently being captured has no `Capture`
+    /// implementation. Does not panic and does not emit a root for it — the
+    /// resulting program is marked incomplete (see [`ConstraintProgram::complete`])
+    /// so callers know not to interpret it.
+    pub fn mark_unsupported(&mut self) {
+        self.complete = false;
     }
 
     /// Append (or reuse) a node with the given op and result dimension.
@@ -238,6 +254,7 @@ impl IrBuilder {
             dims: self.dims,
             roots: self.roots,
             num_base,
+            complete: self.complete,
         }
     }
 }

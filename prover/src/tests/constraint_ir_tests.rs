@@ -190,9 +190,19 @@ mod full_table_gate {
     }
 
     /// A handful of real EQ operations (BEQ-style and BNE-style) so the
-    /// captured LogUp program (1 batched pair + 1 absorbed interaction, the
-    /// branch not exercised by the CPU table below) sees non-trivial
-    /// fingerprints on every row.
+    /// captured LogUp program sees non-trivial fingerprints on every row.
+    ///
+    /// Both this table and CPU (below) have an even `bus_interactions().len()`
+    /// (EQ: 6, CPU: 20), so `split_interactions` gives both an `absorbed_count`
+    /// of **2**, not 1 — there is in fact no in-repo production table whose
+    /// real interaction count is odd-and->1, so nothing here exercises
+    /// `LookupAccumulatedConstraint`'s 1-absorbed branch end-to-end. Both the
+    /// 1- and 2-absorbed branches (plus `LookupBatchedTermConstraint`, and all
+    /// 10 `Packing` variants) are covered by targeted, self-certifying
+    /// differential tests in `crypto/stark/src/lookup.rs`'s
+    /// `logup_capture_tests` module instead (each asserts `absorbed.len()`/
+    /// `degree()` up front so the test can't silently degrade to the wrong
+    /// branch).
     fn sample_eq_operations() -> Vec<EqOperation> {
         vec![
             EqOperation::new(42, 42, false),
@@ -262,6 +272,12 @@ mod full_table_gate {
             "every constraint_idx must have been emitted"
         );
         assert_eq!(prog.num_base, air.num_base_transition_constraints());
+        assert!(
+            prog.complete,
+            "[{label}] every production constraint must have a real Capture impl \
+             (a constraint fell back to the default IrBuilder::mark_unsupported, \
+             which would make ConstraintEvaluator skip the IR path entirely for this AIR)"
+        );
 
         let num_base = air.num_base_transition_constraints();
         let num_transition = air.num_transition_constraints();

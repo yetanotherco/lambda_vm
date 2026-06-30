@@ -79,6 +79,15 @@ pub struct ConstraintProgram {
     /// interpreter writes these into `base_evals`; the rest (LogUp, always
     /// `D3`) go into `ext_evals[num_base..]`.
     pub num_base: usize,
+    /// `false` if any constraint in this program was captured via the
+    /// default `TransitionConstraintEvaluator::capture` (i.e. it has no real
+    /// `Capture` impl — see [`crate::constraint_ir::builder::IrBuilder::mark_unsupported`]).
+    /// Callers (the prover/verifier bridge) must not interpret an incomplete
+    /// program — fall back to the boxed `TransitionConstraintEvaluator` path
+    /// instead. Every production lambda_vm AIR captures cleanly
+    /// (`complete: true`); this only trips for the `examples/`/test-only
+    /// AIRs that predate the IR migration.
+    pub complete: bool,
 }
 
 impl ConstraintProgram {

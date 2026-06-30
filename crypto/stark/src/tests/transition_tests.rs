@@ -83,3 +83,32 @@ fn end_exemptions_roots_zero_exemptions_is_empty() {
 
     assert!(c.end_exemptions_roots(&g, trace_length).is_empty());
 }
+
+/// `DummyConstraint` doesn't override `capture`, so it exercises the default
+/// `TransitionConstraintEvaluator::capture` body — which must not panic (see
+/// `crypto/stark/src/constraints/transition.rs`) and must mark the resulting
+/// `ConstraintProgram` incomplete via `IrBuilder::mark_unsupported`, so
+/// `ConstraintEvaluator`/the verifier fall back to the boxed path instead of
+/// interpreting a partial program. This is the regression test for the
+/// `cargo test -p stark --features constraint-ir` panic fixed alongside this
+/// test (every `examples/`/test-only AIR relies on this default).
+#[test]
+fn default_capture_marks_program_incomplete_without_panicking() {
+    use crate::constraint_ir::IrBuilder;
+
+    let c = DummyConstraint::<GoldilocksField> {
+        period: 1,
+        offset: 0,
+        end_exemptions: 0,
+        phantom: PhantomData,
+    };
+
+    let mut b = IrBuilder::new();
+    c.capture(&mut b); // must not panic
+    let prog = b.finish(0);
+
+    assert!(
+        !prog.complete,
+        "a constraint with no Capture impl must mark the program incomplete"
+    );
+}

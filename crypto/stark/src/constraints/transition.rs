@@ -28,17 +28,17 @@ where
     /// (non-boxed) counterpart that [`super::transition::TransitionConstraintAdapter`]
     /// forwards to.
     ///
-    /// Default panics: every production constraint must override this (via
+    /// Default marks the program incomplete (via
+    /// [`IrBuilder::mark_unsupported`]) rather than panicking: every
+    /// production lambda_vm constraint overrides this (via
     /// `TransitionConstraintAdapter` + `Capture`, or directly for the LogUp
-    /// framework constraints). The default exists only so the many
-    /// `examples/` and test-only `TransitionConstraintEvaluator` impls (not
-    /// part of the IR migration) don't need a body.
-    fn capture(&self, _builder: &mut IrBuilder) {
-        unimplemented!(
-            "TransitionConstraintEvaluator::capture not implemented for this constraint; \
-             it is not part of the constraint-ir migration (see crypto/stark/src/examples/ \
-             or implement Capture for production constraints)"
-        );
+    /// framework constraints), but the many `examples/` and test-only
+    /// `TransitionConstraintEvaluator` impls (not part of the IR migration)
+    /// don't need a body — `AIR::constraint_program()` callers must check
+    /// `ConstraintProgram::complete` and fall back to the boxed evaluator
+    /// when it's `false`, rather than interpreting a partial program.
+    fn capture(&self, builder: &mut IrBuilder) {
+        builder.mark_unsupported();
     }
 
     /// The function representing the evaluation of the constraint over elements

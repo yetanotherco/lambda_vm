@@ -257,6 +257,12 @@ pub trait IsStarkVerifier<
         ctx: &TransitionEvaluationContext<Field, FieldExtension>,
     ) -> Vec<FieldElement<FieldExtension>> {
         let prog = air.constraint_program();
+        // `complete: false` means some constraint had no real `Capture` impl
+        // (e.g. an `examples/`/test-only AIR) — don't interpret a partial
+        // program, fall back to the boxed path unconditionally.
+        if !prog.complete {
+            return air.compute_transition(ctx);
+        }
         let mut evals =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
         let ran = crate::constraint_ir::bridge::try_eval_program_verifier(&prog, ctx, &mut evals);

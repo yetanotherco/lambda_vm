@@ -2398,3 +2398,393 @@ where
         b.emit(self.constraint_idx, root);
     }
 }
+
+#[cfg(test)]
+mod logup_capture_tests {
+    //! Differential tests for `LookupAccumulatedConstraint::capture`, targeting
+    //! the **2-absorbed** branch specifically.
+    //!
+    //! `full_table_gate` (in the `lambda-vm-prover` crate) captures the real
+    //! CPU and EQ tables, but both happen to have an even `bus_interactions()`
+    //! count > 2 that nonetheless lands... no — both CPU (20 interactions) and
+    //! EQ (6 interactions) are even, so `split_interactions` gives them
+    //! `absorbed_count == 2` as well (verified directly via
+    //! `bus_interactions().len()`, not the call-site count). There is in fact
+    //! no in-repo production table with an *odd* interaction count > 1 that
+    //! would exercise `absorbed_count == 1` through `AirWithBuses` — every
+    //! real table happens to be even. This module exists to (a) pin down the
+    //! 2-absorbed branch with a self-certifying targeted test, independent of
+    //! which production tables happen to hit it, and (b) provide the same
+    //! coverage for 1-absorbed, since none of the current tables exercise it
+    //! through the full pipeline.
+    use super::*;
+    use crate::constraint_ir::{eval_program, eval_program_verifier};
+    use crate::frame::Frame;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type Fp = FieldElement<Gl>;
+    type Fp3 = FieldElement<Ext3>;
+
+    /// A tiny deterministic SplitMix64 PRNG (same generator as
+    /// `prover/src/tests/constraint_ir_tests.rs`) so this test needs no `rand`
+    /// dependency.
+    struct SplitMix64 {
+        state: u64,
+    }
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    const NUM_MAIN_COLS: usize = 4;
+    const NUM_TERM_COLUMNS: usize = 2;
+    const NUM_AUX_COLS: usize = NUM_TERM_COLUMNS + 1;
+    const TRIALS: usize = 1000;
+
+    /// Two absorbed interactions: one sender (`Packing::Direct` on a main
+    /// column), one receiver (`Multiplicity::Column`, `BusValue::column`),
+    /// distinct `bus_id`s so the sign/bus-id handling can't accidentally
+    /// cancel out a translation bug.
+    fn two_absorbed_interactions() -> Vec<BusInteraction> {
+        vec![
+            BusInteraction::sender(
+                7u64,
+                Multiplicity::Column(0),
+                vec![BusValue::Packed {
+                    start_column: 1,
+                    packing: Packing::Direct,
+                }],
+            ),
+            BusInteraction::receiver(11u64, Multiplicity::Column(2), vec![BusValue::column(3)]),
+        ]
+    }
+
+    /// One absorbed interaction (the 1-absorbed branch), for contrast.
+    fn one_absorbed_interaction() -> Vec<BusInteraction> {
+        vec![BusInteraction::sender(
+            7u64,
+            Multiplicity::Column(0),
+            vec![BusValue::Packed {
+                start_column: 1,
+                packing: Packing::Direct,
+            }],
+        )]
+    }
+
+    /// Build a random 2-step frame (offsets 0 and 1) with `NUM_MAIN_COLS` main
+    /// columns and `NUM_AUX_COLS` aux columns, plus matching rap challenges /
+    /// alpha powers / table offset / packing shifts.
+    #[allow(clippy::type_complexity)]
+    fn random_inputs(
+        seed: u64,
+    ) -> (
+        Frame<Gl, Ext3>,
+        Vec<Fp3>, // rap_challenges (z, alpha)
+        Vec<Fp3>, // logup_alpha_powers
+        Fp3,      // logup_table_offset
+        PackingShifts<Gl>,
+    ) {
+        let mut rng = SplitMix64::new(seed);
+
+        fn rand_fp3(rng: &mut SplitMix64) -> Fp3 {
+            FieldElement::<Ext3>::new([
+                Fp::from(rng.next_u64()),
+                Fp::from(rng.next_u64()),
+                Fp::from(rng.next_u64()),
+            ])
+        }
+
+        fn step(rng: &mut SplitMix64) -> TableView<Gl, Ext3> {
+            let main: Vec<Fp> = (0..NUM_MAIN_COLS)
+                .map(|_| Fp::from(rng.next_u64()))
+                .collect();
+            let aux: Vec<Fp3> = (0..NUM_AUX_COLS).map(|_| rand_fp3(rng)).collect();
+            TableView::new(vec![main], vec![aux])
+        }
+
+        let frame = Frame::new(vec![step(&mut rng), step(&mut rng)]);
+        let rap_challenges = vec![rand_fp3(&mut rng), rand_fp3(&mut rng)]; // [z, alpha] (alpha unused by fingerprint capture here)
+        // alpha_powers must cover every alpha index the captured interactions
+        // read; `Direct`/`column` each consume exactly 1, and `capture_fingerprint`
+        // starts at alpha_idx 1 (alpha^0 is the bus_id), so index 1 suffices for
+        // each interaction captured independently — give a generous buffer.
+        let logup_alpha_powers: Vec<Fp3> = (0..8).map(|_| rand_fp3(&mut rng)).collect();
+        let logup_table_offset = rand_fp3(&mut rng);
+        let packing_shifts = PackingShifts::<Gl>::new();
+
+        (
+            frame,
+            rap_challenges,
+            logup_alpha_powers,
+            logup_table_offset,
+            packing_shifts,
+        )
+    }
+
+    /// Run the differential check for a given `absorbed` set: capture `c` via
+    /// `IrBuilder`, then for `TRIALS` random frames compare the boxed
+    /// `evaluate_verifier` (used for both the prover's `ext_evals` write and
+    /// the verifier path) against `eval_program`/`eval_program_verifier`,
+    /// bit-for-bit.
+    fn assert_ir_matches_evaluate(absorbed: Vec<BusInteraction>, label: &str) {
+        let c = LookupAccumulatedConstraint::new(0, NUM_TERM_COLUMNS, absorbed);
+
+        let mut b = IrBuilder::new();
+        TransitionConstraintEvaluator::<Gl, Ext3>::capture(&c, &mut b);
+        let prog = b.finish(0); // num_base = 0: this constraint is always D3-rooted
+
+        assert!(
+            prog.complete,
+            "[{label}] capture must not fall back to the default unsupported marker"
+        );
+
+        for trial in 0..TRIALS {
+            let (frame, rap_challenges, logup_alpha_powers, logup_table_offset, packing_shifts) =
+                random_inputs(0xC0FF_EE00_u64.wrapping_add(trial as u64));
+
+            // --- Prover-side oracle vs eval_program ---
+            let prover_ctx = TransitionEvaluationContext::new_prover(
+                &frame,
+                &[], // no periodic columns
+                &rap_challenges,
+                &logup_alpha_powers,
+                &logup_table_offset,
+                &packing_shifts,
+            );
+            let mut oracle_ext = vec![FieldElement::<Ext3>::zero(); 1];
+            c.evaluate_verifier(&prover_ctx, &mut oracle_ext);
+
+            let mut ir_base: Vec<Fp> = vec![];
+            let mut ir_ext = vec![FieldElement::<Ext3>::zero(); 1];
+            eval_program(&prog, &prover_ctx, &mut ir_base, &mut ir_ext);
+
+            assert_eq!(
+                oracle_ext, ir_ext,
+                "[{label}] prover mismatch at trial {trial}"
+            );
+
+            // --- Verifier-side oracle vs eval_program_verifier ---
+            // The verifier frame holds only extension-field elements; embed
+            // the same step data into Ext3 (mirrors `full_table_gate`).
+            let embed_step = |step: &TableView<Gl, Ext3>| -> TableView<Ext3, Ext3> {
+                let main: Vec<Fp3> = (0..NUM_MAIN_COLS)
+                    .map(|c| (*step.get_main_evaluation_element(0, c)).to_extension())
+                    .collect();
+                let aux: Vec<Fp3> = (0..NUM_AUX_COLS)
+                    .map(|c| *step.get_aux_evaluation_element(0, c))
+                    .collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let verifier_frame: Frame<Ext3, Ext3> = Frame::new(vec![
+                embed_step(frame.get_evaluation_step(0)),
+                embed_step(frame.get_evaluation_step(1)),
+            ]);
+            let verifier_packing_shifts = PackingShifts::<Ext3>::new();
+            let verifier_ctx = TransitionEvaluationContext::new_verifier(
+                &verifier_frame,
+                &[],
+                &rap_challenges,
+                &logup_alpha_powers,
+                &logup_table_offset,
+                &verifier_packing_shifts,
+            );
+            let mut oracle_verifier = vec![FieldElement::<Ext3>::zero(); 1];
+            c.evaluate_verifier(&verifier_ctx, &mut oracle_verifier);
+
+            let mut ir_verifier = vec![FieldElement::<Ext3>::zero(); 1];
+            eval_program_verifier(&prog, &verifier_ctx, &mut ir_verifier);
+
+            assert_eq!(
+                oracle_verifier, ir_verifier,
+                "[{label}] verifier mismatch at trial {trial}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_ir_matches_accumulated_constraint_two_absorbed() {
+        let absorbed = two_absorbed_interactions();
+        // Self-certify: this test targets the 2-absorbed branch specifically.
+        // If a future edit shrinks `two_absorbed_interactions` to 1 element,
+        // this assertion fails loudly instead of silently degrading to the
+        // 1-absorbed branch.
+        assert_eq!(
+            absorbed.len(),
+            2,
+            "this test must exercise absorbed.len()==2"
+        );
+        let c = LookupAccumulatedConstraint::new(0, NUM_TERM_COLUMNS, absorbed.clone());
+        assert_eq!(
+            TransitionConstraintEvaluator::<Gl, Ext3>::degree(&c),
+            3,
+            "absorbed.len()==2 must select the degree-3 (f1*f2) branch"
+        );
+        assert_ir_matches_evaluate(absorbed, "accumulated_two_absorbed");
+    }
+
+    #[test]
+    fn test_ir_matches_accumulated_constraint_one_absorbed() {
+        let absorbed = one_absorbed_interaction();
+        assert_eq!(
+            absorbed.len(),
+            1,
+            "this test must exercise absorbed.len()==1"
+        );
+        let c = LookupAccumulatedConstraint::new(0, NUM_TERM_COLUMNS, absorbed.clone());
+        assert_eq!(
+            TransitionConstraintEvaluator::<Gl, Ext3>::degree(&c),
+            2,
+            "absorbed.len()==1 must select the degree-2 (f only) branch"
+        );
+        assert_ir_matches_evaluate(absorbed, "accumulated_one_absorbed");
+    }
+
+    #[test]
+    fn test_ir_matches_batched_term_constraint() {
+        // LookupBatchedTermConstraint: always exactly 2 interactions (a, b),
+        // committed to one aux "term" column (column 0 here). Covered
+        // end-to-end by `full_table_gate`'s CPU/EQ programs already, but a
+        // targeted test pins the formula independent of table layout.
+        let interaction_a = BusInteraction::sender(
+            7u64,
+            Multiplicity::Column(0),
+            vec![BusValue::Packed {
+                start_column: 1,
+                packing: Packing::Direct,
+            }],
+        );
+        let interaction_b =
+            BusInteraction::receiver(11u64, Multiplicity::Column(2), vec![BusValue::column(3)]);
+        let c = LookupBatchedTermConstraint::new(interaction_a, interaction_b, 0, 0);
+
+        let mut b = IrBuilder::new();
+        TransitionConstraintEvaluator::<Gl, Ext3>::capture(&c, &mut b);
+        let prog = b.finish(0);
+        assert!(prog.complete);
+
+        for trial in 0..TRIALS {
+            let (frame, rap_challenges, logup_alpha_powers, logup_table_offset, packing_shifts) =
+                random_inputs(0xFACE_F00D_u64.wrapping_add(trial as u64));
+
+            let prover_ctx = TransitionEvaluationContext::new_prover(
+                &frame,
+                &[],
+                &rap_challenges,
+                &logup_alpha_powers,
+                &logup_table_offset,
+                &packing_shifts,
+            );
+            let mut oracle_ext = vec![FieldElement::<Ext3>::zero(); 1];
+            c.evaluate_verifier(&prover_ctx, &mut oracle_ext);
+
+            let mut ir_base: Vec<Fp> = vec![];
+            let mut ir_ext = vec![FieldElement::<Ext3>::zero(); 1];
+            eval_program(&prog, &prover_ctx, &mut ir_base, &mut ir_ext);
+
+            assert_eq!(
+                oracle_ext, ir_ext,
+                "batched_term prover mismatch at trial {trial}"
+            );
+        }
+    }
+
+    /// Differential coverage for **every** `Packing` variant's fingerprint
+    /// contribution: `capture_fingerprint` (IR) vs `compute_fingerprint_from_step`
+    /// (boxed), bit-for-bit on random rows. Only 5 of 10 variants are ever
+    /// instantiated by production tables (Direct, DWordWL, DWordHL, DWordBL,
+    /// DWordHHW); the live ones besides DWordHHW/DWordBL have no other
+    /// differential gate (only e2e coverage via `full_table_gate`), and the
+    /// other 5 (Word2L, Word4L, DWordWHH, QuadHL, QuadWL) have none at all.
+    /// This test drives `capture_packing_fingerprint`'s full `match` arm-by-arm.
+    #[test]
+    fn test_capture_fingerprint_matches_for_all_packing_variants() {
+        const ALL_PACKINGS: [Packing; 10] = [
+            Packing::Direct,
+            Packing::Word2L,
+            Packing::Word4L,
+            Packing::DWordWL,
+            Packing::DWordHHW,
+            Packing::DWordWHH,
+            Packing::DWordHL,
+            Packing::DWordBL,
+            Packing::QuadHL,
+            Packing::QuadWL,
+        ];
+
+        // Enough main columns for the widest packing (DWordBL/QuadHL: 8).
+        const NUM_COLS: usize = 8;
+
+        for packing in ALL_PACKINGS {
+            let interaction = BusInteraction::sender(
+                13u64,
+                Multiplicity::One,
+                vec![BusValue::Packed {
+                    start_column: 0,
+                    packing,
+                }],
+            );
+
+            // Capture once per packing.
+            let mut b = IrBuilder::new();
+            let root = capture_fingerprint(&mut b, &interaction, 0);
+            b.emit(0, root);
+            let prog = b.finish(0);
+            assert!(prog.complete);
+
+            let mut rng = SplitMix64::new(0x9E11_u64.wrapping_add(packing.num_columns() as u64));
+            for trial in 0..TRIALS {
+                let main: Vec<Fp> = (0..NUM_COLS).map(|_| Fp::from(rng.next_u64())).collect();
+                let step: TableView<Gl, Ext3> =
+                    TableView::new(vec![main.clone()], vec![Vec::new()]);
+
+                let z = FieldElement::<Ext3>::new([
+                    Fp::from(rng.next_u64()),
+                    Fp::from(rng.next_u64()),
+                    Fp::from(rng.next_u64()),
+                ]);
+                let alpha_powers: Vec<Fp3> = (0..6)
+                    .map(|_| {
+                        FieldElement::<Ext3>::new([
+                            Fp::from(rng.next_u64()),
+                            Fp::from(rng.next_u64()),
+                            Fp::from(rng.next_u64()),
+                        ])
+                    })
+                    .collect();
+                let shifts = PackingShifts::<Gl>::new();
+
+                let oracle =
+                    compute_fingerprint_from_step(&step, &interaction, &z, &alpha_powers, &shifts);
+
+                // Drive `eval_program`'s shared `run()` walk directly (no full
+                // TransitionEvaluationContext needed: the captured program's
+                // only leaves are `Var{main}`, `RapChallenge{0}`, `AlphaPow{idx}`).
+                let logup_table_offset = FieldElement::<Ext3>::zero();
+                let rap_challenges = vec![z];
+                let frame = Frame::new(vec![step]);
+                let ctx = TransitionEvaluationContext::new_prover(
+                    &frame,
+                    &[],
+                    &rap_challenges,
+                    &alpha_powers,
+                    &logup_table_offset,
+                    &shifts,
+                );
+                let mut ir_base: Vec<Fp> = vec![];
+                let mut ir_ext = vec![FieldElement::<Ext3>::zero(); 1];
+                eval_program(&prog, &ctx, &mut ir_base, &mut ir_ext);
+
+                assert_eq!(oracle, ir_ext[0], "{packing:?} mismatch at trial {trial}");
+            }
+        }
+    }
+}

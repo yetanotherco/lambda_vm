@@ -23,9 +23,11 @@ pub struct ConstraintEvaluator<
     logup_table_offset: FieldElement<FieldExtension>,
     /// Captured once per proof (behind the `constraint-ir` feature): the flat
     /// IR program for every transition constraint, interpreted in place of
-    /// the boxed dispatch loop. See `crate::constraint_ir`.
+    /// the boxed dispatch loop. `None` if the AIR's constraints aren't all
+    /// `Capture`-capable (see `ConstraintProgram::complete`) — falls back to
+    /// the boxed path unconditionally in that case. See `crate::constraint_ir`.
     #[cfg(feature = "constraint-ir")]
-    constraint_program: crate::constraint_ir::ConstraintProgram,
+    constraint_program: Option<crate::constraint_ir::ConstraintProgram>,
     phantom: PhantomData<(Field, PI)>,
 }
 impl<Field, FieldExtension, PI> ConstraintEvaluator<Field, FieldExtension, PI>
@@ -50,8 +52,9 @@ where
         num_periodic: usize,
         offsets: &[usize],
         logup_table_offset: &FieldElement<FieldExtension>,
-        #[cfg(feature = "constraint-ir")]
-        constraint_program: &crate::constraint_ir::ConstraintProgram,
+        #[cfg(feature = "constraint-ir")] constraint_program: Option<
+            &crate::constraint_ir::ConstraintProgram,
+        >,
     ) -> Vec<FieldElement<FieldExtension>> {
         let is_uniform = zerofier_data.is_uniform();
         let num_base = air.num_base_transition_constraints();
@@ -106,12 +109,14 @@ where
             );
             #[cfg(feature = "constraint-ir")]
             {
-                let ran = crate::constraint_ir::bridge::try_eval_program_prover(
-                    constraint_program,
-                    &ctx,
-                    base_buf,
-                    transition_buf,
-                );
+                let ran = constraint_program.is_some_and(|prog| {
+                    crate::constraint_ir::bridge::try_eval_program_prover(
+                        prog,
+                        &ctx,
+                        base_buf,
+                        transition_buf,
+                    )
+                });
                 if !ran {
                     air.compute_transition_prover(&ctx, base_buf, transition_buf);
                 }
@@ -226,11 +231,22 @@ where
             None => FieldElement::zero(),
         };
 
+        // `complete: false` means some constraint had no real `Capture` impl
+        // (e.g. an `examples/`/test-only AIR predating the IR migration) —
+        // don't cache an unusable program; `evaluate_transitions` then always
+        // takes the boxed path for this AIR. Every production lambda_vm AIR
+        // captures cleanly.
+        #[cfg(feature = "constraint-ir")]
+        let constraint_program = {
+            let prog = air.constraint_program();
+            prog.complete.then_some(prog)
+        };
+
         Self {
             boundary_constraints,
             logup_table_offset,
             #[cfg(feature = "constraint-ir")]
-            constraint_program: air.constraint_program(),
+            constraint_program,
             phantom: PhantomData::<(Field, PI)> {},
         }
     }
@@ -336,7 +352,7 @@ where
             offsets,
             &self.logup_table_offset,
             #[cfg(feature = "constraint-ir")]
-            &self.constraint_program,
+            self.constraint_program.as_ref(),
         )
     }
 }
