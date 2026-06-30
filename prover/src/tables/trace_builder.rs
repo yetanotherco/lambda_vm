@@ -679,32 +679,55 @@ fn collect_ecsm_ops(
 
     let mut memw_ops = Vec::with_capacity(15);
 
-    // x11 -> addr_xG, x12 -> addr_k (register reads at T).
-    for reg in [11u8, 12u8] {
-        let (val, old_ts) = register_state.read(reg);
+    // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(11);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
+            MemwOperation::new(true, 2 * 11, value, t, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(reg, val, t);
+        register_state.write(11, val, t);
     }
 
-    // xG and k: 4 doubleword reads each at T.
-    for (base, bytes) in [(addr_xg, &witness.x_g), (addr_k, &witness.k)] {
-        for i in 0..4 {
-            let addr = base.wrapping_add((8 * i) as u64);
-            let mut value = [0u64; 8];
-            let mut dword = 0u64;
-            for j in 0..8 {
-                value[j] = bytes[8 * i + j] as u64;
-                dword |= (bytes[8 * i + j] as u64) << (8 * j);
-            }
-            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
-            memw_ops
-                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
-            memory_state.write_bytes(addr, dword, 8, t);
+    // xG: 4 doubleword reads at T.
+    for i in 0..4 {
+        let addr = addr_xg.wrapping_add((8 * i) as u64);
+        let mut value = [0u64; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.x_g[8 * i + j] as u64;
+            dword |= (witness.x_g[8 * i + j] as u64) << (8 * j);
         }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
+    }
+
+    // x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(12);
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 12, value, t + 1, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(12, val, t + 1);
+    }
+
+    // k: 4 doubleword reads at T+1.
+    for i in 0..4 {
+        let addr = addr_k.wrapping_add((8 * i) as u64);
+        let mut value = [0u64; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.k[8 * i + j] as u64;
+            dword |= (witness.k[8 * i + j] as u64) << (8 * j);
+        }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, t + 1, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t + 1);
     }
 
     // x10 -> addr_xR (register read at T + 1).

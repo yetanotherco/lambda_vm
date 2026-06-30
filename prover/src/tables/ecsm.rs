@@ -368,7 +368,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // read x12 -> addr_k (register read at ts).
+    let ts_lo_plus = |d: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP_0,
+            },
+            LinearTerm::Constant(d),
+        ])
+    };
+
+    // read x12 -> addr_k (register read at ts + 1).
     out.push(BusInteraction::sender(
         BusId::Memw,
         mu(),
@@ -377,13 +387,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 12),
             BusValue::constant(0),
-            ts_lo(),
+            ts_lo_plus(1),
             ts_hi(),
             1,
             0,
         ),
     ));
-    // read k: 4 doublewords at addr_k + 8i (ts).
+    // read k: 4 doublewords at addr_k + 8i (ts + 1).
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -400,7 +410,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 0,
                 base_lo,
                 packed(cols::ADDR_K_1),
-                ts_lo(),
+                ts_lo_plus(1),
                 ts_hi(),
                 0,
                 1,
@@ -409,15 +419,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // read x10 -> addr_xR (register read at ts + 1).
-    let ts_lo_plus = |d: i64| {
-        BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::TIMESTAMP_0,
-            },
-            LinearTerm::Constant(d),
-        ])
-    };
     out.push(BusInteraction::sender(
         BusId::Memw,
         mu(),
