@@ -106,12 +106,8 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
     let program = Elf::load(recursion_elf_bytes).expect("load recursion elf");
     let mut executor = Executor::new(&program, blob.to_vec()).expect("executor new");
 
-    // Drain chunks to completion without retaining logs or building a trace.
-    while executor
-        .resume()
-        .expect("recursion guest execution failed (verify panicked in-VM?)")
-        .is_some()
-    {}
+    let (total_cycles, exec_time) =
+        drive_executor(&mut executor, |_log| ControlFlow::Continue(()), |_, _, _| {});
 
     let committed = executor
         .finish()
@@ -119,7 +115,7 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
         .memory_values;
 
     eprintln!(
-        "[{label}] committed {} bytes: {:?} (as str: {:?})",
+        "[{label}] {total_cycles} cycles in {exec_time:?}; committed {} bytes: {:?} (as str: {:?})",
         committed.len(),
         committed,
         String::from_utf8_lossy(&committed),
@@ -170,7 +166,7 @@ fn drive_executor(
     let start = std::time::Instant::now();
     let mut total_cycles: u64 = 0;
     let mut chunks: usize = 0;
-    while let Some(logs) = executor.resume().expect("executor resume failed") {
+    while let Some(logs) = executor.resume().expect("executor resume failed (guest panicked in-VM?)") {
         let mut stop = false;
         for log in logs {
             total_cycles += 1;
@@ -210,6 +206,10 @@ fn setup_guest_run(
     let (_inner_proof, blob) = prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], opts);
 
     let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
+    assert_ne!(
+        program.entry_point, 0,
+        "{guest_name} ELF has entry_point=0 — build artifact is malformed"
+    );
     let executor =
         executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
     (guest_elf_bytes, program, executor)
@@ -217,9 +217,12 @@ fn setup_guest_run(
 
 /// A `drive_executor` progress callback that prints the throttled
 /// `[label]   ... N chunks, M cycles, T elapsed` line every `stride` chunks —
-/// the readout every counting diagnostic shares. Tests that need extra live
-/// state (unique PC count, active step bucket) keep their own closure instead.
-fn log_progress(label: &'static str, stride: usize) -> impl FnMut(usize, u64, std::time::Duration) {
+/// the readout the counting diagnostics share. Tests that need extra live state
+/// (unique PC count, active step bucket) keep their own closure instead. Takes
+/// `impl Into<String>` so it works with both `&'static` tags and a run's
+/// dynamic `label`.
+fn log_progress(label: impl Into<String>, stride: usize) -> impl FnMut(usize, u64, std::time::Duration) {
+    let label = label.into();
     move |chunks, cycles, elapsed| {
         if chunks.is_multiple_of(stride) {
             eprintln!("[{label}]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed");
@@ -239,30 +242,35 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
     )
 }
 
-/// Print a per-function PC-histogram summary: the cycles each resolved function
-/// accounts for, folded over all its PCs. `pc_hist` maps program counter →
-/// cycle count.
-///
-/// We fold by function deliberately: an inlined kernel is spread across dozens
-/// of PCs, so a raw per-address table scatters its true cost — and without
-/// file:line resolution a bare PC isn't actionable for optimization anyway, so
-/// there is no per-address detail table.
-fn print_pc_histogram(
-    title: &str,
+/// Verifier sub-routines in execution order. LLVM inlines the step bodies, but
+/// closures inside each keep the method name in their mangled symbol, so
+/// `run_profile` advances the step bucket by substring-matching the enclosing
+/// symbol. A step with no matching symbol merges into the previous bucket.
+const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
+    "replay_rounds_after_round_1",
+    "step_2_verify_claimed_composition_polynomial",
+    "step_3_verify_fri",
+    "step_4_verify_trace_and_composition_openings",
+];
+
+/// `blowup=8` inner-proof options: the security-derived multi-query count (tens
+/// of queries, 128-bit) used by every `multiquery` profiling variant.
+fn blowup8() -> stark::proof::options::ProofOptions {
+    crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
+}
+
+/// Fold the PC histogram by enclosing function and print the top-25 by cycles.
+/// Folded because an inlined kernel spreads across many PCs; no per-address
+/// table since a bare PC isn't actionable without file:line.
+fn print_function_table(
     symbols: &executor::elf::SymbolTable,
     pc_hist: std::collections::HashMap<u64, u64>,
     total_cycles: u64,
-    exec_time: std::time::Duration,
 ) {
-    let entries: Vec<(u64, u64)> = pc_hist.into_iter().collect();
-
-    // Aggregate the full histogram by resolved function, resolving each PC once.
     let mut by_function: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new();
-    for (pc, count) in &entries {
-        let entry = by_function
-            .entry(resolve_pc(symbols, *pc))
-            .or_insert((0, 0));
+    for (pc, count) in &pc_hist {
+        let entry = by_function.entry(resolve_pc(symbols, *pc)).or_insert((0, 0));
         entry.0 += *count; // cycles
         entry.1 += 1; // distinct PCs folded into this function
     }
@@ -270,20 +278,10 @@ fn print_pc_histogram(
     fn_entries.sort_unstable_by_key(|(_name, (cycles, _pcs))| std::cmp::Reverse(*cycles));
 
     let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
-
-    eprintln!();
-    eprintln!("============================================================");
-    eprintln!("  {title}");
-    eprintln!("============================================================");
-    eprintln!("  Total cycles : {total_cycles}");
-    eprintln!("  Unique PCs   : {}", entries.len());
-    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!("  Unique PCs   : {}", pc_hist.len());
     eprintln!();
     eprintln!("  Top 25 functions by cycle count (aggregated over their PCs):");
-    eprintln!(
-        "  {:>4}  {:>14}  {:>7}  {:>7}  {:>5}  {}",
-        "rank", "cycles", "%", "cum %", "PCs", "function"
-    );
+    eprintln!("  rank          cycles        %    cum %    PCs  function");
     let mut fn_cumulative: u64 = 0;
     for (rank, (name, (cycles, pcs))) in fn_entries.iter().take(25).enumerate() {
         fn_cumulative += cycles;
@@ -296,6 +294,149 @@ fn print_pc_histogram(
             pcs,
             name,
         );
+    }
+}
+
+/// Print the monotonic per-verifier-step cycle bucketing. `buckets[0]` is
+/// pre-step-1 setup (alloc + postcard decode + `VmAirs::new`); `buckets[i]` is
+/// verifier step i (with a missing step's cycles merged into the previous one).
+fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
+    let labels = [
+        "0. setup (alloc + postcard decode + VmAirs::new + pre-step-1)",
+        "1. step 1: replay_rounds_after_round_1",
+        "2. step 2: verify_claimed_composition_polynomial",
+        "3. step 3: verify_fri",
+        "4. step 4: verify_trace_and_composition_openings (+ wrap-up)",
+    ];
+    eprintln!();
+    eprintln!("  Per-step cycle breakdown (monotonic state machine):");
+    eprintln!("  {:<60}  {:>14}  {:>7}", "bucket", "cycles", "%");
+    for (label, cycles) in labels.iter().zip(buckets.iter()) {
+        let pct = if total_cycles > 0 {
+            100.0 * (*cycles as f64) / (total_cycles as f64)
+        } else {
+            0.0
+        };
+        eprintln!("  {:<60}  {:>14}  {:>6.2}%", label, cycles, pct);
+    }
+}
+
+/// Single-pass execute-only profiler. Always prints total cycles + wall time +
+/// a rough trace/LDE size estimate. With `detailed`, the same pass also builds
+/// the PC histogram and verifier-step bucketing and prints the top-25 functions
+/// and the per-step breakdown (the two always come together); `!detailed` does
+/// no per-log work, so it's just a fast cycle counter. `progress_stride`
+/// throttles the readout (recursion large, the deserialize-only control small).
+fn run_profile(
+    guest_name: &str,
+    progress_stride: usize,
+    opts: stark::proof::options::ProofOptions,
+    detailed: bool,
+) {
+    use std::collections::HashMap;
+
+    let (guest_elf_bytes, _program, mut executor) = setup_guest_run("profile", guest_name, &opts);
+    let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
+
+    let mut pc_hist: HashMap<u64, u64> = HashMap::new();
+    let mut buckets = [0u64; 5];
+    let mut last_range: Option<(u64, u64)> = None;
+    let mut last_advance: u8 = 0;
+    let bucket = std::cell::Cell::new(0u8);
+    let unique = std::cell::Cell::new(0usize);
+
+    if detailed {
+        assert!(
+            !symbols.is_empty(),
+            "{guest_name} ELF has no symbol table — was it stripped?"
+        );
+        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
+            let n = symbols.functions().iter().filter(|f| f.name.contains(kw)).count();
+            eprintln!(
+                "[profile] step {}: keyword={kw:?} -> {n} symbol(s) {}",
+                i + 1,
+                if n > 0 { "" } else { "(no match; merges into previous bucket)" },
+            );
+        }
+    }
+
+    eprintln!(
+        "[profile] executing {guest_name} guest ({}) ...",
+        if detailed { "histogram + steps" } else { "cycle counter" }
+    );
+    let (total_cycles, exec_time) = drive_executor(
+        &mut executor,
+        |log| {
+            if detailed {
+                let pc = log.current_pc;
+                *pc_hist.entry(pc).or_insert(0) += 1;
+                unique.set(pc_hist.len());
+
+                let in_cached = matches!(last_range, Some((s, e)) if pc >= s && pc < e);
+                if !in_cached {
+                    if let Some(sym) = symbols.lookup(pc) {
+                        last_range = Some((sym.address, sym.address + sym.size.max(1)));
+                        last_advance = 0;
+                        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
+                            if sym.name.contains(kw) {
+                                last_advance = (i + 1) as u8;
+                            }
+                        }
+                    } else {
+                        last_range = None;
+                        last_advance = 0;
+                    }
+                }
+                if bucket.get() < last_advance {
+                    bucket.set(last_advance);
+                }
+                buckets[bucket.get() as usize] += 1;
+            }
+            ControlFlow::Continue(())
+        },
+        |chunks, cycles, elapsed| {
+            if chunks.is_multiple_of(progress_stride) {
+                if detailed {
+                    eprintln!(
+                        "[profile]   ... {chunks} chunks, {cycles} cycles, {} unique PCs, bucket={}, {elapsed:?}",
+                        unique.get(),
+                        bucket.get(),
+                    );
+                } else {
+                    eprintln!("[profile]   ... {chunks} chunks, {cycles} cycles, {elapsed:?}");
+                }
+            }
+        },
+    );
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!(
+        "  {} GUEST PROFILE (blowup={}, {} queries)",
+        guest_name.to_uppercase(),
+        opts.blowup_factor,
+        opts.fri_number_of_queries,
+    );
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Rough trace/LDE size if this guest were proven:");
+    let approx_columns = 250u64;
+    let main_trace_bytes = total_cycles * approx_columns * 8;
+    eprintln!(
+        "    main trace          : ~{:.2} GB ({total_cycles} cycles × ~{approx_columns} cols × 8 B)",
+        main_trace_bytes as f64 / 1e9,
+    );
+    eprintln!(
+        "    main LDE (blowup=2) : ~{:.2} GB  (+aux ≈ 50% more → peak ≈ 2-3× LDE)",
+        (main_trace_bytes * 2) as f64 / 1e9,
+    );
+
+    if detailed {
+        eprintln!();
+        print_function_table(&symbols, pc_hist, total_cycles);
+        print_step_breakdown(&buckets, total_cycles);
     }
     eprintln!("============================================================");
 }
@@ -514,59 +655,33 @@ fn test_dump_recursion_input() {
     eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
 }
 
-/// Diagnostic: build the inner proof + recursion guest input, then **execute
-/// only** the recursion guest (no STARK proving) and report cycle counts +
-/// trace size estimates.
-///
-/// This is the cheap way to find out how many RISC-V instructions the
-/// verifier actually executes inside the guest — a much faster signal than
-/// running the full outer prove (which can OOM on a 125 GB machine).
+/// Cycle count only of the recursion guest verifying a 1-query inner proof.
 #[test]
-#[ignore = "diagnostic: runs the executor only, prints cycle counts"]
-fn test_recursion_cycle_count() {
-    // Build the inner proof with the absolute-minimum FRI params (smallest
-    // possible inner) and stand up the recursion guest over it.
-    let (_bytes, _program, mut executor) =
-        setup_guest_run("cycle-count", "recursion", &MIN_PROOF_OPTIONS);
+#[ignore = "diagnostic: fast; recursion guest cycle count (1 query)"]
+fn test_recursion_cycles_1query() {
+    run_profile("recursion", 500, MIN_PROOF_OPTIONS, false);
+}
 
-    // Execute (NOT prove) the recursion guest. `drive_executor` streams chunks
-    // and never accumulates logs in memory — this avoids the Vec<Log> blow-up
-    // that OOMs even a 125 GB server (one Log is 40 B; a few billion of them is
-    // hundreds of GB).
-    eprintln!("[cycle-count] executing recursion guest (streaming counter only) ...");
-    let (total_cycles, exec_time) = drive_executor(
-        &mut executor,
-        |_log| ControlFlow::Continue(()),
-        log_progress("cycle-count", 50),
-    );
-    let cycle_count = total_cycles as usize;
+/// Cycle count only at 128-bit security: more FRI queries → more verifier cycles.
+#[test]
+#[ignore = "diagnostic: fast; recursion guest cycle count (multi-query)"]
+fn test_recursion_cycles_multiquery() {
+    run_profile("recursion", 500, blowup8(), false);
+}
 
-    eprintln!();
-    eprintln!("============================================================");
-    eprintln!("  RECURSION GUEST EXECUTION SUMMARY");
-    eprintln!("============================================================");
-    eprintln!("  Cycle count           : {cycle_count}");
-    eprintln!("  Executor wall time    : {exec_time:?}");
-    eprintln!();
-    eprintln!("  Rough memory estimate for outer prove:");
-    let bytes_per_field = 8usize;
-    let approx_columns = 250usize; // CPU + MEMW + DECODE + bus columns combined
-    let main_trace_bytes = cycle_count * approx_columns * bytes_per_field;
-    let blowup = 2usize;
-    let lde_main_bytes = main_trace_bytes * blowup;
-    eprintln!(
-        "    main trace            : ~{:.2} GB ({} cycles × ~{} cols × 8 B)",
-        main_trace_bytes as f64 / 1e9,
-        cycle_count,
-        approx_columns
-    );
-    eprintln!(
-        "    main LDE (blowup={})   : ~{:.2} GB",
-        blowup,
-        lde_main_bytes as f64 / 1e9
-    );
-    eprintln!("  (aux trace adds roughly 50% more, so peak peak ≈ 2-3× LDE)");
-    eprintln!("============================================================");
+/// Full profile (top-25 functions + per-step breakdown) of the 1-query run —
+/// the cheapest verifier run, dominated by fixed setup.
+#[test]
+#[ignore = "diagnostic: ~8 min; recursion guest histogram + steps (1 query)"]
+fn test_recursion_profile_1query() {
+    run_profile("recursion", 500, MIN_PROOF_OPTIONS, true);
+}
+
+/// Full profile at 128-bit security: weight shifts toward per-query FRI/Merkle.
+#[test]
+#[ignore = "diagnostic: heavy; recursion guest histogram + steps (multi-query)"]
+fn test_recursion_profile_multiquery() {
+    run_profile("recursion", 500, blowup8(), true);
 }
 
 /// Diagnostic: count the distinct 4 KB memory pages the recursion guest
@@ -690,91 +805,6 @@ fn test_recursion_page_count() {
     eprintln!("    10k-100k      → TLSF heap fragmentation; try a bump alloc.");
     eprintln!("    >100k         → postcard decode dominates; stream-decode?");
     eprintln!("============================================================");
-}
-
-/// Build a PC histogram of guest `guest_name` verifying an `empty`-program
-/// inner proof produced with `inner_proof_options`, and print it via
-/// [`print_pc_histogram`] under `title`.
-///
-/// For the recursion guest, `blowup_factor` and `fri_number_of_queries` are
-/// coupled (the query count is derived from blowup for a fixed security
-/// target), so each recursion `#[test]` is just this runner with a different
-/// `ProofOptions` — a single query at low blowup, vs. the security-derived
-/// multi-query count at a higher blowup. The deserialize-only control guest
-/// reuses the same runner with its own ELF name.
-///
-/// Streams chunks of logs via `Executor::resume()` so memory stays bounded to
-/// the histogram itself. Each PC is resolved to its enclosing function via the
-/// in-house `executor::elf::SymbolTable` (reading the guest ELF's symbol table
-/// directly — no external tool, no DWARF dependency).
-fn run_pc_histogram(
-    title: &str,
-    guest_name: &str,
-    progress_stride: usize,
-    inner_proof_options: stark::proof::options::ProofOptions,
-) {
-    use std::collections::HashMap;
-
-    let (guest_elf_bytes, _program, mut executor) =
-        setup_guest_run("pc-hist", guest_name, &inner_proof_options);
-
-    eprintln!("[pc-hist] executing {guest_name} guest (building PC histogram) ...");
-    let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(300_000);
-    let unique = std::cell::Cell::new(0usize);
-    let (total_cycles, exec_time) = drive_executor(
-        &mut executor,
-        |log| {
-            *pc_hist.entry(log.current_pc).or_insert(0) += 1;
-            unique.set(pc_hist.len());
-            ControlFlow::Continue(())
-        },
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(progress_stride) {
-                eprintln!(
-                    "[pc-hist]   ... {chunks} chunks, {cycles} cycles, {} unique PCs, {elapsed:?}",
-                    unique.get()
-                );
-            }
-        },
-    );
-
-    // Resolve PCs to functions directly from the ELF's symbol table.
-    let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
-    print_pc_histogram(title, &symbols, pc_hist, total_cycles, exec_time);
-}
-
-/// Diagnostic: PC histogram of the recursion guest with a **single** FRI query
-/// at blowup=2 — the cheapest verifier run, dominated by fixed setup cost
-/// (decode, allocator, postcard) rather than per-query FRI/Merkle work.
-#[test]
-#[ignore = "diagnostic: ~8 minutes; prints PC histogram of the verifier-in-VM"]
-fn test_recursion_pc_histogram_1query() {
-    run_pc_histogram(
-        "RECURSION GUEST PC HISTOGRAM (blowup=2, 1 query)",
-        "recursion",
-        500,
-        MIN_PROOF_OPTIONS,
-    );
-}
-
-/// Diagnostic: PC histogram of the recursion guest at **128-bit security**
-/// (blowup=8, FRI query count derived by the Johnson Bound Regime — tens of
-/// queries). Compared against the single-query runs, weight shifts toward the
-/// verifier's per-query FRI-layer / Merkle-opening and field arithmetic.
-#[test]
-#[ignore = "diagnostic: heavy; PC histogram of the multi-query verifier-in-VM"]
-fn test_recursion_pc_histogram_multiquery() {
-    let inner_proof_options =
-        crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid");
-    run_pc_histogram(
-        &format!(
-            "RECURSION GUEST PC HISTOGRAM (blowup=8, {} queries, 128-bit)",
-            inner_proof_options.fri_number_of_queries
-        ),
-        "recursion",
-        500,
-        inner_proof_options,
-    );
 }
 
 /// Diagnostic: build a **sampled** call-stack histogram of the recursion guest.
@@ -951,236 +981,31 @@ fn test_host_verify_step_timings() {
     eprintln!("[host-verify] verified OK");
 }
 
-/// Diagnostic: cycle count for the **deserialize-only** counterpart of the
-/// recursion guest. Same input layout
-/// (`(VmProof, Vec<u8>, ProofOptions)`) and same proof, but
-/// the guest just postcard-decodes the blob and halts — it never calls
-/// `verify_with_options`.
-///
-/// The cycle delta between this and `test_recursion_cycle_count` is the
-/// actual cost of the STARK verifier inside the VM. Historically (40.5 B-cycle
-/// recursion guest) postcard decode was ~15.6 M cycles — negligible. Now that
-/// the recursion guest is ~67 M cycles, the same absolute cost would be ~23%
-/// of total; this test re-measures it.
+// Control guest: decodes the blob and halts. Its cycle count subtracted from
+// the matching recursion run isolates the in-VM verifier cost.
+
 #[test]
-#[ignore = "diagnostic: runs the deserialize-only guest, prints cycle count"]
-fn test_deserialize_only_cycle_count() {
-    let (deser_elf_bytes, program, mut executor) =
-        setup_guest_run("deser-only", "deserialize-only", &MIN_PROOF_OPTIONS);
-
-    eprintln!(
-        "[deser-only] ELF: {} bytes, entry_point=0x{:x}",
-        deser_elf_bytes.len(),
-        program.entry_point,
-    );
-    assert_ne!(
-        program.entry_point, 0,
-        "deserialize-only ELF has entry_point=0 — build artifact is malformed"
-    );
-
-    eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
-    let (total_cycles, exec_time) = drive_executor(
-        &mut executor,
-        |_log| ControlFlow::Continue(()),
-        log_progress("deser-only", 50),
-    );
-    let cycle_count = total_cycles;
-
-    eprintln!();
-    eprintln!("============================================================");
-    eprintln!("  DESERIALIZE-ONLY GUEST EXECUTION SUMMARY");
-    eprintln!("============================================================");
-    eprintln!("  Cycle count           : {cycle_count}");
-    eprintln!("  Executor wall time    : {exec_time:?}");
-    eprintln!();
-    eprintln!("  Compare against test_recursion_cycle_count (~40.5B cycles");
-    eprintln!("  with the same proof). Delta = verifier-in-VM cost.");
-    eprintln!("============================================================");
+#[ignore = "diagnostic: fast; deserialize-only guest cycle count (1 query)"]
+fn test_deserialize_only_cycles_1query() {
+    run_profile("deserialize-only", 50, MIN_PROOF_OPTIONS, false);
 }
 
-/// Diagnostic: PC histogram for the **deserialize-only** guest.
-///
-/// Sibling of `test_recursion_pc_histogram`, but targeting the
-/// deserialize-only control guest so we can locate the hot kernel inside the
-/// 15.7 M-cycle postcard decode itself. Every cycle goes through the
-/// histogram (no sampling), so attribution is exact — the previous sampled
-/// flamegraph at 1:1000 had broken stack reconstruction on skipped
-/// CALL/RETURNs, which made it unreliable for a workload this small.
-///
-/// Each top PC is resolved to its enclosing function via the in-house
-/// `executor::elf::SymbolTable`, reading the guest ELF's symbol table directly
-/// (no external tool, no DWARF dependency).
 #[test]
-#[ignore = "diagnostic: ~1 min; PC histogram for the deserialize-only guest"]
-fn test_deserialize_only_pc_histogram() {
-    // Same runner as the recursion PC histograms, pointed at the deserialize-only
-    // control guest. Smaller workload (~16 M cycles, far fewer chunks), so use a
-    // tighter progress stride to still get periodic readouts.
-    run_pc_histogram(
-        "DESERIALIZE-ONLY GUEST PC HISTOGRAM",
-        "deserialize-only",
-        50,
-        MIN_PROOF_OPTIONS,
-    );
+#[ignore = "diagnostic: fast; deserialize-only guest cycle count (multi-query)"]
+fn test_deserialize_only_cycles_multiquery() {
+    run_profile("deserialize-only", 50, blowup8(), false);
 }
 
-/// Diagnostic: bucket the recursion guest's cycles by which verifier step
-/// is currently executing.
-///
-/// The verifier's hot path is `verify_rounds_2_to_4`, which calls four
-/// sub-routines in a fixed order:
-///   1. `replay_rounds_after_round_1`               (recover challenges)
-///   2. `step_2_verify_claimed_composition_polynomial`
-///   3. `step_3_verify_fri`
-///   4. `step_4_verify_trace_and_composition_openings`
-///
-/// We resolve each sub-routine's entry PC from the recursion ELF's symbol
-/// table, then run a monotonic state machine over the execution stream:
-/// the active bucket only advances 0 → 1 → 2 → 3 → 4 (never backwards),
-/// so cycles inside a step's callees stay attributed to that step.
-///
-/// Bucket 0 ("setup") captures everything before step 1 is entered — the
-/// allocator init, postcard decode, and `VmAirs::new` (which contains the
-/// expensive preprocessed-commitment FFTs).
-///
-/// Streams chunks via `Executor::resume()` so memory stays bounded.
 #[test]
-#[ignore = "diagnostic: ~13 min; buckets the 40B cycles by verifier step"]
-fn test_recursion_step_breakdown() {
-    use executor::elf::SymbolTable;
+#[ignore = "diagnostic: ~1 min; deserialize-only guest histogram (1 query)"]
+fn test_deserialize_only_profile_1query() {
+    run_profile("deserialize-only", 50, MIN_PROOF_OPTIONS, true);
+}
 
-    let (recursion_elf_bytes, _program, mut executor) =
-        setup_guest_run("step-bkd", "recursion", &MIN_PROOF_OPTIONS);
-
-    // Build a per-step "advance bucket to N" lookup. The verifier's step
-    // functions get inlined by LLVM in release mode, so we can't rely on
-    // matching their entry PCs directly. Instead we anchor on closures the
-    // compiler emits *inside* each step's body — iterator combinators like
-    // `.fold(|...|)` keep the step's method name as a substring in their
-    // mangled symbol. Any PC that resolves to a symbol containing step N's
-    // keyword advances the bucket to N (monotonically).
-    //
-    // If step N has no matching symbol at all (e.g. step 4 is fully inlined
-    // with no closure children of its own), its cycles get attributed to the
-    // previous bucket. We report that explicitly in the summary.
-    let symbols = SymbolTable::parse(&recursion_elf_bytes);
-    assert!(
-        !symbols.is_empty(),
-        "recursion ELF has no symbol table — was it stripped?"
-    );
-
-    let step_keywords = [
-        "replay_rounds_after_round_1",
-        "step_2_verify_claimed_composition_polynomial",
-        "step_3_verify_fri",
-        "step_4_verify_trace_and_composition_openings",
-    ];
-    let step_found: [bool; 4] = std::array::from_fn(|i| {
-        symbols
-            .functions()
-            .iter()
-            .any(|f| f.name.contains(step_keywords[i]))
-    });
-    for (i, found) in step_found.iter().enumerate() {
-        let n_matches = symbols
-            .functions()
-            .iter()
-            .filter(|f| f.name.contains(step_keywords[i]))
-            .count();
-        eprintln!(
-            "[step-bkd] step {}: keyword={:?} -> {} symbol(s) {}",
-            i + 1,
-            step_keywords[i],
-            n_matches,
-            if *found {
-                ""
-            } else {
-                "(fully inlined; will merge into the previous bucket)"
-            }
-        );
-    }
-
-    // Monotonic state machine: 0=setup, 1..=4=inside step N (or its callees /
-    // inlined-step-N-cycles attributed here because step N+1 is missing).
-    // `bucket` lives in a Cell so the per-log closure can advance it while the
-    // progress closure reads it for its live readout.
-    let bucket = std::cell::Cell::new(0u8);
-    let mut buckets = [0u64; 5];
-
-    eprintln!("[step-bkd] executing recursion guest (streaming) ...");
-
-    // Cache the last symbol-table hit so we only do a binary search on
-    // function transitions, not on every cycle. Functions are typically
-    // long-running (>>1 instruction), so this cache hits ~all of the time.
-    let mut last_range: Option<(u64, u64)> = None;
-    let mut last_advance: u8 = 0;
-
-    let (total_cycles, exec_time) = drive_executor(
-        &mut executor,
-        |log| {
-            let pc = log.current_pc;
-            let in_cached = matches!(last_range, Some((s, e)) if pc >= s && pc < e);
-            if !in_cached {
-                // Slow path: refresh the cache from the symbol table.
-                if let Some(sym) = symbols.lookup(pc) {
-                    // SymbolTable accepts size=0 symbols as "any address >="; for
-                    // those we'd need the next symbol's start for a real upper
-                    // bound. Cheapest workaround: set a tiny range so we re-resolve
-                    // soon enough that wrong attribution is bounded.
-                    let end = sym.address + sym.size.max(1);
-                    last_range = Some((sym.address, end));
-                    last_advance = 0;
-                    for (i, kw) in step_keywords.iter().enumerate() {
-                        if sym.name.contains(kw) {
-                            last_advance = (i + 1) as u8;
-                        }
-                    }
-                } else {
-                    last_range = None;
-                    last_advance = 0;
-                }
-            }
-            if bucket.get() < last_advance {
-                bucket.set(last_advance);
-            }
-            buckets[bucket.get() as usize] += 1;
-            ControlFlow::Continue(())
-        },
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(500) {
-                eprintln!(
-                    "[step-bkd]   ... {chunks} chunks, {cycles} cycles, bucket={}, {elapsed:?}",
-                    bucket.get()
-                );
-            }
-        },
-    );
-
-    let labels = [
-        "0. setup (alloc + postcard decode + VmAirs::new + pre-step-1)",
-        "1. step 1: replay_rounds_after_round_1",
-        "2. step 2: verify_claimed_composition_polynomial",
-        "3. step 3: verify_fri",
-        "4. step 4: verify_trace_and_composition_openings (+ wrap-up)",
-    ];
-
-    eprintln!();
-    eprintln!("============================================================");
-    eprintln!("  RECURSION GUEST PER-STEP CYCLE BREAKDOWN");
-    eprintln!("============================================================");
-    eprintln!("  Total cycles : {total_cycles}");
-    eprintln!("  Exec time    : {exec_time:?}");
-    eprintln!();
-    eprintln!("  {:<60}  {:>14}  {:>7}", "bucket", "cycles", "%");
-    for (label, cycles) in labels.iter().zip(buckets.iter()) {
-        let pct = if total_cycles > 0 {
-            100.0 * (*cycles as f64) / (total_cycles as f64)
-        } else {
-            0.0
-        };
-        eprintln!("  {:<60}  {:>14}  {:>6.2}%", label, cycles, pct);
-    }
-    eprintln!("============================================================");
+#[test]
+#[ignore = "diagnostic: deserialize-only guest histogram (multi-query)"]
+fn test_deserialize_only_profile_multiquery() {
+    run_profile("deserialize-only", 50, blowup8(), true);
 }
 
 /// Inner program: fibonacci(10).
