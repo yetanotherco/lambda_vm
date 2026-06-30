@@ -32,7 +32,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Vast offer search: RTX 5090, >=16 cores, >=64GB RAM (the prover suite proves real ELFs,
+  # Vast offer search: RTX 5090, >=16 cores, >=96GB RAM (the prover suite proves real ELFs,
   # so allow headroom), >=64GB disk, verified + rentable, Blackwell-capable driver, <= cap.
   GPU_NAME: RTX_5090
   PRICE_CAP: "1"
@@ -90,7 +90,7 @@ jobs:
           # 13.1 because the template's nvcc is 13.1 and build.rs JIT-compiles its PTX at load —
           # a 13.0 driver rejects 13.1 PTX (CUDA_ERROR_UNSUPPORTED_PTX_VERSION). Bump this in
           # lockstep if the base image's CUDA toolkit changes.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=64 disk_space>=64 verified=true rentable=true cuda_max_good>=13.1 dph_total<=${PRICE_CAP}"
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=96 disk_space>=64 verified=true rentable=true cuda_max_good>=13.1 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first (within
           # the cap) — premium hosts have faster disks/network and better reliability; cheapest
@@ -110,7 +110,7 @@ jobs:
             sleep "$OFFER_INTERVAL"
           done
           if [ -z "$OFFER_ID" ]; then
-            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=32GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
             exit 1
           fi
           echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
@@ -255,18 +255,44 @@ jobs:
         env:
           OUTCOME: ${{ steps.tests.outcome }}
         run: |
+          OUT="$RUNNER_TEMP/gpu_test_out.txt"
           {
-            echo "## GPU tests (CUDA-only suite)"
-            echo "Outcome: **${OUTCOME}**"
-            # On failure, surface the failing-group markers explicitly, then the log tail.
-            if [ "$OUTCOME" != "success" ]; then
-              FAILED=$(grep -F '::error::GPU test group failed:' "$RUNNER_TEMP/gpu_test_out.txt" 2>/dev/null \
-                       | sed 's/.*failed: /- /' || true)
-              [ -n "$FAILED" ] && { echo; echo "Failed groups:"; echo "$FAILED"; }
+            echo "## GPU tests (CUDA suite) — ${OUTCOME}"
+            if [ "$OUTCOME" = "success" ]; then
+              echo "All GPU test groups passed."
+            else
+              # Group the failed tests under the make target that ran them: gpu_test.sh prints
+              # "=== make <target> ===" before each group, and cargo prints "test <name> ... FAILED".
+              report=$(awk '
+                /^=== make / { grp=$3; next }
+                / \.\.\. FAILED/ { fails[grp]=fails[grp] "\n    - " $2; n[grp]++ }
+                END { for (g in fails) printf "- **%s** (%d failed):%s\n", g, n[g], fails[g] }
+              ' "$OUT" 2>/dev/null || true)
+              # Per-test panic/assertion messages: each "thread '…' panicked at …:" block plus
+              # its following message lines (assertion, left/right), capped per block.
+              details=$(awk '
+                /^thread .* panicked at / { cap=1; lines=0; buf=$0; next }
+                cap {
+                  if ($0 ~ /^note: run with/ || $0 ~ /^----/ || $0 ~ /^test / || $0 ~ /^=== / || $0 ~ /^[[:space:]]*$/) { printf "%s\n\n", buf; cap=0; next }
+                  if (lines < 14) { buf=buf "\n" $0; lines++ } else if (lines==14) { buf=buf "\n    ...(truncated)"; lines++ }
+                }
+                END { if (cap) printf "%s\n", buf }
+              ' "$OUT" 2>/dev/null || true)
+              if [ -n "$report" ]; then
+                echo; echo "### Failed tests by group"; echo "$report"
+                if [ -n "$details" ]; then
+                  echo; echo "### Failure details"; echo '```'; echo "$details"; echo '```'
+                fi
+              else
+                # No per-test failures parsed (likely a build/infra error) — fall back to the
+                # failed-group markers plus a short log tail.
+                grps=$(grep -F '::error::GPU test group failed:' "$OUT" 2>/dev/null | sed 's/.*failed: /- /' | sort -u || true)
+                [ -n "$grps" ] && { echo; echo "### Failed groups"; echo "$grps"; }
+                echo; echo "No individual test failures parsed (build/infra error?). Last lines:"
+                echo '```'; tail -n 40 "$OUT" 2>/dev/null || echo "(no output captured)"; echo '```'
+              fi
+              echo; echo "<sub>Full output is in the \"Run GPU tests\" step log.</sub>"
             fi
-            echo '```'
-            tail -n 80 "$RUNNER_TEMP/gpu_test_out.txt" 2>/dev/null || echo "(no output captured)"
-            echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
       # TEMP(debugging): when KEEP_INSTANCE=1, leave the box up and print how to reach it.
