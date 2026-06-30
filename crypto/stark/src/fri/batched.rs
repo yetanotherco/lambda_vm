@@ -1,4 +1,4 @@
-use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
@@ -181,6 +181,102 @@ where
     (last_value, fri_layer_list)
 }
 
+/// Canonical, order-deterministic absorption of an epoch's table-height histogram
+/// into the transcript. Single source of truth for the structural binding: the
+/// multiset of `lde_log_height`s across an epoch's tables fully determines the fold
+/// order and injection points of the batched FRI (arity is uniformly 2 — #729 is not
+/// on this branch, see the task-3 brief override). Binding this histogram is
+/// therefore equivalent to binding the whole arity/injection schedule.
+///
+/// Encoding (fixed-width, length-prefixed, order-preserving):
+/// `u64::to_le_bytes(heights.len())` followed by `u64::to_le_bytes(h)` for each `h`
+/// in `heights`, in the exact order given. Caller (prover and verifier alike) must
+/// pass `heights` in the same canonical per-epoch table order — this function does
+/// not sort or deduplicate.
+pub fn absorb_height_histogram<E, T>(transcript: &mut T, heights: &[usize])
+where
+    E: IsField,
+    T: IsTranscript<E>,
+{
+    transcript.append_bytes(&(heights.len() as u64).to_le_bytes());
+    for h in heights {
+        transcript.append_bytes(&(*h as u64).to_le_bytes());
+    }
+}
+
+/// Challenges derived from replaying the shared batched round-4 transcript sequence.
+/// See [`derive_batched_fri_challenges`].
+#[derive(Debug, Clone)]
+pub struct BatchedFriChallenges<E: IsField> {
+    /// Sampled once after the height histogram (and, at the call site, after all
+    /// per-table OOD evaluations have been absorbed).
+    pub alpha: FieldElement<E>,
+    /// One per committed layer plus one final challenge for the last fold.
+    /// `betas.len() == layer_roots.len() + 1`.
+    pub betas: Vec<FieldElement<E>>,
+    /// Transcript state right before the grinding nonce bytes are appended.
+    /// All-zero when `grinding_factor == 0` or `nonce` is `None` (mirrors
+    /// the per-table convention in `verifier.rs`).
+    pub grinding_seed: [u8; 32],
+    /// One `sample_u64(domain_size >> 1)` draw per query.
+    pub iotas: Vec<usize>,
+}
+
+/// Replays the shared batched round-4 transcript sequence (histogram, alpha,
+/// per-layer beta/root, final beta/last_value, grinding, query iotas) and returns
+/// the derived challenges. The single routine the prover (T4) and verifier (T5)
+/// both call so they provably derive identical challenges; calls
+/// `absorb_height_histogram` internally instead of duplicating the encoding.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_batched_fri_challenges<E, T>(
+    transcript: &mut T,
+    heights: &[usize],
+    layer_roots: &[[u8; 32]],
+    last_value: &FieldElement<E>,
+    grinding_factor: u8,
+    nonce: Option<u64>,
+    num_queries: usize,
+    domain_size: usize,
+) -> BatchedFriChallenges<E>
+where
+    E: IsField,
+    T: IsTranscript<E>,
+{
+    absorb_height_histogram(transcript, heights);
+
+    let alpha = transcript.sample_field_element();
+
+    let mut betas = Vec::with_capacity(layer_roots.len() + 1);
+    for root in layer_roots {
+        let beta = transcript.sample_field_element();
+        transcript.append_bytes(root);
+        betas.push(beta);
+    }
+
+    let final_beta = transcript.sample_field_element();
+    transcript.append_field_element(last_value);
+    betas.push(final_beta);
+
+    let mut grinding_seed = [0u8; 32];
+    if grinding_factor > 0
+        && let Some(nonce_value) = nonce
+    {
+        grinding_seed = transcript.state();
+        transcript.append_bytes(&nonce_value.to_be_bytes());
+    }
+
+    let iotas = (0..num_queries)
+        .map(|_| transcript.sample_u64((domain_size as u64) >> 1) as usize)
+        .collect();
+
+    BatchedFriChallenges {
+        alpha,
+        betas,
+        grinding_seed,
+        iotas,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -300,6 +396,104 @@ mod tests {
         assert_eq!(
             layers[0].evaluation, expected,
             "layer[0] evaluation does not match manual fold+inject"
+        );
+    }
+
+    /// The prover, by hand, runs exactly the sequence documented in the design spec's
+    /// "Transcript binding" section (restricted to round 4, batched-arity-2, no
+    /// final_poly / no log_arities — see task-3 override): absorb the height
+    /// histogram, sample α, then per committed layer sample β and append its root,
+    /// then a final β and append `last_value`, then grinding, then query indices.
+    /// `derive_batched_fri_challenges` must reproduce byte-identical outputs when
+    /// fed the same inputs, starting from a transcript in the same state.
+    #[test]
+    fn batched_round4_prover_inline_matches_verifier_replay() {
+        // Canonical per-epoch table heights (the multiset bound into the transcript).
+        let heights: Vec<usize> = vec![10, 10, 8, 8, 8, 5];
+
+        // Fake committed layer roots (K = 4) — only their bytes/order matter here.
+        let layer_roots: Vec<[u8; 32]> = (0u8..4).map(|i| [i; 32]).collect();
+        let last_value = FE::from(999u64);
+
+        let grinding_factor: u8 = 4;
+        let num_queries = 3;
+        let domain_size = 1usize << 10;
+
+        let seed_transcript = Transcript::new(b"batched_round4_test");
+        let mut transcript_a = seed_transcript.clone();
+        let mut transcript_b = seed_transcript.clone();
+
+        // --- Clone A: prover-inline sequence, by hand ---
+        absorb_height_histogram(&mut transcript_a, &heights);
+        let alpha_a = transcript_a.sample_field_element();
+
+        let mut betas_a = Vec::with_capacity(layer_roots.len() + 1);
+        for root in &layer_roots {
+            let beta = transcript_a.sample_field_element();
+            transcript_a.append_bytes(root);
+            betas_a.push(beta);
+        }
+        let final_beta_a = transcript_a.sample_field_element();
+        transcript_a.append_field_element(&last_value);
+        betas_a.push(final_beta_a);
+        assert_eq!(
+            betas_a.len(),
+            layer_roots.len() + 1,
+            "beta count must be K+1 to match batched_commit_phase"
+        );
+
+        let grinding_seed_a = transcript_a.state();
+        // Test-only: derive a real PoW nonce so the grinding step is exercised
+        // identically by both sides (the nonce search itself is not under test).
+        let nonce = crate::grinding::generate_nonce(&grinding_seed_a, grinding_factor)
+            .expect("a valid grinding nonce exists for this small grinding_factor");
+        transcript_a.append_bytes(&nonce.to_be_bytes());
+
+        let iotas_a: Vec<usize> = (0..num_queries)
+            .map(|_| transcript_a.sample_u64((domain_size as u64) >> 1) as usize)
+            .collect();
+
+        // --- Clone B: shared replay routine ---
+        let result = derive_batched_fri_challenges(
+            &mut transcript_b,
+            &heights,
+            &layer_roots,
+            &last_value,
+            grinding_factor,
+            Some(nonce),
+            num_queries,
+            domain_size,
+        );
+
+        assert_eq!(result.alpha, alpha_a, "alpha mismatch");
+        assert_eq!(result.betas, betas_a, "beta vector mismatch");
+        assert_eq!(
+            result.grinding_seed, grinding_seed_a,
+            "grinding seed mismatch"
+        );
+        assert_eq!(result.iotas, iotas_a, "iotas mismatch");
+    }
+
+    /// Tampering with the height histogram (without changing anything else) must
+    /// change the derived batching challenge α — this is the structural binding
+    /// that protects the fold/injection schedule (spec trap #4).
+    #[test]
+    fn absorb_height_histogram_binds_heights_into_alpha() {
+        let heights_a: Vec<usize> = vec![10, 10, 8, 8, 8, 5];
+        let heights_b: Vec<usize> = vec![10, 10, 8, 8, 8, 6]; // one height differs
+
+        let mut transcript_a = Transcript::new(b"histogram_binding_test");
+        let mut transcript_b = Transcript::new(b"histogram_binding_test");
+
+        absorb_height_histogram(&mut transcript_a, &heights_a);
+        absorb_height_histogram(&mut transcript_b, &heights_b);
+
+        let alpha_a = transcript_a.sample_field_element();
+        let alpha_b = transcript_b.sample_field_element();
+
+        assert_ne!(
+            alpha_a, alpha_b,
+            "different height histograms must yield different alpha"
         );
     }
 }
