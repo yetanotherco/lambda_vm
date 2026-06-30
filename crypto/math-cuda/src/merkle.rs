@@ -455,15 +455,8 @@ fn build_comp_poly_tree_nodes_dev(
     Ok((nodes_dev, num_leaves, stream))
 }
 
-pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Result<Vec<u8>> {
-    let (nodes_dev, _num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
-    let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
-    Ok(out)
-}
-
-/// Like [`build_comp_poly_tree_from_evals_ext3`] but keeps the tree nodes on
-/// device (returned as a [`crate::lde::GpuMerkleTree`] with its root), so R4
+/// Build the comp poly Merkle tree on device and keep the nodes resident
+/// (returned as a [`crate::lde::GpuMerkleTree`] with its root), so R4
 /// composition openings gather paths on device instead of copying the whole
 /// tree to host. `leaves_len = lde_size / 2` (row pair leaves).
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
@@ -480,11 +473,12 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep(
     })
 }
 
-/// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval
-/// vector. Each leaf hashes two consecutive ext3 values. `num_leaves =
-/// evals.len() / 6` (since each ext3 is 3 u64s).
-///
-/// Returns the `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
+/// Test-only parity harness: build a FRI layer Merkle tree on device from an
+/// interleaved ext3 eval vector and return the full host node buffer so tests
+/// can compare it byte for byte against the CPU. Production folds and commits
+/// via [`crate::fri::FriLayer::fold_and_commit_layer`]. Each leaf hashes two
+/// consecutive ext3 values; `num_leaves = evals.len() / 6`. Returns the
+/// `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
 pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     assert!(
         evals.len().is_multiple_of(6),

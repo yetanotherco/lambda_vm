@@ -424,14 +424,10 @@ pub fn table_parallelism() -> usize {
     }
 }
 
-/// Heuristic peak device working set for one table, in bytes. Two parts: the
-/// LDE columns co-resident on the GPU (main base field at 8 B, aux ext3 at
-/// 24 B) times a scratch factor for the NTT and leaf hash transients, plus the
-/// resident Merkle trees (main, aux, composition, FRI layers) kept on device R1
-/// to R4. Each full tree is about `2*lde_size` nodes of 32 B (`64*lde_size`);
-/// together at the R4 peak about 256 B per `lde_size` covers them. A deliberate
-/// over estimate that gates a safety ceiling, not a precise allocator. Pass
-/// `aux_cols == 0` where the aux LDE is not yet resident (R1 main commit).
+/// Heuristic peak device bytes for one table: co-resident LDE columns plus the
+/// resident Merkle trees, with a scratch factor for NTT and leaf transients. A
+/// deliberate over estimate for a safety ceiling, not a precise allocator. Pass
+/// aux_cols == 0 when the aux LDE is not yet resident (R1 main commit).
 fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
     const BYTES_PER_BASE: u64 = 8;
     const EXT3_BYTES: u64 = 24;
@@ -445,16 +441,12 @@ fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize)
     lde_term.saturating_add(tree_term)
 }
 
-/// Plan contiguous table chunks for parallel proving.
-///
-/// A chunk grows until it reaches `k` tables (the core and RAM bound limit) or
-/// its summed VRAM estimate would exceed `budget`, whichever comes first. A
-/// single table larger than `budget` forms its own chunk (it runs solo rather
-/// than being excluded). With `budget == u64::MAX` the VRAM constraint is never
-/// binding for any realistic estimate, so chunks fall back to fixed size `k`,
-/// the same as the previous `step_by(k)` scheme. So on non-cuda builds and when
-/// VRAM is not binding, scheduling (and therefore the proof) is unchanged.
-/// Returns `(start, end)` half open ranges covering `0..estimates.len()` in order.
+/// Plan contiguous table chunks for parallel proving. A chunk grows until it
+/// hits `k` tables or its summed VRAM estimate would exceed `budget`; a single
+/// table larger than `budget` runs solo. With `budget == u64::MAX` (non-cuda,
+/// or VRAM not binding) chunks fall back to fixed size `k`, identical to the
+/// old `step_by(k)`, so scheduling and the proof are unchanged. Returns
+/// `(start, end)` half open ranges covering `0..estimates.len()` in order.
 fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
     let n = estimates.len();
     let k = k.max(1);

@@ -4,22 +4,18 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-// =========================================================================
-// Wall-clock span timeline (the trustworthy per-step measurement)
-// =========================================================================
+// Wall clock span timeline: the trustworthy per step latency breakdown.
 //
-// Nested wall clock spans opened and closed on the driving (main) thread at
-// phase boundaries. Unlike the `accum_*` thread local sub timers below (which
-// sum per worker CPU time across rayon threads and over count, so percentages
-// exceed 100%), these spans do not overlap and sum to their parent, so the tree
-// is a true latency breakdown. Parallel regions are measured as a single span
-// around the blocking call (that is their latency); their internal split is
-// reported separately as CPU time, never mixed into the wall tree.
+// Spans open and close on the main thread at phase boundaries. They do not
+// overlap and sum to their parent, so the tree is a true latency breakdown
+// (unlike the accum_* thread local sub timers below, which sum per worker CPU
+// time across rayon threads and can exceed 100%). A parallel region is one span
+// around the blocking call; its internal split is reported separately as CPU
+// time, never mixed into the wall tree.
 //
 //     let _s = instruments::span("trace_build");   // RAII, stops on drop
 //
-// `Instant::now()` is about 20 ns, fine at phase granularity; never put it
-// inside per op loops.
+// Instant::now() is about 20 ns, fine at phase granularity, not in per op loops.
 
 #[derive(Clone, Debug)]
 pub struct SpanRecord {
@@ -138,9 +134,11 @@ pub fn timeline_json(spans: &[SpanRecord]) -> String {
         if i > 0 {
             out.push(',');
         }
+        // Escape the label so a quote or backslash cannot break the JSON.
+        let label = s.label.replace('\\', "\\\\").replace('"', "\\\"");
         out.push_str(&format!(
             "{{\"label\":\"{}\",\"depth\":{},\"wall_ns\":{},\"order\":{},\"start_ns\":{}}}",
-            s.label,
+            label,
             s.depth,
             s.wall.as_nanos(),
             s.order,
