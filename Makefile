@@ -253,7 +253,7 @@ test-cuda-integration:
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
 test-cuda-fallback:
 	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
-	    --test cuda_fallback_tests -- --ignored --nocapture
+	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
 
 # The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
