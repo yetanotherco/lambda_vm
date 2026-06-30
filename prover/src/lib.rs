@@ -961,7 +961,7 @@ pub fn verify_with_options(
     vm_proof.table_counts.validate()?;
 
     // Bound num_private_input_pages before allocating PageConfigs.
-    // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
+    // MAX_PRIVATE_INPUT_SIZE fits in ~257 pages of DEFAULT_PAGE_SIZE.
     {
         use crate::tables::page::DEFAULT_PAGE_SIZE;
         use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
