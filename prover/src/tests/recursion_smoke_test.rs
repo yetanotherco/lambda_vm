@@ -156,7 +156,8 @@ const OUTER_EPOCH_SIZE_LOG2: u32 = 20;
 /// from the per-epoch bound slices, so a `Some(output)` already means every
 /// epoch proof, the cross-epoch linkage, and the L2G binding verified.
 fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
-    let opts = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    let opts =
+        crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
     eprintln!(
         "[{label}] proving outer (recursion guest) via continuations \
          (epoch=2^{OUTER_EPOCH_SIZE_LOG2} cycles) ..."
