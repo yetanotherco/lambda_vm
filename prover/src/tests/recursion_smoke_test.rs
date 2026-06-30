@@ -47,6 +47,7 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
 /// Prove `inner_elf` (fed `inner_input`) under `opts`, then package
