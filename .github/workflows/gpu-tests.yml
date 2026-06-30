@@ -19,10 +19,6 @@ name: GPU Tests (merge queue)
 on:
   merge_group:
   workflow_dispatch:
-  # TEMP(testing): run on pushes to this branch pre-merge (no merge queue needed to test the
-  # rent -> test -> destroy path). REMOVE before merging.
-  push:
-    branches: [ci_run_tests_gpu]
 
 permissions:
   contents: read
@@ -42,10 +38,6 @@ env:
   # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
   # hash can't) — avoids pulling untrusted code at run time.
   VAST_CLI_COMMIT: "28494d92c6c03d887f8375085243c22eb68c5874"
-  # TEMP(debugging): "1" skips teardown so the box stays up for SSH debugging. The
-  # "Connection info" step prints how to connect and how to destroy it manually.
-  # SET BACK TO "0" (or remove) so the box is destroyed again.
-  KEEP_INSTANCE: "1"
 
 jobs:
   gpu-tests:
@@ -295,31 +287,9 @@ jobs:
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-      # TEMP(debugging): when KEEP_INSTANCE=1, leave the box up and print how to reach it.
-      - name: Connection info (instance kept for debugging)
-        if: always() && env.KEEP_INSTANCE == '1'
-        env:
-          HOST: ${{ steps.ssh.outputs.host }}
-          PORT: ${{ steps.ssh.outputs.port }}
-          IID: ${{ steps.instance.outputs.id }}
-        run: |
-          {
-            echo "## ⚠️ Instance KEPT for debugging (KEEP_INSTANCE=1)"
-            echo "SSH in with your team key (baked into the box by the template onstart):"
-            echo '```'
-            echo "ssh -o StrictHostKeyChecking=accept-new -p ${PORT:-?} root@${HOST:-?}"
-            echo "cd /workspace/lambda_vm   # the failing tests live here"
-            echo '```'
-            echo "Destroy it when done (it bills hourly):"
-            echo '```'
-            echo "vastai destroy instance ${IID:-?} --yes   # label: $RUN_LABEL"
-            echo '```'
-          } | tee -a "$GITHUB_STEP_SUMMARY"
-          echo "::warning::Instance $IID kept for debugging — destroy it manually: vastai destroy instance $IID --yes"
-
       # --- Teardown: ALWAYS destroy the instance (cost guardrail) ---
       - name: Destroy instance
-        if: always() && env.KEEP_INSTANCE != '1'
+        if: always()
         run: |
           # Retry transient failures (network/auth) so a paid box isn't stranded.
           # --yes: skip the interactive [y/N] confirm (CI has no tty).
