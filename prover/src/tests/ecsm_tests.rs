@@ -123,8 +123,8 @@ fn constraints_hold_on_generated_trace() {
 #[test]
 fn create_constraints_count() {
     let (constraints, next) = create_constraints(0);
-    assert_eq!(constraints.len(), 404);
-    assert_eq!(next, 404);
+    assert_eq!(constraints.len(), 412);
+    assert_eq!(next, 412);
 }
 
 /// The yG carry recurrence is unsatisfiable on a padding row unless two ingredients hold,

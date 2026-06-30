@@ -58,11 +58,12 @@ pub mod cols {
     pub const C0: usize = 457; // BaseField[64]
     pub const Q1: usize = 521; // Byte[33]
     pub const C1: usize = 554; // BaseField[64]
-    pub const K_SUB_N: usize = 618; // U256HL (16 halfwords)
-    pub const XR_SUB_P: usize = 634; // U256HL (16 halfwords)
-    pub const MU: usize = 650;
+    pub const XG_SUB_P: usize = 618; // U256HL (16 halfwords)
+    pub const K_SUB_N: usize = 634; // U256HL (16 halfwords)
+    pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
+    pub const MU: usize = 666;
 
-    pub const NUM_COLUMNS: usize = 651;
+    pub const NUM_COLUMNS: usize = 667;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
@@ -100,6 +101,10 @@ pub mod cols {
     #[inline]
     pub const fn c1(i: usize) -> usize {
         C1 + i
+    }
+    #[inline]
+    pub const fn xg_sub_p(i: usize) -> usize {
+        XG_SUB_P + i
     }
     #[inline]
     pub const fn k_sub_n(i: usize) -> usize {
@@ -179,6 +184,7 @@ pub fn generate_ecsm_trace(
         table.set_bytes(row_idx, cols::X2, &w.x2);
         table.set_bytes(row_idx, cols::Q0, &w.q0);
         table.set_bytes(row_idx, cols::Q1, &w.q1);
+        write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
         write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
         write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
 
@@ -493,6 +499,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         out.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu(),
+            vec![packed(cols::xg_sub_p(i))],
+        ));
+    }
+    for i in 0..16 {
+        out.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mu(),
             vec![packed(cols::k_sub_n(i))],
         ));
     }
@@ -737,6 +750,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
 /// `p + xR_sub_p = xR + 2^256` (with `xR_sub_p = xR − p mod 2^256`).
 #[derive(Clone, Copy)]
 pub enum OverflowKind {
+    XgLtP,
     KLtN,
     XrLtP,
 }
@@ -745,6 +759,7 @@ impl OverflowKind {
     /// The constant addend's 32-bit word `i` (`N` for `k<N`, `p` for `xR<p`).
     fn const_word(self, i: usize) -> u64 {
         let bytes = match self {
+            OverflowKind::XgLtP => &P_BYTES,
             OverflowKind::KLtN => &N_BYTES,
             OverflowKind::XrLtP => &P_BYTES,
         };
@@ -757,6 +772,7 @@ impl OverflowKind {
     /// Column base of the witnessed halfword addend (`k_sub_N` / `xR_sub_p`).
     fn addend_hl_base(self) -> usize {
         match self {
+            OverflowKind::XgLtP => cols::XG_SUB_P,
             OverflowKind::KLtN => cols::K_SUB_N,
             OverflowKind::XrLtP => cols::XR_SUB_P,
         }
@@ -764,11 +780,12 @@ impl OverflowKind {
     /// Column base of the sum.
     fn sum_col_base(self) -> usize {
         match self {
+            OverflowKind::XgLtP => cols::XG,
             OverflowKind::KLtN => cols::K,
             OverflowKind::XrLtP => cols::XR,
         }
     }
-    /// Whether the sum is stored as individual bits (k) rather than bytes (xR).
+    /// Whether the sum is stored as individual bits (k) rather than bytes (xR/xG).
     fn sum_is_bits(self) -> bool {
         matches!(self, OverflowKind::KLtN)
     }
@@ -867,7 +884,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
     }
 }
 
-/// Creates all ECSM transition constraints (405 total: 1 mu + 256 k bits + 148 others).
+/// Creates all ECSM transition constraints (412 total: 1 mu + 256 k bits + 8 xG<p + 147 others).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -935,6 +952,27 @@ pub fn create_constraints(
 
     // IS_BIT(q1[32])
     constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
+    idx += 1;
+
+    // xG < p: 7 carry bits + overflow-required.
+    for i in 0..7 {
+        constraints.push(
+            CarryBit {
+                kind: OverflowKind::XgLtP,
+                i,
+                constraint_idx: idx,
+            }
+            .boxed(),
+        );
+        idx += 1;
+    }
+    constraints.push(
+        OverflowRequired {
+            kind: OverflowKind::XgLtP,
+            constraint_idx: idx,
+        }
+        .boxed(),
+    );
     idx += 1;
 
     // k < N: 7 carry bits + overflow-required.
