@@ -2,10 +2,12 @@
 #
 # gpu_test.sh — run the CUDA-only test groups on a GPU box.
 #
-# These groups can't run in CPU CI (GitHub runners have no GPU):
-#   1. math-cuda kernel parity        (make test-math-cuda)
-#   2. end-to-end GPU dispatch + proof (make test-cuda-integration)
-#   3. GPU error-path / CPU fallback   (make test-cuda-fallback)
+# Exercises the CUDA path, which CPU CI can't (GitHub runners have no GPU):
+#   1. math-cuda kernel parity         (make test-math-cuda)
+#   2. end-to-end GPU dispatch + proof  (make test-cuda-integration)
+#   3. GPU error-path / CPU fallback    (make test-cuda-fallback)
+#   4. prover/stark/crypto/ecsm suite   (make test-prover-cuda) — CPU CI's prover tests on GPU
+#   5. comprehensive all-instructions   (make test-prover-comprehensive-cuda)
 #
 # Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All three groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
@@ -42,12 +44,14 @@ log "pinning cudarc to $CUDARC_PIN"
 sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
     crypto/math-cuda/Cargo.toml
 
-# --- Build the asm guest ELFs used by Groups 2 & 3 (clang on .s; fast) ----------
-# (math-cuda parity tests need no ELF; cuda_path_integration / cuda_fallback prove an asm ELF.)
-log "compiling asm guest programs"
+# --- Build the guest ELFs the tests prove ---------------------------------------
+# math-cuda parity needs none; cuda_path_integration / cuda_fallback prove an asm ELF; the
+# prover suite (Groups 4 & 5) proves asm AND rust guests. Build both up front.
+log "compiling guest programs (asm + rust)"
 make compile-programs-asm
+make compile-programs-rust
 
-# --- Run the three CUDA test groups via the Makefile targets --------------------
+# --- Run the CUDA test groups via the Makefile targets --------------------------
 fail=0
 run() {  # $1 = make target
     log "make $1"
@@ -56,9 +60,11 @@ run() {  # $1 = make target
         fail=1
     fi
 }
-run test-math-cuda         # Group 1: kernel parity
-run test-cuda-integration  # Group 2: end-to-end GPU dispatch + proof verifies
-run test-cuda-fallback     # Group 3: GPU error -> CPU fallback still verifies
+run test-math-cuda                  # Group 1: kernel parity
+run test-cuda-integration           # Group 2: end-to-end GPU dispatch + proof verifies
+run test-cuda-fallback              # Group 3: GPU error -> CPU fallback still verifies
+run test-prover-cuda                # Group 4: prover/stark/crypto/ecsm suite on the GPU path
+run test-prover-comprehensive-cuda  # Group 5: comprehensive all-instructions prove on GPU
 
 if [ "$fail" -ne 0 ]; then
     log "FAILED — one or more GPU test groups failed"

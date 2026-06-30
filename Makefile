@@ -2,6 +2,7 @@
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover \
 test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -253,6 +254,20 @@ test-cuda-integration:
 test-cuda-fallback:
 	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
 	    --test cuda_fallback_tests -- --ignored --nocapture
+
+# The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
+# GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
+# GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
+# to stark; crypto/ecsm build without it (they have no GPU path).
+test-prover-cuda:
+	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	    --features lambda-vm-prover/cuda -- --test-threads=1
+
+# The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
+# NVIDIA GPU + nvcc). GPU counterpart of CPU CI's merge-queue-only comprehensive job.
+test-prover-comprehensive-cuda:
+	cargo test --release -p lambda-vm-prover --features cuda \
+	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
