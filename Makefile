@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs clean-asm clean-rust clean-bench clean-shared clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -247,6 +247,12 @@ test-math-cuda:
 test-cuda-integration:
 	cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture
+
+# GPU error-path coverage (requires NVIDIA GPU + nvcc).
+# Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
+test-cuda-fallback:
+	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	    --test cuda_fallback_tests -- --ignored --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
