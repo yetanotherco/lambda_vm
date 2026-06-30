@@ -24,8 +24,22 @@ fn elf_digest(elf: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
+/// Which statement is being bound. Selects the leading domain tag and whether an
+/// epoch label is appended, so monolithic and continuation-epoch proofs share one
+/// function while each starts with its own tag. `Monolithic` reproduces the
+/// original encoding byte-for-byte (no label), so existing proofs are unaffected.
+#[derive(Clone, Copy)]
+pub(crate) enum StatementKind {
+    /// Whole-program (monolithic) proof.
+    Monolithic,
+    /// One continuation epoch proof, pinned to its position by `epoch_label`.
+    ContinuationEpoch { epoch_label: u64 },
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_statement(
     t: &mut impl IsTranscript<E>,
+    kind: StatementKind,
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
@@ -33,7 +47,13 @@ pub(crate) fn absorb_statement(
     runtime_page_ranges: &[RuntimePageRange],
     fri_final_poly_log_degree: u8,
 ) {
-    t.append_bytes(DOMAIN_TAG);
+    // Leading domain tag — distinct per statement kind, so a monolithic proof and
+    // a continuation epoch proof can never share a transcript prefix.
+    let domain_tag = match kind {
+        StatementKind::Monolithic => DOMAIN_TAG,
+        StatementKind::ContinuationEpoch { .. } => CONTINUATION_EPOCH_TAG,
+    };
+    t.append_bytes(domain_tag);
 
     // ELF: fixed 32-byte digest — no length prefix needed.
     t.append_bytes(&elf_digest(elf_bytes));
@@ -94,4 +114,29 @@ pub(crate) fn absorb_statement(
         t.append_bytes(&base.to_le_bytes());
         t.append_bytes(&count.to_le_bytes());
     }
+
+    // Continuation epochs additionally bind their position (replay protection).
+    // Monolithic proofs append nothing here, so their encoding is unchanged.
+    if let StatementKind::ContinuationEpoch { epoch_label } = kind {
+        t.append_bytes(&epoch_label.to_le_bytes());
+    }
+}
+
+/// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
+/// monolithic proof and a continuation proof can never share a transcript prefix.
+const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V1";
+const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V1";
+
+/// Statement bound into the cross-epoch **global** proof's transcript before
+/// Phase A: the ELF (so the global proof is program-bound) and the epoch count
+/// (so a global proof from a run with a different number of epochs cannot be
+/// spliced in). Prove and verify must call this with identical arguments.
+pub(crate) fn absorb_continuation_global_statement(
+    t: &mut impl IsTranscript<E>,
+    elf_bytes: &[u8],
+    num_epochs: usize,
+) {
+    t.append_bytes(CONTINUATION_GLOBAL_TAG);
+    t.append_bytes(&elf_digest(elf_bytes));
+    t.append_bytes(&(num_epochs as u64).to_le_bytes());
 }

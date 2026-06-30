@@ -140,9 +140,16 @@ pub struct Backend {
     pub ntt_dit_8_levels_batched: CudaFunction,
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
+    // row-major NTT kernels
+    pub bit_reverse_row_major: CudaFunction,
+    pub ntt_dit_level_row_major: CudaFunction,
+    pub pointwise_mul_row_major: CudaFunction,
+    pub matrix_transpose_strided: CudaFunction,
 
     // keccak.ptx
+    pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
@@ -237,7 +244,15 @@ impl Backend {
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
+            bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
+            ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
+            pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
+            matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
+            keccak256_leaves_base_row_major_row_pair: keccak
+                .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_base_row_pair_batched: keccak
+                .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,

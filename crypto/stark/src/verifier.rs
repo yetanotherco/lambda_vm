@@ -351,25 +351,11 @@ pub trait IsStarkVerifier<
         domain.lde_coset_element(reverse_index(raw, domain.lde_length as u64))
     }
 
-    /// Verifies the validity of the opening proof.
-    fn verify_opening<E>(
-        proof: &Proof<Commitment>,
-        root: &Commitment,
-        index: usize,
-        value: &[FieldElement<E>],
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<E>: AsBytes + Sync + Send,
-        E: IsField,
-        Field: IsSubFieldOf<E>,
-    {
-        proof.verify::<BatchedMerkleTreeBackend<E>>(root, index, &value.to_owned())
-    }
-
-    /// Verify both (proof, evaluations) and (proof_sym, evaluations_sym) openings
-    /// of a `PolynomialOpenings` against the given `root` at iota positions
-    /// `iota*2` and `iota*2 + 1`.
+    /// Verify a row-paired `PolynomialOpenings` against `root`. The row pair
+    /// (`2·iota`, `2·iota+1`) is committed as the single leaf at position `iota`,
+    /// so one Merkle path authenticates both rows: reconstruct the leaf from
+    /// `evaluations ‖ evaluations_sym` and verify once. (Same as the composition
+    /// opening check.)
     fn verify_opening_pair<E>(
         opening: &PolynomialOpenings<E>,
         root: &Commitment,
@@ -381,13 +367,11 @@ pub trait IsStarkVerifier<
         E: IsField,
         Field: IsSubFieldOf<E>,
     {
-        Self::verify_opening::<E>(&opening.proof, root, iota * 2, &opening.evaluations)
-            && Self::verify_opening::<E>(
-                &opening.proof_sym,
-                root,
-                iota * 2 + 1,
-                &opening.evaluations_sym,
-            )
+        let mut value = opening.evaluations.clone();
+        value.extend_from_slice(&opening.evaluations_sym);
+        opening
+            .proof
+            .verify::<BatchedMerkleTreeBackend<E>>(root, iota, &value)
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,

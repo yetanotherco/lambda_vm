@@ -10,9 +10,14 @@ use crate::{
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "")]
+/// Opening of a bit-reversed, row-paired commitment at one FRI query.
+///
+/// The queried row and its symmetric counterpart (LDE positions `2·iota`,
+/// `2·iota+1`) are committed together as a single leaf at position `iota`, so one
+/// Merkle `proof` authenticates both `evaluations` (the row) and
+/// `evaluations_sym` (its symmetric). Same layout used for trace and composition.
 pub struct PolynomialOpenings<F: IsField> {
     pub proof: Proof<Commitment>,
-    pub proof_sym: Proof<Commitment>,
     pub evaluations: Vec<FieldElement<F>>,
     pub evaluations_sym: Vec<FieldElement<F>>,
 }

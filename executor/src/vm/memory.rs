@@ -50,7 +50,7 @@ pub const MAX_PRIVATE_INPUT_SIZE: u64 = 6700000;
 /// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone)]
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
     /// Bytes committed to public output via `commit_public_output`. The
@@ -78,6 +78,18 @@ impl Memory {
             .entry(aligned_address)
             .or_insert_with(|| [0, 0, 0, 0]);
         entry[(address % 4) as usize] = value;
+    }
+
+    /// Iterate over all stored bytes as `(address, value)` pairs. Cells are
+    /// stored as 4-byte words; each word expands into its four byte addresses.
+    /// Used to snapshot memory at an epoch boundary.
+    pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
+        self.cells.iter().flat_map(|(&addr, bytes)| {
+            bytes
+                .iter()
+                .enumerate()
+                .map(move |(i, &b)| (addr + i as u64, b))
+        })
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
