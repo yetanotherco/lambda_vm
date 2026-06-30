@@ -3,7 +3,7 @@
 //! Matches `FieldElementVectorBackend<F, Keccak256, 32>::hash_data` in
 //! `crypto/crypto/src/merkle_tree/backends/field_element_vector.rs`, combined
 //! with the `reverse_index` row read pattern used in
-//! `commit_columns_bit_reversed` at `crypto/stark/src/prover.rs`.
+//! `commit_bit_reversed` at `crypto/stark/src/commitment.rs`.
 //!
 //! Caller supplies base-field column slabs already laid out as
 //! `[col * col_stride + row]` (the same layout `coset_lde_batch_base_into`
@@ -26,15 +26,27 @@ use crate::lde::pack_ext3_to_pinned_slabs;
 /// Run GPU Keccak-256 leaf hashing on a base-field column buffer.
 ///
 /// `columns` must hold `num_cols * col_stride` u64s with column `c`'s data
-/// at `[c*col_stride .. c*col_stride + num_rows]`. Returns `num_rows * 32`
-/// hash bytes in natural (non-bit-reversed) row order.
+/// at `[c*col_stride .. c*col_stride + num_rows]`. `rows_per_leaf` selects the
+/// leaf layout: `1` = one leaf per bit-reversed row (`num_rows` leaves), `2` =
+/// one leaf per bit-reversed row pair `2i`,`2i+1` (`num_rows/2` leaves, the
+/// trace-commit layout). Returns `(num_rows / rows_per_leaf) * 32` hash bytes.
 pub fn keccak_leaves_base(
     columns: &[u64],
     col_stride: usize,
     num_cols: usize,
     num_rows: usize,
+    rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
+    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    assert!(
+        num_rows >= rows_per_leaf,
+        "num_rows must be at least rows_per_leaf"
+    );
+    assert!(
+        num_rows >= 2,
+        "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
+    );
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
@@ -46,8 +58,13 @@ pub fn keccak_leaves_base(
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
-    launch_keccak_base(
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
+    let launch = if rows_per_leaf == 2 {
+        launch_keccak_base_row_pair
+    } else {
+        launch_keccak_base
+    };
+    launch(
         stream.as_ref(),
         &cols_dev,
         col_stride as u64,
@@ -61,14 +78,25 @@ pub fn keccak_leaves_base(
 }
 
 /// Ext3 variant. Columns interleaved as three base slabs per ext3 column.
-/// `columns.len() >= num_cols * 3 * col_stride`.
+/// `columns.len() >= num_cols * 3 * col_stride`. `rows_per_leaf` as in
+/// [`keccak_leaves_base`].
 pub fn keccak_leaves_ext3(
     columns: &[u64],
     col_stride: usize,
     num_cols: usize,
     num_rows: usize,
+    rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
     assert!(num_rows.is_power_of_two());
+    assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
+    assert!(
+        num_rows >= rows_per_leaf,
+        "num_rows must be at least rows_per_leaf"
+    );
+    assert!(
+        num_rows >= 2,
+        "num_rows must be at least 2 for bit-reversed GPU leaf hashing"
+    );
     assert!(
         col_stride >= num_rows,
         "col_stride must be >= num_rows to keep per-column reads in-bounds"
@@ -81,8 +109,13 @@ pub fn keccak_leaves_ext3(
     let be = backend()?;
     let stream = be.next_stream();
     let cols_dev = stream.clone_htod(&columns[..total])?;
-    let mut out_dev = stream.alloc_zeros::<u8>(num_rows * 32)?;
-    launch_keccak_ext3(
+    let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
+    let launch = if rows_per_leaf == 2 {
+        launch_keccak_ext3_row_pair
+    } else {
+        launch_keccak_ext3
+    };
+    launch(
         stream.as_ref(),
         &cols_dev,
         col_stride as u64,
@@ -160,6 +193,72 @@ pub(crate) fn launch_keccak_base(
     unsafe {
         stream
             .launch_builder(&be.keccak256_leaves_base_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-pair base-field leaf hashing: leaf `i` hashes bit-reversed rows `2i`,
+/// `2i+1` (one Merkle path per FRI query). Writes `num_rows/2` leaves of 32
+/// bytes into `out_dev`. Base-field analog of the comp-poly ext3 path; matches
+/// the CPU `keccak_leaves_row_pair_bit_reversed`.
+pub(crate) fn launch_keccak_base_row_pair(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "keccak row-pair leaf kernel: num_rows must be >= 2"
+    );
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    // One thread per leaf (= row pair).
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_pair_batched)
+            .arg(cols_dev)
+            .arg(&col_stride)
+            .arg(&num_cols)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(out_dev)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Row-pair ext3 leaf hashing for the aux trace: reuses the comp-poly kernel
+/// (`keccak_comp_poly_leaves_ext3`), which hashes bit-reversed rows `2i`, `2i+1`
+/// across all ext3 columns. Writes `num_rows/2` leaves of 32 bytes.
+pub(crate) fn launch_keccak_ext3_row_pair(
+    stream: &CudaStream,
+    cols_dev: &CudaSlice<u64>,
+    col_stride: u64,
+    num_cols: u64,
+    num_rows: u64,
+    out_dev: &mut CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "keccak row-pair leaf kernel: num_rows must be >= 2"
+    );
+    let be = backend()?;
+    let log_num_rows = num_rows.trailing_zeros() as u64;
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak_comp_poly_leaves_ext3)
             .arg(cols_dev)
             .arg(&col_stride)
             .arg(&num_cols)

@@ -18,6 +18,9 @@ use executor::{
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
+const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
+const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
+
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
 /// thread-local caches — `epoch::advance()` just merges cached counters.
@@ -130,20 +133,34 @@ enum Commands {
 
         /// Blowup factor (power of 2). Higher = fewer queries, smaller proof, slower proving.
         #[arg(long, default_value = "2")]
-        blowup: Option<u8>,
+        blowup: u8,
 
         /// Print proving time
         #[arg(long)]
         time: bool,
 
-        /// Execute one pre-pass outside the timer and print dynamic instruction count
+        /// Execute once outside the timer and print dynamic instruction count
         #[arg(long)]
         cycles: bool,
 
         /// Build traces and print total main-trace field elements (rows × columns summed across
         /// all tables) and aux-trace field elements (committed EF columns × rows)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "continuations")]
         elements: bool,
+
+        /// Prove with continuations (split execution into epochs; flat peak memory)
+        #[arg(long)]
+        continuations: bool,
+
+        /// Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.
+        #[arg(
+            long,
+            value_name = "N",
+            requires = "continuations",
+            value_parser = parse_epoch_size_log2,
+            long_help = "Continuation epoch size as log2(cycles); e.g. 20 means 1,048,576 cycles.\n\nDefault when omitted: 20. Values below 18 are rejected for the CLI because tiny epochs are dominated by fixed overhead. Indicative ethrex 10-transfer distinct-account peak heap from a local sweep: 19 ~= 6.9 GB, 20 ~= 9.5 GB, 21 ~= 15.8 GB, 22 ~= 26.8 GB. Higher values reduce epoch count, continuation bundle size, and fixed per-epoch overhead, but increase peak memory. For a new workload, try the highest value your machine can run without swapping."
+        )]
+        epoch_size_log2: Option<u32>,
     },
 
     /// Verify a proof bundle
@@ -158,11 +175,15 @@ enum Commands {
 
         /// Blowup factor used during proving (must match)
         #[arg(long, default_value = "2")]
-        blowup: Option<u8>,
+        blowup: u8,
 
         /// Print verification time
         #[arg(long)]
         time: bool,
+
+        /// Verify a continuation proof bundle (produced by `prove --continuations`)
+        #[arg(long)]
+        continuations: bool,
     },
 
     /// Count main-trace and aux-trace field elements without proving
@@ -196,13 +217,36 @@ fn main() -> ExitCode {
             time,
             cycles,
             elements,
-        } => cmd_prove(elf, output, private_input, blowup, time, cycles, elements),
+            continuations,
+            epoch_size_log2,
+        } => {
+            if continuations {
+                cmd_prove_continuation(
+                    elf,
+                    output,
+                    private_input,
+                    epoch_size_log2,
+                    blowup,
+                    time,
+                    cycles,
+                )
+            } else {
+                cmd_prove(elf, output, private_input, blowup, time, cycles, elements)
+            }
+        }
         Commands::Verify {
             proof,
             elf,
             blowup,
             time,
-        } => cmd_verify(proof, elf, blowup, time),
+            continuations,
+        } => {
+            if continuations {
+                cmd_verify_continuation(proof, elf, blowup, time)
+            } else {
+                cmd_verify(proof, elf, blowup, time)
+            }
+        }
         Commands::CountElements { elf, private_input } => cmd_count_elements(elf, private_input),
     }
 }
@@ -215,6 +259,17 @@ fn read_private_input(path: Option<&PathBuf>) -> Result<Vec<u8>, String> {
         }
         None => Ok(vec![]),
     }
+}
+
+fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
+    let program =
+        Elf::load(elf_data).map_err(|e| format!("Failed to load ELF for cycle count: {e:?}"))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| format!("Failed to create executor for cycle count: {e:?}"))?;
+    executor
+        .run()
+        .map(|result| result.logs.len() as u64)
+        .map_err(|e| format!("Execution failed during cycle count: {e:?}"))
 }
 
 fn cmd_execute(
@@ -324,7 +379,7 @@ fn cmd_prove(
     elf_path: PathBuf,
     output_path: PathBuf,
     private_input_path: Option<PathBuf>,
-    blowup: Option<u8>,
+    blowup: u8,
     time: bool,
     cycles: bool,
     elements: bool,
@@ -350,24 +405,10 @@ fn cmd_prove(
     // Mirrors SP1's cycle-count pass so both provers report the same kind of
     // number without inflating the measured proving time.
     let cycle_count = if cycles {
-        let program = match Elf::load(&elf_data) {
-            Ok(p) => p,
+        match count_cycles(&elf_data, &private_inputs) {
+            Ok(count) => Some(count),
             Err(e) => {
-                eprintln!("Failed to load ELF for cycle count: {:?}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        let executor = match Executor::new(&program, private_inputs.clone()) {
-            Ok(e) => e,
-            Err(e) => {
-                eprintln!("Failed to create executor for cycle count: {:?}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        match executor.run() {
-            Ok(result) => Some(result.logs.len() as u64),
-            Err(e) => {
-                eprintln!("Execution failed during cycle count: {:?}", e);
+                eprintln!("{e}");
                 return ExitCode::FAILURE;
             }
         }
@@ -398,31 +439,23 @@ fn cmd_prove(
     });
 
     let start = Instant::now();
-    let proof = match blowup {
-        Some(b) => {
-            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
-                Ok(opts) => opts,
-                Err(e) => {
-                    eprintln!("Invalid proof options: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            eprintln!(
-                "Generating proof (blowup={b}, queries={})...",
-                opts.fri_number_of_queries
-            );
-            prover::prove_with_options_and_inputs(
-                &elf_data,
-                &private_inputs,
-                &opts,
-                &Default::default(),
-            )
-        }
-        None => {
-            eprintln!("Generating proof...");
-            prover::prove_with_inputs(&elf_data, &private_inputs)
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
         }
     };
+    eprintln!(
+        "Generating proof (blowup={blowup}, queries={})...",
+        opts.fri_number_of_queries
+    );
+    let proof = prover::prove_with_options_and_inputs(
+        &elf_data,
+        &private_inputs,
+        &opts,
+        &Default::default(),
+    );
     let prove_elapsed = start.elapsed();
     let proof = match proof {
         Ok(proof) => proof,
@@ -474,7 +507,7 @@ fn cmd_prove(
     ExitCode::SUCCESS
 }
 
-fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: bool) -> ExitCode {
+fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) -> ExitCode {
     eprintln!("Reading ELF file...");
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -503,19 +536,14 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
 
     eprintln!("Verifying proof...");
     let start = Instant::now();
-    let result = match blowup {
-        Some(b) => {
-            let opts = match GoldilocksCubicProofOptions::with_blowup(b) {
-                Ok(opts) => opts,
-                Err(e) => {
-                    eprintln!("Invalid proof options: {e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            prover::verify_with_options(&proof, &elf_data, &opts, None, None)
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
         }
-        None => prover::verify(&proof, &elf_data),
     };
+    let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
     let verify_elapsed = start.elapsed();
     let result = match result {
         Ok(valid) => valid,
@@ -532,8 +560,178 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: Option<u8>, time: 
         }
         ExitCode::SUCCESS
     } else {
-        eprintln!("Verification failed!");
+        eprintln!("Verification failed! Ensure --blowup matches the value used for proving.");
         ExitCode::FAILURE
+    }
+}
+
+fn cmd_prove_continuation(
+    elf_path: PathBuf,
+    output_path: PathBuf,
+    private_input_path: Option<PathBuf>,
+    epoch_size_log2: Option<u32>,
+    blowup: u8,
+    time: bool,
+    cycles: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let private_inputs = match read_private_input(private_input_path.as_ref()) {
+        Ok(inputs) => inputs,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let cycle_count = if cycles {
+        match count_cycles(&elf_data, &private_inputs) {
+            Ok(count) => Some(count),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
+    let epoch_size_log2 = epoch_size_log2.unwrap_or(DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2);
+    let epoch_size = match continuation_epoch_size(epoch_size_log2) {
+        Ok(size) => size,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!(
+        "Generating continuation proof (blowup={blowup}, epoch_size_log2={epoch_size_log2}, epoch_size={epoch_size})...",
+    );
+    let start = Instant::now();
+    let bundle = match prover::continuation::prove_continuation(
+        &elf_data,
+        &private_inputs,
+        epoch_size_log2,
+        &opts,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Continuation proof generation failed: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let prove_elapsed = start.elapsed();
+
+    eprintln!("Writing proof...");
+    let file = match File::create(&output_path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create output file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let mut writer = BufWriter::new(file);
+    let bytes = match bincode::serialize(&bundle) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to serialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Err(e) = writer.write_all(&bytes) {
+        eprintln!("Failed to write proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+
+    eprintln!("Proof written to {:?}", output_path);
+    if let Some(c) = cycle_count {
+        println!("Cycles: {}", c);
+    }
+    println!("Epochs: {}", bundle.num_epochs());
+    if time {
+        println!("Proving time: {:.3}s", prove_elapsed.as_secs_f64());
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_verify_continuation(
+    proof_path: PathBuf,
+    elf_path: PathBuf,
+    blowup: u8,
+    time: bool,
+) -> ExitCode {
+    eprintln!("Reading ELF file...");
+    let elf_data = match std::fs::read(&elf_path) {
+        Ok(data) => data,
+        Err(e) => {
+            eprintln!("Failed to read ELF file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Reading proof...");
+    let proof_bytes = match std::fs::read(&proof_path) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("Failed to read proof file: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+    let bundle: prover::continuation::ContinuationProof = match bincode::deserialize(&proof_bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to deserialize proof: {}", e);
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
+        Ok(opts) => opts,
+        Err(e) => {
+            eprintln!("Invalid proof options: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    eprintln!("Verifying continuation proof...");
+    let start = Instant::now();
+    let result = prover::continuation::verify_continuation(&elf_data, &bundle, &opts);
+    let verify_elapsed = start.elapsed();
+
+    match result {
+        Ok(Some(output)) => {
+            eprintln!("Verification succeeded!");
+            let hex: String = output.iter().map(|b| format!("{:02x}", b)).collect();
+            println!("Output: {}", hex);
+            if time {
+                println!("Verification time: {:.3}s", verify_elapsed.as_secs_f64());
+            }
+            ExitCode::SUCCESS
+        }
+        Ok(None) => {
+            eprintln!("Verification failed! Ensure --blowup matches the value used for proving.");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("Verification error: {}", e);
+            ExitCode::FAILURE
+        }
     }
 }
 
@@ -564,5 +762,162 @@ fn cmd_count_elements(elf_path: PathBuf, private_input_path: Option<PathBuf>) ->
             eprintln!("Failed to count elements: {:?}", e);
             ExitCode::FAILURE
         }
+    }
+}
+
+fn continuation_epoch_size(epoch_size_log2: u32) -> Result<usize, String> {
+    if epoch_size_log2 < MIN_CONTINUATION_EPOCH_SIZE_LOG2 {
+        return Err(format!(
+            "--epoch-size-log2 must be at least {MIN_CONTINUATION_EPOCH_SIZE_LOG2} for CLI proving"
+        ));
+    }
+    1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+        format!("--epoch-size-log2 {epoch_size_log2} is too large for this platform")
+    })
+}
+
+fn parse_epoch_size_log2(value: &str) -> Result<u32, String> {
+    let epoch_size_log2 = value
+        .parse::<u32>()
+        .map_err(|_| format!("--epoch-size-log2 must be an integer, got `{value}`"))?;
+    continuation_epoch_size(epoch_size_log2)?;
+    Ok(epoch_size_log2)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    // The arg graph is well-formed (e.g. `requires`/`conflicts_with` reference real args).
+    #[test]
+    fn cli_command_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    // The continuation epoch flag requires --continuations.
+    #[test]
+    fn epoch_size_log2_requires_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--epoch-size-log2",
+            "20",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn epoch_size_log2_accepts_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size-log2",
+            "20",
+        ]);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn cycles_accepts_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--cycles",
+        ]);
+        assert!(r.is_ok());
+    }
+
+    #[test]
+    fn elements_conflicts_with_continuations() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--elements",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn epoch_size_log2_rejects_tiny_cli_values() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size-log2",
+            "17",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn old_epoch_size_flag_is_rejected() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--epoch-size",
+            "1048576",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn old_num_epochs_flag_is_rejected() {
+        let r = Cli::command().try_get_matches_from([
+            "cli",
+            "prove",
+            "prog.elf",
+            "-o",
+            "out",
+            "--continuations",
+            "--num-epochs",
+            "4",
+        ]);
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn prove_help_omits_removed_epoch_flags() {
+        let mut cmd = Cli::command();
+        let prove = cmd.find_subcommand_mut("prove").unwrap();
+        let mut help = Vec::new();
+        prove.write_long_help(&mut help).unwrap();
+        let help = String::from_utf8(help).unwrap();
+
+        assert!(help.contains("--epoch-size-log2 <N>"));
+        assert!(!help.contains("--num-epochs"));
+        assert!(!help.contains("--epoch-size <"));
+    }
+
+    #[test]
+    fn continuation_epoch_size_rejects_tiny_cli_values() {
+        assert!(continuation_epoch_size(17).is_err());
+    }
+
+    #[test]
+    fn continuation_epoch_size_uses_exact_power_of_two() {
+        assert_eq!(continuation_epoch_size(20).unwrap(), 1 << 20);
     }
 }

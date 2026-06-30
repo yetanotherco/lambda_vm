@@ -34,13 +34,13 @@
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::{Instruction, InstructionError};
 use executor::vm::memory::U64HashMap;
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -85,10 +85,8 @@ pub const NUM_PRECOMPUTED_COLS: usize = 5;
 // Trace generation
 // =========================================================================
 
-use std::collections::HashMap;
-
 /// Map from PC to row index in the DECODE trace table.
-pub type PcToRow = HashMap<u64, usize>;
+pub type PcToRow = U64HashMap<usize>;
 
 /// Generates the DECODE trace table from the instructions map.
 ///
@@ -103,7 +101,8 @@ pub fn generate_decode_trace(
     instructions: &U64HashMap<Instruction>,
 ) -> (TraceTable<GoldilocksField, GoldilocksExtension>, PcToRow) {
     // Build entries and PC-to-row mapping
-    let mut pc_to_row = HashMap::with_capacity(instructions.len());
+    let mut pc_to_row = PcToRow::default();
+    pc_to_row.reserve(instructions.len() + 1);
     let entries: Vec<_> = instructions
         .iter()
         .enumerate()
@@ -286,7 +285,7 @@ pub fn compute_precomputed_commitment(
     // Step 4: Evaluate polynomials on LDE domain (N * blowup_factor points)
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
@@ -294,19 +293,9 @@ pub fn compute_precomputed_commitment(
         })
         .collect();
 
-    // Step 5: Bit-reverse permute (same as prover)
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    // Step 6: Convert columns to rows for Merkle tree
-    let lde_rows = columns2rows(lde_columns);
-
-    // Step 7: Build Merkle tree over LDE (N * blowup leaves)
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
         .expect("Failed to build Merkle tree for decode LDE");
-
-    tree.root
+    root
 }
 
 // =========================================================================
@@ -366,7 +355,8 @@ pub struct ElfTables {
 /// Table has multiplicities initialized to 0.
 pub fn tables_from_elf(elf: &Elf) -> Result<ElfTables, InstructionError> {
     let mut decode_entries = Vec::new();
-    let mut pc_to_row = HashMap::with_capacity(elf.data.iter().map(|s| s.values.len()).sum());
+    let mut pc_to_row = PcToRow::default();
+    pc_to_row.reserve(elf.data.iter().map(|s| s.values.len()).sum());
 
     // Process all ELF segments for DECODE (only executable segments)
     for segment in &elf.data {

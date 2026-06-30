@@ -13,10 +13,12 @@
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod constraints;
+pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+mod paged_mem;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -37,7 +39,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::absorb_statement;
+use crate::statement::{StatementKind, absorb_statement};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -184,6 +186,13 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Continuation epoch size exponent is invalid.
+    InvalidContinuationEpochSize(String),
+    /// Continuation proof construction hit an internal invariant failure.
+    ContinuationInvariant(String),
+    /// A non-final continuation epoch contains the program-terminating
+    /// instruction. The terminating instruction must be in the final epoch.
+    HaltInNonFinalEpoch,
 }
 
 impl fmt::Display for Error {
@@ -197,6 +206,18 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::InvalidContinuationEpochSize(msg) => {
+                write!(f, "invalid continuation epoch size: {msg}")
+            }
+            Error::ContinuationInvariant(msg) => {
+                write!(f, "continuation invariant failed: {msg}")
+            }
+            Error::HaltInNonFinalEpoch => {
+                write!(
+                    f,
+                    "the program-terminating instruction must be in the final epoch"
+                )
+            }
         }
     }
 }
@@ -234,6 +255,9 @@ pub(crate) struct VmAirs {
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
+    /// Whether the HALT table participates in this proof. False for intermediate
+    /// continuation epochs, which do not terminate the program.
+    pub include_halt: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
@@ -247,7 +271,6 @@ impl VmAirs {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
             (&self.bitwise, &mut traces.bitwise, &()),
             (&self.decode, &mut traces.decode, &()),
-            (&self.halt, &mut traces.halt, &()),
             (&self.commit, &mut traces.commit, &()),
             (&self.keccak, &mut traces.keccak, &()),
             (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
@@ -257,6 +280,9 @@ impl VmAirs {
             (&self.ecdas, &mut traces.ecdas, &()),
             (&self.register, &mut traces.register, &()),
         ];
+        if self.include_halt {
+            pairs.push((&self.halt, &mut traces.halt, &()));
+        }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
             pairs.push((air, trace, &()));
@@ -320,7 +346,6 @@ impl VmAirs {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
             &self.bitwise,
             &self.decode,
-            &self.halt,
             &self.commit,
             &self.keccak,
             &self.keccak_rnd,
@@ -330,6 +355,9 @@ impl VmAirs {
             &self.ecdas,
             &self.register,
         ];
+        if self.include_halt {
+            refs.push(&self.halt);
+        }
 
         for air in &self.cpus {
             refs.push(air);
@@ -410,6 +438,7 @@ impl VmAirs {
     /// here. A wrong value is rejected, never silently accepted: it either
     /// mismatches the prover's committed precomputed root (an explicit
     /// verifier check) or yields diverging Fiat-Shamir challenges.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -417,7 +446,10 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
+        include_halt: bool,
+        register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
+        register_preprocessed: Option<(Commitment, usize)>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
@@ -471,10 +503,17 @@ impl VmAirs {
         let ecsm = create_ecsm_air(proof_options);
         let ec_scalar = create_ec_scalar_air(proof_options);
         let ecdas = create_ecdas_air(proof_options);
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        let register = if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
+            create_register_air(proof_options).with_preprocessed(commitment, num_preprocessed_cols)
+        } else {
+            let register_init = register_init
+                .map(<[u32]>::to_vec)
+                .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+            create_register_air(proof_options).with_preprocessed(
+                register::preprocessed_commitment(proof_options, &register_init),
+                register::NUM_PREPROCESSED_COLS,
+            )
+        };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -553,6 +592,7 @@ impl VmAirs {
             register,
             pages,
             memw_registers,
+            include_halt,
             eqs,
             bytewises,
             stores,
@@ -597,6 +637,7 @@ pub(crate) fn replay_transcript_phase_a(
 /// which the caller should treat as verification failure.
 pub(crate) fn compute_commit_bus_offset(
     public_output: &[u8],
+    start_index: u64,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
 ) -> Option<FieldElement<E>> {
@@ -607,13 +648,16 @@ pub(crate) fn compute_commit_bus_offset(
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
     let alpha_sq = alpha * alpha;
 
-    // fingerprint_i = z - (BusId::Commit + i·α + value_i·α²)
+    // fingerprint_i = z - (BusId::Commit + (start_index + i)·α + value_i·α²).
+    // `start_index` is the carried x254: 0 for a monolithic proof or the first
+    // epoch, nonzero for a continuation epoch whose commits continue a prior one.
     let mut fingerprints: Vec<FieldElement<E>> = public_output
         .iter()
         .enumerate()
         .map(|(i, &value)| {
+            let global_index = start_index + i as u64;
             let linear_combination = bus_id
-                + (FieldElement::<E>::from(i as u64) * alpha)
+                + (FieldElement::<E>::from(global_index) * alpha)
                 + (FieldElement::<E>::from(value as u64) * alpha_sq);
             z - linear_combination
         })
@@ -639,10 +683,32 @@ pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
+    start_index: u64,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
-    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
+/// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
+///
+/// The final proof commits one local-to-global sub-table per epoch as its first
+/// `N` tables, so `final_proof.proofs[i].lde_trace_main_merkle_root` is epoch
+/// `i`'s L2G commitment. `epoch_l2g_roots[i]` is the same root as committed in
+/// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
+/// the very same L2G tables the epochs committed (shared commitments).
+///
+/// Called by `continuation::verify_continuation`; also exercised by the
+/// local-to-global bus tests.
+pub(crate) fn verify_l2g_commitment_binding(
+    epoch_l2g_roots: &[Commitment],
+    final_proof: &MultiProof<F, E, ()>,
+) -> bool {
+    final_proof.proofs.len() >= epoch_l2g_roots.len()
+        && epoch_l2g_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
 }
 
 // =============================================================================
@@ -786,6 +852,9 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
 
@@ -809,6 +878,7 @@ pub fn prove_with_options_and_inputs(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
+        StatementKind::Monolithic,
         elf_bytes,
         &traces.public_output_bytes,
         &table_counts,
@@ -958,7 +1028,10 @@ pub fn verify_with_options(
         &page_configs,
         &vm_proof.table_counts,
         decode_commitment,
+        true,
+        None,
         page_commitments,
+        None,
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
@@ -972,6 +1045,7 @@ pub fn verify_with_options(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
+        StatementKind::Monolithic,
         elf_bytes,
         &vm_proof.public_output,
         &vm_proof.table_counts,
@@ -987,6 +1061,8 @@ pub fn verify_with_options(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
+        // Monolithic proof: commits are indexed from 0.
+        0,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,

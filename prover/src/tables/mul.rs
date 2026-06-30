@@ -30,14 +30,14 @@
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
-use std::collections::HashMap;
-
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
 use stark::trace::TraceTable;
+
+use std::collections::HashMap;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
