@@ -3,8 +3,8 @@
 //! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
 //! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
-//! triggers EC_SCALAR to serve `k` bit-by-bit, and delegates the double-and-add to ECDAS over
-//! the `Ecdas`/`ServeK`/`Bit` buses.
+//! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
+//! over the `Ecdas`/`Bit` buses.
 //!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
@@ -26,7 +26,7 @@ use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
+use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint, new_is_bit_constraints};
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
@@ -49,27 +49,28 @@ pub mod cols {
 
     pub const XR: usize = 8; // U256BL (32)
     pub const YR: usize = 40; // U256BL (32)
-    pub const K: usize = 72; // U256BL (32)
-    pub const LEN_K: usize = 104; // Byte
-    pub const XG: usize = 105; // U256BL (32)
-    pub const YG: usize = 137; // U256BL (32)
-    pub const X2: usize = 169; // U256BL (32)
-    pub const Q0: usize = 201; // U256BL (32)
-    pub const C0: usize = 233; // BaseField[64]
-    pub const Q1: usize = 297; // Byte[33]
-    pub const C1: usize = 330; // BaseField[64]
-    pub const K_SUB_N: usize = 394; // U256HL (16 halfwords)
-    pub const XR_SUB_P: usize = 410; // U256HL (16 halfwords)
-    pub const MU: usize = 426;
+    pub const K: usize = 72; // Bit[256] — scalar bits, k[0] is LSB
+    pub const LEN_K: usize = 328; // Byte
+    pub const XG: usize = 329; // U256BL (32)
+    pub const YG: usize = 361; // U256BL (32)
+    pub const X2: usize = 393; // U256BL (32)
+    pub const Q0: usize = 425; // U256BL (32)
+    pub const C0: usize = 457; // BaseField[64]
+    pub const Q1: usize = 521; // Byte[33]
+    pub const C1: usize = 554; // BaseField[64]
+    pub const K_SUB_N: usize = 618; // U256HL (16 halfwords)
+    pub const XR_SUB_P: usize = 634; // U256HL (16 halfwords)
+    pub const MU: usize = 650;
 
-    pub const NUM_COLUMNS: usize = 427;
+    pub const NUM_COLUMNS: usize = 651;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
         XR + i
     }
+    /// Bit `i` of the scalar `k` (0 = LSB, 255 = MSB).
     #[inline]
-    pub const fn k(i: usize) -> usize {
+    pub const fn k_bit(i: usize) -> usize {
         K + i
     }
     #[inline]
@@ -168,7 +169,10 @@ pub fn generate_ecsm_trace(
 
         table.set_bytes(row_idx, cols::XR, &w.x_r);
         table.set_bytes(row_idx, cols::YR, &w.y_r);
-        table.set_bytes(row_idx, cols::K, &w.k);
+        for b in 0..256 {
+            let bit = (w.k[b / 8] >> (b % 8)) & 1;
+            table.set_fe(row_idx, cols::k_bit(b), FE::from(bit as u64));
+        }
         table.set_u64(row_idx, cols::LEN_K, w.len_k as u64);
         table.set_bytes(row_idx, cols::XG, &w.x_g);
         table.set_bytes(row_idx, cols::YG, &w.y_g);
@@ -278,6 +282,24 @@ pub fn point_coord_busvalues(col: usize) -> Vec<BusValue> {
     (0..32).map(|b| packed(col + b)).collect()
 }
 
+/// `byte_k[byte_idx]` as a MEMW bus value: linear combination of 8 bit columns
+/// `k_bit[8*byte_idx .. 8*byte_idx+7]` with coefficients 2^0..2^7.
+fn k_byte_busvalue(byte_idx: usize) -> BusValue {
+    BusValue::linear(
+        (0..8)
+            .map(|j| LinearTerm::Column {
+                coefficient: 1i64 << j,
+                column: cols::k_bit(8 * byte_idx + j),
+            })
+            .collect(),
+    )
+}
+
+/// One 8-byte MEMW dword chunk of k (bytes `8*dword_idx .. 8*dword_idx+7`).
+fn k_dword_busvalues(dword_idx: usize) -> [BusValue; 8] {
+    std::array::from_fn(|b| k_byte_busvalue(8 * dword_idx + b))
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================
@@ -368,7 +390,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memw,
             mu(),
             memw_read(
-                dword_bytes(cols::K, i),
+                k_dword_busvalues(i),
                 0,
                 base_lo,
                 packed(cols::ADDR_K_1),
@@ -482,16 +504,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ZERO bus: assert k != 0 (sum of k's 32 bytes is nonzero).
+    // ZERO bus: assert k != 0 (sum of byte_k[0..31] is nonzero).
+    // byte_k[i] = Σ_{j=0}^{7} 2^j · k[8i+j], so Σ byte_k = Σ_{b=0}^{255} 2^(b%8) · k[b].
     out.push(BusInteraction::sender(
         BusId::Zero,
         mu(),
         vec![
             BusValue::linear(
-                (0..32)
-                    .map(|i| LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::k(i),
+                (0..256)
+                    .map(|b| LinearTerm::Column {
+                        coefficient: 1i64 << (b % 8),
+                        column: cols::k_bit(b),
                     })
                     .collect(),
             ),
@@ -500,19 +523,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // Delegation buses.
-    // SERVE_K send: [ts, addr_k, 31].
-    out.push(BusInteraction::sender(
-        BusId::ServeK,
-        mu(),
-        vec![
-            ts_lo(),
-            ts_hi(),
-            packed(cols::ADDR_K_0),
-            packed(cols::ADDR_K_1),
-            BusValue::constant(31),
-        ],
-    ));
-    // BIT sender: the MSB at position len_k.
+    // BIT receivers: receive Bit[ts, i] from ECDAS for each scalar bit i=0..255.
+    for i in 0..256 {
+        out.push(BusInteraction::receiver(
+            BusId::Bit,
+            Multiplicity::Column(cols::k_bit(i)),
+            vec![ts_lo(), ts_hi(), BusValue::constant(i as u64)],
+        ));
+    }
+    // BIT sender: the MSB at position len_k (always 1).
     out.push(BusInteraction::sender(
         BusId::Bit,
         mu(),
@@ -742,12 +761,16 @@ impl OverflowKind {
             OverflowKind::XrLtP => cols::XR_SUB_P,
         }
     }
-    /// Column base of the byte sum (`k` / `xR`).
-    fn sum_bl_base(self) -> usize {
+    /// Column base of the sum.
+    fn sum_col_base(self) -> usize {
         match self {
             OverflowKind::KLtN => cols::K,
             OverflowKind::XrLtP => cols::XR,
         }
+    }
+    /// Whether the sum is stored as individual bits (k) rather than bytes (xR).
+    fn sum_is_bits(self) -> bool {
+        matches!(self, OverflowKind::KLtN)
     }
 }
 
@@ -759,7 +782,7 @@ where
 {
     let inv = FieldElement::<F>::from(INV_SHIFT_32);
     let hl = kind.addend_hl_base();
-    let bl = kind.sum_bl_base();
+    let base = kind.sum_col_base();
     let mut c: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
     let mut prev = FieldElement::<F>::zero();
     for (i, slot) in c.iter_mut().enumerate() {
@@ -767,11 +790,24 @@ where
         let addend1 = step.get_main_evaluation_element(0, hl + 2 * i).clone()
             + step.get_main_evaluation_element(0, hl + 2 * i + 1).clone()
                 * FieldElement::<F>::from(1u64 << 16);
-        // sum word i (from bytes): Σ bl[4i+b]·2^{8b}
+        // sum word i: computed from individual bits (k) or bytes (xR).
         let mut sum = FieldElement::<F>::zero();
-        for b in 0..4 {
-            sum += step.get_main_evaluation_element(0, bl + 4 * i + b).clone()
-                * FieldElement::<F>::from(1u64 << (8 * b));
+        if kind.sum_is_bits() {
+            // k is stored as 256 individual bits; word i = bits 32i..32i+31.
+            for bit in 0..32 {
+                sum += step
+                    .get_main_evaluation_element(0, base + 32 * i + bit)
+                    .clone()
+                    * FieldElement::<F>::from(1u64 << bit);
+            }
+        } else {
+            // xR is stored as 32 bytes; word i = bytes 4i..4i+3.
+            for b in 0..4 {
+                sum += step
+                    .get_main_evaluation_element(0, base + 4 * i + b)
+                    .clone()
+                    * FieldElement::<F>::from(1u64 << (8 * b));
+            }
         }
         let addend0 = FieldElement::<F>::from(kind.const_word(i));
         let ci = (addend0 + addend1 + prev.clone() - sum) * inv.clone();
@@ -831,7 +867,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
     }
 }
 
-/// Creates all ECSM transition constraints (148 total).
+/// Creates all ECSM transition constraints (405 total: 1 mu + 256 k bits + 148 others).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -846,6 +882,14 @@ pub fn create_constraints(
     // IS_BIT(mu)
     constraints.push(IsBitConstraint::unconditional(cols::MU, idx).boxed());
     idx += 1;
+
+    // IS_BIT(k[i]) for all 256 scalar bits.
+    let k_bit_cols: Vec<usize> = (0..256).map(cols::k_bit).collect();
+    let (k_bit_constraints, next_idx) = new_is_bit_constraints(&k_bit_cols, idx);
+    for c in k_bit_constraints {
+        constraints.push(c.boxed());
+    }
+    idx = next_idx;
 
     // x2 convolution: 64 carries + closing.
     for i in 0..64 {

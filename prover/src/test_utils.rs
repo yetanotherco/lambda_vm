@@ -58,9 +58,6 @@ use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as
 use crate::tables::dvrm::{
     bus_interactions as dvrm_bus_interactions, cols as dvrm_cols, dvrm_constraints,
 };
-use crate::tables::ec_scalar::{
-    bus_interactions as ec_scalar_bus_interactions, cols as ec_scalar_cols,
-};
 use crate::tables::ecdas::{bus_interactions as ecdas_bus_interactions, cols as ecdas_cols};
 use crate::tables::ecsm::{bus_interactions as ecsm_bus_interactions, cols as ecsm_cols};
 use crate::tables::eq::{bus_interactions as eq_bus_interactions, cols as eq_cols, eq_constraints};
@@ -1060,22 +1057,6 @@ pub fn create_ecsm_air(proof_options: &ProofOptions) -> VmAir {
         transition_constraints,
     )
     .with_name("ECSM")
-}
-
-/// Create EC_SCALAR AIR (serves the scalar bit-by-bit to ECDAS).
-pub fn create_ec_scalar_air(proof_options: &ProofOptions) -> VmAir {
-    let (transition_constraints, _) = crate::tables::ec_scalar::create_constraints(0);
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: ec_scalar_bus_interactions(),
-    };
-    AirWithBuses::new(
-        ec_scalar_cols::NUM_COLUMNS,
-        auxiliary_trace_build_data,
-        proof_options,
-        1,
-        transition_constraints,
-    )
-    .with_name("EC_SCALAR")
 }
 
 /// Create ECDAS AIR (per-step double/add of the scalar-multiplication sequence).

@@ -297,15 +297,14 @@ pub enum BusId {
     Cpu32 = 27,
 
     // =========================================================================
-    // EC scalar multiplication accelerator (ECSM / ECDAS / EC_SCALAR)
+    // EC scalar multiplication accelerator (ECSM / ECDAS)
     // =========================================================================
     /// ECDAS self-referential double/add sequence bus:
     /// (timestamp, xA, yA, xG, yG, round, op). ECSM seeds and drains it.
     Ecdas = 28,
-    /// EC_SCALAR self-referential scalar-byte server bus: (timestamp, ptr, offset).
-    ServeK = 29,
-    /// Scalar-bit bus: EC_SCALAR sends one per set bit (timestamp, bit_index);
-    /// ECDAS receives one per add, ECSM receives the MSB.
+    /// Scalar-bit bus: ECDAS sends Bit[ts, round] per step (mult = next_op);
+    /// ECSM receives Bit[ts, i] for each of the 256 k bits (mult = k[i]),
+    /// and sends Bit[ts, idx_k] for the MSB (mult = μ).
     Bit = 30,
 
     // =========================================================================
@@ -341,7 +340,6 @@ impl BusId {
             BusId::MemoryOp => "MemoryOp",
             BusId::Cpu32 => "Cpu32",
             BusId::Ecdas => "Ecdas",
-            BusId::ServeK => "ServeK",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
         }
@@ -374,7 +372,6 @@ impl TryFrom<u64> for BusId {
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
-            29 => Ok(BusId::ServeK),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
             other => Err(other),
