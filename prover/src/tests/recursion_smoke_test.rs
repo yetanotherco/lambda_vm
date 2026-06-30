@@ -188,6 +188,47 @@ fn drive_executor(
     (total_cycles, start.elapsed())
 }
 
+/// Shared preamble for every execute-only diagnostic below: build the standard
+/// recursion private-input blob (an `empty`-program inner proof produced under
+/// `opts`), load guest `guest_name`, and stand up an executor over it. Returns
+/// the guest's raw ELF bytes (callers that resolve PCs pass them to
+/// [`executor::elf::SymbolTable::parse`]), the loaded program, and the
+/// ready-to-drive executor.
+fn setup_guest_run(
+    label: &str,
+    guest_name: &str,
+    opts: &stark::proof::options::ProofOptions,
+) -> (
+    Vec<u8>,
+    executor::elf::Elf,
+    executor::vm::execution::Executor,
+) {
+    let root = workspace_root();
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
+    let guest_elf_bytes = read_guest_elf(&root, guest_name);
+
+    let (_inner_proof, blob) = prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], opts);
+
+    let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
+    let executor = executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
+    (guest_elf_bytes, program, executor)
+}
+
+/// A `drive_executor` progress callback that prints the throttled
+/// `[label]   ... N chunks, M cycles, T elapsed` line every `stride` chunks —
+/// the readout every counting diagnostic shares. Tests that need extra live
+/// state (unique PC count, active step bucket) keep their own closure instead.
+fn log_progress(
+    label: &'static str,
+    stride: usize,
+) -> impl FnMut(usize, u64, std::time::Duration) {
+    move |chunks, cycles, elapsed| {
+        if chunks.is_multiple_of(stride) {
+            eprintln!("[{label}]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed");
+        }
+    }
+}
+
 /// Resolve a guest PC to its (demangled) enclosing function name using the
 /// ELF's own symbol table — the same data `executor::flamegraph` resolves
 /// against. `<unknown>` when no function symbol covers the PC (e.g. PLT stubs
@@ -485,35 +526,20 @@ fn test_dump_recursion_input() {
 #[test]
 #[ignore = "diagnostic: runs the executor only, prints cycle counts"]
 fn test_recursion_cycle_count() {
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
-
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
-
-    // Build the inner proof exactly as the smoke test does, with the
-    // absolute-minimum FRI params so the inner is as small as possible.
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("cycle-count", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+    // Build the inner proof with the absolute-minimum FRI params (smallest
+    // possible inner) and stand up the recursion guest over it.
+    let (_bytes, _program, mut executor) =
+        setup_guest_run("cycle-count", "recursion", &MIN_PROOF_OPTIONS);
 
     // Execute (NOT prove) the recursion guest. `drive_executor` streams chunks
     // and never accumulates logs in memory — this avoids the Vec<Log> blow-up
     // that OOMs even a 125 GB server (one Log is 40 B; a few billion of them is
     // hundreds of GB).
     eprintln!("[cycle-count] executing recursion guest (streaming counter only) ...");
-    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
         |_log| ControlFlow::Continue(()),
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(50) {
-                eprintln!(
-                    "[cycle-count]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed"
-                );
-            }
-        },
+        log_progress("cycle-count", 50),
     );
     let cycle_count = total_cycles as usize;
 
@@ -569,23 +595,16 @@ fn test_recursion_cycle_count() {
 #[test]
 #[ignore = "diagnostic: counts distinct 4 KB memory pages touched by the recursion guest"]
 fn test_recursion_page_count() {
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     use std::collections::HashSet;
 
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
-
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("page-count", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+    let (_bytes, program, mut executor) =
+        setup_guest_run("page-count", "recursion", &MIN_PROOF_OPTIONS);
 
     // Precompute the recursion ELF's PT_LOAD ranges so we can bucket code/
     // static pages separately from heap. `Elf::load` already expands BSS
     // (memsz > filesz) into zero-valued words, so these ranges cover
     // .text + .rodata + .data + .bss.
-    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
     let segment_ranges: Vec<(u64, u64)> = program
         .data
         .iter()
@@ -606,17 +625,10 @@ fn test_recursion_page_count() {
     // would accumulate ~67 M `Log` records (~2.7 GB) we don't need. We only
     // care about the *final* memory state.
     eprintln!("[page-count] executing recursion guest (streaming) ...");
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
         |_log| ControlFlow::Continue(()),
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(50) {
-                eprintln!(
-                    "[page-count]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed"
-                );
-            }
-        },
+        log_progress("page-count", 50),
     );
 
     // Collect the set of distinct 4 KB pages from every cell touched during
@@ -682,38 +694,33 @@ fn test_recursion_page_count() {
     eprintln!("============================================================");
 }
 
-/// Build a PC histogram of the recursion guest verifying an `empty`-program
+/// Build a PC histogram of guest `guest_name` verifying an `empty`-program
 /// inner proof produced with `inner_proof_options`, and print it via
 /// [`print_pc_histogram`] under `title`.
 ///
-/// `blowup_factor` and `fri_number_of_queries` are coupled (the query count is
-/// derived from blowup for a fixed security target), so each `#[test]` below is
-/// just this runner with a different `ProofOptions` — a single query at low
-/// blowup, vs. the security-derived multi-query count at a higher blowup.
+/// For the recursion guest, `blowup_factor` and `fri_number_of_queries` are
+/// coupled (the query count is derived from blowup for a fixed security
+/// target), so each recursion `#[test]` is just this runner with a different
+/// `ProofOptions` — a single query at low blowup, vs. the security-derived
+/// multi-query count at a higher blowup. The deserialize-only control guest
+/// reuses the same runner with its own ELF name.
 ///
 /// Streams chunks of logs via `Executor::resume()` so memory stays bounded to
 /// the histogram itself. Each PC is resolved to its enclosing function via the
-/// in-house `executor::elf::SymbolTable` (reading the recursion ELF's symbol
-/// table directly — no external tool, no DWARF dependency).
-fn run_recursion_pc_histogram(
+/// in-house `executor::elf::SymbolTable` (reading the guest ELF's symbol table
+/// directly — no external tool, no DWARF dependency).
+fn run_pc_histogram(
     title: &str,
+    guest_name: &str,
+    progress_stride: usize,
     inner_proof_options: stark::proof::options::ProofOptions,
 ) {
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
     use std::collections::HashMap;
 
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
+    let (guest_elf_bytes, _program, mut executor) =
+        setup_guest_run("pc-hist", guest_name, &inner_proof_options);
 
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("pc-hist", &empty_elf_bytes, &[], &inner_proof_options);
-
-    eprintln!("[pc-hist] executing recursion guest (building PC histogram) ...");
-    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
-
+    eprintln!("[pc-hist] executing {guest_name} guest (building PC histogram) ...");
     let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(300_000);
     let unique = std::cell::Cell::new(0usize);
     let (total_cycles, exec_time) = drive_executor(
@@ -724,7 +731,7 @@ fn run_recursion_pc_histogram(
             ControlFlow::Continue(())
         },
         |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(500) {
+            if chunks.is_multiple_of(progress_stride) {
                 eprintln!(
                     "[pc-hist]   ... {chunks} chunks, {cycles} cycles, {} unique PCs, {elapsed:?}",
                     unique.get()
@@ -734,7 +741,7 @@ fn run_recursion_pc_histogram(
     );
 
     // Resolve PCs to functions directly from the ELF's symbol table.
-    let symbols = executor::elf::SymbolTable::parse(&recursion_elf_bytes);
+    let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
     print_pc_histogram(title, &symbols, pc_hist, total_cycles, exec_time);
 }
 
@@ -744,8 +751,10 @@ fn run_recursion_pc_histogram(
 #[test]
 #[ignore = "diagnostic: ~8 minutes; prints PC histogram of the verifier-in-VM"]
 fn test_recursion_pc_histogram_1query() {
-    run_recursion_pc_histogram(
+    run_pc_histogram(
         "RECURSION GUEST PC HISTOGRAM (blowup=2, 1 query)",
+        "recursion",
+        500,
         MIN_PROOF_OPTIONS,
     );
 }
@@ -759,11 +768,13 @@ fn test_recursion_pc_histogram_1query() {
 fn test_recursion_pc_histogram_multiquery() {
     let inner_proof_options =
         crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid");
-    run_recursion_pc_histogram(
+    run_pc_histogram(
         &format!(
             "RECURSION GUEST PC HISTOGRAM (blowup=8, {} queries, 128-bit)",
             inner_proof_options.fri_number_of_queries
         ),
+        "recursion",
+        500,
         inner_proof_options,
     );
 }
@@ -783,9 +794,7 @@ fn test_recursion_pc_histogram_multiquery() {
 #[test]
 #[ignore = "diagnostic: sampled flamegraph for the verifier-in-VM"]
 fn test_recursion_sampled_flamegraph() {
-    use executor::elf::Elf;
     use executor::flamegraph::FlamegraphGenerator;
-    use executor::vm::execution::Executor;
     use std::io::BufWriter;
 
     /// 1 in N logs is fed to `process_logs`, which both updates the call
@@ -805,18 +814,12 @@ fn test_recursion_sampled_flamegraph() {
     /// At SAMPLE_RATE=1, ~57µs per cycle means 5M cycles ≈ 5 min wall time.
     const CYCLE_BUDGET: u64 = 5_000_000;
 
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
-
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("sampled-fg", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+    let (recursion_elf_bytes, program, mut executor) =
+        setup_guest_run("sampled-fg", "recursion", &MIN_PROOF_OPTIONS);
 
     eprintln!("[sampled-fg] executing recursion guest (sampling 1-in-{SAMPLE_RATE}) ...",);
-    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
     let symbols = executor::elf::SymbolTable::parse(&recursion_elf_bytes);
     let entry_point = program.entry_point;
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
 
     // Build our own instruction cache from the same segments `Executor::new`
     // decodes internally. Owning it (rather than reading `executor.instructions`
@@ -964,18 +967,9 @@ fn test_host_verify_step_timings() {
 #[test]
 #[ignore = "diagnostic: runs the deserialize-only guest, prints cycle count"]
 fn test_deserialize_only_cycle_count() {
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
+    let (deser_elf_bytes, program, mut executor) =
+        setup_guest_run("deser-only", "deserialize-only", &MIN_PROOF_OPTIONS);
 
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let deser_elf_bytes = read_guest_elf(&root, "deserialize-only");
-
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("deser-only", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
-
-    eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
-    let program = Elf::load(&deser_elf_bytes).expect("ELF load failed");
     eprintln!(
         "[deser-only] ELF: {} bytes, entry_point=0x{:x}",
         deser_elf_bytes.len(),
@@ -985,18 +979,12 @@ fn test_deserialize_only_cycle_count() {
         program.entry_point, 0,
         "deserialize-only ELF has entry_point=0 — build artifact is malformed"
     );
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
 
+    eprintln!("[deser-only] executing deserialize-only guest (streaming) ...");
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
         |_log| ControlFlow::Continue(()),
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(50) {
-                eprintln!(
-                    "[deser-only]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed"
-                );
-            }
-        },
+        log_progress("deser-only", 50),
     );
     let cycle_count = total_cycles;
 
@@ -1027,50 +1015,14 @@ fn test_deserialize_only_cycle_count() {
 #[test]
 #[ignore = "diagnostic: ~1 min; PC histogram for the deserialize-only guest"]
 fn test_deserialize_only_pc_histogram() {
-    use executor::elf::Elf;
-    use executor::vm::execution::Executor;
-    use std::collections::HashMap;
-
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let deser_elf_bytes = read_guest_elf(&root, "deserialize-only");
-
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("deser-pc-hist", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
-
-    eprintln!("[deser-pc-hist] executing deserialize-only guest (building PC histogram) ...");
-    let program = Elf::load(&deser_elf_bytes).expect("ELF load failed");
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
-
-    // ~50k unique PCs is plenty: the deserialize-only guest is ~74 KB of ELF
-    // (~18k 4-byte instructions); the hot inner loop is much smaller still.
-    let mut pc_hist: HashMap<u64, u64> = HashMap::with_capacity(50_000);
-    let unique = std::cell::Cell::new(0usize);
-    let (total_cycles, exec_time) = drive_executor(
-        &mut executor,
-        |log| {
-            *pc_hist.entry(log.current_pc).or_insert(0) += 1;
-            unique.set(pc_hist.len());
-            ControlFlow::Continue(())
-        },
-        |chunks, cycles, elapsed| {
-            if chunks.is_multiple_of(50) {
-                eprintln!(
-                    "[deser-pc-hist]   ... {chunks} chunks, {cycles} cycles, {} unique PCs, {elapsed:?}",
-                    unique.get()
-                );
-            }
-        },
-    );
-
-    // Resolve PCs to functions directly from the ELF's symbol table.
-    let symbols = executor::elf::SymbolTable::parse(&deser_elf_bytes);
-    print_pc_histogram(
+    // Same runner as the recursion PC histograms, pointed at the deserialize-only
+    // control guest. Smaller workload (~16 M cycles, far fewer chunks), so use a
+    // tighter progress stride to still get periodic readouts.
+    run_pc_histogram(
         "DESERIALIZE-ONLY GUEST PC HISTOGRAM",
-        &symbols,
-        pc_hist,
-        total_cycles,
-        exec_time,
+        "deserialize-only",
+        50,
+        MIN_PROOF_OPTIONS,
     );
 }
 
@@ -1097,15 +1049,10 @@ fn test_deserialize_only_pc_histogram() {
 #[test]
 #[ignore = "diagnostic: ~13 min; buckets the 40B cycles by verifier step"]
 fn test_recursion_step_breakdown() {
-    use executor::elf::{Elf, SymbolTable};
-    use executor::vm::execution::Executor;
+    use executor::elf::SymbolTable;
 
-    let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let recursion_elf_bytes = read_guest_elf(&root, "recursion");
-
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("step-bkd", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+    let (recursion_elf_bytes, _program, mut executor) =
+        setup_guest_run("step-bkd", "recursion", &MIN_PROOF_OPTIONS);
 
     // Build a per-step "advance bucket to N" lookup. The verifier's step
     // functions get inlined by LLVM in release mode, so we can't rely on
@@ -1163,8 +1110,6 @@ fn test_recursion_step_breakdown() {
     let mut buckets = [0u64; 5];
 
     eprintln!("[step-bkd] executing recursion guest (streaming) ...");
-    let program = Elf::load(&recursion_elf_bytes).expect("ELF load failed");
-    let mut executor = Executor::new(&program, blob).expect("Executor::new failed");
 
     // Cache the last symbol-table hit so we only do a binary search on
     // function transitions, not on every cycle. Functions are typically
