@@ -2,5 +2,6 @@
 rustflags = [
   "-C", "link-arg=-e",
   "-C", "link-arg=main",
+  "--cfg", "getrandom_backend=\"custom\"",
   "-C", "passes=lower-atomic"
 ]

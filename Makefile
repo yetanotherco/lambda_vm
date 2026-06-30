@@ -51,7 +51,7 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 # rather than executor/programs/. The recursion guest is the in-VM STARK verifier.
 RECURSION_GUESTS_DIR=./bench_vs/lambda
 RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
-RECURSION_GUESTS := empty fibonacci recursion
+RECURSION_GUESTS := empty fibonacci recursion deserialize-only
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
