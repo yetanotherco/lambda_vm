@@ -9,7 +9,7 @@
 #   4. prover/stark/crypto/ecsm suite   (make test-prover-cuda) — CPU CI's prover tests on GPU
 #   5. comprehensive all-instructions   (make test-prover-comprehensive-cuda)
 #
-# Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All three groups
+# Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
 # run even if one fails (so the log shows every failure); the script exits non-zero if ANY
 # group failed, which fails the workflow job and blocks the merge.
 #
@@ -38,8 +38,9 @@ nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 # --- Pin cudarc so it binds a fixed driver-symbol set --------------------------
 # crypto/math-cuda/Cargo.toml uses `cuda-version-from-build-system` + `fallback-latest`;
 # when detection falls back to "latest", cudarc requests symbols some boxes' driver doesn't
-# export (e.g. cuDevSmResourceSplit / cuCtxGetDevice_v2) -> runtime panic. Pinning to a fixed
-# CUDA version (12.8, matching the cuda_max_good>=12.8 offer floor) avoids that.
+# export (e.g. cuDevSmResourceSplit / cuCtxGetDevice_v2) -> runtime panic. Pinning to a fixed,
+# conservative CUDA version binds a known driver-symbol set instead. (This is cudarc's
+# host-side driver-API floor — independent of the PTX/driver version the offer filter targets.)
 log "pinning cudarc to $CUDARC_PIN"
 sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
     crypto/math-cuda/Cargo.toml

@@ -228,10 +228,11 @@ jobs:
             ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid ref: '$REF'"; exit 1 ;;
           esac
           # Check out the ref under test on the box, then run the CUDA test groups.
+          # gpu_test.sh owns the CUDARC_PIN / SYSROOT_DIR defaults — don't duplicate them here.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             git fetch --force origin '$REF'; \
             git checkout -f FETCH_HEAD; \
-            CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot bash scripts/gpu_test.sh"
+            bash scripts/gpu_test.sh"
 
           # pipefail so a test failure on the box propagates through the tee pipe and FAILS this
           # step (which fails the job and blocks the merge), instead of being masked by tee.
