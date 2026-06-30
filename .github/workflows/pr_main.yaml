@@ -308,6 +308,29 @@ jobs:
         with:
           name: prover-tests
 
+      # The un-ignored recursion execute-only smoke tests read prebuilt guest
+      # ELFs from executor/program_artifacts/recursion/ at runtime, so build
+      # them before the test run (cached on the guest sources + toolchain spec).
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      # Only needed when the recursion cache missed but the rust-elf cache hit
+      # (so the rust-elf compile step's Setup Rust did not run).
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
+
       - name: Run prover tests (shard ${{ matrix.partition }}/4)
         run: |
           cargo nextest run \
@@ -370,12 +393,35 @@ jobs:
         with:
           name: prover-tests
 
+      # The #[ignore]d recursion full-prove smoke tests (run only here, via
+      # --run-ignored) read prebuilt guest ELFs from
+      # executor/program_artifacts/recursion/ at runtime, so build them first.
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      # Only needed when the recursion cache missed but the rust-elf cache hit
+      # (so the rust-elf compile step's Setup Rust did not run).
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
+
       - name: Run comprehensive prover tests
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
             --test-threads=1 \
-            -E 'test(test_prove_elfs_all_instructions_64_full)' \
+            -E 'test(test_prove_elfs_all_instructions_64_full) | test(test_recursion_prove)' \
             --run-ignored ignored-only
 
   # Seed ELF caches on refs/heads/main so merge-queue runs can restore them.

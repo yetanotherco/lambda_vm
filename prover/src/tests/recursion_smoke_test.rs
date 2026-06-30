@@ -4,17 +4,20 @@
 //! 1. Proves an inner program on the host.
 //! 2. Serializes `(VmProof, inner_elf, opts)` with postcard.
 //! 3. Hands that as private input to the recursion guest.
-//! 4. Either **proves** the recursion guest's execution and verifies the outer
-//!    proof (`OuterMode::Prove`), or merely **executes** the guest in-VM and
-//!    reads the committed marker off the trace (`OuterMode::ExecuteOnly`) — a
-//!    cheaper tier that skips the LDE/FRI that dominate the full pipeline.
+//! 4. Either **proves** the recursion guest's execution (memory-bounded via
+//!    continuations) and verifies the outer proof (`OuterMode::Prove`), or
+//!    merely **executes** the guest in-VM and reads the committed marker
+//!    straight off the executor's memory (`OuterMode::ExecuteOnly`) — a cheaper
+//!    tier that skips the LDE/FRI that dominate the full pipeline.
 //!
 //! The guest ELFs are built by `make compile-recursion-elfs` (which the
 //! `test-prover-all` make target depends on) and read from
 //! `executor/program_artifacts/recursion/`, like every other program test.
 //!
-//! Tests are `#[ignore]`d because the outer proof runs the full STARK verifier
-//! inside the VM (minutes per run, large memory footprint).
+//! Both tiers stream/epoch the work, so neither holds the whole execution at
+//! once. The execute-only tests run in well under a minute and are not ignored;
+//! the full-prove tests still run the STARK verifier in-VM (minutes per run) and
+//! stay `#[ignore]`d, run by the comprehensive CI job and `make test-prover-all`.
 
 use std::path::PathBuf;
 
@@ -83,64 +86,91 @@ fn prove_inner_and_encode_blob(
 /// whether we also prove the guest's own execution.
 #[derive(Clone, Copy, Debug)]
 enum OuterMode {
-    /// Execute the guest in-VM and read the committed marker off the trace.
-    /// Skips the LDE blowup + FRI commit that dominate the full pipeline's
-    /// footprint, so it needs materially less RAM than `Prove`.
-    ///
-    /// "Less" is not "little": `Executor::run` retains a per-instruction log
-    /// and `Traces` materializes the full execution trace, so verifying even a
-    /// 1-query inner proof still needs tens of GB — it OOMs on a 36 GB box.
+    /// Execute the guest in-VM and read the committed marker straight off the
+    /// executor's memory. Streams logs via `Executor::resume()` and never
+    /// builds a `Traces`, so footprint stays bounded to the VM's touched
+    /// memory + instruction cache — runs end-to-end where the old `run()` +
+    /// `Traces` path OOM'd. Skips the LDE/FRI of the full pipeline entirely.
     ExecuteOnly,
-    /// Prove the guest's execution and verify the outer proof on the host. The
-    /// full STARK verifier inside the VM — minutes per run, ~125 GB.
+    /// Prove the guest's execution **memory-bounded** via continuations, then
+    /// verify the outer proof on the host. The run is split into
+    /// `2^OUTER_EPOCH_SIZE_LOG2`-cycle epochs, each proved independently, plus
+    /// the one cross-epoch global-memory linkage. Peak RAM is a single epoch's
+    /// trace+LDE (the accumulated per-epoch proofs are small), not the
+    /// monolithic ~125 GB a single-shot prove of the whole verifier would
+    /// build — so the outer prove runs end-to-end on a normal box.
     Prove,
 }
 
 /// Execute the recursion guest in-VM on `blob` and return the bytes it
 /// committed (the success marker the in-VM verifier emits).
+///
+/// Streams execution via `Executor::resume()`: each chunk reuses one
+/// `CHUNK_SIZE`-bounded log buffer (cleared per chunk), so logs never
+/// accumulate, and we never build a `Traces`. The committed marker is read
+/// directly off the executor's memory — `Memory::commit_public_output`
+/// accumulates the same byte stream the trace builder's `public_output_bytes`
+/// would, exposed via `Executor::finish()`. This avoids both OOM sources of
+/// the old `run()` + `Traces::from_elf_and_logs` path (the full `Vec<Log>` and
+/// the materialized execution trace), neither of which the marker needs.
 fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
 
-    eprintln!("[{label}] executing outer (recursion guest, in-VM verify) ...");
+    eprintln!("[{label}] executing outer (recursion guest, in-VM verify, streaming) ...");
     let program = Elf::load(recursion_elf_bytes).expect("load recursion elf");
-    let result = Executor::new(&program, blob.to_vec())
-        .expect("executor new")
-        .run()
-        .expect("recursion guest execution failed (verify panicked in-VM?)");
+    let mut executor = Executor::new(&program, blob.to_vec()).expect("executor new");
 
-    let traces = crate::tables::trace_builder::Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        &crate::MaxRowsConfig::default(),
-        blob,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .expect("trace build");
+    // Drain chunks to completion without retaining logs or building a trace.
+    while executor
+        .resume()
+        .expect("recursion guest execution failed (verify panicked in-VM?)")
+        .is_some()
+    {}
+
+    let committed = executor
+        .finish()
+        .expect("read committed output after execution")
+        .memory_values;
 
     eprintln!(
         "[{label}] committed {} bytes: {:?} (as str: {:?})",
-        traces.public_output_bytes.len(),
-        traces.public_output_bytes,
-        String::from_utf8_lossy(&traces.public_output_bytes),
+        committed.len(),
+        committed,
+        String::from_utf8_lossy(&committed),
     );
-    traces.public_output_bytes
+    committed
 }
 
-/// Prove the recursion guest's execution on `blob`, verify the outer proof on
-/// the host, and return the bytes the guest committed.
-fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
-    eprintln!("[{label}] proving outer (recursion guest) ...");
-    let outer_proof =
-        crate::prove_with_inputs(recursion_elf_bytes, blob).expect("outer prove should succeed");
-    eprintln!("[{label}] outer proof generated");
+/// Epoch size for the memory-bounded outer prove: 2^20 ≈ 1M cycles per epoch.
+/// Each epoch's trace+LDE is what bounds peak RAM, so this trades per-epoch
+/// footprint against epoch count — small enough to fit a normal box, large
+/// enough to keep epoch count (and thus the cross-epoch overhead) modest. Well
+/// under `local_to_global::MAX_EPOCHS` (2^20) for any guest we run here.
+const OUTER_EPOCH_SIZE_LOG2: u32 = 20;
 
-    assert!(
-        crate::verify(&outer_proof, recursion_elf_bytes).expect("outer verify errored"),
-        "outer proof must verify on host"
+/// Prove the recursion guest's execution on `blob` **memory-bounded** via
+/// continuations and verify the bundle on the host, returning the bytes the
+/// guest committed. `prove_and_verify_continuation` proves epoch-by-epoch
+/// (holding one epoch's trace at a time) and reconstructs the committed output
+/// from the per-epoch bound slices, so a `Some(output)` already means every
+/// epoch proof, the cross-epoch linkage, and the L2G binding verified.
+fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
+    let opts = crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
+    eprintln!(
+        "[{label}] proving outer (recursion guest) via continuations \
+         (epoch=2^{OUTER_EPOCH_SIZE_LOG2} cycles) ..."
     );
-    outer_proof.public_output
+    let committed = crate::continuation::prove_and_verify_continuation(
+        recursion_elf_bytes,
+        blob,
+        OUTER_EPOCH_SIZE_LOG2,
+        &opts,
+    )
+    .expect("outer continuation prove/verify errored")
+    .expect("outer continuation proof must verify on host");
+    eprintln!("[{label}] outer continuation proof generated and verified");
+    committed
 }
 
 /// Core pipeline: prove an inner program with the given options, hand the
@@ -250,14 +280,16 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 
 // === Execute-only tier ========================================================
 // Mirrors the proving tests below, but stops at `OuterMode::ExecuteOnly`: the
-// guest runs in-VM and we read the committed marker off the trace, skipping the
-// outer STARK prove. Needs tens of GB (execution trace), not the ~125 GB the
-// full outer prove wants — but still OOMs on a 36 GB box.
+// guest runs in-VM and we read the committed marker straight off the executor's
+// memory, skipping the outer STARK prove. Streams execution (no trace, no
+// buffered logs), so the footprint is bounded to the VM's touched memory.
+//
+// Not `#[ignore]`d: each runs in well under a minute, so they execute in the
+// regular per-PR prover test job (which builds the recursion guest ELFs first).
 
 /// Execute-only mirror of `test_recursion_prove_empty`: verify a `blowup=8`
 /// proof of the empty program in-VM.
 #[test]
-#[ignore = "needs prebuilt recursion guest ELF + tens of GB RAM (execution trace)"]
 fn test_recursion_execute_empty() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -272,7 +304,6 @@ fn test_recursion_execute_empty() {
 /// Execute-only mirror of `test_recursion_prove_1query`: smallest possible
 /// inner proof (blowup=2, 1 query) → least guest work.
 #[test]
-#[ignore = "needs prebuilt recursion guest ELF + tens of GB RAM (execution trace)"]
 fn test_recursion_execute_1query() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -288,7 +319,6 @@ fn test_recursion_execute_1query() {
 /// Execute-only mirror of `test_recursion_prove`: verify a `blowup=8` proof of
 /// fibonacci(10) in-VM.
 #[test]
-#[ignore = "needs prebuilt recursion guest ELF + tens of GB RAM (execution trace)"]
 fn test_recursion_execute() {
     let root = workspace_root();
     let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
@@ -310,7 +340,7 @@ fn test_recursion_execute() {
 /// lambda-vm verifier's intrinsic recursion overhead — i.e. what it costs
 /// to verify the smallest possible lambda-vm proof, with no inner workload.
 #[test]
-#[ignore = "slow: runs the full STARK verifier inside the VM"]
+#[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_empty() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -327,7 +357,7 @@ fn test_recursion_prove_empty() {
 /// run end-to-end on a 125 GB box" experiment — security is intentionally
 /// terrible. Use only for capacity probing.
 #[test]
-#[ignore = "slow: runs the full STARK verifier inside the VM"]
+#[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_1query() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -343,7 +373,7 @@ fn test_recursion_prove_1query() {
 
 /// Inner program: fibonacci(10).
 #[test]
-#[ignore = "slow: runs the full STARK verifier inside the VM"]
+#[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove() {
     let root = workspace_root();
     let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
