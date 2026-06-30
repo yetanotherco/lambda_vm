@@ -200,12 +200,14 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
     )
 }
 
-/// Print a PC histogram as two tables: a per-function summary (the cycles each
-/// resolved function accounts for, folded over all its PCs) followed by the
-/// top-100 per-address detail. `pc_hist` maps program counter → cycle count.
+/// Print a per-function PC-histogram summary: the cycles each resolved function
+/// accounts for, folded over all its PCs. `pc_hist` maps program counter →
+/// cycle count.
 ///
-/// The per-function view is the one that matters: an inlined kernel is spread
-/// across dozens of PCs, so the raw per-address table scatters its true cost.
+/// We fold by function deliberately: an inlined kernel is spread across dozens
+/// of PCs, so a raw per-address table scatters its true cost — and without
+/// file:line resolution a bare PC isn't actionable for optimization anyway, so
+/// there is no per-address detail table.
 fn print_pc_histogram(
     title: &str,
     symbols: &executor::elf::SymbolTable,
@@ -213,8 +215,7 @@ fn print_pc_histogram(
     total_cycles: u64,
     exec_time: std::time::Duration,
 ) {
-    let mut entries: Vec<(u64, u64)> = pc_hist.into_iter().collect();
-    entries.sort_unstable_by_key(|(_pc, count)| std::cmp::Reverse(*count));
+    let entries: Vec<(u64, u64)> = pc_hist.into_iter().collect();
 
     // Aggregate the full histogram by resolved function, resolving each PC once.
     let mut by_function: std::collections::HashMap<String, (u64, u64)> =
@@ -255,25 +256,6 @@ fn print_pc_histogram(
             pct(fn_cumulative),
             pcs,
             name,
-        );
-    }
-    eprintln!();
-    eprintln!("  Top 100 PCs by cycle count (per-address detail):");
-    eprintln!(
-        "  {:>4}  {:>18}  {:>14}  {:>7}  {:>7}  {}",
-        "rank", "pc", "cycles", "%", "cum %", "function"
-    );
-    let mut cumulative: u64 = 0;
-    for (rank, (pc, count)) in entries.iter().take(100).enumerate() {
-        cumulative += count;
-        eprintln!(
-            "  {:>4}  {:#018x}  {:>14}  {:>6.2}%  {:>6.2}%  {}",
-            rank + 1,
-            pc,
-            count,
-            pct(*count),
-            pct(cumulative),
-            resolve_pc(symbols, *pc),
         );
     }
     eprintln!("============================================================");

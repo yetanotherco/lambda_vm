@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Format the recursion-guest per-function profile as a Markdown PR comment.
 
-`test_recursion_pc_histogram` prints a per-function summary table (cycles folded
-over each function's PCs, computed across the *full* histogram) followed by a
-per-address detail table. We extract the per-function table — the view that
-shows where the cycles actually go — and render it as Markdown.
+`test_recursion_pc_histogram` prints a per-function summary table: the cycles
+folded over each function's PCs, computed across the *full* histogram — the view
+that shows where the cycles actually go. We parse that table and render it as
+Markdown.
 
     Top 25 functions by cycle count (aggregated over their PCs):
-    rank          cycles        %    cum %    PCs  function (file:line)
+    rank          cycles        %    cum %    PCs  function
        1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
 
 Reads the test's captured output from argv[1]; writes the Markdown body to
@@ -18,12 +18,12 @@ import re
 import sys
 
 # A per-function summary row: rank, cycles, pct%, cum%, pcs, function.
-# Distinguished from the per-PC detail rows by the absence of a 0x<pc> column.
 FN_ROW = re.compile(
     r"^\s*\d+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+(\d+)\s+(.*\S)\s*$"
 )
 FN_TABLE_START = re.compile(r"Top \d+ functions by cycle count")
-PC_TABLE_START = re.compile(r"Top \d+ PCs by cycle count")
+# The "====" rule the test prints right after the (now sole) function table.
+TABLE_END = re.compile(r"^=+\s*$")
 TOTAL_CYCLES = re.compile(r"Total cycles\s*:\s*(\d+)")
 UNIQUE_PCS = re.compile(r"Unique PCs\s*:\s*(\d+)")
 EXEC_TIME = re.compile(r"Exec time\s*:\s*(\S+)")
@@ -43,7 +43,7 @@ def parse(text):
         if FN_TABLE_START.search(line):
             in_fn_table = True
             continue
-        if PC_TABLE_START.search(line):
+        if in_fn_table and TABLE_END.match(line):
             in_fn_table = False
             continue
         if in_fn_table and (m := FN_ROW.match(line)):
