@@ -44,7 +44,7 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
 /// Maximum size of the private input memory region (in bytes). 64 MiB so that a
 /// whole `VmProof` can be passed as private input to a verifier guest (naive
-/// recursion); the previous 6.7 MiB was too small to hold real proofs.
+/// recursion).
 pub const MAX_PRIVATE_INPUT_SIZE: u64 = 64 * 1024 * 1024;
 /// Fixed high address where private input is mapped. Guest programs can read
 /// directly from this address (ZisK-style memory-mapped input).
