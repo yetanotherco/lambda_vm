@@ -83,8 +83,11 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
     let program = Elf::load(recursion_elf_bytes).expect("load recursion elf");
     let mut executor = Executor::new(&program, blob.to_vec()).expect("executor new");
 
-    let (total_cycles, exec_time) =
-        drive_executor(&mut executor, |_log| ControlFlow::Continue(()), |_, _, _| {});
+    let (total_cycles, exec_time) = drive_executor(
+        &mut executor,
+        |_log| ControlFlow::Continue(()),
+        |_, _, _| {},
+    );
 
     let committed = executor
         .finish()
@@ -136,7 +139,10 @@ fn drive_executor(
     let start = std::time::Instant::now();
     let mut total_cycles: u64 = 0;
     let mut chunks: usize = 0;
-    while let Some(logs) = executor.resume().expect("executor resume failed (guest panicked in-VM?)") {
+    while let Some(logs) = executor
+        .resume()
+        .expect("executor resume failed (guest panicked in-VM?)")
+    {
         let mut stop = false;
         for log in logs {
             total_cycles += 1;
@@ -182,7 +188,10 @@ fn setup_guest_run(
 }
 
 /// A `drive_executor` progress callback printing one line every `stride` chunks.
-fn log_progress(label: impl Into<String>, stride: usize) -> impl FnMut(usize, u64, std::time::Duration) {
+fn log_progress(
+    label: impl Into<String>,
+    stride: usize,
+) -> impl FnMut(usize, u64, std::time::Duration) {
     let label = label.into();
     move |chunks, cycles, elapsed| {
         if chunks.is_multiple_of(stride) {
@@ -223,7 +232,9 @@ fn print_function_table(
     let mut by_function: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new();
     for (pc, count) in &pc_hist {
-        let entry = by_function.entry(resolve_pc(symbols, *pc)).or_insert((0, 0));
+        let entry = by_function
+            .entry(resolve_pc(symbols, *pc))
+            .or_insert((0, 0));
         entry.0 += *count; // cycles
         entry.1 += 1; // distinct PCs folded into this function
     }
@@ -299,18 +310,30 @@ fn run_profile(
             "{guest_name} ELF has no symbol table — was it stripped?"
         );
         for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
-            let n = symbols.functions().iter().filter(|f| f.name.contains(kw)).count();
+            let n = symbols
+                .functions()
+                .iter()
+                .filter(|f| f.name.contains(kw))
+                .count();
             eprintln!(
                 "[profile] step {}: keyword={kw:?} -> {n} symbol(s) {}",
                 i + 1,
-                if n > 0 { "" } else { "(no match; merges into previous bucket)" },
+                if n > 0 {
+                    ""
+                } else {
+                    "(no match; merges into previous bucket)"
+                },
             );
         }
     }
 
     eprintln!(
         "[profile] executing {guest_name} guest ({}) ...",
-        if detailed { "histogram + steps" } else { "cycle counter" }
+        if detailed {
+            "histogram + steps"
+        } else {
+            "cycle counter"
+        }
     );
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
