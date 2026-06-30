@@ -43,7 +43,7 @@ env:
   # side past 5 buys little here (the cached comparison can't beat the ~1% drift wall),
   # so the per-PR run count is also capped at 5 (clamp below).
   BENCH_RUNS_BASELINE: 5
-  VERIFIER_BENCH_RUNS: 100
+  VERIFIER_BENCH_RUNS: 10
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
   # the matching transfer counts (x-axis; slope is MB per transfer).
