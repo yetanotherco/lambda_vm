@@ -45,6 +45,7 @@
 //!
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -849,5 +850,25 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstr
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for CommitConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+
+        let root = match self.kind {
+            CommitConstraintKind::FirstOrEndImpliesMu => {
+                let first = b.main(0, cols::FIRST);
+                let end = b.main(0, cols::END);
+                let mu = b.main(0, cols::MU);
+                // (first + end) * (1 - mu)
+                let sum = b.add(first, end);
+                let one_minus_mu = b.sub(one, mu);
+                b.mul(sum, one_minus_mu)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }

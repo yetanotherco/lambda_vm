@@ -10,6 +10,7 @@ use math::{
 };
 
 use crate::{
+    constraint_ir::{ConstraintProgram, IrBuilder},
     constraints::transition::TransitionConstraintEvaluator,
     domain::Domain,
     lookup::{BusPublicInputs, PackingShifts},
@@ -314,6 +315,25 @@ pub trait AIR: Send + Sync {
     fn transition_constraints(
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
+
+    /// Capture every transition constraint into one flat [`ConstraintProgram`].
+    ///
+    /// Calls `capture` on each boxed constraint (object-safe, see
+    /// [`TransitionConstraintEvaluator::capture`]) into a single [`IrBuilder`],
+    /// so `roots[c]` ends up indexed by `constraint_idx()` exactly like
+    /// `transition_constraints()` itself. `num_base` is
+    /// `num_base_transition_constraints()`, matching the prover's base/ext
+    /// split (`compute_transition_prover`).
+    ///
+    /// Not cached here — callers (e.g. `ConstraintEvaluator::new`) that need
+    /// the program on every prove/verify should cache it once.
+    fn constraint_program(&self) -> ConstraintProgram {
+        let mut builder = IrBuilder::new();
+        for c in self.transition_constraints() {
+            c.capture(&mut builder);
+        }
+        builder.finish(self.num_base_transition_constraints())
+    }
 
     /// Compute zerofier evaluations as deduplicated groups with index mapping.
     ///

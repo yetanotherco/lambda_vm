@@ -21,6 +21,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -305,6 +306,31 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for StoreConstra
                 &sum * (&one - &mu)
             }
         }
+    }
+}
+
+impl Capture for StoreConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let w2 = b.main(0, cols::WRITE2);
+        let w4 = b.main(0, cols::WRITE4);
+        let w8 = b.main(0, cols::WRITE8);
+        let sum = b.add(w2, w4);
+        let sum = b.add(sum, w8);
+        let one = b.one();
+
+        let root = match self.kind {
+            StoreConstraintKind::WidthSumIsBit => {
+                let one_minus_sum = b.sub(one, sum);
+                b.mul(sum, one_minus_sum)
+            }
+            StoreConstraintKind::WidthImpliesMu => {
+                let mu = b.main(0, cols::MU);
+                let one_minus_mu = b.sub(one, mu);
+                b.mul(sum, one_minus_mu)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

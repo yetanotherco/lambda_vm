@@ -31,6 +31,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -1214,6 +1215,76 @@ impl DvrmConstraint {
             ext_word,
         ]
     }
+
+    /// Capture carry[i], mirroring [`Self::compute_carry`].
+    fn capture_carry(&self, i: usize, b: &mut IrBuilder) -> Expr {
+        let shift_16 = b.const_base(SHIFT_16);
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        let sign_fill = b.const_base(SIGN_FILL);
+
+        let n: [Expr; 4] = [
+            b.main(0, cols::N_0),
+            b.main(0, cols::N_1),
+            b.main(0, cols::N_2),
+            b.main(0, cols::N_3),
+        ];
+        let nsr: [Expr; 4] = [
+            b.main(0, cols::N_SUB_R_0),
+            b.main(0, cols::N_SUB_R_1),
+            b.main(0, cols::N_SUB_R_2),
+            b.main(0, cols::N_SUB_R_3),
+        ];
+        let r: [Expr; 4] = [
+            b.main(0, cols::R_0),
+            b.main(0, cols::R_1),
+            b.main(0, cols::R_2),
+            b.main(0, cols::R_3),
+        ];
+
+        let sign_n = b.main(0, cols::SIGN_N);
+        let sign_r = b.main(0, cols::SIGN_R);
+        let sign_nsr = b.main(0, cols::SIGN_N_SUB_R);
+
+        let ext_n = Self::capture_extended_quad(&n, sign_n, shift_16, sign_fill, b);
+        let ext_r = Self::capture_extended_quad(&r, sign_r, shift_16, sign_fill, b);
+        let ext_nsr = Self::capture_extended_quad(&nsr, sign_nsr, shift_16, sign_fill, b);
+
+        if i == 0 {
+            // (ext_nsr[0] + ext_r[0] - ext_n[0]) * inv_2_32
+            let s = b.add(ext_nsr[0], ext_r[0]);
+            let s = b.sub(s, ext_n[0]);
+            b.mul(s, inv_2_32)
+        } else {
+            let prev_carry = self.capture_carry(i - 1, b);
+            // (ext_nsr[i] + ext_r[i] + prev_carry - ext_n[i]) * inv_2_32
+            let s = b.add(ext_nsr[i], ext_r[i]);
+            let s = b.add(s, prev_carry);
+            let s = b.sub(s, ext_n[i]);
+            b.mul(s, inv_2_32)
+        }
+    }
+
+    /// Capture the sign-extended QuadWL representation, mirroring
+    /// [`Self::build_extended_quad`].
+    fn capture_extended_quad(
+        halfwords: &[Expr; 4],
+        sign: Expr,
+        shift_16: Expr,
+        sign_fill: Expr,
+        b: &mut IrBuilder,
+    ) -> [Expr; 4] {
+        // ext_word = sign*sign_fill + sign*sign_fill*shift_16
+        let sign_fill_term = b.mul(sign, sign_fill);
+        let sign_fill_shifted = b.mul(sign_fill_term, shift_16);
+        let ext_word = b.add(sign_fill_term, sign_fill_shifted);
+
+        let h1_shifted = b.mul(halfwords[1], shift_16);
+        let w0 = b.add(halfwords[0], h1_shifted);
+        let h3_shifted = b.mul(halfwords[3], shift_16);
+        let w1 = b.add(halfwords[2], h3_shifted);
+
+        [w0, w1, ext_word, ext_word]
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstraint {
@@ -1243,6 +1314,136 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for DvrmConstrai
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for DvrmConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+
+        let root = match self.kind {
+            DvrmConstraintKind::SignedIsBit => {
+                // signed * (1 - signed)
+                let signed = b.main(0, cols::SIGNED);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(signed, one_minus_signed)
+            }
+            DvrmConstraintKind::RemainderSignMatchesNumerator => {
+                // (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n)
+                let r0 = b.main(0, cols::R_0);
+                let r1 = b.main(0, cols::R_1);
+                let r2 = b.main(0, cols::R_2);
+                let r3 = b.main(0, cols::R_3);
+                let sign_r = b.main(0, cols::SIGN_R);
+                let sign_n = b.main(0, cols::SIGN_N);
+                let r_sum = b.add(r0, r1);
+                let r_sum = b.add(r_sum, r2);
+                let r_sum = b.add(r_sum, r3);
+                let sign_diff = b.sub(sign_r, sign_n);
+                b.mul(r_sum, sign_diff)
+            }
+            DvrmConstraintKind::AbsRFormula(i) => {
+                // (1-sign_r) * (abs_r[i] - (r::DWordWL)[i])
+                let sign_r = b.main(0, cols::SIGN_R);
+                let abs_r_col = if i == 0 { cols::ABS_R_0 } else { cols::ABS_R_1 };
+                let abs_r = b.main(0, abs_r_col);
+                let shift_16 = b.const_base(SHIFT_16);
+                let r_wl = if i == 0 {
+                    let r0 = b.main(0, cols::R_0);
+                    let r1 = b.main(0, cols::R_1);
+                    let r1_shifted = b.mul(r1, shift_16);
+                    b.add(r0, r1_shifted)
+                } else {
+                    let r2 = b.main(0, cols::R_2);
+                    let r3 = b.main(0, cols::R_3);
+                    let r3_shifted = b.mul(r3, shift_16);
+                    b.add(r2, r3_shifted)
+                };
+                let one_minus_sign_r = b.sub(one, sign_r);
+                let diff = b.sub(abs_r, r_wl);
+                b.mul(one_minus_sign_r, diff)
+            }
+            DvrmConstraintKind::AbsDFormula(i) => {
+                // (1-sign_d) * (abs_d[i] - (d::DWordWL)[i])
+                let sign_d = b.main(0, cols::SIGN_D);
+                let abs_d_col = if i == 0 { cols::ABS_D_0 } else { cols::ABS_D_1 };
+                let abs_d = b.main(0, abs_d_col);
+                let shift_16 = b.const_base(SHIFT_16);
+                let d_wl = if i == 0 {
+                    let d0 = b.main(0, cols::D_0);
+                    let d1 = b.main(0, cols::D_1);
+                    let d1_shifted = b.mul(d1, shift_16);
+                    b.add(d0, d1_shifted)
+                } else {
+                    let d2 = b.main(0, cols::D_2);
+                    let d3 = b.main(0, cols::D_3);
+                    let d3_shifted = b.mul(d3, shift_16);
+                    b.add(d2, d3_shifted)
+                };
+                let one_minus_sign_d = b.sub(one, sign_d);
+                let diff = b.sub(abs_d, d_wl);
+                b.mul(one_minus_sign_d, diff)
+            }
+            DvrmConstraintKind::SignQFormula => {
+                // signed * (1-overflow) - sign_q
+                let signed = b.main(0, cols::SIGNED);
+                let overflow = b.main(0, cols::OVERFLOW);
+                let sign_q = b.main(0, cols::SIGN_Q);
+                let one_minus_overflow = b.sub(one, overflow);
+                let lhs = b.mul(signed, one_minus_overflow);
+                b.sub(lhs, sign_q)
+            }
+            DvrmConstraintKind::CarryIsBit(i) => {
+                // carry[i] * (1 - carry[i])
+                let carry = self.capture_carry(i, b);
+                let one_minus_carry = b.sub(one, carry);
+                b.mul(carry, one_minus_carry)
+            }
+            DvrmConstraintKind::SignNSubRIsBit => {
+                // sign_n_sub_r * (1 - sign_n_sub_r)
+                let sign = b.main(0, cols::SIGN_N_SUB_R);
+                let one_minus_sign = b.sub(one, sign);
+                b.mul(sign, one_minus_sign)
+            }
+            DvrmConstraintKind::UnsignedSignN => {
+                // (1-signed) * sign_n
+                let signed = b.main(0, cols::SIGNED);
+                let sign_n = b.main(0, cols::SIGN_N);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(one_minus_signed, sign_n)
+            }
+            DvrmConstraintKind::UnsignedSignR => {
+                // (1-signed) * sign_r
+                let signed = b.main(0, cols::SIGNED);
+                let sign_r = b.main(0, cols::SIGN_R);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(one_minus_signed, sign_r)
+            }
+            DvrmConstraintKind::UnsignedSignD => {
+                // (1-signed) * sign_d
+                let signed = b.main(0, cols::SIGNED);
+                let sign_d = b.main(0, cols::SIGN_D);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(one_minus_signed, sign_d)
+            }
+            DvrmConstraintKind::DivByZeroQ(i) => {
+                // div_by_zero * (q[i] - 65535)
+                let dbz = b.main(0, cols::DIV_BY_ZERO);
+                let q_col = match i {
+                    0 => cols::Q_0,
+                    1 => cols::Q_1,
+                    2 => cols::Q_2,
+                    3 => cols::Q_3,
+                    _ => unreachable!(),
+                };
+                let q = b.main(0, q_col);
+                let fill = b.const_base(SIGN_FILL);
+                let diff = b.sub(q, fill);
+                b.mul(dbz, diff)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

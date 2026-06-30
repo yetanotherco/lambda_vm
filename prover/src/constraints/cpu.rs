@@ -17,7 +17,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraint_ir::{Capture, IrBuilder};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::table::TableView;
 
@@ -70,6 +70,21 @@ where
     let shift_16: FieldElement<F> = FieldElement::from(SHIFT_16);
     step.get_main_evaluation_element(0, lo_col)
         + step.get_main_evaluation_element(0, hi_col) * shift_16
+}
+
+/// Capture `cast(res, DWordWL)` low/high words, mirroring [`res_word`].
+#[inline]
+fn capture_res_word(b: &mut IrBuilder, high: bool) -> Expr {
+    let (lo_col, hi_col) = if high {
+        (cols::RES_2, cols::RES_3)
+    } else {
+        (cols::RES_0, cols::RES_1)
+    };
+    let lo = b.main(0, lo_col);
+    let hi = b.main(0, hi_col);
+    let shift_16 = b.const_base(SHIFT_16);
+    let hi_shifted = b.mul(hi, shift_16);
+    b.add(lo, hi_shifted)
 }
 
 // =========================================================================
@@ -163,6 +178,22 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Exclusiv
     }
 }
 
+impl Capture for Arg2ExclusiveConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // (1 - memory - branch) * rr2 * imm
+        let one = b.one();
+        let memory = b.main(0, cols::MEMORY);
+        let branch = b.main(0, cols::BRANCH);
+        let rr2 = b.main(0, cols::READ_REGISTER2);
+        let imm = b.main(0, self.imm_col);
+        let coeff = b.sub(one, memory);
+        let coeff = b.sub(coeff, branch);
+        let coeff_rr2 = b.mul(coeff, rr2);
+        let root = b.mul(coeff_rr2, imm);
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 /// `IS_BIT<mem_flags>` on non-MEMORY rows: `(1 - MEMORY) · mem_flags · (1 - mem_flags) = 0`.
 /// On non-memory rows `mem_flags` carries only the JALR bit, so it must be 0/1.
 /// A spec defense-in-depth assumption (the DECODE lookup already enforces it).
@@ -194,6 +225,21 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemFlagsBitC
         let memory = step.get_main_evaluation_element(0, cols::MEMORY).clone();
         let mem_flags = step.get_main_evaluation_element(0, cols::MEM_FLAGS).clone();
         (one.clone() - memory) * &mem_flags * (one - &mem_flags)
+    }
+}
+
+impl Capture for MemFlagsBitConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // (1 - memory) * mem_flags * (1 - mem_flags)
+        let one = b.one();
+        let memory = b.main(0, cols::MEMORY);
+        let mem_flags = b.main(0, cols::MEM_FLAGS);
+        let one_minus_memory = b.sub(one, memory);
+        let one2 = b.one();
+        let one_minus_mem_flags = b.sub(one2, mem_flags);
+        let lhs = b.mul(one_minus_memory, mem_flags);
+        let root = b.mul(lhs, one_minus_mem_flags);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -237,6 +283,18 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RegNotReadIs
         let flag = step.get_main_evaluation_element(0, self.flag_col).clone();
         let value = step.get_main_evaluation_element(0, self.value_col);
         (one - flag) * value
+    }
+}
+
+impl Capture for RegNotReadIsZeroConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // (1 - flag) * value
+        let one = b.one();
+        let flag = b.main(0, self.flag_col);
+        let value = b.main(0, self.value_col);
+        let one_minus_flag = b.sub(one, flag);
+        let root = b.mul(one_minus_flag, value);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -314,6 +372,38 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Arg2Constrai
     }
 }
 
+impl Capture for Arg2Constraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let (arg2_col, imm_col, rv2_col) = if self.word_idx == 0 {
+            (cols::ARG2_0, cols::IMM_0, cols::RV2_0)
+        } else {
+            (cols::ARG2_1, cols::IMM_1, cols::RV2_1)
+        };
+
+        let one = b.one();
+        let arg2 = b.main(0, arg2_col);
+        let imm = b.main(0, imm_col);
+        let rv2 = b.main(0, rv2_col);
+        let memory = b.main(0, cols::MEMORY);
+        let branch = b.main(0, cols::BRANCH);
+
+        // MEMORY * imm
+        let memory_imm = b.mul(memory, imm);
+        // BRANCH * rv2
+        let branch_rv2 = b.mul(branch, rv2);
+        // (1 - MEMORY - BRANCH) * (rv2 + imm)
+        let coeff = b.sub(one, memory);
+        let coeff = b.sub(coeff, branch);
+        let rv2_imm = b.add(rv2, imm);
+        let last_term = b.mul(coeff, rv2_imm);
+
+        let expected = b.add(memory_imm, branch_rv2);
+        let expected = b.add(expected, last_term);
+        let root = b.sub(arg2, expected);
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 // =========================================================================
 // mem group: ¬MEMORY ∧ ¬JALR ⇒ rvd = cast(res, WL)
 // =========================================================================
@@ -362,6 +452,25 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for RvdEqResCons
         let rvd = step.get_main_evaluation_element(0, rvd_col).clone();
         let res_w = res_word(step, high);
         (&one - &memory - &branch) * (rvd - res_w)
+    }
+}
+
+impl Capture for RvdEqResConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let high = self.word_idx == 1;
+        let rvd_col = if high { cols::RVD_1 } else { cols::RVD_0 };
+        let one = b.one();
+        let memory = b.main(0, cols::MEMORY);
+        let branch = b.main(0, cols::BRANCH);
+        let rvd = b.main(0, rvd_col);
+        let res_w = capture_res_word(b, high);
+
+        // (1 - memory - branch) * (rvd - res_w)
+        let coeff = b.sub(one, memory);
+        let coeff = b.sub(coeff, branch);
+        let diff = b.sub(rvd, res_w);
+        let root = b.mul(coeff, diff);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -428,6 +537,29 @@ impl BranchRvdConstraint {
         let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_hi + carry_0 - rvd_hi) * inv_2_32
     }
+
+    /// Capture carry_0, mirroring [`Self::compute_carry_0`].
+    fn capture_carry_0(&self, b: &mut IrBuilder) -> Expr {
+        let pc_lo = b.main(0, cols::PC_0);
+        let rvd_lo = b.main(0, cols::RVD_0);
+        let half_len = b.main(0, cols::HALF_INSTRUCTION_LENGTH);
+        let instr_len = b.add(half_len, half_len); // real byte length = 2 * half
+        let inv_2_32 = b.const_base(super::templates::INV_SHIFT_32);
+        let s = b.add(pc_lo, instr_len);
+        let s = b.sub(s, rvd_lo);
+        b.mul(s, inv_2_32)
+    }
+
+    /// Capture carry_1, mirroring [`Self::compute_carry_1`].
+    fn capture_carry_1(&self, b: &mut IrBuilder) -> Expr {
+        let pc_hi = b.main(0, cols::PC_1);
+        let rvd_hi = b.main(0, cols::RVD_1);
+        let carry_0 = self.capture_carry_0(b);
+        let inv_2_32 = b.const_base(super::templates::INV_SHIFT_32);
+        let s = b.add(pc_hi, carry_0);
+        let s = b.sub(s, rvd_hi);
+        b.mul(s, inv_2_32)
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchRvdConstraint {
@@ -453,6 +585,23 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchRvdCon
             _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
         branch * &carry * (&one - &carry)
+    }
+}
+
+impl Capture for BranchRvdConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let branch = b.main(0, cols::BRANCH);
+        let carry = match self.carry_idx {
+            0 => self.capture_carry_0(b),
+            1 => self.capture_carry_1(b),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
+        };
+        // branch * carry * (1 - carry)
+        let one_minus_carry = b.sub(one, carry);
+        let branch_carry = b.mul(branch, carry);
+        let root = b.mul(branch_carry, one_minus_carry);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -496,6 +645,26 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchCondCo
 
         let expected = &branch * &jalr + &branch * (&one - &jalr) * res0;
         branch_cond - expected
+    }
+}
+
+impl Capture for BranchCondConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let branch = b.main(0, cols::BRANCH);
+        let jalr = b.main(0, cols::MEM_FLAGS);
+        let res0 = b.main(0, cols::RES_0);
+        let branch_cond = b.main(0, cols::BRANCH_COND);
+
+        // branch*jalr + branch*(1-jalr)*res0
+        let branch_jalr = b.mul(branch, jalr);
+        let one_minus_jalr = b.sub(one, jalr);
+        let branch_one_minus_jalr = b.mul(branch, one_minus_jalr);
+        let second_term = b.mul(branch_one_minus_jalr, res0);
+        let expected = b.add(branch_jalr, second_term);
+
+        let root = b.sub(branch_cond, expected);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -552,6 +721,29 @@ impl NextPcAddConstraint {
         let inv_2_32 = FieldElement::<F>::from(super::templates::INV_SHIFT_32);
         (pc_hi + carry_0 - next_pc_hi) * inv_2_32
     }
+
+    /// Capture carry_0, mirroring [`Self::compute_carry_0`].
+    fn capture_carry_0(&self, b: &mut IrBuilder) -> Expr {
+        let pc_lo = b.main(0, cols::PC_0);
+        let next_pc_lo = b.main(0, cols::NEXT_PC_0);
+        let half_len = b.main(0, cols::HALF_INSTRUCTION_LENGTH);
+        let instr_len = b.add(half_len, half_len); // real byte length = 2 * half
+        let inv_2_32 = b.const_base(super::templates::INV_SHIFT_32);
+        let s = b.add(pc_lo, instr_len);
+        let s = b.sub(s, next_pc_lo);
+        b.mul(s, inv_2_32)
+    }
+
+    /// Capture carry_1, mirroring [`Self::compute_carry_1`].
+    fn capture_carry_1(&self, b: &mut IrBuilder) -> Expr {
+        let pc_hi = b.main(0, cols::PC_1);
+        let next_pc_hi = b.main(0, cols::NEXT_PC_1);
+        let carry_0 = self.capture_carry_0(b);
+        let inv_2_32 = b.const_base(super::templates::INV_SHIFT_32);
+        let s = b.add(pc_hi, carry_0);
+        let s = b.sub(s, next_pc_hi);
+        b.mul(s, inv_2_32)
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddConstraint {
@@ -579,6 +771,24 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for NextPcAddCon
             _ => unreachable!("carry_idx validated <= 1 at construction"),
         };
         not_branch * &carry * (one - carry)
+    }
+}
+
+impl Capture for NextPcAddConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let branch_cond = b.main(0, cols::BRANCH_COND);
+        let one = b.one();
+        let not_branch = b.sub(one, branch_cond);
+        let carry = match self.carry_idx {
+            0 => self.capture_carry_0(b),
+            1 => self.capture_carry_1(b),
+            _ => unreachable!("carry_idx validated <= 1 at construction"),
+        };
+        let one2 = b.one();
+        let one_minus_carry = b.sub(one2, carry);
+        let not_branch_carry = b.mul(not_branch, carry);
+        let root = b.mul(not_branch_carry, one_minus_carry);
+        b.emit(self.constraint_idx, root);
     }
 }
 

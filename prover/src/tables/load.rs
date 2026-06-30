@@ -25,6 +25,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -594,6 +595,75 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LoadConstrai
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for LoadConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let ff = b.const_base(255);
+
+        let mu = b.main(0, cols::MU);
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let signed = b.main(0, cols::SIGNED);
+        let sign_bit = b.main(0, cols::SIGN_BIT);
+
+        let root = match self.kind {
+            LoadConstraintKind::ReadImpliesMu => {
+                // (read2 + read4 + read8) * (1 - mu)
+                let read_sum = b.add(read2, read4);
+                let read_sum = b.add(read_sum, read8);
+                let one_minus_mu = b.sub(one, mu);
+                b.mul(read_sum, one_minus_mu)
+            }
+            LoadConstraintKind::ExtensionHigh(i) => {
+                // (1 - read8) * (res[i] - signed * sign_bit * 255)
+                let res_i = b.main(0, cols::RES[i]);
+                let signed_sign_bit = b.mul(signed, sign_bit);
+                let expected = b.mul(signed_sign_bit, ff);
+                let diff = b.sub(res_i, expected);
+                let one_minus_read8 = b.sub(one, read8);
+                b.mul(one_minus_read8, diff)
+            }
+            LoadConstraintKind::ExtensionMid(i) => {
+                // (1 - read4 - read8) * (res[i] - signed * sign_bit * 255)
+                let res_i = b.main(0, cols::RES[i]);
+                let signed_sign_bit = b.mul(signed, sign_bit);
+                let expected = b.mul(signed_sign_bit, ff);
+                let diff = b.sub(res_i, expected);
+                let coeff = b.sub(one, read4);
+                let coeff = b.sub(coeff, read8);
+                b.mul(coeff, diff)
+            }
+            LoadConstraintKind::ExtensionLow => {
+                // (1 - read2 - read4 - read8) * (res[1] - signed * sign_bit * 255)
+                let res_1 = b.main(0, cols::RES[1]);
+                let signed_sign_bit = b.mul(signed, sign_bit);
+                let expected = b.mul(signed_sign_bit, ff);
+                let diff = b.sub(res_1, expected);
+                let coeff = b.sub(one, read2);
+                let coeff = b.sub(coeff, read4);
+                let coeff = b.sub(coeff, read8);
+                b.mul(coeff, diff)
+            }
+            LoadConstraintKind::FlagIsBit(col) => {
+                // flag * (1 - flag)
+                let flag = b.main(0, col);
+                let one_minus_flag = b.sub(one, flag);
+                b.mul(flag, one_minus_flag)
+            }
+            LoadConstraintKind::WidthSumIsBit => {
+                // sum * (1 - sum), sum = read2 + read4 + read8
+                let sum = b.add(read2, read4);
+                let sum = b.add(sum, read8);
+                let one_minus_sum = b.sub(one, sum);
+                b.mul(sum, one_minus_sum)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

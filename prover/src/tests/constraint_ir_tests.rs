@@ -51,7 +51,7 @@ where
 {
     let mut b = IrBuilder::new();
     c.capture(&mut b);
-    let prog = b.finish();
+    let prog = b.finish(0);
     eprintln!("[{label}] captured {} IR nodes", prog.len());
 
     let mut rng = SplitMix64::new(0xDEAD_BEEF_CAFE_F00D ^ (label.len() as u64));
@@ -67,7 +67,7 @@ where
             c.evaluate::<GoldilocksField, GoldilocksExtension>(&real_step);
 
         // IR interpreter over the same row.
-        let got = eval_program_base(&prog, &row);
+        let got = eval_program_base(&prog, c.constraint_idx(), &row);
 
         assert_eq!(
             real, got,
@@ -110,4 +110,257 @@ fn test_ir_matches_product_zero() {
     // col_a * col_b, columns 12 and 17.
     let c = ProductZeroConstraint::new(12, 17, 0);
     assert_ir_matches_evaluate(&c, "product_zero");
+}
+
+// =============================================================================
+// Phase 1 GATE: full-table, full-program differential test (CPU, LogUp-heavy).
+//
+// `create_cpu_air` assembles every algebraic CPU constraint AND, via
+// `AirWithBuses::new`, the 2 LogUp constraints for its bus interactions
+// (DECODE/ALU/MEMORY/CPU32/MEMW/BRANCH/ECALL). Capturing its full program and
+// interpreting it over a real LDE must reproduce `air.compute_transition_prover`
+// (prover) and `air.compute_transition` (verifier, at the OOD point) bit-for-bit.
+// =============================================================================
+mod full_table_gate {
+    use crate::tables::cpu::{CpuOperation, generate_cpu_trace};
+    use crate::tables::eq::{EqOperation, generate_eq_trace};
+    use crate::tables::types::DecodeEntry;
+    use crate::test_utils::{VmAir, create_cpu_air, create_eq_air};
+
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use executor::vm::instruction::decoding::{ArithOp, Instruction};
+    use executor::vm::logs::Log;
+    use math::field::element::FieldElement;
+    use stark::constraint_ir::{eval_program, eval_program_verifier};
+    use stark::frame::Frame;
+    use stark::proof::options::ProofOptions;
+    use stark::table::TableView;
+    use stark::trace::{LDETraceTable, TraceTable};
+    use stark::traits::{AIR, TransitionEvaluationContext};
+
+    use super::{GoldilocksExtension, GoldilocksField};
+
+    const PC: u64 = 0x1000;
+
+    /// Build a `CpuOperation` from an instruction + register values (mirrors
+    /// `prover/src/tests/cpu_tests.rs::op_of`, duplicated here to keep this
+    /// gate test self-contained).
+    fn op_of(instr: Instruction, src1: u64, src2: u64, dst: u64, next_pc: u64) -> CpuOperation {
+        let decode = DecodeEntry::from_instruction(PC, instr, 4);
+        let log = Log {
+            current_pc: PC,
+            next_pc,
+            src1_val: src1,
+            src2_val: src2,
+            dst_val: dst,
+        };
+        CpuOperation::from_log(&log, 4, decode)
+    }
+
+    /// A handful of real CPU operations exercising different bus interactions
+    /// (ALU add, ALU sub) so the captured LogUp program sees non-trivial
+    /// fingerprints/multiplicities on every row, not just padding zeros.
+    fn sample_operations() -> Vec<CpuOperation> {
+        vec![
+            op_of(
+                Instruction::Arith {
+                    dst: 3,
+                    src1: 1,
+                    src2: 2,
+                    op: ArithOp::Add,
+                },
+                10,
+                20,
+                30,
+                PC + 4,
+            ),
+            op_of(
+                Instruction::Arith {
+                    dst: 3,
+                    src1: 1,
+                    src2: 2,
+                    op: ArithOp::Sub,
+                },
+                50,
+                20,
+                30,
+                PC + 4,
+            ),
+        ]
+    }
+
+    /// A handful of real EQ operations (BEQ-style and BNE-style) so the
+    /// captured LogUp program (1 batched pair + 1 absorbed interaction, the
+    /// branch not exercised by the CPU table below) sees non-trivial
+    /// fingerprints on every row.
+    fn sample_eq_operations() -> Vec<EqOperation> {
+        vec![
+            EqOperation::new(42, 42, false),
+            EqOperation::new(7, 9, true),
+        ]
+    }
+
+    #[test]
+    fn test_cpu_table_full_program_matches_boxed_path_prover_and_verifier() {
+        let air = create_cpu_air(&ProofOptions::default_test_options());
+        let trace = generate_cpu_trace(&sample_operations());
+        assert_full_table_ir_matches_boxed_path(&air, trace, "cpu_full_table");
+    }
+
+    #[test]
+    fn test_eq_table_full_program_matches_boxed_path_prover_and_verifier() {
+        let air = create_eq_air(&ProofOptions::default_test_options());
+        let trace = generate_eq_trace(&sample_eq_operations());
+        assert_full_table_ir_matches_boxed_path(&air, trace, "eq_full_table");
+    }
+
+    /// Capture `air`'s full program, then for every prover-side LDE row and one
+    /// verifier-side OOD point, assert the IR interpreter reproduces the boxed
+    /// `compute_transition_prover`/`compute_transition` path bit-for-bit.
+    fn assert_full_table_ir_matches_boxed_path(
+        air: &VmAir,
+        mut trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+        label: &str,
+    ) {
+        // Build the aux (LogUp) trace + rap challenges, exactly as the prover
+        // pipeline would (minus the surrounding LDE/FRI machinery, which the
+        // constraint evaluator doesn't touch).
+        let mut transcript = DefaultTranscript::<GoldilocksExtension>::new(&[]);
+        let rap_challenges = air.build_rap_challenges(&mut transcript);
+        air.build_auxiliary_trace(&mut trace, &rap_challenges);
+
+        let num_rows = trace.num_rows();
+        assert!(num_rows >= 2, "need >=2 rows for the LogUp next-row read");
+
+        let main_columns: Vec<Vec<FieldElement<GoldilocksField>>> = (0..trace.num_main_columns)
+            .map(|col| {
+                (0..num_rows)
+                    .map(|row| *trace.main_table.get(row, col))
+                    .collect()
+            })
+            .collect();
+        let aux_columns: Vec<Vec<FieldElement<GoldilocksExtension>>> = (0..trace.num_aux_columns)
+            .map(|col| {
+                (0..num_rows)
+                    .map(|row| *trace.aux_table.get(row, col))
+                    .collect()
+            })
+            .collect();
+        let lde_trace =
+            LDETraceTable::from_columns(main_columns.clone(), aux_columns.clone(), 1, 1);
+
+        let prog = air.constraint_program();
+        eprintln!(
+            "[{label}] captured {} IR nodes, {} constraints (num_base={})",
+            prog.len(),
+            prog.roots.len(),
+            prog.num_base
+        );
+        assert_eq!(
+            prog.roots.len(),
+            air.num_transition_constraints(),
+            "every constraint_idx must have been emitted"
+        );
+        assert_eq!(prog.num_base, air.num_base_transition_constraints());
+
+        let num_base = air.num_base_transition_constraints();
+        let num_transition = air.num_transition_constraints();
+        let no_periodic: Vec<FieldElement<GoldilocksField>> = Vec::new();
+        let logup_alpha_powers = {
+            // Mirrors `ConstraintEvaluator::evaluate_transitions`'s alpha-power
+            // precompute (`compute_alpha_powers`, crate-private in `stark`):
+            // [1, alpha, alpha^2, ...], rap_challenges[1] is alpha.
+            use stark::lookup::LOGUP_CHALLENGE_ALPHA;
+            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                let alpha = &rap_challenges[LOGUP_CHALLENGE_ALPHA];
+                let count = air.max_bus_elements();
+                let mut powers = Vec::with_capacity(count);
+                let mut cur = FieldElement::<GoldilocksExtension>::one();
+                for _ in 0..count {
+                    powers.push(cur);
+                    cur *= alpha;
+                }
+                powers
+            } else {
+                Vec::new()
+            }
+        };
+        let logup_table_offset = FieldElement::<GoldilocksExtension>::zero();
+        let packing_shifts = stark::lookup::PackingShifts::<GoldilocksField>::new();
+
+        // --- Prover-side: every row, boxed path vs IR interpreter ---
+        let offsets = &air.context().transition_offsets;
+        for step in 0..lde_trace.num_steps() {
+            let frame: Frame<GoldilocksField, GoldilocksExtension> =
+                Frame::read_step_from_lde(&lde_trace, step, offsets);
+            let ctx = TransitionEvaluationContext::new_prover(
+                &frame,
+                &no_periodic,
+                &rap_challenges,
+                &logup_alpha_powers,
+                &logup_table_offset,
+                &packing_shifts,
+            );
+
+            let mut boxed_base = vec![FieldElement::<GoldilocksField>::zero(); num_base];
+            let mut boxed_ext = vec![FieldElement::<GoldilocksExtension>::zero(); num_transition];
+            air.compute_transition_prover(&ctx, &mut boxed_base, &mut boxed_ext);
+
+            let mut ir_base = vec![FieldElement::<GoldilocksField>::zero(); num_base];
+            let mut ir_ext = vec![FieldElement::<GoldilocksExtension>::zero(); num_transition];
+            eval_program(&prog, &ctx, &mut ir_base, &mut ir_ext);
+
+            assert_eq!(boxed_base, ir_base, "base evals mismatch at step {step}");
+            assert_eq!(
+                boxed_ext[num_base..],
+                ir_ext[num_base..],
+                "ext (LogUp) evals mismatch at step {step}"
+            );
+        }
+
+        // --- Verifier-side: at one "OOD" point, boxed path vs IR interpreter ---
+        // The verifier frame holds only extension-field elements; embed the
+        // same real row data (rows 0 and 1, matching transition_offsets=[0,1])
+        // into GoldilocksExtension to build it, exactly as `evaluate_zerofier`'s
+        // sibling machinery would after a real FRI opening.
+        let embed_row = |row: usize| -> (
+            Vec<FieldElement<GoldilocksExtension>>,
+            Vec<FieldElement<GoldilocksExtension>>,
+        ) {
+            let main: Vec<_> = main_columns
+                .iter()
+                .map(|col| col[row].to_extension())
+                .collect();
+            let aux: Vec<_> = aux_columns.iter().map(|col| col[row]).collect();
+            (main, aux)
+        };
+        let (main0, aux0) = embed_row(0);
+        let (main1, aux1) = embed_row(1);
+        let verifier_frame: Frame<GoldilocksExtension, GoldilocksExtension> = Frame::new(vec![
+            TableView::new(vec![main0], vec![aux0]),
+            TableView::new(vec![main1], vec![aux1]),
+        ]);
+        let no_periodic_ext: Vec<FieldElement<GoldilocksExtension>> = no_periodic
+            .iter()
+            .map(|x: &FieldElement<GoldilocksField>| (*x).to_extension())
+            .collect();
+        let verifier_packing_shifts = stark::lookup::PackingShifts::<GoldilocksExtension>::new();
+        let verifier_ctx = TransitionEvaluationContext::new_verifier(
+            &verifier_frame,
+            &no_periodic_ext,
+            &rap_challenges,
+            &logup_alpha_powers,
+            &logup_table_offset,
+            &verifier_packing_shifts,
+        );
+
+        let boxed_verifier = air.compute_transition(&verifier_ctx);
+        let mut ir_verifier = vec![FieldElement::<GoldilocksExtension>::zero(); num_transition];
+        eval_program_verifier(&prog, &verifier_ctx, &mut ir_verifier);
+
+        assert_eq!(
+            boxed_verifier, ir_verifier,
+            "verifier evals mismatch at OOD point"
+        );
+    }
 }

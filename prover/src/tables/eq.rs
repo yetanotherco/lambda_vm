@@ -23,6 +23,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -279,6 +280,24 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EqXorConstra
         let two = FieldElement::<F>::from(2u64);
         // res - (eq + invert - 2*eq*invert)
         res - (&eq + &invert - two * &eq * &invert)
+    }
+}
+
+impl Capture for EqXorConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let res = b.main(0, cols::RES);
+        let eq = b.main(0, cols::EQ);
+        let invert = b.main(0, cols::INVERT);
+        let two = b.const_base(2);
+
+        // res - (eq + invert - 2*eq*invert)
+        let two_eq = b.mul(two, eq);
+        let two_eq_invert = b.mul(two_eq, invert);
+        let sum = b.add(eq, invert);
+        let inner = b.sub(sum, two_eq_invert);
+        let root = b.sub(res, inner);
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

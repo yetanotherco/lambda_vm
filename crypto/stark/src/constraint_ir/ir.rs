@@ -40,6 +40,15 @@ pub enum Op {
         /// Column index.
         col: u16,
     },
+    /// A periodic column read: `periodic_values[idx]` at the current row (`D1`).
+    Periodic { idx: u16 },
+    /// A LogUp RAP challenge: `rap_challenges[idx]` (`D3`, uniform per proof).
+    RapChallenge { idx: u16 },
+    /// A precomputed LogUp alpha power: `logup_alpha_powers[idx]` (`D3`, uniform
+    /// per proof).
+    AlphaPow { idx: u16 },
+    /// The LogUp table offset `L/N` (`D3`, uniform per proof).
+    TableOffset,
     /// `nodes[a] + nodes[b]`.
     Add(u32, u32),
     /// `nodes[a] - nodes[b]`.
@@ -63,8 +72,13 @@ pub struct ConstraintProgram {
     pub nodes: Vec<Op>,
     /// Per-node result dimension, parallel to `nodes`.
     pub dims: Vec<Dim>,
-    /// Per-constraint root node ids.
+    /// Per-constraint root node ids, indexed by `constraint_idx`.
     pub roots: Vec<u32>,
+    /// Number of constraints (a prefix of `roots`) that are base-field (`D1`)
+    /// rooted, matching `AIR::num_base_transition_constraints()`. The prover
+    /// interpreter writes these into `base_evals`; the rest (LogUp, always
+    /// `D3`) go into `ext_evals[num_base..]`.
+    pub num_base: usize,
 }
 
 impl ConstraintProgram {

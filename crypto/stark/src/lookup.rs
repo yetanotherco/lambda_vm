@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use crate::{
+    constraint_ir::{Expr, IrBuilder},
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         transition::TransitionConstraintEvaluator,
@@ -1708,6 +1709,303 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z - &linear_combination
 }
 
+// =============================================================================
+// IR capture (constraint-ir): fingerprint / multiplicity / packing
+// =============================================================================
+//
+// These mirror `Multiplicity::evaluate_with`, `Packing::accumulate_fingerprint_with`,
+// `BusValue::accumulate_fingerprint_from_step`, and `compute_fingerprint_from_step`
+// above, but build `IrBuilder` nodes instead of evaluating `FieldElement`s. All
+// take an explicit `offset` (frame step: 0 = current row, 1 = next row) because
+// `LookupAccumulatedConstraint`'s absorbed interactions read the next row,
+// whereas `LookupBatchedTermConstraint` reads the current row (see capture
+// impls below). Packing shifts (8/16/24) are base-field constants — `const_base`
+// reproduces `PackingShifts` exactly, so no separate uniform leaf is needed.
+//
+// Honesty note (matches the runtime body): `BusValue::Linear`'s data-dependent
+// "skip the multiply when the row value is zero" optimization is **not**
+// reproduced here — the IR is row-agnostic and always emits the multiply. This
+// is value-preserving (adding `0·α` is a no-op) and only costs a few extra
+// D1×D3 muls/row; see `thoughts/gpu-constraint-eval/roadmap.md`.
+
+/// Capture the multiplicity for an interaction, mirroring
+/// [`Multiplicity::evaluate_with`] (via [`compute_multiplicity_from_step`]).
+fn capture_multiplicity(b: &mut IrBuilder, multiplicity: &Multiplicity, offset: u8) -> Expr {
+    match multiplicity {
+        Multiplicity::One => b.one(),
+        Multiplicity::Column(col) => b.main(offset, *col),
+        Multiplicity::Sum(a, c) => {
+            let va = b.main(offset, *a);
+            let vc = b.main(offset, *c);
+            b.add(va, vc)
+        }
+        Multiplicity::Negated(col) => {
+            let one = b.one();
+            let v = b.main(offset, *col);
+            b.sub(one, v)
+        }
+        Multiplicity::Diff(a, c) => {
+            let va = b.main(offset, *a);
+            let vc = b.main(offset, *c);
+            b.sub(va, vc)
+        }
+        Multiplicity::Sum3(a, c, d) => {
+            let va = b.main(offset, *a);
+            let vc = b.main(offset, *c);
+            let vd = b.main(offset, *d);
+            let r = b.add(va, vc);
+            b.add(r, vd)
+        }
+        Multiplicity::Linear(terms) => capture_linear_terms(b, terms, offset),
+    }
+}
+
+/// Capture a slice of `LinearTerm`s as a sum, mirroring the `Multiplicity::Linear`
+/// arm of [`Multiplicity::evaluate_with`] (`result = Σ terms`, starting at zero).
+fn capture_linear_terms(b: &mut IrBuilder, terms: &[LinearTerm], offset: u8) -> Expr {
+    let mut result = b.const_base(0);
+    for term in terms {
+        match *term {
+            LinearTerm::Column {
+                coefficient,
+                column,
+            } => {
+                let col = b.main(offset, column);
+                let coeff = b.const_signed(coefficient);
+                let term_e = b.mul(col, coeff);
+                result = b.add(result, term_e);
+            }
+            LinearTerm::ColumnUnsigned {
+                coefficient,
+                column,
+            } => {
+                let col = b.main(offset, column);
+                let coeff = b.const_base(coefficient);
+                let term_e = b.mul(col, coeff);
+                result = b.add(result, term_e);
+            }
+            LinearTerm::Constant(value) => {
+                let c = b.const_signed(value);
+                result = b.add(result, c);
+            }
+        }
+    }
+    result
+}
+
+/// Capture a `Packing`'s fingerprint contribution, mirroring
+/// [`Packing::accumulate_fingerprint_with`]. `acc` is updated in place (like the
+/// real `&mut acc`); `alpha_powers` is the captured `Expr` for each needed
+/// `alpha_power` leaf, fetched lazily via `alpha_power_at`. Returns the number of
+/// alpha powers consumed (`= packing.num_bus_elements()`).
+fn capture_packing_fingerprint(
+    b: &mut IrBuilder,
+    packing: Packing,
+    start_col: usize,
+    offset: u8,
+    alpha_offset: usize,
+    acc: &mut Expr,
+) -> usize {
+    let alpha = |i: usize, b: &mut IrBuilder| b.alpha_power(alpha_offset + i);
+    let col = |c: usize, b: &mut IrBuilder| b.main(offset, c);
+
+    match packing {
+        Packing::Direct => {
+            let v = col(start_col, b);
+            let ap = alpha(0, b);
+            let t = b.mul(v, ap);
+            *acc = b.add(*acc, t);
+            1
+        }
+        Packing::Word2L => {
+            let shift_16 = b.const_base(SHIFT_16);
+            let c0 = col(start_col, b);
+            let c1 = col(start_col + 1, b);
+            let c1_shifted = b.mul(c1, shift_16);
+            let combined = b.add(c0, c1_shifted);
+            let ap = alpha(0, b);
+            let t = b.mul(combined, ap);
+            *acc = b.add(*acc, t);
+            1
+        }
+        Packing::Word4L => {
+            let shift_8 = b.const_base(SHIFT_8);
+            let shift_16 = b.const_base(SHIFT_16);
+            let shift_24 = b.const_base(SHIFT_8 * SHIFT_16);
+            let c0 = col(start_col, b);
+            let c1 = col(start_col + 1, b);
+            let c2 = col(start_col + 2, b);
+            let c3 = col(start_col + 3, b);
+            let c1s = b.mul(c1, shift_8);
+            let c2s = b.mul(c2, shift_16);
+            let c3s = b.mul(c3, shift_24);
+            let combined = b.add(c0, c1s);
+            let combined = b.add(combined, c2s);
+            let combined = b.add(combined, c3s);
+            let ap = alpha(0, b);
+            let t = b.mul(combined, ap);
+            *acc = b.add(*acc, t);
+            1
+        }
+        Packing::DWordWL => {
+            let c0 = col(start_col, b);
+            let ap0 = alpha(0, b);
+            let t0 = b.mul(c0, ap0);
+            *acc = b.add(*acc, t0);
+            let c1 = col(start_col + 1, b);
+            let ap1 = alpha(1, b);
+            let t1 = b.mul(c1, ap1);
+            *acc = b.add(*acc, t1);
+            2
+        }
+        Packing::DWordHHW => {
+            let c0 = col(start_col, b);
+            let ap0 = alpha(0, b);
+            let t0 = b.mul(c0, ap0);
+            *acc = b.add(*acc, t0);
+            let shift_16 = b.const_base(SHIFT_16);
+            let c1 = col(start_col + 1, b);
+            let c2 = col(start_col + 2, b);
+            let c2_shifted = b.mul(c2, shift_16);
+            let w = b.add(c1, c2_shifted);
+            let ap1 = alpha(1, b);
+            let t1 = b.mul(w, ap1);
+            *acc = b.add(*acc, t1);
+            2
+        }
+        Packing::DWordWHH => {
+            let shift_16 = b.const_base(SHIFT_16);
+            let c0 = col(start_col, b);
+            let c1 = col(start_col + 1, b);
+            let c1_shifted = b.mul(c1, shift_16);
+            let w = b.add(c0, c1_shifted);
+            let ap0 = alpha(0, b);
+            let t0 = b.mul(w, ap0);
+            *acc = b.add(*acc, t0);
+            let c2 = col(start_col + 2, b);
+            let ap1 = alpha(1, b);
+            let t1 = b.mul(c2, ap1);
+            *acc = b.add(*acc, t1);
+            2
+        }
+        Packing::DWordHL => {
+            let shift_16 = b.const_base(SHIFT_16);
+            let c0 = col(start_col, b);
+            let c1 = col(start_col + 1, b);
+            let c1_shifted = b.mul(c1, shift_16);
+            let w0 = b.add(c0, c1_shifted);
+            let ap0 = alpha(0, b);
+            let t0 = b.mul(w0, ap0);
+            *acc = b.add(*acc, t0);
+            let c2 = col(start_col + 2, b);
+            let c3 = col(start_col + 3, b);
+            let c3_shifted = b.mul(c3, shift_16);
+            let w1 = b.add(c2, c3_shifted);
+            let ap1 = alpha(1, b);
+            let t1 = b.mul(w1, ap1);
+            *acc = b.add(*acc, t1);
+            2
+        }
+        Packing::DWordBL => {
+            let shift_8 = b.const_base(SHIFT_8);
+            let shift_16 = b.const_base(SHIFT_16);
+            let shift_24 = b.const_base(SHIFT_8 * SHIFT_16);
+            let c0 = col(start_col, b);
+            let c1 = col(start_col + 1, b);
+            let c2 = col(start_col + 2, b);
+            let c3 = col(start_col + 3, b);
+            let c1s = b.mul(c1, shift_8);
+            let c2s = b.mul(c2, shift_16);
+            let c3s = b.mul(c3, shift_24);
+            let w0 = b.add(c0, c1s);
+            let w0 = b.add(w0, c2s);
+            let w0 = b.add(w0, c3s);
+            let ap0 = alpha(0, b);
+            let t0 = b.mul(w0, ap0);
+            *acc = b.add(*acc, t0);
+            let c4 = col(start_col + 4, b);
+            let c5 = col(start_col + 5, b);
+            let c6 = col(start_col + 6, b);
+            let c7 = col(start_col + 7, b);
+            let c5s = b.mul(c5, shift_8);
+            let c6s = b.mul(c6, shift_16);
+            let c7s = b.mul(c7, shift_24);
+            let w1 = b.add(c4, c5s);
+            let w1 = b.add(w1, c6s);
+            let w1 = b.add(w1, c7s);
+            let ap1 = alpha(1, b);
+            let t1 = b.mul(w1, ap1);
+            *acc = b.add(*acc, t1);
+            2
+        }
+        Packing::QuadHL => {
+            let shift_16 = b.const_base(SHIFT_16);
+            for i in 0..4 {
+                let c = start_col + i * 2;
+                let c0 = col(c, b);
+                let c1 = col(c + 1, b);
+                let c1_shifted = b.mul(c1, shift_16);
+                let w = b.add(c0, c1_shifted);
+                let ap = alpha(i, b);
+                let t = b.mul(w, ap);
+                *acc = b.add(*acc, t);
+            }
+            4
+        }
+        Packing::QuadWL => {
+            for i in 0..4 {
+                let v = col(start_col + i, b);
+                let ap = alpha(i, b);
+                let t = b.mul(v, ap);
+                *acc = b.add(*acc, t);
+            }
+            4
+        }
+    }
+}
+
+/// Capture a `BusValue`'s fingerprint contribution, mirroring
+/// [`BusValue::accumulate_fingerprint_from_step`]. Returns the number of alpha
+/// powers consumed.
+fn capture_busvalue_fingerprint(
+    b: &mut IrBuilder,
+    bv: &BusValue,
+    offset: u8,
+    alpha_offset: usize,
+    acc: &mut Expr,
+) -> usize {
+    match bv {
+        BusValue::Packed {
+            start_column,
+            packing,
+        } => capture_packing_fingerprint(b, *packing, *start_column, offset, alpha_offset, acc),
+        BusValue::Linear(terms) => {
+            // Mirrors the runtime zero-skip's *value* (not its data-dependent
+            // skip, see the module-level honesty note): the IR always emits the
+            // multiply.
+            let result = capture_linear_terms(b, terms, offset);
+            let ap = b.alpha_power(alpha_offset);
+            let t = b.mul(result, ap);
+            *acc = b.add(*acc, t);
+            1
+        }
+    }
+}
+
+/// Capture an interaction's fingerprint, mirroring [`compute_fingerprint_from_step`]:
+/// `z - (bus_id + α·v[0] + α²·v[1] + ...)`.
+fn capture_fingerprint(b: &mut IrBuilder, interaction: &BusInteraction, offset: u8) -> Expr {
+    let z = b.challenge(0);
+    // α⁰ = 1: the bus-id term needs no multiply — a base constant added directly,
+    // matching `FieldElement::<B>::from(interaction.bus_id)`.
+    let mut lc = b.const_base(interaction.bus_id);
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        alpha_idx += capture_busvalue_fingerprint(b, bv, offset, alpha_idx, &mut lc);
+    }
+    b.sub(z, lc)
+}
+
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
 /// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
@@ -1827,6 +2125,37 @@ where
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
+    }
+
+    fn capture(&self, b: &mut IrBuilder) {
+        // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a
+        // Mirrors `evaluate_batched_term_constraint` above: `is_sender` is a
+        // compile-time bool, resolved here as `add` vs `neg` instead of an E×E
+        // sign multiply (same optimization as the runtime body).
+        let c = b.aux(0, self.term_column_idx);
+        let m_a = capture_multiplicity(b, &self.interaction_a.multiplicity, 0);
+        let m_b = capture_multiplicity(b, &self.interaction_b.multiplicity, 0);
+        let fp_a = capture_fingerprint(b, &self.interaction_a, 0);
+        let fp_b = capture_fingerprint(b, &self.interaction_b, 0);
+
+        let term_a = b.mul(m_a, fp_b);
+        let term_a = if self.interaction_a.is_sender {
+            term_a
+        } else {
+            b.neg(term_a)
+        };
+        let term_b = b.mul(m_b, fp_a);
+        let term_b = if self.interaction_b.is_sender {
+            term_b
+        } else {
+            b.neg(term_b)
+        };
+
+        let main = b.mul(c, fp_a);
+        let main = b.mul(main, fp_b);
+        let root = b.sub(main, term_a);
+        let root = b.sub(root, term_b);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -2002,5 +2331,70 @@ where
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
         }
+    }
+
+    fn capture(&self, b: &mut IrBuilder) {
+        // Mirrors `evaluate_accumulated_constraint` above. `acc_curr` reads the
+        // current row (offset 0); `acc_next`/`terms_sum`/the absorbed
+        // fingerprints+multiplicities all read the *next* row (offset 1) —
+        // this is the one constraint in the IR migration that needs offset 1.
+        let acc_curr = b.aux(0, self.acc_column_idx);
+        let acc_next = b.aux(1, self.acc_column_idx);
+
+        // Sum of all committed term columns at the next step.
+        let mut terms_sum = b.const_base(0);
+        for i in 0..self.num_term_columns {
+            let t = b.aux(1, i);
+            terms_sum = b.add(terms_sum, t);
+        }
+
+        // delta = acc_next - acc_curr - terms_sum + L/N
+        let offset = b.table_offset();
+        let delta = b.sub(acc_next, acc_curr);
+        let delta = b.sub(delta, terms_sum);
+        let delta = b.add(delta, offset);
+
+        let root = match self.absorbed.len() {
+            1 => {
+                // delta * f - sign * m
+                let m = capture_multiplicity(b, &self.absorbed[0].multiplicity, 1);
+                let f = capture_fingerprint(b, &self.absorbed[0], 1);
+                let mt = if self.absorbed[0].is_sender {
+                    m
+                } else {
+                    b.neg(m)
+                };
+                let lhs = b.mul(delta, f);
+                b.sub(lhs, mt)
+            }
+            2 => {
+                // delta * f1 * f2 - sign1*m1*f2 - sign2*m2*f1
+                let m1 = capture_multiplicity(b, &self.absorbed[0].multiplicity, 1);
+                let m2 = capture_multiplicity(b, &self.absorbed[1].multiplicity, 1);
+                let f1 = capture_fingerprint(b, &self.absorbed[0], 1);
+                let f2 = capture_fingerprint(b, &self.absorbed[1], 1);
+
+                let term1 = b.mul(m1, f2);
+                let term1 = if self.absorbed[0].is_sender {
+                    term1
+                } else {
+                    b.neg(term1)
+                };
+                let term2 = b.mul(m2, f1);
+                let term2 = if self.absorbed[1].is_sender {
+                    term2
+                } else {
+                    b.neg(term2)
+                };
+
+                let lhs = b.mul(delta, f1);
+                let lhs = b.mul(lhs, f2);
+                let r = b.sub(lhs, term1);
+                b.sub(r, term2)
+            }
+            _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }

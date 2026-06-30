@@ -113,6 +113,26 @@ impl IrBuilder {
         )
     }
 
+    /// A periodic column read at the current row (`D1`).
+    pub fn periodic(&mut self, idx: usize) -> Expr {
+        self.push(Op::Periodic { idx: idx as u16 }, Dim::D1)
+    }
+
+    /// A LogUp RAP challenge, uniform per proof (`D3`).
+    pub fn challenge(&mut self, idx: usize) -> Expr {
+        self.push(Op::RapChallenge { idx: idx as u16 }, Dim::D3)
+    }
+
+    /// A precomputed LogUp alpha power, uniform per proof (`D3`).
+    pub fn alpha_power(&mut self, idx: usize) -> Expr {
+        self.push(Op::AlphaPow { idx: idx as u16 }, Dim::D3)
+    }
+
+    /// The LogUp table offset `L/N`, uniform per proof (`D3`).
+    pub fn table_offset(&mut self) -> Expr {
+        self.push(Op::TableOffset, Dim::D3)
+    }
+
     // ---------------------------------------------------------------------
     // Constants
     // ---------------------------------------------------------------------
@@ -137,6 +157,16 @@ impl IrBuilder {
         let e = self.push(Op::Const1(canon), Dim::D1);
         self.const_cache.insert(canon, e.id);
         e
+    }
+
+    /// An extension-field constant `[c0, c1, c2]`, each component reduced.
+    /// Dedup is via the general `(Op, Dim)` hash-cons (`push`); no separate
+    /// cache is needed since `Const3` is `Eq + Hash`.
+    pub fn const_ext(&mut self, v: [u64; 3]) -> Expr {
+        let c0 = *FieldElement::<GoldilocksField>::from(v[0]).value();
+        let c1 = *FieldElement::<GoldilocksField>::from(v[1]).value();
+        let c2 = *FieldElement::<GoldilocksField>::from(v[2]).value();
+        self.push(Op::Const3([c0, c1, c2]), Dim::D3)
     }
 
     /// The base-field constant `1`.
@@ -185,19 +215,29 @@ impl IrBuilder {
 
     /// Record `e` as the root for constraint `constraint_idx`.
     ///
-    /// Roots are stored in emit order; the minimal spike emits exactly one root
-    /// per program, so `constraint_idx` is accepted for parity with the
-    /// production design but not used to index `roots` here.
-    pub fn emit(&mut self, _constraint_idx: usize, e: Expr) {
-        self.roots.push(e.id);
+    /// `roots` is indexed by `constraint_idx` (grown/filled with sentinel `0`
+    /// as needed), so constraints can be captured in any order and a full
+    /// per-table program (one `emit` per `TransitionConstraintEvaluator` in
+    /// `transition_constraints()`) ends up with `roots[c]` = constraint `c`'s
+    /// value, matching `AIR::num_transition_constraints()` indexing.
+    pub fn emit(&mut self, constraint_idx: usize, e: Expr) {
+        if self.roots.len() <= constraint_idx {
+            self.roots.resize(constraint_idx + 1, 0);
+        }
+        self.roots[constraint_idx] = e.id;
     }
 
     /// Consume the builder and produce the captured program.
-    pub fn finish(self) -> ConstraintProgram {
+    ///
+    /// `num_base` is the number of leading (by `constraint_idx`) constraints
+    /// that are base-field (`D1`) rooted, matching
+    /// `AIR::num_base_transition_constraints()`.
+    pub fn finish(self, num_base: usize) -> ConstraintProgram {
         ConstraintProgram {
             nodes: self.nodes,
             dims: self.dims,
             roots: self.roots,
+            num_base,
         }
     }
 }

@@ -28,6 +28,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -514,6 +515,59 @@ impl BranchConstraint {
             }
         }
     }
+
+    /// Capture virtual next_pc_unmasked as DWordWL, mirroring
+    /// [`Self::compute_next_pc_unmasked`].
+    fn capture_next_pc_unmasked(b: &mut IrBuilder) -> (Expr, Expr) {
+        let unmasked_low_byte = b.main(0, cols::UNMASKED_LOW_BYTE);
+        let next_pc_low_1 = b.main(0, cols::NEXT_PC_LOW_1);
+        let next_pc_high_0 = b.main(0, cols::NEXT_PC_HIGH_0);
+        let next_pc_high_1 = b.main(0, cols::NEXT_PC_HIGH_1);
+        let next_pc_high_2 = b.main(0, cols::NEXT_PC_HIGH_2);
+
+        let shift_8 = b.const_base(SHIFT_8);
+        let shift_16 = b.const_base(SHIFT_16);
+
+        // unmasked_low_byte + next_pc_low_1 * shift_8 + next_pc_high_0 * shift_16
+        let t1 = b.mul(next_pc_low_1, shift_8);
+        let t2 = b.mul(next_pc_high_0, shift_16);
+        let unmasked_0 = b.add(unmasked_low_byte, t1);
+        let unmasked_0 = b.add(unmasked_0, t2);
+
+        // next_pc_high_1 + next_pc_high_2 * shift_16
+        let t3 = b.mul(next_pc_high_2, shift_16);
+        let unmasked_1 = b.add(next_pc_high_1, t3);
+
+        (unmasked_0, unmasked_1)
+    }
+
+    /// Capture carry_0 for a given base column, mirroring [`Self::compute_carry_0_for`].
+    fn capture_carry_0_for(base_col_0: usize, b: &mut IrBuilder) -> Expr {
+        let base_0 = b.main(0, base_col_0);
+        let offset_0 = b.main(0, cols::OFFSET_0);
+        let (unmasked_0, _) = Self::capture_next_pc_unmasked(b);
+
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        // (base_0 + offset_0 - unmasked_0) * inv_2_32
+        let s = b.add(base_0, offset_0);
+        let s = b.sub(s, unmasked_0);
+        b.mul(s, inv_2_32)
+    }
+
+    /// Capture carry_1 for a given base column pair, mirroring [`Self::compute_carry_1_for`].
+    fn capture_carry_1_for(base_col_0: usize, base_col_1: usize, b: &mut IrBuilder) -> Expr {
+        let base_1 = b.main(0, base_col_1);
+        let offset_1 = b.main(0, cols::OFFSET_1);
+        let carry_0 = Self::capture_carry_0_for(base_col_0, b);
+        let (_, unmasked_1) = Self::capture_next_pc_unmasked(b);
+
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        // (base_1 + offset_1 + carry_0 - unmasked_1) * inv_2_32
+        let s = b.add(base_1, offset_1);
+        let s = b.add(s, carry_0);
+        let s = b.sub(s, unmasked_1);
+        b.mul(s, inv_2_32)
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
@@ -536,6 +590,53 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstr
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for BranchConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let jalr = b.main(0, cols::JALR);
+        let one = b.one();
+
+        let root = match self.kind {
+            BranchConstraintKind::JalrIsBit => {
+                // jalr * (1 - jalr)
+                let one_minus_jalr = b.sub(one, jalr);
+                b.mul(jalr, one_minus_jalr)
+            }
+            BranchConstraintKind::PcCarry0IsBit => {
+                // (1 - jalr) * c * (1 - c)
+                let cond = b.sub(one, jalr);
+                let c = Self::capture_carry_0_for(cols::PC_0, b);
+                let one2 = b.one();
+                let one_minus_c = b.sub(one2, c);
+                let cond_c = b.mul(cond, c);
+                b.mul(cond_c, one_minus_c)
+            }
+            BranchConstraintKind::PcCarry1IsBit => {
+                let cond = b.sub(one, jalr);
+                let c = Self::capture_carry_1_for(cols::PC_0, cols::PC_1, b);
+                let one2 = b.one();
+                let one_minus_c = b.sub(one2, c);
+                let cond_c = b.mul(cond, c);
+                b.mul(cond_c, one_minus_c)
+            }
+            BranchConstraintKind::RegCarry0IsBit => {
+                // cond = jalr
+                let c = Self::capture_carry_0_for(cols::REGISTER_0, b);
+                let one_minus_c = b.sub(one, c);
+                let cond_c = b.mul(jalr, c);
+                b.mul(cond_c, one_minus_c)
+            }
+            BranchConstraintKind::RegCarry1IsBit => {
+                let c = Self::capture_carry_1_for(cols::REGISTER_0, cols::REGISTER_1, b);
+                let one_minus_c = b.sub(one, c);
+                let cond_c = b.mul(jalr, c);
+                b.mul(cond_c, one_minus_c)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

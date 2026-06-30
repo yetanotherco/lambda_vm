@@ -36,6 +36,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -720,6 +721,42 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedC
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for MemwAlignedConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let mu_read = b.main(0, cols::MU_READ);
+        let mu_write = b.main(0, cols::MU_WRITE);
+        let mu_sum = b.add(mu_read, mu_write);
+
+        let root = match self.kind {
+            MemwAlignedConstraintKind::MuSumIsBit => {
+                let one_minus_mu_sum = b.sub(one, mu_sum);
+                b.mul(mu_sum, one_minus_mu_sum)
+            }
+            MemwAlignedConstraintKind::W2ImpliesMuSum => {
+                let write2 = b.main(0, cols::WRITE2);
+                let write4 = b.main(0, cols::WRITE4);
+                let write8 = b.main(0, cols::WRITE8);
+                let w2 = b.add(write2, write4);
+                let w2 = b.add(w2, write8);
+                let one_minus_mu_sum = b.sub(one, mu_sum);
+                b.mul(w2, one_minus_mu_sum)
+            }
+            MemwAlignedConstraintKind::WidthSumIsBit => {
+                let write2 = b.main(0, cols::WRITE2);
+                let write4 = b.main(0, cols::WRITE4);
+                let write8 = b.main(0, cols::WRITE8);
+                let w2 = b.add(write2, write4);
+                let w2 = b.add(w2, write8);
+                let one_minus_w2 = b.sub(one, w2);
+                b.mul(w2, one_minus_w2)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

@@ -32,6 +32,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -842,6 +843,70 @@ impl MulConstraint {
 
         raw_product - sum
     }
+
+    /// Capture raw_product constraint for index `i`, mirroring
+    /// [`Self::compute_raw_product_constraint`]. The `for j`/`for k` loops are
+    /// bounded by `i` (compile-time), so they unroll into builder calls.
+    fn capture_raw_product_constraint(&self, i: usize, b: &mut IrBuilder) -> Expr {
+        let lhs: [Expr; 4] = [
+            b.main(0, cols::LHS_0),
+            b.main(0, cols::LHS_1),
+            b.main(0, cols::LHS_2),
+            b.main(0, cols::LHS_3),
+        ];
+        let rhs: [Expr; 4] = [
+            b.main(0, cols::RHS_0),
+            b.main(0, cols::RHS_1),
+            b.main(0, cols::RHS_2),
+            b.main(0, cols::RHS_3),
+        ];
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+
+        let sign_fill = b.const_base(SIGN_FILL);
+        let zero = b.const_base(0);
+        let mut lhs_ext: [Expr; 8] = [zero; 8];
+        let mut rhs_ext: [Expr; 8] = [zero; 8];
+        lhs_ext[..4].copy_from_slice(&lhs);
+        rhs_ext[..4].copy_from_slice(&rhs);
+        for j in 4..8 {
+            lhs_ext[j] = b.mul(sign_fill, lhs_is_neg);
+            rhs_ext[j] = b.mul(sign_fill, rhs_is_neg);
+        }
+
+        let shift_16 = b.const_base(SHIFT_16);
+        let mut sum = zero;
+
+        for k in 0..=1u32 {
+            let idx = 2 * i + k as usize;
+            if idx < 8 {
+                let mut inner_sum = zero;
+                for j in 0..=idx {
+                    if j < 8 && (idx - j) < 8 {
+                        let term = b.mul(lhs_ext[j], rhs_ext[idx - j]);
+                        inner_sum = b.add(inner_sum, term);
+                    }
+                }
+                if k == 0 {
+                    sum = b.add(sum, inner_sum);
+                } else {
+                    let scaled = b.mul(inner_sum, shift_16);
+                    sum = b.add(sum, scaled);
+                }
+            }
+        }
+
+        let raw_col = match i {
+            0 => cols::RAW_PRODUCT_0,
+            1 => cols::RAW_PRODUCT_1,
+            2 => cols::RAW_PRODUCT_2,
+            3 => cols::RAW_PRODUCT_3,
+            _ => unreachable!(),
+        };
+        let raw_product = b.main(0, raw_col);
+
+        b.sub(raw_product, sum)
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstraint {
@@ -868,6 +933,38 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstrain
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for MulConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let root = match self.kind {
+            MulConstraintKind::LhsSign => {
+                // (1 - lhs_signed) * lhs_is_negative
+                let lhs_signed = b.main(0, cols::LHS_SIGNED);
+                let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+                let one = b.one();
+                let one_minus_signed = b.sub(one, lhs_signed);
+                b.mul(one_minus_signed, lhs_is_neg)
+            }
+            MulConstraintKind::RhsSign => {
+                // (1 - rhs_signed) * rhs_is_negative
+                let rhs_signed = b.main(0, cols::RHS_SIGNED);
+                let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+                let one = b.one();
+                let one_minus_signed = b.sub(one, rhs_signed);
+                b.mul(one_minus_signed, rhs_is_neg)
+            }
+            MulConstraintKind::SignedIsBit(col) => {
+                // x * (1 - x)
+                let x = b.main(0, col);
+                let one = b.one();
+                let one_minus_x = b.sub(one, x);
+                b.mul(x, one_minus_x)
+            }
+            MulConstraintKind::RawProduct(i) => self.capture_raw_product_constraint(i, b),
+        };
+        b.emit(self.constraint_idx, root);
     }
 }
 

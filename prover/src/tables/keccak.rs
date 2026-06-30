@@ -18,6 +18,7 @@
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -517,6 +518,69 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for KeccakAddressNoOverflowConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        // mirrors compute(): addr_lo/addr_hi as little-endian byte combinations,
+        // ptr_lo/ptr_hi from the top-lane state_ptr halfwords, then the ADD-style
+        // carry chain, gated by mu.
+        let addr_0 = b.main(0, cols::addr(0));
+        let addr_1 = b.main(0, cols::addr(1));
+        let addr_2 = b.main(0, cols::addr(2));
+        let addr_3 = b.main(0, cols::addr(3));
+        let c256 = b.const_base(256);
+        let c65536 = b.const_base(65536);
+        let c16777216 = b.const_base(16777216);
+
+        let t1 = b.mul(addr_1, c256);
+        let addr_lo = b.add(addr_0, t1);
+        let t2 = b.mul(addr_2, c65536);
+        let addr_lo = b.add(addr_lo, t2);
+        let t3 = b.mul(addr_3, c16777216);
+        let addr_lo = b.add(addr_lo, t3);
+
+        let addr_4 = b.main(0, cols::addr(4));
+        let addr_5 = b.main(0, cols::addr(5));
+        let addr_6 = b.main(0, cols::addr(6));
+        let addr_7 = b.main(0, cols::addr(7));
+
+        let t4 = b.mul(addr_5, c256);
+        let addr_hi = b.add(addr_4, t4);
+        let t5 = b.mul(addr_6, c65536);
+        let addr_hi = b.add(addr_hi, t5);
+        let t6 = b.mul(addr_7, c16777216);
+        let addr_hi = b.add(addr_hi, t6);
+
+        let ptr_24_0 = b.main(0, cols::state_ptr(24, 0));
+        let ptr_24_1 = b.main(0, cols::state_ptr(24, 1));
+        let ptr_24_2 = b.main(0, cols::state_ptr(24, 2));
+        let ptr_24_3 = b.main(0, cols::state_ptr(24, 3));
+
+        let t7 = b.mul(ptr_24_1, c65536);
+        let ptr_lo = b.add(ptr_24_0, t7);
+        let t8 = b.mul(ptr_24_3, c65536);
+        let ptr_hi = b.add(ptr_24_2, t8);
+
+        let inv_2_32 = b.const_base(INV_SHIFT_32);
+        let c192 = b.const_base(192);
+
+        // carry_0 = (addr_lo + 192 - ptr_lo) * inv_2_32
+        let s = b.add(addr_lo, c192);
+        let s = b.sub(s, ptr_lo);
+        let carry_0 = b.mul(s, inv_2_32);
+
+        // carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32
+        let s2 = b.add(addr_hi, carry_0);
+        let s2 = b.sub(s2, ptr_hi);
+        let inv_2_32_2 = b.const_base(INV_SHIFT_32);
+        let carry_1 = b.mul(s2, inv_2_32_2);
+
+        let mu = b.main(0, cols::MU);
+        let root = b.mul(mu, carry_1);
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

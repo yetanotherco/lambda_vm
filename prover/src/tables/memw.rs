@@ -31,6 +31,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -864,6 +865,22 @@ where
     mu_read + mu_write
 }
 
+/// Capture virtual w2 = write2 + write4 + write8, mirroring [`compute_w2`].
+fn capture_w2(b: &mut IrBuilder) -> Expr {
+    let write2 = b.main(0, cols::WRITE2);
+    let write4 = b.main(0, cols::WRITE4);
+    let write8 = b.main(0, cols::WRITE8);
+    let s = b.add(write2, write4);
+    b.add(s, write8)
+}
+
+/// Capture virtual μ_sum = μ_read + μ_write, mirroring [`compute_mu_sum`].
+fn capture_mu_sum(b: &mut IrBuilder) -> Expr {
+    let mu_read = b.main(0, cols::MU_READ);
+    let mu_write = b.main(0, cols::MU_WRITE);
+    b.add(mu_read, mu_write)
+}
+
 // =========================================================================
 // Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
 // =========================================================================
@@ -937,6 +954,33 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for MemwConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+
+        let root = match self.kind {
+            MemwConstraintKind::MuSumIsBit => {
+                let mu_sum = capture_mu_sum(b);
+                let one_minus_mu_sum = b.sub(one, mu_sum);
+                b.mul(mu_sum, one_minus_mu_sum)
+            }
+            MemwConstraintKind::W2ImpliesMuSum => {
+                let w2 = capture_w2(b);
+                let mu_sum = capture_mu_sum(b);
+                let one_minus_mu_sum = b.sub(one, mu_sum);
+                b.mul(w2, one_minus_mu_sum)
+            }
+            MemwConstraintKind::WidthSumIsBit => {
+                let w2 = capture_w2(b);
+                let one_minus_w2 = b.sub(one, w2);
+                b.mul(w2, one_minus_w2)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

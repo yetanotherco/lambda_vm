@@ -139,7 +139,7 @@ where
 /// With zero bus interactions, `AirWithBuses::new` appends no LogUp constraints
 /// and allocates no aux columns, so `validate_trace` evaluates exactly the chip's
 /// transition constraints over a main-only trace.
-pub fn busless_air<C: TransitionConstraint<F, E> + 'static>(
+pub fn busless_air<C: TransitionConstraint<F, E> + stark::constraint_ir::Capture + 'static>(
     num_columns: usize,
     constraints: Vec<C>,
 ) -> VmAir {

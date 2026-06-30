@@ -40,6 +40,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -400,6 +401,19 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwRegister
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for MemwRegisterMuSumIsBit {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let mu_read = b.main(0, cols::MU_READ);
+        let mu_write = b.main(0, cols::MU_WRITE);
+        let mu_sum = b.add(mu_read, mu_write);
+        // mu_sum * (1 - mu_sum)
+        let one_minus_mu_sum = b.sub(one, mu_sum);
+        let root = b.mul(mu_sum, one_minus_mu_sum);
+        b.emit(self.constraint_idx, root);
     }
 }
 

@@ -19,6 +19,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -707,6 +708,101 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constra
                 (one - get(cols::SIGNED)) * get(sign_col)
             }
         }
+    }
+}
+
+impl Capture for Cpu32Constraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let shift16 = b.const_base(SHIFT_16);
+        let hi_fill = b.const_base(HI_FILL);
+        let one = b.one();
+
+        let root = match self.kind {
+            Cpu32ConstraintKind::Arg1Lo => {
+                // arg1[0] - rv1[0] - shift16*rv1[1]
+                let arg1_0 = b.main(0, cols::ARG1_0);
+                let rv1_0 = b.main(0, cols::RV1_0);
+                let rv1_1 = b.main(0, cols::RV1_1);
+                let shifted = b.mul(shift16, rv1_1);
+                let r = b.sub(arg1_0, rv1_0);
+                b.sub(r, shifted)
+            }
+            Cpu32ConstraintKind::Arg1Hi => {
+                // arg1[1] - hi_fill*rv1_sign
+                let arg1_1 = b.main(0, cols::ARG1_1);
+                let rv1_sign = b.main(0, cols::RV1_SIGN);
+                let fill = b.mul(hi_fill, rv1_sign);
+                b.sub(arg1_1, fill)
+            }
+            Cpu32ConstraintKind::Arg2Lo => {
+                // arg2[0] - rv2[0] - shift16*rv2[1] - imm[0]
+                let arg2_0 = b.main(0, cols::ARG2_0);
+                let rv2_0 = b.main(0, cols::RV2_0);
+                let rv2_1 = b.main(0, cols::RV2_1);
+                let imm_0 = b.main(0, cols::IMM_0);
+                let shifted = b.mul(shift16, rv2_1);
+                let r = b.sub(arg2_0, rv2_0);
+                let r = b.sub(r, shifted);
+                b.sub(r, imm_0)
+            }
+            Cpu32ConstraintKind::Arg2Hi => {
+                // arg2[1] - hi_fill*rv2_sign - imm[1]
+                let arg2_1 = b.main(0, cols::ARG2_1);
+                let rv2_sign = b.main(0, cols::RV2_SIGN);
+                let imm_1 = b.main(0, cols::IMM_1);
+                let fill = b.mul(hi_fill, rv2_sign);
+                let r = b.sub(arg2_1, fill);
+                b.sub(r, imm_1)
+            }
+            Cpu32ConstraintKind::RvdLo => {
+                // rvd[0] - res[0] - shift16*res[1]
+                let rvd_0 = b.main(0, cols::RVD_0);
+                let res_0 = b.main(0, cols::RES_0);
+                let res_1 = b.main(0, cols::RES_1);
+                let shifted = b.mul(shift16, res_1);
+                let r = b.sub(rvd_0, res_0);
+                b.sub(r, shifted)
+            }
+            Cpu32ConstraintKind::RvdHi => {
+                // rvd[1] - hi_fill*res_sign
+                let rvd_1 = b.main(0, cols::RVD_1);
+                let res_sign = b.main(0, cols::RES_SIGN);
+                let fill = b.mul(hi_fill, res_sign);
+                b.sub(rvd_1, fill)
+            }
+            Cpu32ConstraintKind::RegZero {
+                read_col,
+                value_col,
+            } => {
+                // (1 - read) * value
+                let read = b.main(0, read_col);
+                let value = b.main(0, value_col);
+                let one_minus_read = b.sub(one, read);
+                b.mul(one_minus_read, value)
+            }
+            Cpu32ConstraintKind::Arg2Exclusive { imm_col } => {
+                // read_register2 * imm
+                let rr2 = b.main(0, cols::READ_REGISTER2);
+                let imm = b.main(0, imm_col);
+                b.mul(rr2, imm)
+            }
+            Cpu32ConstraintKind::FlagImpliesMu { flag_col } => {
+                // (1 - mu) * flag
+                let mu = b.main(0, cols::MU);
+                let flag = b.main(0, flag_col);
+                let one_minus_mu = b.sub(one, mu);
+                b.mul(one_minus_mu, flag)
+            }
+            Cpu32ConstraintKind::SignZeroWhenUnsigned { sign_col } => {
+                // (1 - signed) * sign
+                let signed = b.main(0, cols::SIGNED);
+                let sign = b.main(0, sign_col);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(one_minus_signed, sign)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

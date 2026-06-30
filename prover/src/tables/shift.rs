@@ -19,6 +19,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -839,6 +840,92 @@ impl ShiftConstraint {
         left_part + right_part
     }
 
+    /// Capture the `shifted` virtual column at index `half_idx` (0..4),
+    /// mirroring [`Self::compute_shifted_half`].
+    fn capture_shifted_half(half_idx: usize, b: &mut IrBuilder) -> Expr {
+        let dir = b.main(0, cols::DIRECTION);
+        let mu = b.main(0, cols::MU);
+        let left = b.sub(mu, dir); // mu - direction
+        let right = dir;
+
+        // extension = 65535 * is_negative
+        let is_neg = b.main(0, cols::IS_NEGATIVE);
+        let shift_fill = b.const_base(65535u64);
+        let extension = b.mul(is_neg, shift_fill);
+
+        let get_x = |i: usize, b: &mut IrBuilder| b.main(0, cols::X[i]);
+        let get_y = |i: usize, b: &mut IrBuilder| b.main(0, cols::Y[i]);
+        let get_ls = |i: usize, b: &mut IrBuilder| -> Expr {
+            if i < 3 {
+                b.main(0, cols::LIMB_SHIFT_RAW[i])
+            } else {
+                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
+                let one = b.one();
+                let ls0 = b.main(0, cols::LIMB_SHIFT_RAW[0]);
+                let ls1 = b.main(0, cols::LIMB_SHIFT_RAW[1]);
+                let ls2 = b.main(0, cols::LIMB_SHIFT_RAW[2]);
+                let r = b.sub(one, ls0);
+                let r = b.sub(r, ls1);
+                b.sub(r, ls2)
+            }
+        };
+
+        // intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0
+        let intra_left = |i: usize, b: &mut IrBuilder| -> Expr {
+            if i == 0 {
+                get_x(0, b)
+            } else {
+                let xi = get_x(i, b);
+                let yi1 = get_y(i - 1, b);
+                b.add(xi, yi1)
+            }
+        };
+
+        // intra_limb_right[i]: Y[i]+X[i+1]
+        let intra_right = |i: usize, b: &mut IrBuilder| -> Expr {
+            let yi = get_y(i, b);
+            let xi1 = get_x(i + 1, b);
+            b.add(yi, xi1)
+        };
+
+        let i = half_idx;
+        let zero = b.const_base(0);
+
+        // left_part = left * Σ_j=0^i limb_shift[j] * intra_limb_left[i-j]
+        let mut left_part = zero;
+        for j in 0..=i {
+            let ls_j = get_ls(j, b);
+            let il = intra_left(i - j, b);
+            let term = b.mul(ls_j, il);
+            left_part = b.add(left_part, term);
+        }
+        let left_part = b.mul(left, left_part);
+
+        // right_shift_part = right * Σ_j=0^(3-i) limb_shift[j] * intra_limb_right[i+j]
+        let mut right_shift_part = zero;
+        for j in 0..=(3 - i) {
+            let ls_j = get_ls(j, b);
+            let ir = intra_right(i + j, b);
+            let term = b.mul(ls_j, ir);
+            right_shift_part = b.add(right_shift_part, term);
+        }
+
+        // right_ext_part = right * extension * Σ_j=(4-i)^3 limb_shift[j]
+        let mut ext_sum = zero;
+        if i < 4 {
+            for j in (4 - i)..4 {
+                let ls_j = get_ls(j, b);
+                ext_sum = b.add(ext_sum, ls_j);
+            }
+        }
+        let right_ext_part = b.mul(extension, ext_sum);
+
+        let right_inner = b.add(right_shift_part, right_ext_part);
+        let right_part = b.mul(right, right_inner);
+
+        b.add(left_part, right_part)
+    }
+
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
         F: IsSubFieldOf<E>,
@@ -934,6 +1021,85 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstra
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for ShiftConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+        let shift_16 = b.const_base(SHIFT_16);
+
+        let root = match self.kind {
+            ShiftConstraintKind::DirectionImpliesMu => {
+                // direction * (1 - mu)
+                let dir = b.main(0, cols::DIRECTION);
+                let mu = b.main(0, cols::MU);
+                let one_minus_mu = b.sub(one, mu);
+                b.mul(dir, one_minus_mu)
+            }
+            ShiftConstraintKind::ZbsOverrideX(i) => {
+                // zbs * (X[i] - in[i] * left), left = mu - direction
+                let zbs = b.main(0, cols::ZBS);
+                let x_i = b.main(0, cols::X[i]);
+                let in_i = b.main(0, cols::IN[i]);
+                let mu = b.main(0, cols::MU);
+                let dir = b.main(0, cols::DIRECTION);
+                let left = b.sub(mu, dir);
+                let in_left = b.mul(in_i, left);
+                let diff = b.sub(x_i, in_left);
+                b.mul(zbs, diff)
+            }
+            ShiftConstraintKind::ZbsOverrideX4 => {
+                // zbs * X[4]
+                let zbs = b.main(0, cols::ZBS);
+                let x4 = b.main(0, cols::X_4);
+                b.mul(zbs, x4)
+            }
+            ShiftConstraintKind::ZbsOverrideY(i) => {
+                // zbs * (Y[i] - in[i] * right), right = direction
+                let zbs = b.main(0, cols::ZBS);
+                let y_i = b.main(0, cols::Y[i]);
+                let in_i = b.main(0, cols::IN[i]);
+                let dir = b.main(0, cols::DIRECTION);
+                let in_dir = b.mul(in_i, dir);
+                let diff = b.sub(y_i, in_dir);
+                b.mul(zbs, diff)
+            }
+            ShiftConstraintKind::LimbShiftIsBit(i) => {
+                // limb_shift[i] * (1 - limb_shift[i])
+                let ls = if i < 3 {
+                    b.main(0, cols::LIMB_SHIFT_RAW[i])
+                } else {
+                    let ls0 = b.main(0, cols::LIMB_SHIFT_RAW[0]);
+                    let ls1 = b.main(0, cols::LIMB_SHIFT_RAW[1]);
+                    let ls2 = b.main(0, cols::LIMB_SHIFT_RAW[2]);
+                    let r = b.sub(one, ls0);
+                    let r = b.sub(r, ls1);
+                    b.sub(r, ls2)
+                };
+                let one_minus_ls = b.sub(one, ls);
+                b.mul(ls, one_minus_ls)
+            }
+            ShiftConstraintKind::OutputMatchesShifted(i) => {
+                // out[i] - (shifted::DWordWL)[i]
+                // (shifted::DWordWL)[i] = shifted[2*i] + shifted[2*i+1] * 2^16
+                let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
+                let out = b.main(0, out_col);
+                let half_lo = Self::capture_shifted_half(2 * i, b);
+                let half_hi = Self::capture_shifted_half(2 * i + 1, b);
+                let half_hi_shifted = b.mul(half_hi, shift_16);
+                let r = b.sub(out, half_lo);
+                b.sub(r, half_hi_shifted)
+            }
+            ShiftConstraintKind::FlagIsBit(col) => {
+                // flag * (1 - flag)
+                let flag = b.main(0, col);
+                let one_minus_flag = b.sub(one, flag);
+                b.mul(flag, one_minus_flag)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

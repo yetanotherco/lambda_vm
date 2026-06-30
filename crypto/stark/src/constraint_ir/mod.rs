@@ -24,7 +24,7 @@ pub mod interp;
 pub mod ir;
 
 pub use builder::{Expr, IrBuilder};
-pub use interp::eval_program_base;
+pub use interp::{eval_program, eval_program_base, eval_program_verifier};
 pub use ir::{ConstraintProgram, Dim, Op};
 
 /// A transition constraint that can record its algebra into an [`IrBuilder`].

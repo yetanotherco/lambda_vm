@@ -20,6 +20,7 @@
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -658,6 +659,76 @@ impl ConvCarry {
         }
         s
     }
+
+    /// Capture `s_i`, mirroring [`Self::s_i`].
+    fn capture_s_i(&self, b: &mut IrBuilder) -> Expr {
+        let i = self.i;
+        let byte = |base: usize, len: usize, j: usize, b: &mut IrBuilder| -> Expr {
+            if j < len {
+                b.main(0, base + j)
+            } else {
+                b.const_base(0)
+            }
+        };
+        let p_byte_e = |m: usize, b: &mut IrBuilder| -> Expr {
+            if m < 32 {
+                b.const_base(P_BYTES[m] as u64)
+            } else {
+                b.const_base(0)
+            }
+        };
+        let mut s = b.const_base(0);
+        match self.relation {
+            Relation::X2 => {
+                // Σ xG_j·xG_{i-j} − x2_i − Σ q0_j·P_{i-j}
+                for j in 0..=i {
+                    let xg_j = byte(cols::XG, 32, j, b);
+                    let xg_ij = byte(cols::XG, 32, i - j, b);
+                    let term = b.mul(xg_j, xg_ij);
+                    s = b.add(s, term);
+
+                    let q0_j = byte(cols::Q0, 32, j, b);
+                    let p_ij = p_byte_e(i - j, b);
+                    let term2 = b.mul(q0_j, p_ij);
+                    s = b.sub(s, term2);
+                }
+                let x2_i = byte(cols::X2, 32, i, b);
+                s = b.sub(s, x2_i);
+            }
+            Relation::Yg => {
+                // Σ (yG_j·yG_{i-j} + P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − b_i
+                for j in 0..=i {
+                    let yg_j = byte(cols::YG, 32, j, b);
+                    let yg_ij = byte(cols::YG, 32, i - j, b);
+                    let term = b.mul(yg_j, yg_ij);
+                    s = b.add(s, term);
+
+                    let p_j = p_byte_e(j, b);
+                    let p_ij = p_byte_e(i - j, b);
+                    let term2 = b.mul(p_j, p_ij);
+                    s = b.add(s, term2);
+
+                    let x2_j = byte(cols::X2, 32, j, b);
+                    let xg_ij = byte(cols::XG, 32, i - j, b);
+                    let term3 = b.mul(x2_j, xg_ij);
+                    s = b.sub(s, term3);
+
+                    let q1_j = byte(cols::Q1, 33, j, b);
+                    let p_ij2 = p_byte_e(i - j, b);
+                    let term4 = b.mul(q1_j, p_ij2);
+                    s = b.sub(s, term4);
+                }
+                if i == 0 {
+                    // Only the curve constant `b` is gated by `µ`.
+                    let mu = b.main(0, cols::MU);
+                    let b_const = b.const_base(B);
+                    let mu_b = b.mul(mu, b_const);
+                    s = b.sub(s, mu_b);
+                }
+            }
+        }
+        s
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
@@ -689,6 +760,29 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
     }
 }
 
+impl Capture for ConvCarry {
+    fn capture(&self, b: &mut IrBuilder) {
+        let c_base = match self.relation {
+            Relation::X2 => cols::C0,
+            Relation::Yg => cols::C1,
+        };
+        let c_i = b.main(0, c_base + self.i);
+        let c_prev = if self.i == 0 {
+            b.const_base(0)
+        } else {
+            b.main(0, c_base + self.i - 1)
+        };
+        let s_i = self.capture_s_i(b);
+
+        // 256·c_i − c_prev − s_i
+        let two_five_six = b.const_base(256);
+        let scaled = b.mul(two_five_six, c_i);
+        let s = b.sub(scaled, c_prev);
+        let root = b.sub(s, s_i);
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 /// `col = 0` (unconditional, degree 1). Used for the closing `c_63 = 0`.
 pub struct ColIsZero {
     pub col: usize,
@@ -708,6 +802,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
         E: IsField,
     {
         step.get_main_evaluation_element(0, self.col).clone()
+    }
+}
+
+impl Capture for ColIsZero {
+    fn capture(&self, b: &mut IrBuilder) {
+        let root = b.main(0, self.col);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -781,6 +882,41 @@ where
     c
 }
 
+/// Captures the 8 word-carries of the addition for `kind`, mirroring [`carry_chain`].
+fn capture_carry_chain(kind: OverflowKind, b: &mut IrBuilder) -> [Expr; 8] {
+    let inv = b.const_base(INV_SHIFT_32);
+    let hl = kind.addend_hl_base();
+    let bl = kind.sum_bl_base();
+    let mut c: [Expr; 8] = std::array::from_fn(|_| b.const_base(0));
+    let mut prev = b.const_base(0);
+    for (i, slot) in c.iter_mut().enumerate() {
+        // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
+        let h_lo = b.main(0, hl + 2 * i);
+        let h_hi = b.main(0, hl + 2 * i + 1);
+        let shift_16 = b.const_base(1u64 << 16);
+        let h_hi_scaled = b.mul(h_hi, shift_16);
+        let addend1 = b.add(h_lo, h_hi_scaled);
+
+        // sum word i (from bytes): Σ bl[4i+b]·2^{8b}
+        let mut sum = b.const_base(0);
+        for byte_idx in 0..4 {
+            let byte = b.main(0, bl + 4 * i + byte_idx);
+            let shift = b.const_base(1u64 << (8 * byte_idx));
+            let term = b.mul(byte, shift);
+            sum = b.add(sum, term);
+        }
+
+        let addend0 = b.const_base(kind.const_word(i));
+        let s = b.add(addend0, addend1);
+        let s = b.add(s, prev);
+        let s = b.sub(s, sum);
+        let ci = b.mul(s, inv);
+        *slot = ci;
+        prev = ci;
+    }
+    c
+}
+
 /// `µ · c_i · (1 - c_i) = 0` for a virtual carry bit (degree 3, since `c_i` is linear).
 pub struct CarryBit {
     pub kind: OverflowKind,
@@ -807,6 +943,18 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CarryBit {
     }
 }
 
+impl Capture for CarryBit {
+    fn capture(&self, b: &mut IrBuilder) {
+        let c = capture_carry_chain(self.kind, b);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        let one_minus_ci = b.sub(one, c[self.i]);
+        let mu_ci = b.mul(mu, c[self.i]);
+        let root = b.mul(mu_ci, one_minus_ci);
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 /// `µ · (1 - c_7) = 0`: the top carry must be 1 (the addition overflows).
 pub struct OverflowRequired {
     pub kind: OverflowKind,
@@ -828,6 +976,17 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
         let c = carry_chain(self.kind, step);
         let mu = step.get_main_evaluation_element(0, cols::MU).clone();
         mu * (FieldElement::<F>::one() - c[7].clone())
+    }
+}
+
+impl Capture for OverflowRequired {
+    fn capture(&self, b: &mut IrBuilder) {
+        let c = capture_carry_chain(self.kind, b);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        let one_minus_c7 = b.sub(one, c[7]);
+        let root = b.mul(mu, one_minus_c7);
+        b.emit(self.constraint_idx, root);
     }
 }
 

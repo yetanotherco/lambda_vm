@@ -12,6 +12,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -358,6 +359,142 @@ impl ConvCarry {
             }
         }
     }
+
+    /// Capture `s_i`, mirroring [`Self::s_i`].
+    fn capture_s_i(&self, b: &mut IrBuilder) -> Expr {
+        let i = self.i;
+        let col = |c: usize, b: &mut IrBuilder| -> Expr { b.main(0, c) };
+        // bytes (zero beyond the stored length)
+        let byte = |base: usize, len: usize, j: usize, b: &mut IrBuilder| -> Expr {
+            if j < len {
+                col(base + j, b)
+            } else {
+                b.const_base(0)
+            }
+        };
+        let lam = |j: usize, b: &mut IrBuilder| byte(cols::LAMBDA, 32, j, b);
+        let xg = |j: usize, b: &mut IrBuilder| byte(cols::XG, 32, j, b);
+        let xa = |j: usize, b: &mut IrBuilder| byte(cols::XA, 32, j, b);
+        let ya = |j: usize, b: &mut IrBuilder| byte(cols::YA, 32, j, b);
+        let yg = |j: usize, b: &mut IrBuilder| byte(cols::YG, 32, j, b);
+        let xr = |j: usize, b: &mut IrBuilder| byte(cols::XR, 32, j, b);
+        let yr = |j: usize, b: &mut IrBuilder| byte(cols::YR, 32, j, b);
+        let p_byte_e = |m: usize, b: &mut IrBuilder| -> Expr {
+            if m < 32 {
+                b.const_base(P_BYTES[m] as u64)
+            } else {
+                b.const_base(0)
+            }
+        };
+        let r_byte_e = |m: usize, b: &mut IrBuilder| -> Expr {
+            if m < 33 {
+                b.const_base(R_BYTES[m] as u64)
+            } else {
+                b.const_base(0)
+            }
+        };
+
+        // r·P − q·P convolution (shared structure across all three relations).
+        let rq = |qbase: usize, i: usize, b: &mut IrBuilder| -> Expr {
+            let mut s = b.const_base(0);
+            for j in 0..=i {
+                let r_j = r_byte_e(j, b);
+                let q_j = byte(qbase, 33, j, b);
+                let diff = b.sub(r_j, q_j);
+                let p_ij = p_byte_e(i - j, b);
+                let term = b.mul(diff, p_ij);
+                s = b.add(s, term);
+            }
+            s
+        };
+
+        match self.relation {
+            Relation::Lambda => {
+                let op = col(cols::OP, b);
+                let one = b.one();
+                // op·(Σ λ_j(xG-xA)_{i-j} + (yA_i - yG_i))
+                let ya_i = ya(i, b);
+                let yg_i = yg(i, b);
+                let mut op_branch = b.sub(ya_i, yg_i);
+                for j in 0..=i {
+                    let lam_j = lam(j, b);
+                    let xg_ij = xg(i - j, b);
+                    let xa_ij = xa(i - j, b);
+                    let diff = b.sub(xg_ij, xa_ij);
+                    let term = b.mul(lam_j, diff);
+                    op_branch = b.add(op_branch, term);
+                }
+                // (1-op)·Σ (2 λ_j yA_{i-j} - 3 xA_j xA_{i-j})
+                let mut notop_branch = b.const_base(0);
+                for j in 0..=i {
+                    let two = b.const_base(2);
+                    let lam_j = lam(j, b);
+                    let ya_ij = ya(i - j, b);
+                    let two_lam = b.mul(two, lam_j);
+                    let term_pos = b.mul(two_lam, ya_ij);
+
+                    let three = b.const_base(3);
+                    let xa_j = xa(j, b);
+                    let xa_ij = xa(i - j, b);
+                    let three_xa = b.mul(three, xa_j);
+                    let term_neg = b.mul(three_xa, xa_ij);
+
+                    let sum_pos = b.add(notop_branch, term_pos);
+                    notop_branch = b.sub(sum_pos, term_neg);
+                }
+                let op_term = b.mul(op, op_branch);
+                let one_minus_op = b.sub(one, op);
+                let notop_term = b.mul(one_minus_op, notop_branch);
+                let rq_term = rq(cols::Q0, i, b);
+                let s = b.add(op_term, notop_term);
+                b.add(s, rq_term)
+            }
+            Relation::Xr => {
+                let op = col(cols::OP, b);
+                let one = b.one();
+                // Σ λ_j λ_{i-j} − xA_i − xG_i − xR_i − (1-op)(xA_i − xG_i) + rq
+                let mut s = b.const_base(0);
+                for j in 0..=i {
+                    let lam_j = lam(j, b);
+                    let lam_ij = lam(i - j, b);
+                    let term = b.mul(lam_j, lam_ij);
+                    s = b.add(s, term);
+                }
+                let xa_i = xa(i, b);
+                let xg_i = xg(i, b);
+                let xr_i = xr(i, b);
+                let s = b.sub(s, xa_i);
+                let s = b.sub(s, xg_i);
+                let s = b.sub(s, xr_i);
+                let xa_i2 = xa(i, b);
+                let xg_i2 = xg(i, b);
+                let diff = b.sub(xa_i2, xg_i2);
+                let one_minus_op = b.sub(one, op);
+                let term2 = b.mul(one_minus_op, diff);
+                let s = b.sub(s, term2);
+                let rq_term = rq(cols::Q1, i, b);
+                b.add(s, rq_term)
+            }
+            Relation::Yr => {
+                // Σ λ_j(xA-xR)_{i-j} − yA_i − yR_i + rq
+                let mut s = b.const_base(0);
+                for j in 0..=i {
+                    let lam_j = lam(j, b);
+                    let xa_ij = xa(i - j, b);
+                    let xr_ij = xr(i - j, b);
+                    let diff = b.sub(xa_ij, xr_ij);
+                    let term = b.mul(lam_j, diff);
+                    s = b.add(s, term);
+                }
+                let ya_i = ya(i, b);
+                let yr_i = yr(i, b);
+                let s = b.sub(s, ya_i);
+                let s = b.sub(s, yr_i);
+                let rq_term = rq(cols::Q2, i, b);
+                b.add(s, rq_term)
+            }
+        }
+    }
 }
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
@@ -393,6 +530,30 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
     }
 }
 
+impl Capture for ConvCarry {
+    fn capture(&self, b: &mut IrBuilder) {
+        let c_base = match self.relation {
+            Relation::Lambda => cols::C0,
+            Relation::Xr => cols::C1,
+            Relation::Yr => cols::C2,
+        };
+        let c_i = b.main(0, c_base + self.i);
+        let c_prev = if self.i == 0 {
+            b.const_base(0)
+        } else {
+            b.main(0, c_base + self.i - 1)
+        };
+        let s_i = self.capture_s_i(b);
+
+        // 256·c_i − c_prev − s_i
+        let two_five_six = b.const_base(256);
+        let scaled = b.mul(two_five_six, c_i);
+        let s = b.sub(scaled, c_prev);
+        let root = b.sub(s, s_i);
+        b.emit(self.constraint_idx, root);
+    }
+}
+
 /// `col = 0` (unconditional, degree 1). Used for the closing `c_63 = 0`.
 pub struct ColIsZero {
     pub col: usize,
@@ -412,6 +573,13 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
         E: IsField,
     {
         step.get_main_evaluation_element(0, self.col).clone()
+    }
+}
+
+impl Capture for ColIsZero {
+    fn capture(&self, b: &mut IrBuilder) {
+        let root = b.main(0, self.col);
+        b.emit(self.constraint_idx, root);
     }
 }
 
@@ -442,6 +610,21 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZero {
         } else {
             a * b
         }
+    }
+}
+
+impl Capture for MulZero {
+    fn capture(&self, builder: &mut IrBuilder) {
+        let a = builder.main(0, self.a);
+        let bval = builder.main(0, self.b);
+        let root = if self.b_complement {
+            let one = builder.one();
+            let one_minus_b = builder.sub(one, bval);
+            builder.mul(a, one_minus_b)
+        } else {
+            builder.mul(a, bval)
+        };
+        builder.emit(self.constraint_idx, root);
     }
 }
 

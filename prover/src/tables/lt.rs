@@ -28,6 +28,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, Expr, IrBuilder};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -467,6 +468,52 @@ impl LtConstraint {
         (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
     }
 
+    /// Capture virtual carry[0], mirroring [`Self::compute_carry_0`].
+    fn capture_carry_0(&self, b: &mut IrBuilder) -> Expr {
+        let lhs_0 = b.main(0, cols::LHS_0);
+        let rhs_0 = b.main(0, cols::RHS_0);
+        let sub_0 = b.main(0, cols::LHS_SUB_RHS_0);
+        let sub_1 = b.main(0, cols::LHS_SUB_RHS_1);
+
+        let shift_16 = b.const_base(SHIFT_16);
+        let sub_1_shifted = b.mul(sub_1, shift_16);
+        let sub_lo = b.add(sub_0, sub_1_shifted);
+
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        let s = b.add(rhs_0, sub_lo);
+        let s = b.sub(s, lhs_0);
+        b.mul(s, inv_2_32)
+    }
+
+    /// Capture virtual carry[1], mirroring [`Self::compute_carry_1`].
+    fn capture_carry_1(&self, b: &mut IrBuilder) -> Expr {
+        let lhs_1 = b.main(0, cols::LHS_1);
+        let lhs_2 = b.main(0, cols::LHS_2);
+        let rhs_1 = b.main(0, cols::RHS_1);
+        let rhs_2 = b.main(0, cols::RHS_2);
+        let sub_2 = b.main(0, cols::LHS_SUB_RHS_2);
+        let sub_3 = b.main(0, cols::LHS_SUB_RHS_3);
+
+        let shift_16 = b.const_base(SHIFT_16);
+
+        let lhs_2_shifted = b.mul(lhs_2, shift_16);
+        let lhs_hi = b.add(lhs_1, lhs_2_shifted);
+
+        let rhs_2_shifted = b.mul(rhs_2, shift_16);
+        let rhs_hi = b.add(rhs_1, rhs_2_shifted);
+
+        let sub_3_shifted = b.mul(sub_3, shift_16);
+        let sub_hi = b.add(sub_2, sub_3_shifted);
+
+        let carry_0 = self.capture_carry_0(b);
+
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        let s = b.add(rhs_hi, sub_hi);
+        let s = b.add(s, carry_0);
+        let s = b.sub(s, lhs_hi);
+        b.mul(s, inv_2_32)
+    }
+
     /// Compute the constraint value.
     fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
     where
@@ -559,6 +606,78 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+impl Capture for LtConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let one = b.one();
+
+        let root = match self.kind {
+            LtConstraintKind::Carry0IsBit => {
+                // carry[0] * (1 - carry[0])
+                let c0 = self.capture_carry_0(b);
+                let one_minus_c0 = b.sub(one, c0);
+                b.mul(c0, one_minus_c0)
+            }
+            LtConstraintKind::Carry1IsBit => {
+                // carry[1] * (1 - carry[1])
+                let c1 = self.capture_carry_1(b);
+                let one_minus_c1 = b.sub(one, c1);
+                b.mul(c1, one_minus_c1)
+            }
+            LtConstraintKind::LtFormula => {
+                // lt = signed*(A*(1-B) + A*C + (1-B)*C) + (1-signed)*unsigned_lt
+                let lt = b.main(0, cols::LT);
+                let signed = b.main(0, cols::SIGNED);
+                let a = b.main(0, cols::LHS_MSB);
+                let bb = b.main(0, cols::RHS_MSB);
+                let c = self.capture_carry_1(b);
+                let unsigned_lt = c;
+
+                // signed_lt = A*(1-B) + A*C + (1-B)*C
+                let one_minus_b = b.sub(one, bb);
+                let a_term = b.mul(a, one_minus_b);
+                let ac_term = b.mul(a, c);
+                let bc_term = b.mul(one_minus_b, c);
+                let signed_lt = b.add(a_term, ac_term);
+                let signed_lt = b.add(signed_lt, bc_term);
+
+                // expected_lt = signed*signed_lt + (1-signed)*unsigned_lt
+                let signed_part = b.mul(signed, signed_lt);
+                let one_minus_signed = b.sub(one, signed);
+                let unsigned_part = b.mul(one_minus_signed, unsigned_lt);
+                let expected_lt = b.add(signed_part, unsigned_part);
+
+                b.sub(lt, expected_lt)
+            }
+            LtConstraintKind::OutXorInvert => {
+                // out - (lt + invert - 2*lt*invert)
+                let out = b.main(0, cols::OUT);
+                let lt = b.main(0, cols::LT);
+                let invert = b.main(0, cols::INVERT);
+                let two = b.const_base(2);
+                let lt_invert = b.mul(lt, invert);
+                let two_lt_invert = b.mul(two, lt_invert);
+                let s = b.add(lt, invert);
+                let s = b.sub(s, two_lt_invert);
+                b.sub(out, s)
+            }
+            LtConstraintKind::InvertIsBit => {
+                // invert * (1 - invert)
+                let invert = b.main(0, cols::INVERT);
+                let one_minus_invert = b.sub(one, invert);
+                b.mul(invert, one_minus_invert)
+            }
+            LtConstraintKind::SignedIsBit => {
+                // signed * (1 - signed)
+                let signed = b.main(0, cols::SIGNED);
+                let one_minus_signed = b.sub(one, signed);
+                b.mul(signed, one_minus_signed)
+            }
+        };
+
+        b.emit(self.constraint_idx, root);
     }
 }
 

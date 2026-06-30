@@ -1,5 +1,6 @@
 use core::ops::Div;
 
+use crate::constraint_ir::IrBuilder;
 use crate::domain::Domain;
 use crate::traits::TransitionEvaluationContext;
 use math::field::element::FieldElement;
@@ -19,6 +20,26 @@ where
     /// Each transition constraint should have one index in the range [0, N),
     /// where N is the total number of transition constraints.
     fn constraint_idx(&self) -> usize;
+
+    /// Translate this constraint's algebra into [`IrBuilder`] nodes, finishing
+    /// with `builder.emit(self.constraint_idx(), root)`. Object-safe (the
+    /// builder is concrete, not generic), so it lives directly on this boxed
+    /// trait — see [`crate::constraint_ir::Capture`] for the user-facing
+    /// (non-boxed) counterpart that [`super::transition::TransitionConstraintAdapter`]
+    /// forwards to.
+    ///
+    /// Default panics: every production constraint must override this (via
+    /// `TransitionConstraintAdapter` + `Capture`, or directly for the LogUp
+    /// framework constraints). The default exists only so the many
+    /// `examples/` and test-only `TransitionConstraintEvaluator` impls (not
+    /// part of the IR migration) don't need a body.
+    fn capture(&self, _builder: &mut IrBuilder) {
+        unimplemented!(
+            "TransitionConstraintEvaluator::capture not implemented for this constraint; \
+             it is not part of the constraint-ir migration (see crypto/stark/src/examples/ \
+             or implement Capture for production constraints)"
+        );
+    }
 
     /// The function representing the evaluation of the constraint over elements
     /// of the trace table.
@@ -377,10 +398,12 @@ where
     /// Wrap into a boxed `TransitionConstraintEvaluator` for the evaluator.
     ///
     /// The adapter auto-generates `evaluate_verifier()` and `evaluate_prover()`
-    /// from the generic `evaluate()`.
+    /// from the generic `evaluate()`, and forwards `capture()` to `Self`'s
+    /// `Capture` impl (required so every boxed constraint can be captured into
+    /// the IR — see `crypto/stark/src/constraint_ir/mod.rs`).
     fn boxed(self) -> Box<dyn TransitionConstraintEvaluator<F, E>>
     where
-        Self: Sized + 'static,
+        Self: Sized + crate::constraint_ir::Capture + 'static,
     {
         Box::new(TransitionConstraintAdapter(self))
     }
@@ -389,12 +412,14 @@ where
 /// Adapter: implements `TransitionConstraintEvaluator` for any `TransitionConstraint`.
 ///
 /// Auto-generates `evaluate_verifier()` (E×E path) and `evaluate_prover()` (F path)
-/// from the user's generic `evaluate()`.
+/// from the user's generic `evaluate()`, and forwards `capture()` to the wrapped
+/// `T: Capture` (every production constraint implements `Capture` alongside
+/// `evaluate`; see `crypto/stark/src/constraint_ir/mod.rs`).
 pub struct TransitionConstraintAdapter<T>(pub T);
 
 impl<T, F, E> TransitionConstraintEvaluator<F, E> for TransitionConstraintAdapter<T>
 where
-    T: TransitionConstraint<F, E> + 'static,
+    T: TransitionConstraint<F, E> + crate::constraint_ir::Capture + 'static,
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
 {
@@ -418,6 +443,9 @@ where
     }
     fn periodic_exemptions_offset(&self) -> Option<usize> {
         self.0.periodic_exemptions_offset()
+    }
+    fn capture(&self, builder: &mut IrBuilder) {
+        self.0.capture(builder);
     }
 
     fn evaluate_verifier(

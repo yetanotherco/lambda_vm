@@ -18,6 +18,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraint_ir::{Capture, IrBuilder};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -309,6 +310,21 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZeroConst
         } else {
             a * b
         }
+    }
+}
+
+impl Capture for MulZeroConstraint {
+    fn capture(&self, b: &mut IrBuilder) {
+        let a = b.main(0, self.a);
+        let bb = b.main(0, self.b);
+        let root = if self.b_complement {
+            let one = b.one();
+            let one_minus_b = b.sub(one, bb);
+            b.mul(a, one_minus_b)
+        } else {
+            b.mul(a, bb)
+        };
+        b.emit(self.constraint_idx, root);
     }
 }
 
