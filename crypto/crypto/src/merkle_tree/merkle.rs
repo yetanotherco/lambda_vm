@@ -255,9 +255,9 @@ where
     /// Merkle tree
     pub fn get_proof_by_pos(&self, pos: usize) -> Option<Proof<B::Node>> {
         // A root only tree (from `from_root`) has no nodes to walk. Callers must
-        // gather paths from the device resident copy instead. Catch the misuse
-        // early in debug builds rather than returning a misleading None.
-        debug_assert!(
+        // gather paths from the device resident copy instead. Fail loudly in all
+        // builds rather than returning a misleading empty path.
+        assert!(
             !self.nodes.is_empty(),
             "get_proof_by_pos called on a root-only MerkleTree (no nodes)"
         );

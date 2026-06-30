@@ -1446,6 +1446,12 @@ pub(crate) fn gather_proofs_dev(
     if positions.is_empty() {
         return Some(Vec::new());
     }
+    // Positions index an LDE that `assert_u32_domain` keeps within u32; guard the
+    // cast so any future relaxation fails loudly instead of wrapping silently.
+    debug_assert!(
+        positions.iter().all(|&p| p <= u32::MAX as usize),
+        "gather_proofs_dev: position exceeds u32 range"
+    );
     let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
     let bytes = math_cuda::merkle::gather_merkle_paths_dev(
         &tree.nodes,
@@ -1698,8 +1704,17 @@ where
     // The GPU FRI commit sets `gpu_tree` on every layer as a group; the CPU
     // commit sets none. Host trees fall back to the host walk. When the layers
     // are device resident the host trees are root only, so the gather below must
-    // succeed (a failure is a hard abort, not a silent walk).
-    if fri_layers[0].gpu_tree.is_none() {
+    // succeed (a failure is a hard abort, not a silent walk). The residency is
+    // all or nothing; assert it so a future partial-build can never route a
+    // root-only layer through the host walk and ship empty proofs.
+    let first_resident = fri_layers[0].gpu_tree.is_some();
+    debug_assert!(
+        fri_layers
+            .iter()
+            .all(|l| l.gpu_tree.is_some() == first_resident),
+        "FRI layer residency must be all or nothing"
+    );
+    if !first_resident {
         return None;
     }
     let stream = math_cuda::device::backend()

@@ -378,16 +378,11 @@ pub fn gather_merkle_paths_dev(
     Ok(host)
 }
 
-/// Row-pair Keccak leaf + Merkle tree build for R2 composition-polynomial
-/// commit. `parts_interleaved` is `num_parts` slices, each holding an ext3
-/// LDE column interleaved as `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`.
-///
-/// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
-/// layout (root at byte offset 0, leaves in the tail).
-/// Build the composition Merkle tree on device. Leaves hash row pairs, so
+/// Build the composition Merkle tree on device. `parts_interleaved` is
+/// `num_parts` slices, each an ext3 LDE column interleaved as
+/// `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`. Leaves hash row pairs, so
 /// `num_leaves = lde_size / 2`. Returns the device node buffer, the leaf count,
-/// and the stream it was built on. Shared by the host copy and device keep
-/// wrappers below.
+/// and the stream it was built on. Used by the device keep wrapper below.
 fn build_comp_poly_tree_nodes_dev(
     parts_interleaved: &[&[u64]],
 ) -> Result<(CudaSlice<u8>, usize, Arc<CudaStream>)> {
