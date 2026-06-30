@@ -219,9 +219,8 @@ fn keccak_comp_poly_leaves_matches_cpu() {
 
             // Exercise the production keep path, then read the resident nodes
             // back to host to check the leaf bytes.
-            let tree =
-                math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&parts_slices)
-                    .unwrap();
+            let tree = math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&parts_slices)
+                .unwrap();
             let be = math_cuda::device::backend().unwrap();
             let stream = be.next_stream();
             let nodes: Vec<u8> = stream.clone_dtoh(&*tree.nodes).unwrap();

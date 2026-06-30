@@ -299,15 +299,14 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                 let fwd_tw =
                     TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
-                let (handle, _lde) =
-                    math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
-                        &row_major,
-                        n,
-                        num_cols,
-                        blowup,
-                        &weights_u64,
-                    )
-                    .expect("new row-major GPU pipeline");
+                let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+                    &row_major,
+                    n,
+                    num_cols,
+                    blowup,
+                    &weights_u64,
+                )
+                .expect("new row-major GPU pipeline");
                 let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;
 
                 let cpu_root = cpu_row_major_merkle_root(

@@ -36,8 +36,6 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-#[cfg(feature = "cuda")]
-use crypto::merkle_tree::proof::Proof;
 use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
@@ -45,6 +43,8 @@ use super::lookup::BusPublicInputs;
 use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
 use super::trace::TraceTable;
 use super::traits::AIR;
+#[cfg(feature = "cuda")]
+use crypto::merkle_tree::proof::Proof;
 
 pub use crate::commitment::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
@@ -1875,8 +1875,9 @@ pub trait IsStarkProver<
                 let stream = lde_trace
                     .bound_stream()
                     .expect("bound stream for device-resident composition-tree opening");
-                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
-                    .expect("device composition-tree gather failed; resident tree has no host fallback")
+                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream).expect(
+                    "device composition-tree gather failed; resident tree has no host fallback",
+                )
             });
 
         for (qi, index) in indexes_to_open.iter().enumerate() {
@@ -1892,12 +1893,9 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &main_dev_proofs {
-                        Self::open_polys_with_proofs(
-                            domain,
-                            proofs[qi].clone(),
-                            *index,
-                            |row| lde_trace.gather_main_row(row),
-                        )
+                        Self::open_polys_with_proofs(domain, proofs[qi].clone(), *index, |row| {
+                            lde_trace.gather_main_row(row)
+                        })
                     } else {
                         Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
                             lde_trace.gather_main_row(row)
@@ -1950,12 +1948,9 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &aux_dev_proofs {
-                        Self::open_polys_with_proofs(
-                            domain,
-                            proofs[qi].clone(),
-                            *index,
-                            |row| lde_trace.gather_aux_row(row),
-                        )
+                        Self::open_polys_with_proofs(domain, proofs[qi].clone(), *index, |row| {
+                            lde_trace.gather_aux_row(row)
+                        })
                     } else {
                         Self::open_polys_with(domain, &aux.tree, *index, |row| {
                             lde_trace.gather_aux_row(row)
@@ -2098,8 +2093,8 @@ pub trait IsStarkProver<
                 .iter()
                 .enumerate()
                 .map(|(idx, (_, trace, _))| {
-                    let lde_size = domains[idx].interpolation_domain_size
-                        * domains[idx].blowup_factor;
+                    let lde_size =
+                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
                     estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
                 })
                 .collect();
@@ -2303,8 +2298,8 @@ pub trait IsStarkProver<
                 .iter()
                 .enumerate()
                 .map(|(idx, (_, trace, _))| {
-                    let lde_size = domains[idx].interpolation_domain_size
-                        * domains[idx].blowup_factor;
+                    let lde_size =
+                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
                     estimate_table_vram_bytes(
                         trace.num_main_columns,
                         trace.num_aux_columns,

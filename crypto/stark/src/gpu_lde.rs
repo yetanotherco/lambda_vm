@@ -485,7 +485,11 @@ where
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
         let mut v = std::mem::ManuallyDrop::new(lde_u64);
-        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len(), v.capacity())
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
     };
 
     // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
@@ -554,7 +558,11 @@ where
             v.len() % 3 == 0 && v.capacity() % 3 == 0,
             "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
         );
-        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len() / 3, v.capacity() / 3)
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
+        )
     };
 
     // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
