@@ -55,9 +55,11 @@ fn gpu_merkle_root(columns: &[Vec<u64>], blowup: usize, weights: &[u64]) -> [u8;
         }
     }
 
-    // Per-row leaves (rows_per_leaf = 1): this parity test compares the generic
-    // keccak-leaves + Merkle primitives against a per-row CPU reference.
-    let gpu_leaves = math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde, 1)
+    // Row-pair leaves (rows_per_leaf = 2, matching `ROWS_PER_LEAF`): the CPU
+    // reference is `commit_rows_bit_reversed`, which hashes bit-reversed row
+    // pairs into each leaf, so the generic GPU keccak-leaves + Merkle path must
+    // use the same row-pair layout to produce a matching root.
+    let gpu_leaves = math_cuda::merkle::keccak_leaves_base(&flat, n_lde, num_cols, n_lde, 2)
         .expect("GPU keccak leaves");
     let nodes =
         math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");
@@ -191,8 +193,10 @@ fn gpu_ext3_merkle_root(columns: &[Vec<Fp3>], blowup: usize, weights: &[u64]) ->
         }
     }
 
+    // Row-pair leaves (rows_per_leaf = 2, matching `ROWS_PER_LEAF`) to match the
+    // row-pair `commit_rows_bit_reversed` CPU reference below.
     let gpu_leaves =
-        math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size, 1)
+        math_cuda::merkle::keccak_leaves_ext3(&flat_for_keccak, lde_size, num_cols, lde_size, 2)
             .expect("GPU ext3 keccak leaves");
     let nodes =
         math_cuda::merkle::build_merkle_tree_on_device(&gpu_leaves).expect("GPU Merkle tree");
