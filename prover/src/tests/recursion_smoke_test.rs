@@ -2,6 +2,10 @@
 //! hand `(VmProof, elf, opts)` to the in-VM verifier guest, then either prove
 //! the guest's execution (`OuterMode::Prove`) or just execute it
 //! (`OuterMode::ExecuteOnly`). Guest ELFs come from `make compile-recursion-elfs`.
+//!
+//! Every pipeline host-verifies the inner proof, so building with
+//! `--features stark/instruments` makes any of these tests print the verifier's
+//! per-step `Time spent:` timings.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -818,40 +822,6 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!("  To render SVG (requires inferno):");
     eprintln!("    cat {path} | inferno-flamegraph > /tmp/recursion_flamegraph_sampled.svg");
     eprintln!("============================================================");
-}
-
-/// Host-side per-step verifier timings (build with `--features stark/instruments`
-/// for the `Time spent:` lines). No VM execution.
-#[test]
-#[ignore = "diagnostic: prints host-side verifier step timings"]
-fn test_host_verify_step_timings() {
-    let root = workspace_root();
-    let empty_path =
-        root.join("bench_vs/lambda/empty/target/riscv64im-lambda-vm-elf/release/empty-bench");
-    let empty_elf_bytes = std::fs::read(&empty_path).expect("read empty-bench");
-
-    let inner_proof_options = MIN_PROOF_OPTIONS;
-
-    eprintln!("[host-verify] proving empty (blowup=2, fri_queries=1) ...");
-    let inner_proof = crate::prove_with_options_and_inputs(
-        &empty_elf_bytes,
-        &[],
-        &inner_proof_options,
-        &crate::MaxRowsConfig::default(),
-    )
-    .expect("inner prove should succeed");
-
-    eprintln!("[host-verify] verifying on host (with instruments) ...");
-    let ok = crate::verify_with_options(
-        &inner_proof,
-        &empty_elf_bytes,
-        &inner_proof_options,
-        None,
-        None,
-    )
-    .expect("verify errored");
-    assert!(ok, "proof must verify");
-    eprintln!("[host-verify] verified OK");
 }
 
 // Control guest: decodes the blob and halts. Its cycle count subtracted from
