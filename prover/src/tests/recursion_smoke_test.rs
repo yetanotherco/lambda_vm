@@ -255,6 +255,7 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 /// Execute-only mirror of `test_recursion_prove_empty`: verify a `blowup=8`
 /// proof of the empty program in-VM.
 #[test]
+#[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_empty() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -269,6 +270,7 @@ fn test_recursion_execute_empty() {
 /// Execute-only mirror of `test_recursion_prove_1query`: smallest possible
 /// inner proof (blowup=2, 1 query) → least guest work.
 #[test]
+#[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_1query() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -284,6 +286,7 @@ fn test_recursion_execute_1query() {
 /// Execute-only mirror of `test_recursion_prove`: verify a `blowup=8` proof of
 /// fibonacci(10) in-VM.
 #[test]
+#[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute() {
     let root = workspace_root();
     let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
