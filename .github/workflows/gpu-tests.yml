@@ -19,6 +19,9 @@ name: GPU Tests (merge queue)
 on:
   merge_group:
   workflow_dispatch:
+  # TEMP(testing): run on pushes to this branch pre-merge. REMOVE before merging.
+  push:
+    branches: [ci_run_tests_gpu]
 
 permissions:
   contents: read
@@ -78,11 +81,12 @@ jobs:
           # because vast can't numerically compare the driver_version string server-side.
           MIN_DRIVER: "580"
         run: |
-          # cpu_ram filter is in GB. cuda_max_good>=13.1: the box's driver must support CUDA
-          # 13.1 because the template's nvcc is 13.1 and build.rs JIT-compiles its PTX at load —
-          # a 13.0 driver rejects 13.1 PTX (CUDA_ERROR_UNSUPPORTED_PTX_VERSION). Bump this in
-          # lockstep if the base image's CUDA toolkit changes.
-          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=96 disk_space>=64 verified=true rentable=true cuda_max_good>=13.1 dph_total<=${PRICE_CAP}"
+          # cpu_ram filter is in GB.
+          # EXPERIMENT: cuda_max_good>=12.8 (was 13.1). The template's nvcc is 13.1, so its PTX
+          # JITs only on drivers with CUDA >= 13.1 — a 12.8/13.0 box will fail with
+          # CUDA_ERROR_UNSUPPORTED_PTX_VERSION. Testing whether the most-expensive selection
+          # still lands on 13.1-capable boxes in practice. Revert to >=13.1 if it flakes.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=96 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
           echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
           # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first (within
           # the cap) — premium hosts have faster disks/network and better reliability; cheapest
