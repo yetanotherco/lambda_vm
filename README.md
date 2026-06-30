@@ -185,7 +185,9 @@ See [`spec/README.md`](./spec/README.md) for full setup instructions.
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
-| `make test-math-cuda` | math-cuda parity tests (requires NVIDIA GPU + nvcc) |
+| `make test-math-cuda` | math-cuda GPU kernel parity tests (requires NVIDIA GPU + nvcc; see GPU Tests) |
+| `make test-cuda-integration` | End-to-end GPU dispatch + proof verification (requires NVIDIA GPU + nvcc) |
+| `make test-cuda-fallback` | GPU error-path / CPU-fallback tests (requires NVIDIA GPU + nvcc) |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 | `make clippy` | Run clippy on all crates |
@@ -218,6 +220,21 @@ Then add the corresponding test under `executor/tests/rust.rs`
 You can run it with
 
 `make test-rust`
+
+### GPU Tests
+
+The CUDA test groups run only on a machine with an NVIDIA GPU and `nvcc`:
+
+- `make test-math-cuda` — GPU-vs-CPU kernel parity (NTT, LDE, barycentric, FRI, …)
+- `make test-cuda-integration` — proves a guest on GPU and checks every dispatch fired + the proof verifies
+- `make test-cuda-fallback` — forces GPU dispatch errors and checks the CPU fallback still verifies
+
+**Requirement: an NVIDIA driver supporting CUDA ≥ 13.1.** The kernels are compiled with the
+toolkit's `nvcc` (currently CUDA 13.1) into PTX that the driver JIT-compiles at load; a driver
+older than the toolkit rejects it with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Keep the driver/CUDA
+floor in step with the installed toolkit (e.g. the `cuda_max_good>=13.1` filter in
+`.github/workflows/gpu-tests.yml`). These groups run automatically on a rented GPU in the merge
+queue via that workflow.
 
 ## Benchmarking & Profiling
 
