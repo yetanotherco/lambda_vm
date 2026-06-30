@@ -233,12 +233,10 @@ The CUDA test groups run only on a machine with an NVIDIA GPU and `nvcc`:
 - `make test-prover-cuda` — the prover/stark/crypto/ecsm suite with the GPU path enabled
 - `make test-prover-comprehensive-cuda` — the comprehensive all-instructions prove on the GPU path
 
-**Requirement: an NVIDIA driver supporting CUDA ≥ 13.1.** The kernels are compiled with the
-toolkit's `nvcc` (currently CUDA 13.1) into PTX that the driver JIT-compiles at load; a driver
-older than the toolkit rejects it with `CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. Keep the driver/CUDA
-floor in step with the installed toolkit (e.g. the `cuda_max_good>=13.1` filter in
-`.github/workflows/gpu-tests.yml`). These groups run automatically on a rented GPU in the merge
-queue via that workflow.
+The kernels are compiled by `nvcc` into PTX that the driver JIT-compiles at load, so the GPU's
+driver must be new enough for the toolkit — an older driver rejects the PTX with
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. These groups run automatically on a rented GPU in the merge
+queue via `.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
 
 ## Benchmarking & Profiling
 

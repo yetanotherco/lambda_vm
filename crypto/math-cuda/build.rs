@@ -76,7 +76,7 @@ fn compile_ptx(src: &str, out_name: &str, have_nvcc: bool) {
     // NOTE: this `-arch` only sets the *virtual arch*, not the PTX ISA version, which is
     // fixed by this nvcc's CUDA toolkit. The runtime driver must support that toolkit's CUDA
     // version or it rejects the PTX with CUDA_ERROR_UNSUPPORTED_PTX_VERSION — i.e. the box's
-    // driver CUDA must be >= the build toolkit's CUDA (currently 13.1). See README "GPU Tests".
+    // driver CUDA must be >= the build toolkit's CUDA. See README "GPU Tests".
     let arch = env::var("CUDARC_NVCC_ARCH").unwrap_or_else(|_| detect_arch());
 
     let status = Command::new(nvcc_path())
