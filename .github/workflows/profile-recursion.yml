@@ -106,7 +106,10 @@ jobs:
   # Stitch the matrix fragments into a single PR comment.
   comment:
     needs: profile
-    if: always() && github.event_name == 'issue_comment'
+    # always() so partial-matrix failures still post; skip when `profile` was
+    # skipped (non-/profile_recursion or non-member comment) so this job — and
+    # the self-hosted bench runner it spins up — doesn't fire on every comment.
+    if: always() && github.event_name == 'issue_comment' && needs.profile.result != 'skipped'
     runs-on: [self-hosted, bench]
     steps:
       - name: Get PR head ref
