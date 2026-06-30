@@ -210,7 +210,8 @@ fn setup_guest_run(
     let (_inner_proof, blob) = prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], opts);
 
     let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
-    let executor = executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
+    let executor =
+        executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
     (guest_elf_bytes, program, executor)
 }
 
@@ -218,10 +219,7 @@ fn setup_guest_run(
 /// `[label]   ... N chunks, M cycles, T elapsed` line every `stride` chunks —
 /// the readout every counting diagnostic shares. Tests that need extra live
 /// state (unique PC count, active step bucket) keep their own closure instead.
-fn log_progress(
-    label: &'static str,
-    stride: usize,
-) -> impl FnMut(usize, u64, std::time::Duration) {
+fn log_progress(label: &'static str, stride: usize) -> impl FnMut(usize, u64, std::time::Duration) {
     move |chunks, cycles, elapsed| {
         if chunks.is_multiple_of(stride) {
             eprintln!("[{label}]   ... {chunks} chunks, {cycles} cycles, {elapsed:?} elapsed");
