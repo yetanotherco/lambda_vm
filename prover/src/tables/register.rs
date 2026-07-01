@@ -1,6 +1,6 @@
 //! REGISTER table for register initialization and finalization.
 //!
-//! Similar to PAGE table but for registers (is_register=1).
+//! Similar to PAGE table but for registers (domain=1).
 //! Provides initial and final tokens for the Memory bus to balance
 //! register read/write operations from MEMW.
 //!
@@ -367,7 +367,7 @@ pub fn preprocessed_commitment(options: &ProofOptions, init: &[u32]) -> Commitme
 /// - REG-C1: memory[1, address, 1, init] - receiver, multiplicity -1
 /// - REG-C2: memory[1, address, timestamp, fini] - sender, multiplicity 1
 ///
-/// Note: is_register=1 (constant) to distinguish from memory (is_register=0).
+/// Note: domain=1 (constant) to distinguish from memory (domain=0).
 pub fn bus_interactions() -> Vec<BusInteraction> {
     // Address is just the offset in register space.
     // Stored in low word, high word is 0
@@ -386,7 +386,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::One,
             vec![
-                // is_register = 1 (registers, not memory)
+                // domain = 1 (registers, not memory)
                 BusValue::constant(1),
                 // address_lo = offset
                 address_lo.clone(),
@@ -409,7 +409,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::One,
             vec![
-                // is_register = 1
+                // domain = 1
                 BusValue::constant(1),
                 // address_lo = offset
                 address_lo,

@@ -5,7 +5,7 @@
 //!
 //! ## Column layout (49 columns)
 //!
-//! - `is_register`: Bit (1 = register access, 0 = memory access)
+//! - `domain`: Bit (1 = register access, 0 = memory access)
 //! - `base_address`: DWordWL (64-bit address, 2 cols)
 //! - `value[8]`: BaseField[8] (8 bytes to write)
 //! - `timestamp`: DWordWL (64-bit timestamp, 2 cols)
@@ -50,8 +50,8 @@ pub const MAX_ROWS: usize = super::max_rows::MEMW;
 /// Column definitions for the MEMW table.
 pub mod cols {
     // Input columns
-    /// is_register: Bit (1 = register, 0 = memory)
-    pub const IS_REGISTER: usize = 0;
+    /// domain: Bit (1 = register, 0 = memory)
+    pub const DOMAIN: usize = 0;
 
     /// base_address: DWordWL (2 words = 2 columns)
     pub const BASE_ADDRESS_0: usize = 1;
@@ -105,7 +105,7 @@ pub mod cols {
 #[derive(Debug, Clone)]
 pub struct MemwOperation {
     /// Whether this is a register access (true) or memory access (false)
-    pub is_register: bool,
+    pub domain: bool,
     /// Base address (64-bit)
     pub base_address: u64,
     /// Values to write (8 bytes)
@@ -125,7 +125,7 @@ pub struct MemwOperation {
 impl MemwOperation {
     /// Create a new MEMW operation.
     pub fn new(
-        is_register: bool,
+        domain: bool,
         base_address: u64,
         value: [u64; 8],
         timestamp: u64,
@@ -133,7 +133,7 @@ impl MemwOperation {
         is_read: bool,
     ) -> Self {
         Self {
-            is_register,
+            domain,
             base_address,
             value,
             timestamp,
@@ -184,7 +184,7 @@ pub fn generate_memw_trace(
 
     for (row_idx, op) in operations.iter().enumerate() {
         // Input columns
-        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
+        table.set_bool(row_idx, cols::DOMAIN, op.domain);
 
         // base_address as DWordWL (2 words)
         let base_addr_lo = op.base_address & 0xFFFF_FFFF;
@@ -259,13 +259,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // produces a memory token at a wrong address that has no matching
     // PAGE/REGISTER token, causing multiset imbalance and an invalid proof.
 
-    // CM8: memory[is_register, base_address, old_timestamp[0], old[0]] with +μ_sum
+    // CM8: memory[domain, base_address, old_timestamp[0], old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -291,13 +291,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM9: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // CM9: memory[domain, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -354,7 +354,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             addr_add_0_lo.clone(),
@@ -380,7 +380,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Sum3(cols::WRITE2, cols::WRITE4, cols::WRITE8),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             addr_add_0_lo,
@@ -431,7 +431,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_add_lo.clone(),
@@ -457,7 +457,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_add_lo,
@@ -509,7 +509,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_add_lo.clone(),
@@ -535,7 +535,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_add_lo,
@@ -596,9 +596,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::OLD[7],
                 packing: Packing::Direct,
             },
-            // is_register
+            // domain
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             // base_address
@@ -675,9 +675,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         Multiplicity::Column(cols::MU_WRITE),
         vec![
-            // is_register
+            // domain
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             // base_address
@@ -942,13 +942,14 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstrai
 
 /// Creates all constraints for the MEMW table.
 ///
-/// 15 constraints total:
+/// 16 constraints total:
 /// - IS_BIT<μ_sum> (1)
 /// - w2 => μ_sum (1)
 /// - IS_BIT<μ_read> (1)
 /// - IS_BIT<μ_write> (1)
 /// - IS_BIT for carry[0..6] (7)
 /// - IS_BIT<write2/write4/write8> (3) + IS_BIT<write2+write4+write8> (1) [spec assumption]
+/// - IS_BIT<domain> (1)
 pub fn constraints()
 -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     let mut constraints: Vec<
@@ -985,6 +986,15 @@ pub fn constraints()
         idx += 1;
     }
     constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
+    idx += 1;
+
+    // IS_BIT<domain>: pin the RAM/register domain tag to {0,1} locally. The Memory-bus
+    // commit domain (domain = 2) must never originate from MEMW; previously this held only
+    // indirectly (every Memw-bus dispatcher hardcodes the tag to 0/1, so a 2 leaves an unmatched
+    // dispatch token). Making it an explicit local constraint keeps the commit-domain separation
+    // robust against future refactors, mirroring how the L2G table pins MU explicitly rather
+    // than leaning on its cross-bus argument.
+    constraints.push(IsBitConstraint::unconditional(cols::DOMAIN, idx).boxed());
 
     constraints
 }

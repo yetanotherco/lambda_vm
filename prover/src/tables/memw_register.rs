@@ -1,7 +1,7 @@
 //! MEMW_R (Memory Write/Read -- Register) table.
 //!
 //! Ultra-slim fast path for register accesses. Registers are always 2 words
-//! (DWordWL), always aligned, and `is_register=1`, so this table strips out
+//! (DWordWL), always aligned, and `domain=1`, so this table strips out
 //! all memory-specific columns (address decomposition, alignment mask, width
 //! flags, per-byte old_timestamps).
 //!
@@ -177,7 +177,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // Memory bus read-old (sender, for i=0,1)
-    // memory[is_register=1, addr_lo=2*ADDRESS+i, addr_hi=0,
+    // memory[domain=1, addr_lo=2*ADDRESS+i, addr_hi=0,
     //        OLD_TIMESTAMP_LO, TIMESTAMP_1, OLD[i]]
     // -------------------------------------------------------------------------
     for i in 0..2 {
@@ -214,7 +214,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // Memory bus write-new (receiver, for i=0,1)
-    // memory[is_register=1, addr_lo=2*ADDRESS+i, addr_hi=0,
+    // memory[domain=1, addr_lo=2*ADDRESS+i, addr_hi=0,
     //        TIMESTAMP_0, TIMESTAMP_1, VAL[i]]
     // -------------------------------------------------------------------------
     for i in 0..2 {
@@ -276,7 +276,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // is_register = 1
+            // domain = 1
             BusValue::constant(1),
             // base_address = [2*ADDRESS, 0]
             addr_lo_linear.clone(),
@@ -319,7 +319,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         Multiplicity::Column(cols::MU_WRITE),
         vec![
-            // is_register = 1
+            // domain = 1
             BusValue::constant(1),
             // base_address = [2*ADDRESS, 0]
             addr_lo_linear,

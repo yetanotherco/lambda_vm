@@ -175,7 +175,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 2. MEMW: read byte k[offset] at ptr+offset, timestamp+1, width 1 (mult = mu).
-    // CO24 layout: [old[8], is_register, base[2], value[8], ts[2], w2, w4, w8].
+    // CO24 layout: [old[8], domain, base[2], value[8], ts[2], w2, w4, w8].
     {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -208,7 +208,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         for _ in 1..8 {
             values.push(BusValue::constant(0));
         }
-        values.push(BusValue::constant(0)); // is_register = 0
+        values.push(BusValue::constant(0)); // domain = 0
         values.push(base_lo);
         values.push(base_hi);
         // value[0..8]: same as old (read)

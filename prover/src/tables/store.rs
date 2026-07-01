@@ -135,7 +135,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         Multiplicity::Column(cols::MU),
         vec![
-            BusValue::constant(0), // is_register = 0 (memory access)
+            BusValue::constant(0), // domain = 0 (memory access)
             BusValue::Packed {
                 start_column: cols::BASE_ADDRESS_0,
                 packing: Packing::DWordWL,

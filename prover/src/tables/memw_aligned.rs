@@ -6,7 +6,7 @@
 //!
 //! ## Column layout (29 columns)
 //!
-//! - `is_register`: Bit
+//! - `domain`: Bit
 //! - `base_address[3]`: DWordWHH
 //!   - `base_address[0]`: Half (low 16 bits)
 //!   - `base_address[1]`: Half (mid 16 bits)
@@ -53,7 +53,7 @@ pub const MAX_ROWS: usize = super::max_rows::MEMW_A;
 // =========================================================================
 
 pub mod cols {
-    pub const IS_REGISTER: usize = 0;
+    pub const DOMAIN: usize = 0;
 
     /// base_address: DWordWHH (3 columns)
     /// base_address[0] = low half (bits 0-15)
@@ -102,7 +102,7 @@ pub fn generate_memw_aligned_trace(
     let table = &mut trace.main_table;
 
     for (row_idx, op) in operations.iter().enumerate() {
-        table.set_bool(row_idx, cols::IS_REGISTER, op.is_register);
+        table.set_bool(row_idx, cols::DOMAIN, op.domain);
 
         table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address);
 
@@ -216,13 +216,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         packing: Packing::Direct,
     };
 
-    // CM16: memory[is_register, base_address, old_timestamp, old[0]] with +μ_sum
+    // CM16: memory[domain, base_address, old_timestamp, old[0]] with +μ_sum
     interactions.push(BusInteraction::sender(
         BusId::Memory,
         mu_sum.clone(),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             base_addr_lo.clone(),
@@ -242,13 +242,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // CM17: memory[is_register, base_address, timestamp, value[0]] with -μ_sum
+    // CM17: memory[domain, base_address, timestamp, value[0]] with -μ_sum
     interactions.push(BusInteraction::receiver(
         BusId::Memory,
         mu_sum,
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             base_addr_lo.clone(),
@@ -290,7 +290,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         w2_mult.clone(),
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             addr_1_lo.clone(),
@@ -315,7 +315,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         w2_mult,
         vec![
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             addr_1_lo,
@@ -354,7 +354,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_i_lo.clone(),
@@ -379,7 +379,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Sum(cols::WRITE4, cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_i_lo,
@@ -419,7 +419,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_i_lo.clone(),
@@ -444,7 +444,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             Multiplicity::Column(cols::WRITE8),
             vec![
                 BusValue::Packed {
-                    start_column: cols::IS_REGISTER,
+                    start_column: cols::DOMAIN,
                     packing: Packing::Direct,
                 },
                 addr_i_lo,
@@ -505,9 +505,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::OLD[7],
                 packing: Packing::Direct,
             },
-            // is_register
+            // domain
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             // base_address as DWordWL: [lo32, hi32]
@@ -578,9 +578,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         Multiplicity::Column(cols::MU_WRITE),
         vec![
-            // is_register
+            // domain
             BusValue::Packed {
-                start_column: cols::IS_REGISTER,
+                start_column: cols::DOMAIN,
                 packing: Packing::Direct,
             },
             // base_address as DWordWL: [lo32, hi32]
@@ -723,8 +723,8 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwAlignedC
     }
 }
 
-/// Creates all constraints for the MEMW_A table (8 total). The last four are the
-/// spec's defense-in-depth width-flag assumptions.
+/// Creates all constraints for the MEMW_A table (9 total). Four are the spec's
+/// defense-in-depth width-flag assumptions; the last pins the domain tag to {0,1}.
 pub fn constraints()
 -> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
     vec![
@@ -736,5 +736,9 @@ pub fn constraints()
         IsBitConstraint::unconditional(cols::WRITE4, 5).boxed(),
         IsBitConstraint::unconditional(cols::WRITE8, 6).boxed(),
         MemwAlignedConstraint::new(MemwAlignedConstraintKind::WidthSumIsBit, 7).boxed(),
+        // IS_BIT<domain>: pin the RAM/register domain tag to {0,1} locally, so the
+        // Memory-bus commit domain (domain = 2) can never originate from MEMW_A. See the
+        // matching note in `memw::constraints`.
+        IsBitConstraint::unconditional(cols::DOMAIN, 8).boxed(),
     ]
 }

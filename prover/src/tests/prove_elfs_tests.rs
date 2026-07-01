@@ -80,7 +80,6 @@ fn prove_and_verify_vm_minimal(elf: &Elf, traces: &mut Traces) -> bool {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -168,7 +167,6 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -1379,7 +1377,6 @@ fn test_prove_elfs_test_commit_4_wrong_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -1483,7 +1480,7 @@ fn test_debug_memory_bus_tokens() {
     // === MEMW tokens (for register rows only) ===
     println!("\n=== MEMW Memory Bus Tokens (register rows) ===");
     for row in 0..memw.num_rows() {
-        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::DOMAIN).to_raw();
         if is_reg == 0 {
             continue; // Skip memory rows (multiplicity = 0)
         }
@@ -1623,7 +1620,7 @@ fn test_debug_memory_bus_tokens() {
 
     // MEMW tokens
     for row in 0..memw.num_rows() {
-        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::DOMAIN).to_raw();
         if is_reg == 0 {
             continue;
         }
@@ -1753,7 +1750,7 @@ fn test_debug_memory_tokens_sb_sh() {
     let mut token_balance: HashMap<Token, (i64, Vec<String>)> = HashMap::new();
 
     // === REGISTER Memory tokens ===
-    println!("\n=== REGISTER Memory Bus Tokens (is_register=1) ===");
+    println!("\n=== REGISTER Memory Bus Tokens (domain=1) ===");
     for row in 0..traces.register.num_rows().min(64) {
         let offset = traces
             .register
@@ -1805,7 +1802,7 @@ fn test_debug_memory_tokens_sb_sh() {
     let mut memw_register_rows = 0;
     let mut memw_memory_rows = 0;
     for row in 0..memw.num_rows() {
-        let is_reg = memw.main_table.get(row, memw_cols::IS_REGISTER).to_raw();
+        let is_reg = memw.main_table.get(row, memw_cols::DOMAIN).to_raw();
 
         // Count row types
         if is_reg == 1 {
@@ -2134,7 +2131,6 @@ fn test_deep_stack_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2207,7 +2203,6 @@ fn test_deep_stack_missing_pages_rejected() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2315,7 +2310,6 @@ fn test_heap_alloc_runtime_pages_roundtrip() {
         &verifier_air_refs,
         &proof,
         &traces.public_output_bytes,
-        0,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
@@ -2973,7 +2967,6 @@ fn test_prove_first_epoch_without_halt() {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
-        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -3057,7 +3050,6 @@ fn test_prove_second_epoch_from_snapshot() {
         &airs.air_refs(),
         &multi_proof,
         &traces.public_output_bytes,
-        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -3164,7 +3156,6 @@ fn test_epoch_proof_commits_l2g() {
         &refs,
         &multi_proof,
         &traces.public_output_bytes,
-        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");
@@ -3316,7 +3307,6 @@ fn test_continuation_pipeline_end_to_end() {
             &refs,
             &multi_proof,
             &traces.public_output_bytes,
-            0,
             &mut replay,
         )
         .expect("fingerprint collision in test");
@@ -3447,7 +3437,6 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
         &refs,
         &multi_proof,
         &traces.public_output_bytes,
-        0,
         &mut replay,
     )
     .expect("fingerprint collision in test");

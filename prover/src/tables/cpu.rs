@@ -733,7 +733,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::Memw,
         Multiplicity::Column(cols::WRITE_REGISTER),
         vec![
-            BusValue::constant(1), // is_register
+            BusValue::constant(1), // domain
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: 2,
                 column: cols::RD,
@@ -978,7 +978,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 
-/// MEMW register-read interaction (24 elements: `old(8), is_register, base(2),
+/// MEMW register-read interaction (24 elements: `old(8), domain, base(2),
 /// value(8), timestamp(2), w2, w4, w8`). Register values are DWordWL (the two
 /// value words are read directly; the remaining 6 byte slots are 0).
 fn memw_register_read(
@@ -1023,7 +1023,7 @@ fn memw_register_read(
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // is_register = 1
+            // domain = 1
             BusValue::constant(1),
             // base_address[0] = 2*rs, base_address[1] = 0
             BusValue::linear(vec![LinearTerm::Column {

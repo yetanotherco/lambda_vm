@@ -236,7 +236,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // MEMW sender (to read memory) - ENABLED
     // -------------------------------------------------------------------------
-    // LOAD calls MEMW with is_register=0, passing res as both value and old
+    // LOAD calls MEMW with domain=0, passing res as both value and old
     // (since we're reading, value=old=the read data)
     // RES columns contain individual bytes, sent as Direct elements
     // to match the unified MEMW Read receiver format.
@@ -278,7 +278,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RES[7],
                 packing: Packing::Direct,
             },
-            // is_register = 0 (constant)
+            // domain = 0 (constant)
             BusValue::constant(0),
             // base_address (DWordWL = 2 words)
             BusValue::Packed {

@@ -359,8 +359,8 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 /// (the epoch-start seed, matching the first MEMW read's `old_timestamp`) and
 /// sends its final token at the last access timestamp. This replaces PAGE's
 /// init/fini bookend for touched bytes. The `Memory` token layout is
-/// `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`;
-/// RAM only, so `is_register = 0`, and the byte value is the LO column.
+/// `[domain, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`;
+/// RAM only, so `domain = 0`, and the byte value is the LO column.
 ///
 /// Address, fini timestamp and the values appear here, so MEMW range-checks them
 /// for us — they need no L2G range check (see [`range_check_interactions`]).

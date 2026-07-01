@@ -209,12 +209,12 @@ fn packed(col: usize) -> BusValue {
     }
 }
 
-/// `[old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
+/// `[old[8], domain, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
 /// a 24-element MEMW **read** tuple (`old == value`).
 #[allow(clippy::too_many_arguments)]
 fn memw_read(
     value: [BusValue; 8],
-    is_register: u64,
+    domain: u64,
     base_lo: BusValue,
     base_hi: BusValue,
     ts_lo: BusValue,
@@ -224,7 +224,7 @@ fn memw_read(
 ) -> Vec<BusValue> {
     let mut v = Vec::with_capacity(24);
     v.extend(value.clone()); // old == value (read)
-    v.push(BusValue::constant(is_register));
+    v.push(BusValue::constant(domain));
     v.push(base_lo);
     v.push(base_hi);
     v.extend(value);
@@ -236,7 +236,7 @@ fn memw_read(
     v
 }
 
-/// `[is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
+/// `[domain, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
 /// a 16-element MEMW **write** tuple (MEMW table supplies `old`).
 fn memw_write(
     value: [BusValue; 8],
@@ -247,7 +247,7 @@ fn memw_write(
     w8: u64,
 ) -> Vec<BusValue> {
     let mut v = Vec::with_capacity(16);
-    v.push(BusValue::constant(0)); // is_register = 0 (memory)
+    v.push(BusValue::constant(0)); // domain = 0 (memory)
     v.push(base_lo);
     v.push(base_hi);
     v.extend(value);

@@ -580,7 +580,7 @@ fn collect_load_op_from_cpu(
 
     // Create MEMW operation (read)
     let memw_op = MemwOperation::new(
-        false, // is_register = false
+        false, // domain = false
         base_address,
         res_bytes,
         op.timestamp,
@@ -634,7 +634,7 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     // the old inline M7). It uses the base timestamp — the same the CPU sends on
     // the MEMORY bus — per spec store.toml.
     let memw_op = MemwOperation::new(
-        false, // is_register = false
+        false, // domain = false
         base_address,
         value_bytes,
         op.timestamp,
@@ -1361,7 +1361,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 // =============================================================================
 
 /// An operation routes to MEMW_R if:
-/// 1. It's a 2-word register access (is_register = true, width = 2)
+/// 1. It's a 2-word register access (domain = true, width = 2)
 /// 2. Both words share the same old_timestamp (atomic register write)
 /// 3. timestamp[1] == old_timestamp[1] (upper limbs match)
 /// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
@@ -1370,7 +1370,7 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
 pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
-    if !op.is_register || op.width != 2 {
+    if !op.domain || op.width != 2 {
         return false;
     }
     // Both words must share old_timestamp (atomic register write assumption)

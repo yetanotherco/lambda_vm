@@ -301,7 +301,7 @@ fn timestamp_plus(offset: i64) -> Vec<BusValue> {
     ]
 }
 
-/// MEMW register **read** (24 elements: `old == value`, `is_register=1`, `write2=1`).
+/// MEMW register **read** (24 elements: `old == value`, `domain=1`, `write2=1`).
 fn reg_read(
     rs: usize,
     lo0: usize,
@@ -311,7 +311,7 @@ fn reg_read(
     mult: usize,
 ) -> BusInteraction {
     let mut values = register_dword(lo0, lo1, hi); // old
-    values.push(BusValue::constant(1)); // is_register
+    values.push(BusValue::constant(1)); // domain
     values.push(BusValue::linear(vec![LinearTerm::Column {
         coefficient: 2,
         column: rs,
@@ -334,7 +334,7 @@ fn reg_write(
     mult: usize,
 ) -> BusInteraction {
     let mut values = vec![
-        BusValue::constant(1), // is_register
+        BusValue::constant(1), // domain
         BusValue::linear(vec![LinearTerm::Column {
             coefficient: 2,
             column: rd,

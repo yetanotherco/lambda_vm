@@ -87,7 +87,7 @@ pub fn generate_halt_trace(
 
 /// Returns the 24-element MEMW read bus values for x10 exit code verification.
 ///
-/// Format matches CO24 (read receiver): `[old[0..7], is_register, base_addr[0..1],
+/// Format matches CO24 (read receiver): `[old[0..7], domain, base_addr[0..1],
 /// value[0..7], timestamp[0..1], write2, write4, write8]`.
 /// old=0 enforces that x10 was 0 at halt time.
 fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
@@ -102,7 +102,7 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
         BusValue::constant(0),
         BusValue::constant(0),
         // input (same 16 elements as write format)
-        BusValue::constant(1),           // is_register = 1
+        BusValue::constant(1),           // domain = 1
         BusValue::constant(base_addr),   // base_address[0]
         BusValue::constant(0),           // base_address[1]
         BusValue::constant(0),           // value[0] = 0
@@ -123,11 +123,11 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
 
 /// Returns the 16-element MEMW write bus values for a register finalization.
 ///
-/// Format matches CO25 (write receiver): `[is_register, base_addr[0..1], value[0..7],
+/// Format matches CO25 (write receiver): `[domain, base_addr[0..1], value[0..7],
 /// timestamp[0..1], write2, write4, write8]`.
 fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
     vec![
-        BusValue::constant(1),           // is_register = 1
+        BusValue::constant(1),           // domain = 1
         BusValue::constant(base_addr),   // base_address[0]
         BusValue::constant(0),           // base_address[1]
         BusValue::constant(value_lo),    // value[0]
@@ -209,7 +209,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // its real `next_pc` to x255 (addresses 510/511) at this same timestamp; we
     // consume it (sender, +1) and re-emit pc=1 (receiver, -1) so the CPU padding
     // rows — which all carry pc=1 — chain cleanly to the REGISTER final token.
-    // `value` layout on the bus: [is_register, addr_lo, addr_hi, ts_lo, ts_hi, value].
+    // `value` layout on the bus: [domain, addr_lo, addr_hi, ts_lo, ts_hi, value].
     let ts_plus_one_lo = || {
         BusValue::linear(vec![
             LinearTerm::Column {

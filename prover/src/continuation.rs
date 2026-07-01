@@ -24,11 +24,16 @@
 //! by construction, with the REG-C2 Memory bus binding `FINI` to the true final
 //! registers. No extra bus.
 //!
-//! The x254 commit index is carried across epochs by that same register binding,
-//! so a continuation epoch indexes its commits from the carried value: both the
-//! COMMIT trace (`current_commit_index` seeded from x254) and the verifier's
-//! `compute_commit_bus_offset` (a `start_index` parameter) count from it, and the
-//! driver concatenates each epoch's committed bytes into the run-wide output.
+//! The x254 commit index is carried across epochs by that same register binding, so the
+//! COMMIT trace indexes its committed bytes from the carried global value (index 0 for the
+//! first byte of the run). COMMIT correctness itself is a GLOBAL property: instead of each
+//! epoch closing its own output slice, the COMMIT chip emits each byte as a Memory-bus token
+//! in the `commit` domain (`domain = 2`), and — like the L2G table — each epoch's COMMIT
+//! trace is re-committed in the global proof (root-bound by `verify_commit_commitment_binding`)
+//! under a reduced air that carries only that emit. The verifier closes the output bus once,
+//! over the whole run's output, via `compute_commit_bus_offset` (indices 0..N). The run-wide
+//! output is absorbed into the global statement, so it is verifier-checked (length, order,
+//! completeness, no-splice) rather than driver-trusted.
 //!
 //! The prover and verifier are split: `prove_continuation` emits a self-contained
 //! `ContinuationProof` bundle and `verify_continuation` checks it from the bundle
@@ -58,8 +63,9 @@ use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_i
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
-    Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
+    COMMIT_TABLE_INDEX, Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
+    compute_commit_bus_offset, replay_transcript_phase_a, verify_commit_commitment_binding,
+    verify_l2g_commitment_binding,
 };
 
 type F = GoldilocksField;
@@ -96,11 +102,17 @@ fn epoch_transcript(
     transcript
 }
 
-/// Fresh transcript seeded with the global proof's statement (ELF + epoch count).
-/// `prove_global` and `verify_global` both seed via this so their challenges match.
-fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E> {
+/// Fresh transcript seeded with the global proof's statement (ELF + epoch count + the
+/// run-wide committed output). `prove_global` and `verify_global` both seed via this so their
+/// challenges match; absorbing `full_output` binds it to the proof (tampering it diverges the
+/// challenges and breaks the output-bus close).
+fn global_transcript(
+    elf_bytes: &[u8],
+    num_epochs: usize,
+    full_output: &[u8],
+) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(&mut transcript, elf_bytes, num_epochs);
+    absorb_continuation_global_statement(&mut transcript, elf_bytes, num_epochs, full_output);
     transcript
 }
 
@@ -139,6 +151,28 @@ fn l2g_global_air(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
             interactions: local_to_global::bus_interactions(epoch_label),
+        },
+        opts,
+        1,
+        empty_constraints(),
+    )
+}
+
+/// Reduced COMMIT AIR for the global proof: carries ONLY the committed-output emit
+/// ([`commit::output_bus_interaction`]) on the Memory bus in the `commit` domain.
+///
+/// The global proof re-commits each epoch's COMMIT trace under this air; the verifier
+/// closes the emitted tokens once, over the whole run's output. Uses `empty_constraints()`
+/// for the same reason as [`l2g_global_air`]: the COMMIT trace's `MU`/`END`/`FIRST` bits and
+/// the recursion structure that pins the emitted `(index, value)` pairs are enforced in the
+/// epoch proof's COMMIT air, and `verify_commit_commitment_binding` ties this sub-table to
+/// that *same* committed trace (equal main-trace roots) — so re-asserting them here would be
+/// redundant, not a missing check.
+fn commit_global_air(opts: &ProofOptions) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    AirWithBuses::new(
+        crate::tables::commit::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: vec![crate::tables::commit::output_bus_interaction()],
         },
         opts,
         1,
@@ -251,7 +285,9 @@ struct EpochStart<'a> {
 struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
-    /// Bytes this epoch committed — the COMMIT-bus receiver reference.
+    /// Bytes this epoch committed. Concatenated in order into the run-wide output, which the
+    /// GLOBAL proof binds (output-bus close + COMMIT root binding) — so this slice is a data
+    /// source, not a per-epoch trusted claim.
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
     table_counts: TableCounts,
@@ -268,6 +304,11 @@ struct EpochProof {
     /// The committed L2G table root, tied to the global proof by
     /// [`verify_l2g_commitment_binding`].
     l2g_root: Commitment,
+    /// The committed COMMIT table main-trace root, tied to the global proof by
+    /// [`verify_commit_commitment_binding`]. The global proof re-commits this same COMMIT
+    /// trace (root-bound here) and emits its output tokens there, so the run-wide output is
+    /// closed once, globally, instead of per epoch.
+    commit_root: Commitment,
     /// Touched-cell boundaries; the verifier rebuilds the global AIRs (touched-page
     /// set) from these. Values are redundant with the committed L2G trace.
     boundary: Vec<CellBoundary>,
@@ -316,7 +357,7 @@ fn build_epoch_airs(
         register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     ));
-    VmAirs::new(
+    let mut airs = VmAirs::new(
         elf,
         opts,
         false,
@@ -327,13 +368,20 @@ fn build_epoch_airs(
         None,
         None,
         register_preprocessed,
-    )
+    );
+    // The committed output is closed once in the global proof, not per epoch: rebuild the
+    // epoch's COMMIT air without the output emit (its base register/memory interactions still
+    // commit the trace, whose root is re-committed and bound in the global proof). See
+    // `commit_global_air`.
+    airs.commit = crate::test_utils::create_commit_air(opts, false);
+    airs
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
 /// `boundary`) on the epoch-local Memory bus and its REGISTER table with FINI
 /// preprocessed to the epoch's final register file. Returns the [`EpochProof`] the
-/// standalone verifier later re-checks; does NOT verify here.
+/// standalone verifier later re-checks (does NOT verify here) plus this epoch's COMMIT
+/// trace, which the caller re-commits in the global proof to close the output bus globally.
 #[allow(clippy::too_many_arguments)]
 fn prove_epoch(
     elf: &Elf,
@@ -343,7 +391,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
-) -> Result<EpochProof, Error> {
+) -> Result<(EpochProof, TraceTable<F, E>), Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
     crate::tables::bitwise::update_multiplicities(
@@ -400,6 +448,12 @@ fn prove_epoch(
     // roots). It is appended to the proof below, not through `air_trace_pairs`.
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(boundary);
 
+    // Snapshot the COMMIT main trace BEFORE proving: `multi_prove` appends this epoch's aux
+    // columns to `traces.commit` in place, but the global proof must re-commit a MAIN-ONLY
+    // trace (its reduced air generates its own single aux column). The main-trace data — and
+    // therefore its Merkle root — is identical, so `verify_commit_commitment_binding` matches.
+    let commit_trace = traces.commit.clone();
+
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
     let proof = Prover::multi_prove(
@@ -418,16 +472,30 @@ fn prove_epoch(
         })?
         .lde_trace_main_merkle_root;
 
-    Ok(EpochProof {
-        proof,
-        public_output,
-        table_counts,
-        num_private_input_pages,
-        runtime_page_ranges,
-        reg_fini,
-        l2g_root,
-        boundary: boundary.to_vec(),
-    })
+    // The COMMIT table sits at a fixed position; its main-trace root binds the global
+    // proof's re-committed copy (whose reduced air emits the output tokens).
+    let commit_root = proof
+        .proofs
+        .get(COMMIT_TABLE_INDEX)
+        .ok_or_else(|| {
+            Error::ContinuationInvariant("epoch proof is missing the COMMIT sub-table".to_string())
+        })?
+        .lde_trace_main_merkle_root;
+
+    Ok((
+        EpochProof {
+            proof,
+            public_output,
+            table_counts,
+            num_private_input_pages,
+            runtime_page_ranges,
+            reg_fini,
+            l2g_root,
+            commit_root,
+            boundary: boundary.to_vec(),
+        },
+        commit_trace,
+    ))
 }
 
 /// Verify one epoch using ONLY the [`EpochProof`] bundle plus the verifier-derived
@@ -489,45 +557,53 @@ fn verify_epoch(
         )
     };
 
-    // Start the commit index from the carried x254 (the derived INIT), not a free
-    // input — this is what binds the per-epoch commit slice to its global position.
-    let commit_start_index = register_init
-        .get(register::X254_INDEX)
-        .copied()
-        .unwrap_or(0) as u64;
-
-    let expected = match compute_expected_commit_bus_balance(
-        &refs,
-        &epoch.proof,
-        &epoch.public_output,
-        commit_start_index,
-        &mut seed(),
-    ) {
-        Some(expected) => expected,
-        None => return false,
-    };
-
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
+    // The epoch's COMMIT air does not emit the output token (it is carried to the global
+    // proof and closed there), so the epoch's bus closes to zero — no per-epoch commit
+    // offset. The output's correctness is bound globally: `verify_commit_commitment_binding`
+    // + the global output-bus close over the full run-wide output.
+    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &FieldElement::zero()) {
         return false;
     }
 
     // The claimed L2G root must be the one this proof actually committed (it is what
     // verify_l2g_commitment_binding later ties to the global proof).
-    epoch
+    let l2g_root_ok = epoch
         .proof
         .proofs
         .last()
         .map(|p| p.lde_trace_main_merkle_root)
-        == Some(epoch.l2g_root)
+        == Some(epoch.l2g_root);
+
+    // Likewise the claimed COMMIT root must be the one THIS epoch proof committed — the trace
+    // whose `mu`/`end`/`index`/`value` columns the epoch's constraints pinned. Without this
+    // anchor, `epoch.commit_root` is a free bundle value tied only to the (also prover-supplied)
+    // global proof, so a prover could put a fabricated trace's root here, re-commit that fake
+    // (unconstrained, `commit_global_air`) trace in the global proof, and forge the output while
+    // every other check passes. Mirrors the `l2g_root` anchor above.
+    let commit_root_ok = epoch
+        .proof
+        .proofs
+        .get(COMMIT_TABLE_INDEX)
+        .map(|p| p.lde_trace_main_merkle_root)
+        == Some(epoch.commit_root);
+
+    l2g_root_ok && commit_root_ok
 }
 
-/// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
-/// GlobalMemory bus, plus one GLOBAL_MEMORY table per touched page that sends each
-/// cell's genesis init (preprocessed from the ELF, so the verifier recomputes it)
-/// and receives its final value. The bus balances iff every `fini` matches the next
-/// epoch's `init` and every genesis value matches the ELF.
+/// Build the cross-epoch global proof. It commits, in this order:
+/// 1. every epoch's L2G sub-table on the GlobalMemory bus (cross-epoch memory linkage);
+/// 2. every epoch's COMMIT sub-table under the reduced [`commit_global_air`], which emits
+///    the committed-output tokens (the run-wide output bus);
+/// 3. one GLOBAL_MEMORY table per touched page, sending each cell's genesis init
+///    (preprocessed from the ELF) and receiving its final value.
+///
+/// The GlobalMemory bus balances iff every `fini` matches the next epoch's `init` and every
+/// genesis matches the ELF; the output bus is closed by the verifier's receiver over the
+/// claimed `full_output` (which is absorbed into the global statement here).
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
+    commit_traces: &mut [TraceTable<F, E>],
+    full_output: &[u8],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     opts: &ProofOptions,
@@ -561,6 +637,11 @@ fn prove_global(
     let l2g_airs: Vec<_> = (0..boundaries.len())
         .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
+    // One reduced COMMIT air per epoch (all identical; the emitted tokens come from the
+    // re-committed trace). Order/count must match the epochs so the roots bind.
+    let commit_airs: Vec<_> = (0..commit_traces.len())
+        .map(|_| commit_global_air(opts))
+        .collect();
     let gm_airs: Vec<_> = gm_configs
         .iter()
         .map(|config| global_memory_air(opts, config))
@@ -571,13 +652,16 @@ fn prove_global(
         .zip(l2g_traces.iter_mut())
         .map(|(air, t)| (air as AirRef, t, &()))
         .collect();
+    for (air, trace) in commit_airs.iter().zip(commit_traces.iter_mut()) {
+        pairs.push((air as AirRef, trace, &()));
+    }
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
 
     Prover::multi_prove(
         pairs,
-        &mut global_transcript(elf_bytes, boundaries.len()),
+        &mut global_transcript(elf_bytes, boundaries.len(), full_output),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -587,6 +671,7 @@ fn prove_global(
 fn verify_global(
     boundaries: &[Vec<CellBoundary>],
     proof: &MultiProof<F, E, ()>,
+    full_output: &[u8],
     elf: &Elf,
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -597,6 +682,10 @@ fn verify_global(
     let l2g_airs: Vec<_> = (0..boundaries.len())
         .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
+    // One reduced COMMIT air per epoch — same order/count as `prove_global`.
+    let commit_airs: Vec<_> = (0..boundaries.len())
+        .map(|_| commit_global_air(opts))
+        .collect();
     // Rebuild the genesis configs FROM THE ELF and recompute their commitments:
     // this is the binding — a prover that claimed different genesis values would
     // commit a different root and fail to verify.
@@ -606,17 +695,50 @@ fn verify_global(
         .map(|config| global_memory_air(opts, config))
         .collect();
 
+    // Order must match `prove_global`: L2G, then COMMIT, then GLOBAL_MEMORY.
     let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
+    for air in &commit_airs {
+        refs.push(air as AirRef);
+    }
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
 
+    // The global proof closes two things via one scalar bus balance (all interactions fold
+    // into one LogUp sum): the GlobalMemory bus (telescopes to 0) and the committed-output
+    // bus (the verifier's receiver over the claimed full output). So the expected balance is
+    // 0 + the output offset. Recover (z, alpha) by replaying the global proof's Phase A over
+    // the same statement-seeded transcript the multi_verify below uses.
+    let mut replay_transcript = global_transcript(elf_bytes, boundaries.len(), full_output);
+    let expected = match compute_commit_bus_offset_via_replay(
+        &refs,
+        proof,
+        full_output,
+        &mut replay_transcript,
+    ) {
+        Some(expected) => expected,
+        None => return false,
+    };
+
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut global_transcript(elf_bytes, boundaries.len()),
-        &FieldElement::zero(),
+        &mut global_transcript(elf_bytes, boundaries.len(), full_output),
+        &expected,
     )
+}
+
+/// Recover (z, alpha) from the global proof's Phase-A replay and compute the committed-output
+/// bus offset over `full_output`. Factored out so the transcript fork mirrors the monolithic
+/// path (`compute_expected_commit_bus_balance`).
+fn compute_commit_bus_offset_via_replay(
+    refs: &[AirRef],
+    proof: &MultiProof<F, E, ()>,
+    full_output: &[u8],
+    transcript: &mut DefaultTranscript<E>,
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a(refs, proof, transcript);
+    compute_commit_bus_offset(full_output, &z, &alpha)
 }
 
 /// Prove a full continuation and return a self-contained [`ContinuationProof`]
@@ -661,6 +783,9 @@ pub fn prove_continuation(
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
     let mut epochs: Vec<EpochProof> = Vec::new();
+    // Each epoch's COMMIT trace, retained so the global proof can re-commit them and close
+    // the output bus once, globally (see `prove_global`).
+    let mut commit_traces: Vec<TraceTable<F, E>> = Vec::new();
     // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
     // derived from it (the cross-epoch register binding).
     let mut prev_fini: Option<Vec<u32>> = None;
@@ -733,7 +858,8 @@ pub fn prove_continuation(
             register_init: &register_init,
             label,
         };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        let (epoch, commit_trace) =
+            prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -741,6 +867,7 @@ pub fn prove_continuation(
             image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
         epochs.push(epoch);
+        commit_traces.push(commit_trace);
 
         if is_final {
             break;
@@ -748,10 +875,26 @@ pub fn prove_continuation(
         index += 1;
     }
 
-    // One global LogUp over all the (kept) local-to-global tables.
+    // The run-wide committed output, aggregated in epoch order. The global proof binds it
+    // (both its value, absorbed into the global statement, and that it equals the union of
+    // the re-committed COMMIT tables' emitted tokens), so it is verifier-checked rather than
+    // driver-trusted.
+    let full_output: Vec<u8> = epochs
+        .iter()
+        .flat_map(|e| e.public_output.iter().copied())
+        .collect();
+
+    // One global LogUp over all the (kept) local-to-global tables and COMMIT tables.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         epochs.iter().map(|e| e.boundary.clone()).collect();
-    let global = prove_global(&all_boundaries, elf_bytes, &init_page_data, opts)?;
+    let global = prove_global(
+        &all_boundaries,
+        &mut commit_traces,
+        &full_output,
+        elf_bytes,
+        &init_page_data,
+        opts,
+    )?;
 
     Ok(ContinuationProof {
         epochs,
@@ -811,6 +954,7 @@ pub fn verify_continuation(
     // Derived from the ELF for epoch 0, then from each epoch's bound fini.
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
+    let mut commit_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
     for (index, epoch) in bundle.epochs.iter().enumerate() {
@@ -830,19 +974,25 @@ pub fn verify_continuation(
         }
 
         epoch_roots.push(epoch.l2g_root);
+        commit_roots.push(epoch.commit_root);
+        // The aggregate output; its correctness is enforced globally below (the global
+        // output-bus close over exactly these bytes + the COMMIT root binding), so this is
+        // no longer a driver-trusted concatenation.
         public_output.extend_from_slice(&epoch.public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
         register_init = epoch.reg_fini.clone();
     }
 
-    // Cross-epoch global memory: genesis rebuilt FROM THE ELF (+ private inputs),
-    // so the starting memory cannot be prover-chosen; the bus telescopes fini→init.
+    // Cross-epoch global memory: genesis rebuilt FROM THE ELF (+ private inputs), so the
+    // starting memory cannot be prover-chosen (the bus telescopes fini→init). The same proof
+    // also closes the committed-output bus against `public_output` (bound into its statement).
     let all_boundaries: Vec<Vec<CellBoundary>> =
         bundle.epochs.iter().map(|e| e.boundary.clone()).collect();
     if !verify_global(
         &all_boundaries,
         &bundle.global,
+        &public_output,
         &elf,
         elf_bytes,
         &bundle.private_inputs,
@@ -853,6 +1003,14 @@ pub fn verify_continuation(
 
     // Each epoch's committed L2G table is the same one the global proof used.
     if !verify_l2g_commitment_binding(&epoch_roots, &bundle.global) {
+        return Ok(None);
+    }
+
+    // Each epoch's committed COMMIT table is the same one the global proof re-committed and
+    // emitted output tokens from. The COMMIT sub-tables follow the `n` L2G sub-tables in the
+    // global proof, so they start at offset `n`. This ties the globally-closed output to the
+    // epochs' pinned COMMIT traces.
+    if !verify_commit_commitment_binding(&commit_roots, &bundle.global, n) {
         return Ok(None);
     }
 
@@ -1213,6 +1371,135 @@ mod tests {
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // Negative: corrupting an epoch's claimed COMMIT table root must be rejected —
+    // `verify_commit_commitment_binding` compares each epoch's `commit_root` against the
+    // corresponding re-committed COMMIT sub-proof root in the global proof (at offset `n`),
+    // so a mismatch breaks the binding. Guards the COMMIT root↔global commitment binding,
+    // which is what ties the globally-closed output to the epochs' pinned COMMIT traces.
+    #[test]
+    fn test_split_verify_rejects_tampered_commit_root() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        // `test_commit_split` actually commits bytes, so the COMMIT trace is non-trivial.
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
+        assert!(bundle.num_epochs() > 1, "need multiple epochs");
+        bundle.epochs[0].commit_root[0] ^= 0xFF;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none(),
+            "a tampered COMMIT root must break verify_commit_commitment_binding"
+        );
+    }
+
+    // Negative (the load-bearing one): `commit_root` must be anchored to the epoch proof's OWN
+    // COMMIT trace, not merely be internally consistent with the global proof. Here we rebuild
+    // the global proof over structurally-different COMMIT traces (built from the honest output
+    // ops, so the global bus still closes against the true output) whose Merkle roots differ
+    // from the epochs' real COMMIT traces, and repoint every `commit_root` at those. The global
+    // binding (`verify_commit_commitment_binding`) is then internally consistent — so ONLY the
+    // per-epoch `verify_epoch` anchor (`commit_root == proofs[COMMIT_TABLE_INDEX]`) can reject
+    // it. If that anchor is removed, a prover could likewise re-commit *fabricated* traces
+    // emitting a FORGED output and have it accepted; this test fails closed on that regression.
+    #[test]
+    fn test_split_verify_rejects_commit_root_not_anchored_to_epoch() {
+        use crate::tables::commit::{CommitOperation, generate_commit_trace};
+
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let opts = ProofOptions::default_test_options();
+        let mut bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
+        let n = bundle.epochs.len();
+        assert!(n > 1, "need multiple epochs");
+
+        // Baseline: honest bundle verifies to the true output.
+        let full_output = verify_continuation(&elf_bytes, &bundle, &opts)
+            .unwrap()
+            .expect("honest bundle must verify");
+
+        // Rebuild the global proof over alternate COMMIT traces that emit the SAME output tokens
+        // (one op per committed byte at its true global index) but have a different layout →
+        // different roots. `commit_global_air` has `empty_constraints`, so only the emitted
+        // tokens matter for the global bus, and they still equal `{(i, full_output[i])}`.
+        let elf = Elf::load(&elf_bytes).unwrap();
+        let image = build_initial_image_paged(&elf, &[]);
+        let init_page_data = build_init_page_data(&image);
+        let boundaries: Vec<Vec<CellBoundary>> =
+            bundle.epochs.iter().map(|e| e.boundary.clone()).collect();
+
+        let mut global_index: u64 = 0;
+        let mut alt_traces: Vec<TraceTable<F, E>> = Vec::with_capacity(n);
+        for epoch in &bundle.epochs {
+            let ops: Vec<CommitOperation> = epoch
+                .public_output
+                .iter()
+                .enumerate()
+                .map(|(k, &value)| CommitOperation {
+                    timestamp: 0,
+                    index: global_index + k as u64,
+                    address: 0,
+                    count: 1,
+                    first: k == 0,
+                    end: false,
+                    value,
+                })
+                .collect();
+            global_index += epoch.public_output.len() as u64;
+            alt_traces.push(generate_commit_trace(&ops));
+        }
+
+        let alt_global = prove_global(
+            &boundaries,
+            &mut alt_traces,
+            &full_output,
+            &elf_bytes,
+            &init_page_data,
+            &opts,
+        )
+        .unwrap();
+
+        // Repoint each commit_root at the alternate global's re-committed roots (offset n) and
+        // swap in the alternate global proof, so the global binding stays internally consistent.
+        for (i, epoch) in bundle.epochs.iter_mut().enumerate() {
+            epoch.commit_root = alt_global.proofs[n + i].lde_trace_main_merkle_root;
+        }
+        bundle.global = alt_global;
+
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &opts)
+                .unwrap()
+                .is_none(),
+            "a commit_root not anchored to the epoch's own COMMIT trace must be rejected"
+        );
+    }
+
+    // Negative: tampering an epoch's committed output bytes must be rejected. The output is
+    // only bound globally now (the epoch no longer closes its own commit slice), but the
+    // tampered slice also diverges the epoch's own statement-seeded transcript — either way
+    // the run must fail to verify, and the aggregate the verifier returns can never be a
+    // forged output.
+    #[test]
+    fn test_split_verify_rejects_tampered_output() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_commit_split");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
+        // Find an epoch that actually committed a byte and flip it.
+        let epoch = bundle
+            .epochs
+            .iter_mut()
+            .find(|e| !e.public_output.is_empty())
+            .expect("some epoch must commit a byte in test_commit_split");
+        epoch.public_output[0] ^= 0xFF;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none(),
+            "a tampered committed byte must not verify to a forged output"
         );
     }
 }
