@@ -84,8 +84,11 @@ enum OuterMode {
     /// builds a `Traces`, so footprint stays bounded to the VM's touched
     /// memory + instruction cache. Skips the LDE/FRI of the full pipeline entirely.
     ExecuteOnly,
-    /// Prove the guest's execution memory-bounded via continuations, then
-    /// verify the outer proof on the host. Peak RAM is a single epoch's proof.
+    /// Prove the guest's execution via continuations, then verify the outer
+    /// proof on the host. `prove_and_verify_continuation` retains every epoch's
+    /// STARK proof in the bundle before verifying, so peak RAM grows with epoch
+    /// count. Heavy — excluded from CI, run manually. A future verify-one-and-
+    /// discard API extension would make this memory-friendlier.
     Prove,
 }
 
@@ -123,8 +126,9 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
     committed
 }
 
-/// Epoch size for the outer prove: 2^20 ≈ 1M cycles per epoch.
-const OUTER_EPOCH_SIZE_LOG2: u32 = 20;
+/// Epoch size for the outer prove: 2^16 ≈ 65K cycles. Small so one epoch's
+/// trace+LDE stays under the ~16GiB CI runners.
+const OUTER_EPOCH_SIZE_LOG2: u32 = 16;
 
 /// Prove the recursion guest's execution on `blob` memory-bounded via
 /// continuations and verify the bundle on the host, returning the bytes the

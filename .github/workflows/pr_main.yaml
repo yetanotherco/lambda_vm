@@ -393,7 +393,7 @@ jobs:
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
             --test-threads=1 \
-            -E 'test(test_prove_elfs_all_instructions_64_full) | test(test_recursion)' \
+            -E 'test(test_prove_elfs_all_instructions_64_full) | test(test_recursion_execute)' \
             --run-ignored ignored-only
 
   # Seed ELF caches on refs/heads/main so merge-queue runs can restore them.
