@@ -493,9 +493,10 @@ can't be replayed elsewhere:
 - Each **epoch** absorbs: a domain tag, the ELF digest, the public output, the
   table layout, and the **epoch label** (its position).
 - The **global** proof absorbs: a (distinct) domain tag, the ELF digest, the
-  **epoch count**, and the **private-input page count** (§3.6) — so the genesis AIR
-  layout (which pages are non-preprocessed) is pinned in the statement, matching the
-  monolithic path's `absorb_statement`.
+  **epoch count**, the **private-input page count** (§3.6), and the **touched page-base
+  set** — so the whole genesis AIR layout (which GLOBAL_MEMORY tables exist and which are
+  non-preprocessed) is pinned in the statement, matching the monolithic path's
+  `absorb_statement`.
 
 The monolithic encoding is unchanged (same function, monolithic tag, no label).
 The genesis / register / memory anchor values are *additionally* bound via the
@@ -517,12 +518,18 @@ The integrated `prove_and_verify_continuation` is now a thin wrapper
 likewise split into `prove_epoch` + `verify_epoch`.
 
 The bundle is prover-supplied and therefore **untrusted**. Per epoch it carries the
-`MultiProof`, the `public_output` slice, `table_counts`,
-`num_private_input_pages`, `runtime_page_ranges`, the bound `reg_fini` (`R_{i+1}`),
-the epoch `l2g_root`, and the touched-cell `boundary`; plus the global `MultiProof`
-and a top-level `num_private_input_pages` **count** (§3.6). It does **not** carry the
-raw private input — the verifier never sees it. Everything the integrated path reused
-from prover memory becomes an **explicit verifier action**:
+`MultiProof`, the `public_output` slice, `table_counts`, `runtime_page_ranges`, the bound
+`reg_fini` (`R_{i+1}`), and the epoch `l2g_root`; plus the global `MultiProof`, a top-level
+`num_private_input_pages` **count** (§3.6), and the top-level **`touched_page_bases`** — the
+sorted, deduped set of page bases the run touched. It carries **no cell values**: not the
+raw private input, and — since the per-epoch `CellBoundary` list is *not* serialized — not
+the touched-cell values either (a `CellBoundary.init.value` is a private-input byte for a
+private read, so shipping it would leak the input in plaintext even though the raw blob is
+gone). The verifier only ever needed the epoch count and the touched page-base set from
+those boundaries; `touched_page_bases` supplies exactly that, value-free and at page
+granularity. The full boundaries stay prover-local (they build the L2G traces and
+final-state inside `prove_global`). Everything the integrated path reused from prover memory
+becomes an **explicit verifier action**:
 
 - **Enumerate, don't trust.** The verifier assigns each epoch's `label` and the
   `is_final` flag **by position** (`0..N-1`; the last is final), so the prover can't
@@ -540,8 +547,11 @@ from prover memory becomes an **explicit verifier action**:
   bus; private-input pages are built non-preprocessed (§3.6), so their genesis is a
   committed, bus-pinned column the verifier neither recomputes nor sees.
   `verify_l2g_commitment_binding` ties each epoch's `l2g_root` to the corresponding
-  global-proof sub-table root — which is what makes the prover-supplied `boundary`
-  trustworthy.
+  global-proof sub-table root. The prover-supplied `touched_page_bases` is canonicalized
+  (sorted/deduped) on ingest and pinned the same way the old `boundary` addresses were: a
+  wrong set imbalances the GlobalMemory bus / mismatches the AIR count, and it is bound
+  into the global Fiat-Shamir statement — so a reordered-but-same-set list still verifies
+  while any different set is rejected.
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
 - The verifier also `validate()`s `table_counts` and never trusts a prover-supplied
