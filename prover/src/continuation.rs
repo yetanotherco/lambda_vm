@@ -83,7 +83,6 @@ fn epoch_transcript(
     elf_bytes: &[u8],
     public_output: &[u8],
     table_counts: &TableCounts,
-    num_private_input_pages: usize,
     runtime_page_ranges: &[RuntimePageRange],
     epoch_label: u64,
 ) -> DefaultTranscript<E> {
@@ -94,7 +93,9 @@ fn epoch_transcript(
         elf_bytes,
         public_output,
         table_counts,
-        num_private_input_pages,
+        // Continuation epochs skip PAGE (the L2G bookend replaces it), so they never
+        // have private-input pages — the private-input count is always 0 here.
+        0,
         runtime_page_ranges,
     );
     transcript
@@ -330,9 +331,6 @@ struct EpochProof {
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
     table_counts: TableCounts,
-    /// Always zero for continuation epochs: PAGE is replaced by L2G, and private
-    /// input genesis is carried by the continuation bundle for global verification.
-    num_private_input_pages: usize,
     /// Always empty for continuation epochs: PAGE tables are skipped, so runtime
     /// pages are not part of the epoch AIR statement.
     runtime_page_ranges: Vec<RuntimePageRange>,
@@ -447,11 +445,6 @@ fn prove_epoch(
     let table_counts = traces.table_counts();
     let public_output = traces.public_output_bytes.clone();
     let runtime_page_ranges = traces.runtime_page_ranges();
-    let num_private_input_pages = traces
-        .page_configs
-        .iter()
-        .filter(|c| c.is_private_input)
-        .count();
 
     let airs = build_epoch_airs(
         elf,
@@ -469,7 +462,6 @@ fn prove_epoch(
             elf_bytes,
             &public_output,
             &table_counts,
-            num_private_input_pages,
             &runtime_page_ranges,
             label,
         )
@@ -503,7 +495,6 @@ fn prove_epoch(
         proof,
         public_output,
         table_counts,
-        num_private_input_pages,
         runtime_page_ranges,
         reg_fini,
         l2g_root,
@@ -564,7 +555,6 @@ fn verify_epoch(
             elf_bytes,
             &epoch.public_output,
             &epoch.table_counts,
-            epoch.num_private_input_pages,
             &epoch.runtime_page_ranges,
             label,
         )
@@ -1322,6 +1312,41 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "deflating the count flips a touched page's preprocessed mode → must reject"
+        );
+    }
+
+    // Negative: inflating `num_private_input_pages` to an in-range but wrong value must also
+    // reject. Inflation only enlarges the private-page *range* over untouched pages (no
+    // touched page's preprocessed mode flips, so the committed-AIR-shape check alone would
+    // NOT catch it) — the count is absorbed into the global proof's Fiat-Shamir statement, so
+    // the verifier's challenges diverge from the prover's and `verify_global` rejects. Guards
+    // the FS-binding of the count (complements the deflation test's AIR-shape-mismatch path).
+    #[test]
+    fn test_split_verify_rejects_inflated_num_private_input_pages() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let input: Vec<u8> = (0u8..16).collect();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
+        assert_eq!(
+            bundle.num_private_input_pages, 1,
+            "16 bytes of private input fits in one page"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "baseline must verify before tampering"
+        );
+
+        // In-range (well under the max bound) but one more than the true count.
+        bundle.num_private_input_pages = 2;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none(),
+            "an inflated count diverges the global Fiat-Shamir statement → must reject"
         );
     }
 
