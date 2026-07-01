@@ -107,6 +107,7 @@ fn global_transcript(
     elf_bytes: &[u8],
     num_epochs: usize,
     num_private_input_pages: usize,
+    touched_page_bases: &[u64],
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_continuation_global_statement(
@@ -114,6 +115,7 @@ fn global_transcript(
         elf_bytes,
         num_epochs,
         num_private_input_pages,
+        touched_page_bases,
     );
     transcript
 }
@@ -222,18 +224,46 @@ fn global_memory_air(
     air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
 }
 
-/// The touched pages (sorted) and their genesis configs, for the VERIFIER: built from
-/// the ELF alone (no private bytes). Each cell the program touched lives on one of
-/// these pages; an ELF data page carries its bytes as `init`, every other (stack/heap)
-/// page is zero-init.
+/// The sorted, deduped set of page bases the touched cells fall on — the SINGLE source
+/// of truth for which GLOBAL_MEMORY tables exist. The prover builds the committed tables
+/// from this list, ships the identical list in the bundle (`ContinuationProof.touched_page_bases`),
+/// and the verifier rebuilds the same tables from it. Sorted (BTreeSet order) so prover
+/// and verifier iterate the identical sequence — `multi_verify` matches AIRs to sub-proofs
+/// positionally. Carries page bases ONLY: no cell values, so private-input bytes never
+/// enter the bundle (unlike the full `CellBoundary`, whose `init.value` is a private byte).
+fn touched_page_bases(boundaries: &[Vec<CellBoundary>]) -> Vec<u64> {
+    boundaries
+        .iter()
+        .flatten()
+        .map(|b| page::page_base_for_address(b.address))
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .collect()
+}
+
+/// Canonicalize a possibly-untrusted, out-of-order page-base list to the same sorted,
+/// deduped form the prover produces via [`touched_page_bases`], so the verifier rebuilds
+/// tables in the committed order regardless of the wire order (a shuffled-but-same-set
+/// list still verifies; a different set fails via bus imbalance / AIR-count mismatch).
+fn canonical_page_bases(page_bases: &[u64]) -> Vec<u64> {
+    page_bases
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<u64>>()
+        .into_iter()
+        .collect()
+}
+
+/// The touched pages' genesis configs, for the VERIFIER: built from the ELF alone (no
+/// private bytes). `page_bases` is the canonical touched-page-base list. An ELF data page
+/// carries its bytes as `init`, every other (stack/heap) page is zero-init.
 ///
-/// Private-input pages are built NON-preprocessed, so the verifier never recomputes
-/// their genesis from the ELF and never needs the raw private bytes. They are
-/// identified EXACTLY as the monolithic verifier does — the first
-/// `num_private_input_pages` pages from `PRIVATE_INPUT_START_INDEX` (see
-/// [`is_private_input_page`]).
+/// Private-input pages are built NON-preprocessed, so the verifier never recomputes their
+/// genesis from the ELF and never needs the raw private bytes. They are identified EXACTLY
+/// as the monolithic verifier does — the first `num_private_input_pages` pages from
+/// `PRIVATE_INPUT_START_INDEX` (see [`is_private_input_page`]).
 fn global_memory_configs(
-    boundaries: &[Vec<CellBoundary>],
+    page_bases: &[u64],
     elf: &Elf,
     num_private_input_pages: usize,
 ) -> Vec<PageConfig> {
@@ -241,27 +271,23 @@ fn global_memory_configs(
     // non-preprocessed (their INIT is never recomputed).
     let image = build_initial_image_paged(elf, &[]);
     let init_page_data = build_init_page_data(&image);
-    global_memory_configs_from_init_page_data(boundaries, &init_page_data, num_private_input_pages)
+    global_memory_configs_from_init_page_data(page_bases, &init_page_data, num_private_input_pages)
 }
 
-/// Shared genesis-config builder for prover and verifier. `init_page_data` holds each
-/// page's genesis bytes (ELF + private input on the prover side; ELF only on the verifier
-/// side). Private-input pages are built NON-preprocessed: on the prover their committed
-/// INIT column carries the genesis bytes from `init_page_data`; on the verifier the AIR
-/// is non-preprocessed so those bytes are irrelevant.
+/// Shared genesis-config builder for prover and verifier, one `PageConfig` per page base
+/// in `page_bases` (which must be canonical: sorted + deduped). `init_page_data` holds
+/// each page's genesis bytes (ELF + private input on the prover side; ELF only on the
+/// verifier side). Private-input pages are built NON-preprocessed: on the prover their
+/// committed INIT column carries the genesis bytes; on the verifier the AIR is
+/// non-preprocessed so those bytes are irrelevant.
 fn global_memory_configs_from_init_page_data(
-    boundaries: &[Vec<CellBoundary>],
+    page_bases: &[u64],
     init_page_data: &HashMap<u64, Vec<u8>>,
     num_private_input_pages: usize,
 ) -> Vec<PageConfig> {
-    let touched_pages: std::collections::BTreeSet<u64> = boundaries
+    page_bases
         .iter()
-        .flatten()
-        .map(|b| page::page_base_for_address(b.address))
-        .collect();
-    touched_pages
-        .into_iter()
-        .map(|page_base| {
+        .map(|&page_base| {
             if is_private_input_page(page_base, num_private_input_pages) {
                 let data = init_page_data.get(&page_base).cloned().unwrap_or_default();
                 PageConfig::with_private_input(page_base, data)
@@ -341,20 +367,22 @@ struct EpochProof {
     /// The committed L2G table root, tied to the global proof by
     /// [`verify_l2g_commitment_binding`].
     l2g_root: Commitment,
-    /// Touched-cell boundaries; the verifier rebuilds the global AIRs (touched-page
-    /// set) from these. Values are redundant with the committed L2G trace.
-    boundary: Vec<CellBoundary>,
 }
 
-/// A self-contained continuation proof: the per-epoch proofs in execution order,
-/// the one cross-epoch global-memory proof, and the number of private-input pages.
+/// A self-contained continuation proof: the per-epoch proofs in execution order, the one
+/// cross-epoch global-memory proof, the number of private-input pages, and the touched
+/// page-base set.
 ///
-/// The raw private input is NOT carried (mirrors `VmProof.num_private_input_pages`):
-/// private-input genesis lives in committed, bus-enforced GLOBAL_MEMORY columns the
-/// verifier never recomputes, so the bytes stay private. The count selects which touched
-/// pages are built non-preprocessed and is bound into the global proof's Fiat-Shamir
-/// statement (like the monolithic path), so any wrong value diverges the verifier's
-/// challenges and is rejected; it is also bound-checked up front.
+/// NO cell values are carried. The raw private input is not bundled (mirrors
+/// `VmProof.num_private_input_pages`), and — since the per-epoch `CellBoundary` list
+/// (whose `init.value` is a private-input byte for private reads) is NOT serialized —
+/// touched-cell values never leave the prover either. The verifier only ever needed the
+/// epoch count and the touched page-base set from those boundaries; both are preserved
+/// (`epochs.len()` and `touched_page_bases`) at page granularity, value-free. Private-input
+/// genesis lives in committed, bus-enforced GLOBAL_MEMORY columns the verifier never
+/// recomputes. Both public values (`num_private_input_pages`, `touched_page_bases`) are
+/// bound into the global Fiat-Shamir statement and pinned by the GlobalMemory bus /
+/// AIR-count checks, so a wrong value is rejected; the count is also bound-checked up front.
 ///
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
 /// serde, so it round-trips through `bincode` exactly like a monolithic `VmProof`.
@@ -363,6 +391,12 @@ pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
     num_private_input_pages: usize,
+    /// Sorted, deduped page bases the run touched — the verifier's minimal input for
+    /// rebuilding the GLOBAL_MEMORY AIR set. Carries page bases ONLY (no cell values), so
+    /// private-input bytes never appear in the bundle. Prover- supplied but bus-enforced:
+    /// a wrong set imbalances the GlobalMemory bus / mismatches the AIR count, and it is
+    /// bound into the global Fiat-Shamir statement (canonicalized on ingest).
+    touched_page_bases: Vec<u64>,
 }
 
 impl ContinuationProof {
@@ -498,7 +532,6 @@ fn prove_epoch(
         runtime_page_ranges,
         reg_fini,
         l2g_root,
-        boundary: boundary.to_vec(),
     })
 }
 
@@ -603,6 +636,7 @@ fn prove_global(
     boundaries: &[Vec<CellBoundary>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
+    page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
@@ -621,7 +655,7 @@ fn prove_global(
     }
 
     let gm_configs = global_memory_configs_from_init_page_data(
-        boundaries,
+        page_bases,
         init_page_data,
         num_private_input_pages,
     );
@@ -655,7 +689,12 @@ fn prove_global(
 
     Prover::multi_prove(
         pairs,
-        &mut global_transcript(elf_bytes, boundaries.len(), num_private_input_pages),
+        &mut global_transcript(
+            elf_bytes,
+            boundaries.len(),
+            num_private_input_pages,
+            page_bases,
+        ),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -663,7 +702,8 @@ fn prove_global(
 }
 
 fn verify_global(
-    boundaries: &[Vec<CellBoundary>],
+    num_epochs: usize,
+    page_bases: &[u64],
     proof: &MultiProof<F, E, ()>,
     elf: &Elf,
     elf_bytes: &[u8],
@@ -672,7 +712,7 @@ fn verify_global(
 ) -> bool {
     // One L2G air per epoch, each with its own 1-based `fini_epoch` constant —
     // must match the order/labels the global proof committed in `prove_global`.
-    let l2g_airs: Vec<_> = (0..boundaries.len())
+    let l2g_airs: Vec<_> = (0..num_epochs)
         .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
     // Rebuild the genesis configs FROM THE ELF (no private bytes) and recompute their
@@ -683,7 +723,7 @@ fn verify_global(
     // recomputes (or sees) their genesis bytes; the GlobalMemory bus enforces them. A
     // wrong `num_private_input_pages` flips a touched page's preprocessed mode, so the
     // rebuilt AIR no longer matches the committed trace and `multi_verify` rejects.
-    let gm_configs = global_memory_configs(boundaries, elf, num_private_input_pages);
+    let gm_configs = global_memory_configs(page_bases, elf, num_private_input_pages);
     let gm_airs: Vec<_> = gm_configs
         .iter()
         .map(|config| global_memory_air(opts, config))
@@ -697,7 +737,7 @@ fn verify_global(
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut global_transcript(elf_bytes, boundaries.len(), num_private_input_pages),
+        &mut global_transcript(elf_bytes, num_epochs, num_private_input_pages, page_bases),
         &FieldElement::zero(),
     )
 }
@@ -744,6 +784,11 @@ pub fn prove_continuation(
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
     let mut epochs: Vec<EpochProof> = Vec::new();
+    // Full per-epoch boundaries, kept prover-local for `prove_global` (L2G traces +
+    // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
+    // holds cell values (private-input bytes for private reads); only the value-free
+    // page-base set is shipped (see `touched_page_bases`).
+    let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
     // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
     // derived from it (the cross-epoch register binding).
     let mut prev_fini: Option<Vec<u32>> = None;
@@ -824,6 +869,7 @@ pub fn prove_continuation(
             image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
         epochs.push(epoch);
+        all_boundaries.push(boundary);
 
         if is_final {
             break;
@@ -831,14 +877,17 @@ pub fn prove_continuation(
         index += 1;
     }
 
-    // One global LogUp over all the (kept) local-to-global tables.
-    let all_boundaries: Vec<Vec<CellBoundary>> =
-        epochs.iter().map(|e| e.boundary.clone()).collect();
+    // One global LogUp over all the (kept) local-to-global tables. `all_boundaries` was
+    // accumulated locally in the loop (never round-tripped through the bundle).
     let num_private_input_pages = private_input_page_count(private_inputs);
+    // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
+    // tables and is shipped in the bundle, so the two can never diverge in set or order.
+    let touched_page_bases = touched_page_bases(&all_boundaries);
     let global = prove_global(
         &all_boundaries,
         elf_bytes,
         &init_page_data,
+        &touched_page_bases,
         num_private_input_pages,
         opts,
     )?;
@@ -847,6 +896,7 @@ pub fn prove_continuation(
         epochs,
         global,
         num_private_input_pages,
+        touched_page_bases,
     })
 }
 
@@ -936,11 +986,14 @@ pub fn verify_continuation(
     // Cross-epoch global memory: genesis for ELF/runtime pages is rebuilt FROM THE ELF
     // (no private bytes), so the starting memory cannot be prover-chosen; the bus
     // telescopes fini→init. Private-input pages are committed, non-preprocessed (genesis
-    // stays private), bus-enforced.
-    let all_boundaries: Vec<Vec<CellBoundary>> =
-        bundle.epochs.iter().map(|e| e.boundary.clone()).collect();
+    // stays private), bus-enforced. The verifier needs only the epoch count and the
+    // touched page-base set (never cell values); the bundle carries the latter directly.
+    // Canonicalize the (untrusted) list so a shuffled-but-same-set list still verifies,
+    // while a different set fails via GlobalMemory-bus imbalance / AIR-count mismatch.
+    let page_bases = canonical_page_bases(&bundle.touched_page_bases);
     if !verify_global(
-        &all_boundaries,
+        n,
+        &page_bases,
         &bundle.global,
         &elf,
         elf_bytes,
@@ -1408,13 +1461,104 @@ mod tests {
         ));
     }
 
-    // The bundle's `boundary` field is used only to rebuild the global AIRs' touched-
-    // PAGE set (genesis is recomputed from the ELF). The cross-epoch memory values
-    // live in the committed L2G traces, tied to the epoch proofs by
-    // `verify_l2g_commitment_binding` (exercised by test_split_verify_rejects_tampered_l2g_root
-    // below). Tampering a boundary value is therefore inconsequential; omitting/adding
-    // a touched page is caught by the GlobalMemory bus (unmatched fini / air count
-    // mismatch). So there is no meaningful "tamper a boundary value" negative test.
+    // Privacy regression for the touched-cell value leak. Pre-fix, `EpochProof.boundary`
+    // serialized each touched cell's `init.value`/`fini.value` as a u64, so a private
+    // byte `b` appeared in the bundle as the 8-byte window `[b,0,0,0,0,0,0,0]`. The fix
+    // drops `boundary` from the bundle entirely (only the value-free `touched_page_bases`
+    // ships), so those windows must be gone. We mark distinctive TOUCHED byte values
+    // (0xC7..) — their u64-LE encodings are astronomically unlikely to occur as any honest
+    // field/count/root byte-run — and assert none appear in the serialized bundle. (The
+    // committed `public_output` serializes bytes RAW, not as u64s, so it cannot produce
+    // these windows even for the committed markers.)
+    #[test]
+    fn test_bundle_carries_no_touched_cell_values() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let mut input: Vec<u8> = (0u8..16).collect();
+        let markers = [0xC7u8, 0xC8, 0xC9];
+        input[4] = markers[0];
+        input[5] = markers[1];
+        input[6] = markers[2];
+
+        let bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
+        let bytes = bincode::serialize(&bundle).unwrap();
+        for m in markers {
+            let needle = (m as u64).to_le_bytes(); // [m,0,0,0,0,0,0,0]
+            assert!(
+                !bytes.windows(8).any(|w| w == needle),
+                "byte 0x{m:02X} appears as a u64 in the bundle — a touched-cell value leaked"
+            );
+        }
+        // Sanity: still verifies from bundle + ELF alone.
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    // The verifier canonicalizes (sorts/dedups) the shipped `touched_page_bases`, so a
+    // list that is reordered AND has duplicates — but describes the same set — still
+    // verifies. (Page-count-independent: duplicating then reversing exercises both dedup
+    // and reordering even when the program touches a single page.)
+    #[test]
+    fn test_split_verify_tolerates_reordered_touched_page_bases() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+        assert!(
+            !bundle.touched_page_bases.is_empty(),
+            "baseline must have touched pages"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "baseline must verify"
+        );
+        // Same set, but duplicated and reversed → canonicalization must recover it.
+        let mut scrambled = bundle.touched_page_bases.clone();
+        scrambled.extend(bundle.touched_page_bases.clone());
+        scrambled.reverse();
+        bundle.touched_page_bases = scrambled;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "a reordered/duplicated same-set page-base list must still verify (canonicalized)"
+        );
+    }
+
+    // Negative: dropping a genuinely-touched page base removes its GLOBAL_MEMORY table on
+    // the verify side, so that page's L2G fini token has no receiver → GlobalMemory bus
+    // imbalance (and the global Fiat-Shamir statement diverges) → reject.
+    #[test]
+    fn test_split_verify_rejects_dropped_touched_page_base() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+        assert!(
+            !bundle.touched_page_bases.is_empty(),
+            "baseline must have touched pages"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "baseline must verify before tampering"
+        );
+        bundle.touched_page_bases.pop();
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none(),
+            "a missing touched page base must be rejected"
+        );
+    }
 
     // Negative: corrupting an epoch's claimed L2G table root must be rejected —
     // `verify_l2g_commitment_binding` compares each epoch's `l2g_root` against the

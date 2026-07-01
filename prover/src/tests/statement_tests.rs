@@ -163,29 +163,50 @@ fn continuation_epoch_differs_from_monolithic_statement() {
     assert_ne!(monolithic, epoch_state(b"elf", 1));
 }
 
-fn global_state(elf: &[u8], num_epochs: usize, num_private_input_pages: usize) -> [u8; 32] {
+fn global_state(
+    elf: &[u8],
+    num_epochs: usize,
+    num_private_input_pages: usize,
+    touched_page_bases: &[u64],
+) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(&mut t, elf, num_epochs, num_private_input_pages);
+    absorb_continuation_global_statement(
+        &mut t,
+        elf,
+        num_epochs,
+        num_private_input_pages,
+        touched_page_bases,
+    );
     t.state()
 }
 
 #[test]
-fn continuation_global_state_binds_program_epoch_count_and_private_pages() {
-    let baseline = global_state(b"elf", 3, 1);
-    assert_eq!(baseline, global_state(b"elf", 3, 1)); // deterministic
+fn continuation_global_state_binds_program_epoch_count_pages_and_touched_set() {
+    let baseline = global_state(b"elf", 3, 1, &[0x1000, 0x2000]);
+    assert_eq!(baseline, global_state(b"elf", 3, 1, &[0x1000, 0x2000])); // deterministic
     assert_ne!(
         baseline,
-        global_state(b"elf", 4, 1),
+        global_state(b"elf", 4, 1, &[0x1000, 0x2000]),
         "must bind epoch count"
     );
     assert_ne!(
         baseline,
-        global_state(b"other-elf", 3, 1),
+        global_state(b"other-elf", 3, 1, &[0x1000, 0x2000]),
         "must bind the ELF"
     );
     assert_ne!(
         baseline,
-        global_state(b"elf", 3, 2),
+        global_state(b"elf", 3, 2, &[0x1000, 0x2000]),
         "must bind the private-input page count"
+    );
+    assert_ne!(
+        baseline,
+        global_state(b"elf", 3, 1, &[0x1000, 0x3000]),
+        "must bind the touched page-base set"
+    );
+    assert_ne!(
+        baseline,
+        global_state(b"elf", 3, 1, &[0x1000]),
+        "must bind the touched page-base count"
     );
 }
