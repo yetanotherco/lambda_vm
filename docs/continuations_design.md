@@ -256,8 +256,11 @@ semantics, identical to the monolithic prover.
 recomputation is safe *only* if no ELF-declared data lives in the private-input region;
 otherwise a prover could classify that page private and forge the ELF byte's genesis
 (the value would be committed but never checked against the ELF). This reservation is
-**enforced by the loader**: `Elf::load` rejects any `PT_LOAD` segment overlapping
-`[PRIVATE_INPUT_START_INDEX, +MAX_PRIVATE_INPUT_SIZE)` (`ElfError::SegmentInPrivateInputRegion`).
+**enforced by the loader**: `Elf::load` rejects any `PT_LOAD` segment reaching at or above
+`PRIVATE_INPUT_START_INDEX` (`ElfError::SegmentInPrivateInputRegion`) — covering every page
+the verifier can classify private, which slightly exceeds `[base, base+MAX_PRIVATE_INPUT_SIZE)`
+(the length prefix pushes an honest max-size input onto one more page, plus a page of
+count-bound slack).
 Turning the reservation from convention into an enforced invariant closes this gap for
 **both** the continuation and monolithic paths (they share the loader and the same
 non-preprocessed-private-page design).

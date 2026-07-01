@@ -283,11 +283,10 @@ fn global_memory_configs_from_init_page_data(
 ///
 /// NOTE (shared with the monolithic path): a page classified private is built
 /// non-preprocessed, so its genesis is NOT recomputed from the ELF. This is safe because
-/// the private-input region is reserved for private input and the reservation is enforced:
-/// `Elf::load` rejects any loadable segment overlapping
-/// `[PRIVATE_INPUT_START_INDEX, +MAX_PRIVATE_INPUT_SIZE)`
-/// (`ElfError::SegmentInPrivateInputRegion`), so no ELF-declared data can live there and
-/// have its genesis go unbound.
+/// the private-input area is reserved and the reservation is enforced: `Elf::load` rejects
+/// any loadable segment reaching at/above `PRIVATE_INPUT_START_INDEX`
+/// (`ElfError::SegmentInPrivateInputRegion`) — covering every page this function can
+/// classify private — so no ELF-declared data can live there and have its genesis go unbound.
 fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE as u64;

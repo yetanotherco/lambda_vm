@@ -292,19 +292,25 @@ impl Elf {
             if !program_header.p_vaddr.is_multiple_of(WORD_SIZE) {
                 return Err(ElfError::UnalignedVAddr);
             }
-            // Reject any loadable segment that overlaps the reserved private-input region
-            // `[PRIVATE_INPUT_START_INDEX, +MAX_PRIVATE_INPUT_SIZE)`. Genesis for pages in
-            // that region is prover-committed and NOT recomputed from the ELF (so private
-            // input stays private); ELF data placed there would have an unbound, prover-
-            // forgeable genesis. Forbidding the overlap turns "the region holds only private
-            // input" from a convention into an enforced invariant. `store_private_inputs`
-            // writes the runtime private input separately, so this does not affect it.
+            // Reject any loadable segment that reaches at or above `PRIVATE_INPUT_START_INDEX`
+            // — the base of the reserved high-memory private-input area. Genesis for pages in
+            // that area is prover-committed and NOT recomputed from the ELF (so private input
+            // stays private); ELF data placed there would have an unbound, prover-forgeable
+            // genesis. The verifier can classify any page from the base up to the maximum
+            // private-input page count as private — a span that slightly exceeds
+            // `MAX_PRIVATE_INPUT_SIZE` (the length prefix pushes an honest max-size input onto
+            // one more page, and the page-count bound adds a page of slack), so we reserve the
+            // whole high area rather than exactly `[base, base+MAX)`. Nothing legitimate loads
+            // here: ELF code/data live at low addresses, and the stack (`STACK_TOP`) and
+            // private input are runtime regions written outside `load_program`, so this does
+            // not affect them. Turns "the private-input area holds only private input" from a
+            // convention into an enforced invariant.
             if program_header.p_memsz > 0 {
-                use crate::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
-                let seg_start = program_header.p_vaddr;
-                let seg_end = seg_start.saturating_add(program_header.p_memsz);
-                let region_end = PRIVATE_INPUT_START_INDEX.saturating_add(MAX_PRIVATE_INPUT_SIZE);
-                if seg_start < region_end && seg_end > PRIVATE_INPUT_START_INDEX {
+                use crate::vm::memory::PRIVATE_INPUT_START_INDEX;
+                let seg_end = program_header
+                    .p_vaddr
+                    .saturating_add(program_header.p_memsz);
+                if seg_end > PRIVATE_INPUT_START_INDEX {
                     return Err(ElfError::SegmentInPrivateInputRegion);
                 }
             }
@@ -643,9 +649,26 @@ mod tests {
     }
 
     #[test]
-    fn accepts_segment_at_region_end() {
-        // Starts exactly at the region end → no overlap → accepted.
-        let region_end = PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE;
-        assert!(Elf::load(&minimal_elf_with_segment(region_end, 4)).is_ok());
+    fn rejects_segment_at_max_size_boundary() {
+        // The `[base, base+MAX)` byte cap ends here, but an honest max-size input (plus its
+        // 4-byte length prefix) spills onto this page, so the verifier can classify it private.
+        // It must therefore be rejected too — the reservation covers the full classifiable
+        // span, not just `[base, base+MAX)`.
+        let boundary = PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE;
+        assert!(matches!(
+            Elf::load(&minimal_elf_with_segment(boundary, 4)),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
+    }
+
+    #[test]
+    fn rejects_segment_far_above_region() {
+        // Any segment reaching at/above the private-input base is rejected — nothing
+        // legitimate loads that high (ELF is low; stack/private input are runtime).
+        let high = PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE + (16 << 20);
+        assert!(matches!(
+            Elf::load(&minimal_elf_with_segment(high, 4)),
+            Err(ElfError::SegmentInPrivateInputRegion)
+        ));
     }
 }
