@@ -33,6 +33,8 @@ if ! command -v nvcc >/dev/null 2>&1; then
 fi
 command -v nvcc >/dev/null 2>&1 || { echo "ERROR: nvcc not found — CUDA toolkit missing" >&2; exit 1; }
 nvcc --version | tail -n 2
+# Full nvidia-smi up front: GPU model, driver + CUDA runtime version, memory — for the log.
+nvidia-smi
 nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 
 # --- Pin cudarc so it binds a fixed driver-symbol set --------------------------
