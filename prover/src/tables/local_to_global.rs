@@ -46,20 +46,45 @@
 //! guarantee. There is no `init_timestamp` column: timestamps are epoch-local, and
 //! the cross-epoch chain is ordered by epoch.
 //!
-//! ## Padding
+//! ## Padding via brought-forward (filler) rows
 //!
-//! Real rows carry `MU = 1`; the power-of-two padding rows carry `MU = 0`. Every
-//! interaction uses `Multiplicity::Column(MU)`, so padding rows fire nothing —
-//! we never rely on token self-cancellation (this is the standard pattern used
-//! by every variable-length table). `MU` is self-enforced: dropping a real row
-//! (`MU = 0`) breaks its telescoping link → bus imbalance.
+//! The table has no selector column. Every interaction fires with multiplicity 1
+//! on every row (exactly like PAGE). The power-of-two padding rows are therefore
+//! not inert — they are **real "brought-forward" rows** for genuinely-untouched
+//! memory cells, carried forward unchanged from their previous owner to the
+//! current epoch: `init_value == fini_value`, `fini_timestamp = 0`,
+//! `init_epoch = the cell's previous owner` (`GENESIS_EPOCH` if never written),
+//! `fini_epoch = the current epoch`.
+//!
+//! Such a filler is a genuine no-op on both buses:
+//! - On the epoch-local `Memory` bus its init-receive `[0, addr, 0, 0, value]` and
+//!   fini-send `[0, addr, 0, 0, value]` are the *identical* token (fini_ts = 0,
+//!   init_value = fini_value), so they self-cancel — exactly as PAGE's init/fini
+//!   bookend cancels for a never-accessed cell (`page.rs`). An untouched cell has
+//!   no MEMW to balance any non-cancelling token, so this self-cancellation is the
+//!   *only* shape a filler can take without dangling a Memory-bus token; it forces
+//!   both `fini_ts = 0` and `init_value = fini_value`.
+//! - On the cross-epoch `GlobalMemory` bus it consumes the cell's current head
+//!   token `(addr, value, prev_owner)` and produces `(addr, value, current_epoch)`
+//!   — a value-preserving telescoping link, grounded (like every chain) at the
+//!   `GENESIS_EPOCH` source and ordered by the `init_epoch < fini_epoch` check. The
+//!   constant `fini_epoch` is fine here precisely because a filler is a real link,
+//!   not a self-cancel.
+//!
+//! Because the trace must be a power of two, each epoch needs
+//! `next_pow2(#touched) - #touched` such fillers, drawn from distinct live cells not
+//! touched that epoch (see [`append_bring_forward_fillers`]). This relies on
+//! `#total live cells ≥ next_pow2(#touched per epoch)`; the continuation prover
+//! sources fillers from the epoch's own touched pages (and genesis pages as a
+//! fallback) and fails closed if that pool is ever too small.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::page::DEFAULT_PAGE_SIZE;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField};
 use crate::paged_mem::PagedMem;
 
@@ -189,6 +214,91 @@ pub fn genesis_provenance(genesis: impl IntoIterator<Item = (u64, u64)>) -> Prov
     provenance
 }
 
+/// The number of filler rows [`append_bring_forward_fillers`] could not supply: the
+/// candidate cell pool was too small to pad the epoch's table to a power of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FillerShortage {
+    /// Power-of-two row count the table needed.
+    pub needed: usize,
+    /// Rows actually available (touched cells + all sourceable untouched cells).
+    pub got: usize,
+}
+
+/// Pad `boundary` up to a power of two with brought-forward filler rows for
+/// genuinely-untouched cells, so the L2G table needs no selector column.
+///
+/// Each filler is a value-preserving no-op carried forward to `epoch` (the 1-based
+/// label): `init` is the cell's current `provenance` entry `(prev_owner, value)`,
+/// `fini` repeats the same `value` at `epoch` with `timestamp = 0`. This
+/// self-cancels on the epoch-local Memory bus and telescopes on the GlobalMemory
+/// bus (see the module docs). Every brought-forward cell's `provenance` is updated
+/// to `(epoch, value, 0)` so the next epoch to touch it sees the correct owner.
+///
+/// Cells are drawn from `candidate_pages` (page bases, tried in order), skipping any
+/// address already in `boundary` (touched this epoch) — so the caller lists the
+/// epoch's own touched pages first (they never grow the global touched-page set) and
+/// genesis pages as a fallback (needed when the epoch touched no cell of its own).
+/// The `init_value` read from `provenance` equals the cell's live GlobalMemory head
+/// value (genesis default `0`, or the last fini), so the filler's init token matches
+/// that head.
+///
+/// Returns `Err(FillerShortage)` if the pool cannot fill the table — i.e. the
+/// `#total live cells ≥ next_pow2(#touched per epoch)` assumption is violated for
+/// this epoch. The trace is left partially filled; the caller must abort.
+pub fn append_bring_forward_fillers(
+    boundary: &mut Vec<CellBoundary>,
+    provenance: &mut Provenance,
+    candidate_pages: &[u64],
+    epoch: u64,
+) -> Result<(), FillerShortage> {
+    let target = boundary.len().next_power_of_two().max(1);
+    if boundary.len() >= target {
+        return Ok(());
+    }
+    // Addresses already claimed this epoch (real touched cells). Filler pages are
+    // deduplicated by the caller, so a filler address can never collide with another
+    // filler; only touched cells need to be skipped.
+    let occupied: HashSet<u64> = boundary.iter().map(|b| b.address).collect();
+
+    for &page_base in candidate_pages {
+        if boundary.len() == target {
+            break;
+        }
+        for offset in 0..DEFAULT_PAGE_SIZE as u64 {
+            if boundary.len() == target {
+                break;
+            }
+            let address = page_base + offset;
+            if occupied.contains(&address) {
+                continue;
+            }
+            let (originating_epoch, value, _ts) = provenance.get(address);
+            boundary.push(CellBoundary {
+                address,
+                init: InitClaim {
+                    value,
+                    originating_epoch,
+                    timestamp: 0,
+                },
+                fini: FiniClaim {
+                    value,
+                    epoch,
+                    timestamp: 0,
+                },
+            });
+            provenance.set(address, (epoch, value, 0));
+        }
+    }
+
+    if boundary.len() != target {
+        return Err(FillerShortage {
+            needed: target,
+            got: boundary.len(),
+        });
+    }
+    Ok(())
+}
+
 // =========================================================================
 // AIR trace columns
 // =========================================================================
@@ -200,7 +310,8 @@ pub fn genesis_provenance(genesis: impl IntoIterator<Item = (u64, u64)>) -> Prov
 /// halfword columns ([`RANGE_CHECKED_HALFWORDS`]), checked via `IsHalfword`, and
 /// rebuilt into its 32-bit bus value via [`word`]. The value bytes get the
 /// batched `AreBytes` check. `fini_epoch` is a per-table constant (not a column).
-/// `MU` is the real-row selector / multiplicity.
+/// There is no selector column: every row is real (touched cell or brought-forward
+/// filler) and every interaction fires with multiplicity 1.
 pub mod cols {
     /// address_lo: 32-bit; matched on the Memory bus against MEMW.
     pub const ADDRESS_LO: usize = 0;
@@ -228,10 +339,7 @@ pub mod cols {
     /// fini_timestamp_hi: 32-bit; matched on the Memory bus against MEMW.
     pub const FINI_TIMESTAMP_HI: usize = 7;
 
-    /// MU: real-row selector / LogUp multiplicity (1 on real rows, 0 on padding).
-    pub const MU: usize = 8;
-
-    pub const NUM_COLUMNS: usize = 9;
+    pub const NUM_COLUMNS: usize = 8;
 
     /// The halfword columns (cross-epoch-only quantities), in order — every column
     /// that is `IsHalfword`-checked.
@@ -249,9 +357,16 @@ fn epoch_halfwords(epoch: u64) -> [u64; 2] {
 // Trace generation
 // =========================================================================
 
-/// Build the local-to-global trace: one row per touched cell's boundary claims,
-/// padded up to a power of two. Real rows set `MU = 1`; padding rows stay all-zero
-/// (`MU = 0`), so they fire no interactions.
+/// Build the local-to-global trace: one row per boundary claim.
+///
+/// Every row is real and every interaction fires with multiplicity 1, so any trace
+/// that is committed on the range-check or `GlobalMemory` bus MUST be passed a
+/// power-of-two-length, fully-real `boundaries` slice (touched cells plus
+/// brought-forward fillers — see [`append_bring_forward_fillers`]). If a shorter
+/// slice is passed it is zero-padded to a power of two; those all-zero rows
+/// self-cancel on the epoch-local `Memory` bus (identical init/fini token) but would
+/// dangle on the range-check / `GlobalMemory` buses, so callers proving those buses
+/// must fill first.
 pub fn generate_local_to_global_trace(
     boundaries: &[CellBoundary],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -273,8 +388,6 @@ pub fn generate_local_to_global_trace(
         // Cross-epoch-only quantity as IsHalfword-checked halfwords.
         data[base + cols::INIT_EPOCH_0] = FE::from(init_epoch[0]);
         data[base + cols::INIT_EPOCH_1] = FE::from(init_epoch[1]);
-        // Real-row selector.
-        data[base + cols::MU] = FE::one();
     }
 
     TraceTable::new_main(data, cols::NUM_COLUMNS, 1)
@@ -306,10 +419,6 @@ pub(crate) fn direct(column: usize) -> BusValue {
     }
 }
 
-fn mu() -> Multiplicity {
-    Multiplicity::Column(cols::MU)
-}
-
 /// Cross-epoch memory bus interactions, two per row (one touched cell):
 /// - **receive** the `init` token `(address, value, originating_epoch)` left by the
 ///   epoch that last wrote the cell;
@@ -323,14 +432,16 @@ fn mu() -> Multiplicity {
 ///
 /// These tokens are matched ACROSS epochs by the final aggregation LogUp (step 4),
 /// so within a single epoch's table the GlobalMemory bus is deliberately
-/// unbalanced (real rows have `init != fini`). Padding rows fire nothing (`MU = 0`).
+/// unbalanced (rows have `init_epoch != fini_epoch`). Every row fires with
+/// multiplicity 1; brought-forward filler rows telescope here just like touched
+/// cells (their value is preserved, `init_epoch < fini_epoch`).
 pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     vec![
         // init: receive the token left by the originating epoch. No timestamp: the
         // chain is ordered by epoch, and timestamps are epoch-local (see cols).
         BusInteraction::receiver(
             BusId::GlobalMemory,
-            mu(),
+            Multiplicity::One,
             vec![
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
@@ -341,7 +452,7 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
         // fini: send the token for the next epoch to consume.
         BusInteraction::sender(
             BusId::GlobalMemory,
-            mu(),
+            Multiplicity::One,
             vec![
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
@@ -362,6 +473,12 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 /// `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`;
 /// RAM only, so `is_register = 0`, and the byte value is the LO column.
 ///
+/// Brought-forward filler rows (untouched cells, `fini_ts = 0`,
+/// `init_value = fini_value`) emit an init-receive and a fini-send that are the
+/// identical token, so they self-cancel here — exactly as PAGE's bookend cancels
+/// for a never-accessed cell. An untouched cell has no MEMW partner, so this is the
+/// only shape a filler can take without dangling a token.
+///
 /// Address, fini timestamp and the values appear here, so MEMW range-checks them
 /// for us — they need no L2G range check (see [`range_check_interactions`]).
 pub fn memory_bus_interactions() -> Vec<BusInteraction> {
@@ -369,7 +486,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
         // init: receive the cell's initial token at the epoch-start seed (ts = 0).
         BusInteraction::receiver(
             BusId::Memory,
-            mu(),
+            Multiplicity::One,
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -382,7 +499,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
         // fini: send the cell's final token at the last access timestamp.
         BusInteraction::sender(
             BusId::Memory,
-            mu(),
+            Multiplicity::One,
             vec![
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
@@ -396,12 +513,15 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
 }
 
 /// Range-check + ordering bus interactions for the columns nothing else
-/// constrains, all with multiplicity `MU` (so padding fires none):
+/// constrains, all with multiplicity 1 (every row is real — touched cell or
+/// brought-forward filler — so all fire, and [`collect_bitwise_from_l2g`] must
+/// supply BITWISE multiplicities for every row):
 /// - one `AreBytes` for the two value bytes (the `init` value is a trusted source);
 /// - one `IsHalfword` per cross-epoch-only halfword column;
 /// - one `IsB20` proving `init_epoch < fini_epoch` (the ordering constraint), via
 ///   `fini_epoch − 1 − init_epoch` being a valid 20-bit value. With genesis epoch
-///   `0` this also covers genesis cells (`0 < fini_epoch`) with no special case.
+///   `0` this also covers genesis cells (`0 < fini_epoch`) with no special case. A
+///   filler's `init_epoch` is its previous owner (`< fini_epoch`), so it passes too.
 ///
 /// Address and fini timestamp are NOT here — MEMW checks them on the Memory bus.
 /// These are committed only on the epoch-local table (`l2g_memory_air`), whose
@@ -417,13 +537,13 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(2 + cols::RANGE_CHECKED_HALFWORDS.len());
     interactions.push(BusInteraction::sender(
         BusId::AreBytes,
-        mu(),
+        Multiplicity::One,
         vec![direct(cols::INIT_VALUE), direct(cols::FINI_VALUE)],
     ));
     for &column in &cols::RANGE_CHECKED_HALFWORDS {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
-            mu(),
+            Multiplicity::One,
             vec![direct(column)],
         ));
     }
@@ -431,7 +551,7 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     // init_epoch = INIT_EPOCH_0 + 2^16·INIT_EPOCH_1.
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
-        mu(),
+        Multiplicity::One,
         vec![BusValue::linear(vec![
             LinearTerm::Constant(epoch_label as i64 - 1),
             LinearTerm::Column {
@@ -449,9 +569,10 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 
 /// The BITWISE lookups the L2G range checks + ordering check send, so the BITWISE
 /// table's multiplicities balance the [`range_check_interactions`] senders. Emits,
-/// per real row, one `AreBytes`, one `IsHalfword` per cross-epoch halfword, and one
-/// `IsB20` for the ordering difference. Padding rows fire nothing (`MU = 0`), so
-/// none are emitted for them.
+/// per boundary row, one `AreBytes`, one `IsHalfword` per cross-epoch halfword, and
+/// one `IsB20` for the ordering difference. `boundaries` MUST include the
+/// brought-forward filler rows (they fire the range checks with multiplicity 1 too),
+/// or the BITWISE table under-provisions and the epoch proof cannot balance.
 pub fn collect_bitwise_from_l2g(boundaries: &[CellBoundary]) -> Vec<BitwiseOperation> {
     let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();
     let mut ops = Vec::with_capacity(boundaries.len() * per_row);
@@ -642,7 +763,7 @@ mod tests {
 
     #[test]
     fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 9);
+        assert_eq!(cols::NUM_COLUMNS, 8);
         assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 2);
     }
 
@@ -672,23 +793,70 @@ mod tests {
             word_value(&trace, cols::INIT_EPOCH_0, cols::INIT_EPOCH_1),
             FE::from(GENESIS_EPOCH)
         );
-        // Real row carries MU = 1.
-        assert_eq!(at(cols::MU), FE::one());
     }
 
     #[test]
-    fn test_padding_rows_are_zero_including_mu() {
-        // 3 boundaries pad up to 4 rows; the padding row is all zero, MU = 0.
-        let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
-        let trace = generate_local_to_global_trace(&boundaries);
-        assert_eq!(trace.num_rows(), 4);
-        for col in 0..cols::NUM_COLUMNS {
-            assert_eq!(*trace.main_table.get(3, col), FE::zero());
-        }
-        // And real rows have MU = 1.
-        for row in 0..3 {
-            assert_eq!(*trace.main_table.get(row, cols::MU), FE::one());
-        }
+    fn test_append_fillers_pads_to_power_of_two() {
+        // 3 touched cells on page 0; fillers pad the table to 4 rows.
+        let mut provenance = genesis_provenance([(10u64, 5u64), (11, 6)]);
+        let mut boundary = epoch_boundary(
+            &mut provenance,
+            epoch_label(0),
+            &[(10, 7, 3), (11, 8, 4), (12, 9, 5)],
+        );
+        assert_eq!(boundary.len(), 3);
+
+        append_bring_forward_fillers(&mut boundary, &mut provenance, &[0], epoch_label(0)).unwrap();
+        assert_eq!(boundary.len(), 4, "padded to next power of two");
+
+        // The filler row is a value-preserving no-op brought forward to this epoch.
+        let filler = &boundary[3];
+        assert_eq!(filler.init.value, filler.fini.value, "value unchanged");
+        assert_eq!(
+            filler.fini.timestamp, 0,
+            "fini timestamp is zero (self-cancels)"
+        );
+        assert_eq!(filler.fini.epoch, epoch_label(0));
+        assert!(
+            filler.init.originating_epoch < filler.fini.epoch,
+            "ordering holds for fillers"
+        );
+        // The brought-forward cell is a distinct, previously-untouched address.
+        assert!(![10u64, 11, 12].contains(&filler.address));
+
+        // And its provenance now records this epoch as the owner.
+        let (owner, value, _) = provenance.get(filler.address);
+        assert_eq!(owner, epoch_label(0));
+        assert_eq!(value, filler.fini.value);
+    }
+
+    #[test]
+    fn test_append_fillers_is_noop_when_already_power_of_two() {
+        // 2 touched cells is already a power of two → no fillers added.
+        let mut provenance = genesis_provenance([(10u64, 5u64)]);
+        let mut boundary =
+            epoch_boundary(&mut provenance, epoch_label(0), &[(10, 7, 3), (20, 9, 4)]);
+        assert_eq!(boundary.len(), 2);
+        append_bring_forward_fillers(&mut boundary, &mut provenance, &[0], epoch_label(0)).unwrap();
+        assert_eq!(boundary.len(), 2, "already a power of two, unchanged");
+    }
+
+    #[test]
+    fn test_append_fillers_reports_shortage_when_pool_too_small() {
+        // A single candidate page of 3 addresses (via a synthetic tiny page) cannot
+        // supply enough fillers when the pool is exhausted. We simulate exhaustion by
+        // offering NO candidate pages while the table needs padding.
+        let mut provenance = genesis_provenance(std::iter::empty());
+        let mut boundary = epoch_boundary(
+            &mut provenance,
+            epoch_label(0),
+            &[(10, 7, 3), (11, 8, 4), (12, 9, 5)],
+        );
+        assert_eq!(boundary.len(), 3);
+        let err = append_bring_forward_fillers(&mut boundary, &mut provenance, &[], epoch_label(0))
+            .unwrap_err();
+        assert_eq!(err.needed, 4);
+        assert_eq!(err.got, 3);
     }
 
     #[test]
@@ -745,7 +913,8 @@ mod tests {
     #[test]
     fn test_collect_bitwise_matches_sender_count() {
         // Per row: 1 AreBytes + one IsHalfword per cross-epoch halfword + 1 IsB20.
-        // No padding ops (padding has MU = 0 and fires nothing).
+        // Every row (touched cell or brought-forward filler) is real, so `boundaries`
+        // — which must include fillers — gets exactly `per_row` ops each.
         let boundaries: Vec<CellBoundary> = (0..3).map(sample_boundary).collect();
         let ops = collect_bitwise_from_l2g(&boundaries);
         let per_row = 2 + cols::RANGE_CHECKED_HALFWORDS.len();

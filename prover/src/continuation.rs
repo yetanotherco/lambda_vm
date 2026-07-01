@@ -104,33 +104,19 @@ fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E
     transcript
 }
 
-/// The L2G table's AIR constraint: the `MU` selector column is boolean.
-///
-/// The Memory bus already pins `MU = 1` on real rows and `MU = 0` on padding —
-/// it's anchored to MEMW's own bit-constrained multiplicity, since a non-1 `MU`
-/// leaves the cell's seed/fini tokens unmatched. This constraint makes
-/// "`MU ∈ {0,1}`" explicit on the table itself rather than relying on that
-/// cross-bus argument. Lives on the epoch-local air; the global proof commits the
-/// identical trace (root-bound), so it inherits it.
-fn l2g_constraints()
--> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
-    use crate::constraints::templates::IsBitConstraint;
-    use stark::constraints::transition::TransitionConstraint;
-    vec![IsBitConstraint::unconditional(local_to_global::cols::MU, 0).boxed()]
-}
-
 /// Local-to-global AIR on the cross-epoch GlobalMemory bus (used in the global proof).
 ///
 /// `epoch_label` is this epoch's 1-based label; it is the `fini_epoch` constant
 /// the fini token carries (not a trace column, since it's the same for every row).
 ///
-/// Uses `empty_constraints()` deliberately: the MU boolean (`MU·(1-MU)=0`), the
-/// column range checks, and the `init_epoch < fini_epoch` ordering are NOT
-/// re-asserted here. They are enforced once in the epoch proof's `l2g_memory_air`,
-/// and `verify_l2g_commitment_binding` ties this global L2G sub-table to the *same*
-/// committed trace (equal Merkle roots). So under collision resistance the trace the
-/// global bus runs over already satisfies all those constraints — do not add them
-/// here (it would be redundant, not a missing check).
+/// Uses `empty_constraints()` deliberately: the column range checks and the
+/// `init_epoch < fini_epoch` ordering are NOT re-asserted here. They are enforced
+/// once in the epoch proof's `l2g_memory_air`, and `verify_l2g_commitment_binding`
+/// ties this global L2G sub-table to the *same* committed trace (equal Merkle
+/// roots). So under collision resistance the trace the global bus runs over already
+/// satisfies all those checks — do not add them here (it would be redundant, not a
+/// missing check). The table has no AIR transition constraints of its own (there is
+/// no longer any selector column to bound).
 fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
@@ -151,7 +137,10 @@ fn l2g_global_air(
 /// Carries the column range checks and the `init_epoch < fini_epoch` ordering
 /// check too: this proof has the BITWISE provider, and the global proof commits
 /// the identical trace (the commitment binding compares roots), so checking here
-/// covers both. `epoch_label` is the `fini_epoch` constant used by both.
+/// covers both. `epoch_label` is the `fini_epoch` constant used by both. The table
+/// has no AIR transition constraints (every row is real — a touched cell or a
+/// brought-forward filler — so there is no selector to bound); soundness rests on
+/// the bus balance and the range/ordering lookups.
 fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
@@ -166,7 +155,7 @@ fn l2g_memory_air(
         AuxiliaryTraceBuildData { interactions },
         opts,
         1,
-        l2g_constraints(),
+        empty_constraints(),
     )
 }
 
@@ -229,6 +218,33 @@ fn global_memory_configs_from_init_page_data(
             None => PageConfig::zero_init(page_base),
         })
         .collect()
+}
+
+/// Page bases (in preference order) from which one epoch draws brought-forward
+/// filler rows for [`local_to_global::append_bring_forward_fillers`]: the epoch's
+/// own touched pages first (already in the global touched-page set, so fillers on
+/// them add no `GLOBAL_MEMORY` table), then any genesis page as a fallback for
+/// epochs that touched no cell of their own. Deduplicated, deterministic.
+fn filler_candidate_pages(
+    boundary: &[CellBoundary],
+    init_page_data: &HashMap<u64, Vec<u8>>,
+) -> Vec<u64> {
+    let mut seen: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+    let mut pages: Vec<u64> = Vec::new();
+    for b in boundary {
+        let base = page::page_base_for_address(b.address);
+        if seen.insert(base) {
+            pages.push(base);
+        }
+    }
+    let mut genesis: Vec<u64> = init_page_data.keys().copied().collect();
+    genesis.sort_unstable();
+    for base in genesis {
+        if seen.insert(base) {
+            pages.push(base);
+        }
+    }
+    pages
 }
 
 /// Per-epoch register state and label.
@@ -532,9 +548,19 @@ fn prove_global(
     init_page_data: &HashMap<u64, Vec<u8>>,
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
-    // Each cell's final state (boundaries are in epoch order, so the last fini wins).
+    // Each cell's final state (boundaries are in epoch order and each epoch touches
+    // an address at most once — touched cells are unique and fillers are drawn from
+    // untouched cells — so iterating in order makes the highest-epoch fini win, which
+    // is the true final value).
     let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
+        debug_assert!(
+            {
+                let mut seen = std::collections::HashSet::new();
+                epoch.iter().all(|b| seen.insert(b.address))
+            },
+            "an epoch's boundary must not repeat an address (touched + filler rows are disjoint)"
+        );
         for b in epoch {
             final_state.insert(
                 b.address,
@@ -726,8 +752,40 @@ pub fn prove_continuation(
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )?;
-        let boundary =
+        let mut boundary =
             local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+
+        // Carry the image forward from this epoch's real writes (the touched cells,
+        // which are all of `boundary` before fillers are appended): this epoch's fini
+        // is the next epoch's init. Filler rows are value-preserving no-ops, so they
+        // are deliberately excluded here.
+        for cell in &boundary {
+            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+        }
+
+        // Pad the epoch's L2G table to a power of two with brought-forward filler
+        // rows for untouched cells (so it needs no MU selector). Source from this
+        // epoch's own touched pages first — they never enlarge the global
+        // touched-page set — then genesis pages as a fallback (needed when the epoch
+        // touched no cell of its own). Fails closed if an epoch touches too large a
+        // fraction of total memory (the `#total cells ≥ next_pow2(#touched)`
+        // assumption); the verifier would reject such a proof anyway.
+        let candidate_pages = filler_candidate_pages(&boundary, &init_page_data);
+        local_to_global::append_bring_forward_fillers(
+            &mut boundary,
+            &mut provenance,
+            &candidate_pages,
+            label,
+        )
+        .map_err(|s| {
+            Error::ContinuationFillerShortage(format!(
+                "epoch {label} needs {} local-to-global rows (a power of two) but only \
+                 {} could be filled (touched cells plus every untouched cell available \
+                 to bring forward); the execution touches too large a fraction of total \
+                 memory in one epoch (use a smaller epoch size)",
+                s.needed, s.got
+            ))
+        })?;
 
         let start = EpochStart {
             register_init: &register_init,
@@ -735,11 +793,6 @@ pub fn prove_continuation(
         };
         let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
         prev_fini = Some(epoch.reg_fini.clone());
-
-        // Carry the image forward: this epoch's fini is the next epoch's init.
-        for cell in &boundary {
-            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
-        }
         epochs.push(epoch);
 
         if is_final {
@@ -874,7 +927,56 @@ pub fn prove_and_verify_continuation(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tables::local_to_global::{FiniClaim, InitClaim};
     use crate::test_utils::asm_elf_bytes;
+
+    fn boundary_at(address: u64) -> CellBoundary {
+        CellBoundary {
+            address,
+            init: InitClaim {
+                value: 0,
+                originating_epoch: 0,
+                timestamp: 0,
+            },
+            fini: FiniClaim {
+                value: 0,
+                epoch: 1,
+                timestamp: 0,
+            },
+        }
+    }
+
+    // filler_candidate_pages lists the epoch's own touched pages FIRST (so fillers
+    // don't enlarge the global touched-page set), then genesis pages as a fallback,
+    // deduplicated. This exercises the fallback branch used when an epoch touches no
+    // cell of its own (which the self-contained bus tests bypass by passing pages
+    // directly).
+    #[test]
+    fn test_filler_candidate_pages_touched_first_then_genesis_fallback() {
+        let page = page::DEFAULT_PAGE_SIZE as u64;
+        // Touched cell on page 1; genesis image spans pages 0, 1, 2.
+        let boundary = vec![boundary_at(page + 5)];
+        let init_page_data: HashMap<u64, Vec<u8>> =
+            HashMap::from([(0, vec![1]), (page, vec![1]), (2 * page, vec![1])]);
+
+        let pages = filler_candidate_pages(&boundary, &init_page_data);
+
+        // Touched page (1) comes first; genesis pages 0 and 2 follow (page 1 is not
+        // repeated), sorted.
+        assert_eq!(pages, vec![page, 0, 2 * page]);
+    }
+
+    // With no touched cells (a compute-only epoch), the candidate set is exactly the
+    // genesis pages, sorted — this is the fallback the streaming prover relies on to
+    // pad a zero-touch epoch's L2G table.
+    #[test]
+    fn test_filler_candidate_pages_zero_touch_uses_genesis_pages() {
+        let page = page::DEFAULT_PAGE_SIZE as u64;
+        let init_page_data: HashMap<u64, Vec<u8>> =
+            HashMap::from([(2 * page, vec![1]), (0, vec![1])]);
+        let pages = filler_candidate_pages(&[], &init_page_data);
+        assert_eq!(pages, vec![0, 2 * page]);
+    }
 
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with

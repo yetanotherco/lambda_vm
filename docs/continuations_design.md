@@ -3,7 +3,8 @@
 This is the single design document for the "continuations" prover (Approach 2,
 "prove-epoch" from the streaming spec). It covers the things a continuation must
 carry across epoch boundaries — **memory** (the bulk of the doc: §1–§5, including
-the cross-epoch local-to-global table and the Design X vs Design Y decision),
+the cross-epoch local-to-global table and its selector-free chain-completeness
+argument),
 **registers** including the commit index x254 (§6), and the **Fiat-Shamir statement
 binding** (§7) that ties each epoch proof to its program and position — plus the
 soundness mechanisms that make each safe. §8 describes the **standalone (split)
@@ -76,9 +77,11 @@ makes the proof fail.
                   which epoch wrote it          access timestamp)
 ```
 
-Column layout (9 columns): `address_lo/hi` (32-bit), `init_value` (byte),
+Column layout (8 columns): `address_lo/hi` (32-bit), `init_value` (byte),
 `init_epoch` (two 16-bit halfwords), `fini_value` (byte),
-`fini_timestamp_lo/hi` (32-bit), `MU` (selector).
+`fini_timestamp_lo/hi` (32-bit). There is **no selector column** — every row is
+real (a touched cell or a brought-forward filler) and every interaction fires with
+multiplicity 1 (see §3.4).
 
 Note: **`fini_epoch` is NOT a column** — it is supplied as a per-table constant
 (see §4.2).
@@ -182,29 +185,56 @@ Unreachable in practice (optimal epochs are millions of cycles → thousands of
 epochs even for a billion-cycle run) and fails closed. If ever needed, widen the
 gap check to 32-bit or switch to the LT table.
 
-### 3.4 The `MU` selector
+### 3.4 Padding via brought-forward (filler) rows
 
-Traces are padded with blank rows to a power of two (an FFT requirement). Those
-padding rows must not disturb any bus.
+Traces are padded to a power of two (an FFT requirement). Those padding rows must
+not disturb any bus.
 
-Originally padding was harmless because a blank row's `init` and `fini` tokens
-were identical and self-cancelled. **Two** of the changes above broke that, each
-on its own:
+Blank (all-zero) padding rows do **not** work here. Two of the changes above break
+their self-cancellation, each on its own:
 
-- §3.2 (constant `fini_epoch`): a padding row's `fini` now carries
-  `epoch = the constant` while its `init` carries `epoch = 0`, so the tokens
-  differ and no longer cancel.
-- §3.3 (the ordering check): a padding row has `init_epoch == fini_epoch` (both
-  `0`), which fails the strict `<` check.
+- §3.2 (constant `fini_epoch`): a blank row's `fini` carries `epoch = the constant`
+  while its `init` carries `epoch = 0`, so on the **GlobalMemory** bus the two
+  tokens differ and no longer cancel.
+- §3.3 (the ordering check): a blank row has `init_epoch == fini_epoch` (both `0`),
+  which fails the strict `<` check.
 
-So `MU` is required by *either* change.
+An earlier design fixed this with a boolean **`MU` selector column** (1 on real
+rows, 0 on padding) gating every interaction. That column has since been
+**removed**. Instead the table has **no selector**: every interaction fires with
+multiplicity 1 (exactly like PAGE), and the power-of-two padding rows are **real
+"brought-forward" rows** for genuinely-untouched memory cells, carried forward
+unchanged from their previous owner to the current epoch:
 
-Fix: a selector column `MU` (1 on real rows, 0 on padding). Interactions gated by
-`Multiplicity::Column(MU)` contribute nothing on padding rows.
+- `init_value == fini_value` (value unchanged),
+- `fini_timestamp = 0`,
+- `init_epoch = the cell's previous owner` (`GENESIS_EPOCH = 0` if never written),
+- `fini_epoch = the current epoch` (the same per-table constant as real rows).
 
-`MU` is itself constrained boolean (`MU·(1−MU)=0`), and pinned to the right
-rows by bus balance (a real row with `MU=0` drops its telescoping link →
-imbalance).
+Such a filler is a provable no-op on both buses:
+
+- **Epoch-local Memory bus:** its init-receive `[0, addr, 0, 0, value]` and
+  fini-send `[0, addr, 0, 0, value]` are the *identical* token (`fini_ts = 0`,
+  `init_value = fini_value`), so they self-cancel — exactly as PAGE's init/fini
+  bookend cancels for a never-accessed cell. An untouched cell has **no MEMW
+  partner** to balance any non-cancelling token, so this self-cancellation is the
+  *only* shape a filler can take without dangling a Memory-bus token; the memory
+  argument therefore **forces** both `fini_ts = 0` and `init_value = fini_value`.
+- **GlobalMemory bus:** it consumes the cell's current head token
+  `(addr, value, prev_owner)` and produces `(addr, value, current_epoch)` — a
+  value-preserving telescoping link, grounded (like every chain) at genesis and
+  ordered by the strict `init_epoch < fini_epoch` check (`prev_owner < current`).
+  The constant `fini_epoch` is fine here precisely because a filler is a *real
+  link*, not a self-cancel.
+
+The prover sources filler cells from each epoch's own touched pages first (which
+never enlarge the global touched-page set) and from genesis pages as a fallback
+(needed when an epoch touched no cell of its own); it updates each brought-forward
+cell's provenance to the current epoch so the next epoch to touch it sees the right
+owner. This relies on `#total live cells ≥ next_pow2(#touched per epoch)`; the
+prover **fails closed** (`Error::ContinuationFillerShortage`) if that pool is ever
+too small — a completeness limit, never an unsound proof. Because paged memory
+gives each touched page `2^18` cells, this holds for every realistic program.
 
 ### 3.5 CPU padding and the power-of-two epoch size
 
@@ -233,48 +263,47 @@ accepts — only how the driver slices cycles. A debug-assert enforces the
 
 ---
 
-## 4. Design X vs Design Y — *where* `MU` is applied
+## 4. Chain completeness — why the design is selector-free (and safe)
 
-`MU` is needed to neutralize padding, but **which** interactions should it gate?
+The soundness backbone is **chain completeness**: every touched epoch must be
+forced into each cell's cross-epoch chain, so the prover-controlled finalization is
+pinned. This section explains why completeness holds with **no selector column**,
+and preserves — as the guiding lesson — the chain-truncation attack that an earlier
+selector-based design (Design Y) opened.
 
-```
-                       GlobalMemory   Memory     range +
-                       (telescoping)  (bookend)  ordering
-   Design X (SOUND):       MU            MU          MU      ← MU gates everything
-   Design Y (UNSOUND):     MU           One         One      ← MU only on GlobalMemory
-```
+### Why completeness holds without a selector (Statement S)
 
-**Conclusion up front: Design X is sound; Design Y is *not*.** We initially
-believed Y was a cleaner equivalent (and two adversarial reviews agreed). They
-were wrong — Y opens a chain-truncation attack. Below is X, then Y, then the
-attack and why X blocks it.
+The load-bearing fact is **Statement S**:
 
-### Design X
+> In a continuation epoch, the only table that provides a RAM cell's seed (its
+> value at timestamp 0) on the Memory bus is L2G (PAGE is off). If a cell is
+> accessed by MEMW during the epoch, the memory argument requires that seed; if the
+> L2G seed/fini bookend does not fire, the Memory bus cannot balance. Therefore any
+> accessed cell is forced to have a firing L2G bookend.
 
-`MU` gates **every** L2G interaction (matches the standard table pattern —
-LT/MUL/MEMW each gate all their interactions with one multiplicity column).
+S rests on three checkable facts: (1) PAGE is off in continuation epochs;
+(2) MEMW enforces timestamp ordering, so a cell's access chain must bottom out at
+the seed; (3) no other table provides a RAM seed (REGISTER is registers only, a
+disjoint token subspace).
 
-The crucial consequence — which we first mistook for redundancy — is that gating
-the **Memory bus bookend** with `MU` forces `MU = 1` on every *touched* cell:
-a touched cell's MEMW accesses need the L2G seed/fini on the Memory bus (PAGE is
-off), so `MU = 0` would dangle them → the epoch proof fails. This is **Statement
-S** below. Forcing `MU = 1` on every touched cell forces every touching epoch
-**into the global chain** — so the chain is **complete**, and cannot be truncated.
+With **no selector column**, every L2G row's Memory bookend fires unconditionally
+(`Multiplicity::One`). So a touched cell's bookend *always* fires — there is no
+selector to set to 0 — which is a strictly stronger form of S than any gated
+design: every touching epoch is **unconditionally** in the global chain, so the
+chain is complete and the finalization is pinned. Fillers add only extra
+value-preserving links (§3.4) and never remove one.
 
-### Design Y (rejected — unsound)
+### The lesson we keep: the Design-Y chain-truncation attack
 
-`MU` gates **only the GlobalMemory bus**; the Memory bus and range/ordering checks
-use `Multiplicity::One`. The intended win was that the ordering check then fires
-unconditionally so `MU` can't skip it. But decoupling the Memory bookend from `MU`
-**broke Statement S**: a touched cell's bookend now fires regardless of `MU`
-(`Multiplicity::One`), so the epoch proof passes even with `MU = 0`. Nothing then
-forces `MU = 1` on a *non-first-touch* row — and that is exploitable.
-
-### The attack Design Y allows: orphan a touched epoch
+An earlier design ("Design Y") gated **only** the GlobalMemory bus with a selector
+`MU`, leaving the Memory bookend and range/ordering checks at `Multiplicity::One`.
+Two adversarial reviews called it sound; they were wrong. Because the Memory
+bookend fired regardless of `MU`, a touched epoch's proof passed even with `MU = 0`,
+and nothing forced `MU = 1` on a *non-first-touch* row:
 
 Cell A, touched by epochs e1 then e2. Honest: genesis `v0` → e1 writes `f1` →
-e2 writes `f2` → final `f2`. A cheating prover sets **`MU = 0` on e2's L2G row**
-and sets `global_memory`'s finalization for A to `f1`:
+e2 writes `f2` → final `f2`. A cheat sets `MU = 0` on e2's L2G row and points
+`global_memory`'s finalization for A at `f1`:
 
 ```
    genesis(v0) ──► e1.init        ✓ (genesis must be consumed — forces e1 only)
@@ -282,45 +311,21 @@ and sets `global_memory`'s finalization for A to `f1`:
    e2.init / e2.fini              ✗ MU=0 — orphaned, don't fire
 ```
 
-- The GlobalMemory bus **balances** (every fired token matched).
-- e2's **epoch proof still passes** — in Design Y its Memory bookend is
-  `Multiplicity::One`, so it fires regardless of `MU`; e2 ran internally-consistently.
-- **Nothing forces `MU_e2 = 1`:** e2 isn't first-touch (genesis went to e1), and
-  the finalization is a *prover column*, so it just absorbs whatever the last fired
-  fini was.
+The GlobalMemory bus balances, e2's epoch proof still passes, and e2's write to A
+is silently dropped — A's final value is claimed `f1` when it is really `f2`. A
+false statement, proven. The root cause is the **input/output asymmetry** of the
+anchors: genesis is the *input* and is ELF-bound (fixed), but the finalization is
+the *output* — a prover column, trustworthy only if the chain is **complete** so
+the last fini is *forced* to be consumed by it.
 
-Result: e2's write to A is silently dropped — A's final value is claimed `f1`
-when it's really `f2`. A false statement, proven. (For a *middle* epoch, reroute
-the later init to consume the earlier fini, skipping the middle one.)
-
-The root cause is the **input/output asymmetry** of the anchors: genesis is the
-*input* and is ELF-bound (fixed), but the finalization is the *output* — a prover
-column. The finalization is only trustworthy if the chain is **complete** so that
-the last fini is *forced* to be consumed by it. A complete chain pins the
-finalization; a truncatable chain leaves it free. Design X forces completeness
-(via `MU=1` on every touched cell); Design Y does not.
-
-### Statement S (why Design X is sound, and what Y broke)
-
-> In a continuation epoch, the only table that provides a RAM cell's seed (its
-> value at timestamp 0) on the Memory bus is L2G (PAGE is off). If a cell is
-> accessed by MEMW during the epoch, the memory argument requires that seed; with
-> `MU = 0` the seed is absent and the Memory bus cannot balance. Therefore any
-> accessed cell is forced to `MU = 1`.
-
-S rests on three checkable facts: (1) PAGE is off in continuation epochs;
-(2) MEMW enforces timestamp ordering, so a cell's access chain must bottom out at
-the seed; (3) no other table provides a RAM seed (REGISTER is registers only, a
-disjoint token subspace).
-
-**S requires the Memory bookend to be `MU`-gated** — that is exactly what Design X
-has and Design Y removed. So the "redundant" `MU` on the Memory bus in Design X is
-in fact load-bearing: it's what forces every touched epoch into the chain, making
-the chain complete and the finalization trustworthy.
+**How the current design forecloses this:** there is no `MU` column to zero, so no
+row can be silenced — the attack is structurally impossible. Removing the selector
+did not weaken S; it removed the very lever the attack needed. (This is why we do
+**not** reintroduce any selector-gated Memory bookend.)
 
 ### The anchoring chain (why a real access cannot be dropped at all)
 
-`MU = 1` being forced bottoms out at the program itself:
+A forced-firing L2G bookend bottoms out at the program itself:
 
 ```
    ELF ─DECODE(preprocessed)─► each row's instruction (LOAD/STORE flags) is fixed
@@ -328,13 +333,14 @@ the chain complete and the finalization trustworthy.
         │
    ▼ a real load/store row has its flag = 1 (DECODE match + IsBit) ⟹ CPU sends Memw req
    ▼ MEMW must receive it (MU_READ/MU_WRITE) — dropping it ⟹ Memw-bus imbalance
-   ▼ MEMW's bookend pairing needs the L2G seed/fini — in Design X (MU-gated) ⟹ MU=1
-   ▼ MU=1 ⟹ the cell is in the global chain ⟹ chain complete ⟹ finalization pinned
+   ▼ MEMW's bookend pairing needs the L2G seed/fini, which fires unconditionally
+   ▼ ⟹ the cell is in the global chain ⟹ chain complete ⟹ finalization pinned
 ```
 
 This is the VM's core execution soundness (DECODE + PC-continuity + IsBit flags,
 verified in `cpu.rs` / `constraints/cpu.rs`), extended one link at a time up to
-cross-epoch memory. Design X keeps every link; Design Y cut the MEMW→L2G link.
+cross-epoch memory. Every link is kept; the selector-free bookend is what makes the
+MEMW→L2G link unconditional.
 
 ### How `global_memory`'s finalization is constrained — and the parallel with `main`
 
@@ -343,28 +349,33 @@ output, not a known input). It is pinned **internally** by the bus: it must cons
 the last fini of each cell's chain, which (with a complete chain) is the cell's
 real last-written value. This is exactly how **PAGE** works in the monolithic
 prover — PAGE's `fini` is pinned by the (single, complete) Memory bus to the last
-MEMW write. Design X is the faithful cross-epoch extension; Design Y silently
-dropped the "chain is complete" property both rely on.
+MEMW write. The selector-free L2G is the faithful cross-epoch extension; Design Y
+silently dropped the "chain is complete" property both rely on.
 
 ---
 
 ## 5. Adversarial review summary
 
-1. **`MU` safety (Design X).** Could `MU=0` on a real row, or a non-boolean `MU`,
-   skip the ordering or forge a balance? No — caught by the Memory bus (Statement
-   S) and the boolean constraint. **Holds.**
-2. **Design Y.** Two adversarial reviews concluded Y was sound (padding harmless,
-   ordering unconditional, "ghost row" attack defeated). **They were wrong.** Both
-   only tested *first-touch* `MU=0` (genesis dangles → caught) and added/forged
+1. **Selector-free padding (brought-forward fillers).** Can a filler row be a
+   non-no-op — inject/change a value, or forge a timestamp? No — an untouched cell
+   has no MEMW partner, so on the Memory bus its init/fini must be the identical
+   token (`fini_ts = 0`, `init_value = fini_value`) or a token dangles; any other
+   shape is rejected. On the GlobalMemory bus a filler is forced to consume its
+   cell's real head token, so its value telescopes from genesis. **Holds** (see the
+   negative tests in `local_to_global_bus_tests.rs`).
+2. **The Design-Y lesson (chain truncation).** An earlier selector design gated only
+   the GlobalMemory bus; two adversarial reviews called it sound and were wrong —
+   they only tested *first-touch* `MU=0` (genesis dangles → caught) and added/forged
    rows; neither tested **truncating the chain at a non-first-touch row** while
-   pointing the prover-controlled finalization at the truncation. That attack (§4)
-   makes Y unsound. Lesson: a review that misses an attack class proves nothing
-   about it — the truncation/orphan class was the gap.
+   pointing the prover-controlled finalization at the truncation (§4). Removing the
+   selector entirely makes that attack structurally impossible (no row can be
+   silenced). Lesson kept: a review that misses an attack class proves nothing about
+   it — the truncation/orphan class was the gap.
 3. **`fini_epoch` as a constant.** Sound — strictly more so than a column. Labels
    are verifier-computed from epoch position (unforgeable); prove/verify use
    identical labels (no off-by-one); the free `init_epoch` column and
-   `global_memory`'s `FINI_EPOCH` column are pinned by bus balance **when the chain
-   is complete** (Design X). Independent of the X/Y choice.
+   `global_memory`'s `FINI_EPOCH` column are pinned by bus balance because the chain
+   is complete (§4 — every touched cell's bookend fires unconditionally).
 
 ---
 
@@ -518,15 +529,16 @@ recursion/aggregation layer (deferred).
 ## 9. Status and open items
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
-  ordering check (§3.3), the `MU` selector (§3.4), the **power-of-two epoch size**
-  (§3.5), **cross-epoch registers** (§6), the **commit index x254** across epochs
-  (§6), the **Fiat-Shamir statement binding** (§7), and the **standalone split
-  prover/verifier** (§8) — bundle serialized with `bincode` and driven from the CLI
-  (`prove`/`verify --continuations`).
-- **The committed code implements Design X** (`MU` gates every L2G interaction),
-  which is the sound design. Design Y was implemented briefly, then found unsound
-  (§4, the chain-truncation attack) and **reverted**. Do not re-introduce the
-  Design Y wiring: gating only the GlobalMemory bus reopens the orphan attack.
+  ordering check (§3.3), **selector-free brought-forward filler padding** (§3.4),
+  the **power-of-two epoch size** (§3.5), **cross-epoch registers** (§6), the
+  **commit index x254** across epochs (§6), the **Fiat-Shamir statement binding**
+  (§7), and the **standalone split prover/verifier** (§8) — bundle serialized with
+  `bincode` and driven from the CLI (`prove`/`verify --continuations`).
+- **The L2G table has no selector column.** An earlier `MU`-gated design (and the
+  briefly-implemented, unsound Design Y that gated only the GlobalMemory bus) were
+  both replaced by the selector-free filler design (§3.4). Do **not** reintroduce a
+  selector-gated Memory bookend: it would recreate the lever the chain-truncation
+  attack (§4) needs.
 - Deferred:
   - **Succinctness.** The split verifier is non-succinct (N+1 proofs, §8). A single
     small proof needs a recursion/aggregation layer — a separate, larger effort.
@@ -541,7 +553,7 @@ recursion/aggregation layer (deferred).
 
 - `prover/src/tables/local_to_global.rs` — L2G columns, trace generation, the
   Memory/GlobalMemory bus interactions, range checks, the ordering lookup, and
-  the per-row selector.
+  `append_bring_forward_fillers` (the selector-free power-of-two padding).
 - `prover/src/tables/global_memory.rs` — the genesis (ELF-bound) and
   finalization anchors.
 - `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
