@@ -19,6 +19,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+pub use stark::profile_markers;
 mod statement;
 pub mod tables;
 pub mod test_utils;

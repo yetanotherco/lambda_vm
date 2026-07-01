@@ -209,13 +209,17 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
     )
 }
 
-/// Verifier sub-routines in execution order; `run_profile` buckets cycles by
-/// substring-matching the enclosing symbol (a missing step merges into the prior).
-const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
-    "replay_rounds_after_round_1",
-    "step_2_verify_claimed_composition_polynomial",
-    "step_3_verify_fri",
-    "step_4_verify_trace_and_composition_openings",
+/// Verifier sub-steps in execution order, keyed by `stark::profile_markers::STEP_*`
+/// value. `run_profile` buckets cycles by the highest marker observed so far
+/// (`decode_step_marker` — a missing marker just means that bucket stays at 0
+/// cycles, no substring matching or symbol table needed).
+const STEP_LABELS: [&str; 6] = [
+    "0. setup (alloc, pre-decode)",
+    "1. decode (postcard decode -> Elf::load/VmAirs::new/transcript setup)",
+    "2. step 1: replay_rounds_after_round_1",
+    "3. step 2: verify_claimed_composition_polynomial",
+    "4. step 3: verify_fri",
+    "5. step 4: verify_trace_and_composition_openings (+ wrap-up)",
 ];
 
 /// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
@@ -262,18 +266,11 @@ fn print_function_table(
 }
 
 /// Print the monotonic per-verifier-step cycle bucketing (`buckets[0]` = setup).
-fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
-    let labels = [
-        "0. setup (alloc + postcard decode + VmAirs::new + pre-step-1)",
-        "1. step 1: replay_rounds_after_round_1",
-        "2. step 2: verify_claimed_composition_polynomial",
-        "3. step 3: verify_fri",
-        "4. step 4: verify_trace_and_composition_openings (+ wrap-up)",
-    ];
+fn print_step_breakdown(buckets: &[u64; 6], total_cycles: u64) {
     eprintln!();
     eprintln!("  Per-step cycle breakdown (monotonic state machine):");
-    eprintln!("  {:<60}  {:>14}  {:>7}", "bucket", "cycles", "%");
-    for (label, cycles) in labels.iter().zip(buckets.iter()) {
+    eprintln!("  {:<70}  {:>14}  {:>7}", "bucket", "cycles", "%");
+    for (label, cycles) in STEP_LABELS.iter().zip(buckets.iter()) {
         let pct = if total_cycles > 0 {
             100.0 * (*cycles as f64) / (total_cycles as f64)
         } else {
@@ -283,9 +280,10 @@ fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
     }
 }
 
-/// Single-pass execute-only profiler. Always prints total cycles + a rough
-/// trace/LDE estimate; with `detailed`, also the top-25 functions + per-step
-/// breakdown (one streamed pass). `!detailed` does no per-log work.
+/// Single-pass execute-only profiler. Always prints total cycles, the
+/// per-step cycle breakdown (marker decode is cheap — one `InstructionCache`
+/// lookup per cycle), and a rough trace/LDE estimate; with `detailed`, also
+/// the top-25 functions table (needs a `pc_hist` HashMap, so gated).
 fn run_profile(
     guest_name: &str,
     progress_stride: usize,
@@ -294,75 +292,41 @@ fn run_profile(
 ) {
     use std::collections::HashMap;
 
-    let (guest_elf_bytes, _program, mut executor) = setup_guest_run("profile", guest_name, &opts);
+    let (guest_elf_bytes, program, mut executor) = setup_guest_run("profile", guest_name, &opts);
     let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
+    let instructions = executor::vm::execution::InstructionCache::new(&program.data)
+        .expect("instruction cache build failed");
 
     let mut pc_hist: HashMap<u64, u64> = HashMap::new();
-    let mut buckets = [0u64; 5];
-    let mut last_range: Option<(u64, u64)> = None;
-    let mut last_advance: u8 = 0;
+    let mut buckets = [0u64; 6];
     let bucket = std::cell::Cell::new(0u8);
     let unique = std::cell::Cell::new(0usize);
-
-    if detailed {
-        assert!(
-            !symbols.is_empty(),
-            "{guest_name} ELF has no symbol table — was it stripped?"
-        );
-        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
-            let n = symbols
-                .functions()
-                .iter()
-                .filter(|f| f.name.contains(kw))
-                .count();
-            eprintln!(
-                "[profile] step {}: keyword={kw:?} -> {n} symbol(s) {}",
-                i + 1,
-                if n > 0 {
-                    ""
-                } else {
-                    "(no match; merges into previous bucket)"
-                },
-            );
-        }
-    }
 
     eprintln!(
         "[profile] executing {guest_name} guest ({}) ...",
         if detailed {
             "histogram + steps"
         } else {
-            "cycle counter"
+            "steps"
         }
     );
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
         |log| {
+            let pc = log.current_pc;
+
             if detailed {
-                let pc = log.current_pc;
                 *pc_hist.entry(pc).or_insert(0) += 1;
                 unique.set(pc_hist.len());
-
-                let in_cached = matches!(last_range, Some((s, e)) if pc >= s && pc < e);
-                if !in_cached {
-                    if let Some(sym) = symbols.lookup(pc) {
-                        last_range = Some((sym.address, sym.address + sym.size.max(1)));
-                        last_advance = 0;
-                        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
-                            if sym.name.contains(kw) {
-                                last_advance = (i + 1) as u8;
-                            }
-                        }
-                    } else {
-                        last_range = None;
-                        last_advance = 0;
-                    }
-                }
-                if bucket.get() < last_advance {
-                    bucket.set(last_advance);
-                }
-                buckets[bucket.get() as usize] += 1;
             }
+
+            if let Some(marker) = executor::vm::execution::decode_step_marker(&instructions, pc)
+                && bucket.get() < marker as u8
+            {
+                bucket.set(marker as u8);
+            }
+            buckets[bucket.get() as usize] += 1;
+
             ControlFlow::Continue(())
         },
         |chunks, cycles, elapsed| {
@@ -374,7 +338,10 @@ fn run_profile(
                         bucket.get(),
                     );
                 } else {
-                    eprintln!("[profile]   ... {chunks} chunks, {cycles} cycles, {elapsed:?}");
+                    eprintln!(
+                        "[profile]   ... {chunks} chunks, {cycles} cycles, bucket={}, {elapsed:?}",
+                        bucket.get(),
+                    );
                 }
             }
         },
@@ -404,10 +371,11 @@ fn run_profile(
         (main_trace_bytes * 2) as f64 / 1e9,
     );
 
+    eprintln!();
+    print_step_breakdown(&buckets, total_cycles);
     if detailed {
         eprintln!();
         print_function_table(&symbols, pc_hist, total_cycles);
-        print_step_breakdown(&buckets, total_cycles);
     }
     eprintln!("============================================================");
 }
@@ -539,6 +507,65 @@ fn test_recursion_execute_1query() {
         MIN_PROOF_OPTIONS,
         OuterMode::ExecuteOnly,
     );
+}
+
+/// Regression test for the marker mechanism itself: every `STEP_*` marker
+/// must be observed at least once during a full verifier run, and each
+/// transition between consecutive markers must be a valid step in the
+/// verifier's state machine.
+///
+/// `multi_verify` re-runs `replay_rounds_after_round_1 -> step_2 -> step_3 ->
+/// step_4` once per AIR table (see `crypto/stark/src/verifier.rs`), so the
+/// full marker sequence isn't monotonic overall — it's `STEP_DECODE_DONE`
+/// once, followed by N repetitions of the `2,3,4,5` cycle (one per table).
+/// A transition outside `{1->2, 2->3, 3->4, 4->5, 5->2}` means the marker
+/// convention broke — wrong immediate decoded, or a stale/mismatched build.
+#[test]
+#[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
+fn test_recursion_step_markers_observed_in_order() {
+    let (_bytes, program, mut executor) =
+        setup_guest_run("step-markers", "recursion", &MIN_PROOF_OPTIONS);
+    let instructions = executor::vm::execution::InstructionCache::new(&program.data)
+        .expect("instruction cache build failed");
+
+    let decode_done = stark::profile_markers::STEP_DECODE_DONE;
+    let replay = stark::profile_markers::STEP_REPLAY_ROUNDS_AFTER_ROUND_1;
+    let claimed = stark::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL;
+    let fri = stark::profile_markers::STEP_VERIFY_FRI;
+    let openings = stark::profile_markers::STEP_VERIFY_TRACE_AND_COMPOSITION_OPENINGS;
+
+    let mut last_marker: Option<u32> = None;
+    let mut seen = std::collections::HashSet::new();
+    drive_executor(
+        &mut executor,
+        |log| {
+            if let Some(marker) =
+                executor::vm::execution::decode_step_marker(&instructions, log.current_pc)
+            {
+                let valid_transition = match last_marker {
+                    None => marker == decode_done,
+                    Some(last) if last == decode_done => marker == replay,
+                    Some(last) if last == replay => marker == claimed,
+                    Some(last) if last == claimed => marker == fri,
+                    Some(last) if last == fri => marker == openings,
+                    Some(last) if last == openings => marker == replay,
+                    Some(_) => false,
+                };
+                assert!(
+                    valid_transition,
+                    "invalid step marker transition: {last_marker:?} -> {marker}"
+                );
+                last_marker = Some(marker);
+                seen.insert(marker);
+            }
+            ControlFlow::Continue(())
+        },
+        |_, _, _| {},
+    );
+
+    for step in [decode_done, replay, claimed, fri, openings] {
+        assert!(seen.contains(&step), "marker {step} was never observed");
+    }
 }
 
 /// Execute-only: verify a `blowup=8` proof of fibonacci(10) in-VM.
@@ -845,33 +872,6 @@ fn test_recursion_sampled_flamegraph() {
     eprintln!("  To render SVG (requires inferno):");
     eprintln!("    cat {path} | inferno-flamegraph > /tmp/recursion_flamegraph_sampled.svg");
     eprintln!("============================================================");
-}
-
-// Control guest: decodes the blob and halts. Its cycle count subtracted from
-// the matching recursion run isolates the in-VM verifier cost.
-
-#[test]
-#[ignore = "diagnostic: fast; deserialize-only guest cycle count (1 query)"]
-fn test_deserialize_only_cycles_1query() {
-    run_profile("deserialize-only", 50, MIN_PROOF_OPTIONS, false);
-}
-
-#[test]
-#[ignore = "diagnostic: fast; deserialize-only guest cycle count (multi-query)"]
-fn test_deserialize_only_cycles_multiquery() {
-    run_profile("deserialize-only", 50, blowup8(), false);
-}
-
-#[test]
-#[ignore = "diagnostic: ~1 min; deserialize-only guest histogram (1 query)"]
-fn test_deserialize_only_profile_1query() {
-    run_profile("deserialize-only", 50, MIN_PROOF_OPTIONS, true);
-}
-
-#[test]
-#[ignore = "diagnostic: deserialize-only guest histogram (multi-query)"]
-fn test_deserialize_only_profile_multiquery() {
-    run_profile("deserialize-only", 50, blowup8(), true);
 }
 
 /// Inner program: fibonacci(10).
