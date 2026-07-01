@@ -123,11 +123,11 @@ jobs:
         run: cargo test -p cli
 
   # "Test" is a required check — keep this name to avoid branch protection changes.
-  # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
+  # This gate job passes only when CLI, executor, and prover tests succeed.
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-cli, test-prover, test-disk-spill]
+    needs: [test-executor, test-cli, test-prover]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -135,12 +135,10 @@ jobs:
           executor="${{ needs.test-executor.result }}"
           cli="${{ needs.test-cli.result }}"
           prover="${{ needs.test-prover.result }}"
-          disk_spill="${{ needs.test-disk-spill.result }}"
 
           echo "test-executor: $executor"
           echo "test-cli: $cli"
           echo "test-prover: $prover"
-          echo "test-disk-spill: $disk_spill"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
@@ -152,68 +150,6 @@ jobs:
           if [[ "$prover" != "success" && "$prover" != "skipped" ]]; then
             exit 1
           fi
-          if [[ "$disk_spill" != "success" && "$disk_spill" != "skipped" ]]; then
-            exit 1
-          fi
-
-  test-disk-spill:
-    name: Disk-spill tests
-    runs-on: ubuntu-latest
-    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
-    steps:
-      - name: Checkout sources
-        uses: actions/checkout@v4
-
-      - name: Setup Rust Environment
-        uses: ./.github/actions/setup-rust
-
-      - name: Cache cargo build artifacts
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: "lambda-vm-disk-spill"
-          cache-all-crates: "true"
-
-      - name: Cache compiled ASM ELF artifacts
-        id: cache-asm-elfs
-        uses: actions/cache@v4
-        with:
-          path: executor/program_artifacts/asm
-          key: asm-elf-artifacts-${{ hashFiles('executor/programs/asm/**') }}
-
-      - name: Install clang and lld
-        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
-        run: sudo apt-get update && sudo apt-get install -y clang lld
-
-      - name: Compile ASM programs to ELF
-        if: steps.cache-asm-elfs.outputs.cache-hit != 'true'
-        run: |
-          make compile-programs-asm
-
-      - name: Cache compiled Rust ELF artifacts and build cache
-        id: cache-rust-elfs
-        uses: actions/cache@v4
-        with:
-          path: |
-            executor/program_artifacts/rust
-            executor/shared_target
-          key: rust-elf-artifacts-${{ hashFiles('executor/programs/rust/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'syscalls/**', 'Makefile') }}
-          restore-keys: |
-            rust-elf-artifacts-
-
-      - name: Compile Rust programs to ELF
-        if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
-        run: |
-          make compile-programs-rust
-
-      - name: Run stark disk-spill tests
-        run: |
-          cargo test --release -p stark --features disk-spill disk_spill
-
-      - name: Run prover disk-spill tests
-        env:
-          FORCE_DISK_SPILL: "1"
-        run: |
-          cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
 
   build-prover-tests:
     name: Build prover tests

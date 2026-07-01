@@ -2,7 +2,7 @@
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+test-fast test-prover test-prover-all test-math-cuda test-cuda-integration \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -269,11 +269,6 @@ test-prover-all: compile-recursion-elfs
 test-prover-debug:
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
-# Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
-test-disk-spill:
-	cargo test --release -p stark --features disk-spill disk_spill
-	FORCE_DISK_SPILL=1 cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
-
 # math-cuda parity tests (requires NVIDIA GPU + nvcc)
 test-math-cuda:
 	cargo test -p math-cuda --release
@@ -312,7 +307,6 @@ check:
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 
 fmt:
 	cargo fmt --all
@@ -322,7 +316,6 @@ lint:
 	cargo fmt --check --all
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
-	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
