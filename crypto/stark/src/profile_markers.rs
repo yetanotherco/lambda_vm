@@ -12,10 +12,11 @@
 //! `std::time::Instant::now()`, which panics on the guest target.
 
 pub const STEP_DECODE_DONE: u32 = 1;
-pub const STEP_REPLAY_ROUNDS_AFTER_ROUND_1: u32 = 2;
-pub const STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL: u32 = 3;
-pub const STEP_VERIFY_FRI: u32 = 4;
-pub const STEP_VERIFY_TRACE_AND_COMPOSITION_OPENINGS: u32 = 5;
+pub const STEP_AIRS_AND_BUS_BALANCE_DONE: u32 = 2;
+pub const STEP_REPLAY_ROUNDS_AFTER_ROUND_1: u32 = 3;
+pub const STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL: u32 = 4;
+pub const STEP_VERIFY_FRI: u32 = 5;
+pub const STEP_VERIFY_TRACE_AND_COMPOSITION_OPENINGS: u32 = 6;
 
 #[inline(always)]
 pub fn step_marker<const N: u32>() {

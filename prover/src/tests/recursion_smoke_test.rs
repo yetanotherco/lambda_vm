@@ -200,13 +200,14 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
 /// value. `run_profile` buckets cycles by the highest marker observed so far
 /// (`decode_step_marker` — a missing marker just means that bucket stays at 0
 /// cycles, no substring matching or symbol table needed).
-const STEP_LABELS: [&str; 6] = [
-    "0. setup (alloc, pre-decode)",
-    "1. decode (postcard decode -> Elf::load/VmAirs::new/transcript setup)",
-    "2. step 1: replay_rounds_after_round_1",
-    "3. step 2: verify_claimed_composition_polynomial",
-    "4. step 3: verify_fri",
-    "5. step 4: verify_trace_and_composition_openings (+ wrap-up)",
+const STEP_LABELS: [&str; 7] = [
+    "0. setup (alloc init + postcard decode)",
+    "1. airs_and_bus_balance (Elf::load/VmAirs::new preprocessed FFT+Merkle/bus balance)",
+    "2. multi_verify setup (transcript replay phase A/B, per-table fork)",
+    "3. step 1: replay_rounds_after_round_1",
+    "4. step 2: verify_claimed_composition_polynomial",
+    "5. step 3: verify_fri",
+    "6. step 4: verify_trace_and_composition_openings (+ wrap-up)",
 ];
 
 /// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
@@ -214,46 +215,69 @@ fn blowup8() -> stark::proof::options::ProofOptions {
     crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
 }
 
-/// Print the top-25 functions by cycles, folding the PC histogram by symbol.
+/// Short per-step tag for the function table, keyed by the same bucket index
+/// used in `STEP_LABELS`/`buckets`.
+fn step_tag(bucket: u8) -> &'static str {
+    match bucket {
+        0 => "setup",
+        1 => "airs_bus_balance",
+        2 => "multi_verify_setup",
+        3 => "step1:replay",
+        4 => "step2:claimed",
+        5 => "step3:fri",
+        6 => "step4:openings",
+        _ => "?",
+    }
+}
+
+/// Print the top-25 `(function, step)` pairs by cycles, folding the PC
+/// histogram by symbol and by the verifier step active when each cycle ran.
+/// This is what lets you see e.g. how much of `step4:openings` is spent in
+/// `keccak` at a glance, instead of only the function's total across all steps.
 fn print_function_table(
     symbols: &executor::elf::SymbolTable,
-    pc_hist: std::collections::HashMap<u64, u64>,
+    pc_hist: std::collections::HashMap<(u64, u8), u64>,
     total_cycles: u64,
 ) {
-    let mut by_function: std::collections::HashMap<String, (u64, u64)> =
+    let mut by_function_step: std::collections::HashMap<(String, u8), (u64, u64)> =
         std::collections::HashMap::new();
-    for (pc, count) in &pc_hist {
-        let entry = by_function
-            .entry(resolve_pc(symbols, *pc))
+    let mut unique_pcs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for ((pc, bucket), count) in &pc_hist {
+        unique_pcs.insert(*pc);
+        let entry = by_function_step
+            .entry((resolve_pc(symbols, *pc), *bucket))
             .or_insert((0, 0));
         entry.0 += *count; // cycles
-        entry.1 += 1; // distinct PCs folded into this function
+        entry.1 += 1; // distinct PCs folded into this (function, step)
     }
-    let mut fn_entries: Vec<(String, (u64, u64))> = by_function.into_iter().collect();
-    fn_entries.sort_unstable_by_key(|(_name, (cycles, _pcs))| std::cmp::Reverse(*cycles));
+    let mut fn_entries: Vec<((String, u8), (u64, u64))> = by_function_step.into_iter().collect();
+    fn_entries.sort_unstable_by_key(|(_key, (cycles, _pcs))| std::cmp::Reverse(*cycles));
 
     let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
-    eprintln!("  Unique PCs   : {}", pc_hist.len());
+    eprintln!("  Unique PCs   : {}", unique_pcs.len());
     eprintln!();
-    eprintln!("  Top 25 functions by cycle count (aggregated over their PCs):");
-    eprintln!("  rank          cycles        %    cum %    PCs  function");
+    eprintln!("  Top 25 (function, step) pairs by cycle count (aggregated over their PCs):");
+    eprintln!(
+        "  rank          cycles        %    cum %    PCs  step              function"
+    );
     let mut fn_cumulative: u64 = 0;
-    for (rank, (name, (cycles, pcs))) in fn_entries.iter().take(25).enumerate() {
+    for (rank, ((name, bucket), (cycles, pcs))) in fn_entries.iter().take(25).enumerate() {
         fn_cumulative += cycles;
         eprintln!(
-            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  {:>5}  {}",
+            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  {:>5}  {:<16}  {}",
             rank + 1,
             cycles,
             pct(*cycles),
             pct(fn_cumulative),
             pcs,
+            step_tag(*bucket),
             name,
         );
     }
 }
 
 /// Print the monotonic per-verifier-step cycle bucketing (`buckets[0]` = setup).
-fn print_step_breakdown(buckets: &[u64; 6], total_cycles: u64) {
+fn print_step_breakdown(buckets: &[u64; 7], total_cycles: u64) {
     eprintln!();
     eprintln!("  Per-step cycle breakdown (monotonic state machine):");
     eprintln!("  {:<70}  {:>14}  {:>7}", "bucket", "cycles", "%");
@@ -284,8 +308,8 @@ fn run_profile(
     let instructions = executor::vm::execution::InstructionCache::new(&program.data)
         .expect("instruction cache build failed");
 
-    let mut pc_hist: HashMap<u64, u64> = HashMap::new();
-    let mut buckets = [0u64; 6];
+    let mut pc_hist: HashMap<(u64, u8), u64> = HashMap::new();
+    let mut buckets = [0u64; 7];
     let bucket = std::cell::Cell::new(0u8);
     let unique = std::cell::Cell::new(0usize);
 
@@ -302,17 +326,17 @@ fn run_profile(
         |log| {
             let pc = log.current_pc;
 
-            if detailed {
-                *pc_hist.entry(pc).or_insert(0) += 1;
-                unique.set(pc_hist.len());
-            }
-
             if let Some(marker) = executor::vm::execution::decode_step_marker(&instructions, pc)
                 && bucket.get() < marker as u8
             {
                 bucket.set(marker as u8);
             }
             buckets[bucket.get() as usize] += 1;
+
+            if detailed {
+                *pc_hist.entry((pc, bucket.get())).or_insert(0) += 1;
+                unique.set(pc_hist.len());
+            }
 
             ControlFlow::Continue(())
         },
@@ -503,10 +527,11 @@ fn test_recursion_execute_1query() {
 ///
 /// `multi_verify` re-runs `replay_rounds_after_round_1 -> step_2 -> step_3 ->
 /// step_4` once per AIR table (see `crypto/stark/src/verifier.rs`), so the
-/// full marker sequence isn't monotonic overall — it's `STEP_DECODE_DONE`
-/// once, followed by N repetitions of the `2,3,4,5` cycle (one per table).
-/// A transition outside `{1->2, 2->3, 3->4, 4->5, 5->2}` means the marker
-/// convention broke — wrong immediate decoded, or a stale/mismatched build.
+/// full marker sequence isn't monotonic overall — it's `STEP_DECODE_DONE ->
+/// STEP_AIRS_AND_BUS_BALANCE_DONE` once each, followed by N repetitions of
+/// the `3,4,5,6` cycle (one per table). A transition outside
+/// `{1->2, 2->3, 3->4, 4->5, 5->6, 6->3}` means the marker convention broke —
+/// wrong immediate decoded, or a stale/mismatched build.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_step_markers_observed_in_order() {
@@ -516,6 +541,7 @@ fn test_recursion_step_markers_observed_in_order() {
         .expect("instruction cache build failed");
 
     let decode_done = stark::profile_markers::STEP_DECODE_DONE;
+    let airs_ready = stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE;
     let replay = stark::profile_markers::STEP_REPLAY_ROUNDS_AFTER_ROUND_1;
     let claimed = stark::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL;
     let fri = stark::profile_markers::STEP_VERIFY_FRI;
@@ -531,7 +557,8 @@ fn test_recursion_step_markers_observed_in_order() {
             {
                 let valid_transition = match last_marker {
                     None => marker == decode_done,
-                    Some(last) if last == decode_done => marker == replay,
+                    Some(last) if last == decode_done => marker == airs_ready,
+                    Some(last) if last == airs_ready => marker == replay,
                     Some(last) if last == replay => marker == claimed,
                     Some(last) if last == claimed => marker == fri,
                     Some(last) if last == fri => marker == openings,
@@ -550,7 +577,7 @@ fn test_recursion_step_markers_observed_in_order() {
         |_, _, _| {},
     );
 
-    for step in [decode_done, replay, claimed, fri, openings] {
+    for step in [decode_done, airs_ready, replay, claimed, fri, openings] {
         assert!(seen.contains(&step), "marker {step} was never observed");
     }
 }

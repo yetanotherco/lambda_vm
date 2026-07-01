@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Format the recursion-guest per-function profile as a Markdown PR comment.
 
-`test_recursion_pc_histogram` prints a per-function summary table: the cycles
-folded over each function's PCs, computed across the *full* histogram — the view
-that shows where the cycles actually go. We parse that table and render it as
-Markdown.
+`test_recursion_profile_1query`/`_multiquery` print a per-(function, step)
+summary table: the cycles folded over each function's PCs *within a given
+verifier step*, computed across the full histogram — the view that shows both
+where the cycles go and which verifier step they belong to (e.g. how much of
+`step4:openings` is `keccak`). We parse that table and render it as Markdown.
 
-    Top 25 functions by cycle count (aggregated over their PCs):
-    rank          cycles        %    cum %    PCs  function
-       1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
+    Top 25 (function, step) pairs by cycle count (aggregated over their PCs):
+    rank          cycles        %    cum %    PCs  step              function
+       1         5335072   24.95%   24.95%     72  decode            <...>::visit_seq::<...>
 
 Reads the test's captured output from argv[1]; writes the Markdown body to
 argv[2] (or stdout).
@@ -17,11 +18,11 @@ argv[2] (or stdout).
 import re
 import sys
 
-# A per-function summary row: rank, cycles, pct%, cum%, pcs, function.
+# A per-(function, step) summary row: rank, cycles, pct%, cum%, pcs, step, function.
 FN_ROW = re.compile(
-    r"^\s*\d+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+(\d+)\s+(.*\S)\s*$"
+    r"^\s*\d+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+(\d+)\s+(\S+)\s+(.*\S)\s*$"
 )
-FN_TABLE_START = re.compile(r"Top \d+ functions by cycle count")
+FN_TABLE_START = re.compile(r"Top \d+ \(function, step\) pairs by cycle count")
 # The "====" rule the test prints right after the (now sole) function table.
 TABLE_END = re.compile(r"^=+\s*$")
 TOTAL_CYCLES = re.compile(r"Total cycles\s*:\s*(\d+)")
@@ -53,7 +54,8 @@ def parse(text):
                     "pct": m.group(2),
                     "cum": m.group(3),
                     "pcs": int(m.group(4)),
-                    "fn": m.group(5),
+                    "step": m.group(5),
+                    "fn": m.group(6),
                 }
             )
     return total_cycles, unique_pcs, exec_time, rows
@@ -80,20 +82,22 @@ def render(total_cycles, unique_pcs, exec_time, rows, title="Recursion guest pro
             body += f" · **Exec time:** {exec_time}"
         body += "\n\n"
 
-    body += f"#### Top {len(rows)} functions by cycles (folded over their PCs)\n\n"
-    body += "| Rank | Cycles | % | Cum % | PCs | Function |\n"
-    body += "|-----:|-------:|--:|------:|----:|----------|\n"
+    body += f"#### Top {len(rows)} (function, step) pairs by cycles (folded over their PCs)\n\n"
+    body += "| Rank | Cycles | % | Cum % | PCs | Step | Function |\n"
+    body += "|-----:|-------:|--:|------:|----:|------|----------|\n"
     for i, r in enumerate(rows, 1):
         body += (
             f"| {i} | {r['cycles']:,} | {r['pct']}% | {r['cum']}% | "
-            f"{r['pcs']} | `{short(r['fn'])}` |\n"
+            f"{r['pcs']} | `{r['step']}` | `{short(r['fn'])}` |\n"
         )
 
     last_cum = rows[-1]["cum"]
     body += (
-        f"\n<sub>Each function's cycles are summed over all its program counters "
-        f"across the full histogram; the top {len(rows)} cover {last_cum}% of total "
-        f"cycles. Percentages are of total cycles.</sub>\n"
+        f"\n<sub>Each (function, step) pair's cycles are summed over all its program "
+        f"counters within that verifier step, across the full histogram; the top "
+        f"{len(rows)} cover {last_cum}% of total cycles. Percentages are of total "
+        f"cycles. See the workflow log for the full per-step cycle breakdown "
+        f"table.</sub>\n"
     )
     return body
 
