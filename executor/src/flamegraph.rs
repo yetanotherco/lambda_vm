@@ -30,53 +30,65 @@ pub enum FlamegraphDriveError {
     Flamegraph(#[from] FlamegraphError),
 }
 
+/// One node of the call-graph trie. `addr` is the function-entry address of
+/// the frame this node represents; `count` is the number of instructions
+/// attributed directly to this exact call-stack state.
+struct TrieNode {
+    parent: u32,
+    addr: u64,
+    count: u64,
+    children: HashMap<u64, u32>,
+}
+
+/// Root node index. Its own `parent` field is a self-loop sentinel and is
+/// never followed — `pop` refuses to move past it.
+const ROOT: u32 = 0;
+
 /// Generates flamegraph data by tracking function calls during execution.
+///
+/// Instruction counts are stored in a call-graph trie keyed by address, not a
+/// demangled string per stack — pushing/popping/counting are all O(1)
+/// pointer/hashmap operations independent of call-stack depth. Symbol
+/// resolution and demangling happen once per unique address, only when
+/// `write_folded` walks the trie.
 pub struct FlamegraphGenerator {
-    /// Symbol table for address-to-name resolution
+    /// Symbol table for address-to-name resolution.
     symbols: SymbolTable,
-    /// Current call stack (function entry addresses)
-    call_stack: Vec<u64>,
-    /// Instruction counts per stack state: "main;foo;bar" -> count
-    stack_counts: HashMap<String, u64>,
-    /// Key stacks by raw hex address instead of resolving through the ELF
-    /// symtab (pairs with scripts/enrich_flamegraph.py). Fixed at
-    /// construction, since the stack key is formatted on every log.
-    raw: bool,
+    /// Arena of trie nodes; index 0 is the root (the entry-point frame).
+    nodes: Vec<TrieNode>,
+    /// Index into `nodes` of the current call-stack leaf.
+    current: u32,
+    /// Sum of `count` across all nodes, tracked incrementally.
+    total_counted: u64,
 }
 
 impl FlamegraphGenerator {
     /// Create a new flamegraph generator with the given symbol table.
     pub fn new(symbols: SymbolTable, entry_point: u64) -> Self {
-        Self::with_mode(symbols, entry_point, false)
-    }
-
-    /// Like `new`, but keys folded stacks by raw hex address instead of
-    /// resolving through the symtab.
-    pub fn new_raw(symbols: SymbolTable, entry_point: u64) -> Self {
-        Self::with_mode(symbols, entry_point, true)
-    }
-
-    fn with_mode(symbols: SymbolTable, entry_point: u64, raw: bool) -> Self {
         Self {
             symbols,
-            call_stack: vec![entry_point], // Start with entry point on stack
-            stack_counts: HashMap::new(),
-            raw,
+            nodes: vec![TrieNode {
+                parent: ROOT,
+                addr: entry_point,
+                count: 0,
+                children: HashMap::new(),
+            }],
+            current: ROOT,
+            total_counted: 0,
         }
     }
 
-    /// Process a batch of execution logs, updating call stack and instruction counts.
+    /// Process a batch of execution logs, updating the call stack and
+    /// instruction counts.
     pub fn process_logs(
         &mut self,
         logs: &[Log],
         instructions: &InstructionCache,
     ) -> Result<(), FlamegraphError> {
         for log in logs {
-            // Count this instruction under the current stack
-            let stack_key = self.format_stack();
-            *self.stack_counts.entry(stack_key).or_insert(0) += 1;
+            self.nodes[self.current as usize].count += 1;
+            self.total_counted += 1;
 
-            // Update call stack based on instruction type
             let instruction = instructions
                 .get(log.current_pc)
                 .copied()
@@ -84,29 +96,6 @@ impl FlamegraphGenerator {
             self.update_stack(log, instruction);
         }
         Ok(())
-    }
-
-    /// Format the current call stack as a semicolon-separated string.
-    fn format_stack(&self) -> String {
-        if self.call_stack.is_empty() {
-            return "<root>".to_string();
-        }
-
-        self.call_stack
-            .iter()
-            .map(|&addr| self.format_frame(addr))
-            .collect::<Vec<_>>()
-            .join(";")
-    }
-
-    /// Format one frame: a raw hex address, or the resolved (demangled)
-    /// function name, depending on `self.raw`.
-    fn format_frame(&self, address: u64) -> String {
-        if self.raw {
-            format!("0x{:x}", address)
-        } else {
-            self.resolve_address(address)
-        }
     }
 
     /// Resolve an address to a function name, or hex address if unknown.
@@ -117,28 +106,46 @@ impl FlamegraphGenerator {
             .unwrap_or_else(|| format!("0x{:x}", address))
     }
 
+    /// Descend to (or create) the child of the current node keyed by `addr`.
+    fn push(&mut self, addr: u64) {
+        let current = self.current as usize;
+        if let Some(&child) = self.nodes[current].children.get(&addr) {
+            self.current = child;
+            return;
+        }
+        let new_idx = self.nodes.len() as u32;
+        self.nodes.push(TrieNode {
+            parent: self.current,
+            addr,
+            count: 0,
+            children: HashMap::new(),
+        });
+        self.nodes[current].children.insert(addr, new_idx);
+        self.current = new_idx;
+    }
+
+    /// Move to the parent node. Refuses to pop past the root.
+    fn pop(&mut self) {
+        if self.current != ROOT {
+            self.current = self.nodes[self.current as usize].parent;
+        }
+    }
+
     /// Update the call stack based on the instruction type.
     fn update_stack(&mut self, log: &Log, instruction: Instruction) {
         match instruction {
             // Function CALL: JAL with dst=ra (register 1)
             // Saves return address to ra and jumps to offset
-            Instruction::JumpAndLink { dst: 1, .. } => {
-                self.call_stack.push(log.next_pc);
-            }
+            Instruction::JumpAndLink { dst: 1, .. } => self.push(log.next_pc),
 
             // Function CALL: JALR with dst=ra (register 1)
             // Indirect call through register
-            Instruction::JumpAndLinkRegister { dst: 1, .. } => {
-                self.call_stack.push(log.next_pc);
-            }
+            Instruction::JumpAndLinkRegister { dst: 1, .. } => self.push(log.next_pc),
 
             // Function RETURN: JALR with base=ra (register 1), dst=zero (register 0)
             // This is the standard "ret" instruction (jalr x0, ra, 0)
-            // Only pop if we have more than the root frame to prevent stack underflow
             Instruction::JumpAndLinkRegister { base, dst, .. } if base == 1 && dst == 0 => {
-                if self.call_stack.len() > 1 {
-                    self.call_stack.pop();
-                }
+                self.pop();
             }
 
             // JAL/JALR with dst=zero doesn't save a return address. This
@@ -173,33 +180,118 @@ impl FlamegraphGenerator {
         if same_function {
             return;
         }
-        if self.call_stack.len() > 1 {
-            self.call_stack.pop();
-        }
-        self.call_stack.push(log.next_pc);
+        self.pop();
+        self.push(log.next_pc);
     }
 
     /// Write the folded stack output to a writer.
     ///
     /// Output format: `stack;frame;names count`
     /// Example: `main;quicksort;partition 12345`
+    ///
+    /// Symbol resolution/demangling happens here, once per unique address
+    /// (memoized), rather than per instruction.
     pub fn write_folded<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        // Sort by stack path for deterministic output
-        let mut stacks: Vec<_> = self.stack_counts.iter().collect();
-        stacks.sort_by_key(|(k, _)| k.as_str());
+        let mut name_cache: HashMap<u64, String> = HashMap::new();
+        let mut path = Vec::new();
+        // Keyed by the *resolved* stack string, not by trie node: distinct
+        // nodes (e.g. two different call-site addresses inside the same
+        // function) can resolve to the same name path and must be summed
+        // into one line, matching the pre-trie String-keyed behavior.
+        let mut counts: HashMap<String, u64> = HashMap::new();
+        self.collect(ROOT, &mut path, &mut name_cache, &mut counts);
 
-        for (stack, count) in stacks {
-            if !stack.is_empty() {
-                writeln!(writer, "{} {}", stack, count)?;
-            }
+        // Sort by stack path for deterministic output.
+        let mut entries: Vec<_> = counts.into_iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (stack, count) in entries {
+            writeln!(writer, "{} {}", stack, count)?;
         }
 
         Ok(())
     }
 
-    /// Get the total number of instructions processed.
+    fn collect(
+        &self,
+        node_idx: u32,
+        path: &mut Vec<u64>,
+        name_cache: &mut HashMap<u64, String>,
+        counts: &mut HashMap<String, u64>,
+    ) {
+        let node = &self.nodes[node_idx as usize];
+        path.push(node.addr);
+
+        if node.count > 0 {
+            let stack = path
+                .iter()
+                .map(|addr| {
+                    name_cache
+                        .entry(*addr)
+                        .or_insert_with(|| self.resolve_address(*addr))
+                        .clone()
+                })
+                .collect::<Vec<_>>()
+                .join(";");
+            *counts.entry(stack).or_insert(0) += node.count;
+        }
+
+        for &child in node.children.values() {
+            self.collect(child, path, name_cache, counts);
+        }
+
+        path.pop();
+    }
+
+    /// Get the total number of instructions counted so far.
     pub fn total_instructions(&self) -> u64 {
-        self.stack_counts.values().sum()
+        self.total_counted
+    }
+
+    /// Raw (unresolved) call-stack address paths and their counts — one
+    /// entry per counted trie node, root-to-leaf.
+    pub fn raw_stacks(&self) -> Vec<(Vec<u64>, u64)> {
+        let mut path = Vec::new();
+        let mut out = Vec::new();
+        self.collect_raw(ROOT, &mut path, &mut out);
+        out
+    }
+
+    /// Write folded stack output keyed by raw hex addresses instead of
+    /// resolved names (pairs with scripts/enrich_flamegraph.py).
+    pub fn write_folded_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let mut entries: Vec<(String, u64)> = self
+            .raw_stacks()
+            .into_iter()
+            .map(|(addrs, count)| {
+                let stack = addrs
+                    .iter()
+                    .map(|addr| format!("0x{addr:x}"))
+                    .collect::<Vec<_>>()
+                    .join(";");
+                (stack, count)
+            })
+            .collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+
+        for (stack, count) in entries {
+            writeln!(writer, "{stack} {count}")?;
+        }
+        Ok(())
+    }
+
+    fn collect_raw(&self, node_idx: u32, path: &mut Vec<u64>, out: &mut Vec<(Vec<u64>, u64)>) {
+        let node = &self.nodes[node_idx as usize];
+        path.push(node.addr);
+
+        if node.count > 0 {
+            out.push((path.clone(), node.count));
+        }
+        for &child in node.children.values() {
+            self.collect_raw(child, path, out);
+        }
+
+        path.pop();
     }
 }
 
@@ -245,9 +337,6 @@ pub struct FlamegraphRunOptions {
     /// Stop once at least this many cycles have been processed. `None` runs
     /// to completion.
     pub cycle_budget: Option<u64>,
-    /// Key folded stacks by raw hex address instead of resolving through
-    /// the symtab.
-    pub raw: bool,
 }
 
 /// Reusable execute+flamegraph path: build the `SymbolTable`, construct the
@@ -265,11 +354,7 @@ pub fn run_with_flamegraph(
     on_chunk: impl FnMut(u64, &FlamegraphGenerator),
 ) -> Result<(FlamegraphGenerator, u64), FlamegraphDriveError> {
     let symbols = SymbolTable::parse(elf_bytes);
-    let mut generator = if options.raw {
-        FlamegraphGenerator::new_raw(symbols, program.entry_point)
-    } else {
-        FlamegraphGenerator::new(symbols, program.entry_point)
-    };
+    let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
     let mut executor = Executor::new(program, private_inputs)?;
     let total_cycles = drive_with_flamegraph(
         &mut executor,
