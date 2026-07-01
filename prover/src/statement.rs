@@ -123,15 +123,19 @@ const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V1";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V1";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before
-/// Phase A: the ELF (so the global proof is program-bound) and the epoch count
-/// (so a global proof from a run with a different number of epochs cannot be
-/// spliced in). Prove and verify must call this with identical arguments.
+/// Phase A: the ELF (so the global proof is program-bound), the epoch count (so a
+/// global proof from a run with a different number of epochs cannot be spliced in),
+/// and the private-input page count (so the global proof's AIR layout — which touched
+/// pages are built non-preprocessed — is canonically pinned, like the monolithic
+/// path's `absorb_statement`). Prove and verify must call this with identical arguments.
 pub(crate) fn absorb_continuation_global_statement(
     t: &mut impl IsTranscript<E>,
     elf_bytes: &[u8],
     num_epochs: usize,
+    num_private_input_pages: usize,
 ) {
     t.append_bytes(CONTINUATION_GLOBAL_TAG);
     t.append_bytes(&elf_digest(elf_bytes));
     t.append_bytes(&(num_epochs as u64).to_le_bytes());
+    t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
 }

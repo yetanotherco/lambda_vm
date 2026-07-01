@@ -5,9 +5,13 @@
 //! and proves one cross-epoch "global memory" LogUp that links every epoch's
 //! `fini` to the next epoch's `init` (so `fini(epoch i) == init(epoch i+1)`).
 //!
-//! The global proof's genesis anchor is bound to the ELF: the verifier
-//! recomputes the per-page preprocessed init commitment from the ELF in
-//! `verify_global`, so the starting memory cannot be prover-supplied.
+//! The global proof's genesis anchor is bound to the ELF: for ELF/runtime pages the
+//! verifier recomputes the per-page preprocessed init commitment from the ELF in
+//! `verify_global`, so the starting memory cannot be prover-supplied. Private-input
+//! pages are the one exception — their genesis is committed (non-preprocessed) and
+//! kept private, exactly as the monolithic prover does, with correctness enforced by
+//! the GlobalMemory bus rather than ELF recomputation (so the verifier never sees the
+//! raw private input).
 //!
 //! The local-to-global columns are range-checked in the epoch proof (which
 //! carries the BITWISE provider): values are bytes, and the cross-epoch-only
@@ -98,9 +102,18 @@ fn epoch_transcript(
 
 /// Fresh transcript seeded with the global proof's statement (ELF + epoch count).
 /// `prove_global` and `verify_global` both seed via this so their challenges match.
-fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E> {
+fn global_transcript(
+    elf_bytes: &[u8],
+    num_epochs: usize,
+    num_private_input_pages: usize,
+) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(&mut transcript, elf_bytes, num_epochs);
+    absorb_continuation_global_statement(
+        &mut transcript,
+        elf_bytes,
+        num_epochs,
+        num_private_input_pages,
+    );
     transcript
 }
 
@@ -173,11 +186,17 @@ fn l2g_memory_air(
 /// GLOBAL_MEMORY AIR for one touched page (the cross-epoch analog of PAGE).
 ///
 /// It sends each cell's genesis init and receives its finalization on the
-/// GlobalMemory bus. The genesis `init` column is preprocessed, so the verifier
-/// recomputes its commitment from the ELF — exactly PAGE's binding mechanism:
-/// ELF-data pages via `page::compute_precomputed_commitment`, zero-init pages
-/// (stack/heap) via the static zero-page commitment. The prover cannot choose
-/// the genesis values.
+/// GlobalMemory bus. For ELF/runtime pages the genesis `init` column is
+/// preprocessed, so the verifier recomputes its commitment from the ELF — exactly
+/// PAGE's binding mechanism: ELF-data pages via `page::compute_precomputed_commitment`,
+/// zero-init pages (stack/heap) via the static zero-page commitment. The prover
+/// cannot choose those genesis values.
+///
+/// Private-input pages are built NON-preprocessed (mirrors the monolithic PAGE in
+/// `VmAirs::new`): INIT is a committed main-trace column the verifier never recomputes,
+/// so the verifier never sees the private genesis bytes. Correctness is enforced by
+/// the GlobalMemory bus (the genesis token must telescope into the epochs' reads), not
+/// by recomputation from the ELF.
 fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
@@ -191,6 +210,9 @@ fn global_memory_air(
         1,
         empty_constraints(),
     );
+    if config.is_private_input {
+        return air;
+    }
     let commitment = if config.init_values.is_some() {
         page::compute_precomputed_commitment(config, opts)
     } else {
@@ -199,23 +221,37 @@ fn global_memory_air(
     air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
 }
 
-/// The touched pages (sorted) and their ELF-derived genesis configs, rebuilt
-/// identically by prover and verifier from the ELF + private input. Each cell
-/// the program touched lives on one of these pages; a page in the ELF/input
-/// image carries its bytes as `init`, every other (stack/heap) page is zero-init.
+/// The touched pages (sorted) and their genesis configs, for the VERIFIER: built from
+/// the ELF alone (no private bytes). Each cell the program touched lives on one of
+/// these pages; an ELF data page carries its bytes as `init`, every other (stack/heap)
+/// page is zero-init.
+///
+/// Private-input pages are built NON-preprocessed, so the verifier never recomputes
+/// their genesis from the ELF and never needs the raw private bytes. They are
+/// identified EXACTLY as the monolithic verifier does — the first
+/// `num_private_input_pages` pages from `PRIVATE_INPUT_START_INDEX` (see
+/// [`is_private_input_page`]).
 fn global_memory_configs(
     boundaries: &[Vec<CellBoundary>],
     elf: &Elf,
-    private_inputs: &[u8],
+    num_private_input_pages: usize,
 ) -> Vec<PageConfig> {
-    let image = build_initial_image_paged(elf, private_inputs);
+    // No private bytes: the verifier only builds the AIRs, and private-input pages are
+    // non-preprocessed (their INIT is never recomputed).
+    let image = build_initial_image_paged(elf, &[]);
     let init_page_data = build_init_page_data(&image);
-    global_memory_configs_from_init_page_data(boundaries, &init_page_data)
+    global_memory_configs_from_init_page_data(boundaries, &init_page_data, num_private_input_pages)
 }
 
+/// Shared genesis-config builder for prover and verifier. `init_page_data` holds each
+/// page's genesis bytes (ELF + private input on the prover side; ELF only on the verifier
+/// side). Private-input pages are built NON-preprocessed: on the prover their committed
+/// INIT column carries the genesis bytes from `init_page_data`; on the verifier the AIR
+/// is non-preprocessed so those bytes are irrelevant.
 fn global_memory_configs_from_init_page_data(
     boundaries: &[Vec<CellBoundary>],
     init_page_data: &HashMap<u64, Vec<u8>>,
+    num_private_input_pages: usize,
 ) -> Vec<PageConfig> {
     let touched_pages: std::collections::BTreeSet<u64> = boundaries
         .iter()
@@ -224,11 +260,46 @@ fn global_memory_configs_from_init_page_data(
         .collect();
     touched_pages
         .into_iter()
-        .map(|page_base| match init_page_data.get(&page_base) {
-            Some(data) => PageConfig::with_data(page_base, data.clone()),
-            None => PageConfig::zero_init(page_base),
+        .map(|page_base| {
+            if is_private_input_page(page_base, num_private_input_pages) {
+                let data = init_page_data.get(&page_base).cloned().unwrap_or_default();
+                PageConfig::with_private_input(page_base, data)
+            } else {
+                match init_page_data.get(&page_base) {
+                    Some(data) => PageConfig::with_data(page_base, data.clone()),
+                    None => PageConfig::zero_init(page_base),
+                }
+            }
         })
         .collect()
+}
+
+/// Whether `page_base` is one of the first `num_private_input_pages` pages starting at
+/// `PRIVATE_INPUT_START_INDEX` — the page-aligned span private input actually occupies.
+/// This matches the monolithic verifier's `page_configs_from_elf_and_runtime` exactly,
+/// so the continuation classifies private pages identically to the monolithic path and
+/// only ever marks pages that private input actually occupies. Classifying by the count
+/// (not the raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) also keeps this sound
+/// regardless of whether the region end is page-aligned: a byte-range test would mark a
+/// partial end page private even with no private input, dropping the ELF genesis binding
+/// for any program data in that page's tail beyond the region.
+fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    let page_size = page::DEFAULT_PAGE_SIZE as u64;
+    let end = PRIVATE_INPUT_START_INDEX + num_private_input_pages as u64 * page_size;
+    (PRIVATE_INPUT_START_INDEX..end).contains(&page_base)
+}
+
+/// Number of pages the private input occupies, starting at `PRIVATE_INPUT_START_INDEX`.
+/// Mirrors the monolithic prover (`from_elf_and_logs`): the wire format is a 4-byte
+/// length prefix plus the data, and `PRIVATE_INPUT_START_INDEX` is page-aligned, so the
+/// span is `ceil((4 + len) / page_size)` consecutive pages (0 when there is no input).
+fn private_input_page_count(private_inputs: &[u8]) -> usize {
+    if private_inputs.is_empty() {
+        return 0;
+    }
+    let total_bytes = 4 + private_inputs.len();
+    total_bytes.div_ceil(page::DEFAULT_PAGE_SIZE)
 }
 
 /// Per-epoch register state and label.
@@ -274,8 +345,14 @@ struct EpochProof {
 }
 
 /// A self-contained continuation proof: the per-epoch proofs in execution order,
-/// the one cross-epoch global-memory proof, and the private inputs (needed to
-/// rebuild the genesis image — bound by the global proof's genesis-from-ELF check).
+/// the one cross-epoch global-memory proof, and the number of private-input pages.
+///
+/// The raw private input is NOT carried (mirrors `VmProof.num_private_input_pages`):
+/// private-input genesis lives in committed, bus-enforced GLOBAL_MEMORY columns the
+/// verifier never recomputes, so the bytes stay private. The count selects which touched
+/// pages are built non-preprocessed and is bound into the global proof's Fiat-Shamir
+/// statement (like the monolithic path), so any wrong value diverges the verifier's
+/// challenges and is rejected; it is also bound-checked up front.
 ///
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
 /// serde, so it round-trips through `bincode` exactly like a monolithic `VmProof`.
@@ -283,7 +360,7 @@ struct EpochProof {
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
-    private_inputs: Vec<u8>,
+    num_private_input_pages: usize,
 }
 
 impl ContinuationProof {
@@ -530,6 +607,7 @@ fn prove_global(
     boundaries: &[Vec<CellBoundary>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
+    num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> Result<MultiProof<F, E, ()>, Error> {
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
@@ -546,7 +624,11 @@ fn prove_global(
         }
     }
 
-    let gm_configs = global_memory_configs_from_init_page_data(boundaries, init_page_data);
+    let gm_configs = global_memory_configs_from_init_page_data(
+        boundaries,
+        init_page_data,
+        num_private_input_pages,
+    );
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
@@ -577,7 +659,7 @@ fn prove_global(
 
     Prover::multi_prove(
         pairs,
-        &mut global_transcript(elf_bytes, boundaries.len()),
+        &mut global_transcript(elf_bytes, boundaries.len(), num_private_input_pages),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -589,7 +671,7 @@ fn verify_global(
     proof: &MultiProof<F, E, ()>,
     elf: &Elf,
     elf_bytes: &[u8],
-    private_inputs: &[u8],
+    num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> bool {
     // One L2G air per epoch, each with its own 1-based `fini_epoch` constant —
@@ -597,10 +679,15 @@ fn verify_global(
     let l2g_airs: Vec<_> = (0..boundaries.len())
         .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
-    // Rebuild the genesis configs FROM THE ELF and recompute their commitments:
-    // this is the binding — a prover that claimed different genesis values would
-    // commit a different root and fail to verify.
-    let gm_configs = global_memory_configs(boundaries, elf, private_inputs);
+    // Rebuild the genesis configs FROM THE ELF (no private bytes) and recompute their
+    // commitments: this is the binding for ELF/runtime pages — a prover that claimed
+    // different genesis values would commit a different root and fail to verify.
+    // Private-input pages (the first `num_private_input_pages` from
+    // PRIVATE_INPUT_START_INDEX) are built non-preprocessed, so the verifier never
+    // recomputes (or sees) their genesis bytes; the GlobalMemory bus enforces them. A
+    // wrong `num_private_input_pages` flips a touched page's preprocessed mode, so the
+    // rebuilt AIR no longer matches the committed trace and `multi_verify` rejects.
+    let gm_configs = global_memory_configs(boundaries, elf, num_private_input_pages);
     let gm_airs: Vec<_> = gm_configs
         .iter()
         .map(|config| global_memory_air(opts, config))
@@ -614,7 +701,7 @@ fn verify_global(
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut global_transcript(elf_bytes, boundaries.len()),
+        &mut global_transcript(elf_bytes, boundaries.len(), num_private_input_pages),
         &FieldElement::zero(),
     )
 }
@@ -751,12 +838,19 @@ pub fn prove_continuation(
     // One global LogUp over all the (kept) local-to-global tables.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         epochs.iter().map(|e| e.boundary.clone()).collect();
-    let global = prove_global(&all_boundaries, elf_bytes, &init_page_data, opts)?;
+    let num_private_input_pages = private_input_page_count(private_inputs);
+    let global = prove_global(
+        &all_boundaries,
+        elf_bytes,
+        &init_page_data,
+        num_private_input_pages,
+        opts,
+    )?;
 
     Ok(ContinuationProof {
         epochs,
         global,
-        private_inputs: private_inputs.to_vec(),
+        num_private_input_pages,
     })
 }
 
@@ -782,10 +876,17 @@ pub fn verify_continuation(
     bundle: &ContinuationProof,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    if bundle.private_inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
+    // Bound the claimed private-input page count before using it to size/allocate AIRs
+    // (mirrors `verify_with_options`). The count is also bound into the global proof's
+    // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
+    // diverges the verifier's challenges and `verify_global`'s `multi_verify` rejects —
+    // on top of the committed-AIR-shape mismatch a wrong count causes on a touched page.
+    let max_private_input_pages =
+        (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE) + 1;
+    if bundle.num_private_input_pages > max_private_input_pages {
         return Err(Error::InvalidTableCounts(format!(
-            "private input size ({}) exceeds max ({MAX_PRIVATE_INPUT_SIZE})",
-            bundle.private_inputs.len()
+            "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
+            bundle.num_private_input_pages
         )));
     }
 
@@ -836,8 +937,10 @@ pub fn verify_continuation(
         register_init = epoch.reg_fini.clone();
     }
 
-    // Cross-epoch global memory: genesis rebuilt FROM THE ELF (+ private inputs),
-    // so the starting memory cannot be prover-chosen; the bus telescopes fini→init.
+    // Cross-epoch global memory: genesis for ELF/runtime pages is rebuilt FROM THE ELF
+    // (no private bytes), so the starting memory cannot be prover-chosen; the bus
+    // telescopes fini→init. Private-input pages are committed, non-preprocessed (genesis
+    // stays private), bus-enforced.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         bundle.epochs.iter().map(|e| e.boundary.clone()).collect();
     if !verify_global(
@@ -845,7 +948,7 @@ pub fn verify_continuation(
         &bundle.global,
         &elf,
         elf_bytes,
-        &bundle.private_inputs,
+        bundle.num_private_input_pages,
         opts,
     ) {
         return Ok(None);
@@ -1141,21 +1244,65 @@ mod tests {
         );
     }
 
-    // Negative: the verifier rebuilds private-input genesis from bundle bytes.
-    // Changing those bytes after proving changes the global-memory preprocessed
-    // genesis commitment, so the standalone verifier must reject.
+    // Private input must stay private under continuations. The bundle carries no raw
+    // private bytes (only `num_private_input_pages`), yet a multi-epoch continuation of
+    // a program that reads private input verifies from the bundle + ELF ALONE and
+    // reconstructs the committed output. Regression for the genesis leak: the global
+    // proof's private-input genesis is a committed, bus-enforced column, not a
+    // preprocessed value the verifier would have to recompute from the raw bytes.
     #[test]
-    fn test_split_verify_rejects_tampered_private_input_genesis() {
+    fn test_continuation_private_input_verifies_without_bytes() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let private_inputs: Vec<u8> = (0u8..16).collect();
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &private_inputs,
-            4,
-            &ProofOptions::default_test_options(),
-        )
-        .unwrap();
+        let input: Vec<u8> = (0u8..16).collect();
+        let expected = input[4..12].to_vec();
+
+        // Smallest epochs (2^2 = 4 cycles) so the short program splits across epochs.
+        let bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
+        assert!(
+            bundle.num_epochs() > 1,
+            "4-cycle epochs must split the run into multiple epochs"
+        );
+        assert!(
+            bundle.num_private_input_pages > 0,
+            "a program that reads private input must have a private-input page in the global proof"
+        );
+
+        // The serialized bundle must carry no raw private bytes: it survives a bincode
+        // round-trip and still verifies using ONLY the bundle + ELF (no private input
+        // is passed to `verify_continuation`).
+        let bytes = bincode::serialize(&bundle).unwrap();
+        let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
+        let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
+            .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some(&expected[..]),
+            "continuation with private input must verify from the bundle + ELF alone"
+        );
+    }
+
+    // Negative: `num_private_input_pages` is pinned by the committed AIR shape for TOUCHED
+    // pages. Deflating it to 0 for a program that reads private input makes the verifier
+    // build that touched page preprocessed (ELF-recomputed → zero-init commitment) while
+    // the prover committed it non-preprocessed, so the rebuilt AIR no longer matches the
+    // committed trace and verification rejects. This is the replacement for the removed
+    // tampered-genesis test: it guards the security claim that a wrong count flipping a
+    // touched page's preprocessed mode cannot be accepted.
+    #[test]
+    fn test_split_verify_rejects_deflated_num_private_input_pages() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let input: Vec<u8> = (0u8..16).collect();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
+                .unwrap();
+        assert!(
+            bundle.num_private_input_pages > 0,
+            "baseline must have a touched private-input page"
+        );
         assert!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
@@ -1163,23 +1310,66 @@ mod tests {
             "baseline must verify before tampering"
         );
 
-        bundle.private_inputs[4] ^= 0xFF;
+        bundle.num_private_input_pages = 0;
         assert!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "deflating the count flips a touched page's preprocessed mode → must reject"
         );
     }
 
-    // Negative: verifier-side private inputs are deserialized/untrusted, so reject
-    // oversized bundles before rebuilding genesis page configs from them.
+    // Private-input page classification is count-based (the first `n` pages from
+    // PRIVATE_INPUT_START_INDEX), matching the monolithic verifier — the classification
+    // depends ONLY on the count, never on the raw private-input byte range. This is what
+    // keeps the continuation from ever marking more pages private than the monolithic
+    // path would: with no private input, no page in the region is private, so program
+    // data anywhere in the private-input address space keeps its ELF genesis binding.
     #[test]
-    fn test_split_verify_rejects_oversized_private_inputs() {
+    fn test_private_input_page_classification_is_count_based() {
+        use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
+        let page_size = page::DEFAULT_PAGE_SIZE as u64;
+        let start = PRIVATE_INPUT_START_INDEX;
+
+        // With no private input, NO page in the private-input region is private — not the
+        // first page, not the last. Classification is by count alone, not the region span.
+        let region_pages = MAX_PRIVATE_INPUT_SIZE / page_size;
+        let last_region_page = start + (region_pages - 1) * page_size;
+        assert!(!is_private_input_page(start, 0));
+        assert!(!is_private_input_page(last_region_page, 0));
+
+        // Count n → exactly the first n pages from start.
+        assert!(is_private_input_page(start, 1));
+        assert!(!is_private_input_page(start + page_size, 1));
+        assert!(is_private_input_page(start + page_size, 2));
+        // Pages below the region are never private.
+        assert!(!is_private_input_page(start - page_size, 10));
+
+        // private_input_page_count: wire format is [len:4][data], region is page-aligned.
+        assert_eq!(private_input_page_count(&[]), 0);
+        assert_eq!(private_input_page_count(&[0u8; 16]), 1);
+        // 4-byte prefix + (page_size - 4) data exactly fills one page.
+        assert_eq!(
+            private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 4]),
+            1
+        );
+        // One more byte spills into a second page.
+        assert_eq!(
+            private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 3]),
+            2
+        );
+    }
+
+    // Negative: `num_private_input_pages` is deserialized/untrusted, so reject a bundle
+    // whose count exceeds the max before using it to size/build the global AIRs.
+    #[test]
+    fn test_split_verify_rejects_oversized_num_private_input_pages() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
-            prove_continuation(&elf_bytes, &[], 8, &ProofOptions::default_test_options()).unwrap();
-        bundle.private_inputs = vec![0; MAX_PRIVATE_INPUT_SIZE as usize + 1];
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE) + 1;
+        bundle.num_private_input_pages = max_pages + 1;
         assert!(matches!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
             Err(Error::InvalidTableCounts(_))
