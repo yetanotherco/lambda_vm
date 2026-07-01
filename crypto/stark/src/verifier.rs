@@ -97,6 +97,7 @@ pub trait IsStarkVerifier<
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
+    #[inline(never)]
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
@@ -241,6 +242,7 @@ pub trait IsStarkVerifier<
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
     /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
+    #[inline(never)]
     fn step_3_verify_fri(
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
@@ -396,6 +398,7 @@ pub trait IsStarkVerifier<
     /// Verifies the validity of the purported values of the trace polynomials and the composition polynomial
     /// parts at the domain elements and their symmetric counterparts corresponding to all the FRI query
     /// index challenges.
+    #[inline(never)]
     fn step_4_verify_trace_and_composition_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
@@ -903,6 +906,7 @@ pub trait IsStarkVerifier<
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
     /// already been replayed and the RAP challenges are known.
+    #[inline(never)]
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
