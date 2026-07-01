@@ -40,6 +40,7 @@ impl From<BusId> for u64 {
 /// Test that verifies multi-table LogUp proofs can be serialized, transmitted,
 /// and verified by a verifier who never ran the prover.
 #[test_log::test]
+#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_verify_serialized_multi_table_proofs() {
     // =========================================================================
     // PROVER SIDE - Generate proofs

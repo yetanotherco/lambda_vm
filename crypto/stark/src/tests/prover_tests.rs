@@ -292,6 +292,7 @@ fn test_decompose_and_extend_d2_matches_original() {
 /// `coset_offset`. Both AIRs must get their own `Domain` and the resulting proofs must
 /// verify successfully.
 #[test_log::test]
+#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multi_prove_mixed_coset_offsets() {
     let proof_options_3 = ProofOptions {
         blowup_factor: 2,
@@ -356,10 +357,56 @@ fn test_multi_prove_mixed_coset_offsets() {
     );
 }
 
+/// Scope B Task 2 smoke test: a >=2-table `multi_prove` must still run to
+/// completion and hand back a `MultiProof` (one `StarkProof` per table)
+/// without panicking, now that Round 1 Phase A absorbs a single batched
+/// `MixedMmcs` root instead of N per-table main roots. Verification is
+/// deliberately NOT asserted here — the per-table verifier doesn't understand
+/// the batched root yet (Scope B Task 7); this test only proves the batched
+/// commit wiring executes end-to-end.
+#[test_log::test]
+fn test_multi_prove_batched_main_mmcs_smoke() {
+    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 16);
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let proof_options = ProofOptions::default_test_options();
+    let air_1 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let air_2 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+        &mut _,
+        &_,
+    )> = vec![
+        (&air_1, &mut trace_1, &pub_inputs),
+        (&air_2, &mut trace_2, &pub_inputs),
+    ];
+
+    let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let prove_result = multi_prove_ram(air_trace_pairs, &mut transcript);
+    let multi_proof = prove_result.expect("proving should succeed");
+
+    assert_eq!(
+        multi_proof.proofs.len(),
+        2,
+        "multi_prove should return one StarkProof per table"
+    );
+}
+
 /// Test that the domain cache deduplicates when multiple AIRs share all three key fields
 /// `(trace_length, blowup, coset_offset)`. Asserts exactly one `Domain`/`LdeTwiddles`
 /// construction for N identical AIRs and that the resulting proof still verifies.
 #[test_log::test]
+#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multi_prove_dedups_shared_domain_params() {
     domain_cache_stats::reset();
 

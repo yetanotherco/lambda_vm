@@ -27,6 +27,7 @@ use rayon::prelude::{
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::fri;
+use crate::fri::mmcs::MixedMmcs;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
@@ -701,6 +702,49 @@ pub trait IsStarkProver<
             )
             .expect("coset LDE expansion");
         });
+    }
+
+    /// Build ONE mixed-height `MixedMmcs` over every table's MAIN-split LDE
+    /// matrix (Task 2, batched-FRI unified-shard plan). `main_commits` and
+    /// `main_ldes` must be Phase A's vectors, same per-epoch table order
+    /// `MixedMmcs::commit` requires.
+    ///
+    /// "Main split" excludes the leading precomputed-column prefix for
+    /// preprocessed tables (`commit.num_precomputed_cols`); those stay
+    /// committed separately via the existing hardcoded precomputed tree.
+    ///
+    /// `main_ldes` is row-major in NATURAL order (row r = the LDE evaluation
+    /// at domain point r); `MixedMmcs::commit` requires row-major data
+    /// already permuted into BIT-REVERSED order, so this builds a temporary
+    /// permuted copy per table (see the Task 2 report's memory note). The
+    /// resulting single-matrix root is byte-identical to the existing
+    /// per-table row-pair tree root over the same column range.
+    fn build_batched_main_mmcs(
+        main_commits: &[TableCommit<Field>],
+        main_ldes: &[(Vec<FieldElement<Field>>, usize)],
+    ) -> MixedMmcs<Field>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+    {
+        let mats: Vec<(Vec<FieldElement<Field>>, usize, usize)> = main_commits
+            .iter()
+            .zip(main_ldes.iter())
+            .map(|(commit, (main_data, total_cols))| {
+                let col_start = commit.num_precomputed_cols;
+                let width = total_cols - col_start;
+                let num_rows = main_data.len() / total_cols;
+                let log_height = num_rows.trailing_zeros() as usize;
+                let mut data: Vec<FieldElement<Field>> = Vec::with_capacity(num_rows * width);
+                for r in 0..num_rows {
+                    let br = reverse_index(r, num_rows as u64);
+                    let src = br * total_cols + col_start;
+                    data.extend_from_slice(&main_data[src..src + width]);
+                }
+                (data, log_height, width)
+            })
+            .collect();
+
+        MixedMmcs::<Field>::commit(&mats)
     }
 
     /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
@@ -1902,7 +1946,9 @@ pub trait IsStarkProver<
                 if let Some(ref pre_root) = commit.precomputed_root {
                     transcript.append_bytes(pre_root);
                 }
-                transcript.append_bytes(&commit.root);
+                // Per-table main root is no longer absorbed here — Task 2
+                // replaces it with ONE batched root below, absorbed after all
+                // tables' main commits are collected.
                 main_commits.push(commit);
                 main_ldes.push(cached_main);
                 #[cfg(feature = "cuda")]
@@ -1916,6 +1962,19 @@ pub trait IsStarkProver<
         if let Some(s) = crate::instruments::snap("After main commits") {
             heap_snaps.push(s);
         }
+
+        // Absorb ONE batched root over every table's main-split LDE, replacing
+        // the N per-table root absorptions above. This MMCS is transient: we
+        // only need its root for the transcript here; Round 4 still opens the
+        // existing per-table trees (kept in `main_commits`) unchanged.
+        //
+        // Task 5: rebuild this MMCS (or thread it through instead of dropping
+        // it) so Round 4 opens it directly and the per-table trees can be
+        // dropped. Until then this is a second full pass over every table's
+        // main LDE columns purely to extract a root — real, but transient,
+        // memory/CPU cost that the Task 10 perf gate should account for.
+        let batched_main_mmcs = Self::build_batched_main_mmcs(&main_commits, &main_ldes);
+        transcript.append_bytes(&batched_main_mmcs.root());
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
