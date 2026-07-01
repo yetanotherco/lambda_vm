@@ -276,13 +276,18 @@ fn global_memory_configs_from_init_page_data(
 
 /// Whether `page_base` is one of the first `num_private_input_pages` pages starting at
 /// `PRIVATE_INPUT_START_INDEX` — the page-aligned span private input actually occupies.
-/// This matches the monolithic verifier's `page_configs_from_elf_and_runtime` exactly,
-/// so the continuation classifies private pages identically to the monolithic path and
-/// only ever marks pages that private input actually occupies. Classifying by the count
-/// (not the raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) also keeps this sound
-/// regardless of whether the region end is page-aligned: a byte-range test would mark a
-/// partial end page private even with no private input, dropping the ELF genesis binding
-/// for any program data in that page's tail beyond the region.
+/// This matches the monolithic verifier's `page_configs_from_elf_and_runtime` exactly, so
+/// the continuation classifies private pages identically to the monolithic path. Classifying
+/// by the count (not the raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) keeps prover
+/// and verifier in lockstep regardless of whether the region end is page-aligned.
+///
+/// NOTE (shared with the monolithic path): a page classified private is built
+/// non-preprocessed, so its genesis is NOT recomputed from the ELF. This is safe because
+/// the private-input region is reserved for private input and the reservation is enforced:
+/// `Elf::load` rejects any loadable segment overlapping
+/// `[PRIVATE_INPUT_START_INDEX, +MAX_PRIVATE_INPUT_SIZE)`
+/// (`ElfError::SegmentInPrivateInputRegion`), so no ELF-declared data can live there and
+/// have its genesis go unbound.
 fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = page::DEFAULT_PAGE_SIZE as u64;
@@ -600,9 +605,11 @@ fn verify_epoch(
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
 /// GlobalMemory bus, plus one GLOBAL_MEMORY table per touched page that sends each
-/// cell's genesis init (preprocessed from the ELF, so the verifier recomputes it)
-/// and receives its final value. The bus balances iff every `fini` matches the next
-/// epoch's `init` and every genesis value matches the ELF.
+/// cell's genesis init and receives its final value. For ELF/runtime pages the genesis
+/// is preprocessed (the verifier recomputes it from the ELF); private-input pages are
+/// non-preprocessed (committed, bus-enforced genesis — see `global_memory_air` / §3.6).
+/// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
+/// matches its source (the ELF for ELF/runtime pages).
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
     elf_bytes: &[u8],
@@ -1321,10 +1328,11 @@ mod tests {
 
     // Private-input page classification is count-based (the first `n` pages from
     // PRIVATE_INPUT_START_INDEX), matching the monolithic verifier — the classification
-    // depends ONLY on the count, never on the raw private-input byte range. This is what
-    // keeps the continuation from ever marking more pages private than the monolithic
-    // path would: with no private input, no page in the region is private, so program
-    // data anywhere in the private-input address space keeps its ELF genesis binding.
+    // depends ONLY on the count, never on the raw private-input byte range. So with no
+    // private input, no page in the region is classified private (checked below), keeping
+    // the continuation from ever marking more pages private than the monolithic path would.
+    // (ELF data cannot be placed *inside* the reserved region: `Elf::load` rejects any
+    // segment overlapping it, so a private page never holds ELF-bound data.)
     #[test]
     fn test_private_input_page_classification_is_count_based() {
         use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_START_INDEX};
