@@ -41,9 +41,7 @@ use super::traits::{IsPrimeField, IsSubFieldOf, LegendreSymbol};
 /// A field element with operations algorithms defined in `F`
 ///
 /// `#[repr(transparent)]` makes `FieldElement<F>` byte-identical to
-/// `F::BaseType`, which [`SpillSafe`](crate::spill_safe::SpillSafe)
-/// requires. Changing the `repr` or adding fields breaks this and
-/// is UB in any function that requires `T: SpillSafe`.
+/// `F::BaseType`.
 #[allow(clippy::derived_hash_with_manual_eq)]
 #[repr(transparent)]
 #[derive(Debug, Clone, Hash, Copy)]

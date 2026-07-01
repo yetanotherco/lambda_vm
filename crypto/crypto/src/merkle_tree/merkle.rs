@@ -4,8 +4,6 @@ use crate::merkle_tree::proof::BatchProof;
 
 use super::{proof::Proof, traits::IsMerkleTreeBackend, utils::*};
 use alloc::{collections::BTreeSet, vec::Vec};
-#[cfg(feature = "disk-spill")]
-use math::spill_safe::SpillSafe;
 
 #[derive(Debug)]
 pub enum Error {
@@ -24,16 +22,6 @@ impl Display for Error {
 #[cfg(feature = "std")]
 impl std::error::Error for Error {}
 
-/// File-backed mmap storage for Merkle tree nodes.
-///
-/// After `spill_nodes_to_disk()`, the in-memory node vector is freed and
-/// node access goes through this mmap instead.
-#[cfg(feature = "disk-spill")]
-pub(crate) struct MmapNodeBacking {
-    mmap: memmap2::Mmap,
-    node_count: usize,
-}
-
 /// The struct for the Merkle tree, consisting of the root and the nodes.
 /// A typical tree would look like this
 ///                 root
@@ -43,75 +31,11 @@ pub(crate) struct MmapNodeBacking {
 ///    leaf 1     leaf 2 leaf 3  leaf 4
 /// The bottom leafs correspond to the hashes of the elements, while each upper
 /// layer contains the hash of the concatenation of the daughter nodes.
-#[cfg_attr(not(feature = "disk-spill"), derive(Clone))]
-#[cfg_attr(
-    all(feature = "serde", not(feature = "disk-spill")),
-    derive(serde::Serialize, serde::Deserialize)
-)]
-#[cfg_attr(
-    all(feature = "serde", feature = "disk-spill"),
-    derive(serde::Deserialize)
-)]
+#[derive(Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct MerkleTree<B: IsMerkleTreeBackend> {
     pub root: B::Node,
     nodes: Vec<B::Node>,
-    #[cfg(feature = "disk-spill")]
-    #[cfg_attr(feature = "serde", serde(skip))]
-    mmap_backing: Option<MmapNodeBacking>,
-}
-
-#[cfg(all(test, feature = "disk-spill"))]
-impl<B: IsMerkleTreeBackend> MerkleTree<B> {
-    pub(crate) fn has_mmap_backing(&self) -> bool {
-        self.mmap_backing.is_some()
-    }
-}
-
-// `mmap_backing` is `#[serde(skip)]` and `spill_nodes_to_disk` empties `nodes`,
-// so the default derive would emit `{root, nodes: []}` and lose the tree.
-//
-// Output matches the non-disk-spill derive byte-for-byte, so a proof from either
-// storage mode deserializes with the same `Deserialize` impl.
-#[cfg(all(feature = "serde", feature = "disk-spill"))]
-impl<B: IsMerkleTreeBackend> serde::Serialize for MerkleTree<B>
-where
-    B::Node: serde::Serialize,
-{
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("MerkleTree", 2)?;
-        s.serialize_field("root", &self.root)?;
-        if self.mmap_backing.is_some() {
-            s.serialize_field("nodes", &MmapNodesSeq(self))?;
-        } else {
-            s.serialize_field("nodes", &self.nodes)?;
-        }
-        s.end()
-    }
-}
-
-#[cfg(all(feature = "serde", feature = "disk-spill"))]
-struct MmapNodesSeq<'a, B: IsMerkleTreeBackend>(&'a MerkleTree<B>);
-
-#[cfg(all(feature = "serde", feature = "disk-spill"))]
-impl<B: IsMerkleTreeBackend> serde::Serialize for MmapNodesSeq<'_, B>
-where
-    B::Node: serde::Serialize,
-{
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let backing = self
-            .0
-            .mmap_backing
-            .as_ref()
-            .expect("MmapNodesSeq is only constructed when mmap_backing is Some");
-        let n = backing.node_count;
-        let mut seq = serializer.serialize_seq(Some(n))?;
-        for i in 0..n {
-            seq.serialize_element(self.0.node_get(i).expect("index in bounds"))?;
-        }
-        seq.end()
-    }
 }
 
 const ROOT: usize = 0;
@@ -160,12 +84,7 @@ where
             );
         }
         let root = nodes[ROOT].clone();
-        Some(MerkleTree {
-            root,
-            nodes,
-            #[cfg(feature = "disk-spill")]
-            mmap_backing: None,
-        })
+        Some(MerkleTree { root, nodes })
     }
 
     /// Create a Merkle tree from pre-hashed leaf nodes.
@@ -192,17 +111,11 @@ where
         Some(MerkleTree {
             root: nodes[ROOT].clone(),
             nodes,
-            #[cfg(feature = "disk-spill")]
-            mmap_backing: None,
         })
     }
 
     /// Total number of nodes in the tree (inner + leaves).
     fn node_count(&self) -> usize {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref backing) = self.mmap_backing {
-            return backing.node_count;
-        }
         self.nodes.len()
     }
 
@@ -210,23 +123,6 @@ where
     ///
     /// Returns `None` if `idx` is out of bounds.
     fn node_get(&self, idx: usize) -> Option<&B::Node> {
-        #[cfg(feature = "disk-spill")]
-        if let Some(ref backing) = self.mmap_backing {
-            if idx < backing.node_count {
-                // SAFETY: spill_nodes_to_disk is the only function that populates
-                // mmap_backing, and its where-clause requires B::Node: SpillSafe.
-                // Reaching this branch means that bound was checked at construction,
-                // so B::Node carries no padding and every bit pattern is valid.
-                //
-                // Alignment: the mmap base is page-aligned (>= 4096), spill_slice_to_mmap
-                // asserts align_of::<B::Node>() <= 4096, and Rust guarantees
-                // size_of::<B::Node> is a multiple of align_of::<B::Node>, so every
-                // offset idx * node_size lands on an aligned address.
-                let ptr = unsafe { backing.mmap.as_ptr().add(idx * size_of::<B::Node>()) };
-                return Some(unsafe { &*(ptr as *const B::Node) });
-            }
-            return None;
-        }
         self.nodes.get(idx)
     }
 
@@ -376,24 +272,5 @@ where
         // Reverse to get descending order (larger indices first).
         // This makes the proof ordered from bottom (nodes closer to leaves) to top (nodes loser to root).
         auth_path_set.into_iter().rev().collect()
-    }
-
-    /// Spill the node vector to a temp-file-backed mmap and free the heap
-    /// allocation. Node access methods read from the mmap after this call.
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_nodes_to_disk(&mut self) -> std::io::Result<()>
-    where
-        B::Node: SpillSafe,
-    {
-        if self.nodes.is_empty() || self.mmap_backing.is_some() {
-            return Ok(());
-        }
-
-        let node_count = self.nodes.len();
-        let mmap = crate::mmap_util::spill_slice_to_mmap(&self.nodes)?;
-        self.nodes = Vec::new();
-        self.mmap_backing = Some(MmapNodeBacking { mmap, node_count });
-
-        Ok(())
     }
 }
