@@ -98,7 +98,7 @@ impl FriCommitState {
     pub fn fold_and_commit_layer(
         &mut self,
         zeta_raw: [u64; 3],
-    ) -> Result<(Vec<u8>, Vec<u64>, Vec<u8>)> {
+    ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree)> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
@@ -214,17 +214,22 @@ impl FriCommitState {
             self.stream.clone_dtoh(&view)?
         };
 
-        // Tree nodes.
-        let nodes_bytes: Vec<u8> = self.stream.clone_dtoh(&nodes_dev)?;
-        debug_assert_eq!(nodes_bytes.len(), tight_total_nodes * 32);
-
-        let mut root = vec![0u8; 32];
-        root.copy_from_slice(&nodes_bytes[0..32]);
+        // Keep the layer tree resident on device; copy only the 32-byte root so
+        // R4 query openings gather paths on device instead of copying the tree.
+        let mut root = [0u8; 32];
+        self.stream
+            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        self.stream.synchronize()?;
 
         self.a_is_input = !self.a_is_input;
         self.current_n = n_out;
 
-        Ok((root, layer_evals, nodes_bytes))
+        let tree = crate::lde::GpuMerkleTree {
+            nodes: std::sync::Arc::new(nodes_dev),
+            leaves_len: num_leaves,
+            root,
+        };
+        Ok((layer_evals, tree))
     }
 
     /// Final fold, no Merkle commit. Returns the single ext3 output
