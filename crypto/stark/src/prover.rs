@@ -2039,21 +2039,11 @@ pub trait IsStarkProver<
             heap_snaps.push(s);
         }
 
-        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
-        // Each table gets its own transcript fork.
+        // Pass 2: Parallel extract → LDE → commit aux traces in chunks of K.
+        // Aux roots are batched into ONE shared MMCS root (absorbed after this
+        // pass), so forks are created AFTER the aux root is bound — see below.
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
-
-        // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
-        let mut table_transcripts: Vec<_> = (0..num_airs)
-            .map(|idx| {
-                let mut t = transcript.clone();
-                if num_airs > 1 {
-                    t.append_bytes(&(idx as u64).to_le_bytes());
-                }
-                t
-            })
-            .collect();
 
         // Parallel aux commit in chunks of K. The closure returns a cfg-gated
         // AuxResult. Under cuda it carries the optional ext3 GPU LDE handle as
@@ -2175,17 +2165,62 @@ pub trait IsStarkProver<
                     }
                 });
 
-            // Sequential: append aux roots to forked transcripts.
-            for (j, result) in chunk_aux.into_iter().enumerate() {
-                let aux_full = result?;
-                // Tuple shape is cfg-gated; `.0` is the optional TableCommit
-                // in both variants.
-                if let Some(ref c) = aux_full.0 {
-                    table_transcripts[chunk_start + j].append_bytes(&c.root);
-                }
-                aux_results.push(aux_full);
+            // Collect aux commits/LDEs; roots are absorbed as ONE batched MMCS
+            // root below (not per-table into forks).
+            for result in chunk_aux.into_iter() {
+                aux_results.push(result?);
             }
         }
+
+        // Absorb ONE batched root over every aux-carrying table's LDE (batched
+        // unified-shard plan), replacing the per-fork aux root absorptions. This
+        // MMCS is transient: only its root is needed for the transcript here;
+        // Round 4 still opens the per-table aux trees (kept in `aux_results`).
+        // Built AFTER Phase B LogUp challenges (aux depends on them) and BEFORE
+        // forking, so the shared aux root is bound into every fork.
+        {
+            let mut aux_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
+                Vec::with_capacity(aux_results.len());
+            for res in aux_results.iter() {
+                // AuxResult is cfg-gated (an extra GPU handle under cuda); bind
+                // the fields by name so the extraction is shape-agnostic.
+                #[cfg(not(feature = "cuda"))]
+                let (aux_commit, aux_lde) = res;
+                #[cfg(feature = "cuda")]
+                let (aux_commit, aux_lde, _aux_gpu) = res;
+                if aux_commit.is_none() {
+                    continue;
+                }
+                let (aux_data, total_cols) = aux_lde;
+                let num_rows = aux_data.len() / *total_cols;
+                let log_height = num_rows.trailing_zeros() as usize;
+                let mut data: Vec<FieldElement<FieldExtension>> =
+                    Vec::with_capacity(num_rows * *total_cols);
+                for r in 0..num_rows {
+                    let br = reverse_index(r, num_rows as u64);
+                    let src = br * *total_cols;
+                    data.extend_from_slice(&aux_data[src..src + *total_cols]);
+                }
+                aux_mats.push((data, log_height, *total_cols));
+            }
+            if !aux_mats.is_empty() {
+                let batched_aux_mmcs = MixedMmcs::<FieldExtension>::commit(&aux_mats);
+                transcript.append_bytes(&batched_aux_mmcs.root());
+            }
+        }
+
+        // Pre-fork all transcripts now that the shared aux root is bound (cheap,
+        // sequential — must match verifier ordering). Domain-separated by table
+        // index so per-table proving stays independent.
+        let mut table_transcripts: Vec<_> = (0..num_airs)
+            .map(|idx| {
+                let mut t = transcript.clone();
+                if num_airs > 1 {
+                    t.append_bytes(&(idx as u64).to_le_bytes());
+                }
+                t
+            })
+            .collect();
 
         // Build commitments and cached LDEs as separate vecs:
         // commitments are borrowed in Phase D, LDEs are consumed by value.
