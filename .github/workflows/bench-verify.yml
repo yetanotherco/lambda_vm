@@ -1,16 +1,11 @@
 name: Bench verifier
 
-# Drift-free paired (A/B/B/A) verifier benchmark (PR vs main). Kept SEPARATE from /bench
-# so the prover and verifier benches never contend for the single self-hosted bench
-# server. It builds both binaries, proves once per side, and runs ~20 interleaved verify
-# pairs (~4 min), so it NEVER auto-triggers -- only on an explicit `/bench-verify`
-# comment on a PR.
+# Manual-only (/bench-verify); separate from /bench so they never share the bench server.
 on:
   issue_comment:
     types: [created]
 
-# One verifier run per PR; a re-trigger cancels the stale one. (The single self-hosted
-# bench runner serializes across PRs on its own.)
+# One verifier run per PR; a re-trigger cancels the stale one.
 concurrency:
   group: bench-verify-${{ github.event.issue.number }}
   cancel-in-progress: true
@@ -22,14 +17,11 @@ permissions:
 
 jobs:
   verify:
-    # Manual-only: a "/bench-verify" comment on a PR, from a repo member. Never auto.
     if: >-
       github.event.issue.pull_request &&
       startsWith(github.event.comment.body, '/bench-verify') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Generous ceiling so a hang can't strand the single bench runner; the workload is
-    # ~a few min (two builds + 2 proves + 2*N verifies at ~5s each).
     timeout-minutes: 60
     steps:
       - name: Acknowledge (react + occupancy notice)
@@ -53,12 +45,10 @@ jobs:
           PR_NUM: ${{ github.event.issue.number }}
           COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
-          # Resolve the head SHA (not the branch name): pinning the commit works for
-          # fork PRs too and avoids a force-push race mid-run.
+          # Head SHA (not branch name) so fork PRs resolve and a mid-run force-push can't race.
           HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          # Optional pair count, e.g. "/bench-verify 32"; default 20. Clamp to [2,40]
-          # (pair-diff sd ~1.15%: ~8 pairs resolve 0.8%, ~15 for 0.6%).
+          # Optional pair count "/bench-verify 32"; default 20, clamp [2,40].
           N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-verify[[:space:]]*\([0-9]\+\).*|\1|p')
           N=${N:-20}
           if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
@@ -88,9 +78,6 @@ jobs:
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
-          # bench_verify.sh builds the cli at both refs (isolated worktree), proves once
-          # per side, runs the interleaved A/B/B/A verify pairs, and prints the paired-t
-          # CI + exact Wilcoxon result.
           scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
           sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
 
@@ -116,7 +103,6 @@ jobs:
               const tail = read('/tmp/verify_out.txt').split('\n').slice(-30).join('\n');
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
             }
-            // Update the existing verifier-bench comment if present, else create one.
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,

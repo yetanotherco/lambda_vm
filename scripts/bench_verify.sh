@@ -1,38 +1,11 @@
 #!/usr/bin/env bash
 #
-# bench_verify.sh — interleaved A/B/B/A paired VERIFIER benchmark (PR vs main).
+# bench_verify.sh — interleaved A/B/B/A paired verifier benchmark (PR vs main).
+# Positive numbers are improvements (PR faster).
 #
-# WHY: the verifier is not covered by /bench (which times proving). Verifier
-# optimizations tend to be small (~1-3%), and a sequential "N runs of PR then N of
-# main" comparison conflates the code delta with machine drift between the two
-# blocks. Measuring both binaries *interleaved on the same machine in the same
-# session* cancels the drift (it hits both sides equally), and a paired analysis is
-# far more powerful. Verify is ~5s and deterministic, so this is CHEAP: one prove per
-# side + a few interleaved verify pairs. Measured pair-diff sd ~1.15% (80% power:
-# ~8 pairs for 0.8%, ~15 for 0.6%), so the default 20 pairs runs in ~4 min.
-#
-# WHAT IT DOES:
-#   1. Builds the ethrex guest ELF + 20-transfer fixture once (identical for both sides).
-#   2. Builds the `cli` at REF_A (PR) and REF_B (main); reuses cached binaries if the
-#      refs + features match (REBUILD=1 forces).
-#   3. Proves ONCE (with the baseline binary) and has BOTH sides verify that SAME proof.
-#      The proof is just input data for the verifier, so feeding both sides identical
-#      bytes isolates the verify-code delta. (Proving separately per side leaks a
-#      proof-specific bias ABBA can't cancel -- it's tied to the proof, not the machine.
-#      A format-changing PR whose binary can't read the baseline proof fails loudly; such
-#      a PR isn't a pure verifier-perf change anyway.)
-#   4. Runs N_PAIRS interleaved verify pairs in A B B A ... order, then reports BOTH a
-#      paired-t 95% CI AND a robust median + exact Wilcoxon signed-rank result.
-#
-# CONVENTION: every reported number is an IMPROVEMENT, positive = PR FASTER.
-#
-# USAGE:
-#   scripts/bench_verify.sh REF_A [REF_B] [N_PAIRS]
-#     REF_A    REQUIRED — ref or SHA to evaluate (the PR side)
-#     REF_B    baseline   (default: origin/main)
-#     N_PAIRS  pairs      (default: 20 -> 40 verify runs, ~4 min; use an EVEN count)
-#   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
-#        BENCH_FEATURES=<list> cargo features for the cli build (default: jemalloc-stats).
+# Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
+#   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~4 min).
+#   Env: REBUILD=1 forces rebuild; BENCH_FEATURES=<list> (default: jemalloc-stats).
 
 set -euo pipefail
 
@@ -120,7 +93,7 @@ else
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
-# --- 3. Prove once per side, then interleaved A/B/B/A verify measurement ---
+# --- 3. Prove once (shared), then interleaved A/B/B/A verify measurement ---
 prove_once() {  # $1=binary $2=proof-path
   if ! "$1" prove "$ELF" --private-input "$INPUT" -o "$2" --time >"$WORK/prove_$(basename "$2").log" 2>&1; then
     echo "ERROR: prove failed for $1. Tail of log:" >&2
@@ -140,6 +113,7 @@ run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s)
   echo "$t"
 }
 
+# One shared proof for both sides: per-side proofs leak a proof-specific bias ABBA can't cancel.
 echo "==> Proving once with the baseline binary (both sides verify this same proof)"
 prove_once "$WORK/cli_B" "$PROOF"
 
