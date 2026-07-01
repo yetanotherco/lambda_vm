@@ -28,8 +28,6 @@ use stark::lookup::{
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
 use stark::prover::{IsStarkProver, Prover, ProvingError};
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 
@@ -123,12 +121,7 @@ pub fn multi_prove_ram<PI>(
 where
     PI: Send + Sync + Clone,
 {
-    Prover::<F, E, PI>::multi_prove(
-        air_trace_pairs,
-        transcript,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
-    )
+    Prover::<F, E, PI>::multi_prove(air_trace_pairs, transcript)
 }
 
 // =============================================================================

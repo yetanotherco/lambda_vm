@@ -839,15 +839,7 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
     let logs = Executor::new(&program, vec![]).unwrap().run().unwrap().logs;
     let max_rows = MaxRowsConfig::default();
 
-    let from_elf = Traces::from_elf_and_logs(
-        &program,
-        &logs,
-        &max_rows,
-        &[],
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .unwrap();
+    let from_elf = Traces::from_elf_and_logs(&program, &logs, &max_rows, &[]).unwrap();
 
     let image = build_initial_image(&program, &[]);
     let register_init =
@@ -861,8 +853,6 @@ fn test_from_image_and_logs_matches_from_elf_and_logs() {
         &[],
         true,
         false,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .unwrap();
 
@@ -962,8 +952,6 @@ fn test_build_traces_for_all_epochs() {
             &[],
             i == last,
             false,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )
         .unwrap_or_else(|e| panic!("epoch {i} (is_final={}) failed to build: {e:?}", i == last));
 
@@ -1017,8 +1005,6 @@ fn test_terminating_epoch_rejected_when_not_final() {
         &[],
         false,
         false,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     );
 
     assert!(

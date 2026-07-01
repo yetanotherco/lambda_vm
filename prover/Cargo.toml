@@ -11,7 +11,6 @@ cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
-disk-spill = ["stark/disk-spill"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

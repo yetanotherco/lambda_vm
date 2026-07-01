@@ -114,8 +114,6 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
         &result.logs,
         &crate::MaxRowsConfig::default(),
         blob,
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
     )
     .expect("trace build");
 

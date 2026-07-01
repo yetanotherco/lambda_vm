@@ -10,8 +10,6 @@
 //! assert!(lambda_vm_prover::verify(&vm_proof, &elf_bytes).unwrap());
 //! ```
 
-#[cfg(feature = "disk-spill")]
-pub mod auto_storage;
 pub mod constraints;
 pub mod continuation;
 #[cfg(feature = "debug-checks")]
@@ -34,8 +32,6 @@ use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
-#[cfg(feature = "disk-spill")]
-use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -46,8 +42,6 @@ use crate::tables::decode;
 use crate::tables::page;
 use crate::tables::register;
 use crate::tables::trace_builder::Traces;
-#[cfg(feature = "disk-spill")]
-use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
@@ -752,8 +746,6 @@ pub fn count_elements(elf_bytes: &[u8], private_inputs: &[u8]) -> Result<(u64, u
         &result.logs,
         &MaxRowsConfig::default(),
         private_inputs,
-        #[cfg(feature = "disk-spill")]
-        StorageMode::Ram,
     )?;
     Ok((
         traces.total_field_elements(),
@@ -803,20 +795,7 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
 
-    #[cfg(feature = "disk-spill")]
-    let storage_mode = {
-        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
-        auto_storage::decide(&lengths, proof_options.blowup_factor)
-    };
-
-    let mut traces = Traces::from_elf_and_logs(
-        &program,
-        &result.logs,
-        max_rows,
-        private_inputs,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
+    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, max_rows, private_inputs)?;
     debug_assert_eq!(
         traces.public_output_bytes, result.return_values.memory_values,
         "public output diverged between executor view and trace reconstruction"
@@ -873,13 +852,8 @@ pub fn prove_with_options_and_inputs(
     );
 
     // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
-        airs.air_trace_pairs(&mut traces),
-        &mut transcript,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof = Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut transcript)
+        .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     #[cfg(feature = "instruments")]
     {

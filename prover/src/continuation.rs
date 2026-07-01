@@ -402,13 +402,8 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let proof = Prover::multi_prove(
-        pairs,
-        &mut seed(),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let proof =
+        Prover::multi_prove(pairs, &mut seed()).map_err(|e| Error::Prover(format!("{e:?}")))?;
 
     let l2g_root = proof
         .proofs
@@ -575,13 +570,8 @@ fn prove_global(
         pairs.push((air as AirRef, trace, &()));
     }
 
-    Prover::multi_prove(
-        pairs,
-        &mut global_transcript(elf_bytes, boundaries.len()),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    Prover::multi_prove(pairs, &mut global_transcript(elf_bytes, boundaries.len()))
+        .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
 fn verify_global(
@@ -723,8 +713,6 @@ pub fn prove_continuation(
             private_inputs,
             is_final,
             true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
         )?;
         let boundary =
             local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
