@@ -101,7 +101,7 @@ jobs:
           PUB="$(cat "$KEY.pub")"
           read -r -a THRESHOLDS <<< "$PRICE_THRESHOLDS"
           # cpu_ram filter is in GB (the returned .cpu_ram field is in MB).
-          BASE="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=48 disk_space>=${VAST_IMAGE_DISK} verified=true rentable=true cuda_max_good>=12.8"
+          BASE="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=48 disk_space>=${VAST_IMAGE_DISK} verified=true rentable=true cuda_max_good>=13.1"
           TRIED=""   # space-separated machine_ids already attempted (never re-pick a flaky host)
 
           destroy() {  # $1 = instance id; retry transient destroy failures so no box is stranded
