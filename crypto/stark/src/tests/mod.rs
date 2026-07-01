@@ -11,7 +11,5 @@ pub mod prove_verify_roundtrip_tests;
 pub mod prover_tests;
 pub mod row_pair_opening_tests;
 pub mod small_trace_tests;
-#[cfg(feature = "disk-spill")]
-pub mod table_disk_spill_tests;
 pub mod trace_test_helpers;
 pub mod transition_tests;

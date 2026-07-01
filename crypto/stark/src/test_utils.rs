@@ -7,7 +7,6 @@ use crate::traits::AIR;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
-use math::spill_safe::SpillSafe;
 use math::traits::{AsBytes, ByteConversion};
 
 type AirTracePair<'a, Field, FieldExtension, PI> = (
@@ -26,13 +25,6 @@ where
     PI: Send + Sync + Clone,
     FieldElement<Field>: AsBytes + ByteConversion,
     FieldElement<FieldExtension>: AsBytes + ByteConversion,
-    <Field as IsField>::BaseType: SpillSafe,
-    <FieldExtension as IsField>::BaseType: SpillSafe,
 {
-    Prover::<Field, FieldExtension, PI>::multi_prove(
-        air_trace_pairs,
-        transcript,
-        #[cfg(feature = "disk-spill")]
-        crate::storage_mode::StorageMode::Ram,
-    )
+    Prover::<Field, FieldExtension, PI>::multi_prove(air_trace_pairs, transcript)
 }

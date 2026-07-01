@@ -11,7 +11,6 @@ use math::fft::two_half_fft::TwoHalfTwiddles;
 
 use log::info;
 use math::field::traits::{IsField, IsSubFieldOf};
-use math::spill_safe::SpillSafe;
 use math::traits::AsBytes;
 use math::{
     field::{element::FieldElement, traits::IsFFTField},
@@ -29,8 +28,6 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
-#[cfg(feature = "disk-spill")]
-use crate::storage_mode::StorageMode;
 use crate::table::Table;
 use crate::trace::LDETraceTable;
 
@@ -84,10 +81,6 @@ pub enum ProvingError {
     /// proof an honest verifier always rejects — fail fast on the prover side
     /// with a localized error instead.
     PrecomputedCommitmentMismatch,
-    /// I/O failure while spilling prover state (traces, LDE, Merkle trees) to disk:
-    /// out of disk space, fd exhaustion, or mmap failure.
-    #[cfg(feature = "disk-spill")]
-    DiskSpill(String),
     /// An internal FFT/LDE computation failed (e.g. domain size exceeds the
     /// field's two-adicity, or a degenerate coset offset). Distinct from
     /// `WrongParameter` because the cause is internal prover machinery, not a
@@ -717,7 +710,6 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainCommitTuple<Field>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -776,11 +768,6 @@ pub trait IsStarkProver<
         let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
         main_data.extend_from_slice(trace_data);
 
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            trace.main_table.advise_drop_cache();
-        }
-
         Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
             &mut main_data,
             total_cols,
@@ -799,25 +786,19 @@ pub trait IsStarkProver<
 
         let commit = match precomputed {
             None => {
-                #[allow(unused_mut)]
-                let (mut tree, root) = Self::commit_rows_bit_reversed(&main_data, total_cols)
+                let (tree, root) = Self::commit_rows_bit_reversed(&main_data, total_cols)
                     .ok_or(ProvingError::EmptyCommitment)?;
-                #[cfg(feature = "disk-spill")]
-                Self::spill_tree(&mut tree, storage_mode, "main Merkle tree")?;
                 TableCommit::plain(tree, root)
             }
             Some((expected_precomputed_root, num_precomputed)) => {
-                #[allow(unused_mut)]
-                let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_rows_bit_reversed_subset(
-                        &main_data,
-                        total_cols,
-                        0,
-                        num_precomputed,
-                    )
-                    .ok_or(ProvingError::EmptyCommitment)?;
-                #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
+                let (precomputed_tree, precomputed_root) = Self::commit_rows_bit_reversed_subset(
+                    &main_data,
+                    total_cols,
+                    0,
+                    num_precomputed,
+                )
+                .ok_or(ProvingError::EmptyCommitment)?;
+                let (mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
                     &main_data,
                     total_cols,
                     num_precomputed,
@@ -826,15 +807,6 @@ pub trait IsStarkProver<
                 .ok_or(ProvingError::EmptyCommitment)?;
                 if precomputed_root != expected_precomputed_root {
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
-                }
-                #[cfg(feature = "disk-spill")]
-                {
-                    Self::spill_tree(
-                        &mut precomputed_tree,
-                        storage_mode,
-                        "precomputed Merkle tree",
-                    )?;
-                    Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 }
                 TableCommit::preprocessed(
                     mult_tree,
@@ -853,26 +825,6 @@ pub trait IsStarkProver<
         return Ok((commit, (main_data, total_cols), None));
         #[cfg(not(feature = "cuda"))]
         Ok((commit, (main_data, total_cols)))
-    }
-
-    /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
-    /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
-    /// site (main / preprocessed split / aux).
-    #[cfg(feature = "disk-spill")]
-    fn spill_tree<C>(
-        tree: &mut BatchedMerkleTree<C>,
-        storage_mode: StorageMode,
-        label: &str,
-    ) -> Result<(), ProvingError>
-    where
-        C: IsField,
-        FieldElement<C>: AsBytes + Sync + Send,
-    {
-        if storage_mode == StorageMode::Disk {
-            tree.spill_nodes_to_disk()
-                .map_err(|e| ProvingError::DiskSpill(format!("{label}: {e}")))?;
-        }
-        Ok(())
     }
 
     /// Recompute Round1 from the trace, reusing the Merkle trees stored in commitments.
@@ -1761,7 +1713,6 @@ pub trait IsStarkProver<
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
-        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1769,8 +1720,6 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         info!("Started proof generation...");
 
@@ -1834,17 +1783,6 @@ pub trait IsStarkProver<
 
         let k = table_parallelism().min(num_airs).max(1);
 
-        // Spill main traces to mmap before Round 1 LDE.
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(_, trace, _)| {
-                trace
-                    .main_table
-                    .spill_to_disk()
-                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
-            })?;
-        }
-
         #[cfg(feature = "instruments")]
         let prepass_elapsed = phase_start.elapsed();
         #[cfg(feature = "instruments")]
@@ -1883,14 +1821,7 @@ pub trait IsStarkProver<
                     let precomputed = air
                         .is_preprocessed()
                         .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
-                    Self::commit_main_trace(
-                        *trace,
-                        domain,
-                        twiddles,
-                        precomputed,
-                        #[cfg(feature = "disk-spill")]
-                        storage_mode,
-                    )
+                    Self::commit_main_trace(*trace, domain, twiddles, precomputed)
                 });
 
             // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
@@ -1959,19 +1890,6 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
-
-        // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(air, trace, _)| {
-                if air.has_aux_trace() {
-                    trace
-                        .spill_aux_to_disk()
-                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
-                }
-                Ok::<(), ProvingError>(())
-            })?;
-        }
 
         #[cfg(feature = "instruments")]
         let aux_build_elapsed = phase_start.elapsed();
@@ -2075,11 +1993,6 @@ pub trait IsStarkProver<
                             Vec::with_capacity(lde_size * total_cols);
                         aux_data.extend_from_slice(trace_data);
 
-                        #[cfg(feature = "disk-spill")]
-                        if storage_mode == StorageMode::Disk {
-                            trace.aux_table.advise_drop_cache();
-                        }
-
                         Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
                             &mut aux_data,
                             total_cols,
@@ -2094,12 +2007,8 @@ pub trait IsStarkProver<
                         let aux_lde_dur = t_sub.elapsed();
                         #[cfg(feature = "instruments")]
                         let t_sub = Instant::now();
-                        #[allow(unused_mut)]
-                        let (mut tree, root) =
-                            Self::commit_rows_bit_reversed(&aux_data, total_cols)
-                                .ok_or(ProvingError::EmptyCommitment)?;
-                        #[cfg(feature = "disk-spill")]
-                        Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
+                        let (tree, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)
+                            .ok_or(ProvingError::EmptyCommitment)?;
                         let commit = TableCommit::plain(tree, root);
                         #[cfg(feature = "instruments")]
                         crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
@@ -2315,17 +2224,10 @@ pub trait IsStarkProver<
         PI: Send + Sync + Clone,
         Field: Copy + 'static,
         FieldExtension: Copy + 'static,
-        <Field as IsField>::BaseType: SpillSafe,
-        <FieldExtension as IsField>::BaseType: SpillSafe,
     {
         let air_trace_pairs = vec![(air, trace, pub_inputs)];
-        Self::multi_prove(
-            air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            StorageMode::Ram,
-        )
-        .map(|mut multi_proof| multi_proof.proofs.remove(0))
+        Self::multi_prove(air_trace_pairs, transcript)
+            .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
     // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations

@@ -3,8 +3,6 @@ use crate::table::Table;
 use math::field::traits::{IsField, IsSubFieldOf};
 use math::field::{element::FieldElement, traits::IsFFTField};
 use math::polynomial::barycentric_inv_denoms;
-#[cfg(feature = "disk-spill")]
-use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
@@ -144,26 +142,6 @@ where
         let aux_data = vec![FieldElement::<E>::zero(); num_rows * num_aux_columns];
         self.aux_table = Table::new(aux_data, num_aux_columns);
         self.num_aux_columns = num_aux_columns;
-    }
-
-    /// Write main trace data to a temp file and free the in-memory vector.
-    /// Accessors read from the mmap after this call.
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_main_to_disk(&mut self) -> std::io::Result<()>
-    where
-        F: Copy + 'static,
-        F::BaseType: SpillSafe,
-    {
-        self.main_table.spill_to_disk()
-    }
-
-    #[cfg(feature = "disk-spill")]
-    pub fn spill_aux_to_disk(&mut self) -> std::io::Result<()>
-    where
-        E: Copy + 'static,
-        E::BaseType: SpillSafe,
-    {
-        self.aux_table.spill_to_disk()
     }
 
     /// Extract main columns as owned vectors, each allocated at `capacity`.
