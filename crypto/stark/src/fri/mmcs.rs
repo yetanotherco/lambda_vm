@@ -62,6 +62,24 @@
 //! The per-matrix `PolynomialOpenings.proof` fields are empty; the single
 //! `MixedOpening.proof` is the authenticator.
 //!
+//! # Width binding (soundness)
+//!
+//! `verify_batch` takes per-matrix `widths` alongside `heights`. Within a height
+//! group the leaf hash is over the FLAT concatenation of every matrix's opened
+//! row pair (`A.eval ‖ A.eval_sym ‖ B.eval ‖ B.eval_sym ‖ …`), which does NOT by
+//! itself record where each matrix's columns end. Fixing `widths[m]` (matrix
+//! `m`'s column count) makes those boundaries unambiguous: without it a prover
+//! could shift a boundary — e.g. lengthen one matrix's `evaluations` by one
+//! element and shorten its `evaluations_sym` by one — leaving the flat bytes (and
+//! therefore the group hash) identical while feeding a corrupted row downstream.
+//! Consumers (the Task 7 verifier) MUST pass the committed public per-table
+//! column counts, in the same INPUT order as `heights`.
+//!
+//! NOTE: `widths` and `heights` should ALSO be bound into the Fiat-Shamir
+//! transcript by the consumer. Scope A's `absorb_height_histogram` currently
+//! binds heights only; extending it to `(height, width)` pairs is a Task 4 /
+//! verifier concern (out of scope for this primitive) and is flagged here.
+//!
 //! # Determinism
 //!
 //! The tree is a pure function of `(matrices, input order)`. Grouping within a
@@ -278,17 +296,43 @@ where
     }
 
     /// Verify a batched opening at `iota` against `root`. `heights[m]` is the
-    /// `log_height` of matrix `m`, in the SAME order as `opening.per_matrix`.
+    /// `log_height` of matrix `m` and `widths[m]` its column count, both in the
+    /// SAME order as `opening.per_matrix`.
+    ///
+    /// `widths` binds each matrix's boundary inside the per-height-group leaf
+    /// hash (see the module `# Width binding` section): the group leaf hashes the
+    /// FLAT concatenation of every matrix's `evaluations ‖ evaluations_sym`, so
+    /// without fixed widths a prover could shift a matrix boundary while keeping
+    /// the flat bytes — and thus the hash — identical. Pinning `widths` makes the
+    /// boundaries unambiguous and closes that forgery.
     pub fn verify_batch(
         root: &Commitment,
         iota: usize,
         opening: &MixedOpening<E>,
         heights: &[usize],
+        widths: &[usize],
     ) -> bool {
-        if heights.len() != opening.per_matrix.len() || heights.is_empty() {
+        if opening.per_matrix.len() != heights.len()
+            || heights.len() != widths.len()
+            || heights.is_empty()
+        {
             return false;
         }
+        // Bind per-matrix boundaries: every opened matrix must present exactly
+        // `widths[m]` columns in BOTH rows of its pair. A boundary shift keeps the
+        // flat per-group concatenation identical but changes these lengths.
+        for (o, w) in opening.per_matrix.iter().zip(widths.iter()) {
+            if o.evaluations.len() != *w || o.evaluations_sym.len() != *w {
+                return false;
+            }
+        }
         let h_max = *heights.iter().max().expect("heights is non-empty");
+        // Defensive: honest heights are >= 1 (row-pair leaves need >= 2 rows), so
+        // h_max >= 1; guard the `h_max - 1` underflow regardless.
+        if h_max == 0 {
+            return false;
+        }
+        // Only the low `h_max - 1` bits of `iota` are consumed (one per level).
         if opening.proof.merkle_path.len() != h_max - 1 {
             return false;
         }
@@ -379,6 +423,7 @@ mod tests {
 
         let mmcs = MixedMmcs::commit(&[(data.clone(), log_height, width)]);
         let heights = [log_height];
+        let widths = [width];
         let n0 = 1usize << (log_height - 1);
 
         for iota in 0..n0 {
@@ -389,13 +434,25 @@ mod tests {
             let row_2k1 = data[(2 * k + 1) * width..(2 * k + 2) * width].to_vec();
             assert_eq!(opening.per_matrix[0].evaluations, row_2k);
             assert_eq!(opening.per_matrix[0].evaluations_sym, row_2k1);
-            assert!(MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights));
+            assert!(MixedMmcs::verify_batch(
+                &mmcs.root(),
+                iota,
+                &opening,
+                &heights,
+                &widths
+            ));
         }
 
         let mut opening = mmcs.open_batch(0);
         opening.per_matrix[0].evaluations[0] =
             &opening.per_matrix[0].evaluations[0] + &FE::from(1u64);
-        assert!(!MixedMmcs::verify_batch(&mmcs.root(), 0, &opening, &heights));
+        assert!(!MixedMmcs::verify_batch(
+            &mmcs.root(),
+            0,
+            &opening,
+            &heights,
+            &widths
+        ));
     }
 
     #[test]
@@ -429,6 +486,7 @@ mod tests {
             (c.clone(), hc, wc),
         ]);
         let heights = [ha, hb, hc];
+        let widths = [wa, wb, wc];
         let h_max = 5usize;
         let n0 = 1usize << (h_max - 1); // 16
 
@@ -449,7 +507,7 @@ mod tests {
             assert_eq!(opening.per_matrix[2].evaluations_sym, row(&c, wc, 2 * kc + 1));
 
             assert!(
-                MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights),
+                MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights, &widths),
                 "honest opening at iota={iota} must verify"
             );
         }
@@ -461,7 +519,7 @@ mod tests {
         opening.per_matrix[2].evaluations[0] =
             &opening.per_matrix[2].evaluations[0] + &FE::from(1u64);
         assert!(
-            !MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights),
+            !MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights, &widths),
             "tampered height-3 row must be rejected"
         );
 
@@ -470,7 +528,7 @@ mod tests {
         opening2.per_matrix[0].evaluations[0] =
             &opening2.per_matrix[0].evaluations[0] + &FE::from(1u64);
         assert!(
-            !MixedMmcs::verify_batch(&mmcs.root(), iota, &opening2, &heights),
+            !MixedMmcs::verify_batch(&mmcs.root(), iota, &opening2, &heights, &widths),
             "tampered tall-matrix row must be rejected"
         );
     }
@@ -520,7 +578,140 @@ mod tests {
 
         for iota in 0..2usize {
             let opening = mmcs.open_batch(iota);
-            assert!(MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &[2, 1]));
+            // heights {2, 1}, widths {2, 3}.
+            assert!(MixedMmcs::verify_batch(
+                &mmcs.root(),
+                iota,
+                &opening,
+                &[2, 1],
+                &[2, 3]
+            ));
         }
+    }
+
+    /// Two SAME-HEIGHT matrices share one base-group leaf, whose hash is over the
+    /// FLAT concatenation `A.eval ‖ A.eval_sym ‖ B.eval ‖ B.eval_sym`. A malicious
+    /// prover can shift the A|A_sym boundary (move one element from A's
+    /// `evaluations_sym` into A's `evaluations`) leaving that flat concatenation —
+    /// and hence the leaf hash — byte-identical, so a width-blind `verify_batch`
+    /// would accept it. The per-matrix width binding rejects the shift.
+    #[test]
+    fn boundary_shift_forgery_rejected() {
+        let h = 2usize;
+        let num_rows = 1usize << h;
+        let (wa, wb) = (2usize, 1usize); // wA >= 2 so we can steal one column.
+        let a = row_major_bit_reversed(&make_columns(wa, num_rows, 11), num_rows);
+        let b = row_major_bit_reversed(&make_columns(wb, num_rows, 22), num_rows);
+
+        let mmcs = MixedMmcs::commit(&[(a, h, wa), (b, h, wb)]);
+        let heights = [h, h];
+        let widths = [wa, wb];
+
+        let iota = 0usize;
+        let opening = mmcs.open_batch(iota);
+        assert!(
+            MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights, &widths),
+            "honest opening must verify"
+        );
+
+        // Forge: lengthen A.evaluations by one element taken from A.evaluations_sym.
+        let mut forged = mmcs.open_batch(iota);
+        let moved = forged.per_matrix[0].evaluations_sym.remove(0);
+        forged.per_matrix[0].evaluations.push(moved);
+
+        // The FLAT per-group concatenation is byte-identical to the honest one, so
+        // the group leaf hash is UNCHANGED — the rejection must come from the width
+        // check, not from a differing hash.
+        let flat = |o: &MixedOpening<GoldilocksField>| -> Vec<FE> {
+            let mut v = Vec::new();
+            for m in &o.per_matrix {
+                v.extend_from_slice(&m.evaluations);
+                v.extend_from_slice(&m.evaluations_sym);
+            }
+            v
+        };
+        assert_eq!(
+            flat(&opening),
+            flat(&forged),
+            "the flat concatenation must be byte-identical (boundary-only shift)"
+        );
+
+        assert!(
+            !MixedMmcs::verify_batch(&mmcs.root(), iota, &forged, &heights, &widths),
+            "boundary-shift forgery must be rejected by the width binding"
+        );
+    }
+
+    /// Extension-field (Fp3) coverage: the aux/composition matrices Tasks 2/3 feed
+    /// the MMCS are cubic-extension. Byte-parity cross-check of a single Fp3 matrix
+    /// against the existing per-table row-pair tree, plus an open/verify/tamper
+    /// roundtrip over the extension path.
+    #[test]
+    fn single_matrix_fp3_root_matches_existing_row_pair_tree() {
+        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Fp3;
+        type F3 = FieldElement<Fp3>;
+
+        let log_height = 3usize;
+        let num_rows = 1usize << log_height;
+        let width = 3usize;
+
+        // Populate ALL three components so the 24-byte extension serialization is
+        // exercised (not just the embedded-base subset).
+        let columns: Vec<Vec<F3>> = (0..width)
+            .map(|c| {
+                (0..num_rows)
+                    .map(|r| {
+                        F3::new([
+                            FE::from((c as u64) * 7 + r as u64 + 1),
+                            FE::from((r as u64) * 13 + 2),
+                            FE::from((c as u64) * 5 + (r as u64) * 3 + 4),
+                        ])
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let (_, existing_root) =
+            commit_bit_reversed(&columns, 2).expect("non-empty columns build a tree");
+
+        // Row-major bit-reversed equivalent of the same column-major data.
+        let mut data = vec![F3::zero(); num_rows * width];
+        for (r, chunk) in data.chunks_exact_mut(width).enumerate() {
+            let br = reverse_index(r, num_rows as u64);
+            for (c, col) in columns.iter().enumerate() {
+                chunk[c] = col[br].clone();
+            }
+        }
+
+        let mmcs = MixedMmcs::commit(&[(data, log_height, width)]);
+        assert_eq!(
+            mmcs.root(),
+            existing_root,
+            "Fp3 single-matrix root must match the existing row-pair tree"
+        );
+
+        let heights = [log_height];
+        let widths = [width];
+        for iota in 0..(1usize << (log_height - 1)) {
+            let opening = mmcs.open_batch(iota);
+            assert!(MixedMmcs::verify_batch(
+                &mmcs.root(),
+                iota,
+                &opening,
+                &heights,
+                &widths
+            ));
+        }
+
+        let mut opening = mmcs.open_batch(0);
+        opening.per_matrix[0].evaluations[0] =
+            &opening.per_matrix[0].evaluations[0] + &F3::one();
+        assert!(!MixedMmcs::verify_batch(
+            &mmcs.root(),
+            0,
+            &opening,
+            &heights,
+            &widths
+        ));
     }
 }
