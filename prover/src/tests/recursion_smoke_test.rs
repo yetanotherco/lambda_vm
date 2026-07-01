@@ -257,9 +257,7 @@ fn print_function_table(
     eprintln!("  Unique PCs   : {}", unique_pcs.len());
     eprintln!();
     eprintln!("  Top 25 (function, step) pairs by cycle count (aggregated over their PCs):");
-    eprintln!(
-        "  rank          cycles        %    cum %    PCs  step              function"
-    );
+    eprintln!("  rank          cycles        %    cum %    PCs  step              function");
     let mut fn_cumulative: u64 = 0;
     for (rank, ((name, bucket), (cycles, pcs))) in fn_entries.iter().take(25).enumerate() {
         fn_cumulative += cycles;

@@ -1072,9 +1072,8 @@ pub fn verify_with_options(
         None => return Ok(false),
     };
 
-    stark::profile_markers::step_marker::<
-        { stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE },
-    >();
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
 
     Ok(Verifier::multi_verify(
         &air_refs,
