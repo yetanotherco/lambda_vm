@@ -2,6 +2,7 @@ pub mod batched;
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
+pub mod mmcs;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::element::FieldElement;
