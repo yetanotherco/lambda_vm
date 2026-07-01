@@ -906,7 +906,6 @@ pub trait IsStarkVerifier<
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
     /// already been replayed and the RAP challenges are known.
-    #[inline(never)]
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
