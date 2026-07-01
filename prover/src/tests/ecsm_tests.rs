@@ -94,7 +94,7 @@ fn constraints_hold_on_generated_trace() {
             .evaluate(&view),
             FE::zero()
         );
-        for kind in [OverflowKind::KLtN, OverflowKind::XrLtP] {
+        for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
             for i in 0..7 {
                 assert_eq!(
                     CarryBit {
