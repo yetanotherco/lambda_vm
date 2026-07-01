@@ -390,15 +390,26 @@ fn launch_row_to_col_major(
 /// Returns (merkle_nodes, column-major device buffer, row-major LDE Vec). The
 /// buffer is transposed to column-major (as required by the downstream GPU
 /// kernels DEEP/barycentric); callers wrap it in the appropriate LDE handle.
+/// Row-major LDE input: either a host slice (uploaded) or an already-resident
+/// device buffer (copied device-to-device, no PCIe upload).
+enum InnerInput<'a> {
+    Host(&'a [u64]),
+    Dev(&'a CudaSlice<u64>),
+}
+
 fn coset_lde_row_major_inner(
-    row_major: &[u64],
+    input: InnerInput,
     n: usize,
     total_cols: usize,
     blowup_factor: usize,
     weights: &[u64],
     what: &str,
 ) -> Result<(GpuMerkleTree, CudaSlice<u64>, Vec<u64>)> {
-    assert_eq!(row_major.len(), n * total_cols);
+    let input_len = match &input {
+        InnerInput::Host(h) => h.len(),
+        InnerInput::Dev(d) => d.len(),
+    };
+    assert_eq!(input_len, n * total_cols);
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
@@ -420,10 +431,14 @@ fn coset_lde_row_major_inner(
     let be = backend()?;
     let stream = be.next_stream();
 
-    // H2D into a zeroed lde_size*total_cols buffer; only the first n*total_cols
-    // rows carry data, the remainder are already zero (zero-padding for LDE).
+    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
+    // carry data, the remainder are already zero (zero-padding for LDE). Host
+    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
-    stream.memcpy_htod(row_major, &mut buf.slice_mut(0..n * total_cols))?;
+    match input {
+        InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+    }
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -527,7 +542,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
     let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
-        row_major,
+        InnerInput::Host(row_major),
         n,
         m,
         blowup_factor,
@@ -561,12 +576,40 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
     let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
-        row_major,
+        InnerInput::Host(row_major),
         n,
         m * 3,
         blowup_factor,
         weights,
         "coset_lde_ext3_row_major lde_size",
+    )?;
+    let handle = GpuLdeExt3 {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+    };
+    Ok((handle, lde_out))
+}
+
+/// Like [`coset_lde_ext3_row_major_with_merkle_tree_keep`] but the input is an
+/// already-resident device buffer (`n * m` ext3 elements, row-major, `n*m*3`
+/// u64s). No PCIe upload: the buffer is copied device-to-device into the LDE
+/// scratch. Used by the resident LogUp aux path.
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+    input_dev: &CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
+        InnerInput::Dev(input_dev),
+        n,
+        m * 3,
+        blowup_factor,
+        weights,
+        "coset_lde_ext3_row_major_dev lde_size",
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),

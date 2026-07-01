@@ -10,6 +10,7 @@ pub mod device;
 pub mod fri;
 pub mod inverse;
 pub mod lde;
+pub mod logup;
 pub mod merkle;
 pub mod ntt;
 

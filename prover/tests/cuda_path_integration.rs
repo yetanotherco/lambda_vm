@@ -12,9 +12,23 @@ use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls,
+    gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls, gpu_parts_lde_calls,
     reset_all_gpu_call_counters,
 };
+
+/// The GPU LogUp aux-build path fires and still yields a verifying proof.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_logup_aux_build_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_logup_calls() > 0,
+        "GPU LogUp aux-build path did not fire (tables below threshold or fell back)"
+    );
+    assert!(verify(&proof, &elf).expect("verify"), "proof failed to verify");
+}
 
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]

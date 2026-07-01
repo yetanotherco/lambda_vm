@@ -30,6 +30,15 @@ where
     pub num_main_columns: usize,
     pub num_aux_columns: usize,
     pub step_size: usize,
+    /// LogUp aux columns built resident on device (pre-LDE), threaded from the
+    /// R1 aux build to the R1 aux commit so they feed the aux LDE without a host
+    /// round-trip. None on the CPU / download path.
+    #[cfg(feature = "cuda")]
+    pub(crate) aux_resident: Option<math_cuda::logup::ResidentAux>,
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill,
+    /// which needs the aux columns in the host trace to spill them).
+    #[cfg(feature = "cuda")]
+    pub(crate) resident_aux_ok: bool,
 }
 
 impl<F, E> TraceTable<F, E>
@@ -54,6 +63,10 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
         }
     }
 
@@ -76,6 +89,10 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
         }
     }
 
@@ -91,11 +108,39 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
         }
     }
 
     pub fn num_rows(&self) -> usize {
         self.main_table.height
+    }
+
+    /// Store the resident (pre-LDE) LogUp aux columns, threaded to the aux commit.
+    #[cfg(feature = "cuda")]
+    pub fn set_aux_resident(&mut self, ra: math_cuda::logup::ResidentAux) {
+        self.aux_resident = Some(ra);
+    }
+
+    /// Borrow the resident aux columns (read by the aux commit for the LDE).
+    #[cfg(feature = "cuda")]
+    pub fn aux_resident(&self) -> Option<&math_cuda::logup::ResidentAux> {
+        self.aux_resident.as_ref()
+    }
+
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn resident_aux_ok(&self) -> bool {
+        self.resident_aux_ok
+    }
+
+    /// Disable the GPU-resident aux build (host trace needed, e.g. disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn set_resident_aux_ok(&mut self, ok: bool) {
+        self.resident_aux_ok = ok;
     }
 
     pub fn num_steps(&self) -> usize {
@@ -395,6 +440,7 @@ where
     pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
         self.gpu_session.aux_lde = Some(h);
     }
+
 
     #[cfg(feature = "cuda")]
     pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {

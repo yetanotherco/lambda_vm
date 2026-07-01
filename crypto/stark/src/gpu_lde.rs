@@ -76,11 +76,18 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
+    GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// LogUp aux-build term-column GPU path attempts (one per table that took it).
+pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_logup_calls() -> u64 {
+    GPU_LOGUP_CALLS.load(Ordering::Relaxed)
 }
 
 // ============================================================================
@@ -1104,7 +1111,53 @@ unsafe fn ext3_slice_to_u64<E: IsField>(col: &[FieldElement<E>]) -> &[u64] {
 /// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated
 /// `Vec<FieldElement<E>>` of length `n`. Caller must have established
 /// `E == Ext3`.
-fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
+/// Like [`try_expand_leaf_and_tree_ext3_row_major_keep`] but the aux columns are
+/// already resident on device (from the GPU LogUp aux build) — no host upload.
+/// Consumes the resident buffer via the device-input LDE.
+pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
+    ra: &math_cuda::logup::ResidentAux,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3, Vec<FieldElement<E>>)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
+    {
+        return None;
+    }
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add((ra.num_aux_cols * 3) as u64, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+        &ra.buf,
+        ra.num_rows,
+        ra.num_aux_cols,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
+
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
+        )
+    };
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
+    Some((tree, handle, lde_out))
+}
+
+pub(crate) fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
 where
     E: IsField + 'static,
 {
