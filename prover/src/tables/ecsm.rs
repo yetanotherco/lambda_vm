@@ -887,7 +887,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
     }
 }
 
-/// Creates all ECSM transition constraints (411 total: 1 mu + 256 k bits + 8 xG<p + 146 others).
+/// Creates all ECSM transition constraints (412 total: 1 mu + 256 k bits + 1 q1[32] + 8 xG<p + 146 others).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -951,6 +951,12 @@ pub fn create_constraints(
         }
         .boxed(),
     );
+    idx += 1;
+
+    // IS_BIT(q1[32]) — the high byte of the 33-byte yG quotient is a single-bit value.
+    // The spec mandates this unconditionally (ec:c:q1_257); IS_BYTE(0..32) is separate
+    // (μ-gated bus interaction) and does not replace this polynomial constraint.
+    constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
     idx += 1;
 
     // xG < p: 7 carry bits + overflow-required.

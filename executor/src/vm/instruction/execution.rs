@@ -412,11 +412,10 @@ impl Instruction {
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
-                        // xG and k are both read at the same proof timestamp, so their
-                        // 32-byte ranges must be disjoint or the trace is unprovable
-                        // (MEMW orders accesses per address by strictly increasing
-                        // timestamp). xR may alias either: its accesses are offset to
-                        // later timestamps.
+                        // xG and k must occupy disjoint 32-byte regions: overlapping
+                        // addresses would cause the same memory byte to serve as both
+                        // an xG limb and a k bit, corrupting the scalar multiplication.
+                        // xR may alias either: its accesses are at a later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }

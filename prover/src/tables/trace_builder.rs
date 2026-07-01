@@ -644,11 +644,11 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
-/// Collects all MEMW ops and the ECSM / EC_SCALAR / ECDAS table ops for one ECSM ecall.
+/// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
-/// Timestamp scheme (within the instruction's 4-wide budget): the `x11`/`x12` register reads
-/// and the `xG`/`k` memory reads happen at `T`; the `x10` register read and the EC_SCALAR
-/// byte reads at `T + 1`; the `xR` memory writes at `T + 2`. Every read advances
+/// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read also
+/// at `T + 1`; `xR` memory writes at `T + 2`. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
 /// accesses always observe a strictly smaller old timestamp.
 #[allow(clippy::needless_range_loop)]
