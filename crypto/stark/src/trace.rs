@@ -441,7 +441,6 @@ where
         self.gpu_session.aux_lde = Some(h);
     }
 
-
     #[cfg(feature = "cuda")]
     pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
         self.gpu_session.main_lde.as_ref()

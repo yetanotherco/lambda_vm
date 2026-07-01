@@ -5,6 +5,7 @@
 //!   2. `logup_term_columns`: fingerprints -> batch inverse -> per-output-column
 //!      signed-multiplicity combine, producing the committed + virtual term
 //!      columns.
+//!
 //! The descriptor is passed as plain array slices ([`LogupDescriptor`]) so this
 //! crate stays independent of the stark types.
 
@@ -12,9 +13,9 @@ use std::sync::Arc;
 
 use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
+use crate::Result;
 use crate::device::backend;
 use crate::inverse::batch_inverse_ext3_dev;
-use crate::Result;
 
 const BLOCK_SIZE: u32 = 256;
 
@@ -286,7 +287,10 @@ pub fn logup_aux_resident(
 
     // Term columns (committed + virtual), resident, layout [col][row].
     // num_out is always >= 1 (the accumulated column); num_committed = num_out - 1.
-    debug_assert!(d.num_out_cols >= 1, "logup descriptor has no output columns");
+    debug_assert!(
+        d.num_out_cols >= 1,
+        "logup descriptor has no output columns"
+    );
     let num_out = d.num_out_cols;
     let mut terms = unsafe { stream.alloc::<u64>(num_out * num_rows * 3) }?;
     let out_col_offsets = stream.clone_htod(d.out_col_offsets)?;
@@ -325,7 +329,7 @@ pub fn logup_aux_resident(
             .arg(&mut row_sum)
             .launch(cfg(num_rows))?;
     }
-    scan_add_inplace(stream, &be, &mut row_sum, num_rows)?; // row_sum now holds S
+    scan_add_inplace(stream, be, &mut row_sum, num_rows)?; // row_sum now holds S
     let (i0, i1, i2) = (inv_n[0], inv_n[1], inv_n[2]);
     let mut accumulated = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
     let n_u64 = num_rows as u64;

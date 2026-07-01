@@ -92,8 +92,16 @@ pub fn print_report(
             mp.round1_sub.aux_fingerprint,
             total,
         );
-        row_sub("    LogUp batch invert (CPU)", mp.round1_sub.aux_invert, total);
-        row_sub("    LogUp term combine (CPU)", mp.round1_sub.aux_term, total);
+        row_sub(
+            "    LogUp batch invert (CPU)",
+            mp.round1_sub.aux_invert,
+            total,
+        );
+        row_sub(
+            "    LogUp term combine (CPU)",
+            mp.round1_sub.aux_term,
+            total,
+        );
         row_sub(
             "    LogUp accumulate scan (CPU)",
             mp.round1_sub.aux_accumulate,

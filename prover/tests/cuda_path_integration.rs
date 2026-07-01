@@ -27,7 +27,10 @@ fn gpu_logup_aux_build_fires_and_verifies() {
         gpu_logup_calls() > 0,
         "GPU LogUp aux-build path did not fire (tables below threshold or fell back)"
     );
-    assert!(verify(&proof, &elf).expect("verify"), "proof failed to verify");
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "proof failed to verify"
+    );
 }
 
 #[test]

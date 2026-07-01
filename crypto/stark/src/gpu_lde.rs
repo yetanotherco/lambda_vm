@@ -1118,7 +1118,11 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
     ra: &math_cuda::logup::ResidentAux,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
-) -> Option<(MerkleTree<B>, math_cuda::lde::GpuLdeExt3, Vec<FieldElement<E>>)>
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeExt3,
+    Vec<FieldElement<E>>,
+)>
 where
     F: IsField + 'static,
     E: IsField + 'static,

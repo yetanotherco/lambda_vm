@@ -12,8 +12,8 @@
 use std::any::TypeId;
 
 use crate::lookup::{
-    compute_alpha_powers, BusInteraction, BusValue, LinearTerm, Multiplicity, Packing,
-    LOGUP_CHALLENGE_ALPHA,
+    BusInteraction, BusValue, LOGUP_CHALLENGE_ALPHA, LinearTerm, Multiplicity, Packing,
+    compute_alpha_powers,
 };
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -46,11 +46,7 @@ fn i64_to_canonical(c: i64) -> u64 {
 
 /// Canonical Goldilocks negation.
 fn neg_canonical(x: u64) -> u64 {
-    if x == 0 {
-        0
-    } else {
-        GOLDILOCKS_P - x
-    }
+    if x == 0 { 0 } else { GOLDILOCKS_P - x }
 }
 
 /// Committed-pair / absorbed split, mirroring `lookup::split_interactions`.
@@ -185,7 +181,12 @@ impl FingerprintDescriptor {
                     Packing::Word4L => self.push_element(
                         alpha_off,
                         0,
-                        &[(1, c), (SHIFT_8, c + 1), (SHIFT_16, c + 2), (SHIFT_24, c + 3)],
+                        &[
+                            (1, c),
+                            (SHIFT_8, c + 1),
+                            (SHIFT_16, c + 2),
+                            (SHIFT_24, c + 3),
+                        ],
                     ),
                     Packing::DWordWL => {
                         self.push_element(alpha_off, 0, &[(1, c)]);
@@ -207,7 +208,12 @@ impl FingerprintDescriptor {
                         self.push_element(
                             alpha_off,
                             0,
-                            &[(1, c), (SHIFT_8, c + 1), (SHIFT_16, c + 2), (SHIFT_24, c + 3)],
+                            &[
+                                (1, c),
+                                (SHIFT_8, c + 1),
+                                (SHIFT_16, c + 2),
+                                (SHIFT_24, c + 3),
+                            ],
                         );
                         self.push_element(
                             alpha_off + 1,
@@ -334,6 +340,7 @@ impl FingerprintDescriptor {
 /// byte identical to the CPU path, or `None` to fall back (non Goldilocks,
 /// below threshold, no GPU, or a GPU error). The committed columns are written
 /// to the aux trace; the virtual column feeds the accumulated column.
+#[allow(clippy::type_complexity)]
 pub fn try_build_term_columns_gpu<F, E>(
     interactions: &[BusInteraction],
     main_cols: &[Vec<FieldElement<F>>],
@@ -383,14 +390,17 @@ where
 
     let md = desc.as_cuda();
     let term_flat =
-        math_cuda::logup::logup_term_columns(&main_flat, trace_len, &md, &alpha_flat, z_arr).ok()?;
+        math_cuda::logup::logup_term_columns(&main_flat, trace_len, &md, &alpha_flat, z_arr)
+            .ok()?;
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // term_flat layout [(col*trace_len + row)*3 + limb]; last column is virtual.
     let mut cols: Vec<Vec<FieldElement<E>>> = Vec::with_capacity(desc.num_out_cols);
     for col in 0..desc.num_out_cols {
         let lo = col * trace_len * 3;
-        cols.push(crate::gpu_lde::u64_to_ext3_vec::<E>(&term_flat[lo..lo + trace_len * 3]));
+        cols.push(crate::gpu_lde::u64_to_ext3_vec::<E>(
+            &term_flat[lo..lo + trace_len * 3],
+        ));
     }
     let virtual_column = cols.pop().unwrap();
     Some((cols, virtual_column))
@@ -449,7 +459,13 @@ where
     let stream = be.next_stream();
     let md = desc.as_cuda();
     let ra = math_cuda::logup::logup_aux_resident(
-        &main_flat, trace_len, &md, &alpha_flat, z_arr, inv_n, &stream,
+        &main_flat,
+        trace_len,
+        &md,
+        &alpha_flat,
+        z_arr,
+        inv_n,
+        &stream,
     )
     .ok()?;
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -479,9 +495,9 @@ where
         let t_hi = d.term_offsets[e + 1] as usize;
         for t in t_lo..t_hi {
             let coef = FieldElement::<F>::from(d.term_coef[t]);
-            base = base + &coef * get_col(d.term_col[t] as usize);
+            base += &coef * get_col(d.term_col[t] as usize);
         }
-        lc = lc + &base * &alpha_powers[d.elem_alpha_idx[e] as usize];
+        lc += &base * &alpha_powers[d.elem_alpha_idx[e] as usize];
     }
     z - &lc
 }
@@ -511,9 +527,10 @@ where
         let t_lo = d.mult_term_offsets[k] as usize;
         let t_hi = d.mult_term_offsets[k + 1] as usize;
         for t in t_lo..t_hi {
-            m = m + &FieldElement::<F>::from(d.mult_term_coef[t]) * get_col(d.mult_term_col[t] as usize);
+            m += &FieldElement::<F>::from(d.mult_term_coef[t])
+                * get_col(d.mult_term_col[t] as usize);
         }
-        term = term + &m * &reciprocals[k * num_rows + row];
+        term += &m * &reciprocals[k * num_rows + row];
     }
     term
 }
@@ -521,7 +538,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lookup::{compute_alpha_powers, PackingShifts};
+    use crate::lookup::{PackingShifts, compute_alpha_powers};
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
     use math::field::goldilocks::GoldilocksField;
 
@@ -570,8 +587,14 @@ mod tests {
                 One,
                 vec![
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 3, column: 1 },
-                        LinearTerm::Column { coefficient: -2, column: 4 },
+                        LinearTerm::Column {
+                            coefficient: 3,
+                            column: 1,
+                        },
+                        LinearTerm::Column {
+                            coefficient: -2,
+                            column: 4,
+                        },
                         LinearTerm::Constant(42),
                     ]),
                     BusValue::column(5),
@@ -583,7 +606,11 @@ mod tests {
         let num_rows = 16;
         let mut st = 0x1234_5678_9abc_def0u64;
         let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
-            .map(|_| (0..num_rows).map(|_| FieldElement::<F>::from(lcg(&mut st))).collect())
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st)))
+                    .collect()
+            })
             .collect();
 
         // Base-embedded random alpha/z: distinct powers exercise every coef/index.
@@ -592,7 +619,11 @@ mod tests {
         let shifts = PackingShifts::<F>::new();
 
         let desc = build_fingerprint_descriptor(&interactions);
-        let max_be = interactions.iter().map(|i| i.num_bus_elements()).max().unwrap();
+        let max_be = interactions
+            .iter()
+            .map(|i| i.num_bus_elements())
+            .max()
+            .unwrap();
         assert_eq!(desc.alpha_powers_len, max_be);
         let alpha_powers = compute_alpha_powers(&alpha, max_be);
 
@@ -634,8 +665,14 @@ mod tests {
                 One,
                 vec![
                     BusValue::linear(vec![
-                        LinearTerm::Column { coefficient: 3, column: 1 },
-                        LinearTerm::Column { coefficient: -2, column: 2 },
+                        LinearTerm::Column {
+                            coefficient: 3,
+                            column: 1,
+                        },
+                        LinearTerm::Column {
+                            coefficient: -2,
+                            column: 2,
+                        },
                         LinearTerm::Constant(7),
                     ]),
                     BusValue::column(3),
@@ -647,7 +684,11 @@ mod tests {
         let num_rows = 64;
         let mut st = 0xabcd_ef01_2345_6789u64;
         let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
-            .map(|_| (0..num_rows).map(|_| FieldElement::<F>::from(lcg(&mut st))).collect())
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st)))
+                    .collect()
+            })
             .collect();
         let alpha = mk_ext3(&mut st);
         let z = mk_ext3(&mut st);
@@ -680,9 +721,15 @@ mod tests {
         let be = math_cuda::device::backend().unwrap();
         let stream = be.next_stream();
         let md = desc.as_cuda();
-        let out_dev =
-            math_cuda::logup::logup_fingerprints_dev(&main_flat, num_rows, &md, &alpha_flat, limbs(&z), &stream)
-                .unwrap();
+        let out_dev = math_cuda::logup::logup_fingerprints_dev(
+            &main_flat,
+            num_rows,
+            &md,
+            &alpha_flat,
+            limbs(&z),
+            &stream,
+        )
+        .unwrap();
         let gpu: Vec<u64> = stream.clone_dtoh(&out_dev).unwrap();
         stream.synchronize().unwrap();
 
@@ -726,13 +773,27 @@ mod tests {
         vec![
             BusInteraction::sender(0u64, Multiplicity::Column(4), Packing::Direct.columns(&[0])),
             BusInteraction::receiver(1u64, Multiplicity::One, Packing::Word4L.columns(&[0])),
-            BusInteraction::sender(2u64, Multiplicity::Sum(4, 5), Packing::DWordHL.columns(&[0])),
-            BusInteraction::receiver(3u64, Multiplicity::Negated(6), Packing::QuadHL.columns(&[0])),
+            BusInteraction::sender(
+                2u64,
+                Multiplicity::Sum(4, 5),
+                Packing::DWordHL.columns(&[0]),
+            ),
+            BusInteraction::receiver(
+                3u64,
+                Multiplicity::Negated(6),
+                Packing::QuadHL.columns(&[0]),
+            ),
             BusInteraction::sender(
                 4u64,
                 Multiplicity::Linear(vec![
-                    LinearTerm::Column { coefficient: 1, column: 4 },
-                    LinearTerm::Column { coefficient: -1, column: 5 },
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: 4,
+                    },
+                    LinearTerm::Column {
+                        coefficient: -1,
+                        column: 5,
+                    },
                 ]),
                 vec![BusValue::column(1), BusValue::column(2)],
             ),
@@ -749,7 +810,11 @@ mod tests {
         let num_rows = 32;
         let mut st = 0x9e37_79b9_7f4a_7c15u64;
         let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
-            .map(|_| (0..num_rows).map(|_| FieldElement::<F>::from(lcg(&mut st) % 251)).collect())
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
             .collect();
         let alpha = FieldElement::<E>::from(lcg(&mut st));
         let z = FieldElement::<E>::from(lcg(&mut st));
@@ -762,7 +827,13 @@ mod tests {
         let mut recips: Vec<FieldElement<E>> = Vec::with_capacity(interactions.len() * num_rows);
         for k in 0..interactions.len() {
             for row in 0..num_rows {
-                recips.push(eval_fingerprint::<F, E>(&desc, k, |c| &main[c][row], &alpha_powers, &z));
+                recips.push(eval_fingerprint::<F, E>(
+                    &desc,
+                    k,
+                    |c| &main[c][row],
+                    &alpha_powers,
+                    &z,
+                ));
             }
         }
         FieldElement::inplace_batch_inverse(&mut recips).unwrap();
@@ -795,7 +866,11 @@ mod tests {
         let mut st = 0x5151_2323_9797_0e0eu64;
         // Small column values so multiplicities like Negated (0/1) stay meaningful.
         let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
-            .map(|_| (0..num_rows).map(|_| FieldElement::<F>::from(lcg(&mut st) % 251)).collect())
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
             .collect();
         let alpha = mk_ext3(&mut st);
         let z = mk_ext3(&mut st);
@@ -896,7 +971,11 @@ mod tests {
         let num_rows = 1024;
         let mut st = 0x243f_6a88_85a3_08d3u64;
         let main: Vec<Vec<FieldElement<F>>> = (0..num_cols)
-            .map(|_| (0..num_rows).map(|_| FieldElement::<F>::from(lcg(&mut st) % 251)).collect())
+            .map(|_| {
+                (0..num_rows)
+                    .map(|_| FieldElement::<F>::from(lcg(&mut st) % 251))
+                    .collect()
+            })
             .collect();
         let alpha = mk_ext3(&mut st);
         let z = mk_ext3(&mut st);
@@ -905,10 +984,31 @@ mod tests {
         let alpha_powers = compute_alpha_powers(&alpha, desc.alpha_powers_len);
 
         let committed = vec![
-            reference_term_column(&[&interactions[0], &interactions[1]], &main, num_rows, &alpha_powers, &z, &shifts),
-            reference_term_column(&[&interactions[2], &interactions[3]], &main, num_rows, &alpha_powers, &z, &shifts),
+            reference_term_column(
+                &[&interactions[0], &interactions[1]],
+                &main,
+                num_rows,
+                &alpha_powers,
+                &z,
+                &shifts,
+            ),
+            reference_term_column(
+                &[&interactions[2], &interactions[3]],
+                &main,
+                num_rows,
+                &alpha_powers,
+                &z,
+                &shifts,
+            ),
         ];
-        let virtual_col = reference_term_column(&[&interactions[4]], &main, num_rows, &alpha_powers, &z, &shifts);
+        let virtual_col = reference_term_column(
+            &[&interactions[4]],
+            &main,
+            num_rows,
+            &alpha_powers,
+            &z,
+            &shifts,
+        );
         let mut all = committed.clone();
         all.push(virtual_col);
         let (acc, total) = reference_accumulate(&all, num_rows);
@@ -940,14 +1040,24 @@ mod tests {
         let stream = be.next_stream();
         let md = desc.as_cuda();
         let ra = math_cuda::logup::logup_aux_resident(
-            &main_flat, num_rows, &md, &alpha_flat, limbs(&z), inv_n, &stream,
+            &main_flat,
+            num_rows,
+            &md,
+            &alpha_flat,
+            limbs(&z),
+            inv_n,
+            &stream,
         )
         .unwrap();
         assert_eq!(ra.num_aux_cols, num_aux);
         let gpu: Vec<u64> = stream.clone_dtoh(&*ra.buf).unwrap();
         stream.synchronize().unwrap();
 
-        assert_eq!(ra.table_contribution, limbs(&total), "table_contribution L mismatch");
+        assert_eq!(
+            ra.table_contribution,
+            limbs(&total),
+            "table_contribution L mismatch"
+        );
         assert_eq!(gpu, expected, "resident aux buffer mismatch CPU reference");
     }
 }
