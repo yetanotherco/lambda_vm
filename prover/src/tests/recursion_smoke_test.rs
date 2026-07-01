@@ -197,9 +197,10 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
 }
 
 /// Verifier sub-steps in execution order, keyed by `stark::profile_markers::STEP_*`
-/// value. `run_profile` buckets cycles by the highest marker observed so far
-/// (`decode_step_marker` — a missing marker just means that bucket stays at 0
-/// cycles, no substring matching or symbol table needed).
+/// value. `run_profile` buckets cycles by the latest marker observed so far
+/// (`decode_step_marker`, defaulting to bucket 0 until the first marker fires),
+/// so `multi_verify`'s per-table `3,4,5,6` repetition re-attributes cycles to
+/// the correct step on each table's `6->3` transition instead of latching at 6.
 const STEP_LABELS: [&str; 7] = [
     "0. setup (alloc init + postcard decode)",
     "1. airs_and_bus_balance (Elf::load/VmAirs::new preprocessed FFT+Merkle/bus balance)",
@@ -266,8 +267,10 @@ fn print_function_table(
 ) {
     let mut by_function: std::collections::HashMap<String, (u64, u64)> =
         std::collections::HashMap::new();
-    let mut by_function_per_step: std::collections::HashMap<u8, std::collections::HashMap<String, (u64, u64)>> =
-        std::collections::HashMap::new();
+    let mut by_function_per_step: std::collections::HashMap<
+        u8,
+        std::collections::HashMap<String, (u64, u64)>,
+    > = std::collections::HashMap::new();
     let mut unique_pcs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for ((pc, bucket), count) in &pc_hist {
         unique_pcs.insert(*pc);
@@ -316,10 +319,10 @@ fn print_function_table(
     }
 }
 
-/// Print the monotonic per-verifier-step cycle bucketing (`buckets[0]` = setup).
+/// Print the per-verifier-step cycle bucketing (`buckets[0]` = setup).
 fn print_step_breakdown(buckets: &[u64; 7], total_cycles: u64) {
     eprintln!();
-    eprintln!("  Per-step cycle breakdown (monotonic state machine):");
+    eprintln!("  Per-step cycle breakdown (latest-marker state machine):");
     eprintln!("  {:<70}  {:>14}  {:>7}", "bucket", "cycles", "%");
     for (label, cycles) in STEP_LABELS.iter().zip(buckets.iter()) {
         let pct = if total_cycles > 0 {
@@ -366,9 +369,7 @@ fn run_profile(
         |log| {
             let pc = log.current_pc;
 
-            if let Some(marker) = executor::vm::execution::decode_step_marker(&instructions, pc)
-                && bucket.get() < marker as u8
-            {
+            if let Some(marker) = executor::vm::execution::decode_step_marker(&instructions, pc) {
                 bucket.set(marker as u8);
             }
             buckets[bucket.get() as usize] += 1;

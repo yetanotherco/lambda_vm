@@ -303,17 +303,18 @@ impl InstructionCache {
 }
 
 /// Decode a `stark::profile_markers::step_marker` hit at `pc`: the marker
-/// convention is `addi x0, x0, N` (an `ArithImm` with `dst == 0`, `op ==
-/// Add`), which real code never emits spontaneously since writes to `x0` are
-/// always discarded. Returns the marker's `N` if `pc` decodes to one.
+/// convention is `addi x0, x0, N` (an `ArithImm` with `dst == 0`, `src == 0`,
+/// `op == Add`, `N != 0`), which real code never emits spontaneously since
+/// writes to `x0` are always discarded and the canonical NOP is `addi x0, x0,
+/// 0`. Returns the marker's `N` if `pc` decodes to one.
 pub fn decode_step_marker(instructions: &InstructionCache, pc: u64) -> Option<u32> {
     match instructions.get(pc)? {
         Instruction::ArithImm {
             dst: 0,
+            src: 0,
             op: crate::vm::instruction::decoding::ArithOp::Add,
             imm,
-            ..
-        } => Some(*imm as u32),
+        } if *imm != 0 => Some(*imm as u32),
         _ => None,
     }
 }
