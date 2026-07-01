@@ -413,6 +413,7 @@ where
 pub fn try_build_aux_resident_gpu<F, E>(
     interactions: &[BusInteraction],
     main_cols: &[Vec<FieldElement<F>>],
+    main_dev: Option<(&math_cuda::CudaSlice<u64>, usize)>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
 ) -> Option<math_cuda::logup::ResidentAux>
@@ -437,10 +438,19 @@ where
     }
 
     let num_cols = main_cols.len();
-    let mut main_flat = vec![0u64; num_cols * trace_len];
-    for (c, col) in main_cols.iter().enumerate() {
-        for (r, e) in col.iter().enumerate() {
-            main_flat[c * trace_len + r] = unsafe { *(e.value() as *const _ as *const u64) };
+    // Reuse the resident main trace from the R1 main LDE (column-major
+    // `[col*trace_len + row]`, same column order as `main_cols`) when it matches
+    // this table exactly; otherwise flatten + upload the host columns. The
+    // resident buffer skips the ~3 GB main re-upload.
+    let resident_main =
+        main_dev.filter(|&(buf, rows)| rows == trace_len && buf.len() == num_cols * trace_len);
+    let mut main_flat = Vec::new();
+    if resident_main.is_none() {
+        main_flat = vec![0u64; num_cols * trace_len];
+        for (c, col) in main_cols.iter().enumerate() {
+            for (r, e) in col.iter().enumerate() {
+                main_flat[c * trace_len + r] = unsafe { *(e.value() as *const _ as *const u64) };
+            }
         }
     }
     let z_arr = unsafe { *(challenges[0].value() as *const _ as *const [u64; 3]) };
@@ -458,8 +468,12 @@ where
     let be = math_cuda::device::backend().ok()?;
     let stream = be.next_stream();
     let md = desc.as_cuda();
+    let main = match resident_main {
+        Some((buf, _)) => math_cuda::logup::ResidentMain::Dev(buf),
+        None => math_cuda::logup::ResidentMain::Host(&main_flat),
+    };
     let ra = math_cuda::logup::logup_aux_resident(
-        &main_flat,
+        main,
         trace_len,
         &md,
         &alpha_flat,
@@ -1040,7 +1054,7 @@ mod tests {
         let stream = be.next_stream();
         let md = desc.as_cuda();
         let ra = math_cuda::logup::logup_aux_resident(
-            &main_flat,
+            math_cuda::logup::ResidentMain::Host(&main_flat),
             num_rows,
             &md,
             &alpha_flat,
@@ -1059,5 +1073,30 @@ mod tests {
             "table_contribution L mismatch"
         );
         assert_eq!(gpu, expected, "resident aux buffer mismatch CPU reference");
+
+        // Resident-main path: upload main col-major to device, then build via
+        // ResidentMain::Dev (no host upload). Must be byte-identical to Host.
+        let main_dev = stream.clone_htod(&main_flat).unwrap();
+        stream.synchronize().unwrap();
+        let ra_dev = math_cuda::logup::logup_aux_resident(
+            math_cuda::logup::ResidentMain::Dev(&main_dev),
+            num_rows,
+            &md,
+            &alpha_flat,
+            limbs(&z),
+            inv_n,
+            &stream,
+        )
+        .unwrap();
+        let gpu_dev: Vec<u64> = stream.clone_dtoh(&*ra_dev.buf).unwrap();
+        stream.synchronize().unwrap();
+        assert_eq!(
+            ra_dev.table_contribution, ra.table_contribution,
+            "resident-main L mismatch vs host-upload path"
+        );
+        assert_eq!(
+            gpu_dev, expected,
+            "resident-main aux buffer mismatch CPU reference"
+        );
     }
 }

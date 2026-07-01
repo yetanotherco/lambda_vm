@@ -269,9 +269,18 @@ impl Eq for ResidentAux {}
 /// Full aux build on device: fingerprints → invert → term columns → accumulate
 /// scan → assemble the row-major aux trace buffer, all resident. `inv_n` is
 /// `1/num_rows` embedded in ext3. The stream is synchronised before return.
+/// Main trace input for the resident aux build: either a host column-major
+/// buffer to upload, or an already-resident device buffer (from the R1 main
+/// LDE) to read in place. The device form skips the ~3 GB main re-upload.
+#[derive(Clone, Copy)]
+pub enum ResidentMain<'a> {
+    Host(&'a [u64]),
+    Dev(&'a CudaSlice<u64>),
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn logup_aux_resident(
-    main_cols: &[u64],
+    main: ResidentMain,
     num_rows: usize,
     d: &LogupDescriptor,
     alpha_powers: &[u64],
@@ -280,10 +289,40 @@ pub fn logup_aux_resident(
     stream: &Arc<CudaStream>,
 ) -> Result<ResidentAux> {
     let be = backend()?;
-    let main_dev = stream.clone_htod(main_cols)?;
-    let fp = fingerprints_into_dev(&main_dev, num_rows, d, alpha_powers, z, stream)?;
+    // Per-phase timing (env LAMBDA_VM_LOGUP_TIMING): sync between phases so wall
+    // time is attributed correctly. Off = no extra syncs, production path.
+    let timing = std::env::var_os("LAMBDA_VM_LOGUP_TIMING").is_some();
+    let sync_if = |on: bool| -> Result<()> {
+        if on {
+            stream.synchronize()?;
+        }
+        Ok(())
+    };
+    let t0 = std::time::Instant::now();
+
+    // Resident device main = zero upload; host main = one H2D. `uploaded` owns
+    // the staged buffer for the function scope so `main_dev` can borrow it.
+    let uploaded: Option<CudaSlice<u64>> = match main {
+        ResidentMain::Dev(_) => None,
+        ResidentMain::Host(h) => Some(stream.clone_htod(h)?),
+    };
+    let main_dev: &CudaSlice<u64> = match (main, &uploaded) {
+        (ResidentMain::Dev(d), _) => d,
+        (ResidentMain::Host(_), Some(up)) => up,
+        _ => unreachable!(),
+    };
+    let main_len = main_dev.len();
+    sync_if(timing)?;
+    let t_h2d = std::time::Instant::now();
+
+    let fp = fingerprints_into_dev(main_dev, num_rows, d, alpha_powers, z, stream)?;
+    sync_if(timing)?;
+    let t_fp = std::time::Instant::now();
+
     let n = d.num_interactions * num_rows;
     let recip = batch_inverse_ext3_dev(&fp, n, stream)?;
+    sync_if(timing)?;
+    let t_inv = std::time::Instant::now();
 
     // Term columns (committed + virtual), resident, layout [col][row].
     // num_out is always >= 1 (the accumulated column); num_committed = num_out - 1.
@@ -299,12 +338,14 @@ pub fn logup_aux_resident(
     let mult_term_offsets = stream.clone_htod(d.mult_term_offsets)?;
     let mult_term_coef = stream.clone_htod(d.mult_term_coef)?;
     let mult_term_col = stream.clone_htod(d.mult_term_col)?;
+    sync_if(timing)?;
+    let t_desc = std::time::Instant::now();
     let num_rows_u32 = num_rows as u32;
     let num_out_u32 = num_out as u32;
     unsafe {
         stream
             .launch_builder(&be.logup_term_ext3)
-            .arg(&main_dev)
+            .arg(main_dev)
             .arg(&num_rows_u32)
             .arg(&recip)
             .arg(&num_out_u32)
@@ -317,6 +358,8 @@ pub fn logup_aux_resident(
             .arg(&mut terms)
             .launch(cfg(num_out * num_rows))?;
     }
+    sync_if(timing)?;
+    let t_term = std::time::Instant::now();
 
     // row_sum over all term columns → additive scan → accumulated column.
     let mut row_sum = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
@@ -360,10 +403,33 @@ pub fn logup_aux_resident(
             .arg(&mut aux)
             .launch(cfg(num_rows))?;
     }
+    sync_if(timing)?;
+    let t_accum_done = std::time::Instant::now();
 
     // L = table_contribution = S[n-1] (sum of all term columns, all rows).
     let l_host: Vec<u64> = stream.clone_dtoh(&row_sum.slice((num_rows - 1) * 3..num_rows * 3))?;
     stream.synchronize()?;
+    if timing {
+        let t_end = std::time::Instant::now();
+        let ms = |a: std::time::Instant, b: std::time::Instant| (b - a).as_secs_f64() * 1e3;
+        let main_mb = (main_len * 8) as f64 / 1e6;
+        eprintln!(
+            "LOGUP_RESIDENT rows={} out_cols={} interactions={} main={:.0}MB | \
+             h2d_main={:.2} fp={:.2} inv={:.2} desc_up={:.2} term={:.2} accum={:.2} l_dtoh={:.2} total={:.2} ms",
+            num_rows,
+            num_out,
+            d.num_interactions,
+            main_mb,
+            ms(t0, t_h2d),
+            ms(t_h2d, t_fp),
+            ms(t_fp, t_inv),
+            ms(t_inv, t_desc),
+            ms(t_desc, t_term),
+            ms(t_term, t_accum_done),
+            ms(t_accum_done, t_end),
+            ms(t0, t_end),
+        );
+    }
     Ok(ResidentAux {
         buf: Arc::new(aux),
         num_aux_cols,

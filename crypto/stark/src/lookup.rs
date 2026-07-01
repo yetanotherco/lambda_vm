@@ -1054,6 +1054,13 @@ where
         let trace_len = trace.num_rows();
         let _table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
+        // Device-resident trace-domain main columns from the R1 main LDE, cloned
+        // (Arc, cheap) into a local so no borrow of `trace` is held across the
+        // `set_aux_resident` mutable borrow below. When present, the resident aux
+        // build reads them in place and skips the ~3 GB main re-upload.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        let resident_main = trace.main_trace_dev.clone();
+
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
@@ -1076,6 +1083,7 @@ where
             && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
                 interactions,
                 &main_segment_cols,
+                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
                 trace_len,
                 challenges,
             )

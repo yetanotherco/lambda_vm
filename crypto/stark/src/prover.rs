@@ -2229,6 +2229,19 @@ pub trait IsStarkProver<
             }
         }
 
+        // Thread each table's device-resident trace-domain main columns (kept by
+        // the R1 main LDE) onto its trace so the LogUp aux fingerprint kernel
+        // reads them in place instead of re-uploading ~3 GB. Tables without a GPU
+        // main handle (CPU LDE, preprocessed) fall back to the host upload path.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        for ((_, trace, _), gpu_main) in air_trace_pairs.iter_mut().zip(main_gpu_handles.iter()) {
+            if let Some(handle) = gpu_main
+                && let Some(td) = &handle.trace_dev
+            {
+                trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+            }
+        }
+
         #[cfg(feature = "parallel")]
         let aux_iter = air_trace_pairs.par_iter_mut();
         #[cfg(not(feature = "parallel"))]

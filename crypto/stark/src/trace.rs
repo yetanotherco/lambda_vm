@@ -39,7 +39,43 @@ where
     /// which needs the aux columns in the host trace to spill them).
     #[cfg(feature = "cuda")]
     pub(crate) resident_aux_ok: bool,
+    /// Trace-domain main columns kept resident on device from the R1 main LDE
+    /// (column-major `[col*rows + row]`), so the R1 LogUp aux fingerprint kernel
+    /// reads them in place instead of re-uploading ~3 GB. None when the GPU main
+    /// LDE did not run for this table.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_trace_dev: Option<ResidentMainTrace>,
 }
+
+/// Device-resident trace-domain main columns (column-major `[col*rows + row]`),
+/// retained from the R1 main LDE for the aux fingerprint kernel. GPU-only and
+/// transient; the device buffer is excluded from logical trace equality (only
+/// `rows` participates) and opaque in `Debug`, matching `ResidentAux`.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct ResidentMainTrace {
+    pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+    pub(crate) rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for ResidentMainTrace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResidentMainTrace")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PartialEq for ResidentMainTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for ResidentMainTrace {}
 
 impl<F, E> TraceTable<F, E>
 where
@@ -67,6 +103,8 @@ where
             aux_resident: None,
             #[cfg(feature = "cuda")]
             resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -93,6 +131,8 @@ where
             aux_resident: None,
             #[cfg(feature = "cuda")]
             resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -112,6 +152,8 @@ where
             aux_resident: None,
             #[cfg(feature = "cuda")]
             resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -141,6 +183,26 @@ where
     #[cfg(feature = "cuda")]
     pub fn set_resident_aux_ok(&mut self, ok: bool) {
         self.resident_aux_ok = ok;
+    }
+
+    /// Stash the device-resident trace-domain main columns from the R1 main LDE
+    /// (column-major `[col*rows + row]`) so the aux fingerprint kernel reads them
+    /// in place.
+    #[cfg(feature = "cuda")]
+    pub fn set_main_trace_dev(
+        &mut self,
+        buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+        rows: usize,
+    ) {
+        self.main_trace_dev = Some(ResidentMainTrace { buf, rows });
+    }
+
+    /// The device-resident main trace `(buffer, rows)`, if retained by R1.
+    #[cfg(feature = "cuda")]
+    pub fn main_trace_dev(&self) -> Option<(&math_cuda::CudaSlice<u64>, usize)> {
+        self.main_trace_dev
+            .as_ref()
+            .map(|r| (r.buf.as_ref(), r.rows))
     }
 
     pub fn num_steps(&self) -> usize {

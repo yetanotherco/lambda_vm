@@ -178,6 +178,8 @@ fn run_parity(
         m: num_main,
         lde_size,
         tree: None,
+        trace_dev: None,
+        trace_rows: 0,
     };
     let aux_handle = if num_aux > 0 {
         Some(GpuLdeExt3 {
