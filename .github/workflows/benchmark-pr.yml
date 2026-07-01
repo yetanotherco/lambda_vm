@@ -43,7 +43,6 @@ env:
   # side past 5 buys little here (the cached comparison can't beat the ~1% drift wall),
   # so the per-PR run count is also capped at 5 (clamp below).
   BENCH_RUNS_BASELINE: 5
-  VERIFIER_BENCH_RUNS: 10
   # Memory-scaling sweep: same ELF, different N-transfer inputs. GROWTH_PROGRAMS
   # are the generated (gitignored) fixture basenames in executor/tests/; GROWTH_STEPS
   # the matching transfer counts (x-axis; slope is MB per transfer).
@@ -62,6 +61,7 @@ jobs:
        startsWith(github.event.comment.body, '/bench') &&
        !startsWith(github.event.comment.body, '/bench-abba') &&
        !startsWith(github.event.comment.body, '/bench-gpu') &&
+       !startsWith(github.event.comment.body, '/bench-verify') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     steps:
       - name: React to comment
@@ -184,6 +184,7 @@ jobs:
             echo "--- Run $i/$RUNS ---"
             ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
               | tee /tmp/cli_output_$i.txt
+            rm -f /tmp/proof.bin
 
             T=$(grep -o 'Proving time: [0-9.]*' /tmp/cli_output_$i.txt | awk '{print $3}')
             H=$(grep -o 'Peak heap: [0-9]*' /tmp/cli_output_$i.txt | awk '{print $3}')
@@ -197,7 +198,6 @@ jobs:
             TIMES="$TIMES $T"
             HEAPS="$HEAPS $H"
           done
-          # proof.bin from the last prover run is kept for the verifier benchmark below
 
           # Median position (works for odd N; for even N picks lower-middle)
           MEDIAN_POS=$(( (RUNS + 1) / 2 ))
@@ -236,35 +236,6 @@ jobs:
           echo "all_times=$ALL_TIMES" >> /tmp/metrics.txt
           echo "all_heaps=$ALL_HEAPS" >> /tmp/metrics.txt
           echo "runs=$RUNS" >> /tmp/metrics.txt
-
-      - name: Benchmark verifier (PR)
-        id: pr-verify
-        run: |
-          VTIMES=""
-          for i in $(seq 1 $VERIFIER_BENCH_RUNS); do
-            echo "--- Verify run $i/$VERIFIER_BENCH_RUNS ---"
-            ./target/release/cli verify /tmp/proof.bin "$ELF" --time \
-              | tee /tmp/verify_output_$i.txt
-            VT=$(grep -o 'Verification time: [0-9.]*' /tmp/verify_output_$i.txt | awk '{print $3}')
-            if [ -z "$VT" ]; then
-              echo "::error::Failed to parse verify time from run $i"
-              cat /tmp/verify_output_$i.txt
-              exit 1
-            fi
-            VTIMES="$VTIMES $VT"
-          done
-          rm -f /tmp/proof.bin
-
-          VMEDIAN_POS=$(( (VERIFIER_BENCH_RUNS + 1) / 2 ))
-          VTIME_MEDIAN=$(echo $VTIMES | tr ' ' '\n' | sort -n | awk "NR==$VMEDIAN_POS")
-          VTIME_MIN=$(echo $VTIMES | tr ' ' '\n' | sort -n | head -1)
-          VTIME_MAX=$(echo $VTIMES | tr ' ' '\n' | sort -n | tail -1)
-          VTIME_SPREAD=$(awk "BEGIN { if ($VTIME_MEDIAN > 0) printf \"%.1f\", (($VTIME_MAX - $VTIME_MIN) / $VTIME_MEDIAN) * 100; else print \"0.0\" }")
-
-          echo "verify_time_s=$VTIME_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "verify_time_spread=$VTIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "verify_time_s=$VTIME_MEDIAN" >> /tmp/metrics.txt
-          echo "verify_time_spread=$VTIME_SPREAD" >> /tmp/metrics.txt
 
       - name: Memory growth (PR)
         id: pr-growth
@@ -366,19 +337,17 @@ jobs:
               BASELINE_FILE=$(ls -t baseline/*/metrics.txt 2>/dev/null | head -1)
               if [ -n "$BASELINE_FILE" ]; then
                 echo "found=true" >> "$GITHUB_OUTPUT"
-                echo "peak_mb=$(grep '^peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_s=$(grep '^time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "time_spread=$(grep '^time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "heap_spread=$(grep '^heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_times=$(grep '^all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "all_heaps=$(grep '^all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "runs=$(grep '^runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_heaps=$(grep '^growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_times=$(grep '^growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_slope_mb=$(grep '^growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "growth_r2=$(grep '^growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "verify_time_s=$(grep '^verify_time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
-                echo "verify_time_spread=$(grep '^verify_time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "peak_mb=$(grep 'peak_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_s=$(grep 'time_s=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "time_spread=$(grep 'time_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "heap_spread=$(grep 'heap_spread=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_times=$(grep 'all_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "all_heaps=$(grep 'all_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "runs=$(grep 'runs=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_heaps=$(grep 'growth_heaps=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_times=$(grep 'growth_times=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_slope_mb=$(grep 'growth_slope_mb=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
+                echo "growth_r2=$(grep 'growth_r2=' "$BASELINE_FILE" | cut -d= -f2)" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
@@ -417,6 +386,7 @@ jobs:
             echo "--- Baseline run $i/$RUNS ---"
             ./target/release/cli prove "$ELF" --private-input "$INPUT" -o /tmp/proof.bin --time \
               | tee /tmp/baseline_output_$i.txt
+            rm -f /tmp/proof.bin
 
             T=$(grep -o 'Proving time: [0-9.]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
             H=$(grep -o 'Peak heap: [0-9]*' /tmp/baseline_output_$i.txt | awk '{print $3}')
@@ -430,7 +400,6 @@ jobs:
             TIMES="$TIMES $T"
             HEAPS="$HEAPS $H"
           done
-          # proof.bin from the last prover run is kept for the verifier benchmark below
 
           MEDIAN_POS=$(( (RUNS + 1) / 2 ))
           TIME_MEDIAN=$(echo $TIMES | tr ' ' '\n' | sort -n | awk "NR==$MEDIAN_POS")
@@ -459,31 +428,6 @@ jobs:
           echo "all_times=$ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "all_heaps=$ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "runs=$RUNS" >> "$GITHUB_OUTPUT"
-
-          # --- Verifier benchmark (100 iterations on the last primary proof) ---
-          VTIMES=""
-          for i in $(seq 1 $VERIFIER_BENCH_RUNS); do
-            echo "--- Baseline verify run $i/$VERIFIER_BENCH_RUNS ---"
-            ./target/release/cli verify /tmp/proof.bin "$ELF" --time \
-              | tee /tmp/baseline_verify_output_$i.txt
-            VT=$(grep -o 'Verification time: [0-9.]*' /tmp/baseline_verify_output_$i.txt | awk '{print $3}')
-            if [ -z "$VT" ]; then
-              echo "::error::Failed to parse baseline verify time from run $i"
-              cat /tmp/baseline_verify_output_$i.txt
-              exit 1
-            fi
-            VTIMES="$VTIMES $VT"
-          done
-          rm -f /tmp/proof.bin
-
-          VMEDIAN_POS=$(( (VERIFIER_BENCH_RUNS + 1) / 2 ))
-          VTIME_MEDIAN=$(echo $VTIMES | tr ' ' '\n' | sort -n | awk "NR==$VMEDIAN_POS")
-          VTIME_MIN=$(echo $VTIMES | tr ' ' '\n' | sort -n | head -1)
-          VTIME_MAX=$(echo $VTIMES | tr ' ' '\n' | sort -n | tail -1)
-          VTIME_SPREAD=$(awk "BEGIN { if ($VTIME_MEDIAN > 0) printf \"%.1f\", (($VTIME_MAX - $VTIME_MIN) / $VTIME_MEDIAN) * 100; else print \"0.0\" }")
-
-          echo "verify_time_s=$VTIME_MEDIAN" >> "$GITHUB_OUTPUT"
-          echo "verify_time_spread=$VTIME_SPREAD" >> "$GITHUB_OUTPUT"
 
           # --- Growth benchmarks (default parallelism, 1 sample each) ---
           # Only run if /bench-growth, push, or workflow_dispatch
@@ -584,8 +528,6 @@ jobs:
           BR_GROWTH_TIMES: ${{ steps.baseline-run.outputs.growth_times }}
           BR_GROWTH_SLOPE: ${{ steps.baseline-run.outputs.growth_slope_mb }}
           BR_GROWTH_R2: ${{ steps.baseline-run.outputs.growth_r2 }}
-          BR_VERIFY_TIME_S: ${{ steps.baseline-run.outputs.verify_time_s }}
-          BR_VERIFY_TIME_SPREAD: ${{ steps.baseline-run.outputs.verify_time_spread }}
           # PR outputs
           CURRENT_PEAK: ${{ steps.pr.outputs.peak_mb }}
           CURRENT_TIME: ${{ steps.pr.outputs.time_s }}
@@ -594,11 +536,6 @@ jobs:
           PR_ALL_TIMES: ${{ steps.pr.outputs.all_times }}
           PR_ALL_HEAPS: ${{ steps.pr.outputs.all_heaps }}
           PR_RUNS: ${{ steps.pr.outputs.runs }}
-          PR_VERIFY_TIME_S: ${{ steps.pr-verify.outputs.verify_time_s }}
-          PR_VERIFY_TIME_SPREAD: ${{ steps.pr-verify.outputs.verify_time_spread }}
-          # Baseline artifact verify outputs
-          BA_VERIFY_TIME_S: ${{ steps.baseline-artifact.outputs.verify_time_s }}
-          BA_VERIFY_TIME_SPREAD: ${{ steps.baseline-artifact.outputs.verify_time_spread }}
           # PR growth outputs
           PR_GROWTH_HEAPS: ${{ steps.pr-growth.outputs.growth_heaps }}
           PR_GROWTH_TIMES: ${{ steps.pr-growth.outputs.growth_times }}
@@ -619,8 +556,6 @@ jobs:
             BASELINE_GROWTH_TIMES="$BA_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BA_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BA_GROWTH_R2"
-            BASELINE_VERIFY_TIME="$BA_VERIFY_TIME_S"
-            BASELINE_VERIFY_SPREAD="$BA_VERIFY_TIME_SPREAD"
           else
             BASELINE_PEAK="$BR_PEAK_MB"
             BASELINE_TIME="$BR_TIME_S"
@@ -634,8 +569,6 @@ jobs:
             BASELINE_GROWTH_TIMES="$BR_GROWTH_TIMES"
             BASELINE_GROWTH_SLOPE="$BR_GROWTH_SLOPE"
             BASELINE_GROWTH_R2="$BR_GROWTH_R2"
-            BASELINE_VERIFY_TIME="$BR_VERIFY_TIME_S"
-            BASELINE_VERIFY_SPREAD="$BR_VERIFY_TIME_SPREAD"
           fi
 
           if [ -z "$BASELINE_PEAK" ] || [ "$BASELINE_PEAK" -eq 0 ] 2>/dev/null ||
@@ -666,18 +599,6 @@ jobs:
           echo "baseline_all_times=$BASELINE_ALL_TIMES" >> "$GITHUB_OUTPUT"
           echo "baseline_all_heaps=$BASELINE_ALL_HEAPS" >> "$GITHUB_OUTPUT"
           echo "baseline_runs=$BASELINE_RUNS" >> "$GITHUB_OUTPUT"
-
-          # Verifier comparison
-          echo "pr_verify_time=$PR_VERIFY_TIME_S" >> "$GITHUB_OUTPUT"
-          echo "pr_verify_time_spread=$PR_VERIFY_TIME_SPREAD" >> "$GITHUB_OUTPUT"
-          echo "baseline_verify_time=$BASELINE_VERIFY_TIME" >> "$GITHUB_OUTPUT"
-          echo "baseline_verify_time_spread=$BASELINE_VERIFY_SPREAD" >> "$GITHUB_OUTPUT"
-          if [ -n "$BASELINE_VERIFY_TIME" ] && [ -n "$PR_VERIFY_TIME_S" ]; then
-            VERIFY_TIME_DIFF=$(awk "BEGIN { printf \"%.4f\", $PR_VERIFY_TIME_S - $BASELINE_VERIFY_TIME }")
-            VERIFY_TIME_PCT=$(awk "BEGIN { if ($BASELINE_VERIFY_TIME > 0) printf \"%.1f\", (($PR_VERIFY_TIME_S - $BASELINE_VERIFY_TIME) * 100) / $BASELINE_VERIFY_TIME; else print \"0.0\" }")
-            echo "verify_time_diff=$VERIFY_TIME_DIFF" >> "$GITHUB_OUTPUT"
-            echo "verify_time_pct=$VERIFY_TIME_PCT" >> "$GITHUB_OUTPUT"
-          fi
 
           # Growth comparison
           echo "pr_growth_heaps=$PR_GROWTH_HEAPS" >> "$GITHUB_OUTPUT"
@@ -729,12 +650,6 @@ jobs:
           BASE_GROWTH_R2: ${{ steps.compare.outputs.baseline_growth_r2 }}
           GROWTH_SLOPE_DIFF: ${{ steps.compare.outputs.growth_slope_diff }}
           GROWTH_SLOPE_PCT: ${{ steps.compare.outputs.growth_slope_pct }}
-          PR_VERIFY_TIME: ${{ steps.compare.outputs.pr_verify_time }}
-          PR_VERIFY_SPREAD: ${{ steps.compare.outputs.pr_verify_time_spread }}
-          BASE_VERIFY_TIME: ${{ steps.compare.outputs.baseline_verify_time }}
-          BASE_VERIFY_SPREAD: ${{ steps.compare.outputs.baseline_verify_time_spread }}
-          VERIFY_TIME_DIFF: ${{ steps.compare.outputs.verify_time_diff }}
-          VERIFY_TIME_PCT: ${{ steps.compare.outputs.verify_time_pct }}
           COMMIT_SHA: ${{ steps.pr-ref.outputs.sha || github.sha }}
           TABLE_PARALLELISM: ${{ steps.config.outputs.table_parallelism }}
         with:
@@ -770,14 +685,6 @@ jobs:
             const growthSlopeDiff = process.env.GROWTH_SLOPE_DIFF;
             const growthSlopePct = process.env.GROWTH_SLOPE_PCT;
 
-            // Verifier data
-            const prVerifyTime = process.env.PR_VERIFY_TIME;
-            const prVerifySpread = process.env.PR_VERIFY_SPREAD;
-            const baseVerifyTime = process.env.BASE_VERIFY_TIME;
-            const baseVerifySpread = process.env.BASE_VERIFY_SPREAD;
-            const verifyTimeDiff = process.env.VERIFY_TIME_DIFF;
-            const verifyTimePct = process.env.VERIFY_TIME_PCT;
-
             const fmt = (v) => parseFloat(v) >= 0 ? `+${v}` : v;
             const icon = (pct) => parseFloat(pct) > 5 ? '🔴' : parseFloat(pct) < -5 ? '🟢' : '⚪';
             const SPREAD_THRESHOLD = 5.0;
@@ -791,13 +698,7 @@ jobs:
             body += `| Metric | main | PR | Δ |\n`;
             body += `|--------|------|----|---|\n`;
             body += `| **Peak heap** | ${basePeak} MB | ${peak} MB | ${fmt(peakDiff)} MB (${fmt(peakPct)}%) ${icon(peakPct)} |\n`;
-            body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timeDiff)}s (${fmt(timePct)}%) ${icon(timePct)} |\n`;
-            if (prVerifyTime && baseVerifyTime && verifyTimeDiff) {
-              body += `| **Verify time** | ${baseVerifyTime}s | ${prVerifyTime}s | ${fmt(verifyTimeDiff)}s (${fmt(verifyTimePct)}%) ${icon(verifyTimePct)} |\n`;
-            } else if (prVerifyTime) {
-              body += `| **Verify time** | — | ${prVerifyTime}s | — |\n`;
-            }
-            body += `\n`;
+            body += `| **Prove time** | ${baseTime}s | ${time}s | ${fmt(timeDiff)}s (${fmt(timePct)}%) ${icon(timePct)} |\n\n`;
 
             const regression = parseFloat(peakPct) > 5 || parseFloat(timePct) > 5;
             const improvement = parseFloat(peakPct) < -5 || parseFloat(timePct) < -5;
@@ -840,9 +741,6 @@ jobs:
             if (baseHeapSpread && parseFloat(baseHeapSpread) > SPREAD_THRESHOLD) {
               const vals = baseAllHeaps ? baseAllHeaps.split('/').map(h => `${h} MB`).join(' / ') : '';
               baseWarnings.push(`Baseline heap spread: ${baseHeapSpread}% (${vals}) — comparison may be less reliable`);
-            }
-            if (prVerifySpread && parseFloat(prVerifySpread) > SPREAD_THRESHOLD) {
-              prWarnings.push(`Verify time spread: ${prVerifySpread}%`);
             }
 
             const allWarnings = [...prWarnings, ...baseWarnings];

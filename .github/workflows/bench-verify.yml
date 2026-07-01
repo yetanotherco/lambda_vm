@@ -1,0 +1,136 @@
+name: Bench verifier
+
+# Drift-free paired (A/B/B/A) verifier benchmark (PR vs main). Kept SEPARATE from /bench
+# so the prover and verifier benches never contend for the single self-hosted bench
+# server. It builds both binaries, proves once per side, and runs ~20 interleaved verify
+# pairs (~4 min), so it NEVER auto-triggers -- only on an explicit `/bench-verify`
+# comment on a PR.
+on:
+  issue_comment:
+    types: [created]
+
+# One verifier run per PR; a re-trigger cancels the stale one. (The single self-hosted
+# bench runner serializes across PRs on its own.)
+concurrency:
+  group: bench-verify-${{ github.event.issue.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  verify:
+    # Manual-only: a "/bench-verify" comment on a PR, from a repo member. Never auto.
+    if: >-
+      github.event.issue.pull_request &&
+      startsWith(github.event.comment.body, '/bench-verify') &&
+      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+    runs-on: [self-hosted, bench]
+    # Generous ceiling so a hang can't strand the single bench runner; the workload is
+    # ~a few min (two builds + 2 proves + 2*N verifies at ~5s each).
+    timeout-minutes: 60
+    steps:
+      - name: Acknowledge (react + occupancy notice)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            });
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: '⏳ **Verifier benchmark started** on the bench server (~4 min). The bench server is occupied until it finishes.'
+            });
+
+      - name: Resolve PR head + pair count
+        id: cfg
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUM: ${{ github.event.issue.number }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+        run: |
+          # Resolve the head SHA (not the branch name): pinning the commit works for
+          # fork PRs too and avoids a force-push race mid-run.
+          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          # Optional pair count, e.g. "/bench-verify 32"; default 20. Clamp to [2,40]
+          # (pair-diff sd ~1.15%: ~8 pairs resolve 0.8%, ~15 for 0.6%).
+          N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-verify[[:space:]]*\([0-9]\+\).*|\1|p')
+          N=${N:-20}
+          if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
+            echo "::warning::pair count $N out of range [2,40]; using 20"
+            N=20
+          fi
+          echo "pairs=$N" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout (full history for ref resolution)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch PR head commit (works for fork PRs)
+        env:
+          PR_NUM: ${{ github.event.issue.number }}
+        run: git fetch origin "pull/$PR_NUM/head" --quiet
+
+      - name: Add cargo to PATH
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Run verifier benchmark
+        id: run
+        env:
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+        run: |
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
+          set -o pipefail
+          # bench_verify.sh builds the cli at both refs (isolated worktree), proves once
+          # per side, runs the interleaved A/B/B/A verify pairs, and prints the paired-t
+          # CI + exact Wilcoxon result.
+          scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
+          sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
+
+      - name: Post result
+        if: always()
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
+          PAIRS: ${{ steps.cfg.outputs.pairs }}
+          OUTCOME: ${{ steps.run.outcome }}
+        with:
+          script: |
+            const fs = require('fs');
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+            const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
+            let body = `## Verifier benchmark — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            if (process.env.OUTCOME === 'success') {
+              const res = read('/tmp/verify_result.txt') || read('/tmp/verify_out.txt');
+              body += res + '\n';
+              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. + = PR faster. ';
+              body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+            } else {
+              const tail = read('/tmp/verify_out.txt').split('\n').slice(-30).join('\n');
+              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
+            }
+            // Update the existing verifier-bench comment if present, else create one.
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Verifier benchmark —'));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body
+              });
+            }
