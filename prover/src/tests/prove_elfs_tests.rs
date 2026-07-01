@@ -3288,6 +3288,19 @@ fn test_continuation_pipeline_end_to_end() {
         boundaries.push(boundary);
     }
 
+    // Guard against silent degradation: this test exists to exercise brought-forward
+    // filler padding, so at least one epoch must have had fillers appended (its padded
+    // boundary is longer than its touched-cell count). If the ELF ever touched a
+    // power-of-two count in every epoch, no fillers would be added and the test would
+    // pass while exercising none.
+    assert!(
+        boundaries
+            .iter()
+            .zip(&all_touched)
+            .any(|(b, touched)| b.len() > touched.len()),
+        "no epoch required filler rows — the filler path is not being exercised"
+    );
+
     let proof_options = ProofOptions::default_test_options();
 
     // Pass 2: prove+verify each epoch, committing boundaries[i] inertly, and

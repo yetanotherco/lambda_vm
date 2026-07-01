@@ -255,10 +255,11 @@ pub fn append_bring_forward_fillers(
     if boundary.len() >= target {
         return Ok(());
     }
-    // Addresses already claimed this epoch (real touched cells). Filler pages are
-    // deduplicated by the caller, so a filler address can never collide with another
-    // filler; only touched cells need to be skipped.
-    let occupied: HashSet<u64> = boundary.iter().map(|b| b.address).collect();
+    // Addresses already claimed this epoch: real touched cells, plus each filler as
+    // it is drawn. Tracking appended fillers here (not just touched cells) keeps the
+    // function correct even if `candidate_pages` contains a duplicate page — a filler
+    // address can then never be emitted twice.
+    let mut occupied: HashSet<u64> = boundary.iter().map(|b| b.address).collect();
 
     for &page_base in candidate_pages {
         if boundary.len() == target {
@@ -269,7 +270,7 @@ pub fn append_bring_forward_fillers(
                 break;
             }
             let address = page_base + offset;
-            if occupied.contains(&address) {
+            if !occupied.insert(address) {
                 continue;
             }
             let (originating_epoch, value, _ts) = provenance.get(address);

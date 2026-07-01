@@ -809,6 +809,38 @@ fn test_global_memory_bus_balances_with_fillers() {
     );
 }
 
+/// Multiple fillers in one epoch (5 touched → padded to 8, i.e. 3 fillers) telescope
+/// on the GlobalMemory bus. The single-filler tests never exercise more than one
+/// filler row nor a wider power-of-two gap.
+#[test]
+fn test_global_memory_bus_balances_with_multiple_fillers() {
+    let mut provenance = local_to_global::genesis_provenance(std::iter::empty());
+    let mut epoch0 = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(0),
+        &[(10, 1, 3), (20, 2, 4), (30, 3, 5), (40, 4, 6), (50, 5, 7)],
+    );
+    assert_eq!(epoch0.len(), 5, "5 touched cells (not a power of two)");
+    local_to_global::append_bring_forward_fillers(
+        &mut epoch0,
+        &mut provenance,
+        &[0],
+        local_to_global::epoch_label(0),
+    )
+    .unwrap();
+    assert_eq!(
+        epoch0.len(),
+        8,
+        "padded to a power of two with three fillers"
+    );
+
+    let boundaries = vec![epoch0];
+    assert!(
+        prove_and_verify(&boundaries),
+        "multiple brought-forward fillers must telescope on the GlobalMemory bus"
+    );
+}
+
 /// A cell brought forward as a filler in one epoch and then genuinely TOUCHED in a
 /// later epoch must telescope correctly: the later epoch's init consumes the
 /// filler's produced token (init_epoch = the filler epoch), and the value flows
