@@ -245,6 +245,22 @@ jobs:
           echo "::error::Could not provision a ready GPU box after $MAX_TRIES distinct offers"
           exit 1
 
+      # Print the box's hardware in its own step: the "Run GPU tests" log is huge and gets
+      # truncated/rotated in the UI, so nvidia-smi printed inside gpu_test.sh can be hard to
+      # recover. Its own short-lived step keeps the GPU/driver/CPU/RAM info easy to find.
+      - name: Print machine info
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # shellcheck disable=SC2016  # $(nproc) etc. must expand on the remote box, not here
+          $SSH 'nvidia-smi; echo; nvcc --version | tail -n2; echo; \
+                echo "CPU: $(nproc) cores"; \
+                grep -m1 "model name" /proc/cpuinfo; \
+                free -h'
+
       - name: Run GPU tests
         id: tests
         env:
