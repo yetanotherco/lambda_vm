@@ -118,6 +118,9 @@ pub struct Backend {
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
+    /// VRAM budget (bytes) for table-session admission control. See
+    /// [`detect_vram_budget_bytes`].
+    vram_budget_bytes: u64,
 
     // arith.ptx
     pub vector_add_u64: CudaFunction,
@@ -154,6 +157,7 @@ pub struct Backend {
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
+    pub merkle_gather_paths: CudaFunction,
 
     // barycentric.ptx
     pub barycentric_base_batched: CudaFunction,
@@ -181,6 +185,74 @@ pub struct Backend {
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
 }
 
+/// Raise the device default memory pool's release threshold so freed
+/// stream-ordered allocations are kept for reuse instead of returned to the OS
+/// at each sync. Best-effort: any failure (e.g. a device/driver without
+/// stream-ordered allocator support) leaves the default behaviour untouched.
+fn retain_default_mempool(ctx: &CudaContext) {
+    use cudarc::driver::sys;
+    // SAFETY: raw CUDA driver calls. `ctx.cu_device()` is a valid device for
+    // the just-created context; the out-pointers are valid stack slots; the
+    // threshold is read as a u64 by the driver. Errors are swallowed.
+    unsafe {
+        let dev = ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        // Default: retain freed stream-ordered blocks indefinitely (u64::MAX)
+        // for reuse. `LAMBDA_VM_MEMPOOL_RELEASE_MB` overrides the cap (bytes the
+        // pool keeps before returning memory to the OS) when retained-pool
+        // growth needs bounding.
+        let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(u64::MAX);
+        let _ = sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const u64 as *mut core::ffi::c_void,
+        )
+        .result();
+    }
+}
+
+/// Device VRAM budget in bytes for table session admission control.
+///
+/// LAMBDA_VM_VRAM_BUDGET_MB overrides it (used to force the throttle in tests).
+/// Otherwise it is 80% of total device memory, leaving headroom for the
+/// context, module code, and retained pool blocks. Returns u64::MAX on any
+/// query failure, which disables budgeting (chunks fall back to the core bound
+/// size alone).
+fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
+    if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB")
+        && let Ok(mb) = mb.parse::<u64>()
+    {
+        return mb.saturating_mul(1024 * 1024);
+    }
+    use cudarc::driver::sys;
+    // SAFETY: raw driver query writing into two stack slots. The caller's
+    // context is already current (it was just created in `init`). Any error
+    // falls through to the budgeting-disabled sentinel.
+    unsafe {
+        let _ = ctx;
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+            .result()
+            .is_err()
+        {
+            return u64::MAX;
+        }
+        // 80% of total, computed to avoid intermediate overflow.
+        (total as u64) / 5 * 4
+    }
+}
+
 impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
@@ -189,6 +261,17 @@ impl Backend {
         // slices across streams (every call scopes its own buffers and syncs
         // before returning), so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
+
+        // Retain freed device memory in the stream ordered pool for reuse.
+        //
+        // cudarc routes CudaStream::alloc* through cuMemAllocAsync, drawing from
+        // the device default memory pool. Its release threshold defaults to 0,
+        // so every freed buffer goes back to the OS at the next sync and the
+        // prover's large LDE/FRI buffers are rebuilt from scratch each op.
+        // Raising the threshold keeps freed blocks in the pool so a same size
+        // allocation skips a real driver allocation. Best effort: on any error
+        // we keep the current behaviour.
+        retain_default_mempool(&ctx);
 
         let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
         let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
@@ -225,6 +308,8 @@ impl Backend {
         // Length = TWO_ADICITY + 1 to allow indexing at log_n = TWO_ADICITY.
         let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
 
+        let vram_budget_bytes = detect_vram_budget_bytes(&ctx);
+
         Ok(Self {
             vector_add_u64: arith.load_function("vector_add_u64")?,
             gl_add: arith.load_function("gl_add_kernel")?,
@@ -257,6 +342,7 @@ impl Backend {
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
@@ -282,7 +368,14 @@ impl Backend {
             pinned_hashes,
             util_stream,
             next: AtomicUsize::new(0),
+            vram_budget_bytes,
         })
+    }
+
+    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// when budgeting is disabled (query failed). See the field docs.
+    pub fn vram_budget_bytes(&self) -> u64 {
+        self.vram_budget_bytes
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
