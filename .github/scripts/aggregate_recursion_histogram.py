@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """Format the recursion-guest per-function profile as a Markdown PR comment.
 
-`test_recursion_profile_1query`/`_multiquery` print a per-(function, step)
-summary table: the cycles folded over each function's PCs *within a given
-verifier step*, computed across the full histogram — the view that shows both
-where the cycles go and which verifier step they belong to (e.g. how much of
-`step4:openings` is `keccak`). We parse that table and render it as Markdown.
+`test_recursion_profile_1query`/`_multiquery` print a global top-25 functions
+table (folded over all verifier steps), followed by one top-25 table per
+verifier step — so e.g. how much of `step4:openings` is `keccak` is visible
+at a glance instead of only the function's total across all steps. We parse
+all of those tables and render them as Markdown.
 
-    Top 25 (function, step) pairs by cycle count (aggregated over their PCs):
-    rank          cycles        %    cum %    PCs  step              function
-       1         5335072   24.95%   24.95%     72  decode            <...>::visit_seq::<...>
+    Top 25 functions by cycle count (aggregated over their PCs, all steps):
+      rank          cycles        %    cum %    PCs  function
+         1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
+
+    Top 25 functions by cycle count — step airs_bus_balance:
+      rank          cycles        %    cum %    PCs  function
+         1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
 
 Reads the test's captured output from argv[1]; writes the Markdown body to
 argv[2] (or stdout).
@@ -17,23 +21,30 @@ argv[2] (or stdout).
 
 import re
 import sys
+from collections import OrderedDict
 
-# A per-(function, step) summary row: rank, cycles, pct%, cum%, pcs, step, function.
+# A per-function summary row: rank, cycles, pct%, cum%, pcs, function.
 FN_ROW = re.compile(
-    r"^\s*\d+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+(\d+)\s+(\S+)\s+(.*\S)\s*$"
+    r"^\s*\d+\s+(\d+)\s+([\d.]+)%\s+([\d.]+)%\s+(\d+)\s+(.*\S)\s*$"
 )
-FN_TABLE_START = re.compile(r"Top \d+ \(function, step\) pairs by cycle count")
-# The "====" rule the test prints right after the (now sole) function table.
-TABLE_END = re.compile(r"^=+\s*$")
+HEADER_ROW = re.compile(r"^\s*rank\s+cycles")
+GLOBAL_TABLE_START = re.compile(
+    r"Top \d+ functions by cycle count \(aggregated over their PCs, all steps\)"
+)
+STEP_TABLE_START = re.compile(r"Top \d+ functions by cycle count — step (\S+):")
 TOTAL_CYCLES = re.compile(r"Total cycles\s*:\s*(\d+)")
 UNIQUE_PCS = re.compile(r"Unique PCs\s*:\s*(\d+)")
 EXEC_TIME = re.compile(r"Exec time\s*:\s*(\S+)")
 
+GLOBAL_KEY = "__global__"
+
 
 def parse(text):
     total_cycles = unique_pcs = exec_time = None
-    rows = []
-    in_fn_table = False
+    # GLOBAL_KEY -> rows, then one entry per step tag, in first-seen order.
+    tables = OrderedDict()
+    current = None
+    skip_header = False
     for line in text.splitlines():
         if total_cycles is None and (m := TOTAL_CYCLES.search(line)):
             total_cycles = int(m.group(1))
@@ -41,32 +52,68 @@ def parse(text):
             unique_pcs = int(m.group(1))
         if exec_time is None and (m := EXEC_TIME.search(line)):
             exec_time = m.group(1)
-        if FN_TABLE_START.search(line):
-            in_fn_table = True
+
+        if GLOBAL_TABLE_START.search(line):
+            current = GLOBAL_KEY
+            tables.setdefault(current, [])
+            skip_header = True
             continue
-        if in_fn_table and TABLE_END.match(line):
-            in_fn_table = False
+        if m := STEP_TABLE_START.search(line):
+            current = m.group(1)
+            tables.setdefault(current, [])
+            skip_header = True
             continue
-        if in_fn_table and (m := FN_ROW.match(line)):
-            rows.append(
+
+        if current is None:
+            continue
+        if skip_header:
+            # The header row right after a table-start line; anything else
+            # (e.g. a stray blank line) just ends the table early, which is
+            # fine — an empty table renders as "no rows".
+            skip_header = False
+            if HEADER_ROW.match(line):
+                continue
+        if m := FN_ROW.match(line):
+            tables[current].append(
                 {
                     "cycles": int(m.group(1)),
                     "pct": m.group(2),
                     "cum": m.group(3),
                     "pcs": int(m.group(4)),
-                    "step": m.group(5),
-                    "fn": m.group(6),
+                    "fn": m.group(5),
                 }
             )
-    return total_cycles, unique_pcs, exec_time, rows
+        else:
+            current = None
+
+    return total_cycles, unique_pcs, exec_time, tables
 
 
 def short(name, width=90):
     return name if len(name) <= width else name[: width - 1] + "…"
 
 
-def render(total_cycles, unique_pcs, exec_time, rows, title="Recursion guest profile"):
+def render_table(rows):
     if not rows:
+        return "> _no rows_\n"
+    body = "| Rank | Cycles | % | Cum % | PCs | Function |\n"
+    body += "|-----:|-------:|--:|------:|----:|----------|\n"
+    for i, r in enumerate(rows, 1):
+        body += (
+            f"| {i} | {r['cycles']:,} | {r['pct']}% | {r['cum']}% | "
+            f"{r['pcs']} | `{short(r['fn'])}` |\n"
+        )
+    last_cum = rows[-1]["cum"]
+    body += (
+        f"\n<sub>Each function's cycles are summed over all its program counters "
+        f"in this table's scope; the top {len(rows)} cover {last_cum}% of total "
+        f"cycles. Percentages are of total cycles.</sub>\n"
+    )
+    return body
+
+
+def render(total_cycles, unique_pcs, exec_time, tables, title="Recursion guest profile"):
+    if not tables.get(GLOBAL_KEY):
         return (
             f"### {title}\n\n"
             "> ⚠️ No per-function rows found in the test output — the run may "
@@ -82,23 +129,17 @@ def render(total_cycles, unique_pcs, exec_time, rows, title="Recursion guest pro
             body += f" · **Exec time:** {exec_time}"
         body += "\n\n"
 
-    body += f"#### Top {len(rows)} (function, step) pairs by cycles (folded over their PCs)\n\n"
-    body += "| Rank | Cycles | % | Cum % | PCs | Step | Function |\n"
-    body += "|-----:|-------:|--:|------:|----:|------|----------|\n"
-    for i, r in enumerate(rows, 1):
-        body += (
-            f"| {i} | {r['cycles']:,} | {r['pct']}% | {r['cum']}% | "
-            f"{r['pcs']} | `{r['step']}` | `{short(r['fn'])}` |\n"
-        )
+    global_rows = tables[GLOBAL_KEY]
+    body += f"#### Top {len(global_rows)} functions by cycles (all steps)\n\n"
+    body += render_table(global_rows)
 
-    last_cum = rows[-1]["cum"]
-    body += (
-        f"\n<sub>Each (function, step) pair's cycles are summed over all its program "
-        f"counters within that verifier step, across the full histogram; the top "
-        f"{len(rows)} cover {last_cum}% of total cycles. Percentages are of total "
-        f"cycles. See the workflow log for the full per-step cycle breakdown "
-        f"table.</sub>\n"
-    )
+    for step, rows in tables.items():
+        if step == GLOBAL_KEY:
+            continue
+        body += f"\n<details><summary>Step <code>{step}</code> — top {len(rows)} functions</summary>\n\n"
+        body += render_table(rows)
+        body += "\n</details>\n"
+
     return body
 
 

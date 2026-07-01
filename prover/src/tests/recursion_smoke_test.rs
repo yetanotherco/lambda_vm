@@ -230,47 +230,83 @@ fn step_tag(bucket: u8) -> &'static str {
     }
 }
 
-/// Print the top-25 `(function, step)` pairs by cycles, folding the PC
-/// histogram by symbol and by the verifier step active when each cycle ran.
-/// This is what lets you see e.g. how much of `step4:openings` is spent in
-/// `keccak` at a glance, instead of only the function's total across all steps.
+/// Print one top-25 table: `rows` is `(name, cycles, distinct_pcs)`, already
+/// unsorted; `total_cycles` is the denominator for percentages (always the
+/// *global* total, so per-step tables' percentages are comparable to the
+/// global table's and to `print_step_breakdown`'s bucket percentages).
+fn print_top25_table(rows: &mut [(String, u64, u64)], total_cycles: u64) {
+    rows.sort_unstable_by_key(|(_name, cycles, _pcs)| std::cmp::Reverse(*cycles));
+    let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
+    eprintln!("  rank          cycles        %    cum %    PCs  function");
+    let mut cumulative: u64 = 0;
+    for (rank, (name, cycles, pcs)) in rows.iter().take(25).enumerate() {
+        cumulative += cycles;
+        eprintln!(
+            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  {:>5}  {}",
+            rank + 1,
+            cycles,
+            pct(*cycles),
+            pct(cumulative),
+            pcs,
+            name,
+        );
+    }
+}
+
+/// Print the global top-25 functions by cycle count, then one top-25 table
+/// per verifier step — so e.g. how much of `step4:openings` is spent in
+/// `keccak` is visible at a glance, instead of only the function's total
+/// across all steps.
 fn print_function_table(
     symbols: &executor::elf::SymbolTable,
     pc_hist: std::collections::HashMap<(u64, u8), u64>,
     total_cycles: u64,
 ) {
-    let mut by_function_step: std::collections::HashMap<(String, u8), (u64, u64)> =
+    let mut by_function: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    let mut by_function_per_step: std::collections::HashMap<u8, std::collections::HashMap<String, (u64, u64)>> =
         std::collections::HashMap::new();
     let mut unique_pcs: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for ((pc, bucket), count) in &pc_hist {
         unique_pcs.insert(*pc);
-        let entry = by_function_step
-            .entry((resolve_pc(symbols, *pc), *bucket))
-            .or_insert((0, 0));
-        entry.0 += *count; // cycles
-        entry.1 += 1; // distinct PCs folded into this (function, step)
-    }
-    let mut fn_entries: Vec<((String, u8), (u64, u64))> = by_function_step.into_iter().collect();
-    fn_entries.sort_unstable_by_key(|(_key, (cycles, _pcs))| std::cmp::Reverse(*cycles));
+        let name = resolve_pc(symbols, *pc);
 
-    let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
+        let entry = by_function.entry(name.clone()).or_insert((0, 0));
+        entry.0 += *count; // cycles
+        entry.1 += 1; // distinct PCs folded into this function
+
+        let step_entry = by_function_per_step
+            .entry(*bucket)
+            .or_default()
+            .entry(name)
+            .or_insert((0, 0));
+        step_entry.0 += *count;
+        step_entry.1 += 1;
+    }
+
     eprintln!("  Unique PCs   : {}", unique_pcs.len());
     eprintln!();
-    eprintln!("  Top 25 (function, step) pairs by cycle count (aggregated over their PCs):");
-    eprintln!("  rank          cycles        %    cum %    PCs  step              function");
-    let mut fn_cumulative: u64 = 0;
-    for (rank, ((name, bucket), (cycles, pcs))) in fn_entries.iter().take(25).enumerate() {
-        fn_cumulative += cycles;
+    eprintln!("  Top 25 functions by cycle count (aggregated over their PCs, all steps):");
+    let mut rows: Vec<(String, u64, u64)> = by_function
+        .into_iter()
+        .map(|(name, (cycles, pcs))| (name, cycles, pcs))
+        .collect();
+    print_top25_table(&mut rows, total_cycles);
+
+    for bucket in 0u8..STEP_LABELS.len() as u8 {
+        let Some(by_step_function) = by_function_per_step.remove(&bucket) else {
+            continue;
+        };
+        eprintln!();
         eprintln!(
-            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  {:>5}  {:<16}  {}",
-            rank + 1,
-            cycles,
-            pct(*cycles),
-            pct(fn_cumulative),
-            pcs,
-            step_tag(*bucket),
-            name,
+            "  Top 25 functions by cycle count — step {}:",
+            step_tag(bucket)
         );
+        let mut rows: Vec<(String, u64, u64)> = by_step_function
+            .into_iter()
+            .map(|(name, (cycles, pcs))| (name, cycles, pcs))
+            .collect();
+        print_top25_table(&mut rows, total_cycles);
     }
 }
 
