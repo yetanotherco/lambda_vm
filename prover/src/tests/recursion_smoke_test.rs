@@ -231,12 +231,14 @@ fn step_tag(bucket: u8) -> &'static str {
 }
 
 /// Print one top-25 table: `rows` is `(name, cycles, distinct_pcs)`, already
-/// unsorted; `total_cycles` is the denominator for percentages (always the
-/// *global* total, so per-step tables' percentages are comparable to the
-/// global table's and to `print_step_breakdown`'s bucket percentages).
-fn print_top25_table(rows: &mut [(String, u64, u64)], total_cycles: u64) {
+/// unsorted; `denom_cycles` is the denominator for percentages — the global
+/// total for the all-steps table, but *that step's own total* for a per-step
+/// table, so `%`/`cum %` show what dominates within that step (a `keccak`
+/// that's 90% of a cheap step should read as 90%, not as a fraction of a
+/// percent of the whole run).
+fn print_top25_table(rows: &mut [(String, u64, u64)], denom_cycles: u64) {
     rows.sort_unstable_by_key(|(_name, cycles, _pcs)| std::cmp::Reverse(*cycles));
-    let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
+    let pct = |n: u64| 100.0 * (n as f64) / (denom_cycles as f64);
     eprintln!("  rank          cycles        %    cum %    PCs  function");
     let mut cumulative: u64 = 0;
     for (rank, (name, cycles, pcs)) in rows.iter().take(25).enumerate() {
@@ -286,7 +288,9 @@ fn print_function_table(
 
     eprintln!("  Unique PCs   : {}", unique_pcs.len());
     eprintln!();
-    eprintln!("  Top 25 functions by cycle count (aggregated over their PCs, all steps):");
+    eprintln!(
+        "  Top 25 functions by cycle count (aggregated over their PCs, all steps; % of total cycles):"
+    );
     let mut rows: Vec<(String, u64, u64)> = by_function
         .into_iter()
         .map(|(name, (cycles, pcs))| (name, cycles, pcs))
@@ -297,16 +301,18 @@ fn print_function_table(
         let Some(by_step_function) = by_function_per_step.remove(&bucket) else {
             continue;
         };
+        let step_total: u64 = by_step_function.values().map(|(cycles, _pcs)| cycles).sum();
         eprintln!();
         eprintln!(
-            "  Top 25 functions by cycle count — step {}:",
-            step_tag(bucket)
+            "  Top 25 functions by cycle count — step {} (% of this step's {} cycles):",
+            step_tag(bucket),
+            step_total,
         );
         let mut rows: Vec<(String, u64, u64)> = by_step_function
             .into_iter()
             .map(|(name, (cycles, pcs))| (name, cycles, pcs))
             .collect();
-        print_top25_table(&mut rows, total_cycles);
+        print_top25_table(&mut rows, step_total);
     }
 }
 

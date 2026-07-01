@@ -2,16 +2,17 @@
 """Format the recursion-guest per-function profile as a Markdown PR comment.
 
 `test_recursion_profile_1query`/`_multiquery` print a global top-25 functions
-table (folded over all verifier steps), followed by one top-25 table per
-verifier step — so e.g. how much of `step4:openings` is `keccak` is visible
-at a glance instead of only the function's total across all steps. We parse
-all of those tables and render them as Markdown.
+table (folded over all verifier steps, % of total run cycles), followed by
+one top-25 table per verifier step (% of that step's own cycles, so the
+table shows what dominates *within* the step) — e.g. how much of
+`step4:openings` is `keccak`. We parse all of those tables and render them
+as Markdown.
 
-    Top 25 functions by cycle count (aggregated over their PCs, all steps):
+    Top 25 functions by cycle count (aggregated over their PCs, all steps; % of total cycles):
       rank          cycles        %    cum %    PCs  function
          1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
 
-    Top 25 functions by cycle count — step airs_bus_balance:
+    Top 25 functions by cycle count — step airs_bus_balance (% of this step's 5129138364 cycles):
       rank          cycles        %    cum %    PCs  function
          1         5335072   24.95%   24.95%     72  <...>::visit_seq::<...>
 
@@ -29,9 +30,11 @@ FN_ROW = re.compile(
 )
 HEADER_ROW = re.compile(r"^\s*rank\s+cycles")
 GLOBAL_TABLE_START = re.compile(
-    r"Top \d+ functions by cycle count \(aggregated over their PCs, all steps\)"
+    r"Top \d+ functions by cycle count \(aggregated over their PCs, all steps"
 )
-STEP_TABLE_START = re.compile(r"Top \d+ functions by cycle count — step (\S+):")
+STEP_TABLE_START = re.compile(
+    r"Top \d+ functions by cycle count — step (\S+) \(% of this step's (\d+) cycles\):"
+)
 TOTAL_CYCLES = re.compile(r"Total cycles\s*:\s*(\d+)")
 UNIQUE_PCS = re.compile(r"Unique PCs\s*:\s*(\d+)")
 EXEC_TIME = re.compile(r"Exec time\s*:\s*(\S+)")
@@ -41,7 +44,8 @@ GLOBAL_KEY = "__global__"
 
 def parse(text):
     total_cycles = unique_pcs = exec_time = None
-    # GLOBAL_KEY -> rows, then one entry per step tag, in first-seen order.
+    # GLOBAL_KEY -> {"denom": int|None, "rows": [...]}, then one entry per
+    # step tag in first-seen order.
     tables = OrderedDict()
     current = None
     skip_header = False
@@ -55,12 +59,12 @@ def parse(text):
 
         if GLOBAL_TABLE_START.search(line):
             current = GLOBAL_KEY
-            tables.setdefault(current, [])
+            tables[current] = {"denom": total_cycles, "rows": []}
             skip_header = True
             continue
         if m := STEP_TABLE_START.search(line):
             current = m.group(1)
-            tables.setdefault(current, [])
+            tables[current] = {"denom": int(m.group(2)), "rows": []}
             skip_header = True
             continue
 
@@ -74,7 +78,7 @@ def parse(text):
             if HEADER_ROW.match(line):
                 continue
         if m := FN_ROW.match(line):
-            tables[current].append(
+            tables[current]["rows"].append(
                 {
                     "cycles": int(m.group(1)),
                     "pct": m.group(2),
@@ -93,7 +97,7 @@ def short(name, width=90):
     return name if len(name) <= width else name[: width - 1] + "…"
 
 
-def render_table(rows):
+def render_table(rows, denom_label):
     if not rows:
         return "> _no rows_\n"
     body = "| Rank | Cycles | % | Cum % | PCs | Function |\n"
@@ -106,14 +110,14 @@ def render_table(rows):
     last_cum = rows[-1]["cum"]
     body += (
         f"\n<sub>Each function's cycles are summed over all its program counters "
-        f"in this table's scope; the top {len(rows)} cover {last_cum}% of total "
-        f"cycles. Percentages are of total cycles.</sub>\n"
+        f"in this table's scope; the top {len(rows)} cover {last_cum}% of "
+        f"{denom_label}.</sub>\n"
     )
     return body
 
 
 def render(total_cycles, unique_pcs, exec_time, tables, title="Recursion guest profile"):
-    if not tables.get(GLOBAL_KEY):
+    if not tables.get(GLOBAL_KEY, {}).get("rows"):
         return (
             f"### {title}\n\n"
             "> ⚠️ No per-function rows found in the test output — the run may "
@@ -129,15 +133,20 @@ def render(total_cycles, unique_pcs, exec_time, tables, title="Recursion guest p
             body += f" · **Exec time:** {exec_time}"
         body += "\n\n"
 
-    global_rows = tables[GLOBAL_KEY]
+    global_rows = tables[GLOBAL_KEY]["rows"]
     body += f"#### Top {len(global_rows)} functions by cycles (all steps)\n\n"
-    body += render_table(global_rows)
+    body += render_table(global_rows, "total cycles")
 
-    for step, rows in tables.items():
+    for step, table in tables.items():
         if step == GLOBAL_KEY:
             continue
-        body += f"\n<details><summary>Step <code>{step}</code> — top {len(rows)} functions</summary>\n\n"
-        body += render_table(rows)
+        rows, denom = table["rows"], table["denom"]
+        denom_note = f" of {denom:,} step cycles" if denom is not None else ""
+        body += (
+            f"\n<details><summary>Step <code>{step}</code>{denom_note} — "
+            f"top {len(rows)} functions</summary>\n\n"
+        )
+        body += render_table(rows, "this step's cycles")
         body += "\n</details>\n"
 
     return body
