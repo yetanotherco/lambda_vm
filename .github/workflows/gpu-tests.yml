@@ -19,9 +19,6 @@ name: GPU Tests (merge queue)
 on:
   merge_group:
   workflow_dispatch:
-  # TEMP(testing): run on pushes to this branch pre-merge. REMOVE before merging.
-  push:
-    branches: [ci_run_tests_gpu]
 
 permissions:
   contents: read
