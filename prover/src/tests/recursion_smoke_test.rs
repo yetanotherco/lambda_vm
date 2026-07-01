@@ -7,6 +7,7 @@
 //! `--features stark/instruments` makes any of these tests print the verifier's
 //! per-step `Time spent:` timings.
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
 use std::path::PathBuf;
 
@@ -17,9 +18,14 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+/// Path to a recursion-suite guest ELF artifact, built by `make compile-recursion-elfs`.
+fn guest_elf_path(root: &std::path::Path, name: &str) -> PathBuf {
+    root.join(format!("executor/program_artifacts/recursion/{name}.elf"))
+}
+
 /// Read a recursion-suite guest ELF artifact, built by `make compile-recursion-elfs`.
 fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
-    let path = root.join(format!("executor/program_artifacts/recursion/{name}.elf"));
+    let path = guest_elf_path(root, name);
     std::fs::read(&path).unwrap_or_else(|e| {
         panic!(
             "failed to read {} — run `make compile-recursion-elfs`: {e}",
@@ -200,17 +206,9 @@ fn log_progress(
     }
 }
 
-/// Demangled enclosing-function name for a PC via the ELF symbol table;
-/// `<unknown>` if none covers it. No file:line (symtab has no DWARF).
-fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
-    symbols.lookup(pc).map_or_else(
-        || "<unknown>".to_string(),
-        |s| executor::flamegraph::demangle(&s.name),
-    )
-}
-
-/// Verifier sub-routines in execution order; `run_profile` buckets cycles by
-/// substring-matching the enclosing symbol (a missing step merges into the prior).
+/// Verifier sub-routines in execution order; `DwarfSteps` buckets cycles by
+/// substring-matching the DWARF inline chain covering each PC (a missing step
+/// merges into the prior).
 const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
     "replay_rounds_after_round_1",
     "step_2_verify_claimed_composition_polynomial",
@@ -218,24 +216,106 @@ const VERIFIER_STEP_KEYWORDS: [&str; 4] = [
     "step_4_verify_trace_and_composition_openings",
 ];
 
+/// DWARF-backed PC resolution for the recursion guest ELF. Reading debug info
+/// directly (rather than the flat symbol table) means an inlined step is still
+/// attributed correctly: LLVM still emits a `DW_TAG_inlined_subroutine` entry
+/// for it, so `find_frames` walks the full inline chain even when the step's
+/// code has been folded into its caller. This makes step detection immune to
+/// inlining decisions, so no `#[inline(never)]` is needed on the verifier.
+struct DwarfSteps {
+    loader: addr2line::Loader,
+    step_cache: HashMap<u64, u8>,
+}
+
+impl DwarfSteps {
+    fn open(elf_path: &std::path::Path) -> Self {
+        let loader = addr2line::Loader::new(elf_path).unwrap_or_else(|e| {
+            panic!(
+                "addr2line: failed to load debug info from {} \
+                 (guest must be built with debug info, e.g. CARGO_PROFILE_RELEASE_DEBUG=1): {e}",
+                elf_path.display()
+            )
+        });
+        Self {
+            loader,
+            step_cache: HashMap::new(),
+        }
+    }
+
+    /// Highest verifier step whose (possibly-inlined) frame covers `pc`, or 0.
+    fn step_for_pc(&mut self, pc: u64) -> u8 {
+        if let Some(&step) = self.step_cache.get(&pc) {
+            return step;
+        }
+        let mut step = 0u8;
+        if let Ok(mut frames) = self.loader.find_frames(pc) {
+            while let Ok(Some(frame)) = frames.next() {
+                let Some(name) = frame.function.as_ref().and_then(|f| f.demangle().ok()) else {
+                    continue;
+                };
+                for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
+                    if name.contains(kw) {
+                        step = step.max((i + 1) as u8);
+                    }
+                }
+            }
+        }
+        self.step_cache.insert(pc, step);
+        step
+    }
+
+    /// `(file:line, demangled function)` for the innermost frame at `pc`, from
+    /// the ELF's DWARF info. `location` is `None` if the frame has no line entry.
+    fn innermost_frame(&self, pc: u64) -> (Option<String>, String) {
+        let Ok(mut frames) = self.loader.find_frames(pc) else {
+            return (None, "<unknown>".to_string());
+        };
+        let Ok(Some(frame)) = frames.next() else {
+            return (None, "<unknown>".to_string());
+        };
+        let location = frame
+            .location
+            .as_ref()
+            .and_then(|loc| match (loc.file, loc.line) {
+                (Some(file), Some(line)) => Some(format!("{file}:{line}")),
+                (Some(file), None) => Some(file.to_string()),
+                _ => None,
+            });
+        let function = frame
+            .function
+            .as_ref()
+            .and_then(|f| f.demangle().ok())
+            .map_or_else(|| "<unknown>".to_string(), |c| c.into_owned());
+        (location, function)
+    }
+
+    /// Demangled name of the innermost frame at `pc`, used to fold the PC
+    /// histogram by function (same as the old symbol-table fold, but correct
+    /// under inlining since it reads the DWARF inline chain).
+    fn function_name(&self, pc: u64) -> String {
+        self.innermost_frame(pc).1
+    }
+
+    /// Best-effort "file:line  (function)" for the innermost frame at `pc`.
+    fn describe_pc(&self, pc: u64) -> String {
+        let (location, function) = self.innermost_frame(pc);
+        let location = location.unwrap_or_else(|| "<unknown location>".to_string());
+        format!("{location}  ({function})")
+    }
+}
+
 /// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
 fn blowup8() -> stark::proof::options::ProofOptions {
     crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
 }
 
-/// Print the top-25 functions by cycles, folding the PC histogram by symbol.
-fn print_function_table(
-    symbols: &executor::elf::SymbolTable,
-    pc_hist: std::collections::HashMap<u64, u64>,
-    total_cycles: u64,
-) {
-    let mut by_function: std::collections::HashMap<String, (u64, u64)> =
-        std::collections::HashMap::new();
-    for (pc, count) in &pc_hist {
-        let entry = by_function
-            .entry(resolve_pc(symbols, *pc))
-            .or_insert((0, 0));
-        entry.0 += *count; // cycles
+/// Print the top-25 functions by cycles, folding the PC histogram by the
+/// DWARF-resolved innermost (possibly-inlined) function per PC.
+fn print_function_table(dwarf: &DwarfSteps, pc_hist: &HashMap<u64, u64>, total_cycles: u64) {
+    let mut by_function: HashMap<String, (u64, u64)> = HashMap::new();
+    for (&pc, &count) in pc_hist {
+        let entry = by_function.entry(dwarf.function_name(pc)).or_insert((0, 0));
+        entry.0 += count; // cycles
         entry.1 += 1; // distinct PCs folded into this function
     }
     let mut fn_entries: Vec<(String, (u64, u64))> = by_function.into_iter().collect();
@@ -257,6 +337,32 @@ fn print_function_table(
             pct(fn_cumulative),
             pcs,
             name,
+        );
+    }
+}
+
+/// Print the top-100 hottest individual PCs (not folded by function), each
+/// resolved to its DWARF file:line and (innermost, possibly-inlined) function.
+fn print_pc_table(dwarf: &DwarfSteps, pc_hist: &HashMap<u64, u64>, total_cycles: u64) {
+    let mut pc_entries: Vec<(u64, u64)> =
+        pc_hist.iter().map(|(&pc, &cycles)| (pc, cycles)).collect();
+    pc_entries.sort_unstable_by_key(|(_pc, cycles)| std::cmp::Reverse(*cycles));
+
+    let pct = |n: u64| 100.0 * (n as f64) / (total_cycles as f64);
+    eprintln!();
+    eprintln!("  Top 100 PCs by cycle count:");
+    eprintln!("  rank          cycles        %    cum %  pc          location (function)");
+    let mut cumulative: u64 = 0;
+    for (rank, (pc, cycles)) in pc_entries.iter().take(100).enumerate() {
+        cumulative += cycles;
+        eprintln!(
+            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  0x{:08x}  {}",
+            rank + 1,
+            cycles,
+            pct(*cycles),
+            pct(cumulative),
+            pc,
+            dwarf.describe_pc(*pc),
         );
     }
 }
@@ -284,48 +390,23 @@ fn print_step_breakdown(buckets: &[u64; 5], total_cycles: u64) {
 }
 
 /// Single-pass execute-only profiler. Always prints total cycles + a rough
-/// trace/LDE estimate; with `detailed`, also the top-25 functions + per-step
-/// breakdown (one streamed pass). `!detailed` does no per-log work.
+/// trace/LDE estimate; with `detailed`, also the top-25 functions, top-100
+/// PCs, and per-step breakdown (one streamed pass). `!detailed` does no
+/// per-log work.
 fn run_profile(
     guest_name: &str,
     progress_stride: usize,
     opts: stark::proof::options::ProofOptions,
     detailed: bool,
 ) {
-    use std::collections::HashMap;
-
-    let (guest_elf_bytes, _program, mut executor) = setup_guest_run("profile", guest_name, &opts);
-    let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
+    let root = workspace_root();
+    let (_guest_elf_bytes, _program, mut executor) = setup_guest_run("profile", guest_name, &opts);
+    let mut dwarf = detailed.then(|| DwarfSteps::open(&guest_elf_path(&root, guest_name)));
 
     let mut pc_hist: HashMap<u64, u64> = HashMap::new();
     let mut buckets = [0u64; 5];
-    let mut last_range: Option<(u64, u64)> = None;
-    let mut last_advance: u8 = 0;
     let bucket = std::cell::Cell::new(0u8);
     let unique = std::cell::Cell::new(0usize);
-
-    if detailed {
-        assert!(
-            !symbols.is_empty(),
-            "{guest_name} ELF has no symbol table — was it stripped?"
-        );
-        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
-            let n = symbols
-                .functions()
-                .iter()
-                .filter(|f| f.name.contains(kw))
-                .count();
-            eprintln!(
-                "[profile] step {}: keyword={kw:?} -> {n} symbol(s) {}",
-                i + 1,
-                if n > 0 {
-                    ""
-                } else {
-                    "(no match; merges into previous bucket)"
-                },
-            );
-        }
-    }
 
     eprintln!(
         "[profile] executing {guest_name} guest ({}) ...",
@@ -338,28 +419,14 @@ fn run_profile(
     let (total_cycles, exec_time) = drive_executor(
         &mut executor,
         |log| {
-            if detailed {
+            if let Some(dwarf) = dwarf.as_mut() {
                 let pc = log.current_pc;
                 *pc_hist.entry(pc).or_insert(0) += 1;
                 unique.set(pc_hist.len());
 
-                let in_cached = matches!(last_range, Some((s, e)) if pc >= s && pc < e);
-                if !in_cached {
-                    if let Some(sym) = symbols.lookup(pc) {
-                        last_range = Some((sym.address, sym.address + sym.size.max(1)));
-                        last_advance = 0;
-                        for (i, kw) in VERIFIER_STEP_KEYWORDS.iter().enumerate() {
-                            if sym.name.contains(kw) {
-                                last_advance = (i + 1) as u8;
-                            }
-                        }
-                    } else {
-                        last_range = None;
-                        last_advance = 0;
-                    }
-                }
-                if bucket.get() < last_advance {
-                    bucket.set(last_advance);
+                let advance = dwarf.step_for_pc(pc);
+                if bucket.get() < advance {
+                    bucket.set(advance);
                 }
                 buckets[bucket.get() as usize] += 1;
             }
@@ -404,9 +471,10 @@ fn run_profile(
         (main_trace_bytes * 2) as f64 / 1e9,
     );
 
-    if detailed {
+    if let Some(dwarf) = dwarf.as_ref() {
         eprintln!();
-        print_function_table(&symbols, pc_hist, total_cycles);
+        print_function_table(dwarf, &pc_hist, total_cycles);
+        print_pc_table(dwarf, &pc_hist, total_cycles);
         print_step_breakdown(&buckets, total_cycles);
     }
     eprintln!("============================================================");

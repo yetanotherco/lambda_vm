@@ -36,6 +36,7 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Enable stark's test-utils so cross-crate tests can reach
 # `compute_precomputed_commitment_for_testing`. Only active under cargo test/bench.
 stark = { path = "../crypto/stark", features = ["test-utils"] }
+addr2line = "0.27.0"
 
 [[bench]]
 name = "vm_prover_benchmark"
