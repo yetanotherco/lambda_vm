@@ -748,11 +748,11 @@ fn test_flamegraph_dst0_jump_onto_zero_size_symbol_boundary() {
 }
 
 // ============================================================================
-// Trie-fold correctness
+// Fold correctness
 // ============================================================================
 
 #[test]
-fn test_flamegraph_trie_fold_matches_hand_computed_counts() {
+fn test_flamegraph_fold_matches_hand_computed_counts() {
     // main (2 insns) -> calls f (1 insn) -> f self-tail-recurses twice more
     // (2 insns) -> returns -> main (1 insn).
     let symbols = make_symbol_table(vec![("main", 0x1000, 100), ("f", 0x2000, 50)]);
@@ -806,4 +806,27 @@ fn test_flamegraph_trie_fold_matches_hand_computed_counts() {
     let mut lines: Vec<&str> = output_str.lines().collect();
     lines.sort();
     assert_eq!(lines, vec!["main 3", "main;f 6"]);
+}
+
+#[test]
+fn test_flamegraph_new_raw_keys_by_hex_address_not_name() {
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100), ("foo", 0x2000, 50)]);
+    let mut generator = FlamegraphGenerator::new_raw(symbols, 0x1000);
+
+    let instructions = make_instructions(vec![
+        (0x1000, Instruction::JumpAndLink { dst: 1, offset: 0 }), // call foo
+        (0x2000, nop_instruction()),
+    ]);
+
+    let logs = vec![mk_log(0x1000, 0x2000), mk_log(0x2000, 0x2004)];
+
+    generator.process_logs(&logs, &instructions).unwrap();
+
+    let mut output = Vec::new();
+    generator.write_folded(&mut output).unwrap();
+    let output_str = String::from_utf8(output).unwrap();
+
+    let mut lines: Vec<&str> = output_str.lines().collect();
+    lines.sort();
+    assert_eq!(lines, vec!["0x1000 1", "0x1000;0x2000 1"]);
 }

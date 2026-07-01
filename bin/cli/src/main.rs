@@ -303,17 +303,13 @@ fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
 fn write_flamegraph_checkpoint(
     output_path: &PathBuf,
     generator: &FlamegraphGenerator,
-    raw: bool,
 ) -> Result<(), String> {
     let file =
         File::create(output_path).map_err(|e| format!("Failed to create output file: {e}"))?;
     let mut writer = BufWriter::new(file);
-    let result = if raw {
-        generator.write_folded_raw(&mut writer)
-    } else {
-        generator.write_folded(&mut writer)
-    };
-    result.map_err(|e| format!("Failed to write flamegraph output: {e:?}"))
+    generator
+        .write_folded(&mut writer)
+        .map_err(|e| format!("Failed to write flamegraph output: {e:?}"))
 }
 
 /// Flamegraph-related flags grouped so `cmd_execute` doesn't need a flat
@@ -363,7 +359,10 @@ fn cmd_execute(
             &elf_data,
             &program,
             private_inputs,
-            executor::flamegraph::FlamegraphRunOptions { cycle_budget },
+            executor::flamegraph::FlamegraphRunOptions {
+                cycle_budget,
+                raw: flamegraph.raw,
+            },
             |total_cycles, generator| {
                 let Some(threshold) = next_checkpoint else {
                     return;
@@ -371,8 +370,7 @@ fn cmd_execute(
                 if total_cycles < threshold {
                     return;
                 }
-                if let Err(e) = write_flamegraph_checkpoint(output_path, generator, flamegraph.raw)
-                {
+                if let Err(e) = write_flamegraph_checkpoint(output_path, generator) {
                     eprintln!("Warning: flamegraph checkpoint failed: {e}");
                 }
                 next_checkpoint = flamegraph.checkpoint_cycles.map(|step| threshold + step);
@@ -387,7 +385,7 @@ fn cmd_execute(
             }
         };
 
-        if let Err(e) = write_flamegraph_checkpoint(output_path, &generator, flamegraph.raw) {
+        if let Err(e) = write_flamegraph_checkpoint(output_path, &generator) {
             eprintln!("{e}");
             return ExitCode::FAILURE;
         }
