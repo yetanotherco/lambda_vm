@@ -3249,7 +3249,44 @@ fn test_continuation_pipeline_end_to_end() {
         register_inits.push(register_init_i);
         all_touched.push(touched_i);
     }
-    let boundaries = local_to_global::epoch_boundaries(&initial_memory, &all_touched);
+    // Build each epoch's boundary and pad it to a power of two with brought-forward
+    // filler rows for untouched cells — exactly as `prove_continuation` does (the L2G
+    // table has no selector column, so padding must be real rows that self-cancel on
+    // the Memory bus and telescope on the GlobalMemory bus). Sourcing mirrors the
+    // prover: this epoch's own touched pages first, then genesis pages as a fallback.
+    let genesis_pages: std::collections::BTreeSet<u64> = image0
+        .keys()
+        .map(|&a| crate::tables::page::page_base_for_address(a))
+        .collect();
+    let mut provenance =
+        local_to_global::genesis_provenance(initial_memory.iter().map(|(&a, &v)| (a, v)));
+    let mut boundaries: Vec<Vec<local_to_global::CellBoundary>> =
+        Vec::with_capacity(all_touched.len());
+    for (i, touched) in all_touched.iter().enumerate() {
+        let label = local_to_global::epoch_label(i as u64);
+        let mut boundary = local_to_global::epoch_boundary(&mut provenance, label, touched);
+        let mut candidate_pages: Vec<u64> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for cell in &boundary {
+            let base = crate::tables::page::page_base_for_address(cell.address);
+            if seen.insert(base) {
+                candidate_pages.push(base);
+            }
+        }
+        for &base in &genesis_pages {
+            if seen.insert(base) {
+                candidate_pages.push(base);
+            }
+        }
+        local_to_global::append_bring_forward_fillers(
+            &mut boundary,
+            &mut provenance,
+            &candidate_pages,
+            label,
+        )
+        .expect("filler shortage building the pipeline test boundaries");
+        boundaries.push(boundary);
+    }
 
     let proof_options = ProofOptions::default_test_options();
 
