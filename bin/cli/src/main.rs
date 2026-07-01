@@ -10,11 +10,7 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use executor::{
-    elf::{Elf, SymbolTable},
-    flamegraph::FlamegraphGenerator,
-    vm::execution::Executor,
-};
+use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
@@ -112,6 +108,22 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
 
+        /// Key the folded stacks by raw hex address instead of resolving
+        /// through the ELF symtab (pairs with scripts/enrich_flamegraph.py).
+        /// Only meaningful with --flamegraph.
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_raw: bool,
+
+        /// Checkpoint the flamegraph's folded output to --flamegraph every N
+        /// cycles, so a killed run still leaves usable (partial) output on
+        /// disk. Only meaningful with --flamegraph.
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_checkpoint_cycles: Option<u64>,
+
+        /// Stop execution early once at least this many cycles have run.
+        #[arg(long)]
+        cycle_budget: Option<u64>,
+
         /// Print the dynamic instruction (cycle) count
         #[arg(long)]
         cycles: bool,
@@ -207,8 +219,21 @@ fn main() -> ExitCode {
             elf,
             private_input,
             flamegraph,
+            flamegraph_raw,
+            flamegraph_checkpoint_cycles,
+            cycle_budget,
             cycles,
-        } => cmd_execute(elf, private_input, flamegraph, cycles),
+        } => cmd_execute(
+            elf,
+            private_input,
+            FlamegraphCliOptions {
+                path: flamegraph,
+                raw: flamegraph_raw,
+                checkpoint_cycles: flamegraph_checkpoint_cycles,
+            },
+            cycle_budget,
+            cycles,
+        ),
         Commands::Prove {
             elf,
             output,
@@ -272,10 +297,38 @@ fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
         .map_err(|e| format!("Execution failed during cycle count: {e:?}"))
 }
 
+/// Write the flamegraph's current (possibly partial) folded output to
+/// `output_path`, overwriting any previous contents. Used both for the final
+/// write and for periodic checkpoints during a long run.
+fn write_flamegraph_checkpoint(
+    output_path: &PathBuf,
+    generator: &FlamegraphGenerator,
+    raw: bool,
+) -> Result<(), String> {
+    let file =
+        File::create(output_path).map_err(|e| format!("Failed to create output file: {e}"))?;
+    let mut writer = BufWriter::new(file);
+    let result = if raw {
+        generator.write_folded_raw(&mut writer)
+    } else {
+        generator.write_folded(&mut writer)
+    };
+    result.map_err(|e| format!("Failed to write flamegraph output: {e:?}"))
+}
+
+/// Flamegraph-related flags grouped so `cmd_execute` doesn't need a flat
+/// 8-argument signature.
+struct FlamegraphCliOptions {
+    path: Option<PathBuf>,
+    raw: bool,
+    checkpoint_cycles: Option<u64>,
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
-    flamegraph_path: Option<PathBuf>,
+    flamegraph: FlamegraphCliOptions,
+    cycle_budget: Option<u64>,
     cycles: bool,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
@@ -302,71 +355,83 @@ fn cmd_execute(
         }
     };
 
-    let mut executor = match Executor::new(&program, private_inputs) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Failed to create executor: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let cycle_count = if let Some(ref output_path) = flamegraph.path {
+        // Shared execute+flamegraph path (executor::flamegraph) instead of
+        // hand-rolling the SymbolTable/Executor/drive-loop wiring here.
+        let mut next_checkpoint = flamegraph.checkpoint_cycles;
+        let result = executor::flamegraph::run_with_flamegraph(
+            &elf_data,
+            &program,
+            private_inputs,
+            executor::flamegraph::FlamegraphRunOptions { cycle_budget },
+            |total_cycles, generator| {
+                let Some(threshold) = next_checkpoint else {
+                    return;
+                };
+                if total_cycles < threshold {
+                    return;
+                }
+                if let Err(e) = write_flamegraph_checkpoint(output_path, generator, flamegraph.raw)
+                {
+                    eprintln!("Warning: flamegraph checkpoint failed: {e}");
+                }
+                next_checkpoint = flamegraph.checkpoint_cycles.map(|step| threshold + step);
+            },
+        );
 
-    // Set up flamegraph generator if requested
-    let mut generator = flamegraph_path.as_ref().map(|_| {
-        let symbols = SymbolTable::parse(&elf_data);
-        FlamegraphGenerator::new(symbols, program.entry_point)
-    });
-
-    // Execute in chunks, counting cycles and (if requested) feeding the flamegraph.
-    let mut cycle_count: u64 = 0;
-    loop {
-        let logs = match executor.resume() {
-            Ok(logs) => logs,
+        let (generator, total_cycles) = match result {
+            Ok(r) => r,
             Err(e) => {
                 eprintln!("Execution failed: {:?}", e);
                 return ExitCode::FAILURE;
             }
         };
-        match logs {
-            Some(logs) => {
-                cycle_count += logs.len() as u64;
-                if let Some(ref mut fg) = generator {
-                    let logs: Vec<_> = logs.to_vec();
-                    if let Err(e) = fg.process_logs(&logs, &executor.instructions) {
-                        eprintln!("Failed to process logs for flamegraph: {:?}", e);
-                        return ExitCode::FAILURE;
-                    }
-                }
-            }
-            None => break,
-        }
-    }
 
-    if let Err(e) = executor.finish() {
-        eprintln!("Failed to finish execution: {:?}", e);
-        return ExitCode::FAILURE;
-    }
-
-    // Write flamegraph output if requested
-    if let (Some(output_path), Some(generator)) = (flamegraph_path, generator) {
-        let file = match File::create(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to create flamegraph output file: {}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        let mut writer = BufWriter::new(file);
-        if let Err(e) = generator.write_folded(&mut writer) {
-            eprintln!("Failed to write flamegraph output: {:?}", e);
+        if let Err(e) = write_flamegraph_checkpoint(output_path, &generator, flamegraph.raw) {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
-
         eprintln!(
             "Flamegraph written to {:?} ({} instructions)",
             output_path,
             generator.total_instructions()
         );
-    }
+
+        total_cycles
+    } else {
+        let mut executor = match Executor::new(&program, private_inputs) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to create executor: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut cycle_count: u64 = 0;
+        loop {
+            let logs = match executor.resume() {
+                Ok(logs) => logs,
+                Err(e) => {
+                    eprintln!("Execution failed: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            match logs {
+                Some(logs) => cycle_count += logs.len() as u64,
+                None => break,
+            }
+            if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
+                break;
+            }
+        }
+
+        if let Err(e) = executor.finish() {
+            eprintln!("Failed to finish execution: {:?}", e);
+            return ExitCode::FAILURE;
+        }
+
+        cycle_count
+    };
 
     if cycles {
         println!("Cycles: {}", cycle_count);

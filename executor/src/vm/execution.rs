@@ -184,6 +184,7 @@ fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct InstructionSegment {
     base_addr: u64,
     instructions: Vec<Instruction>,
@@ -195,6 +196,7 @@ impl InstructionSegment {
     }
 }
 
+#[derive(Clone)]
 pub struct InstructionCache {
     segments: Vec<InstructionSegment>,
 }
