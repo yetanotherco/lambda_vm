@@ -87,6 +87,9 @@ pub struct VmVerifyingKey {
     /// Private-input slots hold a zero placeholder and are never read by the
     /// verifier — they exist only to keep the index aligned with
     /// `page_configs`, which interleaves preprocessed and private-input pages.
+    /// Prover (`traces.page_configs`) and verifier
+    /// (`page_configs_from_elf_and_runtime`) must derive the same page order
+    /// or the digests diverge.
     pub pages: Vec<Commitment>,
 }
 

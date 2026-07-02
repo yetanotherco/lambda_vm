@@ -480,9 +480,11 @@ impl VmAirs {
     }
 
     /// Same as [`Self::new`] but accepts a precomputed [`VmVerifyingKey`].
-    /// When `vkey` is `Some`, the bitwise preprocessed commitment is taken
-    /// from it instead of being recomputed from `proof_options` — that
-    /// recomputation is ~87% of verifier cycles inside the recursion guest.
+    /// When `vkey` is `Some`, the bitwise, decode, register, keccak_rc and
+    /// per-page preprocessed commitments are taken from it instead of being
+    /// recomputed — recomputation (dominated by bitwise) is ~87% of verifier
+    /// cycles inside the recursion guest. Explicit `decode_commitment` /
+    /// `page_commitments` arguments still take precedence over the vkey.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_vkey(
         elf: &Elf,
