@@ -603,3 +603,111 @@ pub fn lt_constraints(constraint_idx_start: usize) -> (Vec<LtConstraint>, usize)
     ];
     (constraints, idx)
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `LtConstraint` / `lt_constraints` above, written
+// once against the generic `ConstraintBuilder` so one body serves the compiled
+// prover folder, the verifier folder and IR capture. The old structs stay for
+// now (they are the differential oracle); the final deletion phase removes
+// them. Constraint indices 0..6 match `lt_constraints(0)` exactly.
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// LT table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the LT layout is fixed via `cols`).
+pub struct LtConstraints;
+
+impl LtConstraints {
+    /// `cast(lhs_sub_rhs, DWordWL)[0] = sub_0 + 2^16 · sub_1`.
+    fn carry_0<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let lhs_0 = b.main(0, cols::LHS_0);
+        let rhs_0 = b.main(0, cols::RHS_0);
+        let sub_0 = b.main(0, cols::LHS_SUB_RHS_0);
+        let sub_1 = b.main(0, cols::LHS_SUB_RHS_1);
+        let shift_16 = b.const_base(SHIFT_16);
+        let sub_lo = sub_0 + sub_1 * shift_16;
+        // carry[0] = (rhs[0] + sub_lo - lhs[0]) / 2^32
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        (rhs_0 + sub_lo - lhs_0) * inv_2_32
+    }
+
+    /// carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32.
+    fn carry_1<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let lhs_1 = b.main(0, cols::LHS_1);
+        let lhs_2 = b.main(0, cols::LHS_2);
+        let rhs_1 = b.main(0, cols::RHS_1);
+        let rhs_2 = b.main(0, cols::RHS_2);
+        let sub_2 = b.main(0, cols::LHS_SUB_RHS_2);
+        let sub_3 = b.main(0, cols::LHS_SUB_RHS_3);
+        let shift_16 = b.const_base(SHIFT_16);
+        // cast(lhs, DWordWL)[1] = lhs[1] + 2^16 * lhs[2]
+        let lhs_hi = lhs_1 + lhs_2 * shift_16.clone();
+        // cast(rhs, DWordWL)[1] = rhs[1] + 2^16 * rhs[2]
+        let rhs_hi = rhs_1 + rhs_2 * shift_16.clone();
+        // cast(lhs_sub_rhs, DWordWL)[1] = sub_2 + 2^16 * sub_3
+        let sub_hi = sub_2 + sub_3 * shift_16;
+        let carry_0 = Self::carry_0(b);
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        (rhs_hi + sub_hi + carry_0 - lhs_hi) * inv_2_32
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 2), // Carry0IsBit
+            ConstraintMeta::base(1, 2), // Carry1IsBit
+            ConstraintMeta::base(2, 3), // LtFormula
+            ConstraintMeta::base(3, 2), // OutXorInvert
+            ConstraintMeta::base(4, 2), // InvertIsBit
+            ConstraintMeta::base(5, 2), // SignedIsBit
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT<carry[0]>: carry[0] * (1 - carry[0])
+        let c0 = Self::carry_0(b);
+        let one = b.one();
+        b.emit_base(0, c0.clone() * (one - c0));
+
+        // idx 1: IS_BIT<carry[1]>: carry[1] * (1 - carry[1])
+        let c1 = Self::carry_1(b);
+        let one = b.one();
+        b.emit_base(1, c1.clone() * (one - c1));
+
+        // idx 2: LT formula: lt - (signed*signed_lt + (1-signed)*unsigned_lt)
+        // signed_lt = A*(1-B) + A*C + (1-B)*C; unsigned_lt = C = carry[1]
+        let lt = b.main(0, cols::LT);
+        let signed = b.main(0, cols::SIGNED);
+        let a = b.main(0, cols::LHS_MSB);
+        let bb = b.main(0, cols::RHS_MSB);
+        let c = Self::carry_1(b);
+        let unsigned_lt = c.clone();
+        let one = b.one();
+        let one_minus_b = one - bb;
+        let signed_lt = a.clone() * one_minus_b.clone() + a * c.clone() + one_minus_b * c;
+        let one = b.one();
+        let expected_lt = signed.clone() * signed_lt + (one - signed) * unsigned_lt;
+        b.emit_base(2, lt - expected_lt);
+
+        // idx 3: out = lt XOR invert = lt + invert - 2*lt*invert
+        let out = b.main(0, cols::OUT);
+        let lt = b.main(0, cols::LT);
+        let invert = b.main(0, cols::INVERT);
+        let two = b.const_base(2);
+        b.emit_base(3, out - (lt.clone() + invert.clone() - two * lt * invert));
+
+        // idx 4: invert * (1 - invert)
+        let invert = b.main(0, cols::INVERT);
+        let one = b.one();
+        b.emit_base(4, invert.clone() * (one - invert));
+
+        // idx 5: signed * (1 - signed)
+        let signed = b.main(0, cols::SIGNED);
+        let one = b.one();
+        b.emit_base(5, signed.clone() * (one - signed));
+    }
+}
