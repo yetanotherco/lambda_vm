@@ -1680,7 +1680,7 @@ where
     let zeta_ptr = &zeta_final as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let (_root, terminal_evals_u64, _nodes) = match state.fold_and_commit_layer(zeta_raw) {
+    let (terminal_evals_u64, _tree) = match state.fold_and_commit_layer(zeta_raw) {
         Ok(v) => v,
         Err(_) => {
             *transcript = transcript_snapshot;
