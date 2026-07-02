@@ -2386,6 +2386,19 @@ pub trait IsStarkProver<
             }
         }
 
+        // ONE shared OOD point z for the whole epoch. Sampled against the
+        // TALLEST table's domain, which is a superset of every shorter table's
+        // LDE and trace domain, so z is out-of-domain for all tables at once.
+        // Cleaner than per-table z and simpler to mirror in the verifier;
+        // identical to per-table z when there is a single table.
+        let tallest = (0..num_airs)
+            .max_by_key(|&i| domains[i].lde_roots_of_unity_coset.len())
+            .expect("at least one table in the epoch");
+        let z = transcript.sample_z_ood(
+            &domains[tallest].lde_roots_of_unity_coset,
+            &domains[tallest].trace_roots_of_unity,
+        );
+
         // Round 3 + Round 4 per table, sequentially on the shared transcript.
         let mut proofs = Vec::with_capacity(num_airs);
         for idx in 0..num_airs {
@@ -2397,12 +2410,6 @@ pub trait IsStarkProver<
 
             #[cfg(feature = "instruments")]
             let table_start = Instant::now();
-
-            // <<<< Receive per-table challenge: z_i
-            let z = transcript.sample_z_ood(
-                &domain.lde_roots_of_unity_coset,
-                &domain.trace_roots_of_unity,
-            );
 
             let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
                 air,
