@@ -83,7 +83,8 @@ where
     constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct SimpleAdditionPublicInputs<F>
 where
     F: IsFFTField,

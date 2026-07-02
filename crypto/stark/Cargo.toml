@@ -78,6 +78,10 @@ dwarf-debug-info = false
 # Should we omit the default import path
 omit-default-module-path = false
 
+[[example]]
+name = "examples_cli"
+required-features = ["test-utils"]
+
 [[bench]]
 name = "prover_benchmark"
 harness = false

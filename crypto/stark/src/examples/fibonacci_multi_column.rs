@@ -114,6 +114,7 @@ where
 /// Public inputs for the multi-column Fibonacci AIR.
 /// Contains the initial values (first two elements) for each column.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct FibonacciMultiColumnPublicInputs<F: IsFFTField> {
     /// Initial values for each column: (a0, a1) pairs
     pub initial_values: Vec<(FieldElement<F>, FieldElement<F>)>,
