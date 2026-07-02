@@ -1310,3 +1310,198 @@ pub fn dvrm_constraints(constraint_idx_start: usize) -> (Vec<DvrmConstraint>, us
 
     (constraints, idx)
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `DvrmConstraint` / `dvrm_constraints` above, written
+// once against the generic `ConstraintBuilder` so one body serves the compiled
+// prover folder, the verifier folder and IR capture. The old structs stay for
+// now (they are the differential oracle); the final deletion phase removes
+// them. Constraint indices 0..19 match `dvrm_constraints(0)` exactly.
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// DVRM table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the DVRM layout is fixed via `cols`).
+pub struct DvrmConstraints;
+
+impl DvrmConstraints {
+    /// Sign-extended QuadWL word `k` (0..4) of a halfword group, matching
+    /// [`DvrmConstraint::build_extended_quad`]:
+    /// `[hw0 + hw1·2^16, hw2 + hw3·2^16, ext, ext]`, where
+    /// `ext = sign·SIGN_FILL + sign·SIGN_FILL·2^16`.
+    fn ext_quad<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        hw: [usize; 4],
+        sign_col: usize,
+        k: usize,
+    ) -> B::Expr {
+        let shift_16 = b.const_base(SHIFT_16);
+        match k {
+            0 => {
+                let hw0 = b.main(0, hw[0]);
+                let hw1 = b.main(0, hw[1]);
+                hw0 + hw1 * shift_16
+            }
+            1 => {
+                let hw2 = b.main(0, hw[2]);
+                let hw3 = b.main(0, hw[3]);
+                hw2 + hw3 * shift_16
+            }
+            _ => {
+                // ext = sign * SIGN_FILL + sign * SIGN_FILL * 2^16
+                let sign = b.main(0, sign_col);
+                let sign_fill = b.const_base(SIGN_FILL);
+                let sign_fill2 = b.const_base(SIGN_FILL);
+                let shift_16b = b.const_base(SHIFT_16);
+                sign.clone() * sign_fill + sign * sign_fill2 * shift_16b
+            }
+        }
+    }
+
+    /// Virtual carry[i] for `n = n_sub_r + r`, matching
+    /// [`DvrmConstraint::compute_carry`] (extended QuadWL, recursive chain).
+    fn carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        const N: [usize; 4] = [cols::N_0, cols::N_1, cols::N_2, cols::N_3];
+        const NSR: [usize; 4] = [
+            cols::N_SUB_R_0,
+            cols::N_SUB_R_1,
+            cols::N_SUB_R_2,
+            cols::N_SUB_R_3,
+        ];
+        const R: [usize; 4] = [cols::R_0, cols::R_1, cols::R_2, cols::R_3];
+
+        let ext_n = Self::ext_quad(b, N, cols::SIGN_N, i);
+        let ext_r = Self::ext_quad(b, R, cols::SIGN_R, i);
+        let ext_nsr = Self::ext_quad(b, NSR, cols::SIGN_N_SUB_R, i);
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+
+        if i == 0 {
+            // carry[0] = (ext_nsr[0] + ext_r[0] - ext_n[0]) / 2^32
+            (ext_nsr + ext_r - ext_n) * inv_2_32
+        } else {
+            // carry[i] = (ext_nsr[i] + ext_r[i] + carry[i-1] - ext_n[i]) / 2^32
+            let prev = Self::carry(b, i - 1);
+            (ext_nsr + ext_r + prev - ext_n) * inv_2_32
+        }
+    }
+
+    /// `r::DWordWL[i]` (i = 0 → lo32, else hi32), matching the `AbsRFormula`
+    /// arm; used generically for r or d halfword groups.
+    fn dword_wl<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        lo: usize,
+        hi: usize,
+    ) -> B::Expr {
+        let shift_16 = b.const_base(SHIFT_16);
+        let a = b.main(0, lo);
+        let c = b.main(0, hi);
+        a + c * shift_16
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // All DVRM constraints are declared degree 2 (see DvrmConstraint::degree).
+        (0..19).map(|i| ConstraintMeta::base(i, 2)).collect()
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: SignedIsBit — signed * (1 - signed)
+        let signed = b.main(0, cols::SIGNED);
+        let one = b.one();
+        b.emit_base(0, signed.clone() * (one - signed));
+
+        // idx 1: RemainderSignMatchesNumerator —
+        // (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n)
+        let r0 = b.main(0, cols::R_0);
+        let r1 = b.main(0, cols::R_1);
+        let r2 = b.main(0, cols::R_2);
+        let r3 = b.main(0, cols::R_3);
+        let sign_r = b.main(0, cols::SIGN_R);
+        let sign_n = b.main(0, cols::SIGN_N);
+        let r_sum = r0 + r1 + r2 + r3;
+        b.emit_base(1, r_sum * (sign_r - sign_n));
+
+        // idx 2,3: AbsRFormula(0,1) — (1-sign_r) * (abs_r[i] - r::DWordWL[i])
+        for (off, (abs_col, lo, hi)) in [
+            (cols::ABS_R_0, cols::R_0, cols::R_1),
+            (cols::ABS_R_1, cols::R_2, cols::R_3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sign_r = b.main(0, cols::SIGN_R);
+            let one = b.one();
+            let abs_r = b.main(0, abs_col);
+            let r_wl = Self::dword_wl(b, lo, hi);
+            b.emit_base(2 + off, (one - sign_r) * (abs_r - r_wl));
+        }
+
+        // idx 4,5: AbsDFormula(0,1) — (1-sign_d) * (abs_d[i] - d::DWordWL[i])
+        for (off, (abs_col, lo, hi)) in [
+            (cols::ABS_D_0, cols::D_0, cols::D_1),
+            (cols::ABS_D_1, cols::D_2, cols::D_3),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let sign_d = b.main(0, cols::SIGN_D);
+            let one = b.one();
+            let abs_d = b.main(0, abs_col);
+            let d_wl = Self::dword_wl(b, lo, hi);
+            b.emit_base(4 + off, (one - sign_d) * (abs_d - d_wl));
+        }
+
+        // idx 6: SignQFormula — signed * (1-overflow) - sign_q
+        let signed = b.main(0, cols::SIGNED);
+        let overflow = b.main(0, cols::OVERFLOW);
+        let sign_q = b.main(0, cols::SIGN_Q);
+        let one = b.one();
+        b.emit_base(6, signed * (one - overflow) - sign_q);
+
+        // idx 7..11: CarryIsBit(0..4) — carry[i] * (1 - carry[i])
+        for i in 0..4 {
+            let carry = Self::carry(b, i);
+            let one = b.one();
+            b.emit_base(7 + i, carry.clone() * (one - carry));
+        }
+
+        // idx 11: SignNSubRIsBit — sign_n_sub_r * (1 - sign_n_sub_r)
+        let sign = b.main(0, cols::SIGN_N_SUB_R);
+        let one = b.one();
+        b.emit_base(11, sign.clone() * (one - sign));
+
+        // idx 12: UnsignedSignN — (1-signed) * sign_n
+        let signed = b.main(0, cols::SIGNED);
+        let sign_n = b.main(0, cols::SIGN_N);
+        let one = b.one();
+        b.emit_base(12, (one - signed) * sign_n);
+
+        // idx 13: UnsignedSignR — (1-signed) * sign_r
+        let signed = b.main(0, cols::SIGNED);
+        let sign_r = b.main(0, cols::SIGN_R);
+        let one = b.one();
+        b.emit_base(13, (one - signed) * sign_r);
+
+        // idx 14: UnsignedSignD — (1-signed) * sign_d
+        let signed = b.main(0, cols::SIGNED);
+        let sign_d = b.main(0, cols::SIGN_D);
+        let one = b.one();
+        b.emit_base(14, (one - signed) * sign_d);
+
+        // idx 15..19: DivByZeroQ(0..4) — div_by_zero * (q[i] - 65535)
+        let q_cols = [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3];
+        for (i, &q_col) in q_cols.iter().enumerate() {
+            let dbz = b.main(0, cols::DIV_BY_ZERO);
+            let q = b.main(0, q_col);
+            let fill = b.const_base(SIGN_FILL);
+            b.emit_base(15 + i, dbz * (q - fill));
+        }
+    }
+}

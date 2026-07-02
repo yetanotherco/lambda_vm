@@ -989,6 +989,196 @@ pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, 
 }
 
 // =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `ShiftConstraint` / `shift_constraints` above,
+// written once against the generic `ConstraintBuilder` so one body serves the
+// compiled prover folder, the verifier folder and IR capture. The old structs
+// stay for now (they are the differential oracle); the final deletion phase
+// removes them. Constraint indices 0..19 match `shift_constraints(0)` exactly.
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// SHIFT table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the SHIFT layout is fixed via `cols`).
+pub struct ShiftConstraints;
+
+impl ShiftConstraints {
+    /// `limb_shift[i]` (i = 0..2 raw, i = 3 virtual
+    /// `1 - ls_raw[0] - ls_raw[1] - ls_raw[2]`), matching `get_ls`.
+    fn limb_shift<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i < 3 {
+            b.main(0, cols::LIMB_SHIFT_RAW[i])
+        } else {
+            let one = b.one();
+            let a = b.main(0, cols::LIMB_SHIFT_RAW[0]);
+            let c = b.main(0, cols::LIMB_SHIFT_RAW[1]);
+            let d = b.main(0, cols::LIMB_SHIFT_RAW[2]);
+            one - a - c - d
+        }
+    }
+
+    /// intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0.
+    fn intra_left<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i == 0 {
+            b.main(0, cols::X[0])
+        } else {
+            let x = b.main(0, cols::X[i]);
+            let y = b.main(0, cols::Y[i - 1]);
+            x + y
+        }
+    }
+
+    /// intra_limb_right[i]: Y[i]+X[i+1].
+    fn intra_right<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        let y = b.main(0, cols::Y[i]);
+        let x = b.main(0, cols::X[i + 1]);
+        y + x
+    }
+
+    /// The `shifted` virtual column at index `half_idx` (0..4), matching
+    /// [`ShiftConstraint::compute_shifted_half`].
+    fn shifted_half<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        // left = μ - direction, right = direction
+        let mu = b.main(0, cols::MU);
+        let dir = b.main(0, cols::DIRECTION);
+        let left = mu - dir;
+        let right = b.main(0, cols::DIRECTION);
+
+        // extension = 65535 * is_negative
+        let is_neg = b.main(0, cols::IS_NEGATIVE);
+        let c65535 = b.const_base(65535);
+        let extension = is_neg * c65535;
+
+        // left_part = left * Σ_{j=0}^{i} limb_shift[j] * intra_limb_left[i-j]
+        let mut left_part = b.zero();
+        for j in 0..=i {
+            left_part = left_part + Self::limb_shift(b, j) * Self::intra_left(b, i - j);
+        }
+        let left_part = left * left_part;
+
+        // right_shift_part = Σ_{j=0}^{3-i} limb_shift[j] * intra_limb_right[i+j]
+        let mut right_shift_part = b.zero();
+        for j in 0..=(3 - i) {
+            right_shift_part =
+                right_shift_part + Self::limb_shift(b, j) * Self::intra_right(b, i + j);
+        }
+
+        // right_ext_part = extension * Σ_{j=4-i}^{3} limb_shift[j]
+        let mut ext_sum = b.zero();
+        if i < 4 {
+            for j in (4 - i)..4 {
+                ext_sum = ext_sum + Self::limb_shift(b, j);
+            }
+        }
+        let right_ext_part = extension * ext_sum;
+
+        let right_part = right * (right_shift_part + right_ext_part);
+
+        left_part + right_part
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(NUM_SHIFT_CONSTRAINTS);
+        m.push(ConstraintMeta::base(0, 2)); // DirectionImpliesMu
+        for i in 0..4 {
+            m.push(ConstraintMeta::base(1 + i, 3)); // ZbsOverrideX
+        }
+        m.push(ConstraintMeta::base(5, 2)); // ZbsOverrideX4
+        for i in 0..4 {
+            m.push(ConstraintMeta::base(6 + i, 3)); // ZbsOverrideY
+        }
+        for i in 0..4 {
+            m.push(ConstraintMeta::base(10 + i, 2)); // LimbShiftIsBit
+        }
+        for i in 0..2 {
+            m.push(ConstraintMeta::base(14 + i, 3)); // OutputMatchesShifted
+        }
+        for i in 0..3 {
+            m.push(ConstraintMeta::base(16 + i, 2)); // FlagIsBit
+        }
+        debug_assert_eq!(m.len(), NUM_SHIFT_CONSTRAINTS);
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: DirectionImpliesMu — direction * (1 - μ)
+        let dir = b.main(0, cols::DIRECTION);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(0, dir * (one - mu));
+
+        // idx 1..5: ZbsOverrideX(i) — zbs * (X[i] - in[i] * (μ - direction))
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let x_i = b.main(0, cols::X[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let mu = b.main(0, cols::MU);
+            let dir = b.main(0, cols::DIRECTION);
+            let left = mu - dir;
+            b.emit_base(1 + i, zbs * (x_i - in_i * left));
+        }
+
+        // idx 5: ZbsOverrideX4 — zbs * X[4]
+        let zbs = b.main(0, cols::ZBS);
+        let x4 = b.main(0, cols::X_4);
+        b.emit_base(5, zbs * x4);
+
+        // idx 6..10: ZbsOverrideY(i) — zbs * (Y[i] - in[i] * direction)
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let y_i = b.main(0, cols::Y[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let dir = b.main(0, cols::DIRECTION);
+            b.emit_base(6 + i, zbs * (y_i - in_i * dir));
+        }
+
+        // idx 10..14: LimbShiftIsBit(i) — limb_shift[i] * (1 - limb_shift[i])
+        for i in 0..4 {
+            let ls = Self::limb_shift(b, i);
+            let one = b.one();
+            b.emit_base(10 + i, ls.clone() * (one - ls));
+        }
+
+        // idx 14,15: OutputMatchesShifted(i) —
+        // out[i] - shifted_half[2i] - shifted_half[2i+1] * 2^16
+        for i in 0..2 {
+            let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
+            let out = b.main(0, out_col);
+            let half_lo = Self::shifted_half(b, 2 * i);
+            let half_hi = Self::shifted_half(b, 2 * i + 1);
+            let shift_16 = b.const_base(SHIFT_16);
+            b.emit_base(14 + i, out - half_lo - half_hi * shift_16);
+        }
+
+        // idx 16..19: FlagIsBit — flag * (1 - flag) for direction, signed, word_instr
+        for (off, flag_col) in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR]
+            .into_iter()
+            .enumerate()
+        {
+            let flag = b.main(0, flag_col);
+            let one = b.one();
+            b.emit_base(16 + off, flag.clone() * (one - flag));
+        }
+    }
+}
+
+// =========================================================================
 // Bitwise operation collection
 // =========================================================================
 
