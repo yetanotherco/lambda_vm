@@ -328,3 +328,33 @@ mod commit {
         check_table("commit", &old, &CommitConstraints, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// keccak.rs
+// =============================================================================
+
+mod keccak {
+    use super::*;
+    use crate::tables::keccak::{KeccakConstraints, cols, create_constraints};
+
+    #[test]
+    fn keccak_constraint_set_matches_old() {
+        let (old, _) = create_constraints(0);
+        check_table("keccak", &old, &KeccakConstraints, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// keccak_rnd.rs
+// =============================================================================
+
+mod keccak_rnd {
+    use super::*;
+    use crate::tables::keccak_rnd::{KeccakRndConstraints, cols, create_constraints};
+
+    #[test]
+    fn keccak_rnd_constraint_set_matches_old() {
+        let (old, _) = create_constraints(0);
+        check_table("keccak_rnd", &old, &KeccakRndConstraints, cols::NUM_COLUMNS);
+    }
+}

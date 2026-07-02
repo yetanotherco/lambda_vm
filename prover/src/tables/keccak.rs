@@ -23,6 +23,8 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
 
@@ -560,4 +562,72 @@ pub fn create_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The KECCAK core table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`create_constraints`] index-for-index (51 constraints):
+/// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
+///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
+///   `state_ptr` DWordHL);
+/// - idx 50:   `μ · carry_1 = 0` (top-lane no-overflow), where `carry_1` is the
+///   high carry of `addr + 192 = state_ptr[24]`.
+pub struct KeccakConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(51);
+        for lane_idx in 0..25 {
+            // ADD pair is conditional on μ → degree 3.
+            m.extend(crate::constraints::templates::add_pair_meta(
+                lane_idx * 2,
+                true,
+            ));
+        }
+        m.push(ConstraintMeta::base(50, 2)); // μ · carry_1
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        use crate::constraints::templates::emit_add_pair;
+
+        // idx 0-49: state_ptr[lane] = addr + 8*lane_idx (gated on μ).
+        for lane_idx in 0..25 {
+            let offset = (lane_idx * 8) as i64;
+            emit_add_pair(
+                b,
+                lane_idx * 2,
+                &[cols::MU],
+                &AddOperand::from_dword_bl(cols::ADDR),
+                &AddOperand::constant(offset),
+                &AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
+            );
+        }
+
+        // idx 50: μ · carry_1 (top-lane no-overflow).
+        let c256 = b.const_base(256);
+        let c65536 = b.const_base(65536);
+        let c16777216 = b.const_base(16777216);
+        let addr_lo = b.main(0, cols::addr(0))
+            + b.main(0, cols::addr(1)) * c256.clone()
+            + b.main(0, cols::addr(2)) * c65536.clone()
+            + b.main(0, cols::addr(3)) * c16777216.clone();
+        let addr_hi = b.main(0, cols::addr(4))
+            + b.main(0, cols::addr(5)) * c256
+            + b.main(0, cols::addr(6)) * c65536.clone()
+            + b.main(0, cols::addr(7)) * c16777216;
+        let ptr_lo =
+            b.main(0, cols::state_ptr(24, 0)) + b.main(0, cols::state_ptr(24, 1)) * c65536.clone();
+        let ptr_hi = b.main(0, cols::state_ptr(24, 2)) + b.main(0, cols::state_ptr(24, 3)) * c65536;
+
+        let inv_2_32 = b.const_base(INV_SHIFT_32);
+        let c192 = b.const_base(192);
+        let carry_0 = (addr_lo + c192 - ptr_lo) * inv_2_32.clone();
+        let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
+        let mu = b.main(0, cols::MU);
+        b.emit_base(50, mu * carry_1);
+    }
 }
