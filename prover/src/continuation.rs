@@ -50,6 +50,7 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
+use crate::paged_mem::PagedMem;
 use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
@@ -619,6 +620,172 @@ fn verify_global(
     )
 }
 
+/// Streaming driver over the epochs of one execution: owns the executor and the
+/// carried cross-epoch state (`image`, `provenance`, `prev_fini`) and proves one epoch
+/// per [`next`](EpochDriver::next) call. It is the single source of truth for the epoch
+/// loop, so the bundle path ([`prove_continuation`], which keeps every proof) and the
+/// streaming self-verify path ([`prove_and_verify_continuation`], which verifies and
+/// drops each proof) cannot diverge in how epochs are produced.
+///
+/// `init_page_data` is snapshotted from the INITIAL image in [`new`](EpochDriver::new)
+/// and never recomputed from the carried (mutated) image, so the global proof's genesis
+/// matches the ELF the verifier rebuilds.
+struct EpochDriver<'a> {
+    elf: Elf,
+    elf_bytes: &'a [u8],
+    private_inputs: &'a [u8],
+    opts: &'a ProofOptions,
+    epoch_size: usize,
+    executor: Executor,
+    /// Cross-epoch memory image, carried forward: epoch i+1's init is epoch i's fini.
+    image: PagedMem<u8>,
+    provenance: PagedMem<(u64, u64, u64)>,
+    /// Genesis page data snapshotted from the initial image (fed to `prove_global`).
+    init_page_data: HashMap<u64, Vec<u8>>,
+    /// The previous epoch's bound final register file `R_{i+1}` (next epoch's init).
+    prev_fini: Option<Vec<u32>>,
+    index: u64,
+}
+
+impl<'a> EpochDriver<'a> {
+    fn new(
+        elf_bytes: &'a [u8],
+        private_inputs: &'a [u8],
+        epoch_size_log2: u32,
+        opts: &'a ProofOptions,
+    ) -> Result<Self, Error> {
+        if epoch_size_log2 < 2 {
+            return Err(Error::InvalidContinuationEpochSize(
+                "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
+            ));
+        }
+        let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
+            Error::InvalidContinuationEpochSize(format!(
+                "epoch_size_log2 {epoch_size_log2} is too large for this platform"
+            ))
+        })?;
+
+        let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+        let executor = Executor::new(&elf, private_inputs.to_vec())
+            .map_err(|e| Error::Execution(format!("{e}")))?;
+
+        let image = build_initial_image_paged(&elf, private_inputs);
+        let init_page_data = build_init_page_data(&image);
+        let provenance =
+            local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+
+        Ok(Self {
+            elf,
+            elf_bytes,
+            private_inputs,
+            opts,
+            epoch_size,
+            executor,
+            image,
+            provenance,
+            init_page_data,
+            prev_fini: None,
+            index: 0,
+        })
+    }
+
+    /// Prove the next epoch, or `Ok(None)` once the execution has halted. Advances the
+    /// carried image/provenance/register state. This epoch's `is_final` is decided here
+    /// by whether the program halted inside it (`executor.pc() == 0`) and baked into its
+    /// AIRs (HALT is present only on the final epoch); the verifier re-derives `is_final`
+    /// independently rather than trusting this.
+    fn next(&mut self) -> Result<Option<EpochProof>, Error> {
+        if self.executor.pc() == 0 {
+            return Ok(None);
+        }
+        // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 - init_epoch`) only
+        // spans `local_to_global::MAX_EPOCHS` epochs. Beyond that an honest proof is
+        // impossible — fail fast instead of building an unprovable trace.
+        if self.index >= local_to_global::MAX_EPOCHS {
+            return Err(Error::InvalidContinuationEpochSize(format!(
+                "execution needs more than {} continuation epochs (the IsB20 cross-epoch \
+                 ordering range); use a larger epoch size",
+                local_to_global::MAX_EPOCHS
+            )));
+        }
+
+        let register_init: Vec<u32> = if self.index == 0 {
+            register::register_init_from_entry_point(self.elf.entry_point)
+        } else {
+            // Epoch i+1's init is epoch i's bound fini, reused directly — the
+            // cross-epoch register binding.
+            self.prev_fini.clone().ok_or_else(|| {
+                Error::ContinuationInvariant(
+                    "previous epoch final registers are missing after the first epoch".to_string(),
+                )
+            })?
+        };
+
+        // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
+        let logs = match self
+            .executor
+            .resume_with_limit(self.epoch_size)
+            .map_err(|e| Error::Execution(format!("{e}")))?
+        {
+            Some(logs) => logs.to_vec(),
+            None => return Ok(None),
+        };
+        let is_final = self.executor.pc() == 0;
+
+        // Invariant: a non-final epoch ran the full `epoch_size` (a power of two), so
+        // its CPU table has no padding rows.
+        if !is_final && logs.len() != self.epoch_size {
+            return Err(Error::ContinuationInvariant(format!(
+                "intermediate epoch ran {} cycles, expected {}",
+                logs.len(),
+                self.epoch_size
+            )));
+        }
+
+        let label = local_to_global::epoch_label(self.index);
+        let traces = Traces::from_image_and_logs(
+            &self.elf,
+            &self.image,
+            &register_init,
+            &logs,
+            &MaxRowsConfig::default(),
+            self.private_inputs,
+            is_final,
+            true,
+            #[cfg(feature = "disk-spill")]
+            stark::storage_mode::StorageMode::Ram,
+        )?;
+        let boundary = local_to_global::epoch_boundary(
+            &mut self.provenance,
+            label,
+            &traces.touched_memory_cells,
+        );
+
+        let start = EpochStart {
+            register_init: &register_init,
+            label,
+        };
+        let epoch = prove_epoch(
+            &self.elf,
+            self.elf_bytes,
+            &start,
+            traces,
+            is_final,
+            &boundary,
+            self.opts,
+        )?;
+        self.prev_fini = Some(epoch.reg_fini.clone());
+
+        // Carry the image forward: this epoch's fini is the next epoch's init.
+        for cell in &boundary {
+            self.image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+        }
+        self.index += 1;
+
+        Ok(Some(epoch))
+    }
+}
+
 /// Prove a full continuation and return a self-contained [`ContinuationProof`]
 /// (prove half only — no verification). Splits the execution into `2^epoch_size_log2`
 /// cycle epochs, proves each, and proves the one cross-epoch global-memory linkage.
@@ -638,120 +805,17 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
-    if epoch_size_log2 < 2 {
-        return Err(Error::InvalidContinuationEpochSize(
-            "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
-        ));
-    }
-    let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
-        Error::InvalidContinuationEpochSize(format!(
-            "epoch_size_log2 {epoch_size_log2} is too large for this platform"
-        ))
-    })?;
-
-    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let mut executor = Executor::new(&elf, private_inputs.to_vec())
-        .map_err(|e| Error::Execution(format!("{e}")))?;
-
-    // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
-    // fini, updated in place with each epoch's touched-cell final values.
-    let mut image = build_initial_image_paged(&elf, private_inputs);
-    let init_page_data = build_init_page_data(&image);
-    let mut provenance =
-        local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
+    let mut driver = EpochDriver::new(elf_bytes, private_inputs, epoch_size_log2, opts)?;
 
     let mut epochs: Vec<EpochProof> = Vec::new();
-    // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
-    // derived from it (the cross-epoch register binding).
-    let mut prev_fini: Option<Vec<u32>> = None;
-
-    let mut index: u64 = 0;
-    loop {
-        if executor.pc() == 0 {
-            break;
-        }
-        // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 - init_epoch`)
-        // only spans `local_to_global::MAX_EPOCHS` epochs. Beyond that the IsB20 bus
-        // cannot balance, so an honest proof is impossible — fail fast with a clear
-        // error instead of building an unprovable trace. The verifier already
-        // rejects any such proof; this is a prover-side guard for a clean message.
-        if index >= local_to_global::MAX_EPOCHS {
-            return Err(Error::InvalidContinuationEpochSize(format!(
-                "execution needs more than {} continuation epochs (the IsB20 cross-epoch \
-                 ordering range); use a larger epoch size",
-                local_to_global::MAX_EPOCHS
-            )));
-        }
-        let register_init: Vec<u32> = if index == 0 {
-            register::register_init_from_entry_point(elf.entry_point)
-        } else {
-            // Epoch i+1's init is epoch i's bound fini, reused directly (same
-            // `register_word_address_list` order) — the cross-epoch register binding.
-            prev_fini.clone().ok_or_else(|| {
-                Error::ContinuationInvariant(
-                    "previous epoch final registers are missing after the first epoch".to_string(),
-                )
-            })?
-        };
-
-        // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
-        let logs = match executor
-            .resume_with_limit(epoch_size)
-            .map_err(|e| Error::Execution(format!("{e}")))?
-        {
-            Some(logs) => logs.to_vec(),
-            None => break,
-        };
-        let is_final = executor.pc() == 0;
-
-        // Invariant: a non-final epoch ran the full `epoch_size` (a power of two),
-        // so its CPU table has no padding rows.
-        if !is_final && logs.len() != epoch_size {
-            return Err(Error::ContinuationInvariant(format!(
-                "intermediate epoch ran {} cycles, expected {epoch_size}",
-                logs.len()
-            )));
-        }
-
-        let label = local_to_global::epoch_label(index);
-        let traces = Traces::from_image_and_logs(
-            &elf,
-            &image,
-            &register_init,
-            &logs,
-            &MaxRowsConfig::default(),
-            private_inputs,
-            is_final,
-            true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )?;
-        let boundary =
-            local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
-
-        let start = EpochStart {
-            register_init: &register_init,
-            label,
-        };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
-        prev_fini = Some(epoch.reg_fini.clone());
-
-        // Carry the image forward: this epoch's fini is the next epoch's init.
-        for cell in &boundary {
-            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
-        }
+    while let Some(epoch) = driver.next()? {
         epochs.push(epoch);
-
-        if is_final {
-            break;
-        }
-        index += 1;
     }
 
     // One global LogUp over all the (kept) local-to-global tables.
     let all_boundaries: Vec<Vec<CellBoundary>> =
         epochs.iter().map(|e| e.boundary.clone()).collect();
-    let global = prove_global(&all_boundaries, elf_bytes, &init_page_data, opts)?;
+    let global = prove_global(&all_boundaries, elf_bytes, &driver.init_page_data, opts)?;
 
     Ok(ContinuationProof {
         epochs,
@@ -859,16 +923,101 @@ pub fn verify_continuation(
     Ok(Some(public_output))
 }
 
-/// Convenience wrapper: prove then verify in one call (the original integrated API).
-/// Returns `Ok(Some(public_output))` iff the continuation proves and verifies.
+/// Prove and verify a full continuation in one streaming pass: each epoch is proved,
+/// verified inline, and its proof dropped — only `boundary`, `l2g_root`, and
+/// `public_output` are retained — then the one cross-epoch global proof is built and
+/// verified. This bounds the retained-proof memory to O(1) epochs instead of collecting
+/// every epoch proof up front (as [`prove_continuation`] + [`verify_continuation`] do).
+///
+/// The verification is a faithful mirror of [`verify_continuation`]: `register_init` is
+/// chained from each verified epoch's `reg_fini`, and `label`/`is_final` are derived
+/// positionally here (one-epoch lookahead for `is_final`), never taken from the prover.
+/// It is NOT a substitute for verifying an untrusted serialized `ContinuationProof` —
+/// [`verify_continuation`] remains that. Returns `Ok(Some(public_output))` iff the
+/// continuation proves and verifies.
 pub fn prove_and_verify_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    let bundle = prove_continuation(elf_bytes, private_inputs, epoch_size_log2, opts)?;
-    verify_continuation(elf_bytes, &bundle, opts)
+    let mut driver = EpochDriver::new(elf_bytes, private_inputs, epoch_size_log2, opts)?;
+
+    // Verify-side state, rebuilt independently of the prover: `register_init` chains
+    // from each verified epoch's bound `reg_fini` (epoch 0 from the ELF entry point).
+    let mut register_init = register::register_init_from_entry_point(driver.elf.entry_point);
+    let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
+    let mut epoch_roots: Vec<Commitment> = Vec::new();
+    let mut public_output: Vec<u8> = Vec::new();
+    let mut index: u64 = 0;
+
+    // One-epoch lookahead: `is_final` is derived from whether another epoch actually
+    // follows (positional), not from a flag the prover stored, so a driver enumeration
+    // bug cannot be silently self-consistent between the prove and verify halves.
+    let mut pending = driver.next()?;
+    while let Some(epoch) = pending {
+        let next = driver.next()?;
+        let is_final = next.is_none();
+        let label = local_to_global::epoch_label(index);
+
+        // Ordering is load-bearing: verify_epoch must pass BEFORE `l2g_root` is trusted
+        // and the proof dropped. The global L2G air is constraint-free, so the epoch
+        // proof (checked here) is the sole enforcer of the L2G column constraints, and
+        // `l2g_root` is only bound to a verified trace once verify_epoch returns true.
+        if !verify_epoch(
+            &driver.elf,
+            elf_bytes,
+            &epoch,
+            &register_init,
+            is_final,
+            label,
+            opts,
+        ) {
+            return Ok(None);
+        }
+
+        // Keep only what the global step + final checks need; the MultiProof drops here.
+        // `epoch` is owned, so `reg_fini` moves out (no clone) into the next epoch's
+        // derived init — the cross-epoch register chain, checked independently here.
+        let EpochProof {
+            boundary,
+            l2g_root,
+            public_output: out,
+            reg_fini,
+            ..
+        } = epoch;
+        register_init = reg_fini;
+        public_output.extend_from_slice(&out);
+        epoch_roots.push(l2g_root);
+        all_boundaries.push(boundary);
+        index += 1;
+
+        pending = next;
+    }
+
+    // Mirror verify_continuation's n == 0 early-return (reachable via an `e_entry == 0`
+    // ELF, which yields zero epochs): without it the empty global prove/verify would
+    // trivially pass and accept a run the standalone verifier rejects.
+    if all_boundaries.is_empty() {
+        return Ok(None);
+    }
+
+    let global = prove_global(&all_boundaries, elf_bytes, &driver.init_page_data, opts)?;
+    if !verify_global(
+        &all_boundaries,
+        &global,
+        &driver.elf,
+        elf_bytes,
+        private_inputs,
+        opts,
+    ) {
+        return Ok(None);
+    }
+    if !verify_l2g_commitment_binding(&epoch_roots, &global) {
+        return Ok(None);
+    }
+
+    Ok(Some(public_output))
 }
 
 #[cfg(test)]
@@ -955,6 +1104,95 @@ mod tests {
             )
             .unwrap()
             .is_some()
+        );
+    }
+
+    // Anti-drift guard: the streaming self-verify path (`prove_and_verify_continuation`)
+    // must accept/reject and aggregate output IDENTICALLY to the authoritative two-phase
+    // path (`prove_continuation` + the untouched `verify_continuation`). The streaming
+    // path derives `is_final`/`label` positionally and chains `register_init` itself, so
+    // it must agree with the standalone verifier on both the single-epoch
+    // (immediately-final) and multi-epoch (enumeration-boundary) shapes.
+    #[test]
+    fn test_streaming_matches_two_phase() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // `expected` pins an independent known-good output where we know it, so the
+        // test is not purely differential over one shared prover (a shared-prover or
+        // aggregation bug affecting both halves identically would otherwise pass).
+        let commit_output: &[u8] = &[0xAA, 0xBB, 0xCC, 0xDD];
+        for (name, log2, want_multi, expected) in [
+            ("test_commit_split", 6u32, false, Some(commit_output)), // one final epoch
+            ("test_commit_split", 4, true, Some(commit_output)),     // splits across epochs
+            ("all_loadstore_32", 3, true, None),                     // several intermediate epochs
+        ] {
+            let elf_bytes = asm_elf_bytes(name);
+
+            let bundle =
+                prove_continuation(&elf_bytes, &[], log2, &ProofOptions::default_test_options())
+                    .unwrap();
+            if want_multi {
+                assert!(
+                    bundle.num_epochs() > 1,
+                    "{name} @ log2={log2} must split into multiple epochs"
+                );
+            } else {
+                assert_eq!(
+                    bundle.num_epochs(),
+                    1,
+                    "{name} @ log2={log2} must be a single final epoch"
+                );
+            }
+            let two_phase =
+                verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                    .unwrap();
+            assert!(two_phase.is_some(), "{name} @ log2={log2} must verify");
+
+            let streaming = prove_and_verify_continuation(
+                &elf_bytes,
+                &[],
+                log2,
+                &ProofOptions::default_test_options(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                streaming, two_phase,
+                "{name} @ log2={log2}: streaming self-verify diverged from prove+verify_continuation"
+            );
+            if let Some(expected) = expected {
+                assert_eq!(
+                    streaming.as_deref(),
+                    Some(expected),
+                    "{name} @ log2={log2}: streaming output must match the known-good value"
+                );
+            }
+        }
+    }
+
+    // An ELF whose entry point is 0 yields zero epochs (the executor starts halted).
+    // The streaming path must mirror `verify_continuation`'s `n == 0` early-return and
+    // reject it with `Ok(None)` rather than trivially "verifying" an empty run.
+    #[test]
+    fn test_streaming_zero_epoch_returns_none() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let mut elf_bytes = asm_elf_bytes("all_loadstore_32");
+        // ELF64 `e_entry` is an 8-byte little-endian field at offset 24; zero it so the
+        // executor starts with pc == 0 and the driver produces no epochs.
+        for b in &mut elf_bytes[24..32] {
+            *b = 0;
+        }
+        assert_eq!(Elf::load(&elf_bytes).unwrap().entry_point, 0);
+        assert!(
+            prove_and_verify_continuation(
+                &elf_bytes,
+                &[],
+                4,
+                &ProofOptions::default_test_options()
+            )
+            .unwrap()
+            .is_none(),
+            "a zero-entry ELF (zero epochs) must be rejected, not accepted as empty"
         );
     }
 
