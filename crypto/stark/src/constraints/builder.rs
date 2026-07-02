@@ -239,6 +239,73 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
 }
 
 // =============================================================================
+// Shared AIR plumbing: run a ConstraintSet through the folders
+// =============================================================================
+
+/// Run a [`ConstraintSet`] through the [`ProverEvalFolder`]: the body of an
+/// `AIR::compute_transition_prover` override. `base_evals` must be sized
+/// `num_base` (the Base-prefix length of the set's meta, see
+/// [`num_base_from_meta`]) and `ext_evals` the total constraint count —
+/// the engine's existing contract.
+///
+/// Panics if `ctx` is the Verifier variant (the engine only calls the
+/// prover path with a prover frame).
+pub fn run_transition_prover<F, E, CS>(
+    cs: &CS,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+    base_evals: &mut [FieldElement<F>],
+    ext_evals: &mut [FieldElement<E>],
+) where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let mut folder = ProverEvalFolder::new(ctx, base_evals, ext_evals);
+    cs.eval(&mut folder);
+    folder.assert_all_emitted();
+}
+
+/// Run a [`ConstraintSet`] at a single point, returning all constraint
+/// values in the extension field: the body of an `AIR::compute_transition`
+/// override.
+///
+/// A Verifier context runs the [`VerifierEvalFolder`] (the OOD/recursion
+/// path). A Prover context is also accepted — debug trace validation calls
+/// this method with a prover frame — by running the [`ProverEvalFolder`]
+/// and promoting the Base-prefix results, mirroring the old boxed path's
+/// `evaluate_verifier` promotion.
+pub fn run_transition_verifier<F, E, CS>(
+    cs: &CS,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+    num_base: usize,
+    num_constraints: usize,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let mut ext_evals = vec![FieldElement::<E>::zero(); num_constraints];
+    match ctx {
+        TransitionEvaluationContext::Verifier { .. } => {
+            let mut folder = VerifierEvalFolder::new(ctx, &mut ext_evals);
+            cs.eval(&mut folder);
+            folder.assert_all_emitted();
+        }
+        TransitionEvaluationContext::Prover { .. } => {
+            let mut base_evals = vec![FieldElement::<F>::zero(); num_base];
+            let mut folder = ProverEvalFolder::new(ctx, &mut base_evals, &mut ext_evals);
+            cs.eval(&mut folder);
+            folder.assert_all_emitted();
+            for (slot, base) in ext_evals.iter_mut().zip(base_evals) {
+                *slot = base.to_extension();
+            }
+        }
+    }
+    ext_evals
+}
+
+// =============================================================================
 // Debug-build emit tracking (shared by the folders)
 // =============================================================================
 
