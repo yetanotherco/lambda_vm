@@ -1105,6 +1105,7 @@ where
             challenges,
         );
         #[cfg(not(feature = "cuda"))]
+        #[allow(clippy::type_complexity)]
         let gpu_term_cols: Option<(Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>)> = None;
 
         let (committed_columns, virtual_column) = match gpu_term_cols {
