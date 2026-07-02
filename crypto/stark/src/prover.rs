@@ -1,3 +1,9 @@
+// The IsStarkProver trait is a crate-internal abstraction whose methods trade in
+// crate-internal round types (Round1/2/3/4, TableCommit, LdeTwiddles). Exposing the
+// rounds-1-3 bundle through prove_rounds_1_to_3 surfaces the private_interfaces lint
+// across the whole trait; these types are never nameable/used across the crate
+// boundary, so silence it module-wide rather than bump every helper type to pub.
+#![allow(private_interfaces)]
 use std::marker::PhantomData;
 use std::sync::{Arc, OnceLock};
 #[cfg(feature = "instruments")]
@@ -41,7 +47,10 @@ use super::domain::{Domain, DomainConstants};
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
-use super::proof::stark::{DeepPolynomialOpening, MultiProof, StarkProof};
+use super::proof::stark::{
+    BatchedMultiProof, BatchedQueryOpening, BatchedTableData, DeepPolynomialOpening,
+    MultiProof, StarkProof,
+};
 use super::trace::TraceTable;
 use super::traits::AIR;
 
@@ -499,6 +508,29 @@ where
 /// helpers — only `prove`, `multi_prove` are meant for callers. The
 /// `private_interfaces` allow is removed once these helpers move off the trait.
 #[allow(private_interfaces)]
+/// Owned artifacts of rounds 1-3 (the linearized unified-shard front half),
+/// shared by the reference per-table path (`multi_prove`) and the batched path
+/// (`multi_prove_batched`). The three MMCS are KEPT (not transient) so the
+/// batched round 4 can open every table at each query from ONE tree per phase.
+pub(crate) struct RoundsOneToThree<Field, FieldExtension>
+where
+    Field: IsSubFieldOf<FieldExtension> + IsFFTField,
+    FieldExtension: IsField,
+    FieldElement<Field>: AsBytes,
+    FieldElement<FieldExtension>: AsBytes,
+{
+    pub(crate) round1s: Vec<Round1<Field, FieldExtension>>,
+    pub(crate) round2s: Vec<Round2<FieldExtension>>,
+    pub(crate) round3s: Vec<Round3<FieldExtension>>,
+    pub(crate) z: FieldElement<FieldExtension>,
+    pub(crate) domains: Vec<Arc<Domain<Field>>>,
+    pub(crate) twiddle_caches: Vec<Arc<LdeTwiddles<Field>>>,
+    pub(crate) main_mmcs: MixedMmcs<Field>,
+    pub(crate) aux_mmcs: Option<MixedMmcs<FieldExtension>>,
+    pub(crate) comp_mmcs: MixedMmcs<FieldExtension>,
+    pub(crate) heights: Vec<usize>,
+}
+
 pub trait IsStarkProver<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync + 'static,
     FieldExtension: Send + Sync + IsField + 'static,
@@ -1802,11 +1834,11 @@ pub trait IsStarkProver<
     /// # Warning
     ///
     /// The transcript must be safely initialized before passing it to this method.
-    fn multi_prove(
-        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+    fn prove_rounds_1_to_3(
+        air_trace_pairs: &mut Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    ) -> Result<RoundsOneToThree<Field, FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -1973,8 +2005,8 @@ pub trait IsStarkProver<
         // dropped. Until then this is a second full pass over every table's
         // main LDE columns purely to extract a root — real, but transient,
         // memory/CPU cost that the Task 10 perf gate should account for.
-        let batched_main_mmcs = Self::build_batched_main_mmcs(&main_commits, &main_ldes);
-        transcript.append_bytes(&batched_main_mmcs.root());
+        let main_mmcs = Self::build_batched_main_mmcs(&main_commits, &main_ldes);
+        transcript.append_bytes(&main_mmcs.root());
 
         // =====================================================================
         // Round 1, Phase B: Sample shared LogUp challenges
@@ -2178,7 +2210,7 @@ pub trait IsStarkProver<
         // Round 4 still opens the per-table aux trees (kept in `aux_results`).
         // Built AFTER Phase B LogUp challenges (aux depends on them) and BEFORE
         // forking, so the shared aux root is bound into every fork.
-        {
+        let aux_mmcs: Option<MixedMmcs<FieldExtension>> = {
             let mut aux_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
                 Vec::with_capacity(aux_results.len());
             for res in aux_results.iter() {
@@ -2203,11 +2235,14 @@ pub trait IsStarkProver<
                 }
                 aux_mats.push((data, log_height, *total_cols));
             }
-            if !aux_mats.is_empty() {
-                let batched_aux_mmcs = MixedMmcs::<FieldExtension>::commit(&aux_mats);
-                transcript.append_bytes(&batched_aux_mmcs.root());
+            if aux_mats.is_empty() {
+                None
+            } else {
+                let m = MixedMmcs::<FieldExtension>::commit(&aux_mats);
+                transcript.append_bytes(&m.root());
+                Some(m)
             }
-        }
+        };
 
 
         // Build commitments and cached LDEs as separate vecs:
@@ -2278,7 +2313,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let mut table_timings: Vec<(
+        let table_timings: Vec<(
             String,
             usize,
             Duration,
@@ -2359,7 +2394,7 @@ pub trait IsStarkProver<
         // >>>> Send commitment: ONE batched composition-poly root over all
         // tables' composition parts (mixed-height MMCS). Transient — round 4
         // still opens the per-table composition trees.
-        {
+        let comp_mmcs: MixedMmcs<FieldExtension> = {
             let mut comp_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
                 Vec::with_capacity(num_airs);
             for r2 in round2s.iter() {
@@ -2380,11 +2415,14 @@ pub trait IsStarkProver<
                 }
                 comp_mats.push((data, log_height, width));
             }
-            if !comp_mats.is_empty() {
-                let batched_comp_mmcs = MixedMmcs::<FieldExtension>::commit(&comp_mats);
-                transcript.append_bytes(&batched_comp_mmcs.root());
-            }
-        }
+            debug_assert!(
+                !comp_mats.is_empty(),
+                "every table produces a composition matrix"
+            );
+            let m = MixedMmcs::<FieldExtension>::commit(&comp_mats);
+            transcript.append_bytes(&m.root());
+            m
+        };
 
         // ONE shared OOD point z for the whole epoch. Sampled against the
         // TALLEST table's domain, which is a superset of every shorter table's
@@ -2425,18 +2463,83 @@ pub trait IsStarkProver<
             round3s.push(round_3_result);
         }
 
-        // Round 4: per-table FRI + StarkProof assembly (reference MultiProof path).
-        let mut proofs = Vec::with_capacity(num_airs);
-        for idx in 0..num_airs {
+        // Per-table FRI heights (lde_log_height), canonical order — the batched
+        // FRI + histogram binding key.
+        let heights: Vec<usize> = domains
+            .iter()
+            .map(|d| d.lde_roots_of_unity_coset.len().trailing_zeros() as usize)
+            .collect();
+
+        #[cfg(feature = "instruments")]
+        {
+            // Coarse report: rounds_2_4 covers rounds 2-3 (round 4 now runs in the
+            // caller); per-table table_timings dropped by the rounds-1-3 split.
+            crate::instruments::store(crate::instruments::MultiProveTiming {
+                prepass: prepass_elapsed,
+                main_commits: main_commits_elapsed,
+                aux_build: aux_build_elapsed,
+                aux_commit: aux_commit_elapsed,
+                rounds_2_4: phase_start.elapsed(),
+                round1_sub: crate::instruments::take_r1_sub(),
+                table_timings,
+                heap_snapshots: heap_snaps,
+            });
+        }
+
+        Ok(RoundsOneToThree {
+            round1s,
+            round2s,
+            round3s,
+            z,
+            domains,
+            twiddle_caches,
+            main_mmcs,
+            aux_mmcs,
+            comp_mmcs,
+            heights,
+        })
+    }
+
+    /// Reference (per-table) proof path: rounds 1-3 shared with the batched path
+    /// via `prove_rounds_1_to_3`, then a per-table FRI + `StarkProof` per table.
+    /// Retained as an A/B oracle; superseded by `multi_prove_batched`.
+    fn multi_prove(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        let RoundsOneToThree {
+            round1s,
+            round2s,
+            round3s,
+            z,
+            domains,
+            twiddle_caches: _twiddle_caches,
+            ..
+        } = Self::prove_rounds_1_to_3(
+            &mut air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+
+        let mut proofs = Vec::with_capacity(round1s.len());
+        for idx in 0..round1s.len() {
             let air = air_trace_pairs[idx].0;
             let pub_inputs = air_trace_pairs[idx].2;
             let domain = &domains[idx];
             let round_1_result = &round1s[idx];
             let round_2_result = &round2s[idx];
             let round_3_result = &round3s[idx];
-
-            #[cfg(feature = "instruments")]
-            let table_start = Instant::now();
 
             let round_4_result =
                 Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
@@ -2448,17 +2551,6 @@ pub trait IsStarkProver<
                     &z,
                     transcript,
                 );
-
-            #[cfg(feature = "instruments")]
-            {
-                let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                table_timings.push((
-                    air.name().to_string(),
-                    air_trace_pairs[idx].1.num_rows(),
-                    table_start.elapsed(),
-                    sub_ops,
-                ));
-            }
 
             proofs.push(StarkProof {
                 lde_trace_main_merkle_root: round_1_result.main.root,
@@ -2480,21 +2572,205 @@ pub trait IsStarkProver<
             });
         }
 
-        #[cfg(feature = "instruments")]
-        {
-            crate::instruments::store(crate::instruments::MultiProveTiming {
-                prepass: prepass_elapsed,
-                main_commits: main_commits_elapsed,
-                aux_build: aux_build_elapsed,
-                aux_commit: aux_commit_elapsed,
-                rounds_2_4: phase_start.elapsed(),
-                round1_sub: crate::instruments::take_r1_sub(),
-                table_timings,
-                heap_snapshots: heap_snaps,
+        Ok(MultiProof { proofs })
+    }
+
+    /// One table's DEEP composition codeword (bit-reversed, ready for the batched
+    /// FRI) built from the SHARED gamma. Mirrors the DEEP setup inside
+    /// `round_4_...` but takes gamma from the shared transcript rather than
+    /// sampling it per table (cross-table separation is handled by `alpha` in
+    /// `combine_by_height`).
+    fn batched_table_deep_codeword(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+        round_1_result: &Round1<Field, FieldExtension>,
+        round_2_result: &Round2<FieldExtension>,
+        round_3_result: &Round3<FieldExtension>,
+        z: &FieldElement<FieldExtension>,
+        gamma: &FieldElement<FieldExtension>,
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let num_terms_trace =
+            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let mut deep_composition_coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * gamma))
+                .take(n_terms_composition_poly + num_terms_trace)
+                .collect();
+        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+            .drain(..num_terms_trace)
+            .collect::<Vec<_>>()
+            .chunks(air.context().transition_offsets.len() * air.step_size())
+            .map(|chunk| chunk.to_vec())
+            .collect();
+        let gammas = deep_composition_coefficients;
+        let mut deep_evals = Self::compute_deep_composition_poly_evaluations(
+            &round_1_result.lde_trace,
+            round_2_result,
+            round_3_result,
+            z,
+            domain,
+            &domain.trace_primitive_root,
+            &gammas,
+            &trace_term_coeffs,
+        );
+        in_place_bit_reverse_permute(&mut deep_evals);
+        deep_evals
+    }
+
+    /// Batched (unified-shard) proof path: rounds 1-3 shared with `multi_prove`,
+    /// then ONE FRI over the height-combined per-table DEEP codewords, opened
+    /// from the three shared MMCS trees. Produces a `BatchedMultiProof`.
+    fn multi_prove_batched(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<BatchedMultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        let RoundsOneToThree {
+            round1s,
+            round2s,
+            round3s,
+            z,
+            domains,
+            main_mmcs,
+            aux_mmcs,
+            comp_mmcs,
+            heights,
+            ..
+        } = Self::prove_rounds_1_to_3(
+            &mut air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+
+        let num_airs = round1s.len();
+
+        // ===== Round 4 (batched) =====
+        // <<<< gamma: ONE shared DEEP intra-table challenge.
+        let gamma = transcript.sample_field_element();
+
+        // Per-table DEEP codewords (bit-reversed) paired with lde_log_height.
+        let mut deep_inputs: Vec<(Vec<FieldElement<FieldExtension>>, usize)> =
+            Vec::with_capacity(num_airs);
+        for idx in 0..num_airs {
+            let air = air_trace_pairs[idx].0;
+            let codeword = Self::batched_table_deep_codeword(
+                air,
+                &domains[idx],
+                &round1s[idx],
+                &round2s[idx],
+                &round3s[idx],
+                &z,
+                &gamma,
+            );
+            deep_inputs.push((codeword, heights[idx]));
+        }
+
+        // Bind the height histogram, then sample the cross-table batching alpha.
+        crate::fri::batched::absorb_height_histogram::<FieldExtension, _>(transcript, &heights);
+        let alpha = transcript.sample_field_element();
+
+        // Combine per-height, then run the batched (fold-and-inject) FRI.
+        let combined = crate::fri::batched::combine_by_height(&deep_inputs, &alpha);
+        let coset_offset =
+            FieldElement::<Field>::from(air_trace_pairs[0].0.context().proof_options.coset_offset);
+        let (fri_last_value, fri_layers) =
+            crate::fri::batched::batched_commit_phase::<Field, FieldExtension, _>(
+                combined,
+                transcript,
+                &coset_offset,
+            );
+
+        // Grinding: mirror the per-table round 4 (shared proof options).
+        let security_bits = air_trace_pairs[0].0.context().proof_options.grinding_factor;
+        let mut nonce = None;
+        if security_bits > 0 {
+            let nonce_value = grinding::generate_nonce(&transcript.state(), security_bits)
+                .expect("nonce not found");
+            transcript.append_bytes(&nonce_value.to_be_bytes());
+            nonce = Some(nonce_value);
+        }
+
+        // Query indices against the tallest domain (2^h_max).
+        let tallest = (0..num_airs)
+            .max_by_key(|&i| heights[i])
+            .expect("at least one table in the epoch");
+        let h_max = heights[tallest];
+        let number_of_queries = air_trace_pairs[0].0.options().fri_number_of_queries;
+        let iotas = Self::sample_query_indexes(number_of_queries, &domains[tallest], transcript);
+
+        let query_list = fri::query_phase(&fri_layers, &iotas);
+        let fri_layers_merkle_roots: Vec<_> =
+            fri_layers.iter().map(|layer| layer.merkle_tree.root).collect();
+
+        // Per-query openings: one MixedOpening per phase (main/aux/composition)
+        // covering all tables at once, plus per-preprocessed-table precomputed
+        // openings (those columns are outside the shared main MMCS).
+        let mut deep_poly_openings = Vec::with_capacity(iotas.len());
+        for &iota in iotas.iter() {
+            let main = main_mmcs.open_batch(iota);
+            let aux = aux_mmcs.as_ref().map(|m| m.open_batch(iota));
+            let composition = comp_mmcs.open_batch(iota);
+
+            let mut precomputed = Vec::new();
+            for idx in 0..num_airs {
+                if let Some(tree) = round1s[idx].main.precomputed_tree.as_ref() {
+                    let num_precomputed_cols = round1s[idx].main.num_precomputed_cols;
+                    let lde_trace = &round1s[idx].lde_trace;
+                    let local = iota >> (h_max - heights[idx]);
+                    precomputed.push(Self::open_polys_with(&domains[idx], tree, local, |row| {
+                        lde_trace.gather_main_row_range(row, 0, num_precomputed_cols)
+                    }));
+                }
+            }
+
+            deep_poly_openings.push(BatchedQueryOpening {
+                main,
+                aux,
+                composition,
+                precomputed,
             });
         }
 
-        Ok(MultiProof { proofs })
+        // Per-table data (canonical epoch order).
+        let mut per_table = Vec::with_capacity(num_airs);
+        for idx in 0..num_airs {
+            per_table.push(BatchedTableData {
+                trace_length: domains[idx].interpolation_domain_size,
+                trace_ood_evaluations: round3s[idx].trace_ood_evaluations.clone(),
+                composition_poly_parts_ood_evaluation: round3s[idx]
+                    .composition_poly_parts_ood_evaluation
+                    .clone(),
+                precomputed_root: round1s[idx].main.precomputed_root,
+                bus_public_inputs: round1s[idx].bus_public_inputs.clone(),
+                public_inputs: air_trace_pairs[idx].2.clone(),
+            });
+        }
+
+        Ok(BatchedMultiProof {
+            main_root: main_mmcs.root(),
+            aux_root: aux_mmcs.as_ref().map(|m| m.root()),
+            composition_root: comp_mmcs.root(),
+            fri_layers_merkle_roots,
+            fri_last_value,
+            query_list,
+            nonce,
+            deep_poly_openings,
+            per_table,
+        })
     }
 
     /// Generate a STARK proof for a single AIR/trace.
