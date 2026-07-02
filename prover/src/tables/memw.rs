@@ -36,8 +36,10 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::IsBitConstraint;
+use crate::constraints::templates::{IsBitConstraint, emit_is_bit};
 
 /// Maximum number of rows per MEMW table chunk.
 /// If operations exceed this, the trace is split into multiple tables.
@@ -987,4 +989,75 @@ pub fn constraints()
     constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
 
     constraints
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// `μ_sum = μ_read + μ_write` as a builder expression (twin of
+/// [`compute_mu_sum`]).
+fn mu_sum_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE)
+}
+
+/// `w2 = write2 + write4 + write8` as a builder expression (twin of
+/// [`compute_w2`]).
+fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::WRITE2) + b.main(0, cols::WRITE4) + b.main(0, cols::WRITE8)
+}
+
+/// The MEMW table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`constraints`] index-for-index (15 constraints):
+/// - idx 0:     `IS_BIT<μ_sum>`;
+/// - idx 1:     `w2 ⇒ μ_sum` (`w2·(1 − μ_sum)`);
+/// - idx 2,3:   `IS_BIT` on `μ_read`, `μ_write`;
+/// - idx 4-10:  `IS_BIT` on `carry[0..6]`;
+/// - idx 11-13: `IS_BIT` on `write2`, `write4`, `write8`;
+/// - idx 14:    `IS_BIT<w2>` (width sum is a bit).
+pub struct MemwConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(15);
+        for i in 0..15 {
+            m.push(ConstraintMeta::base(i, 2));
+        }
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum)
+        let one = b.one();
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(0, mu_sum.clone() * (one - mu_sum));
+
+        // idx 1: w2 ⇒ μ_sum = w2 * (1 - μ_sum)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(1, w2 * (one - mu_sum));
+
+        // idx 2,3: IS_BIT<μ_read>, IS_BIT<μ_write>
+        emit_is_bit(b, 2, cols::MU_READ, None);
+        emit_is_bit(b, 3, cols::MU_WRITE, None);
+
+        // idx 4-10: IS_BIT for carry[0..6]
+        let mut idx = 4;
+        for &col in &cols::CARRY {
+            emit_is_bit(b, idx, col, None);
+            idx += 1;
+        }
+
+        // idx 11-13: IS_BIT on the width flags
+        for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
+            emit_is_bit(b, idx, col, None);
+            idx += 1;
+        }
+
+        // idx 14: IS_BIT<w2> = w2 * (1 - w2)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        b.emit_base(idx, w2.clone() * (one - w2));
+    }
 }

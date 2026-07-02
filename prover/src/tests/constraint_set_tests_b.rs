@@ -239,3 +239,58 @@ mod store {
         check_table("store", &old, &StoreConstraints, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// memw.rs
+// =============================================================================
+
+mod memw {
+    use super::*;
+    use crate::tables::memw::{MemwConstraints, cols, constraints};
+
+    #[test]
+    fn memw_constraint_set_matches_old() {
+        let old = constraints();
+        check_table("memw", &old, &MemwConstraints, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// memw_aligned.rs
+// =============================================================================
+
+mod memw_aligned {
+    use super::*;
+    use crate::tables::memw_aligned::{MemwAlignedConstraints, cols, constraints};
+
+    #[test]
+    fn memw_aligned_constraint_set_matches_old() {
+        let old = constraints();
+        check_table(
+            "memw_aligned",
+            &old,
+            &MemwAlignedConstraints,
+            cols::NUM_COLUMNS,
+        );
+    }
+}
+
+// =============================================================================
+// memw_register.rs
+// =============================================================================
+
+mod memw_register {
+    use super::*;
+    use crate::tables::memw_register::{MemwRegisterConstraints, cols, constraints};
+
+    #[test]
+    fn memw_register_constraint_set_matches_old() {
+        let old = constraints();
+        check_table(
+            "memw_register",
+            &old,
+            &MemwRegisterConstraints,
+            cols::NUM_COLUMNS,
+        );
+    }
+}
