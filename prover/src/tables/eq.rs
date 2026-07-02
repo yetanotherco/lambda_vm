@@ -28,8 +28,13 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
+use crate::constraints::templates::{
+    AddConstraint, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
+    new_is_bit_constraints,
+};
 
 // =========================================================================
 // Column indices for EQ table
@@ -323,4 +328,44 @@ pub fn eq_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The EQ table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`eq_constraints`] index-for-index:
+/// - idx 0,1: `ADD` pair `b + diff = a` (unconditional);
+/// - idx 2:   `IS_BIT(invert)` (unconditional);
+/// - idx 3:   `res = eq XOR invert`.
+pub struct EqConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EqConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = add_pair_meta(0, false).to_vec(); // idx 0,1: b + diff = a
+        m.push(is_bit_meta(2, false)); // idx 2: IS_BIT(invert)
+        m.push(ConstraintMeta::base(3, 2)); // idx 3: res = eq XOR invert
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // diff = a - b, encoded as b + diff = a (unconditional).
+        emit_add_pair(
+            b,
+            0,
+            &[],
+            &AddOperand::dword(cols::B_0),
+            &AddOperand::from_dword_hl(cols::DIFF_0),
+            &AddOperand::dword(cols::A_0),
+        );
+        // IS_BIT(invert)
+        emit_is_bit(b, 2, cols::INVERT, None);
+        // res = eq XOR invert = eq + invert - 2*eq*invert
+        let res = b.main(0, cols::RES);
+        let eq = b.main(0, cols::EQ);
+        let invert = b.main(0, cols::INVERT);
+        let two = b.const_base(2);
+        b.emit_base(3, res - (eq.clone() + invert.clone() - two * eq * invert));
+    }
 }
