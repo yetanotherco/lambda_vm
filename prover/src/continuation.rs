@@ -927,8 +927,10 @@ pub fn verify_continuation(
     // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
     // diverges the verifier's challenges and `verify_global`'s `multi_verify` rejects —
     // on top of the committed-AIR-shape mismatch a wrong count causes on a touched page.
+    // The tight max is the honest span of a MAX-size input including its 4-byte length
+    // prefix: `ceil((MAX_PRIVATE_INPUT_SIZE + 4) / page_size)` pages (no slack).
     let max_private_input_pages =
-        (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE) + 1;
+        (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE);
     if bundle.num_private_input_pages > max_private_input_pages {
         return Err(Error::InvalidTableCounts(format!(
             "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
@@ -1453,7 +1455,7 @@ mod tests {
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
             prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE) + 1;
+        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE);
         bundle.num_private_input_pages = max_pages + 1;
         assert!(matches!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
