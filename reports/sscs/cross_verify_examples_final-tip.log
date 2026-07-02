@@ -1,0 +1,32 @@
+==> Refs
+   OLD 88adbfa6 -> 88adbfa64c
+   NEW 5d725904 -> 5d7259041a
+Preparing worktree (detached HEAD 88adbfa6)
+==> Building examples_cli @ 88adbfa64c -> cli_old
+==> Building examples_cli @ 5d7259041a -> cli_new
+==> Cross-verifying 11 examples, both directions
+PASS prove-NEW-verify-OLD : simple_fibonacci
+PASS prove-OLD-verify-NEW : simple_fibonacci
+PASS prove-NEW-verify-OLD : fibonacci_2_columns
+PASS prove-OLD-verify-NEW : fibonacci_2_columns
+PASS prove-NEW-verify-OLD : fibonacci_2_cols_shifted
+PASS prove-OLD-verify-NEW : fibonacci_2_cols_shifted
+PASS prove-NEW-verify-OLD : fibonacci_multi_column
+PASS prove-OLD-verify-NEW : fibonacci_multi_column
+PASS prove-NEW-verify-OLD : quadratic_air
+PASS prove-OLD-verify-NEW : quadratic_air
+PASS prove-NEW-verify-OLD : fibonacci_rap
+PASS prove-OLD-verify-NEW : fibonacci_rap
+PASS prove-NEW-verify-OLD : dummy_air
+PASS prove-OLD-verify-NEW : dummy_air
+PASS prove-NEW-verify-OLD : simple_addition
+PASS prove-OLD-verify-NEW : simple_addition
+PASS prove-NEW-verify-OLD : read_only_memory
+PASS prove-OLD-verify-NEW : read_only_memory
+PASS prove-NEW-verify-OLD : read_only_memory_logup
+PASS prove-OLD-verify-NEW : read_only_memory_logup
+PASS prove-NEW-verify-OLD : multi_table_lookup
+PASS prove-OLD-verify-NEW : multi_table_lookup
+
+==> RESULT: all 11 examples cross-verify in both directions.
+EXIT=0
