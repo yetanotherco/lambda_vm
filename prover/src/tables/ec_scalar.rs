@@ -374,3 +374,57 @@ pub fn create_constraints(
 
     (constraints, idx)
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `create_constraints` above, written once against the
+// generic `ConstraintBuilder`. The old structs/builder stay as the differential
+// oracle; the final deletion phase removes them. Constraint indices 0..20
+// match `create_constraints(0)` exactly.
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// EC_SCALAR transition constraints as a single-source [`ConstraintSet`] (20
+/// total). No column configuration needed (the layout is fixed via `cols`).
+pub struct EcScalarConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // 10 unconditional IS_BIT (degree 2) + 10 MulZero (degree 2).
+        (0..20).map(|i| ConstraintMeta::base(i, 2)).collect()
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0..10: unconditional IS_BIT `x·(1−x)` for
+        // [mu, limb_bit(0..8), last_limb], in that column order.
+        let mut bit_cols = vec![cols::MU];
+        bit_cols.extend((0..8).map(cols::limb_bit));
+        bit_cols.push(cols::LAST_LIMB);
+        for (i, &col) in bit_cols.iter().enumerate() {
+            let x = b.main(0, col);
+            let one = b.one();
+            b.emit_base(i, x.clone() * (one - x));
+        }
+
+        // idx 10..18: limb_bit(i) · (1 − mu) = 0.
+        for i in 0..8 {
+            let a = b.main(0, cols::limb_bit(i));
+            let mu = b.main(0, cols::MU);
+            let one = b.one();
+            b.emit_base(10 + i, a * (one - mu));
+        }
+
+        // idx 18: last_limb · (1 − mu) = 0.
+        let last_limb = b.main(0, cols::LAST_LIMB);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(18, last_limb * (one - mu));
+
+        // idx 19: last_limb · offset = 0.
+        let last_limb = b.main(0, cols::LAST_LIMB);
+        let offset = b.main(0, cols::OFFSET);
+        b.emit_base(19, last_limb * offset);
+    }
+}

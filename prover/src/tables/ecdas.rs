@@ -515,3 +515,218 @@ pub fn create_constraints(
 
     (constraints, idx)
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `create_constraints` above, written once against the
+// generic `ConstraintBuilder`. The old structs/builder stay as the differential
+// oracle; the final deletion phase removes them. Constraint indices 0..200
+// match `create_constraints(0)` exactly:
+//   0,1,2 : IS_BIT(MU), IS_BIT(OP), IS_BIT(NEXT_OP)
+//   3     : OP · NEXT_OP
+//   4     : NEXT_OP · (1 − MU)
+//   then for (Lambda,C0),(Xr,C1),(Yr,C2): 64 ConvCarry (i=0..64) + 1 ColIsZero.
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// ECDAS transition constraints as a single-source [`ConstraintSet`] (200
+/// total). No column configuration needed (the layout is fixed via `cols`).
+pub struct EcdasConstraints;
+
+impl EcdasConstraints {
+    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes). Twin of
+    /// [`p_byte`].
+    fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        m: usize,
+    ) -> B::Expr {
+        if m < 32 {
+            b.const_base(P_BYTES[m] as u64)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// Byte `m` of `R` (zero beyond 33 bytes). Twin of [`r_byte`].
+    fn r_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        m: usize,
+    ) -> B::Expr {
+        if m < 33 {
+            b.const_base(R_BYTES[m] as u64)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// `bytes[base + j]` for `j < len`, else zero (the `b` closure in `s_i`).
+    fn byte_at<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        base: usize,
+        len: usize,
+        j: usize,
+    ) -> B::Expr {
+        if j < len {
+            b.main(0, base + j)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// The r·P − q·P convolution term `Σ_{j=0..=i} (r_byte(j) − q[j])·p_byte(i−j)`
+    /// (shared structure across all three relations).
+    fn rq<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+        qbase: usize,
+    ) -> B::Expr {
+        let mut s = b.zero();
+        for j in 0..=i {
+            let term = (Self::r_byte_expr(b, j) - Self::byte_at(b, qbase, 33, j))
+                * Self::p_byte_expr(b, i - j);
+            s = s + term;
+        }
+        s
+    }
+
+    /// `S_i` for `relation` at limb `i` (twin of [`ConvCarry::s_i`]).
+    fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let lam = |j: usize| Self::byte_at(b, cols::LAMBDA, 32, j);
+        let xg = |j: usize| Self::byte_at(b, cols::XG, 32, j);
+        let xa = |j: usize| Self::byte_at(b, cols::XA, 32, j);
+        let ya = |j: usize| Self::byte_at(b, cols::YA, 32, j);
+        let yg = |j: usize| Self::byte_at(b, cols::YG, 32, j);
+        let xr = |j: usize| Self::byte_at(b, cols::XR, 32, j);
+        let yr = |j: usize| Self::byte_at(b, cols::YR, 32, j);
+        let op = b.main(0, cols::OP);
+        let one = b.one();
+
+        match relation {
+            Relation::Lambda => {
+                // op·(Σ λ_j(xG-xA)_{i-j} + (yA_i - yG_i))
+                let mut op_branch = ya(i) - yg(i);
+                for j in 0..=i {
+                    op_branch = op_branch + lam(j) * (xg(i - j) - xa(i - j));
+                }
+                // (1-op)·Σ (2 λ_j yA_{i-j} - 3 xA_j xA_{i-j})
+                let mut notop_branch = b.zero();
+                for j in 0..=i {
+                    let two = b.const_base(2);
+                    let three = b.const_base(3);
+                    notop_branch =
+                        notop_branch + two * lam(j) * ya(i - j) - three * xa(j) * xa(i - j);
+                }
+                op.clone() * op_branch + (one - op) * notop_branch + Self::rq(b, i, cols::Q0)
+            }
+            Relation::Xr => {
+                // Σ λ_j λ_{i-j} − xA_i − xG_i − xR_i − (1-op)(xA_i − xG_i) + rq
+                let mut s = b.zero();
+                for j in 0..=i {
+                    s = s + lam(j) * lam(i - j);
+                }
+                s - xa(i) - xg(i) - xr(i) - (one - op) * (xa(i) - xg(i)) + Self::rq(b, i, cols::Q1)
+            }
+            Relation::Yr => {
+                // Σ λ_j(xA-xR)_{i-j} − yA_i − yR_i + rq
+                let mut s = b.zero();
+                for j in 0..=i {
+                    s = s + lam(j) * (xa(i - j) - xr(i - j));
+                }
+                s - ya(i) - yr(i) + Self::rq(b, i, cols::Q2)
+            }
+        }
+    }
+
+    /// `256·c_i − c_{i-1} − S_i` (twin of [`ConvCarry::evaluate`]).
+    fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let c_base = match relation {
+            Relation::Lambda => cols::C0,
+            Relation::Xr => cols::C1,
+            Relation::Yr => cols::C2,
+        };
+        let c_i = b.main(0, c_base + i);
+        let c_prev = if i == 0 {
+            b.zero()
+        } else {
+            b.main(0, c_base + i - 1)
+        };
+        let two_pow_8 = b.const_base(256);
+        two_pow_8 * c_i - c_prev - Self::s_i(b, relation, i)
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(200);
+        // idx 0,1,2: IS_BIT(MU/OP/NEXT_OP), degree 2.
+        for i in 0..3 {
+            m.push(ConstraintMeta::base(i, 2));
+        }
+        // idx 3: OP·NEXT_OP, idx 4: NEXT_OP·(1−MU) — degree 2.
+        m.push(ConstraintMeta::base(3, 2));
+        m.push(ConstraintMeta::base(4, 2));
+        // Per relation: 64 ConvCarry + 1 ColIsZero.
+        let mut idx = 5;
+        for relation in [Relation::Lambda, Relation::Xr, Relation::Yr] {
+            let conv_degree = match relation {
+                Relation::Lambda => 3, // op · (λ · Δx)
+                Relation::Xr | Relation::Yr => 2,
+            };
+            for _ in 0..64 {
+                m.push(ConstraintMeta::base(idx, conv_degree));
+                idx += 1;
+            }
+            m.push(ConstraintMeta::base(idx, 1)); // ColIsZero c_63
+            idx += 1;
+        }
+        debug_assert_eq!(m.len(), 200);
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0,1,2: unconditional IS_BIT `x·(1−x)` on [MU, OP, NEXT_OP].
+        for (i, col) in [cols::MU, cols::OP, cols::NEXT_OP].into_iter().enumerate() {
+            let x = b.main(0, col);
+            let one = b.one();
+            b.emit_base(i, x.clone() * (one - x));
+        }
+
+        // idx 3: OP · NEXT_OP = 0.
+        let op = b.main(0, cols::OP);
+        let next_op = b.main(0, cols::NEXT_OP);
+        b.emit_base(3, op * next_op);
+
+        // idx 4: NEXT_OP · (1 − MU) = 0.
+        let next_op = b.main(0, cols::NEXT_OP);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(4, next_op * (one - mu));
+
+        // Per relation: 64 ConvCarry (i=0..64) + 1 ColIsZero(c_63).
+        let mut idx = 5;
+        for (relation, c_base) in [
+            (Relation::Lambda, cols::C0),
+            (Relation::Xr, cols::C1),
+            (Relation::Yr, cols::C2),
+        ] {
+            for i in 0..64 {
+                let root = Self::conv_carry(b, relation, i);
+                b.emit_base(idx, root);
+                idx += 1;
+            }
+            let c_last = b.main(0, c_base + 63);
+            b.emit_base(idx, c_last);
+            idx += 1;
+        }
+    }
+}

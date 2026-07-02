@@ -101,15 +101,27 @@ fn check_set_vs_old<CS>(
         );
     }
 
-    // --- capture once; tree-measured degree == declared ---
+    // --- capture once; tree-measured degree <= declared (== old degree()) ---
+    //
+    // The declared `meta.degree` reproduces the OLD struct's `degree()` exactly
+    // (asserted above at the meta-parity loop), which the engine uses as the
+    // composition-poly degree bound. For most tables that bound is tight, so
+    // tree-measured == declared. A few constraints (the ecsm/ecdas convolution
+    // TAILS — `ConvCarry` at large `i`) legitimately have a lower EXACT degree
+    // than their uniform declared bound: at limb `i` near the top, every
+    // remaining product has a zeroed (constant) factor, so the surviving
+    // expression is degree 1 while the struct declares 2 (resp. 3). The
+    // soundness-relevant invariant is therefore `measured <= declared` (the
+    // real degree must never EXCEED the bound the composition polynomial is
+    // sized for) — an over-declaration is safe, an under-declaration is not.
     let mut cb = CaptureBuilder::<Gl, Gl3>::new();
     set.eval(&mut cb);
     let (prog, degrees) = cb.finish(num_base);
     assert_eq!(degrees.len(), n, "[{label}] one emit per constraint");
     for &(idx, measured) in &degrees {
-        assert_eq!(
-            measured, meta[idx].degree,
-            "[{label}] constraint {idx}: tree degree {measured} != declared {}",
+        assert!(
+            measured <= meta[idx].degree,
+            "[{label}] constraint {idx}: tree degree {measured} EXCEEDS declared {}",
             meta[idx].degree
         );
     }
@@ -184,10 +196,10 @@ fn check_set_vs_old<CS>(
         }
 
         // --- 3. capture → flatten → interpret == old evaluate_prover ---
-        for i in 0..n {
+        for (i, expected) in old_base.iter().enumerate() {
             assert_eq!(
-                eval_program_base(&prog, i, &row),
-                old_base[i],
+                &eval_program_base(&prog, i, &row),
+                expected,
                 "[{label}] interpreter mismatch, constraint {i}, trial {trial}"
             );
         }
@@ -209,5 +221,123 @@ mod lt {
         assert_eq!(next, old.len());
         let boxed: Vec<_> = old.into_iter().map(|c| c.boxed()).collect();
         check_set_vs_old("lt", &LtConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// dvrm.rs
+// =============================================================================
+
+mod dvrm {
+    use super::*;
+    use crate::tables::dvrm::{DvrmConstraints, cols, dvrm_constraints};
+    use stark::constraints::transition::TransitionConstraint;
+
+    #[test]
+    fn dvrm_constraint_set_matches_old() {
+        let (old, next) = dvrm_constraints(0);
+        assert_eq!(next, old.len());
+        let boxed: Vec<_> = old.into_iter().map(|c| c.boxed()).collect();
+        check_set_vs_old("dvrm", &DvrmConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// shift.rs
+// =============================================================================
+
+mod shift {
+    use super::*;
+    use crate::tables::shift::{ShiftConstraints, cols, shift_constraints};
+    use stark::constraints::transition::TransitionConstraint;
+
+    #[test]
+    fn shift_constraint_set_matches_old() {
+        let (old, next) = shift_constraints(0);
+        assert_eq!(next, old.len());
+        let boxed: Vec<_> = old.into_iter().map(|c| c.boxed()).collect();
+        check_set_vs_old("shift", &ShiftConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// mul.rs
+// =============================================================================
+
+mod mul {
+    use super::*;
+    use crate::tables::mul::{MulConstraints, cols, mul_constraints};
+    use stark::constraints::transition::TransitionConstraint;
+
+    #[test]
+    fn mul_constraint_set_matches_old() {
+        let (old, next) = mul_constraints(0);
+        assert_eq!(next, old.len());
+        let boxed: Vec<_> = old.into_iter().map(|c| c.boxed()).collect();
+        check_set_vs_old("mul", &MulConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// load.rs
+// =============================================================================
+
+mod load {
+    use super::*;
+    use crate::tables::load::{LoadConstraints, cols, constraints as load_constraints};
+
+    #[test]
+    fn load_constraint_set_matches_old() {
+        // `constraints()` already returns boxed evaluators (idx_start = 0).
+        let boxed = load_constraints();
+        check_set_vs_old("load", &LoadConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// ecsm.rs
+// =============================================================================
+
+mod ecsm {
+    use super::*;
+    use crate::tables::ecsm::{EcsmConstraints, cols, create_constraints};
+
+    #[test]
+    fn ecsm_constraint_set_matches_old() {
+        let (boxed, next) = create_constraints(0);
+        assert_eq!(next, boxed.len());
+        check_set_vs_old("ecsm", &EcsmConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// ecdas.rs
+// =============================================================================
+
+mod ecdas {
+    use super::*;
+    use crate::tables::ecdas::{EcdasConstraints, cols, create_constraints};
+
+    #[test]
+    fn ecdas_constraint_set_matches_old() {
+        let (boxed, next) = create_constraints(0);
+        assert_eq!(next, boxed.len());
+        check_set_vs_old("ecdas", &EcdasConstraints, &boxed, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// ec_scalar.rs
+// =============================================================================
+
+mod ec_scalar {
+    use super::*;
+    use crate::tables::ec_scalar::{EcScalarConstraints, cols, create_constraints};
+
+    #[test]
+    fn ec_scalar_constraint_set_matches_old() {
+        let (boxed, next) = create_constraints(0);
+        assert_eq!(next, boxed.len());
+        check_set_vs_old("ec_scalar", &EcScalarConstraints, &boxed, cols::NUM_COLUMNS);
     }
 }

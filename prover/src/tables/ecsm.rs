@@ -937,3 +937,236 @@ pub fn create_constraints(
 
     (constraints, idx)
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `create_constraints` above, written once against the
+// generic `ConstraintBuilder`. The old structs/builder stay as the differential
+// oracle; the final deletion phase removes them. Constraint indices 0..148
+// match `create_constraints(0)` exactly:
+//   0        : IS_BIT(MU)
+//   1..65    : ConvCarry(X2, 0..64)
+//   65       : ColIsZero(c0(63))
+//   66..130  : ConvCarry(Yg, 0..64)
+//   130      : ColIsZero(c1(63))
+//   131      : IS_BIT(q1(32))
+//   132..139 : CarryBit(KLtN, 0..7)
+//   139      : OverflowRequired(KLtN)
+//   140..147 : CarryBit(XrLtP, 0..7)
+//   147      : OverflowRequired(XrLtP)
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (148
+/// total). No column configuration needed (the layout is fixed via `cols`).
+pub struct EcsmConstraints;
+
+impl EcsmConstraints {
+    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes). Twin of
+    /// [`p_byte`].
+    fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        m: usize,
+    ) -> B::Expr {
+        if m < 32 {
+            b.const_base(P_BYTES[m] as u64)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// `bytes[base + j]` for `j < len`, else zero (the `byte` closure in `s_i`).
+    fn byte_at<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        base: usize,
+        len: usize,
+        j: usize,
+    ) -> B::Expr {
+        if j < len {
+            b.main(0, base + j)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// `S_i` for `relation` at limb `i` (twin of [`ConvCarry::s_i`]).
+    fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let byte = |base: usize, len: usize, j: usize| Self::byte_at(b, base, len, j);
+        let mut s = b.zero();
+        match relation {
+            Relation::X2 => {
+                // Σ xG_j·xG_{i-j} − x2_i − Σ q0_j·P_{i-j}
+                for j in 0..=i {
+                    s = s + byte(cols::XG, 32, j) * byte(cols::XG, 32, i - j);
+                    s = s - byte(cols::Q0, 32, j) * Self::p_byte_expr(b, i - j);
+                }
+                s = s - byte(cols::X2, 32, i);
+            }
+            Relation::Yg => {
+                // Σ (yG_j·yG_{i-j} + P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − b_i
+                for j in 0..=i {
+                    s = s + byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
+                    s = s + Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j);
+                    s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
+                    s = s - byte(cols::Q1, 33, j) * Self::p_byte_expr(b, i - j);
+                }
+                if i == 0 {
+                    // Only the curve constant `b` is µ-gated (µ·B); B_i = 0 for i ≥ 1.
+                    let mu = b.main(0, cols::MU);
+                    let curve_b = b.const_base(B);
+                    s = s - mu * curve_b;
+                }
+            }
+        }
+        s
+    }
+
+    /// `256·c_i − c_{i-1} − S_i` (twin of [`ConvCarry::evaluate`]).
+    fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let c_base = match relation {
+            Relation::X2 => cols::C0,
+            Relation::Yg => cols::C1,
+        };
+        let c_i = b.main(0, c_base + i);
+        let c_prev = if i == 0 {
+            b.zero()
+        } else {
+            b.main(0, c_base + i - 1)
+        };
+        let two_pow_8 = b.const_base(256);
+        two_pow_8 * c_i - c_prev - Self::s_i(b, relation, i)
+    }
+
+    /// The 8 word-carries of the `kind` addition (twin of [`carry_chain`]).
+    fn carry_chain<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        kind: OverflowKind,
+    ) -> [B::Expr; 8] {
+        let hl = kind.addend_hl_base();
+        let bl = kind.sum_bl_base();
+        let mut c: [B::Expr; 8] = std::array::from_fn(|_| b.zero());
+        let mut prev = b.zero();
+        for (i, slot) in c.iter_mut().enumerate() {
+            // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
+            let shift_16 = b.const_base(1u64 << 16);
+            let addend1 = b.main(0, hl + 2 * i) + b.main(0, hl + 2 * i + 1) * shift_16;
+            // sum word i (from bytes): Σ bl[4i+b]·2^{8b}
+            let mut sum = b.zero();
+            for byte in 0..4 {
+                let shift = b.const_base(1u64 << (8 * byte));
+                sum = sum + b.main(0, bl + 4 * i + byte) * shift;
+            }
+            let addend0 = b.const_base(kind.const_word(i));
+            let inv = b.const_base(INV_SHIFT_32);
+            let ci = (addend0 + addend1 + prev.clone() - sum) * inv;
+            *slot = ci.clone();
+            prev = ci;
+        }
+        c
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(148);
+        m.push(ConstraintMeta::base(0, 2)); // IS_BIT(MU)
+        let mut idx = 1;
+        // X2 convolution: 64 carries (deg 2) + closing (deg 1).
+        for _ in 0..64 {
+            m.push(ConstraintMeta::base(idx, 2));
+            idx += 1;
+        }
+        m.push(ConstraintMeta::base(idx, 1));
+        idx += 1;
+        // Yg convolution: 64 carries (deg 2) + closing (deg 1).
+        for _ in 0..64 {
+            m.push(ConstraintMeta::base(idx, 2));
+            idx += 1;
+        }
+        m.push(ConstraintMeta::base(idx, 1));
+        idx += 1;
+        // IS_BIT(q1[32]) (deg 2).
+        m.push(ConstraintMeta::base(idx, 2));
+        idx += 1;
+        // k < N: 7 carry bits (deg 3) + overflow-required (deg 2).
+        for _ in 0..7 {
+            m.push(ConstraintMeta::base(idx, 3));
+            idx += 1;
+        }
+        m.push(ConstraintMeta::base(idx, 2));
+        idx += 1;
+        // xR < p: 7 carry bits (deg 3) + overflow-required (deg 2).
+        for _ in 0..7 {
+            m.push(ConstraintMeta::base(idx, 3));
+            idx += 1;
+        }
+        m.push(ConstraintMeta::base(idx, 2));
+        idx += 1;
+        debug_assert_eq!(idx, 148);
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT(MU): mu·(1−mu).
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(0, mu.clone() * (one - mu));
+
+        let mut idx = 1;
+
+        // X2 convolution: 64 carries + closing c0(63).
+        for i in 0..64 {
+            let root = Self::conv_carry(b, Relation::X2, i);
+            b.emit_base(idx, root);
+            idx += 1;
+        }
+        let c0_last = b.main(0, cols::c0(63));
+        b.emit_base(idx, c0_last);
+        idx += 1;
+
+        // Yg convolution: 64 carries + closing c1(63).
+        for i in 0..64 {
+            let root = Self::conv_carry(b, Relation::Yg, i);
+            b.emit_base(idx, root);
+            idx += 1;
+        }
+        let c1_last = b.main(0, cols::c1(63));
+        b.emit_base(idx, c1_last);
+        idx += 1;
+
+        // idx 131: IS_BIT(q1[32]): x·(1−x).
+        let q1_32 = b.main(0, cols::q1(32));
+        let one = b.one();
+        b.emit_base(idx, q1_32.clone() * (one - q1_32));
+        idx += 1;
+
+        // k < N and xR < p: 7 carry bits + overflow-required each.
+        for kind in [OverflowKind::KLtN, OverflowKind::XrLtP] {
+            let c = Self::carry_chain(b, kind);
+            for ci in c.iter().take(7) {
+                // µ · c_i · (1 − c_i)
+                let mu = b.main(0, cols::MU);
+                let one = b.one();
+                b.emit_base(idx, mu * ci.clone() * (one - ci.clone()));
+                idx += 1;
+            }
+            // µ · (1 − c_7)
+            let mu = b.main(0, cols::MU);
+            let one = b.one();
+            b.emit_base(idx, mu * (one - c[7].clone()));
+            idx += 1;
+        }
+
+        debug_assert_eq!(idx, 148);
+    }
+}
