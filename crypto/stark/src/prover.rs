@@ -2399,26 +2399,19 @@ pub trait IsStarkProver<
             &domains[tallest].trace_roots_of_unity,
         );
 
-        // Round 3 + Round 4 per table, sequentially on the shared transcript.
-        let mut proofs = Vec::with_capacity(num_airs);
+        // Round 3: per-table OOD at the shared z; absorb all tables' OOD before
+        // round 4 (round 4 needs the full post-OOD transcript state).
+        let mut round3s: Vec<Round3<FieldExtension>> = Vec::with_capacity(num_airs);
         for idx in 0..num_airs {
             let air = air_trace_pairs[idx].0;
-            let pub_inputs = air_trace_pairs[idx].2;
             let domain = &domains[idx];
-            let round_1_result = &round1s[idx];
-            let round_2_result = &round2s[idx];
-
-            #[cfg(feature = "instruments")]
-            let table_start = Instant::now();
-
             let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
                 air,
                 domain,
-                round_1_result,
-                round_2_result,
+                &round1s[idx],
+                &round2s[idx],
                 &z,
             );
-
             // >>>> Send values: t_j(z g^k)
             for col in round_3_result.trace_ood_evaluations.columns().iter() {
                 for elem in col.iter() {
@@ -2429,6 +2422,21 @@ pub trait IsStarkProver<
             for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
                 transcript.append_field_element(element);
             }
+            round3s.push(round_3_result);
+        }
+
+        // Round 4: per-table FRI + StarkProof assembly (reference MultiProof path).
+        let mut proofs = Vec::with_capacity(num_airs);
+        for idx in 0..num_airs {
+            let air = air_trace_pairs[idx].0;
+            let pub_inputs = air_trace_pairs[idx].2;
+            let domain = &domains[idx];
+            let round_1_result = &round1s[idx];
+            let round_2_result = &round2s[idx];
+            let round_3_result = &round3s[idx];
+
+            #[cfg(feature = "instruments")]
+            let table_start = Instant::now();
 
             let round_4_result =
                 Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
@@ -2436,7 +2444,7 @@ pub trait IsStarkProver<
                     domain,
                     round_1_result,
                     round_2_result,
-                    &round_3_result,
+                    round_3_result,
                     &z,
                     transcript,
                 );
@@ -2456,10 +2464,11 @@ pub trait IsStarkProver<
                 lde_trace_main_merkle_root: round_1_result.main.root,
                 lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
                 lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
-                trace_ood_evaluations: round_3_result.trace_ood_evaluations,
+                trace_ood_evaluations: round_3_result.trace_ood_evaluations.clone(),
                 composition_poly_root: round_2_result.composition_poly_root,
                 composition_poly_parts_ood_evaluation: round_3_result
-                    .composition_poly_parts_ood_evaluation,
+                    .composition_poly_parts_ood_evaluation
+                    .clone(),
                 fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
                 fri_last_value: round_4_result.fri_last_value,
                 query_list: round_4_result.query_list,
