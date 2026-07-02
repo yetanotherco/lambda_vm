@@ -286,15 +286,30 @@ pub trait IsStarkVerifier<
         // `VerifierDomain.root_order` is `log2(trace_length)` (trace bits), and the
         // LDE blowup adds `blowup_log` bits.
         let (blowup_log, expected_k, total_folds) = Self::fri_termination_params(air, domain);
+        let num_committed = total_folds.saturating_sub(1) as usize;
 
         // Structural check: number of committed FRI layers must equal
-        // `total_folds - 1` (zero when no fold or a single final fold happened).
-        if proof.fri_layers_merkle_roots.len() != total_folds.saturating_sub(1) as usize {
+        // `num_committed` (zero when no fold or a single final fold happened).
+        if proof.fri_layers_merkle_roots.len() != num_committed {
             return false;
         }
         // Structural check: the final polynomial must have exactly `2^expected_k`
         // coefficients; otherwise the reconstruction below is ill-defined.
         if proof.fri_final_poly_coeffs.len() != (1usize << expected_k) {
+            return false;
+        }
+        // Structural check: every per-query FRI decommitment must carry exactly
+        // `num_committed` layers. The fold loop in `verify_query_and_sym_openings`
+        // zips these untrusted, variable-length vecs against the committed layer
+        // roots, and they are NOT bound into the Fiat-Shamir transcript. Without
+        // this check a prover could send them empty (making the fold run zero
+        // iterations and accept the query vacuously) or padded (making the loop
+        // skip the terminal low-degree check), bypassing FRI entirely. This length
+        // check is the only thing that pins them, so it must run before the loop.
+        if proof.query_list.iter().any(|decommitment| {
+            decommitment.layers_auth_paths.len() != num_committed
+                || decommitment.layers_evaluations_sym.len() != num_committed
+        }) {
             return false;
         }
 

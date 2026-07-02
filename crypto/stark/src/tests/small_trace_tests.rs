@@ -380,6 +380,89 @@ fn truncated_final_poly_is_rejected() {
     );
 }
 
+/// Soundness: emptying every per-query FRI decommitment must be rejected.
+///
+/// In the multi-fold path, `verify_query_and_sym_openings` folds the query value
+/// through a loop that `zip`s the (trusted-length) committed layer roots against
+/// the per-query `layers_auth_paths` / `layers_evaluations_sym`. Those vecs come
+/// from the untrusted proof and are NOT absorbed into the Fiat-Shamir transcript,
+/// so emptying them (`zip` truncates to 0) would make the fold run zero iterations
+/// and return `true` — no Merkle openings, no terminal low-degree check — bypassing
+/// FRI. The per-query decommitment length check in `step_3_verify_fri` must reject
+/// this before the fold loop runs.
+#[test_log::test]
+fn empty_fri_decommitment_is_rejected() {
+    let (air, mut proof) = make_valid_folding_proof();
+
+    // Sanity: the unmodified multi-fold proof must verify first.
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "precondition: valid folding proof must verify"
+    );
+
+    // Sanity: this is genuinely the multi-fold regime (num_committed >= 1).
+    assert!(
+        !proof.query_list[0].layers_evaluations_sym.is_empty(),
+        "precondition: multi-fold proof must have at least one committed layer"
+    );
+
+    // Drop every per-query decommitment layer.
+    for decommitment in proof.query_list.iter_mut() {
+        decommitment.layers_auth_paths.clear();
+        decommitment.layers_evaluations_sym.clear();
+    }
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject a proof whose per-query FRI decommitment layers are empty"
+    );
+}
+
+/// Soundness: padding every per-query FRI decommitment by one layer must be
+/// rejected. With `layers_evaluations_sym.len() == num_committed + 1`, the fold
+/// loop's last-iteration guard `i < layers_evaluations_sym.len() - 1` stays true,
+/// so the terminal low-degree check in the `else` branch is never executed. The
+/// per-query decommitment length check must reject this before the loop runs.
+#[test_log::test]
+fn padded_fri_decommitment_is_rejected() {
+    let (air, mut proof) = make_valid_folding_proof();
+
+    // Sanity: the unmodified multi-fold proof must verify first.
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "precondition: valid folding proof must verify"
+    );
+
+    // Append one junk layer (copied from the first real layer) to every query.
+    let junk_eval = proof.query_list[0].layers_evaluations_sym[0];
+    let junk_path = proof.query_list[0].layers_auth_paths[0].clone();
+    for decommitment in proof.query_list.iter_mut() {
+        decommitment.layers_evaluations_sym.push(junk_eval);
+        decommitment.layers_auth_paths.push(junk_path.clone());
+    }
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject a proof whose per-query FRI decommitment layers are padded"
+    );
+}
+
 /// Soundness: a proof generated under k=7 must NOT verify when the verifier
 /// uses k=6.  The verifier reads `fri_final_poly_log_degree` from the AIR it
 /// is given, so constructing a fresh AIR with k=6 is sufficient to switch the
