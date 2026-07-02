@@ -170,9 +170,9 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
         let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
         set.eval(&mut folder);
         folder.assert_all_emitted();
-        for i in 0..n {
+        for (i, (got, want)) in base_out.iter().zip(old_base.iter()).enumerate() {
             assert_eq!(
-                base_out[i], old_base[i],
+                got, want,
                 "[{label}] prover folder mismatch, constraint {i}, trial {trial}"
             );
         }
@@ -192,18 +192,18 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
         let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
         set.eval(&mut vfolder);
         vfolder.assert_all_emitted();
-        for i in 0..n {
+        for (i, (got, want)) in vext_out.iter().zip(old_ext_v.iter()).enumerate() {
             assert_eq!(
-                vext_out[i], old_ext_v[i],
+                got, want,
                 "[{label}] verifier folder mismatch, constraint {i}, trial {trial}"
             );
         }
 
         // --- 3. capture → flatten → interpret == old evaluate_prover (base) ---
-        for i in 0..n {
+        for (i, want) in old_base.iter().enumerate() {
             assert_eq!(
-                eval_program_base(&prog, i, &row),
-                old_base[i],
+                &eval_program_base(&prog, i, &row),
+                want,
                 "[{label}] interpreter mismatch, constraint {i}, trial {trial}"
             );
         }
