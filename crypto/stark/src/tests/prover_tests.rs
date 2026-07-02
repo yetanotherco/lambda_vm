@@ -8,7 +8,7 @@ use crate::{
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, LdeTwiddles, Prover, evaluate_polynomial_on_lde_domain},
-    test_utils::multi_prove_ram,
+    test_utils::{multi_prove_batched_ram, multi_prove_ram},
     tests::domain_cache_stats,
     tests::trace_test_helpers::get_trace_evaluations,
     trace::{LDETraceTable, get_trace_evaluations_from_lde},
@@ -292,7 +292,6 @@ fn test_decompose_and_extend_d2_matches_original() {
 /// `coset_offset`. Both AIRs must get their own `Domain` and the resulting proofs must
 /// verify successfully.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multi_prove_mixed_coset_offsets() {
     let proof_options_3 = ProofOptions {
         blowup_factor: 2,
@@ -332,7 +331,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         (&air_2, &mut trace_2, &pub_inputs),
     ];
 
-    let multi_proof = multi_prove_ram(
+    let multi_proof = multi_prove_batched_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
@@ -347,7 +346,7 @@ fn test_multi_prove_mixed_coset_offsets() {
     > = vec![&air_1, &air_2];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),
@@ -406,7 +405,6 @@ fn test_multi_prove_batched_main_mmcs_smoke() {
 /// `(trace_length, blowup, coset_offset)`. Asserts exactly one `Domain`/`LdeTwiddles`
 /// construction for N identical AIRs and that the resulting proof still verifies.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multi_prove_dedups_shared_domain_params() {
     domain_cache_stats::reset();
 
@@ -444,7 +442,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         (&air_3, &mut trace_3, &pub_inputs),
     ];
 
-    let multi_proof = multi_prove_ram(
+    let multi_proof = multi_prove_batched_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
@@ -469,7 +467,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
     > = vec![&air_1, &air_2, &air_3];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),

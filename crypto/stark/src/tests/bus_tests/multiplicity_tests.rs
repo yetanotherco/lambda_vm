@@ -15,7 +15,7 @@ use crate::lookup::{
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
-use crate::test_utils::multi_prove_ram;
+use crate::test_utils::multi_prove_batched_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
@@ -34,7 +34,6 @@ const TEST_BUS: u64 = 0;
 /// Test Multiplicity::One: every row contributes with multiplicity 1.
 /// Sender sends 4 values (one per row), receiver receives each once.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multiplicity_one() {
     fn sender_air(
         proof_options: &ProofOptions,
@@ -114,13 +113,13 @@ fn test_multiplicity_one() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -137,7 +136,6 @@ fn test_multiplicity_one() {
 /// Test Multiplicity::Sum: multiplicity is col_a + col_b.
 /// Sender has two flag columns, receiver uses their sum as multiplicity.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multiplicity_sum() {
     fn sender_air(
         proof_options: &ProofOptions,
@@ -225,13 +223,13 @@ fn test_multiplicity_sum() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -248,7 +246,6 @@ fn test_multiplicity_sum() {
 /// Test Multiplicity::Negated: multiplicity is 1 - col_value.
 /// Useful for "all rows except those marked by this flag".
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multiplicity_negated() {
     fn sender_air(
         proof_options: &ProofOptions,
@@ -334,13 +331,13 @@ fn test_multiplicity_negated() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

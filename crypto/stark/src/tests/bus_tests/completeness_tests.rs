@@ -16,7 +16,7 @@ use crate::lookup::{
     NullBoundaryConstraintBuilder, Packing,
 };
 use crate::proof::options::ProofOptions;
-use crate::test_utils::multi_prove_ram;
+use crate::test_utils::multi_prove_batched_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
@@ -27,7 +27,6 @@ type FE = FieldElement<F>;
 
 /// Standard valid multi-table proof with CPU, ADD, and MUL tables.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_multi_table_proof() {
     // CPU Trace (8 rows): dispatches operations to ADD and MUL tables
     let add_column = vec![
@@ -123,12 +122,12 @@ fn test_multi_table_proof() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -138,7 +137,6 @@ fn test_multi_table_proof() {
 
 /// All padding rows (multiplicity = 0 everywhere). Bus should balance at zero.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_all_padding() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -187,12 +185,12 @@ fn test_all_padding() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -202,7 +200,6 @@ fn test_all_padding() {
 
 /// Single operation (minimal non-trivial case).
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_single_operation() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -251,12 +248,12 @@ fn test_single_operation() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -266,7 +263,6 @@ fn test_single_operation() {
 
 /// Duplicate operations: same (a,b,c) sent twice, received with multiplicity=2.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_duplicate_operations() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -315,12 +311,12 @@ fn test_duplicate_operations() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -330,7 +326,6 @@ fn test_duplicate_operations() {
 
 /// Proof serialization round-trip.
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_serialization_roundtrip() {
     let mut cpu_trace = TraceTable::from_columns_main(
         vec![
@@ -379,17 +374,17 @@ fn test_serialization_roundtrip() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Serialize and deserialize
     let serialized = serde_cbor::to_vec(&multi_proof).expect("serialization failed");
-    let deserialized: crate::proof::stark::MultiProof<F, E, ()> =
+    let deserialized: crate::proof::stark::BatchedMultiProof<F, E, ()> =
         serde_cbor::from_slice(&serialized).expect("deserialization failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &deserialized,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -407,7 +402,6 @@ fn test_serialization_roundtrip() {
 ///
 /// Fingerprint structure: constant(0x42) + α·Word2L(h0,h1) + α²·col[2] + α³·(3·col[3] + 5)
 #[test_log::test]
-#[ignore = "Scope B Task 7: multi-table verify updated for batched MMCS"]
 fn test_bus_value_features() {
     use crate::lookup::{BusValue, LinearTerm};
 
@@ -525,12 +519,12 @@ fn test_bus_value_features() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender_air, &receiver_air];
 
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
