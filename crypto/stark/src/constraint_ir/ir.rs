@@ -99,11 +99,6 @@ pub struct ConstraintProgram<F: IsField = GoldilocksField, E: IsField = Goldiloc
     /// The prover interpreter writes these into `base_evals`; the rest (LogUp,
     /// always [`Dim::Ext`]) go into `ext_evals[num_base..]`.
     pub num_base: usize,
-    /// `false` if any constraint in this program was captured via the
-    /// default capture body (i.e. it has no real capture impl — see
-    /// [`crate::constraint_ir::builder::IrBuilder::mark_unsupported`]).
-    /// Callers must not interpret an incomplete program.
-    pub complete: bool,
 }
 
 impl<F: IsField, E: IsField> ConstraintProgram<F, E> {

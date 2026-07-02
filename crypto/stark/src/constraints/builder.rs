@@ -282,8 +282,7 @@ pub fn run_transition_prover<F, E, CS>(
 /// A Verifier context runs the [`VerifierEvalFolder`] (the OOD/recursion
 /// path). A Prover context is also accepted — debug trace validation calls
 /// this method with a prover frame — by running the [`ProverEvalFolder`]
-/// and promoting the Base-prefix results, mirroring the old boxed path's
-/// `evaluate_verifier` promotion.
+/// and promoting the Base-prefix results into the extension.
 pub fn run_transition_verifier<F, E, CS>(
     cs: &CS,
     ctx: &TransitionEvaluationContext<'_, F, E>,
@@ -768,6 +767,9 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
     type ExprE = IrExpr;
 
     fn main(&self, offset: usize, col: usize) -> IrExpr {
+        // Capture runs once at setup — assert the narrow IR encodings fit
+        // rather than silently truncating into the GPU program.
+        assert!(u8::try_from(offset).is_ok() && u16::try_from(col).is_ok());
         IrExpr::leaf(
             TreeKind::Main {
                 offset: offset as u8,
@@ -778,6 +780,7 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
         )
     }
     fn aux(&self, offset: usize, col: usize) -> IrExpr {
+        assert!(u8::try_from(offset).is_ok() && u16::try_from(col).is_ok());
         IrExpr::leaf(
             TreeKind::Aux {
                 offset: offset as u8,
@@ -788,9 +791,11 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
         )
     }
     fn challenge(&self, idx: usize) -> IrExpr {
+        assert!(u16::try_from(idx).is_ok());
         IrExpr::leaf(TreeKind::Challenge(idx as u16), Dim::Ext, 0)
     }
     fn alpha_pow(&self, idx: usize) -> IrExpr {
+        assert!(u16::try_from(idx).is_ok());
         IrExpr::leaf(TreeKind::AlphaPow(idx as u16), Dim::Ext, 0)
     }
     fn table_offset(&self) -> IrExpr {

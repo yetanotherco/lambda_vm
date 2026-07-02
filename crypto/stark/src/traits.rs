@@ -7,10 +7,8 @@ use math::field::{
 };
 
 use crate::{
-    constraint_ir::ConstraintProgram,
-    constraints::builder::ConstraintMeta,
-    domain::Domain,
-    lookup::{BusPublicInputs, PackingShifts},
+    constraint_ir::ConstraintProgram, constraints::builder::ConstraintMeta, domain::Domain,
+    lookup::BusPublicInputs,
 };
 
 use super::{
@@ -77,14 +75,12 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<F>,
     },
     Verifier {
         frame: &'a Frame<E, E>,
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<E>,
     },
 }
 
@@ -98,14 +94,12 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<F>,
     ) -> Self {
         Self::Prover {
             rows,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
-            packing_shifts,
         }
     }
 
@@ -114,14 +108,12 @@ where
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<E>,
     ) -> Self {
         Self::Verifier {
             frame,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
-            packing_shifts,
         }
     }
 }
@@ -208,10 +200,11 @@ pub trait AIR: Send + Sync {
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
-    /// The method called by the prover to evaluate the transitions corresponding to an evaluation frame.
-    /// In the case of the prover, the main evaluation table of the frame takes values in
-    /// `Self::Field`, since they are the evaluations of the main trace at the LDE domain.
-    /// In the case of the verifier, the frame take elements of Self::FieldExtension.
+    /// Evaluates the transitions corresponding to an evaluation frame at the
+    /// out-of-domain point. The verifier and the debug trace validation call
+    /// this; the prover instead uses `compute_transition_prover`.
+    /// In the verifier's case, the frame takes elements of `Self::FieldExtension`;
+    /// the debug validation path evaluates over the base `Self::Field` trace.
     ///
     /// Required: implemented via the single-source constraint body (the
     /// [`VerifierEvalFolder`](crate::constraints::builder::VerifierEvalFolder)
@@ -252,9 +245,8 @@ pub trait AIR: Send + Sync {
     );
 
     /// The idx-ordered metadata for every transition constraint (kind, declared
-    /// degree, zerofier shape) — plain data replacing the old per-constraint
-    /// trait objects. `RootKind::Base` entries form a prefix (its length is
-    /// `num_base_transition_constraints()`).
+    /// degree, zerofier shape), as plain data. `RootKind::Base` entries form a
+    /// prefix (its length is `num_base_transition_constraints()`).
     fn constraints_meta(&self) -> &[ConstraintMeta];
 
     /// The lazily captured flat IR ([`ConstraintProgram`]) of every transition

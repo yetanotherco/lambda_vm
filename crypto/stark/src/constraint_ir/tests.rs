@@ -12,7 +12,6 @@ use super::builder::IrBuilder;
 use super::interp::{eval_program, eval_program_base, eval_program_verifier};
 use super::ir::{ConstraintProgram, Dim, Op};
 use crate::frame::Frame;
-use crate::lookup::PackingShifts;
 use crate::table::TableView;
 use crate::traits::TransitionEvaluationContext;
 
@@ -199,14 +198,7 @@ fn frame_offset_reads_next_step() {
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &rap,
-        &alpha,
-        &offset,
-        &shifts,
-    );
+    let ctx = TransitionEvaluationContext::new_prover(frame.as_row_frame(), &rap, &alpha, &offset);
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals: Vec<ExtE> = vec![];
@@ -239,14 +231,7 @@ fn mixed_base_ext_auto_embeds() {
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &rap,
-        &alpha,
-        &offset,
-        &shifts,
-    );
+    let ctx = TransitionEvaluationContext::new_prover(frame.as_row_frame(), &rap, &alpha, &offset);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -278,14 +263,7 @@ fn explicit_embed_and_ext_neg() {
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &rap,
-        &alpha,
-        &offset,
-        &shifts,
-    );
+    let ctx = TransitionEvaluationContext::new_prover(frame.as_row_frame(), &rap, &alpha, &offset);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -334,14 +312,7 @@ fn all_leaf_kinds_logup_shaped() {
 
     let step = TableView::<Fp, Ext>::new(vec![main_row], vec![aux_row]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &rap,
-        &alpha,
-        &offset,
-        &shifts,
-    );
+    let ctx = TransitionEvaluationContext::new_prover(frame.as_row_frame(), &rap, &alpha, &offset);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -377,14 +348,7 @@ fn prover_entry_point_splits_base_and_ext() {
     let rap: Vec<ExtE> = vec![];
     let alpha = vec![ext3(3, 3, 3)];
     let offset = ExtE::zero();
-    let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &rap,
-        &alpha,
-        &offset,
-        &shifts,
-    );
+    let ctx = TransitionEvaluationContext::new_prover(frame.as_row_frame(), &rap, &alpha, &offset);
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -408,10 +372,7 @@ fn verifier_entry_point_promotes_base_roots() {
     let rap: Vec<ExtE> = vec![];
     let alpha = vec![ext3(3, 3, 3)];
     let offset = ExtE::zero();
-    let shifts = PackingShifts::<Ext>::new();
-    let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
-        &frame, &rap, &alpha, &offset, &shifts,
-    );
+    let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(&frame, &rap, &alpha, &offset);
 
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
     eval_program_verifier(&prog, &ctx, &mut ext_evals);
@@ -443,20 +404,6 @@ fn roots_indexed_by_constraint_idx_any_order() {
     assert_eq!(eval_program_base(&prog, 0, &row), fp(4));
     assert_eq!(eval_program_base(&prog, 1, &row), fp(4) + fp(1));
     assert_eq!(eval_program_base(&prog, 2, &row), fp(4) * fp(4));
-}
-
-// ------------------------------------------------------------------------
-// complete flag plumbing.
-// ------------------------------------------------------------------------
-
-#[test]
-fn complete_flag_defaults_true_and_mark_unsupported_clears_it() {
-    let b = IrBuilder::<Fp, Ext>::new();
-    assert!(b.finish(0).complete);
-
-    let mut b = IrBuilder::<Fp, Ext>::new();
-    b.mark_unsupported();
-    assert!(!b.finish(0).complete);
 }
 
 // ------------------------------------------------------------------------
@@ -514,13 +461,11 @@ fn non_goldilocks_reflexive_tower_builds_and_interprets() {
     let rap: Vec<GE> = vec![];
     let alpha: Vec<GE> = vec![];
     let offset = g(0);
-    let shifts = PackingShifts::<G>::new();
     let ctx = TransitionEvaluationContext::<G, G>::new_prover(
         frame.as_row_frame(),
         &rap,
         &alpha,
         &offset,
-        &shifts,
     );
     let mut base_evals = vec![GE::zero()];
     let mut ext_evals = vec![GE::zero(), GE::zero()];
@@ -529,8 +474,7 @@ fn non_goldilocks_reflexive_tower_builds_and_interprets() {
     assert_eq!(ext_evals[1], g(4) + g(10));
 
     // Verifier entry point too (the frame is Frame<G, G> either way here).
-    let vctx =
-        TransitionEvaluationContext::<G, G>::new_verifier(&frame, &rap, &alpha, &offset, &shifts);
+    let vctx = TransitionEvaluationContext::<G, G>::new_verifier(&frame, &rap, &alpha, &offset);
     let mut v_evals = vec![GE::zero(), GE::zero()];
     eval_program_verifier(&prog, &vctx, &mut v_evals);
     assert_eq!(v_evals[0], g(6) * g(7) + g(3));

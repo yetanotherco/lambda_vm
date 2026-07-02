@@ -54,10 +54,6 @@ pub struct IrBuilder<F: IsField = GoldilocksField, E: IsField = GoldilocksExtens
     base_consts: Vec<FieldElement<F>>,
     ext_consts: Vec<FieldElement<E>>,
     roots: Vec<u32>,
-    /// Set by [`Self::mark_unsupported`] when a constraint couldn't be
-    /// captured. Propagated to [`ConstraintProgram::complete`] so callers know
-    /// not to interpret an incomplete program.
-    complete: bool,
 }
 
 impl<F: IsField, E: IsField> Default for IrBuilder<F, E> {
@@ -76,21 +72,12 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
             base_consts: Vec::new(),
             ext_consts: Vec::new(),
             roots: Vec::new(),
-            complete: true,
         };
         // Reserve id 0 = ConstBase(0) = base-field zero. `const_base(0)` will
         // dedup to this.
         let zero = b.const_base(0);
         debug_assert_eq!(zero.id, 0);
         b
-    }
-
-    /// Record that the constraint currently being captured has no capture
-    /// implementation. Does not panic and does not emit a root for it — the
-    /// resulting program is marked incomplete (see
-    /// [`ConstraintProgram::complete`]) so callers know not to interpret it.
-    pub fn mark_unsupported(&mut self) {
-        self.complete = false;
     }
 
     /// Append (or reuse) a node with the given op and result dimension.
@@ -111,6 +98,10 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
 
     /// A main-trace column read at the given frame `offset`, row 0.
     pub fn main(&mut self, offset: u8, col: usize) -> Expr {
+        assert!(
+            u16::try_from(col).is_ok(),
+            "column {col} exceeds the IR's u16 index"
+        );
         self.push(
             Op::Var {
                 main: true,
@@ -125,6 +116,10 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
     /// An aux-trace column read at the given frame `offset`, row 0
     /// ([`Dim::Ext`]).
     pub fn aux(&mut self, offset: u8, col: usize) -> Expr {
+        assert!(
+            u16::try_from(col).is_ok(),
+            "column {col} exceeds the IR's u16 index"
+        );
         self.push(
             Op::Var {
                 main: false,
@@ -138,11 +133,19 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
 
     /// A LogUp RAP challenge, uniform per proof ([`Dim::Ext`]).
     pub fn challenge(&mut self, idx: usize) -> Expr {
+        assert!(
+            u16::try_from(idx).is_ok(),
+            "challenge index {idx} exceeds the IR's u16 index"
+        );
         self.push(Op::RapChallenge { idx: idx as u16 }, Dim::Ext)
     }
 
     /// A precomputed LogUp alpha power, uniform per proof ([`Dim::Ext`]).
     pub fn alpha_power(&mut self, idx: usize) -> Expr {
+        assert!(
+            u16::try_from(idx).is_ok(),
+            "alpha index {idx} exceeds the IR's u16 index"
+        );
         self.push(Op::AlphaPow { idx: idx as u16 }, Dim::Ext)
     }
 
@@ -271,7 +274,6 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
             ext_consts: self.ext_consts,
             roots: self.roots,
             num_base,
-            complete: self.complete,
         }
     }
 }

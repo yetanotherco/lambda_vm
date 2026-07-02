@@ -21,7 +21,6 @@ use crate::constraints::builder::{
     VerifierEvalFolder, num_base_from_meta,
 };
 use crate::frame::Frame;
-use crate::lookup::PackingShifts;
 use crate::table::TableView;
 use crate::traits::TransitionEvaluationContext;
 
@@ -179,7 +178,6 @@ fn random_trial(rng: &mut SplitMix64) -> TrialData {
 
 #[test]
 fn prover_folder_matches_direct_arithmetic() {
-    let shifts = PackingShifts::<Fp>::new();
     let mut rng = SplitMix64(0x0001_F01D_u64 ^ 0xABCD);
     for trial in 0..TRIALS {
         let t = random_trial(&mut rng);
@@ -192,7 +190,6 @@ fn prover_folder_matches_direct_arithmetic() {
             &challenges,
             &alphas,
             &t.offset,
-            &shifts,
         );
 
         let mut base_out = vec![FpE::zero(); NUM_BASE];
@@ -216,8 +213,6 @@ fn prover_folder_matches_interpreted_capture() {
     let mut cb = CaptureBuilder::<Fp, Ext>::new();
     SampleSet.eval(&mut cb);
     let (prog, _degrees) = cb.finish(NUM_BASE);
-
-    let shifts = PackingShifts::<Fp>::new();
     let mut rng = SplitMix64(0x0002_F01D_u64 ^ 0xABCD);
     for trial in 0..TRIALS {
         let t = random_trial(&mut rng);
@@ -230,7 +225,6 @@ fn prover_folder_matches_interpreted_capture() {
             &challenges,
             &alphas,
             &t.offset,
-            &shifts,
         );
 
         let mut folder_base = vec![FpE::zero(); NUM_BASE];
@@ -253,8 +247,6 @@ fn verifier_folder_matches_interpreted_capture() {
     let mut cb = CaptureBuilder::<Fp, Ext>::new();
     SampleSet.eval(&mut cb);
     let (prog, _degrees) = cb.finish(NUM_BASE);
-
-    let shifts = PackingShifts::<Ext>::new();
     let mut rng = SplitMix64(0x0003_F01D_u64 ^ 0xABCD);
     for trial in 0..TRIALS {
         let t = random_trial(&mut rng);
@@ -269,7 +261,6 @@ fn verifier_folder_matches_interpreted_capture() {
             &challenges,
             &alphas,
             &t.offset,
-            &shifts,
         );
 
         let mut folder_ext = vec![ExtE::zero(); NUM_CONSTRAINTS];
@@ -293,7 +284,6 @@ fn capture_measured_degrees_match_declared_meta() {
     let mut cb = CaptureBuilder::<Fp, Ext>::new();
     SampleSet.eval(&mut cb);
     let (prog, degrees) = cb.finish(NUM_BASE);
-    assert!(prog.complete);
     assert_eq!(prog.roots.len(), NUM_CONSTRAINTS);
 
     let meta = SampleSet.meta();
@@ -354,7 +344,6 @@ fn meta_non_dense_panics() {
 #[test]
 #[should_panic(expected = "never emitted")]
 fn prover_folder_missing_emit_asserts() {
-    let shifts = PackingShifts::<Fp>::new();
     let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
     let challenges: Vec<ExtE> = vec![];
@@ -365,7 +354,6 @@ fn prover_folder_missing_emit_asserts() {
         &challenges,
         &alphas,
         &offset,
-        &shifts,
     );
 
     let mut base_out = vec![FpE::zero(); 2];
@@ -380,7 +368,6 @@ fn prover_folder_missing_emit_asserts() {
 #[test]
 #[should_panic(expected = "emitted twice")]
 fn prover_folder_double_emit_asserts() {
-    let shifts = PackingShifts::<Fp>::new();
     let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
     let challenges: Vec<ExtE> = vec![];
@@ -391,7 +378,6 @@ fn prover_folder_double_emit_asserts() {
         &challenges,
         &alphas,
         &offset,
-        &shifts,
     );
 
     let mut base_out = vec![FpE::zero(); 2];
@@ -407,19 +393,13 @@ fn prover_folder_double_emit_asserts() {
 #[test]
 #[should_panic(expected = "never emitted")]
 fn verifier_folder_missing_emit_asserts() {
-    let shifts = PackingShifts::<Ext>::new();
     let step = TableView::<Ext, Ext>::new(vec![vec![ExtE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Ext, Ext>::new(vec![step]);
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
-        &frame,
-        &challenges,
-        &alphas,
-        &offset,
-        &shifts,
-    );
+    let ctx =
+        TransitionEvaluationContext::<Fp, Ext>::new_verifier(&frame, &challenges, &alphas, &offset);
 
     let mut ext_out = vec![ExtE::zero(); 2];
     let mut folder = VerifierEvalFolder::new(&ctx, &mut ext_out);
@@ -583,9 +563,6 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
     for &(idx, measured) in &degrees {
         assert_eq!(measured, meta[idx].degree, "constraint {idx} degree");
     }
-
-    let shifts = PackingShifts::<Fp>::new();
-    let vshifts = PackingShifts::<Ext>::new();
     let mut rng = SplitMix64(0x0004_F01D_u64 ^ 0xABCD);
     for trial in 0..TRIALS {
         // Two frame steps with distinct main and aux rows.
@@ -609,7 +586,6 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
             &challenges,
             &alphas,
             &offset,
-            &shifts,
         );
 
         let mut folder_base = vec![FpE::zero(); num_base];
@@ -647,7 +623,6 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
             &challenges,
             &alphas,
             &offset,
-            &vshifts,
         );
 
         let mut vfolder_ext = vec![ExtE::zero(); meta.len()];

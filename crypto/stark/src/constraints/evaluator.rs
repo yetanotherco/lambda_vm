@@ -1,7 +1,7 @@
 use super::boundary::BoundaryConstraints;
 use crate::domain::Domain;
 use crate::frame::RowFrame;
-use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
+use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
 use math::field::element::FieldElement;
@@ -58,9 +58,6 @@ where
                 Vec::new()
             };
 
-        // Precompute packing shift constants once for all LDE domain points.
-        let packing_shifts = PackingShifts::<Field>::new();
-
         // Per-thread output buffers via map_init: each Rayon worker allocates
         // once, then reuses for all iterations assigned to that thread. The
         // trace rows themselves are BORROWED in place per LDE point (the LDE
@@ -79,7 +76,6 @@ where
                 rap_challenges,
                 &logup_alpha_powers,
                 logup_table_offset,
-                &packing_shifts,
             );
             air.compute_transition_prover(&ctx, base_buf, transition_buf);
 

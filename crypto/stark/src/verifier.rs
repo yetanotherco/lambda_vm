@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
+    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -190,13 +190,11 @@ pub trait IsStarkVerifier<
 
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
-        let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
-            &packing_shifts,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
