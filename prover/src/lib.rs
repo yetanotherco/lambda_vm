@@ -61,7 +61,7 @@ use crate::test_utils::{
 // Re-exported so downstream verifier guests (e.g. the in-VM recursion guest) can
 // name the proof-options type carried in their private input alongside `VmProof`.
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
-use stark::proof::stark::MultiProof;
+use stark::proof::stark::{BatchedMultiProof, MultiProof};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
@@ -156,8 +156,8 @@ impl TableCounts {
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct VmProof {
-    /// The multi-table STARK proof.
-    pub proof: MultiProof<F, E, ()>,
+    /// The multi-table STARK proof (unified-shard / batched MMCS).
+    pub proof: BatchedMultiProof<F, E, ()>,
     /// Run-length encoded runtime page ranges.
     /// These are zero-initialized pages accessed during execution but not
     /// covered by ELF segments (stack, heap, etc.).
@@ -692,6 +692,39 @@ pub(crate) fn compute_expected_commit_bus_balance(
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
+/// Batched (unified-shard) analogue of [`replay_transcript_phase_a`]: appends
+/// each preprocessed table's hardcoded precomputed root and the SINGLE batched
+/// main MMCS root (Phase A of the linear transcript), then samples the shared
+/// LogUp `(z, alpha)`. Mirrors `Prover::prove_rounds_1_to_3` Phase A + B.
+pub(crate) fn replay_transcript_phase_a_batched(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proof: &BatchedMultiProof<F, E, ()>,
+    transcript: &mut DefaultTranscript<E>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    for air in airs.iter() {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+    }
+    transcript.append_bytes(&proof.main_root);
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// Batched analogue of [`compute_expected_commit_bus_balance`] for a
+/// [`BatchedMultiProof`].
+pub(crate) fn compute_expected_commit_bus_balance_batched(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proof: &BatchedMultiProof<F, E, ()>,
+    public_output_bytes: &[u8],
+    start_index: u64,
+    transcript: &mut DefaultTranscript<E>,
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a_batched(airs, proof, transcript);
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
 /// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
 ///
 /// The final proof commits one local-to-global sub-table per epoch as its first
@@ -872,8 +905,8 @@ pub fn prove_with_options_and_inputs(
         &runtime_page_ranges,
     );
 
-    // Phase 4: Prove (multi_prove)
-    let proof = Prover::multi_prove(
+    // Phase 4: Prove (unified-shard batched MMCS + single FRI)
+    let proof = Prover::multi_prove_batched(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -985,13 +1018,13 @@ pub fn verify_with_options(
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
     let expected_proof_count =
         vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected_proof_count != vm_proof.proof.proofs.len() {
+    if expected_proof_count != vm_proof.proof.per_table.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
             vm_proof.table_counts.total(),
             page_configs.len(),
             expected_proof_count,
-            vm_proof.proof.proofs.len(),
+            vm_proof.proof.per_table.len(),
         )));
     }
 
@@ -1031,7 +1064,7 @@ pub fn verify_with_options(
     // independently of the multi_verify transcript, but both must start from
     // the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
-    let expected_bus_balance = match compute_expected_commit_bus_balance(
+    let expected_bus_balance = match compute_expected_commit_bus_balance_batched(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
@@ -1043,7 +1076,7 @@ pub fn verify_with_options(
         None => return Ok(false),
     };
 
-    Ok(Verifier::multi_verify(
+    Ok(Verifier::batched_multi_verify(
         &air_refs,
         &vm_proof.proof,
         &mut transcript,

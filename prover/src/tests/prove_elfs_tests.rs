@@ -31,6 +31,7 @@ use executor::vm::execution::Executor;
 
 // Import shared utilities
 use crate::VmAirs;
+use crate::test_utils::multi_prove_batched_ram;
 use crate::test_utils::multi_prove_ram;
 use crate::test_utils::run_asm_elf;
 
@@ -120,7 +121,7 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         None,
     );
     let runtime_page_ranges = traces.runtime_page_ranges();
-    let proof = multi_prove_ram(
+    let proof = multi_prove_batched_ram(
         airs.air_trace_pairs(&mut traces),
         &mut DefaultTranscript::<E>::new(&[]),
     )
@@ -164,7 +165,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
     );
     let air_refs = airs.air_refs();
     let mut replay_transcript = DefaultTranscript::<E>::new(&[]);
-    let expected_bus_balance = crate::compute_expected_commit_bus_balance(
+    let expected_bus_balance = crate::compute_expected_commit_bus_balance_batched(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
@@ -172,7 +173,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
-    Verifier::multi_verify(
+    Verifier::batched_multi_verify(
         &air_refs,
         &vm_proof.proof,
         &mut DefaultTranscript::<E>::new(&[]),
