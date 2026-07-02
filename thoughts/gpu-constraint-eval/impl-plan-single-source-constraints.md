@@ -418,12 +418,38 @@ capture. This preserves the no-HashMap-in-guest rule with zero special-casing.
    - Extend the folder↔capture differential test to cover an `aux(1, col)`
      next-row read and a second alpha index — the real 1-/2-absorbed LogUp bodies
      use both and the PR 1 sample body covers neither.
-1. **Golden proofs** (the transcription safety net — this replaces the oracle
-   role the duplication accidentally provided): proofs are deterministic given
-   trace+params. Before starting conversion, record proof-bytes hashes for a
-   fixed ELF set (e.g. the `test_prove_elfs_*` inputs) on the pre-PR-B commit;
-   assert identical hashes after. Any slip in any constraint body changes the
-   composition polynomial and flips the hash.
+1. **Transcription gate = old-vs-new random-row differentials — NOT golden
+   proofs.** (Golden proofs were the original plan and are RETIRED: proof bytes
+   are nondeterministic BY DESIGN in this system — grinding, plus order-free
+   trace tables built via std HashMap (LT and others have no canonical row
+   order) — and the verifier is robust to that. Do not chase proof determinism.)
+   The dangerous bug class is a *weakened* constraint (new body drops a term
+   that vanishes on honest traces — prove→verify stays green). The differential
+   tests compare the OLD `evaluate` vs the NEW body on **random rows** (off-trace
+   points), where any such divergence shows with overwhelming probability — the
+   old constraint structs stay in-branch until the final deletion phase precisely
+   to serve as this oracle. Required coverage: every converted constraint,
+   ≥1000 random rows, prover folder AND capture→interpret both vs old evaluate.
+1b. **Count/meta parity** (catches "constraint silently dropped from BOTH
+   sides", which differentials can't see): while the old code still exists
+   in-branch, assert per table that the new `ConstraintMeta` list matches the
+   old boxed list in count, `num_base`, per-constraint degree, and zerofier
+   params (period/offset/exemptions/end_exemptions).
+1c. **Cross-version verification (the primary end-to-end gate, user-specified):**
+   build the `cli` at the PR-2 base (old semantics) and at the PR-2 tip; proofs
+   from the NEW prover MUST verify under the OLD verifier, and old proofs under
+   the NEW verifier (both directions, a few small ELFs each; `cli prove` /
+   `cli verify` — `bin/cli/src/main.rs:150,477`). Needs no determinism: the
+   verifier recomputes the OOD constraint evaluations from ITS OWN constraint
+   definitions against the other side's commitments, so any semantic difference
+   in the constraint system fails loudly. This catches the wiring-level slips
+   the per-constraint differentials can't see — constraint (re)ordering,
+   `num_base` split, alpha-power indexing, zerofier grouping, transcript
+   changes. **The invariant this gate enforces: constraint order/indices are
+   preserved EXACTLY 1:1 from the old system** (the β coefficients and OOD
+   checks are index-bound — any reordering fails verification, by design).
+   Implementation: a two-binary script mirroring `scripts/bench_abba.sh`'s
+   build-both-refs worktree pattern.
 2. **Degree assert**: for every table, measured degree (CaptureBuilder trees) ==
    declared `meta.degree`.
 3. **Backend consistency**: folder vs interpreted `ConstraintProgram` on 1000
