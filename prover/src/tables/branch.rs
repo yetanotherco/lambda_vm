@@ -358,7 +358,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // =========================================================================
 
 /// `(unmasked_0, unmasked_1)` — the next-pc value repacked into two words,
-/// as builder expressions (twin of [`BranchConstraint::compute_next_pc_unmasked`]):
+/// as builder expressions (the constraint-expression form of the value
+/// [`BranchOperation::compute_next_pc_unmasked`] computes for trace generation):
 ///
 /// ```text
 /// unmasked_0 = unmasked_low_byte + next_pc_low_1·2⁸ + next_pc_high_0·2¹⁶
@@ -376,8 +377,7 @@ fn next_pc_unmasked_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensi
     (unmasked_0, unmasked_1)
 }
 
-/// `carry_0 = (base_0 + offset_0 − unmasked_0)·2⁻³²` (twin of
-/// [`BranchConstraint::compute_carry_0_for`]).
+/// `carry_0 = (base_0 + offset_0 − unmasked_0)·2⁻³²`.
 fn carry_0_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     base_col_0: usize,
@@ -387,8 +387,7 @@ fn carry_0_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     (b.main(0, base_col_0) + b.main(0, cols::OFFSET_0) - unmasked_0) * inv_2_32
 }
 
-/// `carry_1 = (base_1 + offset_1 + carry_0 − unmasked_1)·2⁻³²` (twin of
-/// [`BranchConstraint::compute_carry_1_for`]).
+/// `carry_1 = (base_1 + offset_1 + carry_0 − unmasked_1)·2⁻³²`.
 ///
 /// Known redundancy: this rebuilds the carry_0 expression (and the unmasked
 /// next-pc repack) that the sibling constraints also compute. Sharing them
@@ -405,8 +404,7 @@ fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     (b.main(0, base_col_1) + b.main(0, cols::OFFSET_1) + carry_0 - unmasked_1) * inv_2_32
 }
 
-/// The BRANCH table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `branch_constraints` index-for-index (5 constraints):
+/// The BRANCH table's 5 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0: `(1 − JALR)·carry_0·(1 − carry_0)` on the pc path (degree 3);
 /// - idx 1: `(1 − JALR)·carry_1·(1 − carry_1)` on the pc path (degree 3);
 /// - idx 2: `JALR·carry_0·(1 − carry_0)` on the register path (degree 3);

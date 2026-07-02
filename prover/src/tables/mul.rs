@@ -453,7 +453,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)
-    // Carries are virtual columns computed as linear combinations:
+    // Carries are virtual (computed inline) as linear combinations:
     //   carry[0] = 2^-32 * (raw_product[0] - res[0])
     //   carry[i] = 2^-32 * (raw_product[i] + carry[i-1] - res[i])
     // where res = [lo_word0, lo_word1, hi_word0, hi_word1]
@@ -683,11 +683,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `MulConstraint` / `mul_constraints` above, written
-// once against the generic `ConstraintBuilder` so one body serves the compiled
-// prover folder, the verifier folder and IR capture. The old structs stay for
-// now (they are the differential oracle); the final deletion phase removes
-// them. Constraint indices 0..8 match `mul_constraints(0)` exactly:
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..8:
 //   0: SignedIsBit(LHS_SIGNED)  1: SignedIsBit(RHS_SIGNED)
 //   2: LhsSign                  3: RhsSign
 //   4..8: RawProduct(0..4)
@@ -710,7 +707,6 @@ impl MulConstraints {
     }
 
     /// `raw_product[i] − Σ_k 2^(16k)·Σ_j lhs_ext[j]·rhs_ext[idx−j]` (idx = 2i+k).
-    /// Mirrors [`MulConstraint::compute_raw_product_constraint`] exactly.
     fn raw_product<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,
@@ -758,7 +754,7 @@ impl MulConstraints {
             rhs_hi,
         ];
 
-        // Convolution sum (same k/j bounds as the old code).
+        // Convolution sum.
         let shift_16 = b.const_base(SHIFT_16);
         let mut sum = b.zero();
         for k in 0..=1usize {

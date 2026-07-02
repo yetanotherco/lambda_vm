@@ -27,7 +27,8 @@
 //! - 16 Memory bus tokens (read old + write new, per byte)
 //! - 2 MEMW output interactions (read + write, from CPU)
 //!
-//! ## Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
+//! ## Constraints (15 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT
+//! for carry + 3 IS_BIT for width flags (write2/4/8) + 1 IS_BIT for the width sum)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -849,8 +850,7 @@ fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) ->
     b.main(0, cols::WRITE2) + b.main(0, cols::WRITE4) + b.main(0, cols::WRITE8)
 }
 
-/// The MEMW table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `constraints` index-for-index (15 constraints):
+/// The MEMW table's 15 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0:     `IS_BIT<μ_sum>`;
 /// - idx 1:     `w2 ⇒ μ_sum` (`w2·(1 − μ_sum)`);
 /// - idx 2,3:   `IS_BIT` on `μ_read`, `μ_write`;

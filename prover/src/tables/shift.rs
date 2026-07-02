@@ -6,16 +6,17 @@
 //! 1. Intra-limb shift by `bit_shift = shift mod 16` using paired HWSL lookups (returning [SLL, SLLC]).
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
-//! ## Columns (26 total)
+//! ## Columns (29 total)
 //! - Input: `in[0..3]` (DWordHL), `shift` (Byte), `direction` (Bit), `signed` (Bit), `word_instr` (Bit)
 //! - Output: `out[0..1]` (DWordWL)
 //! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift_raw[0..2]`
 //! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
+//! - Shift decomposition (ALU-bus shift amount): `shift_b1` (idx 26, Byte = shift[1]), `shift_h1` (idx 27, Half = shift[2]), `shift_high` (idx 28, Word = shift[3])
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (15 total)
-//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
-//! - Receiver: SHIFT (from CPU)
+//! ## Bus Interactions (18 total)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×2), IS_HALFWORD (×5)
+//! - Receiver: ALU (from CPU)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -218,7 +219,7 @@ impl ShiftOperation {
         // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
         // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
         // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
-        // so the extension contribution in `compute_shifted_half` naturally
+        // so the extension contribution in `shifted_half` naturally
         // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
         // the top-bit value of the input.
         let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
@@ -731,11 +732,8 @@ pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `ShiftConstraint` / `shift_constraints` above,
-// written once against the generic `ConstraintBuilder` so one body serves the
-// compiled prover folder, the verifier folder and IR capture. The old structs
-// stay for now (they are the differential oracle); the final deletion phase
-// removes them. Constraint indices 0..19 match `shift_constraints(0)` exactly.
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..19.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
@@ -745,7 +743,7 @@ pub struct ShiftConstraints;
 
 impl ShiftConstraints {
     /// `limb_shift[i]` (i = 0..2 raw, i = 3 virtual
-    /// `1 - ls_raw[0] - ls_raw[1] - ls_raw[2]`), matching `get_ls`.
+    /// `1 - ls_raw[0] - ls_raw[1] - ls_raw[2]`).
     fn limb_shift<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,
@@ -785,8 +783,7 @@ impl ShiftConstraints {
         y + x
     }
 
-    /// The `shifted` virtual column at index `half_idx` (0..4), matching
-    /// [`ShiftConstraint::compute_shifted_half`].
+    /// The `shifted` virtual column at index `half_idx` (0..4).
     fn shifted_half<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,

@@ -634,7 +634,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
     // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
     // implementation guidance in spec/is_byte.typ.
-    // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
+    // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
     for x in 0..5 {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
@@ -900,9 +900,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The KECCAK round table's transition constraints as a single
-/// [`ConstraintSet`], mirroring `create_constraints` index-for-index (20
-/// constraints): for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
+/// The KECCAK round table's 20 transition constraints as a single
+/// [`ConstraintSet`]: for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
 /// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
 pub struct KeccakRndConstraints;
 

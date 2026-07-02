@@ -7,7 +7,7 @@
 //! - **IS_BIT**: Enforces that a value is binary (0 or 1)
 //!   - Constraint: `cond * X * (1-X) = 0`
 //!
-//! - **ADD**: 64-bit addition with embedded virtual carry columns
+//! - **ADD**: 64-bit addition with carries as inline expressions
 //!   - lhs, rhs, sum: DWordWL (2 × 32-bit words)
 //!   - Embeds carry constraints inline
 
@@ -117,7 +117,7 @@ pub enum AddOperand {
     DWordWL { start_column: usize },
 
     /// Linear combination for lo and hi limbs.
-    /// Handles: constants, single columns, expressions, and virtual columns.
+    /// Handles: constants, single columns, and expressions.
     Linear {
         /// Terms for the low 32-bit word
         lo: AddTerms,
@@ -230,8 +230,7 @@ impl AddOperand {
     }
 
     /// Creates a Linear operand from explicit lo/hi term lists (at most 4
-    /// terms per limb). Use this for complex expressions like `4 - 2*c` or
-    /// virtual columns.
+    /// terms per limb). Use this for complex expressions like `4 - 2*c`.
     pub fn linear(lo: &[AddLinearTerm], hi: &[AddLinearTerm]) -> Self {
         AddOperand::Linear {
             lo: AddTerms::of(lo),
@@ -244,11 +243,9 @@ impl AddOperand {
 // Single-body emit functions (ConstraintBuilder front-end)
 // =========================================================================
 //
-// Non-destructive twins of the boxed constraint structs above, written once
-// against the generic `ConstraintBuilder` so one body serves the compiled
-// prover folder, the verifier folder and IR capture. The structs stay for
-// now (they are the differential oracle for the emit functions); the table
-// conversion deletes them.
+// The single-body emit functions: one body written against the generic
+// `ConstraintBuilder` serves the compiled prover folder, the verifier folder
+// and IR capture.
 //
 // Each `emit_*` takes the constraint index it emits at; the matching
 // `*_meta` returns the idx-ordered metadata (declared degree; default
@@ -258,7 +255,7 @@ impl AddOperand {
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta};
 
 /// IS_BIT: `x·(1−x)`, optionally gated by a condition column:
-/// `cond·x·(1−x)`. Twin of `IsBitConstraint`.
+/// `cond·x·(1−x)`.
 pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -282,8 +279,7 @@ pub fn is_bit_meta(idx: usize, conditional: bool) -> ConstraintMeta {
     ConstraintMeta::base(idx, if conditional { 3 } else { 2 })
 }
 
-/// One [`AddLinearTerm`]: `column · coefficient` or a constant
-/// (matches `AddLinearTerm::eval`'s operand order).
+/// One [`AddLinearTerm`]: `column · coefficient` or a constant.
 fn add_term_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     t: &AddLinearTerm,
@@ -297,7 +293,7 @@ fn add_term_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     }
 }
 
-/// Sum of terms, from zero (matches `eval_terms`).
+/// Sum of terms, from zero.
 fn add_terms_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     terms: &[AddLinearTerm],
@@ -309,7 +305,7 @@ fn add_terms_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     acc
 }
 
-/// An operand's low word (matches `AddOperand::eval_lo`).
+/// An operand's low word.
 fn add_operand_lo<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     op: &AddOperand,
@@ -320,7 +316,7 @@ fn add_operand_lo<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     }
 }
 
-/// An operand's high word (matches `AddOperand::eval_hi`).
+/// An operand's high word.
 fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     op: &AddOperand,
@@ -331,8 +327,7 @@ fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     }
 }
 
-/// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`
-/// (twin of `AddConstraint::new_pair`):
+/// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`:
 ///
 /// ```text
 /// carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²

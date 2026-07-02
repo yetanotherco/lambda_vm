@@ -24,11 +24,13 @@
 //! - 16 Memory bus tokens
 //! - 2 MEMW output interactions (read + write)
 //!
-//! ## Constraints (4 total)
+//! ## Constraints (8 total)
 //! - IS_BIT<μ_sum> (1)
 //! - w2 => μ_sum (1)
 //! - IS_BIT<μ_read> (1)
 //! - IS_BIT<μ_write> (1)
+//! - IS_BIT<write2>, IS_BIT<write4>, IS_BIT<write8> (3)
+//! - IS_BIT<w2> (width sum is a bit) (1)
 //!
 //! ## Assumptions (caller's responsibility, not enforced here)
 //! - IS_HALF[base_address[i]] for i ∈ [0, 1]
@@ -649,8 +651,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// `μ_sum = μ_read + μ_write` as a builder expression (twin of the inlined
-/// `compute`).
+/// `μ_sum = μ_read + μ_write` as a builder expression.
 fn mu_sum_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
     b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE)
 }
@@ -660,8 +661,7 @@ fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) ->
     b.main(0, cols::WRITE2) + b.main(0, cols::WRITE4) + b.main(0, cols::WRITE8)
 }
 
-/// The MEMW_A table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `constraints` index-for-index (8 constraints):
+/// The MEMW_A table's 8 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0:   `IS_BIT<μ_sum>`;
 /// - idx 1:   `w2 ⇒ μ_sum` (`w2·(1 − μ_sum)`);
 /// - idx 2,3: `IS_BIT` on `μ_read`, `μ_write`;

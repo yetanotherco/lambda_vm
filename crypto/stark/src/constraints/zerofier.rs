@@ -5,9 +5,6 @@
 //! over each constraint's plain metadata. Every constraint applies to every
 //! row of the trace, so the zerofier is `x^N − 1` corrected by the constraint's
 //! `end_exemptions` (the last rows it must skip).
-//! The bodies were relocated from the deleted boxed-constraint trait's default
-//! methods, specialized to the every-row shape (equivalence was asserted by
-//! migration-time tests).
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};

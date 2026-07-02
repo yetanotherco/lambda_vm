@@ -588,8 +588,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The CPU32 table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `cpu32_constraints` index-for-index (32 constraints):
+/// The CPU32 table's 32 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-6:   `IS_BIT` on `read_register1/2`, `write_register`, `alu`, `add`,
 ///   `sub`, `μ`;
 /// - idx 7,8:   `ADD` pair `arg1 + arg2 = res` (gated on `add`);

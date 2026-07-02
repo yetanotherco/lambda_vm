@@ -455,8 +455,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The KECCAK core table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `create_constraints` index-for-index (51 constraints):
+/// The KECCAK core table's 51 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
 ///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
 ///   `state_ptr` DWordHL);

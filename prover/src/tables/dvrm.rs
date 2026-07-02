@@ -27,7 +27,7 @@
 //! - Sender: ALU (×3, on the unified bus: ×1 LT-flavored for `|r| < |d|`,
 //!   ×2 MUL-flavored for `n - r = d * q` lo/hi)
 //! - Sender: ZERO (×5 for div_by_zero, overflow, NEG template)
-//! - Receiver: DVRM (×2 for quotient and remainder results)
+//! - Receiver: ALU (×2, on the unified bus, for quotient and remainder results)
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -973,11 +973,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `DvrmConstraint` / `dvrm_constraints` above, written
-// once against the generic `ConstraintBuilder` so one body serves the compiled
-// prover folder, the verifier folder and IR capture. The old structs stay for
-// now (they are the differential oracle); the final deletion phase removes
-// them. Constraint indices 0..19 match `dvrm_constraints(0)` exactly.
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..19.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
@@ -986,8 +983,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintS
 pub struct DvrmConstraints;
 
 impl DvrmConstraints {
-    /// Sign-extended QuadWL word `k` (0..4) of a halfword group, matching
-    /// [`DvrmConstraint::build_extended_quad`]:
+    /// Sign-extended QuadWL word `k` (0..4) of a halfword group:
     /// `[hw0 + hw1·2^16, hw2 + hw3·2^16, ext, ext]`, where
     /// `ext = sign·SIGN_FILL + sign·SIGN_FILL·2^16`.
     fn ext_quad<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
@@ -1019,8 +1015,7 @@ impl DvrmConstraints {
         }
     }
 
-    /// Virtual carry[i] for `n = n_sub_r + r`, matching
-    /// [`DvrmConstraint::compute_carry`] (extended QuadWL, recursive chain).
+    /// Virtual carry[i] for `n = n_sub_r + r` (extended QuadWL, recursive chain).
     fn carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,
@@ -1049,8 +1044,8 @@ impl DvrmConstraints {
         }
     }
 
-    /// `r::DWordWL[i]` (i = 0 → lo32, else hi32), matching the `AbsRFormula`
-    /// arm; used generically for r or d halfword groups.
+    /// `r::DWordWL[i]` (i = 0 → lo32, else hi32); used generically for r or d
+    /// halfword groups.
     fn dword_wl<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         lo: usize,
@@ -1065,7 +1060,7 @@ impl DvrmConstraints {
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
     fn meta(&self) -> Vec<ConstraintMeta> {
-        // All DVRM constraints are declared degree 2 (see DvrmConstraint::degree).
+        // All DVRM constraints are declared degree 2.
         (0..19).map(|i| ConstraintMeta::base(i, 2)).collect()
     }
 

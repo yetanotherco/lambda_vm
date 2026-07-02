@@ -475,11 +475,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `LoadConstraint` / `constraints()` above, written
-// once against the generic `ConstraintBuilder` so one body serves the compiled
-// prover folder, the verifier folder and IR capture. The old structs stay for
-// now (they are the differential oracle); the final deletion phase removes
-// them. Constraint indices 0..13 match `constraints()` (idx_start = 0) exactly:
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..13:
 //   0..4: FlagIsBit(SIGNED, READ2, READ4, READ8)   4: WidthSumIsBit
 //   5: ReadImpliesMu                                6..10: ExtensionHigh(4..8)
 //   10..12: ExtensionMid(2..4)                      12: ExtensionLow

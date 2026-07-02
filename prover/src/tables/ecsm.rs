@@ -628,10 +628,8 @@ impl OverflowKind {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `create_constraints` above, written once against the
-// generic `ConstraintBuilder`. The old structs/builder stay as the differential
-// oracle; the final deletion phase removes them. Constraint indices 0..148
-// match `create_constraints(0)` exactly:
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..148:
 //   0        : IS_BIT(MU)
 //   1..65    : ConvCarry(X2, 0..64)
 //   65       : ColIsZero(c0(63))
@@ -650,8 +648,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintS
 pub struct EcsmConstraints;
 
 impl EcsmConstraints {
-    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes). Twin of
-    /// [`p_byte`].
+    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes).
     fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         m: usize,
@@ -677,7 +674,7 @@ impl EcsmConstraints {
         }
     }
 
-    /// `S_i` for `relation` at limb `i` (twin of `ConvCarry::s_i`).
+    /// `S_i` for `relation` at limb `i`.
     fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,
@@ -713,7 +710,7 @@ impl EcsmConstraints {
         s
     }
 
-    /// `256·c_i − c_{i-1} − S_i` (twin of `ConvCarry::evaluate`).
+    /// `256·c_i − c_{i-1} − S_i`.
     fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,
@@ -733,7 +730,7 @@ impl EcsmConstraints {
         two_pow_8 * c_i - c_prev - Self::s_i(b, relation, i)
     }
 
-    /// The 8 word-carries of the `kind` addition (twin of [`carry_chain`]).
+    /// The 8 word-carries of the `kind` addition.
     fn carry_chain<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         kind: OverflowKind,

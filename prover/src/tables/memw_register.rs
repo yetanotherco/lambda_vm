@@ -361,8 +361,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The MEMW_R table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `constraints` index-for-index (3 constraints):
+/// The MEMW_R table's 3 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0,1: `IS_BIT` on `μ_read`, `μ_write`;
 /// - idx 2:   `IS_BIT<μ_sum>` with `μ_sum = μ_read + μ_write`.
 pub struct MemwRegisterConstraints;

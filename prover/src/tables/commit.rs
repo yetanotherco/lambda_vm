@@ -729,8 +729,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The COMMIT table's transition constraints as a single [`ConstraintSet`],
-/// mirroring `create_constraints` index-for-index (8 constraints):
+/// The COMMIT table's 8 transition constraints as a single [`ConstraintSet`]:
 /// - idx 0-2: `IS_BIT` on `first`, `end`, `μ`;
 /// - idx 3:   `(first + end)·(1 − μ) = 0` (first/end ⇒ μ);
 /// - idx 4,5: `ADD` pair `address + 1 = address_incr` (unconditional);

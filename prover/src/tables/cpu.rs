@@ -314,7 +314,7 @@ impl CpuOperation {
         // address `pc + instruction_length` on every BRANCH row (written to `rd`
         // only by JAL/JALR — `cpu.toml` branch group); `res`
         // otherwise. The spec computes this `pc + len` via the ADD chip gated on
-        // `BRANCH`; we pin it with `BranchRvdConstraint` (carry-omitting, like
+        // `BRANCH`; we pin it with `emit_branch_rvd_pair` (carry-omitting, like
         // `next_pc`). For conditional branches `rvd` is computed but never
         // written (`write_register = 0`).
         let store = f.memory && jalr; // under MEMORY, mem_flags bit 0 = memory_op (1 = store)

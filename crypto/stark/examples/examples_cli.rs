@@ -8,8 +8,8 @@
 //!
 //! Proofs are bincode-serialized, mirroring `bin/cli`'s VM-proof format.
 //! Trace sizes and public inputs mirror the existing stark tests
-//! (`tests/air_tests.rs`, `tests/small_trace_tests.rs`,
-//! `tests/bus_tests/completeness_tests.rs`) so a proof produced by one
+//! (`src/tests/air_tests.rs`, `src/tests/small_trace_tests.rs`,
+//! `src/tests/bus_tests/completeness_tests.rs`) so a proof produced by one
 //! version of the constraint system can be checked by another.
 //!
 //! Exit code 0 = success (prove written / verify accepted); nonzero = failure.

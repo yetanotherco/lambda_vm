@@ -262,10 +262,8 @@ pub enum Relation {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `create_constraints` above, written once against the
-// generic `ConstraintBuilder`. The old structs/builder stay as the differential
-// oracle; the final deletion phase removes them. Constraint indices 0..200
-// match `create_constraints(0)` exactly:
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..200:
 //   0,1,2 : IS_BIT(MU), IS_BIT(OP), IS_BIT(NEXT_OP)
 //   3     : OP · NEXT_OP
 //   4     : NEXT_OP · (1 − MU)
@@ -278,8 +276,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintS
 pub struct EcdasConstraints;
 
 impl EcdasConstraints {
-    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes). Twin of
-    /// [`p_byte`].
+    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes).
     fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         m: usize,
@@ -291,7 +288,7 @@ impl EcdasConstraints {
         }
     }
 
-    /// Byte `m` of `R` (zero beyond 33 bytes). Twin of `r_byte`.
+    /// Byte `m` of `R` (zero beyond 33 bytes).
     fn r_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         m: usize,
@@ -333,7 +330,7 @@ impl EcdasConstraints {
         s
     }
 
-    /// `S_i` for `relation` at limb `i` (twin of `ConvCarry::s_i`).
+    /// `S_i` for `relation` at limb `i`.
     fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,
@@ -385,7 +382,7 @@ impl EcdasConstraints {
         }
     }
 
-    /// `256·c_i − c_{i-1} − S_i` (twin of `ConvCarry::evaluate`).
+    /// `256·c_i − c_{i-1} − S_i`.
     fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,

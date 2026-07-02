@@ -129,7 +129,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// `epoch_label` is this epoch's 1-based label; it is the `fini_epoch` constant
 /// the fini token carries (not a trace column, since it's the same for every row).
 ///
-/// Uses `empty_constraints()` deliberately: the MU boolean (`MU·(1-MU)=0`), the
+/// Uses the `EmptyConstraints` set deliberately: the MU boolean (`MU·(1-MU)=0`), the
 /// column range checks, and the `init_epoch < fini_epoch` ordering are NOT
 /// re-asserted here. They are enforced once in the epoch proof's `l2g_memory_air`,
 /// and `verify_l2g_commitment_binding` ties this global L2G sub-table to the *same*
@@ -299,9 +299,9 @@ impl ContinuationProof {
 }
 
 /// Build an epoch's AIRs identically on the prove and verify sides — the single
-/// source of truth for the AIR set, so the two halves can never diverge. Mirrors
-/// the old integrated path: `VmAirs` (HALT included iff `is_final`), with REGISTER
-/// preprocessed to INIT = `register_init` and FINI = `reg_fini`. Continuation epochs
+/// source of truth for the AIR set, so the two halves can never diverge. The set
+/// is `VmAirs` (HALT included iff `is_final`), with REGISTER preprocessed to
+/// INIT = `register_init` and FINI = `reg_fini`. Continuation epochs
 /// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
 fn build_epoch_airs(

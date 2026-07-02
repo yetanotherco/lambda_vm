@@ -70,7 +70,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintS
 
 use super::templates::{INV_SHIFT_32, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta};
 
-/// `col_a · col_b = 0`. Twin of `ProductZeroConstraint`.
+/// `col_a · col_b = 0`.
 pub fn emit_product_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -86,8 +86,7 @@ pub fn product_zero_meta(idx: usize) -> ConstraintMeta {
     ConstraintMeta::base(idx, 2)
 }
 
-/// `(1 − MEMORY − BRANCH) · read_register2 · imm[i] = 0`. Twin of
-/// `Arg2ExclusiveConstraint`.
+/// `(1 − MEMORY − BRANCH) · read_register2 · imm[i] = 0`.
 pub fn emit_arg2_exclusive<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -106,8 +105,7 @@ pub fn arg2_exclusive_meta(idx: usize) -> ConstraintMeta {
     ConstraintMeta::base(idx, 3)
 }
 
-/// `(1 − MEMORY) · mem_flags · (1 − mem_flags) = 0`. Twin of
-/// `MemFlagsBitConstraint`.
+/// `(1 − MEMORY) · mem_flags · (1 − mem_flags) = 0`.
 pub fn emit_mem_flags_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -126,7 +124,7 @@ pub fn mem_flags_bit_meta(idx: usize) -> ConstraintMeta {
     ConstraintMeta::base(idx, 3)
 }
 
-/// `(1 − flag) · value = 0`. Twin of `RegNotReadIsZeroConstraint`.
+/// `(1 − flag) · value = 0`.
 pub fn emit_reg_not_read_is_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -144,8 +142,7 @@ pub fn reg_not_read_is_zero_meta(idx: usize) -> ConstraintMeta {
     ConstraintMeta::base(idx, 2)
 }
 
-/// `arg2` multiplex for word index `word_idx ∈ {0, 1}`. Twin of
-/// `Arg2Constraint`:
+/// `arg2` multiplex for word index `word_idx ∈ {0, 1}`:
 ///
 /// ```text
 /// arg2[i] − (MEMORY·imm[i] + BRANCH·rv2[i] + (1−MEMORY−BRANCH)·(rv2[i] + imm[i]))
@@ -174,13 +171,12 @@ pub fn emit_arg2<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 }
 
 /// Metadata for [`emit_arg2`] (degree 2 relies on the live `MEMORY·BRANCH = 0`
-/// mutex, as with the struct).
+/// mutex).
 pub fn arg2_meta(idx: usize) -> ConstraintMeta {
     ConstraintMeta::base(idx, 2)
 }
 
-/// `cast(res, DWordWL)` word from the four `res` halves (DWordHL); twin of
-/// [`res_word`].
+/// `cast(res, DWordWL)` word from the four `res` halves (DWordHL).
 fn res_word_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     high: bool,
@@ -193,8 +189,7 @@ fn res_word_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b.main(0, lo_col) + b.main(0, hi_col) * b.const_base(SHIFT_16)
 }
 
-/// `(1 − MEMORY − BRANCH) · (rvd[i] − cast(res, WL)[i]) = 0`. Twin of
-/// `RvdEqResConstraint`.
+/// `(1 − MEMORY − BRANCH) · (rvd[i] − cast(res, WL)[i]) = 0`.
 pub fn emit_rvd_eq_res<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -250,8 +245,7 @@ fn emit_pc_len_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensio
 }
 
 /// `BRANCH · carry · (1 − carry) = 0` for `rvd = pc + instruction_length`
-/// (two instances at `idx`, `idx + 1`). Twin of
-/// `BranchRvdConstraint::new_pair`.
+/// (two instances at `idx`, `idx + 1`).
 pub fn emit_branch_rvd_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -269,8 +263,7 @@ pub fn branch_rvd_meta(idx: usize) -> [ConstraintMeta; 2] {
     ]
 }
 
-/// `branch_cond − (BRANCH·JALR + BRANCH·(1−JALR)·res[0])`. Twin of
-/// `BranchCondConstraint`.
+/// `branch_cond − (BRANCH·JALR + BRANCH·(1−JALR)·res[0])`.
 pub fn emit_branch_cond<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -292,7 +285,6 @@ pub fn branch_cond_meta(idx: usize) -> ConstraintMeta {
 
 /// `(1 − branch_cond) · carry · (1 − carry) = 0` for
 /// `next_pc = pc + instruction_length` (two instances at `idx`, `idx + 1`).
-/// Twin of `NextPcAddConstraint::new_pair`.
 pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,

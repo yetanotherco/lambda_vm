@@ -273,10 +273,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
 //
-// Non-destructive twin of `create_constraints` above, written once against the
-// generic `ConstraintBuilder`. The old structs/builder stay as the differential
-// oracle; the final deletion phase removes them. Constraint indices 0..20
-// match `create_constraints(0)` exactly.
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..20.
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
