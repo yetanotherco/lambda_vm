@@ -2118,14 +2118,17 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG, q1[0..32].
+        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..32).
+        // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
+        // while the others are 32. Do NOT merge into a single loop — extending the
+        // loop bound would push q1[32] twice and break AreBytes bus balance.
         for i in 0..32 {
             out.push(is_byte_op(w.x2[i]));
             out.push(is_byte_op(w.q0[i]));
             out.push(is_byte_op(w.y_g[i]));
             out.push(is_byte_op(w.q1[i]));
         }
-        out.push(is_byte_op(w.q1[32]));
+        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, not covered by the loop above
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));

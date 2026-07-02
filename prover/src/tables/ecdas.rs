@@ -7,8 +7,9 @@
 //! and `next_op`. When `next_op = 1` it consumes the scalar bit at `round` on the `Bit`
 //! bus (an add follows). ECSM seeds and drains the bus; interior rows telescope.
 //!
-//! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
-//! to `r` and `op = 0`, which makes every relation hold with zero carries.
+//! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set quotients
+//! to 0 and `op = 1`. The `R·P` term in the λ and xR relations is gated with `μ`, so it
+//! vanishes on padding rows (μ=0) and all relations hold with zero carries.
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};

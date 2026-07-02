@@ -67,6 +67,13 @@ fn constraints_hold_on_generated_trace() {
             FE::zero(),
             "is_bit(mu) row {row}"
         );
+        for i in 0..256 {
+            assert_eq!(
+                IsBitConstraint::unconditional(cols::k_bit(i), 0).evaluate(&view),
+                FE::zero(),
+                "is_bit(k_bit[{i}]) row {row}"
+            );
+        }
         for i in 0..64 {
             for relation in [Relation::X2, Relation::Yg] {
                 let v = ConvCarry {
