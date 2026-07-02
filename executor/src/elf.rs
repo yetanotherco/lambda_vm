@@ -307,9 +307,13 @@ impl Elf {
             // convention into an enforced invariant.
             if program_header.p_memsz > 0 {
                 use crate::vm::memory::PRIVATE_INPUT_START_INDEX;
+                // `checked_add` (not saturating): an overflowing `p_vaddr + p_memsz` is a
+                // malformed segment and is rejected explicitly as `AddrTooLarge`, rather than
+                // saturating to `u64::MAX` and being reported under the wrong error.
                 let seg_end = program_header
                     .p_vaddr
-                    .saturating_add(program_header.p_memsz);
+                    .checked_add(program_header.p_memsz)
+                    .ok_or(ElfError::AddrTooLarge)?;
                 if seg_end > PRIVATE_INPUT_START_INDEX {
                     return Err(ElfError::SegmentInPrivateInputRegion);
                 }
@@ -322,7 +326,17 @@ impl Elf {
                     let len = remaining.min(WORD_SIZE);
                     let mut word = 0u32;
                     for j in 0..len {
-                        let offset = (program_header.p_offset + i + j) as usize;
+                        // `checked_add` (not plain `+`): `p_offset` is an unbounded file
+                        // offset, so `p_offset + i + j` could overflow — which would panic in
+                        // debug and silently wrap in release. In practice the monotonic
+                        // bounds check (`input.get` below) fires first, but don't rely on
+                        // evaluation order: reject an overflow explicitly.
+                        let offset = program_header
+                            .p_offset
+                            .checked_add(i)
+                            .and_then(|o| o.checked_add(j))
+                            .ok_or(ElfError::InvalidOffset)?
+                            as usize;
                         let byte = input.get(offset).ok_or(ElfError::InvalidOffset)?;
                         word |= (*byte as u32)
                             .checked_shl((j as u32).checked_mul(8).ok_or(ElfError::InvalidProgram)?)
@@ -624,6 +638,14 @@ mod tests {
             Elf::load(&elf),
             Err(ElfError::SegmentInPrivateInputRegion)
         ));
+    }
+
+    #[test]
+    fn rejects_segment_with_overflowing_vaddr_span() {
+        // p_vaddr + p_memsz overflows u64 → rejected explicitly as AddrTooLarge (not
+        // saturated to u64::MAX and mis-reported, and no panic/wrap).
+        let elf = minimal_elf_with_segment(0xFFFF_FFFF_FFFF_F000, 0x2000);
+        assert!(matches!(Elf::load(&elf), Err(ElfError::AddrTooLarge)));
     }
 
     #[test]
