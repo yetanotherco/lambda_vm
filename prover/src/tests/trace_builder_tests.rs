@@ -757,16 +757,14 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_constraint_counts() {
-        let (core_constraints, _) = keccak::create_constraints(0);
+        use stark::constraints::builder::ConstraintSet;
         assert_eq!(
-            core_constraints.len(),
+            keccak::KeccakConstraints.meta().len(),
             51,
             "KECCAK core: 25 ADD pairs + no-overflow"
         );
-
-        let (rnd_constraints, _) = keccak_rnd::create_constraints(0);
         assert_eq!(
-            rnd_constraints.len(),
+            keccak_rnd::KeccakRndConstraints.meta().len(),
             20,
             "KECCAK_RND: 20 IS_BIT(μ; Cxz_right_bit) per spec d75944ee"
         );

@@ -18,15 +18,11 @@
 //! virtual-carry checks remain µ-gated as before.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint};
+use crate::constraints::templates::INV_SHIFT_32;
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
@@ -583,10 +579,6 @@ pub fn ecdas_tuple(
     v
 }
 
-// =========================================================================
-// Constraints
-// =========================================================================
-
 /// Which convolution relation a carry constraint enforces.
 #[derive(Clone, Copy)]
 pub enum Relation {
@@ -596,126 +588,7 @@ pub enum Relation {
     Yg,
 }
 
-fn p_byte<F: IsField>(m: usize) -> FieldElement<F> {
-    if m < 32 {
-        FieldElement::from(P_BYTES[m] as u64)
-    } else {
-        FieldElement::zero()
-    }
-}
-
-/// Convolution carry constraint at limb `i`: `2^8·c_i − c_{i-1} − S_i = 0`, with `c_{-1} = 0`.
-/// Unconditional (degree 2); the only µ-gated term is the curve constant `µ·b` inside `S_i`
-/// for the yG relation at limb 0 (see [`ConvCarry::s_i`]).
-pub struct ConvCarry {
-    pub relation: Relation,
-    pub i: usize,
-    pub constraint_idx: usize,
-}
-
-impl ConvCarry {
-    fn s_i<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let i = self.i;
-        let col = |c: usize| -> FieldElement<F> { step.get_main_evaluation_element(0, c).clone() };
-        let byte = |base: usize, len: usize, j: usize| -> FieldElement<F> {
-            if j < len {
-                col(base + j)
-            } else {
-                FieldElement::zero()
-            }
-        };
-        let mut s = FieldElement::<F>::zero();
-        match self.relation {
-            Relation::X2 => {
-                // Σ xG_j·xG_{i-j} − x2_i − Σ q0_j·P_{i-j}
-                for j in 0..=i {
-                    s += byte(cols::XG, 32, j) * byte(cols::XG, 32, i - j);
-                    s = s - byte(cols::Q0, 32, j) * p_byte::<F>(i - j);
-                }
-                s = s - byte(cols::X2, 32, i);
-            }
-            Relation::Yg => {
-                // Σ (yG_j·yG_{i-j} + P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − b_i
-                for j in 0..=i {
-                    s += byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
-                    s += p_byte::<F>(j) * p_byte::<F>(i - j);
-                    s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
-                    s = s - byte(cols::Q1, 33, j) * p_byte::<F>(i - j);
-                }
-                if i == 0 {
-                    // Only the curve constant `b` is gated by `µ`: it vanishes on padding
-                    // (µ=0) and equals `b` on real rows (µ=1). `B` is the zero-extension of
-                    // `b`, so `B_i = 0` for i ≥ 1 — nothing to gate there. The rest of the
-                    // relation stays unconditional.
-                    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                    s = s - mu * FieldElement::<F>::from(B);
-                }
-            }
-        }
-        s
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
-    fn degree(&self) -> usize {
-        2 // degree-2 convolution; the only µ-gated term (µ·b) is degree 1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c_base = match self.relation {
-            Relation::X2 => cols::C0,
-            Relation::Yg => cols::C1,
-        };
-        let c_i = step.get_main_evaluation_element(0, c_base + self.i).clone();
-        let c_prev = if self.i == 0 {
-            FieldElement::<F>::zero()
-        } else {
-            step.get_main_evaluation_element(0, c_base + self.i - 1)
-                .clone()
-        };
-        FieldElement::<F>::from(256u64) * c_i - c_prev - self.s_i(step)
-    }
-}
-
-/// `col = 0` (unconditional, degree 1). Used for the closing `c_63 = 0`.
-pub struct ColIsZero {
-    pub col: usize,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
-    fn degree(&self) -> usize {
-        1
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        step.get_main_evaluation_element(0, self.col).clone()
-    }
-}
-
-/// The two 256-bit addition-overflow checks (`k < N` and `xR < p`), whose 8 word-carries
-/// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition
-/// must overflow `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
-/// `k < N` is `N + k_sub_N = k + 2^256` (with `k_sub_N = k − N mod 2^256`); `xR < p` is
-/// `p + xR_sub_p = xR + 2^256` (with `xR_sub_p = xR − p mod 2^256`).
+/// A range-check overflow addition: `p + xR_sub_p = xR + 2^256` (`k<N` / `xR<p`).
 #[derive(Clone, Copy)]
 pub enum OverflowKind {
     KLtN,
@@ -749,193 +622,6 @@ impl OverflowKind {
             OverflowKind::XrLtP => cols::XR,
         }
     }
-}
-
-/// Computes the 8 word-carries of the addition for `kind`.
-fn carry_chain<F, E>(kind: OverflowKind, step: &TableView<F, E>) -> [FieldElement<F>; 8]
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let inv = FieldElement::<F>::from(INV_SHIFT_32);
-    let hl = kind.addend_hl_base();
-    let bl = kind.sum_bl_base();
-    let mut c: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-    let mut prev = FieldElement::<F>::zero();
-    for (i, slot) in c.iter_mut().enumerate() {
-        // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
-        let addend1 = step.get_main_evaluation_element(0, hl + 2 * i).clone()
-            + step.get_main_evaluation_element(0, hl + 2 * i + 1).clone()
-                * FieldElement::<F>::from(1u64 << 16);
-        // sum word i (from bytes): Σ bl[4i+b]·2^{8b}
-        let mut sum = FieldElement::<F>::zero();
-        for b in 0..4 {
-            sum += step.get_main_evaluation_element(0, bl + 4 * i + b).clone()
-                * FieldElement::<F>::from(1u64 << (8 * b));
-        }
-        let addend0 = FieldElement::<F>::from(kind.const_word(i));
-        let ci = (addend0 + addend1 + prev.clone() - sum) * inv.clone();
-        *slot = ci.clone();
-        prev = ci;
-    }
-    c
-}
-
-/// `µ · c_i · (1 - c_i) = 0` for a virtual carry bit (degree 3, since `c_i` is linear).
-pub struct CarryBit {
-    pub kind: OverflowKind,
-    pub i: usize,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CarryBit {
-    fn degree(&self) -> usize {
-        3
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c = carry_chain(self.kind, step);
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let one = FieldElement::<F>::one();
-        mu * c[self.i].clone() * (one - c[self.i].clone())
-    }
-}
-
-/// `µ · (1 - c_7) = 0`: the top carry must be 1 (the addition overflows).
-pub struct OverflowRequired {
-    pub kind: OverflowKind,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequired {
-    fn degree(&self) -> usize {
-        2
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c = carry_chain(self.kind, step);
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        mu * (FieldElement::<F>::one() - c[7].clone())
-    }
-}
-
-/// Creates all ECSM transition constraints (148 total).
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-    let mut idx = constraint_idx_start;
-
-    // IS_BIT(mu)
-    constraints.push(IsBitConstraint::unconditional(cols::MU, idx).boxed());
-    idx += 1;
-
-    // x2 convolution: 64 carries + closing.
-    for i in 0..64 {
-        constraints.push(
-            ConvCarry {
-                relation: Relation::X2,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-    constraints.push(
-        ColIsZero {
-            col: cols::c0(63),
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-
-    // yG convolution: 64 carries + closing.
-    for i in 0..64 {
-        constraints.push(
-            ConvCarry {
-                relation: Relation::Yg,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-    constraints.push(
-        ColIsZero {
-            col: cols::c1(63),
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-
-    // IS_BIT(q1[32])
-    constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
-    idx += 1;
-
-    // k < N: 7 carry bits + overflow-required.
-    for i in 0..7 {
-        constraints.push(
-            CarryBit {
-                kind: OverflowKind::KLtN,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-    constraints.push(
-        OverflowRequired {
-            kind: OverflowKind::KLtN,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-
-    // xR < p: 7 carry bits + overflow-required.
-    for i in 0..7 {
-        constraints.push(
-            CarryBit {
-                kind: OverflowKind::XrLtP,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-    constraints.push(
-        OverflowRequired {
-            kind: OverflowKind::XrLtP,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-
-    (constraints, idx)
 }
 
 // =========================================================================
@@ -991,7 +677,7 @@ impl EcsmConstraints {
         }
     }
 
-    /// `S_i` for `relation` at limb `i` (twin of [`ConvCarry::s_i`]).
+    /// `S_i` for `relation` at limb `i` (twin of `ConvCarry::s_i`).
     fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,
@@ -1027,7 +713,7 @@ impl EcsmConstraints {
         s
     }
 
-    /// `256·c_i − c_{i-1} − S_i` (twin of [`ConvCarry::evaluate`]).
+    /// `256·c_i − c_{i-1} − S_i` (twin of `ConvCarry::evaluate`).
     fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,

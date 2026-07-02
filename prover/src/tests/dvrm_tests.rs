@@ -4,7 +4,7 @@ use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
 use crate::tables::dvrm::{
-    DvrmConstraints, DvrmOperation, bus_interactions, cols, dvrm_constraints, generate_dvrm_trace,
+    DvrmConstraints, DvrmOperation, bus_interactions, cols, generate_dvrm_trace,
 };
 use crate::tables::types::FE;
 use crate::test_utils::{
@@ -461,7 +461,8 @@ fn test_dvrm_air_wires_in_chip_constraints() {
         cols::NUM_COLUMNS,
         bus_interactions(),
     );
-    assert_eq!(in_chip, dvrm_constraints(0).0.len());
+    use stark::constraints::builder::ConstraintSet;
+    assert_eq!(in_chip, DvrmConstraints.meta().len());
 }
 
 /// Regression test for the `Msb16` LogUp over-send bug.

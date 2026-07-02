@@ -10,15 +10,10 @@
 //! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
 //! to `r` and `op = 0`, which makes every relation hold with zero carries.
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::IsBitConstraint;
 use crate::tables::ecsm::ecdas_tuple;
 use ecsm::{EcdasStep, P_BYTES};
 
@@ -255,265 +250,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out
 }
 
-// =========================================================================
-// Constraints
-// =========================================================================
-
-fn p_byte<F: IsField>(m: usize) -> FieldElement<F> {
-    if m < 32 {
-        FieldElement::from(P_BYTES[m] as u64)
-    } else {
-        FieldElement::zero()
-    }
-}
-
-fn r_byte<F: IsField>(m: usize) -> FieldElement<F> {
-    if m < 33 {
-        FieldElement::from(R_BYTES[m] as u64)
-    } else {
-        FieldElement::zero()
-    }
-}
-
+/// Which convolution relation an ECDAS carry constraint enforces.
 #[derive(Clone, Copy)]
 pub enum Relation {
     Lambda,
     Xr,
     Yr,
-}
-
-/// Unconditional convolution carry constraint at limb `i`: `2^8·c_i − c_{i-1} − S_i = 0`.
-pub struct ConvCarry {
-    pub relation: Relation,
-    pub i: usize,
-    pub constraint_idx: usize,
-}
-
-impl ConvCarry {
-    fn s_i<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let i = self.i;
-        let col = |c: usize| -> FieldElement<F> { step.get_main_evaluation_element(0, c).clone() };
-        // bytes (zero beyond the stored length)
-        let b = |base: usize, len: usize, j: usize| -> FieldElement<F> {
-            if j < len {
-                col(base + j)
-            } else {
-                FieldElement::zero()
-            }
-        };
-        let lam = |j: usize| b(cols::LAMBDA, 32, j);
-        let xg = |j: usize| b(cols::XG, 32, j);
-        let xa = |j: usize| b(cols::XA, 32, j);
-        let ya = |j: usize| b(cols::YA, 32, j);
-        let yg = |j: usize| b(cols::YG, 32, j);
-        let xr = |j: usize| b(cols::XR, 32, j);
-        let yr = |j: usize| b(cols::YR, 32, j);
-        let op = col(cols::OP);
-        let one = FieldElement::<F>::one();
-
-        // r·P − q·P convolution (shared structure across all three relations).
-        let rq = |qbase: usize| -> FieldElement<F> {
-            let mut s = FieldElement::<F>::zero();
-            for j in 0..=i {
-                s += (r_byte::<F>(j) - b(qbase, 33, j)) * p_byte::<F>(i - j);
-            }
-            s
-        };
-
-        match self.relation {
-            Relation::Lambda => {
-                // op·(Σ λ_j(xG-xA)_{i-j} + (yA_i - yG_i))
-                let mut op_branch = ya(i) - yg(i);
-                for j in 0..=i {
-                    op_branch += lam(j) * (xg(i - j) - xa(i - j));
-                }
-                // (1-op)·Σ (2 λ_j yA_{i-j} - 3 xA_j xA_{i-j})
-                let mut notop_branch = FieldElement::<F>::zero();
-                for j in 0..=i {
-                    notop_branch = notop_branch
-                        + FieldElement::<F>::from(2u64) * lam(j) * ya(i - j)
-                        - FieldElement::<F>::from(3u64) * xa(j) * xa(i - j);
-                }
-                op.clone() * op_branch + (one - op) * notop_branch + rq(cols::Q0)
-            }
-            Relation::Xr => {
-                // Σ λ_j λ_{i-j} − xA_i − xG_i − xR_i − (1-op)(xA_i − xG_i) + rq
-                let mut s = FieldElement::<F>::zero();
-                for j in 0..=i {
-                    s += lam(j) * lam(i - j);
-                }
-                s - xa(i) - xg(i) - xr(i) - (one - op) * (xa(i) - xg(i)) + rq(cols::Q1)
-            }
-            Relation::Yr => {
-                // Σ λ_j(xA-xR)_{i-j} − yA_i − yR_i + rq
-                let mut s = FieldElement::<F>::zero();
-                for j in 0..=i {
-                    s += lam(j) * (xa(i - j) - xr(i - j));
-                }
-                s - ya(i) - yr(i) + rq(cols::Q2)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
-    fn degree(&self) -> usize {
-        match self.relation {
-            Relation::Lambda => 3, // op · (λ · Δx)
-            Relation::Xr | Relation::Yr => 2,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c_base = match self.relation {
-            Relation::Lambda => cols::C0,
-            Relation::Xr => cols::C1,
-            Relation::Yr => cols::C2,
-        };
-        let c_i = step.get_main_evaluation_element(0, c_base + self.i).clone();
-        let c_prev = if self.i == 0 {
-            FieldElement::<F>::zero()
-        } else {
-            step.get_main_evaluation_element(0, c_base + self.i - 1)
-                .clone()
-        };
-        FieldElement::<F>::from(256u64) * c_i - c_prev - self.s_i(step)
-    }
-}
-
-/// `col = 0` (unconditional, degree 1). Used for the closing `c_63 = 0`.
-pub struct ColIsZero {
-    pub col: usize,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
-    fn degree(&self) -> usize {
-        1
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        step.get_main_evaluation_element(0, self.col).clone()
-    }
-}
-
-/// `a · b = 0` or `a · (1 - b) = 0` (degree 2).
-pub struct MulZero {
-    pub a: usize,
-    pub b: usize,
-    pub b_complement: bool,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZero {
-    fn degree(&self) -> usize {
-        2
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let a = step.get_main_evaluation_element(0, self.a).clone();
-        let b = step.get_main_evaluation_element(0, self.b).clone();
-        if self.b_complement {
-            a * (FieldElement::<F>::one() - b)
-        } else {
-            a * b
-        }
-    }
-}
-
-/// Creates all ECDAS transition constraints (200 total).
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-    let mut idx = constraint_idx_start;
-
-    // IS_BIT on μ, op and next_op (the spec range-checks op: ecdas:c:range_op).
-    for col in [cols::MU, cols::OP, cols::NEXT_OP] {
-        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
-        idx += 1;
-    }
-
-    // op · next_op = 0
-    constraints.push(
-        MulZero {
-            a: cols::OP,
-            b: cols::NEXT_OP,
-            b_complement: false,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-    // next_op · (1 - mu) = 0
-    constraints.push(
-        MulZero {
-            a: cols::NEXT_OP,
-            b: cols::MU,
-            b_complement: true,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
-
-    // λ, xR, yR convolution carries + closings.
-    for (relation, c_base) in [
-        (Relation::Lambda, cols::C0),
-        (Relation::Xr, cols::C1),
-        (Relation::Yr, cols::C2),
-    ] {
-        for i in 0..64 {
-            constraints.push(
-                ConvCarry {
-                    relation,
-                    i,
-                    constraint_idx: idx,
-                }
-                .boxed(),
-            );
-            idx += 1;
-        }
-        constraints.push(
-            ColIsZero {
-                col: c_base + 63,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-
-    (constraints, idx)
 }
 
 // =========================================================================
@@ -549,7 +291,7 @@ impl EcdasConstraints {
         }
     }
 
-    /// Byte `m` of `R` (zero beyond 33 bytes). Twin of [`r_byte`].
+    /// Byte `m` of `R` (zero beyond 33 bytes). Twin of `r_byte`.
     fn r_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         m: usize,
@@ -591,7 +333,7 @@ impl EcdasConstraints {
         s
     }
 
-    /// `S_i` for `relation` at limb `i` (twin of [`ConvCarry::s_i`]).
+    /// `S_i` for `relation` at limb `i` (twin of `ConvCarry::s_i`).
     fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,
@@ -643,7 +385,7 @@ impl EcdasConstraints {
         }
     }
 
-    /// `256·c_i − c_{i-1} − S_i` (twin of [`ConvCarry::evaluate`]).
+    /// `256·c_i − c_{i-1} − S_i` (twin of `ConvCarry::evaluate`).
     fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         relation: Relation,

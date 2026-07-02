@@ -3,9 +3,7 @@
 use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
-use crate::tables::lt::{
-    LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace, lt_constraints,
-};
+use crate::tables::lt::{LtConstraints, LtOperation, bus_interactions, cols, generate_lt_trace};
 use crate::tables::types::FE;
 use crate::test_utils::{busless_air, create_lt_air, in_chip_constraint_count, validate_busless};
 
@@ -208,9 +206,10 @@ fn test_lt_air_wires_in_chip_constraints() {
         cols::NUM_COLUMNS,
         bus_interactions(),
     );
-    assert_eq!(in_chip, lt_constraints(0).0.len());
+    use stark::constraints::builder::ConstraintSet;
+    assert_eq!(in_chip, LtConstraints.meta().len());
     // Carry0IsBit, Carry1IsBit, LtFormula, OutXorInvert, InvertIsBit, SignedIsBit.
-    assert_eq!(lt_constraints(0).0.len(), 6);
+    assert_eq!(LtConstraints.meta().len(), 6);
 }
 
 /// Enforcement (this branch's unified-ALU-bus layout): the bus consumes `out`,

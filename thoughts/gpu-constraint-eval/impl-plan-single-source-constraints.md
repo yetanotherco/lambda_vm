@@ -527,3 +527,36 @@ Notes:
 | Goldilocks residue constants | `prover/src/tables/types.rs:387-423` |
 | Example AIRs (to migrate) | `crypto/stark/src/examples/*.rs` (13 files) |
 | Bench harness | `scripts/bench_abba.sh` (runs on the bench server only) |
+
+## 9. Completion notes (engine switch, PR 2)
+
+The engine switch (§5.6) landed as: single-source LogUp (`LogUpLayout` +
+`emit_logup_constraints` + `logup_meta` in `lookup.rs`), `CpuConstraints`
+(`prover/src/constraints/cpu.rs`), the `AirWithBuses<F,E,B,PI,CS>` +
+`AIR`-trait rewiring, VM cross-verification (`scripts/cross_verify_vm.sh`,
+both directions green pre- and post-deletion), then the deletions.
+
+- **`AIR::constraint_program()` (Phase-4 GPU access path).** The flat
+  `ConstraintProgram<F,E>` is produced by `AirWithBuses::constraint_program()`,
+  lazily captured once and cached in a `OnceLock` (built by running the table's
+  `ConstraintSet::eval` + `emit_logup_constraints` through `CaptureBuilder`,
+  matching the folders' emission order/indexing exactly). The trait default
+  panics, so only capture-capable AIRs expose it; the verify/recursion path
+  never calls it (guest-safety, §5.7).
+- **`Op::Var.row` is provably 0.** Every capture leaf constructs
+  `Op::Var { row: 0, .. }` (both `IrBuilder::main/aux` and `CaptureBuilder`),
+  and nothing else writes `row`. The Phase-4 device encoding can drop the
+  `row` field entirely.
+- **No `stark/constraint-ir` feature on this branch.** Unlike the spike (which
+  gated an interpreter-as-prover hook behind that feature), this branch has no
+  such feature — the compiled folder is the only prover path and the
+  interpreter is exercised directly by the folder-vs-capture differential
+  tests. The §5.9.4 gate `--features stark/constraint-ir` is therefore N/A;
+  the default suites cover both the folder and interpreter paths.
+- **`VmAir` is now `Box<dyn AIR>`.** Each table's `AirWithBuses<..,CS>` is a
+  distinct concrete type once `CS` is a type parameter, so `VmAirs` stores the
+  heterogeneous per-table AIRs behind a trait object; `create_*_air` return the
+  concrete `AirWithBuses` (so `.with_name` / `.with_preprocessed` still chain)
+  and are boxed at `VmAirs` assembly. One virtual call per row per table into
+  the monomorphized folder — same shape as before, minus the 33 per-row inner
+  virtual calls.

@@ -26,12 +26,8 @@
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
-use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use std::collections::HashMap;
@@ -358,215 +354,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
-// =========================================================================
-
-/// BRANCH table conditional ADD constraint.
-///
-/// Implements two conditional ADD templates per the spec:
-/// - `ADD(pc, offset) = next_pc_unmasked` conditioned on `(1 - JALR)`
-/// - `ADD(register, offset) = next_pc_unmasked` conditioned on `JALR`
-///
-/// Each ADD template produces two carry IS_BIT constraints (carry_0 and carry_1),
-/// for a total of 4 constraints, all at degree 3:
-///   `cond * carry * (1 - carry) = 0`
-///
-/// The carries are computed from degree-1 operands (pc or register, not both),
-/// so carry is degree 1 and the full constraint is degree 3.
-pub struct BranchConstraint {
-    /// Unique constraint identifier
-    constraint_idx: usize,
-    /// Which constraint to check
-    kind: BranchConstraintKind,
-}
-
-/// Kind of BRANCH constraint.
-///
-/// Four variants: two carries × two conditions (pc-path and register-path).
-#[derive(Debug, Clone, Copy)]
-pub enum BranchConstraintKind {
-    /// `(1 - JALR) * carry_0_pc * (1 - carry_0_pc) = 0`
-    /// where carry_0_pc = (pc[0] + offset[0] - next_pc_unmasked[0]) / 2^32
-    PcCarry0IsBit,
-    /// `(1 - JALR) * carry_1_pc * (1 - carry_1_pc) = 0`
-    /// where carry_1_pc = (pc[1] + offset[1] + carry_0_pc - next_pc_unmasked[1]) / 2^32
-    PcCarry1IsBit,
-    /// `IS_BIT<JALR>`: `JALR * (1 - JALR) = 0` (spec defense-in-depth assumption)
-    JalrIsBit,
-    /// `JALR * carry_0_reg * (1 - carry_0_reg) = 0`
-    /// where carry_0_reg = (register[0] + offset[0] - next_pc_unmasked[0]) / 2^32
-    RegCarry0IsBit,
-    /// `JALR * carry_1_reg * (1 - carry_1_reg) = 0`
-    /// where carry_1_reg = (register[1] + offset[1] + carry_0_reg - next_pc_unmasked[1]) / 2^32
-    RegCarry1IsBit,
-}
-
-impl BranchConstraint {
-    /// Creates a new BRANCH constraint.
-    pub fn new(kind: BranchConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
-    }
-
-    /// Compute virtual next_pc_unmasked as DWordWL.
-    ///
-    /// next_pc_unmasked[0] = unmasked_low_byte + 2^8 * next_pc_low[1] + 2^16 * next_pc_high[0]
-    /// next_pc_unmasked[1] = next_pc_high[1] + 2^16 * next_pc_high[2]
-    fn compute_next_pc_unmasked<F, E>(step: &TableView<F, E>) -> (FieldElement<F>, FieldElement<F>)
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let unmasked_low_byte = step
-            .get_main_evaluation_element(0, cols::UNMASKED_LOW_BYTE)
-            .clone();
-        let next_pc_low_1 = step
-            .get_main_evaluation_element(0, cols::NEXT_PC_LOW_1)
-            .clone();
-        let next_pc_high_0 = step
-            .get_main_evaluation_element(0, cols::NEXT_PC_HIGH_0)
-            .clone();
-        let next_pc_high_1 = step
-            .get_main_evaluation_element(0, cols::NEXT_PC_HIGH_1)
-            .clone();
-        let next_pc_high_2 = step
-            .get_main_evaluation_element(0, cols::NEXT_PC_HIGH_2)
-            .clone();
-
-        let shift_8 = FieldElement::<F>::from(SHIFT_8);
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
-        let unmasked_0 =
-            &unmasked_low_byte + &next_pc_low_1 * &shift_8 + &next_pc_high_0 * &shift_16;
-        let unmasked_1 = &next_pc_high_1 + &next_pc_high_2 * &shift_16;
-
-        (unmasked_0, unmasked_1)
-    }
-
-    /// Compute carry_0 for a given base column pair.
-    ///
-    /// carry_0 = (base[0] + offset[0] - next_pc_unmasked[0]) / 2^32
-    fn compute_carry_0_for<F, E>(base_col_0: usize, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let base_0 = step.get_main_evaluation_element(0, base_col_0).clone();
-        let offset_0 = step.get_main_evaluation_element(0, cols::OFFSET_0).clone();
-        let (unmasked_0, _) = Self::compute_next_pc_unmasked(step);
-
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        (base_0 + offset_0 - unmasked_0) * inv_2_32
-    }
-
-    /// Compute carry_1 for a given base column pair.
-    ///
-    /// carry_1 = (base[1] + offset[1] + carry_0 - next_pc_unmasked[1]) / 2^32
-    fn compute_carry_1_for<F, E>(
-        base_col_0: usize,
-        base_col_1: usize,
-        step: &TableView<F, E>,
-    ) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let base_1 = step.get_main_evaluation_element(0, base_col_1).clone();
-        let offset_1 = step.get_main_evaluation_element(0, cols::OFFSET_1).clone();
-        let carry_0 = Self::compute_carry_0_for(base_col_0, step);
-        let (_, unmasked_1) = Self::compute_next_pc_unmasked(step);
-
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        (base_1 + offset_1 + carry_0 - unmasked_1) * inv_2_32
-    }
-
-    /// Compute the constraint value: `cond * carry * (1 - carry)`.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let jalr = step.get_main_evaluation_element(0, cols::JALR).clone();
-        let one = FieldElement::<F>::one();
-
-        match self.kind {
-            BranchConstraintKind::JalrIsBit => &jalr * (&one - &jalr),
-            BranchConstraintKind::PcCarry0IsBit => {
-                let cond = &one - &jalr;
-                let c = Self::compute_carry_0_for(cols::PC_0, step);
-                cond * &c * (&one - c)
-            }
-            BranchConstraintKind::PcCarry1IsBit => {
-                let cond = &one - &jalr;
-                let c = Self::compute_carry_1_for(cols::PC_0, cols::PC_1, step);
-                cond * &c * (&one - c)
-            }
-            BranchConstraintKind::RegCarry0IsBit => {
-                let cond = jalr;
-                let c = Self::compute_carry_0_for(cols::REGISTER_0, step);
-                cond * &c * (&one - c)
-            }
-            BranchConstraintKind::RegCarry1IsBit => {
-                let cond = jalr;
-                let c = Self::compute_carry_1_for(cols::REGISTER_0, cols::REGISTER_1, step);
-                cond * &c * (&one - c)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for BranchConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // JALR * (1 - JALR) = degree 2
-            BranchConstraintKind::JalrIsBit => 2,
-            // cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1) = degree 3
-            _ => 3,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the BRANCH table.
-///
-/// Returns 5 constraints (two conditional ADD templates × 2 carries each, plus
-/// the `IS_BIT<JALR>` defense-in-depth assumption):
-/// - PcCarry0IsBit:  `(1 - JALR) * carry_0 * (1 - carry_0) = 0`  (pc path)
-/// - PcCarry1IsBit:  `(1 - JALR) * carry_1 * (1 - carry_1) = 0`  (pc path)
-/// - RegCarry0IsBit: `JALR * carry_0 * (1 - carry_0) = 0`        (register path)
-/// - RegCarry1IsBit: `JALR * carry_1 * (1 - carry_1) = 0`        (register path)
-/// - JalrIsBit:      `JALR * (1 - JALR) = 0`
-pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut next = || {
-        let i = idx;
-        idx += 1;
-        i
-    };
-    let constraints = vec![
-        BranchConstraint::new(BranchConstraintKind::PcCarry0IsBit, next()),
-        BranchConstraint::new(BranchConstraintKind::PcCarry1IsBit, next()),
-        BranchConstraint::new(BranchConstraintKind::RegCarry0IsBit, next()),
-        BranchConstraint::new(BranchConstraintKind::RegCarry1IsBit, next()),
-        BranchConstraint::new(BranchConstraintKind::JalrIsBit, next()),
-    ];
-    (constraints, idx)
-}
-
-// =========================================================================
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
@@ -614,7 +401,7 @@ fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 }
 
 /// The BRANCH table's transition constraints as a single [`ConstraintSet`],
-/// mirroring [`branch_constraints`] index-for-index (5 constraints):
+/// mirroring `branch_constraints` index-for-index (5 constraints):
 /// - idx 0: `(1 − JALR)·carry_0·(1 − carry_0)` on the pc path (degree 3);
 /// - idx 1: `(1 − JALR)·carry_1·(1 − carry_1)` on the pc path (degree 3);
 /// - idx 2: `JALR·carry_0·(1 − carry_0)` on the register path (degree 3);

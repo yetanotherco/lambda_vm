@@ -4,7 +4,7 @@ use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
 use crate::tables::mul::{
-    MulConstraints, MulOperation, bus_interactions, cols, generate_mul_trace, mul_constraints,
+    MulConstraints, MulOperation, bus_interactions, cols, generate_mul_trace,
 };
 use crate::tables::types::FE;
 use crate::test_utils::{
@@ -339,10 +339,11 @@ fn test_mul_air_wires_in_chip_constraints() {
         cols::NUM_COLUMNS,
         bus_interactions(),
     );
-    assert_eq!(in_chip, mul_constraints(0).0.len());
+    use stark::constraints::builder::ConstraintSet;
+    assert_eq!(in_chip, MulConstraints.meta().len());
     // 2x SignedIsBit + LhsSign + RhsSign + 4x RawProduct (#644 added the two
     // SignedIsBit constraints that #652's count of 6 predated).
-    assert_eq!(mul_constraints(0).0.len(), 8);
+    assert_eq!(MulConstraints.meta().len(), 8);
 }
 
 /// Presence: every input halfword is range-checked via IS_HALFWORD senders, so a

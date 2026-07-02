@@ -21,19 +21,14 @@
 //! four range-checked halves is `0` iff `diff == 0` iff `a == b`), and
 //! `res = eq XOR invert`.
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{
-    AddConstraint, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-    new_is_bit_constraints,
+    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
 };
 
 // =========================================================================
@@ -250,92 +245,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
-// =========================================================================
-
-/// Enforces `res = eq XOR invert`, i.e. `res = eq + invert - 2*eq*invert`.
-pub struct EqXorConstraint {
-    constraint_idx: usize,
-}
-
-impl EqXorConstraint {
-    pub fn new(constraint_idx: usize) -> Self {
-        Self { constraint_idx }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for EqXorConstraint {
-    fn degree(&self) -> usize {
-        2 // eq * invert
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let res = step.get_main_evaluation_element(0, cols::RES).clone();
-        let eq = step.get_main_evaluation_element(0, cols::EQ).clone();
-        let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
-        let two = FieldElement::<F>::from(2u64);
-        // res - (eq + invert - 2*eq*invert)
-        res - (&eq + &invert - two * &eq * &invert)
-    }
-}
-
-/// Creates all transition constraints for the EQ table.
-///
-/// Returns the boxed constraints and the next available constraint index:
-/// - `ADD` template pair enforcing `b + diff = a` (i.e. `diff = a - b`);
-/// - `IS_BIT(invert)`;
-/// - `res = eq XOR invert`.
-pub fn eq_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut idx = constraint_idx_start;
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-
-    // diff = a - b, encoded as b + diff = a (unconditional).
-    let (add_lo, add_hi) = AddConstraint::new_pair(
-        vec![],
-        AddOperand::dword(cols::B_0),
-        AddOperand::from_dword_hl(cols::DIFF_0),
-        AddOperand::dword(cols::A_0),
-        idx,
-    );
-    idx += 2;
-    constraints.push(add_lo.boxed());
-    constraints.push(add_hi.boxed());
-
-    // IS_BIT(invert)
-    let (is_bit, next) = new_is_bit_constraints(&[cols::INVERT], idx);
-    idx = next;
-    for c in is_bit {
-        constraints.push(c.boxed());
-    }
-
-    // res = eq XOR invert
-    constraints.push(EqXorConstraint::new(idx).boxed());
-    idx += 1;
-
-    (constraints, idx)
-}
-
-// =========================================================================
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The EQ table's transition constraints as a single [`ConstraintSet`],
-/// mirroring [`eq_constraints`] index-for-index:
+/// The EQ table's transition constraints as a single [`ConstraintSet`]:
 /// - idx 0,1: `ADD` pair `b + diff = a` (unconditional);
 /// - idx 2:   `IS_BIT(invert)` (unconditional);
 /// - idx 3:   `res = eq XOR invert`.

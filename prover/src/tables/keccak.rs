@@ -16,17 +16,13 @@
 //! | mu             |    1 | Multiplicity flag                              |
 
 use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::{AddConstraint, AddOperand, INV_SHIFT_32};
+use crate::constraints::templates::{AddOperand, INV_SHIFT_32};
 
 // =========================================================================
 // Column indices
@@ -456,120 +452,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
-// =========================================================================
-
-struct KeccakAddressNoOverflowConstraint {
-    constraint_idx: usize,
-}
-
-impl KeccakAddressNoOverflowConstraint {
-    fn new(constraint_idx: usize) -> Self {
-        Self { constraint_idx }
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let addr_lo = step.get_main_evaluation_element(0, cols::addr(0)).clone()
-            + step.get_main_evaluation_element(0, cols::addr(1)) * FieldElement::<F>::from(256)
-            + step.get_main_evaluation_element(0, cols::addr(2)) * FieldElement::<F>::from(65536)
-            + step.get_main_evaluation_element(0, cols::addr(3))
-                * FieldElement::<F>::from(16777216);
-        let addr_hi = step.get_main_evaluation_element(0, cols::addr(4)).clone()
-            + step.get_main_evaluation_element(0, cols::addr(5)) * FieldElement::<F>::from(256)
-            + step.get_main_evaluation_element(0, cols::addr(6)) * FieldElement::<F>::from(65536)
-            + step.get_main_evaluation_element(0, cols::addr(7))
-                * FieldElement::<F>::from(16777216);
-
-        let ptr_lo = step
-            .get_main_evaluation_element(0, cols::state_ptr(24, 0))
-            .clone()
-            + step.get_main_evaluation_element(0, cols::state_ptr(24, 1))
-                * FieldElement::<F>::from(65536);
-        let ptr_hi = step
-            .get_main_evaluation_element(0, cols::state_ptr(24, 2))
-            .clone()
-            + step.get_main_evaluation_element(0, cols::state_ptr(24, 3))
-                * FieldElement::<F>::from(65536);
-
-        let inv_2_32 = FieldElement::<F>::from(INV_SHIFT_32);
-        let carry_0 = (addr_lo + FieldElement::<F>::from(192) - ptr_lo) * inv_2_32.clone();
-        let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
-        step.get_main_evaluation_element(0, cols::MU).clone() * carry_1
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension>
-    for KeccakAddressNoOverflowConstraint
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Create constraints for the KECCAK core chip.
-///
-/// Per spec (keccak:c:state_ptr): ADD template for each lane:
-///   state_ptr[lane] = addr + 8 * lane_idx
-///
-/// 25 lane pointers × 2 constraints per ADD + 1 top-lane no-overflow
-/// constraint = 51 constraints total.
-/// Conditional on mu (only real rows).
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(51);
-    let mut idx = constraint_idx_start;
-
-    // state_ptr[lane] = addr + 8*lane_idx
-    // addr is DWordBL (8 bytes), state_ptr is DWordHL (4 halfwords)
-    // ADD: lhs = addr (DWordBL→DWordWL), rhs = 8*lane_idx (constant), sum = state_ptr (DWordHL→DWordWL)
-    for lane_idx in 0..25 {
-        let offset = (lane_idx * 8) as i64;
-        let (c0, c1) = AddConstraint::new_pair(
-            vec![cols::MU], // conditional on mu
-            AddOperand::from_dword_bl(cols::ADDR),
-            AddOperand::constant(offset),
-            AddOperand::from_dword_hl(cols::state_ptr(lane_idx, 0)),
-            idx,
-        );
-        constraints.push(c0.boxed());
-        constraints.push(c1.boxed());
-        idx += 2;
-    }
-
-    constraints.push(KeccakAddressNoOverflowConstraint::new(idx).boxed());
-    idx += 1;
-
-    (constraints, idx)
-}
-
-// =========================================================================
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
 /// The KECCAK core table's transition constraints as a single [`ConstraintSet`],
-/// mirroring [`create_constraints`] index-for-index (51 constraints):
+/// mirroring `create_constraints` index-for-index (51 constraints):
 /// - idx 0-49: for `lane_idx ∈ 0..25`, the `ADD` carry pair (gated on `μ`)
 ///   enforcing `state_ptr[lane] = addr + 8·lane_idx` (`addr` DWordBL,
 ///   `state_ptr` DWordHL);

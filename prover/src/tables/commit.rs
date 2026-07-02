@@ -43,17 +43,13 @@
 //! - `count_decr_carry_0`: SUB template carry_0 for count_decr + 1 = count (degree 2)
 //! - `count_decr_carry_1`: SUB template carry_1 for count_decr + 1 = count (degree 2)
 //!
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
 use crate::constraints::templates::{
-    AddConstraint, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
+    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
 };
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
@@ -730,138 +726,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
-// =========================================================================
-
-/// Creates all constraints for the COMMIT table (8 total).
-///
-/// Returns constraint objects and the next available constraint index.
-///
-/// Constraints 0-2: IS_BIT for first, end, mu
-/// Constraint 3: (first + end) * (1 - mu) = 0
-/// Constraints 4-5: ADD template for address + 1 = address_incr (unconditional)
-/// Constraints 6-7: SUB template for count_decr + 1 = count (unconditional)
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(8);
-    let mut idx = constraint_idx_start;
-
-    // 0-2: IS_BIT for first, end, mu
-    let (is_bit_constraints, next) = crate::constraints::templates::new_is_bit_constraints(
-        &[cols::FIRST, cols::END, cols::MU],
-        idx,
-    );
-    for c in is_bit_constraints {
-        constraints.push(c.boxed());
-    }
-    idx = next;
-
-    // 3: (first + end) * (1 - mu) = 0
-    constraints.push(
-        (CommitConstraint {
-            kind: CommitConstraintKind::FirstOrEndImpliesMu,
-            constraint_idx: idx,
-        })
-        .boxed(),
-    );
-    idx += 1;
-
-    // 4-5: ADD template for address + 1 = address_incr (unconditional, degree 2)
-    // lhs = address (DWordWL), rhs = 1, sum = address_incr (DWordHL → DWordWL)
-    let (add_c0, add_c1) = AddConstraint::new_pair(
-        vec![], // unconditional
-        AddOperand::dword(cols::ADDRESS_0),
-        AddOperand::constant(1),
-        AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
-        idx,
-    );
-    constraints.push(add_c0.boxed());
-    constraints.push(add_c1.boxed());
-    idx += 2;
-
-    // 6-7: SUB template for count - 1 = count_decr (unconditional, degree 2)
-    // Expressed as ADD: count_decr + 1 = count
-    // lhs = count_decr (DWordHL → DWordWL), rhs = 1, sum = count (DWordWL)
-    let (sub_c0, sub_c1) = AddConstraint::new_pair(
-        vec![], // unconditional
-        AddOperand::from_dword_hl(cols::COUNT_DECR_0),
-        AddOperand::constant(1),
-        AddOperand::dword(cols::COUNT_0),
-        idx,
-    );
-    constraints.push(sub_c0.boxed());
-    constraints.push(sub_c1.boxed());
-    idx += 2;
-
-    (constraints, idx)
-}
-
-/// The kind of COMMIT-specific constraint (not covered by templates).
-#[derive(Debug, Clone, Copy)]
-enum CommitConstraintKind {
-    /// (first + end) * (1 - mu) = 0
-    FirstOrEndImpliesMu,
-}
-
-/// A constraint for the COMMIT table.
-struct CommitConstraint {
-    kind: CommitConstraintKind,
-    constraint_idx: usize,
-}
-
-impl CommitConstraint {
-    fn compute<F, E>(
-        &self,
-        step: &stark::table::TableView<F, E>,
-    ) -> math::field::element::FieldElement<F>
-    where
-        F: math::field::traits::IsSubFieldOf<E>,
-        E: math::field::traits::IsField,
-    {
-        let one = math::field::element::FieldElement::<F>::one();
-
-        match self.kind {
-            CommitConstraintKind::FirstOrEndImpliesMu => {
-                let first = step.get_main_evaluation_element(0, cols::FIRST).clone();
-                let end = step.get_main_evaluation_element(0, cols::END).clone();
-                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                // (first + end) * (1 - mu) = 0
-                (first + end) * (one - mu)
-            }
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-// =========================================================================
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
 /// The COMMIT table's transition constraints as a single [`ConstraintSet`],
-/// mirroring [`create_constraints`] index-for-index (8 constraints):
+/// mirroring `create_constraints` index-for-index (8 constraints):
 /// - idx 0-2: `IS_BIT` on `first`, `end`, `μ`;
 /// - idx 3:   `(first + end)·(1 − μ) = 0` (first/end ⇒ μ);
 /// - idx 4,5: `ADD` pair `address + 1 = address_incr` (unconditional);

@@ -434,27 +434,13 @@ fn test_bus_interactions_count() {
 
 #[test]
 fn test_constraints_count_and_indices() {
-    use crate::tables::commit::create_constraints;
-    let (constraints, next_idx) = create_constraints(0);
-    assert_eq!(constraints.len(), 8);
-    assert_eq!(next_idx, 8);
-
-    // Verify sequential indices
-    for (i, c) in constraints.iter().enumerate() {
-        assert_eq!(c.constraint_idx(), i);
+    use crate::tables::commit::CommitConstraints;
+    use stark::constraints::builder::ConstraintSet;
+    let meta = CommitConstraints.meta();
+    assert_eq!(meta.len(), 8);
+    // Dense, idx-ordered, all degree 2 (unconditional).
+    for (i, m) in meta.iter().enumerate() {
+        assert_eq!(m.constraint_idx, i);
+        assert_eq!(m.degree, 2);
     }
-
-    // All degree 2 (unconditional)
-    for c in &constraints {
-        assert_eq!(c.degree(), 2);
-    }
-}
-
-#[test]
-fn test_constraints_with_offset() {
-    use crate::tables::commit::create_constraints;
-    let (constraints, next_idx) = create_constraints(10);
-    assert_eq!(next_idx, 18);
-    assert_eq!(constraints[0].constraint_idx(), 10);
-    assert_eq!(constraints[7].constraint_idx(), 17);
 }

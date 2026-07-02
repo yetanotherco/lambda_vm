@@ -2,14 +2,37 @@
 //! sign-extension / register-zero constraints.
 
 use crate::tables::cpu32::{
-    Cpu32Constraint, Cpu32ConstraintKind, Cpu32Operation, bus_interactions, cols,
-    generate_cpu32_trace,
+    Cpu32Constraints, Cpu32Operation, bus_interactions, cols, generate_cpu32_trace,
 };
 use crate::tables::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, alu_op, build_alu_flags,
 };
-use stark::constraints::transition::TransitionConstraint;
+use math::field::element::FieldElement;
+use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+use stark::frame::Frame;
+use stark::lookup::PackingShifts;
 use stark::table::TableView;
+use stark::traits::TransitionEvaluationContext;
+
+/// Evaluate the CPU32 [`ConstraintSet`] on one main row, returning every
+/// base-field constraint value (the compiled prover folder path).
+fn eval_cpu32(row: &[FE]) -> Vec<FE> {
+    let n = Cpu32Constraints.meta().len();
+    let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![TableView::new(
+        vec![row.to_vec()],
+        vec![vec![]],
+    )]);
+    let shifts = PackingShifts::<GoldilocksField>::new();
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(&frame, &[], &no_e, &no_e, &offset_e, &shifts);
+    let mut base = vec![FE::zero(); n];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+    Cpu32Constraints.eval(&mut folder);
+    base
+}
 
 #[test]
 fn test_aux_signed_input_extension() {
@@ -124,13 +147,6 @@ fn test_trace_layout() {
     assert_eq!(row[cols::MU], FE::from(1u64));
 }
 
-/// Build a single-row `TableView` from a CPU32 trace generated for `op`.
-fn view_for(op: Cpu32Operation) -> TableView<GoldilocksField, GoldilocksExtension> {
-    let trace = generate_cpu32_trace(&[op]);
-    let row = trace.main_table.get_row(0).to_vec();
-    TableView::new(vec![row], vec![vec![]])
-}
-
 #[test]
 fn test_ext_and_regzero_constraints_hold_on_valid_row() {
     // A signed word op via the immediate path (read_register2 = 0, rv2 = 0).
@@ -148,36 +164,13 @@ fn test_ext_and_regzero_constraints_hold_on_valid_row() {
         half_instruction_length: 2,
         ..Default::default()
     };
-    let view = view_for(op);
+    let trace = generate_cpu32_trace(&[op]);
+    let row = trace.main_table.get_row(0).to_vec();
 
-    // All sign-extension arithmetic constraints evaluate to zero.
-    for kind in [
-        Cpu32ConstraintKind::Arg1Lo,
-        Cpu32ConstraintKind::Arg1Hi,
-        Cpu32ConstraintKind::Arg2Lo,
-        Cpu32ConstraintKind::Arg2Hi,
-        Cpu32ConstraintKind::RvdLo,
-        Cpu32ConstraintKind::RvdHi,
-    ] {
-        let c = Cpu32Constraint::new(kind, 0);
-        assert_eq!(c.evaluate(&view), FE::zero(), "{kind:?} must hold");
-    }
-
-    // Register-zero checks: read_register1=1 ⇒ trivially 0; read_register2=0 with rv2=0 ⇒ 0.
-    for (read_col, value_col) in [
-        (cols::READ_REGISTER1, cols::RV1_0),
-        (cols::READ_REGISTER1, cols::RV1_1),
-        (cols::READ_REGISTER2, cols::RV2_0),
-        (cols::READ_REGISTER2, cols::RV2_1),
-    ] {
-        let c = Cpu32Constraint::new(
-            Cpu32ConstraintKind::RegZero {
-                read_col,
-                value_col,
-            },
-            0,
-        );
-        assert_eq!(c.evaluate(&view), FE::zero());
+    // Every CPU32 constraint (sign-extension arithmetic + register-zero checks)
+    // holds on the valid row.
+    for (i, v) in eval_cpu32(&row).iter().enumerate() {
+        assert_eq!(*v, FE::zero(), "constraint {i} must hold on a valid row");
     }
 }
 
@@ -195,37 +188,26 @@ fn test_constraints_catch_corruption() {
     };
     let trace = generate_cpu32_trace(&[op]);
 
-    // Corrupt arg1[1] (the sign-extended high word) → Arg1Hi must fire.
+    // Corrupt arg1[1] (the sign-extended high word) → some constraint must fire.
     let mut row = trace.main_table.get_row(0).to_vec();
     row[cols::ARG1_1] += FE::one();
-    let bad: TableView<GoldilocksField, GoldilocksExtension> =
-        TableView::new(vec![row], vec![vec![]]);
-    let c = Cpu32Constraint::new(Cpu32ConstraintKind::Arg1Hi, 0);
-    assert_ne!(
-        c.evaluate(&bad),
-        FE::zero(),
-        "Arg1Hi should catch a bad arg1[1]"
+    assert!(
+        eval_cpu32(&row).iter().any(|v| *v != FE::zero()),
+        "a corrupted arg1[1] must break some constraint"
     );
 
-    // read_register1 = 1 but a non-zero unread half would only matter when 0;
-    // instead corrupt with read=0 case: a value present while read flag cleared.
+    // A non-zero unread register value (read_register2 = 0, rv2 ≠ 0) must fire
+    // the register-zero check.
     let op2 = Cpu32Operation {
         rv2: 0x1234,           // non-zero
         read_register2: false, // but flagged unread
         ..Default::default()
     };
-    let view2 = view_for(op2);
-    let c2 = Cpu32Constraint::new(
-        Cpu32ConstraintKind::RegZero {
-            read_col: cols::READ_REGISTER2,
-            value_col: cols::RV2_0,
-        },
-        0,
-    );
-    assert_ne!(
-        c2.evaluate(&view2),
-        FE::zero(),
-        "RegZero should catch rv2≠0 when unread"
+    let trace2 = generate_cpu32_trace(&[op2]);
+    let row2 = trace2.main_table.get_row(0).to_vec();
+    assert!(
+        eval_cpu32(&row2).iter().any(|v| *v != FE::zero()),
+        "rv2≠0 while unread must break some constraint"
     );
 }
 

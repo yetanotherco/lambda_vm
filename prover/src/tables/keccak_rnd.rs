@@ -30,7 +30,6 @@
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -898,48 +897,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
-// =========================================================================
-
-/// KECCAK_RND polynomial constraints: 20 IS_BIT(μ; Cxz_right) constraints.
-///
-/// Per spec d75944ee, `Cxz_right` is typed `[Bit, 4], 5` and range-checked via
-/// IS_BIT polynomial constraints (kind="template", cond="μ"), not lookups:
-///   μ * Cxz_right[x][hw] * (1 - Cxz_right[x][hw]) = 0
-///
-/// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
-/// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
-///
-/// All other checks (XOR, AND, HWSL, ARE_BYTES, IS_HALF, KECCAK, KECCAK_RC) are
-/// enforced via bus interactions against the BITWISE/KECCAK_RC chips.
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    use crate::constraints::templates::IsBitConstraint;
-
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(20);
-    let mut idx = constraint_idx_start;
-    for x in 0..5 {
-        for hw in 0..4 {
-            constraints
-                .push(IsBitConstraint::new(cols::MU, cols::cxz_right_bit(x, hw), idx).boxed());
-            idx += 1;
-        }
-    }
-    (constraints, idx)
-}
-
-// =========================================================================
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
 /// The KECCAK round table's transition constraints as a single
-/// [`ConstraintSet`], mirroring [`create_constraints`] index-for-index (20
+/// [`ConstraintSet`], mirroring `create_constraints` index-for-index (20
 /// constraints): for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
 /// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
 pub struct KeccakRndConstraints;

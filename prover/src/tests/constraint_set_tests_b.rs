@@ -1,25 +1,18 @@
-//! Differential tests for the per-table [`ConstraintSet`] single-body
-//! conversions (PR B, group B tables).
+//! Folder-vs-capture-interpret regression tests for the per-table
+//! [`ConstraintSet`] single bodies (group B tables).
 //!
-//! Each converted table exposes a new `XxxConstraints: ConstraintSet` whose
-//! `meta()`/`eval()` must reproduce, index-for-index, the OLD boxed builder
-//! function (`eq_constraints`, `store_constraints`, …) that still lives in the
-//! same file as the differential oracle. For every table we assert, on
-//! [`TRIALS`] random rows (off-trace points, where a weakened or slipped
-//! transcription diverges with overwhelming probability):
-//!
-//! 1. `ProverEvalFolder` output == old `evaluate_prover` (base field);
-//! 2. `VerifierEvalFolder` output == old `evaluate_verifier` (extension);
-//! 3. `CaptureBuilder` → flatten → `eval_program_base` == old `evaluate_prover`;
-//!
-//! plus meta parity vs the old boxed objects (count, `num_base`, and per-idx
-//! degree / period / offset / exemptions_period / periodic_exemptions_offset /
-//! end_exemptions), and tree-measured degree (`CaptureBuilder::finish`) ==
-//! declared `meta.degree`.
+//! Each table's single `eval` body is exercised three ways — the
+//! `ProverEvalFolder` (base), the `VerifierEvalFolder` (extension), and the
+//! `CaptureBuilder` → flat IR → `eval_program_base` interpreter — and we assert
+//! they agree on [`TRIALS`] random off-trace rows. All three derive from the
+//! ONE body, so this pins that capture/interpretation stays faithful to the
+//! compiled folder (the GPU/interpreter path a divergence would silently break).
+//! We also assert the meta invariants (dense, idx-ordered, all-base) and that
+//! each root's tree-measured degree equals its declared `meta.degree`.
 //!
 //! All group-B tables read the current row only (offset 0) and are entirely
 //! base-field, so `eval_program_base` (single `main_row`, row 0) is the
-//! interpreter oracle.
+//! interpreter entry point.
 
 use math::field::element::FieldElement;
 use stark::constraint_ir::eval_program_base;
@@ -27,7 +20,6 @@ use stark::constraints::builder::{
     CaptureBuilder, ConstraintSet, ProverEvalFolder, RootKind, VerifierEvalFolder,
     num_base_from_meta,
 };
-use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::frame::Frame;
 use stark::lookup::PackingShifts;
 use stark::table::TableView;
@@ -53,20 +45,19 @@ impl SplitMix64 {
     }
 }
 
-/// The OLD boxed constraint builder result, used as the differential oracle.
-type OldVec = Vec<Box<dyn TransitionConstraintEvaluator<Gl, Gl3>>>;
-
-/// Run the full three-way differential + meta-parity check for one table.
+/// Run the folder-vs-capture-interpret differential + meta invariants for one
+/// table's [`ConstraintSet`]. All three interpretations derive from the ONE
+/// single-source body, so agreement across them (on random off-trace rows) is a
+/// permanent regression guard that capture/interpretation stays faithful to the
+/// compiled folder.
 ///
-/// * `old` — the OLD boxed constraints built at `idx_start = 0`.
-/// * `set` — the NEW [`ConstraintSet`].
+/// * `set` — the table's [`ConstraintSet`].
 /// * `num_cols` — the table's `cols::NUM_COLUMNS`.
-fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, num_cols: usize) {
-    let n = old.len();
+fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usize) {
     let meta = set.meta();
+    let n = meta.len();
 
-    // --- count / meta parity vs the old boxed objects ---
-    assert_eq!(meta.len(), n, "[{label}] constraint count");
+    // --- meta invariants: dense, idx-ordered, all-base (group-B tables). ---
     assert_eq!(
         num_base_from_meta(&meta),
         n,
@@ -75,27 +66,6 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
         assert_eq!(m.kind, RootKind::Base, "[{label}] meta kind {i}");
-        // The old boxed objects expose their idx and zerofier params directly.
-        let o = &old[i];
-        assert_eq!(o.constraint_idx(), i, "[{label}] old idx {i} out of order");
-        assert_eq!(m.degree, o.degree(), "[{label}] degree {i}");
-        assert_eq!(m.period, o.period(), "[{label}] period {i}");
-        assert_eq!(m.offset, o.offset(), "[{label}] offset {i}");
-        assert_eq!(
-            m.exemptions_period,
-            o.exemptions_period(),
-            "[{label}] exemptions_period {i}"
-        );
-        assert_eq!(
-            m.periodic_exemptions_offset,
-            o.periodic_exemptions_offset(),
-            "[{label}] periodic_exemptions_offset {i}"
-        );
-        assert_eq!(
-            m.end_exemptions,
-            o.end_exemptions(),
-            "[{label}] end_exemptions {i}"
-        );
     }
 
     // --- capture once; tree-measured degree == declared ---
@@ -123,39 +93,7 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
         let row: Vec<FE> = (0..num_cols).map(|_| FE::from(rng.next_u64())).collect();
         let row_e: Vec<Fp3> = row.iter().map(|x| x.to_extension()).collect();
 
-        // --- OLD oracle: prover (base) + verifier (ext) evaluations ---
-        let old_frame =
-            Frame::<Gl, Gl3>::new(vec![TableView::new(vec![row.clone()], vec![vec![]])]);
-        let old_ctx = TransitionEvaluationContext::new_prover(
-            &old_frame,
-            &no_periodic,
-            &no_ch,
-            &no_ch,
-            &offset_e,
-            &shifts,
-        );
-        let mut old_base = vec![FE::zero(); n];
-        let mut old_ext_p = vec![Fp3::zero(); n];
-        for c in old.iter() {
-            c.evaluate_prover(&old_ctx, &mut old_base, &mut old_ext_p);
-        }
-
-        let old_frame_e =
-            Frame::<Gl3, Gl3>::new(vec![TableView::new(vec![row_e.clone()], vec![vec![]])]);
-        let old_vctx = TransitionEvaluationContext::<Gl, Gl3>::new_verifier(
-            &old_frame_e,
-            &no_periodic_e,
-            &no_ch,
-            &no_ch,
-            &offset_e,
-            &vshifts,
-        );
-        let mut old_ext_v = vec![Fp3::zero(); n];
-        for c in old.iter() {
-            c.evaluate_verifier(&old_vctx, &mut old_ext_v);
-        }
-
-        // --- 1. ProverEvalFolder == old evaluate_prover (base) ---
+        // --- ProverEvalFolder (base) ---
         let frame = Frame::<Gl, Gl3>::new(vec![TableView::new(vec![row.clone()], vec![vec![]])]);
         let ctx = TransitionEvaluationContext::new_prover(
             &frame,
@@ -170,14 +108,8 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
         let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
         set.eval(&mut folder);
         folder.assert_all_emitted();
-        for (i, (got, want)) in base_out.iter().zip(old_base.iter()).enumerate() {
-            assert_eq!(
-                got, want,
-                "[{label}] prover folder mismatch, constraint {i}, trial {trial}"
-            );
-        }
 
-        // --- 2. VerifierEvalFolder == old evaluate_verifier (ext) ---
+        // --- VerifierEvalFolder (ext) ---
         let frame_e =
             Frame::<Gl3, Gl3>::new(vec![TableView::new(vec![row_e.clone()], vec![vec![]])]);
         let vctx = TransitionEvaluationContext::<Gl, Gl3>::new_verifier(
@@ -192,15 +124,19 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
         let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
         set.eval(&mut vfolder);
         vfolder.assert_all_emitted();
-        for (i, (got, want)) in vext_out.iter().zip(old_ext_v.iter()).enumerate() {
+
+        // Prover folder (promoted) == verifier folder: the same body over the
+        // same row in base vs extension must agree.
+        for (i, (b, v)) in base_out.iter().zip(vext_out.iter()).enumerate() {
             assert_eq!(
-                got, want,
-                "[{label}] verifier folder mismatch, constraint {i}, trial {trial}"
+                &b.to_extension(),
+                v,
+                "[{label}] prover-vs-verifier folder mismatch, constraint {i}, trial {trial}"
             );
         }
 
-        // --- 3. capture → flatten → interpret == old evaluate_prover (base) ---
-        for (i, want) in old_base.iter().enumerate() {
+        // --- capture → flatten → interpret == ProverEvalFolder (base) ---
+        for (i, want) in base_out.iter().enumerate() {
             assert_eq!(
                 &eval_program_base(&prog, i, &row),
                 want,
@@ -216,12 +152,11 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, old: &OldVec, set: &CS, 
 
 mod eq {
     use super::*;
-    use crate::tables::eq::{EqConstraints, cols, eq_constraints};
+    use crate::tables::eq::{EqConstraints, cols};
 
     #[test]
-    fn eq_constraint_set_matches_old() {
-        let (old, _) = eq_constraints(0);
-        check_table("eq", &old, &EqConstraints, cols::NUM_COLUMNS);
+    fn eq_constraint_set_folder_capture_agree() {
+        check_table("eq", &EqConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -231,12 +166,11 @@ mod eq {
 
 mod store {
     use super::*;
-    use crate::tables::store::{StoreConstraints, cols, store_constraints};
+    use crate::tables::store::{StoreConstraints, cols};
 
     #[test]
-    fn store_constraint_set_matches_old() {
-        let (old, _) = store_constraints(0);
-        check_table("store", &old, &StoreConstraints, cols::NUM_COLUMNS);
+    fn store_constraint_set_folder_capture_agree() {
+        check_table("store", &StoreConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -246,12 +180,11 @@ mod store {
 
 mod memw {
     use super::*;
-    use crate::tables::memw::{MemwConstraints, cols, constraints};
+    use crate::tables::memw::{MemwConstraints, cols};
 
     #[test]
-    fn memw_constraint_set_matches_old() {
-        let old = constraints();
-        check_table("memw", &old, &MemwConstraints, cols::NUM_COLUMNS);
+    fn memw_constraint_set_folder_capture_agree() {
+        check_table("memw", &MemwConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -261,17 +194,11 @@ mod memw {
 
 mod memw_aligned {
     use super::*;
-    use crate::tables::memw_aligned::{MemwAlignedConstraints, cols, constraints};
+    use crate::tables::memw_aligned::{MemwAlignedConstraints, cols};
 
     #[test]
-    fn memw_aligned_constraint_set_matches_old() {
-        let old = constraints();
-        check_table(
-            "memw_aligned",
-            &old,
-            &MemwAlignedConstraints,
-            cols::NUM_COLUMNS,
-        );
+    fn memw_aligned_constraint_set_folder_capture_agree() {
+        check_table("memw_aligned", &MemwAlignedConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -281,17 +208,11 @@ mod memw_aligned {
 
 mod memw_register {
     use super::*;
-    use crate::tables::memw_register::{MemwRegisterConstraints, cols, constraints};
+    use crate::tables::memw_register::{MemwRegisterConstraints, cols};
 
     #[test]
-    fn memw_register_constraint_set_matches_old() {
-        let old = constraints();
-        check_table(
-            "memw_register",
-            &old,
-            &MemwRegisterConstraints,
-            cols::NUM_COLUMNS,
-        );
+    fn memw_register_constraint_set_folder_capture_agree() {
+        check_table("memw_register", &MemwRegisterConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -301,16 +222,11 @@ mod memw_register {
 
 mod branch {
     use super::*;
-    use crate::tables::branch::{BranchConstraints, branch_constraints, cols};
-    use stark::constraints::transition::TransitionConstraint;
+    use crate::tables::branch::{BranchConstraints, cols};
 
     #[test]
-    fn branch_constraint_set_matches_old() {
-        // `branch_constraints` returns unboxed `BranchConstraint`s; box them
-        // for the differential oracle.
-        let (old_structs, _) = branch_constraints(0);
-        let old: OldVec = old_structs.into_iter().map(|c| c.boxed()).collect();
-        check_table("branch", &old, &BranchConstraints, cols::NUM_COLUMNS);
+    fn branch_constraint_set_folder_capture_agree() {
+        check_table("branch", &BranchConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -320,12 +236,11 @@ mod branch {
 
 mod commit {
     use super::*;
-    use crate::tables::commit::{CommitConstraints, cols, create_constraints};
+    use crate::tables::commit::{CommitConstraints, cols};
 
     #[test]
-    fn commit_constraint_set_matches_old() {
-        let (old, _) = create_constraints(0);
-        check_table("commit", &old, &CommitConstraints, cols::NUM_COLUMNS);
+    fn commit_constraint_set_folder_capture_agree() {
+        check_table("commit", &CommitConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -335,12 +250,11 @@ mod commit {
 
 mod keccak {
     use super::*;
-    use crate::tables::keccak::{KeccakConstraints, cols, create_constraints};
+    use crate::tables::keccak::{KeccakConstraints, cols};
 
     #[test]
-    fn keccak_constraint_set_matches_old() {
-        let (old, _) = create_constraints(0);
-        check_table("keccak", &old, &KeccakConstraints, cols::NUM_COLUMNS);
+    fn keccak_constraint_set_folder_capture_agree() {
+        check_table("keccak", &KeccakConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -350,12 +264,11 @@ mod keccak {
 
 mod keccak_rnd {
     use super::*;
-    use crate::tables::keccak_rnd::{KeccakRndConstraints, cols, create_constraints};
+    use crate::tables::keccak_rnd::{KeccakRndConstraints, cols};
 
     #[test]
-    fn keccak_rnd_constraint_set_matches_old() {
-        let (old, _) = create_constraints(0);
-        check_table("keccak_rnd", &old, &KeccakRndConstraints, cols::NUM_COLUMNS);
+    fn keccak_rnd_constraint_set_folder_capture_agree() {
+        check_table("keccak_rnd", &KeccakRndConstraints, cols::NUM_COLUMNS);
     }
 }
 
@@ -365,43 +278,27 @@ mod keccak_rnd {
 
 mod cpu32 {
     use super::*;
-    use crate::tables::cpu32::{Cpu32Constraints, cols, cpu32_constraints};
+    use crate::tables::cpu32::{Cpu32Constraints, cols};
 
     #[test]
-    fn cpu32_constraint_set_matches_old() {
-        let (old, _) = cpu32_constraints(0);
-        check_table("cpu32", &old, &Cpu32Constraints, cols::NUM_COLUMNS);
+    fn cpu32_constraint_set_folder_capture_agree() {
+        check_table("cpu32", &Cpu32Constraints, cols::NUM_COLUMNS);
     }
 }
 
 // =============================================================================
-// cpu.rs (constraints/cpu.rs — assembled by create_all_cpu_constraints, never
-// a prover/src/tables/*.rs conversion)
+// cpu.rs (CpuConstraints lives in constraints/cpu.rs, not a
+// prover/src/tables/*.rs conversion)
 // =============================================================================
 
 mod cpu {
     use super::*;
-    use crate::constraints::cpu::{
-        CpuConstraints, NUM_CPU_CONSTRAINTS, create_all_cpu_constraints,
-    };
+    use crate::constraints::cpu::{CpuConstraints, NUM_CPU_CONSTRAINTS};
     use crate::tables::cpu::cols;
-    use stark::constraints::transition::TransitionConstraint;
 
     #[test]
-    fn cpu_constraint_set_matches_old() {
-        // create_all_cpu_constraints returns (is_bit, add, other, next) with
-        // idx 0..11, 12..15, 16..38 respectively — concatenate in that order so
-        // the boxed oracle is dense and idx-ordered.
-        let (is_bit, add, other, next) = create_all_cpu_constraints();
-        assert_eq!(next, NUM_CPU_CONSTRAINTS);
-        let mut old: OldVec = Vec::with_capacity(NUM_CPU_CONSTRAINTS);
-        for c in is_bit {
-            old.push(c.boxed());
-        }
-        for c in add {
-            old.push(c.boxed());
-        }
-        old.extend(other);
-        check_table("cpu", &old, &CpuConstraints, cols::NUM_COLUMNS);
+    fn cpu_constraint_set_folder_capture_agree() {
+        assert_eq!(CpuConstraints.meta().len(), NUM_CPU_CONSTRAINTS);
+        check_table("cpu", &CpuConstraints, cols::NUM_COLUMNS);
     }
 }

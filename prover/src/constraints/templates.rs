@@ -11,10 +11,6 @@
 //!   - lhs, rhs, sum: DWordWL (2 × 32-bit words)
 //!   - Embeds carry constraints inline
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::{constraints::transition::TransitionConstraint, table::TableView};
-
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
 // =========================================================================
@@ -28,84 +24,6 @@ pub const SHIFT_32: u64 = 1u64 << 32;
 /// Avoids ~72 multiplications per inv() call in constraint hot loops.
 /// Verify: INV_SHIFT_32 * SHIFT_32 ≡ 1 (mod p)
 pub const INV_SHIFT_32: u64 = 18446744065119617026;
-
-/// 2^(-32) in the field, used for carry extraction.
-#[inline]
-fn inv_2_32<F: IsField>() -> FieldElement<F> {
-    FieldElement::from(INV_SHIFT_32)
-}
-
-// =========================================================================
-// IS_BIT Template
-// =========================================================================
-
-/// Enforces that a value is binary (0 or 1).
-///
-/// Two modes:
-/// - Conditional: `cond * X * (1-X) = 0` (degree 3)
-/// - Unconditional: `X * (1-X) = 0` (degree 2)
-pub struct IsBitConstraint {
-    /// Column index for the condition (None = unconditional)
-    cond_col: Option<usize>,
-    /// Column index for the value to check (X)
-    value_col: usize,
-    /// Unique constraint identifier
-    constraint_idx: usize,
-}
-
-impl IsBitConstraint {
-    /// Creates a conditional IS_BIT constraint.
-    ///
-    /// Constraint: `cond * X * (1-X) = 0`
-    pub fn new(cond_col: usize, value_col: usize, constraint_idx: usize) -> Self {
-        Self {
-            cond_col: Some(cond_col),
-            value_col,
-            constraint_idx,
-        }
-    }
-
-    /// Creates an unconditional IS_BIT constraint.
-    ///
-    /// Constraint: `X * (1-X) = 0`
-    pub fn unconditional(value_col: usize, constraint_idx: usize) -> Self {
-        Self {
-            cond_col: None,
-            value_col,
-            constraint_idx,
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstraint {
-    fn degree(&self) -> usize {
-        match self.cond_col {
-            Some(_) => 3, // cubic: cond * X * (1-X)
-            None => 2,    // quadratic: X * (1-X)
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let x = step.get_main_evaluation_element(0, self.value_col).clone();
-        let one = FieldElement::<F>::one();
-
-        match self.cond_col {
-            Some(cond_col) => {
-                let cond = step.get_main_evaluation_element(0, cond_col).clone();
-                &cond * &x * (one - x)
-            }
-            None => &x * (one - &x),
-        }
-    }
-}
 
 // =========================================================================
 // ADD Template (Embedded Carry Approach)
@@ -159,71 +77,7 @@ pub enum AddOperand {
     },
 }
 
-impl AddLinearTerm {
-    /// Evaluate this term using values from the trace.
-    fn eval<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddLinearTerm::Column {
-                coefficient,
-                column,
-            } => {
-                let col_val = step.get_main_evaluation_element(0, *column);
-                col_val * FieldElement::<F>::from(*coefficient)
-            }
-            AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
-        }
-    }
-}
-
-/// Evaluate a slice of terms as a sum.
-fn eval_terms<F, E>(terms: &[AddLinearTerm], step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    if terms.is_empty() {
-        FieldElement::zero()
-    } else {
-        terms
-            .iter()
-            .map(|t| t.eval(step))
-            .fold(FieldElement::zero(), |acc, x| acc + x)
-    }
-}
-
 impl AddOperand {
-    /// Get the low word value from the trace.
-    pub fn eval_lo<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddOperand::DWordWL { start_column } => {
-                step.get_main_evaluation_element(0, *start_column).clone()
-            }
-            AddOperand::Linear { lo, .. } => eval_terms(lo, step),
-        }
-    }
-
-    /// Get the high word value from the trace.
-    pub fn eval_hi<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddOperand::DWordWL { start_column } => step
-                .get_main_evaluation_element(0, *start_column + 1)
-                .clone(),
-            AddOperand::Linear { hi, .. } => eval_terms(hi, step),
-        }
-    }
-
     // -------------------------------------------------------------------------
     // Convenience constructors for common cast types
     // -------------------------------------------------------------------------
@@ -333,183 +187,6 @@ impl AddOperand {
     }
 }
 
-// -------------------------------------------------------------------------
-// AddConstraint
-// -------------------------------------------------------------------------
-
-/// 64-bit addition constraint with embedded carry.
-///
-/// Enforces: `lhs + rhs = sum (mod 2^64)`
-///
-/// Uses DWordWL representation (2 × 32-bit words):
-/// - lhs = [lhs_lo, lhs_hi]
-/// - rhs = [rhs_lo, rhs_hi]
-/// - sum = [sum_lo, sum_hi]
-///
-/// Embeds virtual carry columns inline:
-/// - carry_0 = (lhs_lo + rhs_lo - sum_lo) / 2^32
-/// - carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) / 2^32
-///
-/// Constraints:
-/// - carry_0 is a bit: cond * carry_0 * (1 - carry_0) = 0
-/// - carry_1 is a bit: cond * carry_1 * (1 - carry_1) = 0
-///
-/// Assumptions (must be verified via bus lookups):
-/// - lhs_lo, lhs_hi, rhs_lo, rhs_hi, sum_lo, sum_hi are all valid 32-bit words
-pub struct AddConstraint {
-    /// Column indices for condition flags (constraint active when sum > 0)
-    cond_cols: Vec<usize>,
-    /// Left-hand side operand (flexible representation)
-    lhs: AddOperand,
-    /// Right-hand side operand (flexible representation)
-    rhs: AddOperand,
-    /// Sum/output operand (flexible representation)
-    sum: AddOperand,
-    /// Which carry constraint this is (0 or 1)
-    carry_idx: usize,
-    /// Unique constraint identifier
-    constraint_idx: usize,
-}
-
-impl AddConstraint {
-    /// Creates ADD constraints for both carries.
-    ///
-    /// Returns two constraints: one for carry_0 and one for carry_1.
-    ///
-    /// # Arguments
-    /// * `cond_cols` - Column indices for condition flags (constraint active when sum > 0)
-    /// * `lhs` - Left-hand side operand (flexible representation)
-    /// * `rhs` - Right-hand side operand (flexible representation)
-    /// * `sum` - Sum/output operand (flexible representation)
-    /// * `constraint_idx_start` - Starting constraint index (uses 2 consecutive indices)
-    pub fn new_pair(
-        cond_cols: Vec<usize>,
-        lhs: AddOperand,
-        rhs: AddOperand,
-        sum: AddOperand,
-        constraint_idx_start: usize,
-    ) -> (Self, Self) {
-        let carry_0 = Self {
-            cond_cols: cond_cols.clone(),
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
-            sum: sum.clone(),
-            carry_idx: 0,
-            constraint_idx: constraint_idx_start,
-        };
-
-        let carry_1 = Self {
-            cond_cols,
-            lhs,
-            rhs,
-            sum,
-            carry_idx: 1,
-            constraint_idx: constraint_idx_start + 1,
-        };
-
-        (carry_0, carry_1)
-    }
-
-    /// Compute carry_0 inline from trace values.
-    fn compute_carry_0<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_lo = self.lhs.eval_lo(step);
-        let rhs_lo = self.rhs.eval_lo(step);
-        let sum_lo = self.sum.eval_lo(step);
-
-        // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        (lhs_lo + rhs_lo - sum_lo) * inv_2_32::<F>()
-    }
-
-    /// Compute carry_1 inline from trace values.
-    fn compute_carry_1<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_hi = self.lhs.eval_hi(step);
-        let rhs_hi = self.rhs.eval_hi(step);
-        let sum_hi = self.sum.eval_hi(step);
-        let carry_0 = self.compute_carry_0(step);
-
-        // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32::<F>()
-    }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-
-        let carry = match self.carry_idx {
-            0 => self.compute_carry_0(step),
-            1 => self.compute_carry_1(step),
-            _ => unreachable!("carry_idx validated <= 1 at construction"),
-        };
-
-        if self.cond_cols.is_empty() {
-            // Unconditional: carry * (1 - carry)
-            &carry * (one - &carry)
-        } else {
-            // Conditional: cond * carry * (1 - carry)
-            let cond = self
-                .cond_cols
-                .iter()
-                .map(|&col| step.get_main_evaluation_element(0, col).clone())
-                .fold(FieldElement::<F>::zero(), |acc, x| acc + x);
-            cond * &carry * (one - carry)
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
-    fn degree(&self) -> usize {
-        if self.cond_cols.is_empty() { 2 } else { 3 }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-// =========================================================================
-// Helper Functions
-// =========================================================================
-
-/// Creates multiple unconditional IS_BIT constraints for the given columns.
-///
-/// # Arguments
-/// * `value_cols` - Slice of column indices to constrain
-/// * `constraint_idx_start` - Starting index for constraint numbering
-///
-/// # Returns
-/// Vector of IS_BIT constraints and the next available constraint index.
-pub fn new_is_bit_constraints(
-    value_cols: &[usize],
-    constraint_idx_start: usize,
-) -> (Vec<IsBitConstraint>, usize) {
-    let constraints = value_cols
-        .iter()
-        .enumerate()
-        .map(|(i, &col)| IsBitConstraint::unconditional(col, constraint_idx_start + i))
-        .collect();
-
-    (constraints, constraint_idx_start + value_cols.len())
-}
-
 // =========================================================================
 // Single-body emit functions (ConstraintBuilder front-end)
 // =========================================================================
@@ -528,7 +205,7 @@ pub fn new_is_bit_constraints(
 use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta};
 
 /// IS_BIT: `x·(1−x)`, optionally gated by a condition column:
-/// `cond·x·(1−x)`. Twin of [`IsBitConstraint`].
+/// `cond·x·(1−x)`. Twin of `IsBitConstraint`.
 pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
     idx: usize,
@@ -602,7 +279,7 @@ fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 }
 
 /// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`
-/// (twin of [`AddConstraint::new_pair`]):
+/// (twin of `AddConstraint::new_pair`):
 ///
 /// ```text
 /// carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²
