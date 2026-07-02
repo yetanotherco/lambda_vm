@@ -1,5 +1,5 @@
 //! End-to-end naive recursion pipeline smoke tests: prove an inner program,
-//! hand `(VmProof, elf, opts)` to the in-VM verifier guest, then either prove
+//! hand `(VmProof, elf, opts, vkey)` to the in-VM verifier guest, then either prove
 //! the guest's execution (`OuterMode::Prove`) or just execute it
 //! (`OuterMode::ExecuteOnly`). Guest ELFs come from `make compile-recursion-elfs`.
 //!
@@ -520,9 +520,16 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
         prove_inner_and_encode_blob("roundtrip", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
     // Decode exactly as the guest does.
-    let decoded: Result<(crate::VmProof, Vec<u8>, crate::ProofOptions), _> =
-        postcard::from_bytes(&blob);
-    let (vm_proof, inner_elf, options) = match decoded {
+    let decoded: Result<
+        (
+            crate::VmProof,
+            Vec<u8>,
+            crate::ProofOptions,
+            crate::VmVerifyingKey,
+        ),
+        _,
+    > = postcard::from_bytes(&blob);
+    let (vm_proof, inner_elf, options, vkey) = match decoded {
         Ok(t) => t,
         Err(e) => panic!("[roundtrip] postcard DECODE failed (this is the guest panic): {e}"),
     };
@@ -532,7 +539,14 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
         options.blowup_factor
     );
 
-    match crate::verify_with_options(&vm_proof, &inner_elf, &options, None, None) {
+    match crate::verify_with_options_with_vkey(
+        &vm_proof,
+        &inner_elf,
+        &options,
+        None,
+        None,
+        Some(&vkey),
+    ) {
         Ok(true) => eprintln!("[roundtrip] verify ok=true — guest path is sound"),
         Ok(false) => panic!(
             "[roundtrip] verify returned FALSE (guest hits assert!(ok)) — proof did not survive the postcard round-trip"
