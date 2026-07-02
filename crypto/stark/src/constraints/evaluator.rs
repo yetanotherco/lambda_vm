@@ -94,16 +94,25 @@ where
             let acc_transition = if is_uniform {
                 // All constraints share one zerofier: factor it out of the sum.
                 let z = zerofier_data.get_uniform(i);
+                // transition_coefficients are the powers β⁰, β¹, … (round 2),
+                // so constraint 0's coefficient is one: seed the sum with its
+                // promoted evaluation and fold the rest — skips the
+                // multiply-by-one without branching on the value.
+                let mut base_iter = base_buf.iter().zip(&transition_coefficients[..num_base]);
+                let mut ext_iter = transition_buf[num_base..]
+                    .iter()
+                    .zip(&transition_coefficients[num_base..]);
+                let seed = match base_iter.next() {
+                    Some((eval, _beta0)) => eval.clone().to_extension(),
+                    None => match ext_iter.next() {
+                        Some((eval, _beta0)) => eval.clone(),
+                        None => FieldElement::zero(),
+                    },
+                };
                 // F×E inner product for base constraints (3 muls per term)
-                let mut sum = base_buf
-                    .iter()
-                    .zip(&transition_coefficients[..num_base])
-                    .fold(FieldElement::zero(), |acc, (eval, beta)| acc + eval * beta);
+                let sum = base_iter.fold(seed, |acc, (eval, beta)| acc + eval * beta);
                 // E×E for extension constraints (9 muls per term)
-                sum = transition_buf[num_base..]
-                    .iter()
-                    .zip(&transition_coefficients[num_base..])
-                    .fold(sum, |acc, (eval, beta)| acc + eval * beta);
+                let sum = ext_iter.fold(sum, |acc, (eval, beta)| acc + eval * beta);
                 z * &sum
             } else {
                 let mut sum = base_buf

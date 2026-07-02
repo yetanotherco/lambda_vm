@@ -372,8 +372,13 @@ impl LtConstraints {
         (rhs_0 + sub_lo - lhs_0) * inv_2_32
     }
 
-    /// carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32.
-    fn carry_1<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    /// carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32. Takes the
+    /// [`Self::carry_0`] value so the body computes it once per row (it is
+    /// also needed by the carry-0 IS_BIT constraint).
+    fn carry_1<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        carry_0: B::Expr,
+    ) -> B::Expr {
         let lhs_1 = b.main(0, cols::LHS_1);
         let lhs_2 = b.main(0, cols::LHS_2);
         let rhs_1 = b.main(0, cols::RHS_1);
@@ -387,7 +392,6 @@ impl LtConstraints {
         let rhs_hi = rhs_1 + rhs_2 * shift_16.clone();
         // cast(lhs_sub_rhs, DWordWL)[1] = sub_2 + 2^16 * sub_3
         let sub_hi = sub_2 + sub_3 * shift_16;
-        let carry_0 = Self::carry_0(b);
         let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
         (rhs_hi + sub_hi + carry_0 - lhs_hi) * inv_2_32
     }
@@ -407,14 +411,15 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: IS_BIT<carry[0]>: carry[0] * (1 - carry[0])
+        // carry_0 and carry_1 are shared by idx 0/1/2 — one computation each.
         let c0 = Self::carry_0(b);
+        let c1 = Self::carry_1(b, c0.clone());
         let one = b.one();
         b.emit_base(0, c0.clone() * (one - c0));
 
         // idx 1: IS_BIT<carry[1]>: carry[1] * (1 - carry[1])
-        let c1 = Self::carry_1(b);
         let one = b.one();
-        b.emit_base(1, c1.clone() * (one - c1));
+        b.emit_base(1, c1.clone() * (one - c1.clone()));
 
         // idx 2: LT formula: lt - (signed*signed_lt + (1-signed)*unsigned_lt)
         // signed_lt = A*(1-B) + A*C + (1-B)*C; unsigned_lt = C = carry[1]
@@ -422,7 +427,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
         let signed = b.main(0, cols::SIGNED);
         let a = b.main(0, cols::LHS_MSB);
         let bb = b.main(0, cols::RHS_MSB);
-        let c = Self::carry_1(b);
+        let c = c1;
         let unsigned_lt = c.clone();
         let one = b.one();
         let one_minus_b = one - bb;

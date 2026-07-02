@@ -144,6 +144,15 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     ) -> Self::ExprE {
         fp - v * self.alpha_pow(alpha_idx)
     }
+
+    /// `e − v` (extension minus base). The expression ops only implement
+    /// base ∘ ext (base operand LEFT), so the generic route — and the shape
+    /// this default keeps in the captured IR — is `−(v − e)`: one mixed sub
+    /// plus a full extension negation. The eval folders override it with
+    /// `FieldElement::sub_subfield`, which touches only component 0.
+    fn ext_sub_base(&self, e: Self::ExprE, v: Self::Expr) -> Self::ExprE {
+        -(v - e)
+    }
 }
 
 // =============================================================================
@@ -487,6 +496,10 @@ where
             fp - v * &self.alphas[alpha_idx]
         }
     }
+
+    fn ext_sub_base(&self, e: FieldElement<E>, v: FieldElement<F>) -> FieldElement<E> {
+        e.sub_subfield(&v)
+    }
 }
 
 // =============================================================================
@@ -601,6 +614,11 @@ where
     fn emit_ext(&mut self, constraint_idx: usize, e: FieldElement<E>) {
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
+    }
+
+    fn ext_sub_base(&self, e: FieldElement<E>, v: FieldElement<E>) -> FieldElement<E> {
+        // Expr = ExprE at the OOD point: a plain extension subtraction.
+        e - v
     }
 }
 
