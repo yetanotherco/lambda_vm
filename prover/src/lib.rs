@@ -175,6 +175,10 @@ pub struct VmProof {
     /// These pages are NOT preprocessed — the verifier reconstructs them
     /// as non-preprocessed tables starting at `PRIVATE_INPUT_START_INDEX`.
     pub num_private_input_pages: usize,
+    /// Digest of the [`VmVerifyingKey`] the proof was made against. Bound
+    /// into the Fiat-Shamir statement and checked by the verifier against
+    /// its own vkey's digest before any STARK work.
+    pub vk_digest: [u8; 32],
 }
 
 /// Error type for the prover crate.
@@ -192,6 +196,8 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Supplied verifying key is malformed (wrong version or page count)
+    InvalidVerifyingKey(String),
     /// Continuation epoch size exponent is invalid.
     InvalidContinuationEpochSize(String),
     /// Continuation proof construction hit an internal invariant failure.
@@ -215,6 +221,7 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::InvalidVerifyingKey(msg) => write!(f, "invalid verifying key: {msg}"),
             Error::InvalidContinuationEpochSize(msg) => {
                 write!(f, "invalid continuation epoch size: {msg}")
             }
@@ -635,7 +642,7 @@ impl VmAirs {
                         .iter()
                         .find(|(pb, _)| *pb == config.page_base)
                         .map(|(_, c)| *c)
-                        .or_else(|| vkey.map(|vk| vk.pages[index]))
+                        .or_else(|| vkey.and_then(|vk| vk.pages.get(index)).copied())
                         .unwrap_or_else(|| {
                             page::compute_precomputed_commitment(config, proof_options)
                         });
@@ -953,7 +960,12 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
-    let airs = VmAirs::new(
+    // Derive the vkey before AIR construction so each preprocessed
+    // commitment is computed once and reused.
+    let vkey =
+        VmVerifyingKey::from_elf_and_options(&program, proof_options, None, &traces.page_configs);
+    let vk_digest = vkey.compute_digest();
+    let airs = VmAirs::new_with_vkey(
         &program,
         proof_options,
         false,
@@ -964,6 +976,7 @@ pub fn prove_with_options_and_inputs(
         None,
         None,
         None,
+        Some(&vkey),
     );
 
     #[cfg(feature = "instruments")]
@@ -986,7 +999,7 @@ pub fn prove_with_options_and_inputs(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
-        StatementKind::Monolithic,
+        StatementKind::Monolithic { vk_digest },
         elf_bytes,
         &traces.public_output_bytes,
         &table_counts,
@@ -1037,6 +1050,7 @@ pub fn prove_with_options_and_inputs(
         table_counts,
         public_output: traces.public_output_bytes.clone(),
         num_private_input_pages,
+        vk_digest,
     })
 }
 
@@ -1101,11 +1115,17 @@ pub fn verify_with_options(
 }
 
 /// Same as [`verify_with_options`] but accepts a precomputed
-/// [`VmVerifyingKey`]. When `vkey` is `Some`, the bitwise preprocessed
-/// commitment is taken from it instead of being recomputed inside
-/// `VmAirs::new`. A tampered vkey is caught by Fiat-Shamir: the verifier
-/// feeds the supplied commitment into the transcript, derives different
-/// challenges from what the prover used, and the openings stop matching.
+/// [`VmVerifyingKey`], skipping the preprocessed-commitment recomputation.
+///
+/// # Security
+///
+/// The vkey is TRUSTED input. Passing one supplied by the prover (as the
+/// recursion guest does) proves nothing by itself: a coordinated prover can
+/// commit to a forged preprocessed table and ship a matching vkey, and the
+/// transcript stays self-consistent. Soundness requires the caller's output
+/// to bind `vkey.compute_digest()` (the recursion guest commits it) so an
+/// outer verifier can compare it against a digest derived from trusted
+/// inputs. See `vkey.rs`.
 pub fn verify_with_options_with_vkey(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
@@ -1137,6 +1157,47 @@ pub fn verify_with_options_with_vkey(
         vm_proof.num_private_input_pages,
     );
 
+    // Validate the vkey before constructing AIRs: `vk.pages` is indexed
+    // parallel to `page_configs` (a short vec would panic), and options are
+    // checked because query count / grinding factor affect soundness but no
+    // commitment. With no caller vkey, derive one from the trusted ELF.
+    let owned_vkey;
+    let vkey = match vkey {
+        Some(vk) => {
+            if vk.version != crate::vkey::VKEY_VERSION {
+                return Err(Error::InvalidVerifyingKey(format!(
+                    "vkey version {} != expected {}",
+                    vk.version,
+                    crate::vkey::VKEY_VERSION,
+                )));
+            }
+            if vk.pages.len() != page_configs.len() {
+                return Err(Error::InvalidVerifyingKey(format!(
+                    "vkey has {} page commitments but the proof requires {}",
+                    vk.pages.len(),
+                    page_configs.len(),
+                )));
+            }
+            if vk.options != *proof_options {
+                return Err(Error::InvalidVerifyingKey(
+                    "vkey options do not match the verification options".into(),
+                ));
+            }
+            vk
+        }
+        None => {
+            owned_vkey =
+                VmVerifyingKey::from_elf_and_options(&program, proof_options, None, &page_configs);
+            &owned_vkey
+        }
+    };
+    let vk_digest = vkey.compute_digest();
+    if vm_proof.vk_digest != vk_digest {
+        return Err(Error::InvalidVerifyingKey(
+            "proof vk_digest does not match the verifying key's digest".into(),
+        ));
+    }
+
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
     let expected_proof_count =
@@ -1162,7 +1223,7 @@ pub fn verify_with_options_with_vkey(
         None,
         page_commitments,
         None,
-        vkey,
+        Some(vkey),
     );
 
     // Recompute the COMMIT output bus offset from VmProof.public_output.
@@ -1176,7 +1237,7 @@ pub fn verify_with_options_with_vkey(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
-        StatementKind::Monolithic,
+        StatementKind::Monolithic { vk_digest },
         elf_bytes,
         &vm_proof.public_output,
         &vm_proof.table_counts,
