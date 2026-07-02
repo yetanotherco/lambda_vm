@@ -1501,6 +1501,51 @@ mod tests {
         );
     }
 
+    // Multi-page private input: the program reads private input across TWO pages
+    // (page 0 for the length, page 1 for the committed bytes), so the run touches two
+    // private pages → `num_private_input_pages >= 2` and two NON-preprocessed
+    // GLOBAL_MEMORY tables in the global proof. Verifies from bundle + ELF alone and the
+    // output equals the page-1 bytes. Exercises the count-based classification and the
+    // committed private genesis across more than one page.
+    #[test]
+    fn test_continuation_multipage_private_input() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_multipage");
+
+        // Page 1 starts at memory address START + page_size = 0xFF040000, which is data
+        // index `page_size - 4` (the 4-byte length prefix sits at START). The program
+        // commits the 8 bytes there, so the input must extend through that.
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        let commit_off = page_size - 4;
+        let mut input = vec![0u8; commit_off + 8];
+        let expected: [u8; 8] = [0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18];
+        input[commit_off..commit_off + 8].copy_from_slice(&expected);
+
+        let bundle =
+            prove_continuation(&elf_bytes, &input, 4, &ProofOptions::default_test_options())
+                .unwrap();
+        assert!(
+            bundle.num_private_input_pages >= 2,
+            "input spanning two pages must give >=2 private pages"
+        );
+        let start = PRIVATE_INPUT_START_INDEX;
+        let ps = page_size as u64;
+        assert!(
+            bundle.touched_page_bases.contains(&start)
+                && bundle.touched_page_bases.contains(&(start + ps)),
+            "both private page 0 and page 1 must be touched (two GLOBAL_MEMORY tables)"
+        );
+
+        let out = verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+            .unwrap();
+        assert_eq!(
+            out.as_deref(),
+            Some(&expected[..]),
+            "committed output must be the 8 bytes read from private page 1"
+        );
+    }
+
     // The verifier canonicalizes (sorts/dedups) the shipped `touched_page_bases`, so a
     // list that is reordered AND has duplicates — but describes the same set — still
     // verifies. (Page-count-independent: duplicating then reversing exercises both dedup
