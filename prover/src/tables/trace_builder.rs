@@ -3097,16 +3097,12 @@ fn build_traces<I: ImageSource + Sync>(
     let bytewises = bytewises_slot.expect(PHASE5_RAN)?;
     let stores = stores_slot.expect(PHASE5_RAN)?;
     let cpu32s = cpu32s_slot.expect(PHASE5_RAN)?;
-    #[allow(unused_mut)]
-    let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
-    #[allow(unused_mut)]
-    let mut decode = decode_slot.expect(PHASE5_RAN);
-    #[allow(unused_mut)]
-    let mut commit_trace = commit_slot.expect(PHASE5_RAN);
+    let bitwise = bitwise_slot.expect(PHASE5_RAN);
+    let decode = decode_slot.expect(PHASE5_RAN);
+    let commit_trace = commit_slot.expect(PHASE5_RAN);
     let keccak_trace = keccak_slot.expect(PHASE5_RAN);
     let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
     let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
-    #[allow(unused_mut)]
     let (pages, page_configs) = pages_slot.expect(PHASE5_RAN);
     let register_trace = register_slot.expect(PHASE5_RAN);
     let halt_trace = halt_slot.expect(PHASE5_RAN);
