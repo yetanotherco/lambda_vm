@@ -637,3 +637,121 @@ pub fn constraints()
 
     constraints
 }
+
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `LoadConstraint` / `constraints()` above, written
+// once against the generic `ConstraintBuilder` so one body serves the compiled
+// prover folder, the verifier folder and IR capture. The old structs stay for
+// now (they are the differential oracle); the final deletion phase removes
+// them. Constraint indices 0..13 match `constraints()` (idx_start = 0) exactly:
+//   0..4: FlagIsBit(SIGNED, READ2, READ4, READ8)   4: WidthSumIsBit
+//   5: ReadImpliesMu                                6..10: ExtensionHigh(4..8)
+//   10..12: ExtensionMid(2..4)                      12: ExtensionLow
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// LOAD table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the LOAD layout is fixed via `cols`).
+pub struct LoadConstraints;
+
+impl LoadConstraints {
+    /// `flag · (1 − flag)` IS_BIT check for a boolean flag column.
+    fn flag_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        col: usize,
+    ) -> B::Expr {
+        let flag = b.main(0, col);
+        let one = b.one();
+        flag.clone() * (one - flag)
+    }
+
+    /// `signed · sign_bit · 255` — the sign-extended byte value.
+    fn extended<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let signed = b.main(0, cols::SIGNED);
+        let sign_bit = b.main(0, cols::SIGN_BIT);
+        let ff = b.const_base(255);
+        signed * sign_bit * ff
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 2),  // FlagIsBit(SIGNED)
+            ConstraintMeta::base(1, 2),  // FlagIsBit(READ2)
+            ConstraintMeta::base(2, 2),  // FlagIsBit(READ4)
+            ConstraintMeta::base(3, 2),  // FlagIsBit(READ8)
+            ConstraintMeta::base(4, 2),  // WidthSumIsBit
+            ConstraintMeta::base(5, 2),  // ReadImpliesMu
+            ConstraintMeta::base(6, 3),  // ExtensionHigh(4)
+            ConstraintMeta::base(7, 3),  // ExtensionHigh(5)
+            ConstraintMeta::base(8, 3),  // ExtensionHigh(6)
+            ConstraintMeta::base(9, 3),  // ExtensionHigh(7)
+            ConstraintMeta::base(10, 3), // ExtensionMid(2)
+            ConstraintMeta::base(11, 3), // ExtensionMid(3)
+            ConstraintMeta::base(12, 3), // ExtensionLow (res[1])
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0..4: IS_BIT on the width/sign flags.
+        for (i, flag_col) in [cols::SIGNED, cols::READ2, cols::READ4, cols::READ8]
+            .into_iter()
+            .enumerate()
+        {
+            let root = Self::flag_is_bit(b, flag_col);
+            b.emit_base(i, root);
+        }
+
+        // idx 4: IS_BIT on the width-selector sum (read2 + read4 + read8).
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let sum = read2 + read4 + read8;
+        let one = b.one();
+        b.emit_base(4, sum.clone() * (one - sum));
+
+        // idx 5: (read2 + read4 + read8) * (1 - μ)
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let mu = b.main(0, cols::MU);
+        let read_sum = read2 + read4 + read8;
+        let one = b.one();
+        b.emit_base(5, read_sum * (one - mu));
+
+        // idx 6..10: ExtensionHigh(i) for i in 4..8:
+        // (1 - read8) * (res[i] - signed*sign_bit*255)
+        for (offset, i) in (4..8).enumerate() {
+            let read8 = b.main(0, cols::READ8);
+            let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
+            let one = b.one();
+            b.emit_base(6 + offset, (one - read8) * (res_i - expected));
+        }
+
+        // idx 10,11: ExtensionMid(i) for i in 2..4:
+        // (1 - read4 - read8) * (res[i] - signed*sign_bit*255)
+        for (offset, i) in (2..4).enumerate() {
+            let read4 = b.main(0, cols::READ4);
+            let read8 = b.main(0, cols::READ8);
+            let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
+            let one = b.one();
+            b.emit_base(10 + offset, (one - read4 - read8) * (res_i - expected));
+        }
+
+        // idx 12: ExtensionLow:
+        // (1 - read2 - read4 - read8) * (res[1] - signed*sign_bit*255)
+        let read2 = b.main(0, cols::READ2);
+        let read4 = b.main(0, cols::READ4);
+        let read8 = b.main(0, cols::READ8);
+        let res_1 = b.main(0, cols::RES[1]);
+        let expected = Self::extended(b);
+        let one = b.one();
+        b.emit_base(12, (one - read2 - read4 - read8) * (res_1 - expected));
+    }
+}

@@ -906,6 +906,155 @@ pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usiz
 }
 
 // =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// Non-destructive twin of `MulConstraint` / `mul_constraints` above, written
+// once against the generic `ConstraintBuilder` so one body serves the compiled
+// prover folder, the verifier folder and IR capture. The old structs stay for
+// now (they are the differential oracle); the final deletion phase removes
+// them. Constraint indices 0..8 match `mul_constraints(0)` exactly:
+//   0: SignedIsBit(LHS_SIGNED)  1: SignedIsBit(RHS_SIGNED)
+//   2: LhsSign                  3: RhsSign
+//   4..8: RawProduct(0..4)
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+/// MUL table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the MUL layout is fixed via `cols`).
+pub struct MulConstraints;
+
+impl MulConstraints {
+    /// `x · (1 − x)` IS_BIT check for a sign-flag column.
+    fn signed_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        col: usize,
+    ) -> B::Expr {
+        let x = b.main(0, col);
+        let one = b.one();
+        x.clone() * (one - x)
+    }
+
+    /// `raw_product[i] − Σ_k 2^(16k)·Σ_j lhs_ext[j]·rhs_ext[idx−j]` (idx = 2i+k).
+    /// Mirrors [`MulConstraint::compute_raw_product_constraint`] exactly.
+    fn raw_product<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        let lhs = [
+            b.main(0, cols::LHS_0),
+            b.main(0, cols::LHS_1),
+            b.main(0, cols::LHS_2),
+            b.main(0, cols::LHS_3),
+        ];
+        let rhs = [
+            b.main(0, cols::RHS_0),
+            b.main(0, cols::RHS_1),
+            b.main(0, cols::RHS_2),
+            b.main(0, cols::RHS_3),
+        ];
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+
+        // Sign-extended values: [0..4] = halfwords, [4..8] = sign_fill * is_neg.
+        let sign_fill = b.const_base(SIGN_FILL);
+        let lhs_hi = sign_fill.clone() * lhs_is_neg;
+        let rhs_hi = sign_fill * rhs_is_neg;
+        let lhs_ext: [B::Expr; 8] = [
+            lhs[0].clone(),
+            lhs[1].clone(),
+            lhs[2].clone(),
+            lhs[3].clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi,
+        ];
+        let rhs_ext: [B::Expr; 8] = [
+            rhs[0].clone(),
+            rhs[1].clone(),
+            rhs[2].clone(),
+            rhs[3].clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi,
+        ];
+
+        // Convolution sum (same k/j bounds as the old code).
+        let shift_16 = b.const_base(SHIFT_16);
+        let mut sum = b.zero();
+        for k in 0..=1usize {
+            let idx = 2 * i + k;
+            if idx < 8 {
+                let mut inner_sum = b.zero();
+                for j in 0..=idx {
+                    if j < 8 && (idx - j) < 8 {
+                        inner_sum = inner_sum + lhs_ext[j].clone() * rhs_ext[idx - j].clone();
+                    }
+                }
+                if k == 0 {
+                    sum = sum + inner_sum;
+                } else {
+                    sum = sum + inner_sum * shift_16.clone();
+                }
+            }
+        }
+
+        let raw_col = match i {
+            0 => cols::RAW_PRODUCT_0,
+            1 => cols::RAW_PRODUCT_1,
+            2 => cols::RAW_PRODUCT_2,
+            3 => cols::RAW_PRODUCT_3,
+            _ => unreachable!(),
+        };
+        let raw_product = b.main(0, raw_col);
+        raw_product - sum
+    }
+}
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 2), // SignedIsBit(LHS_SIGNED)
+            ConstraintMeta::base(1, 2), // SignedIsBit(RHS_SIGNED)
+            ConstraintMeta::base(2, 2), // LhsSign
+            ConstraintMeta::base(3, 2), // RhsSign
+            ConstraintMeta::base(4, 2), // RawProduct(0)
+            ConstraintMeta::base(5, 2), // RawProduct(1)
+            ConstraintMeta::base(6, 2), // RawProduct(2)
+            ConstraintMeta::base(7, 2), // RawProduct(3)
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
+        let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);
+        b.emit_base(0, is_bit_lhs);
+        let is_bit_rhs = Self::signed_is_bit(b, cols::RHS_SIGNED);
+        b.emit_base(1, is_bit_rhs);
+
+        // idx 2: LhsSign: (1 - lhs_signed) * lhs_is_negative
+        let lhs_signed = b.main(0, cols::LHS_SIGNED);
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(2, (one - lhs_signed) * lhs_is_neg);
+
+        // idx 3: RhsSign: (1 - rhs_signed) * rhs_is_negative
+        let rhs_signed = b.main(0, cols::RHS_SIGNED);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
+
+        // idx 4..8: raw_product convolution for i = 0..4.
+        for i in 0..4 {
+            let root = Self::raw_product(b, i);
+            b.emit_base(4 + i, root);
+        }
+    }
+}
+
+// =========================================================================
 // Helper functions
 // =========================================================================
 
