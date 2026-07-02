@@ -294,3 +294,37 @@ mod memw_register {
         );
     }
 }
+
+// =============================================================================
+// branch.rs
+// =============================================================================
+
+mod branch {
+    use super::*;
+    use crate::tables::branch::{BranchConstraints, branch_constraints, cols};
+    use stark::constraints::transition::TransitionConstraint;
+
+    #[test]
+    fn branch_constraint_set_matches_old() {
+        // `branch_constraints` returns unboxed `BranchConstraint`s; box them
+        // for the differential oracle.
+        let (old_structs, _) = branch_constraints(0);
+        let old: OldVec = old_structs.into_iter().map(|c| c.boxed()).collect();
+        check_table("branch", &old, &BranchConstraints, cols::NUM_COLUMNS);
+    }
+}
+
+// =============================================================================
+// commit.rs
+// =============================================================================
+
+mod commit {
+    use super::*;
+    use crate::tables::commit::{CommitConstraints, cols, create_constraints};
+
+    #[test]
+    fn commit_constraint_set_matches_old() {
+        let (old, _) = create_constraints(0);
+        check_table("commit", &old, &CommitConstraints, cols::NUM_COLUMNS);
+    }
+}
