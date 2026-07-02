@@ -292,11 +292,12 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0..10: unconditional IS_BIT `x·(1−x)` for
-        // [mu, limb_bit(0..8), last_limb], in that column order.
-        let mut bit_cols = vec![cols::MU];
-        bit_cols.extend((0..8).map(cols::limb_bit));
-        bit_cols.push(cols::LAST_LIMB);
-        for (i, &col) in bit_cols.iter().enumerate() {
+        // [mu, limb_bit(0..8), last_limb], in that column order. Iterator
+        // chain, not a Vec: eval runs once per LDE row.
+        let bit_cols = core::iter::once(cols::MU)
+            .chain((0..8).map(cols::limb_bit))
+            .chain(core::iter::once(cols::LAST_LIMB));
+        for (i, col) in bit_cols.enumerate() {
             let x = b.main(0, col);
             let one = b.one();
             b.emit_base(i, x.clone() * (one - x));

@@ -307,14 +307,14 @@ fn test_add_operand_linear_with_negative_coefficient() {
     // Test linear operand with negative coefficient: 4 - 2*c
     // This represents expressions like `4 - 2 * c_type_instruction`
     let op = AddOperand::linear(
-        vec![
+        &[
             AddLinearTerm::Constant(4),
             AddLinearTerm::Column {
                 coefficient: -2,
                 column: 0,
             },
         ],
-        vec![], // hi = 0
+        &[], // hi = 0
     );
     match op {
         AddOperand::Linear { lo, hi } => {
@@ -344,7 +344,7 @@ fn test_add_operand_linear_with_negative_coefficient() {
 fn test_add_operand_linear_with_nonzero_hi() {
     // Test linear operand with non-trivial hi terms (virtual column case)
     let op = AddOperand::linear(
-        vec![
+        &[
             AddLinearTerm::Column {
                 coefficient: 1 << 16,
                 column: 0,
@@ -358,7 +358,7 @@ fn test_add_operand_linear_with_nonzero_hi() {
                 column: 2,
             },
         ],
-        vec![
+        &[
             AddLinearTerm::Column {
                 coefficient: 1 << 16,
                 column: 3,

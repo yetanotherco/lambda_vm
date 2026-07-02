@@ -37,7 +37,7 @@ pub const INV_SHIFT_32: u64 = 18446744065119617026;
 ///
 /// Uses i64 for coefficients to support negative values (e.g., `4 - 2*c`).
 /// Converted to FieldElement in eval().
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AddLinearTerm {
     /// coefficient * column_value
     Column {
@@ -48,6 +48,55 @@ pub enum AddLinearTerm {
     },
     /// A constant value
     Constant(i64),
+}
+
+/// Inline term storage for one limb of an [`AddOperand::Linear`]: at most
+/// 4 terms (the byte-packed [`AddOperand::from_dword_bl`] limb is the widest).
+///
+/// Operands are constructed INSIDE the per-row constraint bodies (the CPU
+/// table builds two per row; KECCAK builds three per lane × 25 lanes), so
+/// this must not heap-allocate — a `Vec` here costs allocations per operand
+/// per LDE row.
+#[derive(Debug, Clone, Copy)]
+pub struct AddTerms {
+    terms: [AddLinearTerm; Self::CAP],
+    len: u8,
+}
+
+impl AddTerms {
+    const CAP: usize = 4;
+    const FILL: AddLinearTerm = AddLinearTerm::Constant(0);
+
+    /// The empty term list (a zero limb).
+    pub const fn empty() -> Self {
+        Self {
+            terms: [Self::FILL; Self::CAP],
+            len: 0,
+        }
+    }
+
+    /// Term list from a slice. Panics if given more than 4 terms.
+    pub fn of(source: &[AddLinearTerm]) -> Self {
+        assert!(
+            source.len() <= Self::CAP,
+            "AddTerms holds at most {} terms, got {}",
+            Self::CAP,
+            source.len()
+        );
+        let mut terms = [Self::FILL; Self::CAP];
+        terms[..source.len()].copy_from_slice(source);
+        Self {
+            terms,
+            len: source.len() as u8,
+        }
+    }
+}
+
+impl core::ops::Deref for AddTerms {
+    type Target = [AddLinearTerm];
+    fn deref(&self) -> &[AddLinearTerm] {
+        &self.terms[..self.len as usize]
+    }
 }
 
 /// An ADD operand representing a 64-bit value as [lo, hi] words.
@@ -62,7 +111,7 @@ pub enum AddLinearTerm {
 /// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
 /// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
 /// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AddOperand {
     /// Two consecutive columns (DWordWL): evaluates to [col, col+1]
     DWordWL { start_column: usize },
@@ -71,9 +120,9 @@ pub enum AddOperand {
     /// Handles: constants, single columns, expressions, and virtual columns.
     Linear {
         /// Terms for the low 32-bit word
-        lo: Vec<AddLinearTerm>,
+        lo: AddTerms,
         /// Terms for the high 32-bit word (empty = zero)
-        hi: Vec<AddLinearTerm>,
+        hi: AddTerms,
     },
 }
 
@@ -91,8 +140,8 @@ impl AddOperand {
     /// hi = 0 (since constants fit in 32 bits for VM use cases).
     pub fn constant(value: i64) -> Self {
         AddOperand::Linear {
-            lo: vec![AddLinearTerm::Constant(value)],
-            hi: vec![],
+            lo: AddTerms::of(&[AddLinearTerm::Constant(value)]),
+            hi: AddTerms::empty(),
         }
     }
 
@@ -100,11 +149,11 @@ impl AddOperand {
     /// hi = 0.
     pub fn from_word(col: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![AddLinearTerm::Column {
+            lo: AddTerms::of(&[AddLinearTerm::Column {
                 coefficient: 1,
                 column: col,
-            }],
-            hi: vec![],
+            }]),
+            hi: AddTerms::empty(),
         }
     }
 
@@ -113,7 +162,7 @@ impl AddOperand {
     /// hi = h[2] + 2^16 * h[3]
     pub fn from_dword_hl(start_column: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![
+            lo: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column,
@@ -122,8 +171,8 @@ impl AddOperand {
                     coefficient: 1 << 16,
                     column: start_column + 1,
                 },
-            ],
-            hi: vec![
+            ]),
+            hi: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column + 2,
@@ -132,7 +181,7 @@ impl AddOperand {
                     coefficient: 1 << 16,
                     column: start_column + 3,
                 },
-            ],
+            ]),
         }
     }
 
@@ -141,7 +190,7 @@ impl AddOperand {
     /// hi = b[4] + 2^8*b[5] + 2^16*b[6] + 2^24*b[7]
     pub fn from_dword_bl(start_column: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![
+            lo: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column,
@@ -158,8 +207,8 @@ impl AddOperand {
                     coefficient: 1 << 24,
                     column: start_column + 3,
                 },
-            ],
-            hi: vec![
+            ]),
+            hi: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column + 4,
@@ -176,14 +225,18 @@ impl AddOperand {
                     coefficient: 1 << 24,
                     column: start_column + 7,
                 },
-            ],
+            ]),
         }
     }
 
-    /// Creates a Linear operand from explicit lo/hi term lists.
-    /// Use this for complex expressions like `4 - 2*c` or virtual columns.
-    pub fn linear(lo: Vec<AddLinearTerm>, hi: Vec<AddLinearTerm>) -> Self {
-        AddOperand::Linear { lo, hi }
+    /// Creates a Linear operand from explicit lo/hi term lists (at most 4
+    /// terms per limb). Use this for complex expressions like `4 - 2*c` or
+    /// virtual columns.
+    pub fn linear(lo: &[AddLinearTerm], hi: &[AddLinearTerm]) -> Self {
+        AddOperand::Linear {
+            lo: AddTerms::of(lo),
+            hi: AddTerms::of(hi),
+        }
     }
 }
 

@@ -193,14 +193,14 @@ fn emit_add_pair_linear_unconditional() {
     // exercises const_signed on both signs.
     fn rhs() -> AddOperand {
         AddOperand::linear(
-            vec![
+            &[
                 AddLinearTerm::Column {
                     coefficient: -2,
                     column: 2,
                 },
                 AddLinearTerm::Constant(4),
             ],
-            vec![],
+            &[],
         )
     }
     emit_body!(Body, 2, |b| {
