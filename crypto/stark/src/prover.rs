@@ -1427,7 +1427,6 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         let (fri_final_poly_coeffs, fri_layers) = fri::commit_phase_from_evaluations(
-            domain.root_order as usize,
             lde_evals,
             transcript,
             &coset_offset,

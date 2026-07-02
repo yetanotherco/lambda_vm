@@ -31,8 +31,6 @@ pub fn commit_phase_from_evaluations<
     E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
 >(
-    // `_number_layers`: retained for signature stability with the cuda fast path; termination is now driven by blowup_log + final_poly_log_degree.
-    _number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
@@ -63,7 +61,6 @@ where
         // precondition miss or cudarc error — restoring the transcript first — so
         // the CPU path below then runs as if the GPU had never been tried.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
-            _number_layers,
             &evals,
             transcript,
             coset_offset,

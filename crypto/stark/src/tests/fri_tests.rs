@@ -175,7 +175,6 @@ fn test_commit_phase_early_termination_roundtrip() {
     // ---- Commit phase with early termination ----
     let mut transcript = DefaultTranscript::<F>::new(&[]);
     let (final_poly_coeffs, fri_layers) = commit_phase_from_evaluations::<F, F, _>(
-        root_order as usize,
         codeword.clone(),
         &mut transcript,
         &offset,

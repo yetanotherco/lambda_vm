@@ -49,7 +49,6 @@ use super::traits::AIR;
 /// Full domain with pre-computed roots of unity. Used by the prover which needs
 /// all elements for FFT operations.
 pub struct Domain<F: IsFFTField> {
-    pub(crate) root_order: u32,
     pub(crate) lde_roots_of_unity_coset: Vec<FieldElement<F>>,
     pub(crate) trace_primitive_root: FieldElement<F>,
     pub(crate) trace_roots_of_unity: Vec<FieldElement<F>>,
@@ -88,7 +87,6 @@ impl<F: IsFFTField> Domain<F> {
         .unwrap();
 
         Self {
-            root_order,
             lde_roots_of_unity_coset,
             trace_primitive_root,
             trace_roots_of_unity,

@@ -1567,7 +1567,6 @@ where
 /// concrete transcript type to support snapshot semantics via `Clone`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E, T>(
-    _number_layers: usize,
     evals: &[FieldElement<E>],
     transcript: &mut T,
     coset_offset: &FieldElement<F>,

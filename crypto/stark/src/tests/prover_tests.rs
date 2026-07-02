@@ -80,7 +80,6 @@ fn test_domain_constructor() {
     );
     assert_eq!(domain.blowup_factor, 2);
     assert_eq!(domain.interpolation_domain_size, trace_length);
-    assert_eq!(domain.root_order, trace_length.trailing_zeros());
     assert_eq!(domain.coset_offset, FieldElement::from(coset_offset));
 
     let primitive_root = GoldilocksField::get_primitive_root_of_unity(
