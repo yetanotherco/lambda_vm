@@ -104,7 +104,7 @@ pub fn validate_trace<
     for step in 0..lde_trace.num_steps() {
         let frame = Frame::read_step_from_lde(&lde_trace, step, &air.context().transition_offsets);
         let transition_evaluation_context = TransitionEvaluationContext::new_prover(
-            &frame,
+            frame.as_row_frame(),
             rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,

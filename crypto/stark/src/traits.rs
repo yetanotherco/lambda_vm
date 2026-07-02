@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     config::Commitment, constraints::boundary::BoundaryConstraints, context::AirContext,
-    frame::Frame, proof::options::ProofOptions, trace::TraceTable,
+    frame::Frame, frame::RowFrame, proof::options::ProofOptions, trace::TraceTable,
 };
 
 /// Deduplicated zerofier evaluations: unique zerofier vectors indexed by constraint.
@@ -71,7 +71,9 @@ where
     E: IsField,
 {
     Prover {
-        frame: &'a Frame<F, E>,
+        /// Borrowed row view straight into the row-major trace storage —
+        /// the prover hot path never copies rows into an owned frame.
+        rows: RowFrame<'a, F, E>,
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -92,14 +94,14 @@ where
     E: IsField,
 {
     pub fn new_prover(
-        frame: &'a Frame<F, E>,
+        rows: RowFrame<'a, F, E>,
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
         packing_shifts: &'a PackingShifts<F>,
     ) -> Self {
         Self::Prover {
-            frame,
+            rows,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,

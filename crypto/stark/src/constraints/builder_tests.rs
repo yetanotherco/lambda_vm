@@ -188,7 +188,7 @@ fn prover_folder_matches_direct_arithmetic() {
         let challenges = vec![t.challenge0];
         let alphas = vec![t.alpha0];
         let ctx = TransitionEvaluationContext::new_prover(
-            &frame,
+            frame.as_row_frame(),
             &challenges,
             &alphas,
             &t.offset,
@@ -226,7 +226,7 @@ fn prover_folder_matches_interpreted_capture() {
         let challenges = vec![t.challenge0];
         let alphas = vec![t.alpha0];
         let ctx = TransitionEvaluationContext::new_prover(
-            &frame,
+            frame.as_row_frame(),
             &challenges,
             &alphas,
             &t.offset,
@@ -360,8 +360,13 @@ fn prover_folder_missing_emit_asserts() {
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &challenges,
+        &alphas,
+        &offset,
+        &shifts,
+    );
 
     let mut base_out = vec![FpE::zero(); 2];
     let mut ext_out = vec![ExtE::zero(); 2];
@@ -381,8 +386,13 @@ fn prover_folder_double_emit_asserts() {
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &challenges,
+        &alphas,
+        &offset,
+        &shifts,
+    );
 
     let mut base_out = vec![FpE::zero(); 2];
     let mut ext_out = vec![ExtE::zero(); 2];
@@ -594,8 +604,13 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
             .map(|s| TableView::new(vec![rows[s].clone()], vec![auxs[s].clone()]))
             .collect();
         let frame = Frame::<Fp, Ext>::new(steps);
-        let ctx =
-            TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
+        let ctx = TransitionEvaluationContext::new_prover(
+            frame.as_row_frame(),
+            &challenges,
+            &alphas,
+            &offset,
+            &shifts,
+        );
 
         let mut folder_base = vec![FpE::zero(); num_base];
         let mut folder_ext = vec![ExtE::zero(); meta.len()];

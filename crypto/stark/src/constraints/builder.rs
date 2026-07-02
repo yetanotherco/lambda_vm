@@ -26,7 +26,7 @@ use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
 
 use crate::constraint_ir::{ConstraintProgram, Dim, IrBuilder};
-use crate::frame::Frame;
+use crate::frame::{Frame, RowFrame};
 use crate::traits::TransitionEvaluationContext;
 
 // =============================================================================
@@ -372,7 +372,7 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    frame: &'a Frame<F, E>,
+    rows: RowFrame<'a, F, E>,
     challenges: &'a [FieldElement<E>],
     alphas: &'a [FieldElement<E>],
     logup_table_offset: &'a FieldElement<E>,
@@ -397,7 +397,7 @@ where
         ext_out: &'a mut [FieldElement<E>],
     ) -> Self {
         let TransitionEvaluationContext::Prover {
-            frame,
+            rows,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
@@ -408,7 +408,7 @@ where
         };
         let num_constraints = base_out.len().max(ext_out.len());
         Self {
-            frame,
+            rows: *rows,
             challenges: rap_challenges,
             alphas: logup_alpha_powers,
             logup_table_offset,
@@ -434,16 +434,10 @@ where
     type ExprE = FieldElement<E>;
 
     fn main(&self, offset: usize, col: usize) -> FieldElement<F> {
-        self.frame
-            .get_evaluation_step(offset)
-            .get_main_evaluation_element(0, col)
-            .clone()
+        self.rows.main(offset, col).clone()
     }
     fn aux(&self, offset: usize, col: usize) -> FieldElement<E> {
-        self.frame
-            .get_evaluation_step(offset)
-            .get_aux_evaluation_element(0, col)
-            .clone()
+        self.rows.aux(offset, col).clone()
     }
     fn challenge(&self, idx: usize) -> FieldElement<E> {
         self.challenges[idx].clone()

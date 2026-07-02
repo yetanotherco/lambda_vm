@@ -2327,7 +2327,7 @@ mod logup_single_source_tests {
             let table_offset = rand_fp3(&mut rng);
 
             let prover_ctx = TransitionEvaluationContext::new_prover(
-                &frame,
+                frame.as_row_frame(),
                 &rap_challenges,
                 &alpha_powers,
                 &table_offset,

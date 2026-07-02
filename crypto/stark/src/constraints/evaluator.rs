@@ -1,6 +1,6 @@
 use super::boundary::BoundaryConstraints;
 use crate::domain::Domain;
-use crate::frame::Frame;
+use crate::frame::RowFrame;
 use crate::lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::trace::LDETraceTable;
 use crate::traits::{AIR, TransitionEvaluationContext, ZerofierEvaluations};
@@ -61,29 +61,21 @@ where
         // Precompute packing shift constants once for all LDE domain points.
         let packing_shifts = PackingShifts::<Field>::new();
 
-        // Per-thread buffers via map_init: each Rayon worker allocates once,
-        // then reuses for all iterations assigned to that thread.
-        // The Frame is pre-allocated and filled in-place to avoid Vec allocations
-        // on every LDE point (a significant fraction of total CPU time).
-        let blowup_factor = lde_trace.blowup_factor;
-        let lde_step_size = lde_trace.lde_step_size;
-        let rows_per_step = lde_step_size / blowup_factor;
-        let num_main_cols = lde_trace.num_main_cols();
-        let num_aux_cols = lde_trace.num_aux_cols();
-        let num_offsets = offsets.len();
-
+        // Per-thread output buffers via map_init: each Rayon worker allocates
+        // once, then reuses for all iterations assigned to that thread. The
+        // trace rows themselves are BORROWED in place per LDE point (the LDE
+        // buffers are row-major) — no per-row gather copy.
         // Per-row evaluation, shared by the parallel and sequential paths below:
-        // fill the frame, evaluate transition constraints, accumulate with zerofiers.
+        // borrow the rows, evaluate transition constraints, accumulate with zerofiers.
         let eval_row = |i: usize,
                         boundary: FieldElement<FieldExtension>,
                         transition_buf: &mut [FieldElement<FieldExtension>],
-                        base_buf: &mut [FieldElement<Field>],
-                        frame: &mut Frame<Field, FieldExtension>|
+                        base_buf: &mut [FieldElement<Field>]|
          -> FieldElement<FieldExtension> {
-            frame.fill_from_lde(lde_trace, i, offsets);
+            let rows = RowFrame::from_lde(lde_trace, i, offsets);
 
             let ctx = TransitionEvaluationContext::new_prover(
-                frame,
+                rows,
                 rap_challenges,
                 &logup_alpha_powers,
                 logup_table_offset,
@@ -136,16 +128,10 @@ where
                         (
                             vec![FieldElement::<FieldExtension>::zero(); num_transition],
                             vec![FieldElement::<Field>::zero(); num_base],
-                            Frame::preallocate(
-                                num_offsets,
-                                rows_per_step,
-                                num_main_cols,
-                                num_aux_cols,
-                            ),
                         )
                     },
-                    |(transition_buf, base_buf, frame), (i, boundary)| {
-                        eval_row(i, boundary, transition_buf, base_buf, frame)
+                    |(transition_buf, base_buf), (i, boundary)| {
+                        eval_row(i, boundary, transition_buf, base_buf)
                     },
                 )
                 .collect()
@@ -155,15 +141,11 @@ where
         {
             let mut transition_buf = vec![FieldElement::<FieldExtension>::zero(); num_transition];
             let mut base_buf = vec![FieldElement::<Field>::zero(); num_base];
-            let mut frame =
-                Frame::preallocate(num_offsets, rows_per_step, num_main_cols, num_aux_cols);
 
             boundary_evaluation
                 .into_iter()
                 .enumerate()
-                .map(|(i, boundary)| {
-                    eval_row(i, boundary, &mut transition_buf, &mut base_buf, &mut frame)
-                })
+                .map(|(i, boundary)| eval_row(i, boundary, &mut transition_buf, &mut base_buf))
                 .collect()
         }
     }
