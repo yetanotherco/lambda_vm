@@ -537,7 +537,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // second output = extension - X[4] (the carry, expressed as a linear combination)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
-        one_minus_zbs.clone(),
+        one_minus_zbs,
         vec![
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: 65535,
