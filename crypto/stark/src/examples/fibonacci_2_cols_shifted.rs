@@ -1,6 +1,10 @@
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -159,6 +163,47 @@ where
     }
 }
 
+/// Single-body [`ConstraintSet`] for [`Fibonacci2ColsShifted`]: the same
+/// constraints as `ShiftedFibTransition1` + `ShiftedFibTransition2`, written
+/// once against the [`ConstraintBuilder`].
+pub struct Fibonacci2ColsShiftedConstraints<F: IsFFTField> {
+    phantom: PhantomData<F>,
+}
+
+impl<F: IsFFTField> Default for Fibonacci2ColsShiftedConstraints<F> {
+    fn default() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> ConstraintSet<F, F> for Fibonacci2ColsShiftedConstraints<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            // idx 0: Col0_{i+1} = Col1_i; reads the next row ⇒ 1 end exemption.
+            ConstraintMeta::base(0, 1).with_end_exemptions(1),
+            // idx 1: Col1_{i+1} = Col0_i + Col1_i; reads the next row ⇒ 1 end exemption.
+            ConstraintMeta::base(1, 1).with_end_exemptions(1),
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let a0_0 = b.main(0, 0);
+        let a0_1 = b.main(0, 1);
+        let a1_0 = b.main(1, 0);
+        let a1_1 = b.main(1, 1);
+
+        // Col0_{i+1} = Col1_i
+        b.emit_base(0, a1_0 - a0_1.clone());
+        // Col1_{i+1} = Col0_i + Col1_i
+        b.emit_base(1, a1_1 - a0_0 - a0_1);
+    }
+}
+
 pub struct Fibonacci2ColsShifted<F>
 where
     F: IsFFTField,
@@ -225,6 +270,36 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &Fibonacci2ColsShiftedConstraints::default(),
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &Fibonacci2ColsShiftedConstraints::default(),
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&Fibonacci2ColsShiftedConstraints::<F>::default().meta())
     }
 
     fn context(&self) -> &AirContext {
