@@ -21,7 +21,6 @@ use stark::constraints::builder::{
     num_base_from_meta,
 };
 use stark::frame::Frame;
-use stark::lookup::PackingShifts;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
@@ -73,6 +72,16 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
     set.eval(&mut cb);
     let (prog, degrees) = cb.finish(n);
     assert_eq!(degrees.len(), n, "[{label}] one emit per constraint");
+    // Release-safe exact-once check: the emitted indices must be exactly
+    // 0..n. The per-emit EmitTracker only exists under debug_assertions,
+    // which CI's --release test build compiles out; this assert catches a
+    // double-emit/skip typo (count still == n) in any build profile.
+    let mut emitted: Vec<usize> = degrees.iter().map(|&(idx, _)| idx).collect();
+    emitted.sort_unstable();
+    assert!(
+        emitted.iter().enumerate().all(|(i, &idx)| i == idx),
+        "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
+    );
     for &(idx, measured) in &degrees {
         assert_eq!(
             measured, meta[idx].degree,
@@ -80,9 +89,6 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
             meta[idx].degree
         );
     }
-
-    let shifts = PackingShifts::<Gl>::new();
-    let vshifts = PackingShifts::<Gl3>::new();
     let no_ch: Vec<Fp3> = vec![];
     let offset_e = Fp3::zero();
 
@@ -98,7 +104,6 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
             &no_ch,
             &no_ch,
             &offset_e,
-            &shifts,
         );
         let mut base_out = vec![FE::zero(); n];
         let mut ext_out = vec![Fp3::zero(); n];
@@ -110,7 +115,7 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
         let frame_e =
             Frame::<Gl3, Gl3>::new(vec![TableView::new(vec![row_e.clone()], vec![vec![]])]);
         let vctx = TransitionEvaluationContext::<Gl, Gl3>::new_verifier(
-            &frame_e, &no_ch, &no_ch, &offset_e, &vshifts,
+            &frame_e, &no_ch, &no_ch, &offset_e,
         );
         let mut vext_out = vec![Fp3::zero(); n];
         let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);

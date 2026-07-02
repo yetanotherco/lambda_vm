@@ -10,7 +10,6 @@ use crate::tables::types::{
 use math::field::element::FieldElement;
 use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
 use stark::frame::Frame;
-use stark::lookup::PackingShifts;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
@@ -22,16 +21,10 @@ fn eval_cpu32(row: &[FE]) -> Vec<FE> {
         vec![row.to_vec()],
         vec![vec![]],
     )]);
-    let shifts = PackingShifts::<GoldilocksField>::new();
     let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
     let offset_e = FieldElement::<GoldilocksExtension>::zero();
-    let ctx = TransitionEvaluationContext::new_prover(
-        frame.as_row_frame(),
-        &no_e,
-        &no_e,
-        &offset_e,
-        &shifts,
-    );
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
     let mut base = vec![FE::zero(); n];
     let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
     let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);

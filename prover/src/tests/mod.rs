@@ -17,6 +17,8 @@ pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
 pub mod constraint_emit_tests;
 #[cfg(test)]
+pub mod constraint_program_tests;
+#[cfg(test)]
 pub mod constraint_set_tests_a;
 #[cfg(test)]
 pub mod constraint_set_tests_b;

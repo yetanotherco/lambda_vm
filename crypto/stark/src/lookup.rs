@@ -542,8 +542,9 @@ pub enum LinearTerm {
 
 /// A value that contributes to the bus fingerprint.
 ///
-/// Each `BusValue` produces exactly **1 bus element** for the fingerprint.
-/// The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
+/// A `BusValue` produces 1, 2, or 4 bus elements for the fingerprint depending
+/// on its packing (see [`BusValue::num_bus_elements`]); `Linear` always
+/// produces 1. The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
 /// where each `vᵢ` is a bus element from a `BusValue`.
 #[derive(Debug, Clone)]
 pub enum BusValue {
@@ -591,7 +592,8 @@ impl BusValue {
         BusValue::Linear(terms)
     }
 
-    /// Returns the number of bus elements this value produces (always 1).
+    /// Returns the number of bus elements this value produces: 1, 2, or 4 for
+    /// `Packed` depending on the packing, always 1 for `Linear`.
     pub fn num_bus_elements(&self) -> usize {
         match self {
             BusValue::Packed { packing, .. } => packing.num_bus_elements(),
@@ -1729,11 +1731,12 @@ where
 // All LogUp constraints use the default zerofier shape (every row, no
 // exemptions), so [`logup_meta`] emits plain [`RootKind::Ext`] entries.
 //
-// Honesty note (matches the runtime body): `BusValue::Linear`'s data-dependent
-// "skip the multiply when the row value is zero" optimization is NOT reproduced
-// here — the constraint body is row-agnostic and always emits the multiply.
-// This is value-preserving (adding `0·α` is a no-op) and only costs a few extra
-// base×ext muls per row.
+// The data-dependent "skip the multiply when the row value is zero"
+// optimization IS reproduced, through the [`ConstraintBuilder::fold_fingerprint_term`]
+// hook rather than in this row-agnostic body: capture and the verifier fold the
+// term unconditionally (value-identical, since `0·α = 0`), while
+// `ProverEvalFolder` overrides the hook to skip the base×ext multiply for a
+// zero bus element on the hot per-row path.
 
 use crate::constraints::builder::ConstraintBuilder;
 
@@ -1963,8 +1966,8 @@ where
         ),
         BusValue::Linear(terms) => {
             // Routed through the builder so the prover folder can zero-skip
-            // the multiply, as the old runtime body did (Linear is where the
-            // constant-0 bus-width padding lives). Value-identical either way.
+            // the multiply (Linear is where the constant-0 bus-width padding
+            // lives). Value-identical either way.
             let result = emit_linear_terms(b, terms, offset);
             (b.fold_fingerprint_term(fp, result, alpha_offset), 1)
         }
@@ -2117,11 +2120,10 @@ where
 }
 
 /// The idx-ordered [`ConstraintMeta`] for `layout`'s LogUp constraints, starting
-/// at `idx_start`. Reproduces the boxed structs' answers exactly: batched terms
-/// are degree 3; the accumulated constraint is degree `1 + absorbed.len()`
-/// (2 for one absorbed, 3 for two). All are [`RootKind::Ext`] with the default
-/// zerofier shape (period 1, offset 0, no exemptions) — the structs override
-/// none of those.
+/// at `idx_start`: batched terms are degree 3; the accumulated constraint is
+/// degree `1 + absorbed.len()` (2 for one absorbed, 3 for two). All are
+/// [`RootKind::Ext`] with the default zerofier shape (period 1, offset 0, no
+/// exemptions).
 pub fn logup_meta(layout: &LogUpLayout, idx_start: usize) -> Vec<ConstraintMeta> {
     let mut meta = Vec::with_capacity(layout.num_constraints());
     if layout.interactions.is_empty() {
@@ -2167,7 +2169,7 @@ fn run_air_transition_prover<F, E, CS>(
 /// A Verifier context runs the [`VerifierEvalFolder`] (the OOD/recursion path).
 /// A Prover context is also accepted — debug trace validation calls this with a
 /// prover frame — by running the [`ProverEvalFolder`] and promoting the
-/// base-prefix results, mirroring the old boxed path.
+/// base-prefix results.
 fn run_air_transition_verifier<F, E, CS>(
     constraint_set: &CS,
     logup: &LogUpLayout,
@@ -2268,9 +2270,7 @@ mod logup_single_source_tests {
     /// two-step frames: the LogUp body run three ways from ONE definition must
     /// agree bit-for-bit — [`ProverEvalFolder`] == capture→[`eval_program`]
     /// (prover) and [`VerifierEvalFolder`] == capture→[`eval_program_verifier`]
-    /// (verifier). (The old boxed-constraint oracle these were originally
-    /// differentiated against is gone; the folder-vs-interpreter equality it
-    /// established stays as the standing invariant.)
+    /// (verifier).
     fn check_layout(label: &str, layout: &LogUpLayout, num_main_cols: usize) {
         let n_base = 0usize; // LogUp constraints are all extension-rooted.
         let n = layout.num_constraints();
@@ -2296,8 +2296,16 @@ mod logup_single_source_tests {
         let mut cb = CaptureBuilder::<Gl, Ext3>::new();
         emit_logup_constraints(&mut cb, layout, n_base);
         let (prog, degrees) = cb.finish(num_base);
-        assert!(prog.complete, "[{label}] capture must be complete");
         assert_eq!(degrees.len(), n, "[{label}] one emit per constraint");
+        // Release-safe exact-once check: the emitted indices must be exactly
+        // 0..n (the per-emit EmitTracker only exists under debug_assertions,
+        // which a --release test build compiles out).
+        let mut emitted: Vec<usize> = degrees.iter().map(|&(idx, _)| idx).collect();
+        emitted.sort_unstable();
+        assert!(
+            emitted.iter().enumerate().all(|(i, &idx)| i == idx),
+            "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
+        );
         for &(idx, measured) in &degrees {
             assert!(
                 measured <= meta[idx].degree,
@@ -2307,8 +2315,6 @@ mod logup_single_source_tests {
         }
 
         let n_aux = num_aux_cols(layout);
-        let shifts = PackingShifts::<Gl>::new();
-        let vshifts = PackingShifts::<Ext3>::new();
 
         for trial in 0..TRIALS {
             let mut rng = SplitMix64::new(0xC0FF_EE00_u64 ^ (label.len() as u64) ^ trial as u64);
@@ -2331,7 +2337,6 @@ mod logup_single_source_tests {
                 &rap_challenges,
                 &alpha_powers,
                 &table_offset,
-                &shifts,
             );
 
             // --- ProverEvalFolder == capture → interpret (prover) ---
@@ -2370,7 +2375,6 @@ mod logup_single_source_tests {
                 &rap_challenges,
                 &alpha_powers,
                 &table_offset,
-                &vshifts,
             );
 
             // --- VerifierEvalFolder == capture → interpret (verifier) ---
@@ -2495,6 +2499,29 @@ mod logup_single_source_tests {
                 packing.num_columns(),
             );
         }
+    }
+
+    #[test]
+    fn logup_two_committed_pairs() {
+        // >= 2 committed pairs: split(6) = (2 pairs, 2 absorbed). Exercises
+        // the batched-term loop past its first iteration (pair_idx*2
+        // interaction indexing, per-pair term columns) and the accumulated
+        // constraint's committed-term sum over more than one aux column —
+        // the layout shape every production table has, which the fixtures
+        // above (<= 4 interactions, <= 1 pair) never reach.
+        let interactions = vec![
+            direct_sender(3),
+            column_receiver(5),
+            direct_sender(7),
+            column_receiver(11),
+            direct_sender(13),
+            column_receiver(17),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 2, "must exercise >= 2 pairs");
+        assert_eq!(layout.absorbed().len(), 2);
+        assert_eq!(layout.num_constraints(), 3); // 2 batched terms + accumulated
+        check_layout("two_committed_pairs", &layout, 8);
     }
 
     #[test]
