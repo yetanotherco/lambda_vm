@@ -240,17 +240,6 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
-    // b − a touches only component 0 (the default neg(sub) shape negates
-    // every component twice).
-    #[inline(always)]
-    fn sub_from(
-        a: &Self::BaseType,
-        b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
-    ) -> <Degree2GoldilocksExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::sub(b[0].value(), a));
-        [c0, b[1]]
-    }
-
     #[inline(always)]
     fn embed(a: Self::BaseType) -> <Degree2GoldilocksExtensionField as IsField>::BaseType {
         [FpE::from_raw(a), FpE::zero()]
@@ -471,17 +460,6 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         let c1 = FpE::from_raw(<Self as IsField>::neg(b[1].value()));
         let c2 = FpE::from_raw(<Self as IsField>::neg(b[2].value()));
         [c0, c1, c2]
-    }
-
-    // b − a touches only component 0 (the default neg(sub) shape negates
-    // every component twice).
-    #[inline(always)]
-    fn sub_from(
-        a: &Self::BaseType,
-        b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
-    ) -> <Degree3GoldilocksExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::sub(b[0].value(), a));
-        [c0, b[1], b[2]]
     }
 
     #[inline(always)]

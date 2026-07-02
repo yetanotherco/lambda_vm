@@ -19,13 +19,6 @@ pub trait IsSubFieldOf<F: IsField>: IsField {
     fn add(a: &Self::BaseType, b: &F::BaseType) -> F::BaseType;
     fn div(a: &Self::BaseType, b: &F::BaseType) -> Result<F::BaseType, FieldError>;
     fn sub(a: &Self::BaseType, b: &F::BaseType) -> F::BaseType;
-    /// `b - a` (extension minus subfield). The default routes through
-    /// `neg(sub(a, b))`; extension impls with a subfield-aligned basis
-    /// override it to subtract on component 0 only.
-    #[inline(always)]
-    fn sub_from(a: &Self::BaseType, b: &F::BaseType) -> F::BaseType {
-        F::neg(&<Self as IsSubFieldOf<F>>::sub(a, b))
-    }
     fn embed(a: Self::BaseType) -> F::BaseType;
     #[cfg(feature = "alloc")]
     fn to_subfield_vec(b: F::BaseType) -> alloc::vec::Vec<Self::BaseType>;

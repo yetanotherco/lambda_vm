@@ -578,8 +578,10 @@ where
     /// explicitly converting rhs to the extension field.
     #[inline(always)]
     pub fn sub_subfield<S: IsSubFieldOf<F>>(&self, rhs: &FieldElement<S>) -> Self {
+        // embed(rhs) - self gives the negation of what we want, in F.
+        // Then negate to get self - embed(rhs).
         Self {
-            value: <S as IsSubFieldOf<F>>::sub_from(&rhs.value, &self.value),
+            value: F::neg(&<S as IsSubFieldOf<F>>::sub(&rhs.value, &self.value)),
         }
     }
 

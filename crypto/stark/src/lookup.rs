@@ -1991,7 +1991,9 @@ where
 {
     let z = b.challenge(0);
     let bus = b.const_base(interaction.bus_id);
-    let mut fp = b.ext_sub_base(z, bus);
+    // `bus` is base and `z` ext; the tower only implements base − ext (base
+    // operand LEFT), so z − bus is written −(bus − z).
+    let mut fp = -(bus - z);
     let mut alpha_idx = 1;
     for bv in &interaction.values {
         let (next, consumed) = emit_busvalue_fingerprint::<F, E, B>(b, bv, offset, alpha_idx, fp);
@@ -2019,25 +2021,25 @@ where
     let fp_a = emit_fingerprint::<F, E, B>(b, interaction_a, 0);
     let fp_b = emit_fingerprint::<F, E, B>(b, interaction_b, 0);
 
-    // is_sender is a compile-time bool, resolved as sub vs add — subtracting
-    // a receiver's negated term is adding it (x − (−t) = x + t), which skips
-    // the ext negation entirely. m·fp is base×ext = ext (base operand LEFT).
+    // is_sender is a compile-time bool, resolved as add vs neg instead of an
+    // ext×ext sign multiply (same optimization as the runtime body). m·fp is
+    // base×ext = ext (base operand LEFT).
     let term_a = m_a * fp_b.clone();
+    let term_a = if interaction_a.is_sender {
+        term_a
+    } else {
+        -term_a
+    };
     let term_b = m_b * fp_a.clone();
+    let term_b = if interaction_b.is_sender {
+        term_b
+    } else {
+        -term_b
+    };
 
     // c · fp_a · fp_b: c is aux (ext), so this is ext throughout.
     let main = c * fp_a * fp_b;
-    let acc = if interaction_a.is_sender {
-        main - term_a
-    } else {
-        main + term_a
-    };
-    let acc = if interaction_b.is_sender {
-        acc - term_b
-    } else {
-        acc + term_b
-    };
-    b.emit_ext(idx, acc);
+    b.emit_ext(idx, main - term_a - term_b);
 }
 
 /// Emit the accumulated constraint (with 1–2 absorbed interactions).
@@ -2069,36 +2071,23 @@ where
             // delta · f − sign · m
             let m = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
             let f = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
-            let df = delta * f;
-            // sign resolved as ext−base vs base+ext: for a sender the root is
-            // df − m; for a receiver, df − (−m) = m + df (base operand LEFT).
-            if absorbed[0].is_sender {
-                b.ext_sub_base(df, m)
-            } else {
-                m + df
-            }
+            let mt = if absorbed[0].is_sender { m } else { -m };
+            // delta · f is ext; `mt` is base. The tower only implements base −
+            // ext (base operand LEFT), so write `delta·f − mt` as `−(mt − delta·f)`.
+            -(mt - delta * f)
         }
         2 => {
-            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1, with the signs
-            // resolved as sub vs add (x − (−t) = x + t) — no ext negation.
+            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1
             let m1 = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
             let m2 = emit_multiplicity::<F, E, B>(b, &absorbed[1].multiplicity, 1);
             let f1 = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
             let f2 = emit_fingerprint::<F, E, B>(b, &absorbed[1], 1);
 
             let term1 = m1 * f2.clone();
+            let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
             let term2 = m2 * f1.clone();
-            let acc = delta * f1 * f2;
-            let acc = if absorbed[0].is_sender {
-                acc - term1
-            } else {
-                acc + term1
-            };
-            if absorbed[1].is_sender {
-                acc - term2
-            } else {
-                acc + term2
-            }
+            let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+            delta * f1 * f2 - term1 - term2
         }
         _ => unreachable!("absorbed must contain 1 or 2 interactions"),
     };
