@@ -482,6 +482,7 @@ impl VmAirs {
     /// When `vkey` is `Some`, the bitwise preprocessed commitment is taken
     /// from it instead of being recomputed from `proof_options` — that
     /// recomputation is ~87% of verifier cycles inside the recursion guest.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_with_vkey(
         elf: &Elf,
         proof_options: &ProofOptions,
