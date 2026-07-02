@@ -64,8 +64,9 @@ makes the proof fail.
   - **genesis**: a cell's starting value. For ELF/runtime pages it is **preprocessed**
     (read from the ELF, so the verifier recomputes it — the prover cannot choose initial
     memory). For **private-input pages** it is a **committed** (non-preprocessed) column
-    the verifier never recomputes — the private bytes stay private and are pinned by the
-    bus instead (see §3.6); this mirrors the monolithic PAGE table.
+    the verifier never recomputes from the ELF — the raw private input is neither bundled
+    nor reconstructed by the verifier, and the value is pinned by the bus instead (see
+    §3.6); this mirrors the monolithic PAGE table. (Not a ZK/hiding guarantee — see §3.6.)
   - **finalization**: a cell's final value after the last epoch that touched it.
 
 ### A single L2G row
@@ -238,12 +239,13 @@ accepts — only how the driver slices cycles. A debug-assert enforces the
 
 Genesis for ELF/runtime pages is preprocessed, so the verifier recomputes it from the
 ELF — that is what stops a prover from choosing initial memory (§2). But **private
-input** is, by definition, *not* in the ELF and must **stay private** from the verifier.
-So a private-input page's genesis cannot be ELF-recomputed.
+input** is, by definition, *not* in the ELF, so it must not be verifier-recomputed and
+must not be shipped in the proof bundle. So a private-input page's genesis cannot be
+ELF-recomputed.
 
 Fix (mirrors the monolithic PAGE table exactly): build the `global_memory` AIR for a
 private-input page **non-preprocessed**, so its `INIT` (genesis) is a **committed
-main-trace column** the verifier never recomputes or sees. Correctness is enforced by
+main-trace column** the verifier never recomputes from the ELF. Correctness is enforced by
 the same bus chain as everything else: the genesis token telescopes into the first
 touching epoch's L2G `init`, which is pinned on the epoch-local Memory bus to MEMW's
 true first-read value. A forged genesis would leave an unmatched Memory-bus term. This
@@ -251,6 +253,15 @@ is the same "output pinned by a complete chain" argument as the finalization (§
 private genesis is prover-supplied *by design* (it is the private input), so the proof
 attests "**there exists** a private input producing this output" — the intended
 semantics, identical to the monolithic prover.
+
+**Scope of the guarantee (not zero-knowledge).** What this buys is that the raw private
+input is **neither bundled in the proof nor recomputed by the verifier** — not that it is
+cryptographically hidden. This proving stack is a non-ZK STARK: the committed private
+`INIT` column, like every committed column, is opened at FRI query positions, so a
+verifier does learn some trace evaluations. Cryptographic hiding of the private input
+would require a ZK/blinded proof system (a separate, larger change). Phrase any external
+claim as "raw private input is not bundled or recomputed by the verifier," not "the
+verifier never sees it."
 
 **One prerequisite — the region must hold only private input.** Skipping the ELF
 recomputation is safe *only* if no ELF-declared data lives in the private-input region;
@@ -586,7 +597,7 @@ recursion/aggregation layer (deferred).
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
   ordering check (§3.3), the `MU` selector (§3.4), the **power-of-two epoch size**
-  (§3.5), **private-input genesis kept private** (§3.6), **cross-epoch registers**
+  (§3.5), **private-input genesis not bundled/recomputed** (§3.6), **cross-epoch registers**
   (§6), the **commit index x254** across epochs (§6), the **Fiat-Shamir statement
   binding** (§7), and the **standalone split prover/verifier** (§8) — bundle serialized
   with `bincode` and driven from the CLI (`prove`/`verify --continuations`).
@@ -598,11 +609,14 @@ recursion/aggregation layer (deferred).
   - **Succinctness.** The split verifier is non-succinct (N+1 proofs, §8). A single
     small proof needs a recursion/aggregation layer — a separate, larger effort.
   - **Private-input *content* binding.** The bundle no longer carries the private input
-    in the clear (§3.6 — it carries only the page count, and the verifier never sees the
-    bytes). What remains deferred is pinning *which specific input* produced the output:
-    the proof attests only that *some* private input does. A guest that needs "this exact
-    input" must commit a hash of it to the public output — the framework provides no such
-    binding on either the continuation or monolithic path.
+    in the clear (§3.6 — it carries only the page count; the raw input is neither bundled
+    nor recomputed by the verifier). What remains deferred is pinning *which specific input*
+    produced the output: the proof attests only that *some* private input does. A guest that
+    needs "this exact input" must commit a hash of it to the public output — the framework
+    provides no such binding on either the continuation or monolithic path.
+  - **Zero-knowledge / hiding.** As noted in §3.6, this is a non-ZK STARK: committed private
+    columns are opened at query positions, so the private input is not cryptographically
+    hidden. Cryptographic hiding would need a ZK/blinded proof system.
 
 ---
 

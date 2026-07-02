@@ -15,8 +15,10 @@
 //!
 //! Private-input pages are the exception: the AIR is built NON-preprocessed (see
 //! `continuation::global_memory_air`), so INIT is a committed main-trace column the
-//! verifier never recomputes — the private genesis bytes stay private and correctness
-//! is enforced by the GlobalMemory bus, exactly as the monolithic PAGE does.
+//! verifier never recomputes from the ELF — the raw private input is neither bundled nor
+//! reconstructed by the verifier, and correctness is enforced by the GlobalMemory bus,
+//! exactly as the monolithic PAGE does. (This is not zero-knowledge: the committed column
+//! is still opened at STARK query positions; it is not a cryptographic hiding guarantee.)
 //!
 //! ## Columns
 //!

@@ -8,10 +8,16 @@
 //! The global proof's genesis anchor is bound to the ELF: for ELF/runtime pages the
 //! verifier recomputes the per-page preprocessed init commitment from the ELF in
 //! `verify_global`, so the starting memory cannot be prover-supplied. Private-input
-//! pages are the one exception — their genesis is committed (non-preprocessed) and
-//! kept private, exactly as the monolithic prover does, with correctness enforced by
-//! the GlobalMemory bus rather than ELF recomputation (so the verifier never sees the
-//! raw private input).
+//! pages are the one exception — their genesis is committed (non-preprocessed), exactly
+//! as the monolithic prover does, with correctness enforced by the GlobalMemory bus
+//! rather than ELF recomputation, so the raw private input is neither carried in the
+//! proof bundle nor reconstructed by the verifier.
+//!
+//! Scope of the privacy guarantee: this is NOT zero-knowledge. Like every non-ZK STARK
+//! column, the committed private genesis is opened at FRI query positions, so this does
+//! not cryptographically hide the private input — it only guarantees the raw input is
+//! not bundled and not recomputed by the verifier. Cryptographic hiding would require a
+//! ZK/blinded proof system.
 //!
 //! The local-to-global columns are range-checked in the epoch proof (which
 //! carries the BITWISE provider): values are bytes, and the cross-epoch-only
@@ -196,10 +202,11 @@ fn l2g_memory_air(
 /// cannot choose those genesis values.
 ///
 /// Private-input pages are built NON-preprocessed (mirrors the monolithic PAGE in
-/// `VmAirs::new`): INIT is a committed main-trace column the verifier never recomputes,
-/// so the verifier never sees the private genesis bytes. Correctness is enforced by
-/// the GlobalMemory bus (the genesis token must telescope into the epochs' reads), not
-/// by recomputation from the ELF.
+/// `VmAirs::new`): INIT is a committed main-trace column the verifier never recomputes
+/// from the ELF, so the raw private input is neither bundled nor reconstructed by the
+/// verifier. Correctness is enforced by the GlobalMemory bus (the genesis token must
+/// telescope into the epochs' reads), not by ELF recomputation. (Not a ZK/hiding claim —
+/// the committed column is still opened at STARK query positions.)
 fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
@@ -720,7 +727,7 @@ fn verify_global(
     // different genesis values would commit a different root and fail to verify.
     // Private-input pages (the first `num_private_input_pages` from
     // PRIVATE_INPUT_START_INDEX) are built non-preprocessed, so the verifier never
-    // recomputes (or sees) their genesis bytes; the GlobalMemory bus enforces them. A
+    // recomputes their genesis from the ELF; the GlobalMemory bus enforces them. A
     // wrong `num_private_input_pages` flips a touched page's preprocessed mode, so the
     // rebuilt AIR no longer matches the committed trace and `multi_verify` rejects.
     let gm_configs = global_memory_configs(page_bases, elf, num_private_input_pages);
@@ -988,7 +995,7 @@ pub fn verify_continuation(
     // Cross-epoch global memory: genesis for ELF/runtime pages is rebuilt FROM THE ELF
     // (no private bytes), so the starting memory cannot be prover-chosen; the bus
     // telescopes fini→init. Private-input pages are committed, non-preprocessed (genesis
-    // stays private), bus-enforced. The verifier needs only the epoch count and the
+    // not bundled/ELF-recomputed), bus-enforced. The verifier needs only the epoch count and the
     // touched page-base set (never cell values); the bundle carries the latter directly.
     // Canonicalize the (untrusted) list so a shuffled-but-same-set list still verifies,
     // while a different set fails via GlobalMemory-bus imbalance / AIR-count mismatch.
@@ -1295,8 +1302,8 @@ mod tests {
         );
     }
 
-    // Private input must stay private under continuations. The bundle carries no raw
-    // private bytes (only `num_private_input_pages`), yet a multi-epoch continuation of
+    // The raw private input must not be bundled under continuations. The bundle carries no
+    // raw private bytes (only `num_private_input_pages`), yet a multi-epoch continuation of
     // a program that reads private input verifies from the bundle + ELF ALONE and
     // reconstructs the committed output. Regression for the genesis leak: the global
     // proof's private-input genesis is a committed, bus-enforced column, not a
