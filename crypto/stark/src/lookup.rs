@@ -1962,9 +1962,11 @@ where
             fp,
         ),
         BusValue::Linear(terms) => {
-            // Value-preserving: always emit the multiply (see the module note).
+            // Routed through the builder so the prover folder can zero-skip
+            // the multiply, as the old runtime body did (Linear is where the
+            // constant-0 bus-width padding lives). Value-identical either way.
             let result = emit_linear_terms(b, terms, offset);
-            (fp - result * b.alpha_pow(alpha_offset), 1)
+            (b.fold_fingerprint_term(fp, result, alpha_offset), 1)
         }
     }
 }
@@ -2493,5 +2495,50 @@ mod logup_single_source_tests {
                 packing.num_columns(),
             );
         }
+    }
+
+    #[test]
+    fn logup_linear_zero_skip() {
+        // The prover folder zero-skips the F×E multiply for Linear bus
+        // elements ([`ConstraintBuilder::fold_fingerprint_term`]); the random
+        // frames above never produce a zero element, so drive both always-zero
+        // shapes explicitly — the constant-0 bus-width padding and a
+        // column-minus-itself combination — next to a nonzero element, and
+        // assert the folder still matches the (skip-free) captured program
+        // bit-for-bit.
+        let zero_padded = |bus: u64, sender: bool| {
+            let values = vec![
+                BusValue::column(1),
+                BusValue::linear(vec![LinearTerm::Constant(0)]),
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: 2,
+                    },
+                    LinearTerm::Column {
+                        coefficient: -1,
+                        column: 2,
+                    },
+                ]),
+                BusValue::linear(vec![LinearTerm::Column {
+                    coefficient: 3,
+                    column: 3,
+                }]),
+            ];
+            if sender {
+                BusInteraction::sender(bus, Multiplicity::Column(0), values)
+            } else {
+                BusInteraction::receiver(bus, Multiplicity::Column(0), values)
+            }
+        };
+        let interactions = vec![
+            zero_padded(3, true),
+            zero_padded(5, false),
+            zero_padded(7, true),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 1);
+        check_layout("linear_zero_skip", &layout, 8);
     }
 }

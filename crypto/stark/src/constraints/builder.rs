@@ -123,6 +123,27 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr);
     /// Record extension-field (LogUp) constraint `constraint_idx`'s value.
     fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE);
+
+    // ---- folds ----------------------------------------------------------
+    /// Fold one α·value term into a running LogUp fingerprint:
+    /// `fp − v·α[alpha_idx]`.
+    ///
+    /// This default emits the multiply unconditionally — the only option for
+    /// capture (the IR has no data-dependent control flow) and correct for
+    /// every builder. [`ProverEvalFolder`] overrides it with a zero-skip: a
+    /// bus element that is zero on this row contributes nothing (`0·α = 0`),
+    /// so the F×E multiply is skipped. That covers the constant-0 bus-width
+    /// padding plus any variable element that is zero on the row, and it runs
+    /// once per fingerprint element per LDE row — the hot path where the old
+    /// runtime body had the same skip.
+    fn fold_fingerprint_term(
+        &self,
+        fp: Self::ExprE,
+        v: Self::Expr,
+        alpha_idx: usize,
+    ) -> Self::ExprE {
+        fp - v * self.alpha_pow(alpha_idx)
+    }
 }
 
 // =============================================================================
@@ -451,6 +472,20 @@ where
         );
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
+    }
+
+    fn fold_fingerprint_term(
+        &self,
+        fp: FieldElement<E>,
+        v: FieldElement<F>,
+        alpha_idx: usize,
+    ) -> FieldElement<E> {
+        // Zero bus elements contribute nothing — skip the F×E multiply.
+        if v == FieldElement::zero() {
+            fp
+        } else {
+            fp - v * &self.alphas[alpha_idx]
+        }
     }
 }
 
