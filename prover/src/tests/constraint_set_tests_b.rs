@@ -373,3 +373,35 @@ mod cpu32 {
         check_table("cpu32", &old, &Cpu32Constraints, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// cpu.rs (constraints/cpu.rs — assembled by create_all_cpu_constraints, never
+// a prover/src/tables/*.rs conversion)
+// =============================================================================
+
+mod cpu {
+    use super::*;
+    use crate::constraints::cpu::{
+        CpuConstraints, NUM_CPU_CONSTRAINTS, create_all_cpu_constraints,
+    };
+    use crate::tables::cpu::cols;
+    use stark::constraints::transition::TransitionConstraint;
+
+    #[test]
+    fn cpu_constraint_set_matches_old() {
+        // create_all_cpu_constraints returns (is_bit, add, other, next) with
+        // idx 0..11, 12..15, 16..38 respectively — concatenate in that order so
+        // the boxed oracle is dense and idx-ordered.
+        let (is_bit, add, other, next) = create_all_cpu_constraints();
+        assert_eq!(next, NUM_CPU_CONSTRAINTS);
+        let mut old: OldVec = Vec::with_capacity(NUM_CPU_CONSTRAINTS);
+        for c in is_bit {
+            old.push(c.boxed());
+        }
+        for c in add {
+            old.push(c.boxed());
+        }
+        old.extend(other);
+        check_table("cpu", &old, &CpuConstraints, cols::NUM_COLUMNS);
+    }
+}

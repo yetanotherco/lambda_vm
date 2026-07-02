@@ -724,9 +724,9 @@ pub fn create_all_cpu_constraints() -> (
 // exemptions), matching the structs (none override period/offset/
 // exemptions).
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 
-use super::templates::INV_SHIFT_32;
+use super::templates::{INV_SHIFT_32, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta};
 
 /// `col_a · col_b = 0`. Twin of [`ProductZeroConstraint`].
 pub fn emit_product_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
@@ -967,4 +967,180 @@ pub fn next_pc_add_meta(idx: usize) -> [ConstraintMeta; 2] {
         ConstraintMeta::base(idx, 3),
         ConstraintMeta::base(idx + 1, 3),
     ]
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The CPU table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`create_all_cpu_constraints`] index-for-index (39 constraints,
+/// all base-field):
+/// - idx 0..11:  IS_BIT (unconditional) on each of [`BIT_FLAG_COLUMNS`];
+/// - idx 12,13:  ADD fast-path carry pair (conditional on `ADD`);
+/// - idx 14,15:  SUB fast-path carry pair (conditional on `SUB`);
+/// - idx 16..21: `word_instr · {MEMORY, BRANCH, ECALL, WRITE_REGISTER,
+///   READ_REGISTER1, READ_REGISTER2} = 0`;
+/// - idx 22,23:  `arg2` multiplex (words 0, 1);
+/// - idx 24..27: register zero-forcing (`rv1[0..1]`, `rv2[0..1]`);
+/// - idx 28,29:  `rvd = cast(res, WL)` (words 0, 1);
+/// - idx 30,31:  BRANCH ⇒ `rvd = pc + instruction_length` carry pair;
+/// - idx 32:     `branch_cond`;
+/// - idx 33,34:  `next_pc = pc + instruction_length` carry pair;
+/// - idx 35:     `MEMORY · BRANCH = 0`;
+/// - idx 36,37:  `arg2` exclusivity (`imm_0`, `imm_1`);
+/// - idx 38:     `IS_BIT(mem_flags)` on non-MEMORY rows.
+pub struct CpuConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(NUM_CPU_CONSTRAINTS);
+        // idx 0..11: IS_BIT on each BIT_FLAG_COLUMNS entry (unconditional).
+        for i in 0..BIT_FLAG_COLUMNS.len() {
+            m.push(is_bit_meta(i, false));
+        }
+        let mut idx = BIT_FLAG_COLUMNS.len();
+        // idx 12,13: ADD pair (conditional on ADD).
+        m.extend(add_pair_meta(idx, true));
+        idx += 2;
+        // idx 14,15: SUB pair (conditional on SUB).
+        m.extend(add_pair_meta(idx, true));
+        idx += 2;
+        // idx 16..21: word_instr mutexes + register-read gates.
+        for _ in 0..6 {
+            m.push(product_zero_meta(idx));
+            idx += 1;
+        }
+        // idx 22,23: arg2 multiplex.
+        m.push(arg2_meta(idx));
+        idx += 1;
+        m.push(arg2_meta(idx));
+        idx += 1;
+        // idx 24..27: register zero-forcing.
+        for _ in 0..4 {
+            m.push(reg_not_read_is_zero_meta(idx));
+            idx += 1;
+        }
+        // idx 28,29: rvd = cast(res, WL).
+        m.push(rvd_eq_res_meta(idx));
+        idx += 1;
+        m.push(rvd_eq_res_meta(idx));
+        idx += 1;
+        // idx 30,31: branch rvd = pc + len.
+        m.extend(branch_rvd_meta(idx));
+        idx += 2;
+        // idx 32: branch_cond.
+        m.push(branch_cond_meta(idx));
+        idx += 1;
+        // idx 33,34: next_pc = pc + len.
+        m.extend(next_pc_add_meta(idx));
+        idx += 2;
+        // idx 35: MEMORY · BRANCH = 0.
+        m.push(product_zero_meta(idx));
+        idx += 1;
+        // idx 36,37: arg2 exclusivity.
+        m.push(arg2_exclusive_meta(idx));
+        idx += 1;
+        m.push(arg2_exclusive_meta(idx));
+        idx += 1;
+        // idx 38: IS_BIT(mem_flags) on non-MEMORY rows.
+        m.push(mem_flags_bit_meta(idx));
+        idx += 1;
+        debug_assert_eq!(idx, NUM_CPU_CONSTRAINTS);
+        debug_assert_eq!(m.len(), NUM_CPU_CONSTRAINTS);
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0..11: IS_BIT on each BIT_FLAG_COLUMNS entry (unconditional).
+        for (i, &col) in BIT_FLAG_COLUMNS.iter().enumerate() {
+            emit_is_bit(b, i, col, None);
+        }
+        let mut idx = BIT_FLAG_COLUMNS.len();
+
+        // idx 12,13: ADD fast-path (cond = ADD), rv1 + arg2 = cast(res, WL).
+        emit_add_pair(
+            b,
+            idx,
+            &[cols::ADD],
+            &AddOperand::dword(cols::RV1_0),
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
+        );
+        idx += 2;
+
+        // idx 14,15: SUB fast-path (cond = SUB), arg2 + res = rv1.
+        emit_add_pair(
+            b,
+            idx,
+            &[cols::SUB],
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
+            &AddOperand::dword(cols::RV1_0),
+        );
+        idx += 2;
+
+        // idx 16..21: word_instr mutexes + register-read gates.
+        for &col in &[
+            cols::MEMORY,
+            cols::BRANCH,
+            cols::ECALL,
+            cols::WRITE_REGISTER,
+            cols::READ_REGISTER1,
+            cols::READ_REGISTER2,
+        ] {
+            emit_product_zero(b, idx, cols::WORD_INSTR, col);
+            idx += 1;
+        }
+
+        // idx 22,23: arg2 multiplex (low, high words).
+        emit_arg2(b, idx, 0);
+        idx += 1;
+        emit_arg2(b, idx, 1);
+        idx += 1;
+
+        // idx 24..27: register zero-forcing (rv1/rv2 are DWordWL → 2 words each).
+        for &value_col in &[cols::RV1_0, cols::RV1_1] {
+            emit_reg_not_read_is_zero(b, idx, cols::READ_REGISTER1, value_col);
+            idx += 1;
+        }
+        for &value_col in &[cols::RV2_0, cols::RV2_1] {
+            emit_reg_not_read_is_zero(b, idx, cols::READ_REGISTER2, value_col);
+            idx += 1;
+        }
+
+        // idx 28,29: ¬MEMORY ∧ ¬BRANCH ⇒ rvd = cast(res, WL).
+        emit_rvd_eq_res(b, idx, 0);
+        idx += 1;
+        emit_rvd_eq_res(b, idx, 1);
+        idx += 1;
+
+        // idx 30,31: BRANCH ⇒ rvd = pc + instruction_length.
+        emit_branch_rvd_pair(b, idx);
+        idx += 2;
+
+        // idx 32: branch_cond.
+        emit_branch_cond(b, idx);
+        idx += 1;
+
+        // idx 33,34: next_pc = pc + instruction_length.
+        emit_next_pc_add_pair(b, idx);
+        idx += 2;
+
+        // idx 35: MEMORY · BRANCH = 0.
+        emit_product_zero(b, idx, cols::MEMORY, cols::BRANCH);
+        idx += 1;
+
+        // idx 36,37: arg2 exclusivity.
+        for &imm_col in &[cols::IMM_0, cols::IMM_1] {
+            emit_arg2_exclusive(b, idx, imm_col);
+            idx += 1;
+        }
+
+        // idx 38: IS_BIT(mem_flags) on non-MEMORY rows.
+        emit_mem_flags_bit(b, idx);
+        idx += 1;
+
+        debug_assert_eq!(idx, NUM_CPU_CONSTRAINTS);
+    }
 }
