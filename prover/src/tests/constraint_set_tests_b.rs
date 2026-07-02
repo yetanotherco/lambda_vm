@@ -358,3 +358,18 @@ mod keccak_rnd {
         check_table("keccak_rnd", &old, &KeccakRndConstraints, cols::NUM_COLUMNS);
     }
 }
+
+// =============================================================================
+// cpu32.rs
+// =============================================================================
+
+mod cpu32 {
+    use super::*;
+    use crate::tables::cpu32::{Cpu32Constraints, cols, cpu32_constraints};
+
+    #[test]
+    fn cpu32_constraint_set_matches_old() {
+        let (old, _) = cpu32_constraints(0);
+        check_table("cpu32", &old, &Cpu32Constraints, cols::NUM_COLUMNS);
+    }
+}

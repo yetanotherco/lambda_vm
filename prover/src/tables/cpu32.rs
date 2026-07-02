@@ -28,7 +28,12 @@ use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
 };
-use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+use crate::constraints::templates::{
+    AddConstraint, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
+    new_is_bit_constraints,
+};
 
 // =========================================================================
 // Column indices for CPU32 table
@@ -842,4 +847,166 @@ pub fn cpu32_constraints(
     }
 
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The CPU32 table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`cpu32_constraints`] index-for-index (32 constraints):
+/// - idx 0-6:   `IS_BIT` on `read_register1/2`, `write_register`, `alu`, `add`,
+///   `sub`, `μ`;
+/// - idx 7,8:   `ADD` pair `arg1 + arg2 = res` (gated on `add`);
+/// - idx 9,10:  `ADD` pair `arg2 + res = arg1` (gated on `sub`);
+/// - idx 11-16: `(1 − read)·value` for the six `rv1/rv2` limbs;
+/// - idx 17-22: sign-extension arithmetic `Arg1Lo/Hi`, `Arg2Lo/Hi`, `RvdLo/Hi`;
+/// - idx 23,24: `(1 − signed)·rv·_sign` (sign zero when unsigned);
+/// - idx 25,26: `read_register2·imm[i]` (arg2 exclusivity);
+/// - idx 27-31: `(1 − μ)·flag` for `read_register1/2`, `write_register`,
+///   `signed`, `res_sign`.
+pub struct Cpu32Constraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = Vec::with_capacity(32);
+        // idx 0-6: IS_BIT (unconditional, degree 2).
+        for i in 0..7 {
+            m.push(is_bit_meta(i, false));
+        }
+        // idx 7,8: ADD pair gated on ADD (conditional, degree 3).
+        m.extend(add_pair_meta(7, true));
+        // idx 9,10: SUB pair gated on SUB (conditional, degree 3).
+        m.extend(add_pair_meta(9, true));
+        // idx 11-16: RegZero (degree 2).
+        for i in 11..17 {
+            m.push(ConstraintMeta::base(i, 2));
+        }
+        // idx 17-22: sign-extension arithmetic (linear, degree 1).
+        for i in 17..23 {
+            m.push(ConstraintMeta::base(i, 1));
+        }
+        // idx 23-31: sign-zero, arg2-exclusive, flag ⇒ μ (all degree 2).
+        for i in 23..32 {
+            m.push(ConstraintMeta::base(i, 2));
+        }
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0-6: IS_BIT on the flag columns and the multiplicity.
+        for (i, &col) in [
+            cols::READ_REGISTER1,
+            cols::READ_REGISTER2,
+            cols::WRITE_REGISTER,
+            cols::ALU,
+            cols::ADD,
+            cols::SUB,
+            cols::MU,
+        ]
+        .iter()
+        .enumerate()
+        {
+            emit_is_bit(b, i, col, None);
+        }
+
+        // idx 7,8: ADD fast-path arg1 + arg2 = res (cond = ADD).
+        emit_add_pair(
+            b,
+            7,
+            &[cols::ADD],
+            &AddOperand::dword(cols::ARG1_0),
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
+        );
+
+        // idx 9,10: SUB fast-path arg2 + res = arg1 (cond = SUB).
+        emit_add_pair(
+            b,
+            9,
+            &[cols::SUB],
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
+            &AddOperand::dword(cols::ARG1_0),
+        );
+
+        // idx 11-16: unread register limbs are zero: (1 - read)·value.
+        let mut idx = 11;
+        for (read_col, value_col) in [
+            (cols::READ_REGISTER1, cols::RV1_0),
+            (cols::READ_REGISTER1, cols::RV1_1),
+            (cols::READ_REGISTER1, cols::RV1_2),
+            (cols::READ_REGISTER2, cols::RV2_0),
+            (cols::READ_REGISTER2, cols::RV2_1),
+            (cols::READ_REGISTER2, cols::RV2_2),
+        ] {
+            let one = b.one();
+            let read = b.main(0, read_col);
+            let value = b.main(0, value_col);
+            b.emit_base(idx, (one - read) * value);
+            idx += 1;
+        }
+
+        // idx 17-22: sign-extension (`ext`) arithmetic for arg1, arg2, rvd.
+        let shift16 = b.const_base(SHIFT_16);
+        let hi_fill = b.const_base(HI_FILL);
+
+        // Arg1Lo: arg1_0 - rv1_0 - shift16·rv1_1
+        let e = b.main(0, cols::ARG1_0)
+            - b.main(0, cols::RV1_0)
+            - shift16.clone() * b.main(0, cols::RV1_1);
+        b.emit_base(17, e);
+        // Arg1Hi: arg1_1 - hi_fill·rv1_sign
+        let e = b.main(0, cols::ARG1_1) - hi_fill.clone() * b.main(0, cols::RV1_SIGN);
+        b.emit_base(18, e);
+        // Arg2Lo: arg2_0 - rv2_0 - shift16·rv2_1 - imm_0
+        let e = b.main(0, cols::ARG2_0)
+            - b.main(0, cols::RV2_0)
+            - shift16.clone() * b.main(0, cols::RV2_1)
+            - b.main(0, cols::IMM_0);
+        b.emit_base(19, e);
+        // Arg2Hi: arg2_1 - hi_fill·rv2_sign - imm_1
+        let e = b.main(0, cols::ARG2_1)
+            - hi_fill.clone() * b.main(0, cols::RV2_SIGN)
+            - b.main(0, cols::IMM_1);
+        b.emit_base(20, e);
+        // RvdLo: rvd_0 - res_0 - shift16·res_1
+        let e = b.main(0, cols::RVD_0) - b.main(0, cols::RES_0) - shift16 * b.main(0, cols::RES_1);
+        b.emit_base(21, e);
+        // RvdHi: rvd_1 - hi_fill·res_sign
+        let e = b.main(0, cols::RVD_1) - hi_fill * b.main(0, cols::RES_SIGN);
+        b.emit_base(22, e);
+
+        // idx 23,24: (1 - signed)·sign — sign bit is zero when unsigned.
+        for (i, sign_col) in [cols::RV1_SIGN, cols::RV2_SIGN].into_iter().enumerate() {
+            let one = b.one();
+            let signed = b.main(0, cols::SIGNED);
+            let sign = b.main(0, sign_col);
+            b.emit_base(23 + i, (one - signed) * sign);
+        }
+
+        // idx 25,26: read_register2·imm[i] (arg2 multiplex exclusivity).
+        for (i, imm_col) in [cols::IMM_0, cols::IMM_1].into_iter().enumerate() {
+            let rr2 = b.main(0, cols::READ_REGISTER2);
+            let imm = b.main(0, imm_col);
+            b.emit_base(25 + i, rr2 * imm);
+        }
+
+        // idx 27-31: (1 - μ)·flag — flag must be 0 on padding rows.
+        for (i, flag_col) in [
+            cols::READ_REGISTER1,
+            cols::READ_REGISTER2,
+            cols::WRITE_REGISTER,
+            cols::SIGNED,
+            cols::RES_SIGN,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let one = b.one();
+            let mu = b.main(0, cols::MU);
+            let flag = b.main(0, flag_col);
+            b.emit_base(27 + i, (one - mu) * flag);
+        }
+    }
 }
