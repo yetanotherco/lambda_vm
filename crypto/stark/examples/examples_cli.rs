@@ -573,6 +573,8 @@ fn prove_multi_table_lookup() -> Result<Vec<u8>, String> {
     let multi_proof = Prover::<Gl, Gl3, ()>::multi_prove(
         air_trace_pairs,
         &mut DefaultTranscript::<Gl3>::new(&[]),
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
     )
     .map_err(|e| format!("prove failed: {e:?}"))?;
     ser(&multi_proof)
