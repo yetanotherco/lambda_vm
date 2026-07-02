@@ -4,3 +4,4 @@ pub mod builder;
 mod builder_tests;
 pub mod evaluator;
 pub mod transition;
+pub mod zerofier;
