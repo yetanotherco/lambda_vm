@@ -1,6 +1,10 @@
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -74,6 +78,37 @@ where
     }
 }
 
+/// Single-body [`ConstraintSet`] for [`FibonacciAIR`]: the same constraint
+/// as `FibConstraint`, written once against the [`ConstraintBuilder`].
+pub struct SimpleFibonacciConstraints<F: IsFFTField> {
+    phantom: PhantomData<F>,
+}
+
+impl<F: IsFFTField> Default for SimpleFibonacciConstraints<F> {
+    fn default() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> ConstraintSet<F, F> for SimpleFibonacciConstraints<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // idx 0: a_{i+2} = a_{i+1} + a_i; reads two next rows ⇒ 2 end exemptions.
+        vec![ConstraintMeta::base(0, 1).with_end_exemptions(2)]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let a0 = b.main(0, 0);
+        let a1 = b.main(1, 0);
+        let a2 = b.main(2, 0);
+        b.emit_base(0, a2 - a1 - a0);
+    }
+}
+
 pub struct FibonacciAIR<F>
 where
     F: IsFFTField,
@@ -127,6 +162,36 @@ where
 
     fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, F>>> {
         &self.constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &SimpleFibonacciConstraints::default(),
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &SimpleFibonacciConstraints::default(),
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&SimpleFibonacciConstraints::<F>::default().meta())
     }
 
     fn boundary_constraints(

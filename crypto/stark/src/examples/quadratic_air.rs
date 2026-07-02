@@ -3,6 +3,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -73,6 +77,36 @@ where
     }
 }
 
+/// Single-body [`ConstraintSet`] for [`QuadraticAIR`]: the same constraint
+/// as `QuadraticConstraint`, written once against the [`ConstraintBuilder`].
+pub struct QuadraticConstraints<F: IsFFTField> {
+    phantom: PhantomData<F>,
+}
+
+impl<F: IsFFTField> Default for QuadraticConstraints<F> {
+    fn default() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> ConstraintSet<F, F> for QuadraticConstraints<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // idx 0: x_{i+1} = x_i²; reads the next row ⇒ 1 end exemption.
+        vec![ConstraintMeta::base(0, 2).with_end_exemptions(1)]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let x = b.main(0, 0);
+        let x_squared = b.main(1, 0);
+        b.emit_base(0, x_squared - x.clone() * x);
+    }
+}
+
 pub struct QuadraticAIR<F>
 where
     F: IsFFTField,
@@ -136,6 +170,36 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &QuadraticConstraints::default(),
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &QuadraticConstraints::default(),
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&QuadraticConstraints::<F>::default().meta())
     }
 
     fn context(&self) -> &AirContext {

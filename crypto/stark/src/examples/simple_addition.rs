@@ -6,6 +6,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -72,6 +76,39 @@ where
         let res = col0 + col1 - col2;
 
         transition_evaluations[self.constraint_idx()] = res;
+    }
+}
+
+/// Single-body [`ConstraintSet`] for [`SimpleAdditionAIR`]: the same
+/// constraint as `AdditionConstraint`, written once against the
+/// [`ConstraintBuilder`].
+pub struct SimpleAdditionConstraints<F: IsFFTField> {
+    phantom: PhantomData<F>,
+}
+
+impl<F: IsFFTField> Default for SimpleAdditionConstraints<F> {
+    fn default() -> Self {
+        Self {
+            phantom: PhantomData,
+        }
+    }
+}
+
+impl<F> ConstraintSet<F, F> for SimpleAdditionConstraints<F>
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // idx 0: col0 + col1 = col2, applied at every row (no exemptions).
+        vec![ConstraintMeta::base(0, 1)]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let col0 = b.main(0, 0);
+        let col1 = b.main(0, 1);
+        let col2 = b.main(0, 2);
+        // Constraint: col0 + col1 - col2 = 0
+        b.emit_base(0, col0 + col1 - col2);
     }
 }
 
@@ -144,6 +181,36 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &SimpleAdditionConstraints::default(),
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &SimpleAdditionConstraints::default(),
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&SimpleAdditionConstraints::<F>::default().meta())
     }
 
     fn context(&self) -> &AirContext {
