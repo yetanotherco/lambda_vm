@@ -1,9 +1,12 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
 //! Private input layout (postcard-encoded):
-//!   `(VmProof, Vec<u8>, ProofOptions)`
+//!   `(VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)`
 //! where the `Vec<u8>` holds the inner program's ELF bytes and `ProofOptions`
-//! specifies the parameters the inner prover used. Commits `[1]` on success.
+//! specifies the parameters the inner prover used. Commits
+//! `vk_digest ‖ inner public output` on success: every input here is
+//! prover-supplied, so soundness comes from the outer verifier checking
+//! the committed digest against one derived from the trusted inner ELF.
 //!
 //! Not `no_std` (std/alloc are available — `build-std` provides them, and the
 //! prover links as a normal std crate; its prove-side code is dead-code
@@ -46,6 +49,9 @@ pub fn main() -> ! {
     .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
-    lambda_vm_syscalls::syscalls::commit(&[1u8]);
+    let mut output = Vec::with_capacity(32 + vm_proof.public_output.len());
+    output.extend_from_slice(&vkey.compute_digest());
+    output.extend_from_slice(&vm_proof.public_output);
+    lambda_vm_syscalls::syscalls::commit(&output);
     lambda_vm_syscalls::syscalls::sys_halt();
 }

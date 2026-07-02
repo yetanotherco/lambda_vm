@@ -136,6 +136,9 @@ fn prove_vm_minimal(elf_bytes: &[u8], private_inputs: &[u8], max_rows: &MaxRowsC
         table_counts,
         public_output: traces.public_output_bytes.clone(),
         num_private_input_pages,
+        // Minimal proofs skip statement absorption; only verify_vm_minimal
+        // can check them, so the digest is never read.
+        vk_digest: [0u8; 32],
     }
 }
 

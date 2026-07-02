@@ -441,7 +441,9 @@ fn run_profile(
 }
 
 /// Core pipeline: prove the inner program, run the guest to `mode`, assert it
-/// committed `[1]` (the in-VM verifier accepted the proof).
+/// committed `vk_digest ‖ inner public output` — the outer-verifier check:
+/// the digest of the vkey used in-guest must match one derived on the host
+/// from the trusted inner ELF.
 fn run_recursion_pipeline_with_options(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -480,12 +482,13 @@ fn run_recursion_pipeline_with_options(
         OuterMode::Prove => prove_outer_and_commit(label, &recursion_elf_bytes, &blob),
     };
 
+    let mut expected = inner_proof.vk_digest.to_vec();
+    expected.extend_from_slice(&inner_proof.public_output);
     assert_eq!(
-        committed,
-        vec![1u8],
-        "recursion guest must commit the [1] success marker (in-VM verify accepted)"
+        committed, expected,
+        "recursion guest must commit vk_digest ‖ inner public output"
     );
-    eprintln!("[{label}] guest committed [1]: in-VM verify accepted ✓");
+    eprintln!("[{label}] guest committed vk_digest ‖ output: in-VM verify accepted ✓");
 }
 
 /// `run_recursion_pipeline_with_options` with `blowup=8` (the `empty`/`fibonacci` default).

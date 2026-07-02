@@ -10,7 +10,8 @@
 //! ## Current scope
 //!
 //! All five preprocessed tables — BITWISE, DECODE, REGISTER, KECCAK_RC, and
-//! every non-private-input PAGE — are cached here. `VmAirs::new_with_vkey`
+//! every non-private-input PAGE — are cached here, together with the
+//! [`ProofOptions`] the commitments were derived under. `VmAirs::new_with_vkey`
 //! prefers the vkey-supplied commitment over recomputing when a vkey is
 //! provided. The `version` field exists so a vkey serialized against an
 //! older layout produces a different `compute_digest()` and stops
@@ -18,13 +19,23 @@
 //!
 //! ## Security
 //!
-//! For this PR the verifying key is only a performance shortcut. The
-//! verifier still relies on Fiat-Shamir: every preprocessed commitment the
-//! prover used is bound into the proof's challenges, so a verifier that
-//! consumes a tampered `vkey` field derives different challenges, the
-//! openings stop matching, and verification fails. A future PR will
-//! additionally embed `vkey.compute_digest()` in `VmProof` so vkey
-//! substitution surfaces as an explicit error before any STARK work runs.
+//! The vkey is **trusted input**. Fiat-Shamir only detects a vkey that is
+//! inconsistent with the proof (post-hoc tampering); a coordinated prover
+//! can commit to a forged preprocessed table from the start and supply a
+//! matching vkey, and the transcript stays self-consistent. The binding
+//! that makes recursion sound is `compute_digest()`:
+//!
+//! - The prover stamps it into `VmProof::vk_digest` and binds it into the
+//!   Fiat-Shamir statement; the verifier recomputes it from its own vkey
+//!   and rejects on mismatch before any STARK work.
+//! - The recursion guest commits `vk_digest ‖ inner public output`, so the
+//!   *outer* verifier can check which vkey was used in-guest against a
+//!   digest derived from the trusted inner ELF. Without that outer check
+//!   the guest's result says nothing — every guest input is prover-supplied.
+//!
+//! The digest covers the embedded [`ProofOptions`]: query count and
+//! grinding factor affect soundness but no commitment, so nothing else
+//! would pin them.
 
 use executor::elf::Elf;
 use sha3::{Digest, Keccak256};
@@ -40,7 +51,7 @@ use crate::tables::register;
 /// Current `VmVerifyingKey` layout version. Bump whenever fields are added,
 /// removed, or reordered so that vkeys serialized against an older layout
 /// produce a different `compute_digest()` and stop validating.
-pub const VKEY_VERSION: u32 = 3;
+pub const VKEY_VERSION: u32 = 4;
 
 /// Placeholder commitment stored in [`VmVerifyingKey::pages`] for
 /// private-input page slots, where there is no preprocessed commitment to
@@ -54,6 +65,10 @@ const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
 pub struct VmVerifyingKey {
     /// Layout version. See [`VKEY_VERSION`].
     pub version: u32,
+    /// The options every commitment below was derived under. In the digest
+    /// because query count and grinding factor affect soundness but no
+    /// commitment.
+    pub options: ProofOptions,
     /// Merkle root over the LDE of the bitwise preprocessed columns.
     /// Program-independent; depends only on `ProofOptions`.
     pub bitwise: Commitment,
@@ -107,6 +122,7 @@ impl VmVerifyingKey {
             .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
         Self {
             version: VKEY_VERSION,
+            options: options.clone(),
             bitwise: bitwise::preprocessed_commitment(options),
             decode: decode::commitment_from_elf(elf, options)
                 .expect("decode commitment must compute"),

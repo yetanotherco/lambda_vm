@@ -16,7 +16,8 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V2";
+/// V3: monolithic statements bind the verifying-key digest after the tag.
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
 fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
@@ -24,14 +25,15 @@ fn elf_digest(elf: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-/// Which statement is being bound. Selects the leading domain tag and whether an
-/// epoch label is appended, so monolithic and continuation-epoch proofs share one
-/// function while each starts with its own tag. `Monolithic` reproduces the
-/// original encoding byte-for-byte (no label), so existing proofs are unaffected.
+/// Which statement is being bound. Selects the leading domain tag and the
+/// kind-specific fields, so monolithic and continuation-epoch proofs share one
+/// function while each starts with its own tag.
 #[derive(Clone, Copy)]
 pub(crate) enum StatementKind {
-    /// Whole-program (monolithic) proof.
-    Monolithic,
+    /// Whole-program (monolithic) proof. Carries the digest of the
+    /// [`crate::VmVerifyingKey`] (preprocessed commitments + proof options)
+    /// so every challenge depends on which vkey the proof was made against.
+    Monolithic { vk_digest: [u8; 32] },
     /// One continuation epoch proof, pinned to its position by `epoch_label`.
     ContinuationEpoch { epoch_label: u64 },
 }
@@ -48,10 +50,16 @@ pub(crate) fn absorb_statement(
     // Leading domain tag — distinct per statement kind, so a monolithic proof and
     // a continuation epoch proof can never share a transcript prefix.
     let domain_tag = match kind {
-        StatementKind::Monolithic => DOMAIN_TAG,
+        StatementKind::Monolithic { .. } => DOMAIN_TAG,
         StatementKind::ContinuationEpoch { .. } => CONTINUATION_EPOCH_TAG,
     };
     t.append_bytes(domain_tag);
+
+    // Fixed 32 bytes, no length prefix needed; the per-kind tags keep
+    // kind-specific fields unambiguous.
+    if let StatementKind::Monolithic { vk_digest } = kind {
+        t.append_bytes(&vk_digest);
+    }
 
     // ELF: fixed 32-byte digest — no length prefix needed.
     t.append_bytes(&elf_digest(elf_bytes));

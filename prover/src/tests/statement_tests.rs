@@ -39,7 +39,8 @@ fn sample_ranges() -> Vec<RuntimePageRange> {
     ]
 }
 
-fn state_after_absorb(
+fn state_after_absorb_with_digest(
+    vk_digest: [u8; 32],
     elf: &[u8],
     out: &[u8],
     counts: &TableCounts,
@@ -49,7 +50,7 @@ fn state_after_absorb(
     let mut t = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut t,
-        StatementKind::Monolithic,
+        StatementKind::Monolithic { vk_digest },
         elf,
         out,
         counts,
@@ -57,6 +58,16 @@ fn state_after_absorb(
         ranges,
     );
     t.state()
+}
+
+fn state_after_absorb(
+    elf: &[u8],
+    out: &[u8],
+    counts: &TableCounts,
+    priv_pages: usize,
+    ranges: &[RuntimePageRange],
+) -> [u8; 32] {
+    state_after_absorb_with_digest([7u8; 32], elf, out, counts, priv_pages, ranges)
 }
 
 #[test]
@@ -111,6 +122,19 @@ fn state_depends_on_every_field() {
         baseline,
         state_after_absorb(b"elf", b"out", &sample_counts(), 1, &[]),
         "state must depend on runtime_page_ranges",
+    );
+
+    assert_ne!(
+        baseline,
+        state_after_absorb_with_digest(
+            [8u8; 32],
+            b"elf",
+            b"out",
+            &sample_counts(),
+            1,
+            &sample_ranges()
+        ),
+        "state must depend on vk_digest",
     );
 }
 
