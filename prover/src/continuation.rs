@@ -32,7 +32,9 @@
 //!
 //! The prover and verifier are split: `prove_continuation` emits a self-contained
 //! `ContinuationProof` bundle and `verify_continuation` checks it from the bundle
-//! and ELF alone (`prove_and_verify_continuation` is a thin wrapper over both).
+//! and ELF alone; `prove_and_verify_continuation` proves and verifies in one
+//! streaming pass, verifying and dropping each epoch proof so its retained-proof
+//! memory stays bounded to a single epoch.
 
 use std::collections::HashMap;
 
@@ -728,6 +730,12 @@ impl<'a> EpochDriver<'a> {
             .map_err(|e| Error::Execution(format!("{e}")))?
         {
             Some(logs) => logs.to_vec(),
+            // `resume_with_limit` returns `None` only when `pc == 0` at entry, which the
+            // guard above already handles — so this arm is effectively unreachable today.
+            // Kept as a graceful terminator (not `unreachable!`) so that if a future
+            // change makes the executor stop for another reason, the driver ends cleanly
+            // rather than panicking; a resulting `is_final` disagreement would be caught
+            // by `verify_epoch` on the streaming path, never silently accepted.
             None => return Ok(None),
         };
         let is_final = self.executor.pc() == 0;
@@ -941,6 +949,16 @@ pub fn prove_and_verify_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
+    // Match `verify_continuation`'s up-front bound so the two paths surface the same
+    // error on an oversized input (the executor also rejects it, but with a different
+    // variant).
+    if private_inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
+        return Err(Error::InvalidTableCounts(format!(
+            "private input size ({}) exceeds max ({MAX_PRIVATE_INPUT_SIZE})",
+            private_inputs.len()
+        )));
+    }
+
     let mut driver = EpochDriver::new(elf_bytes, private_inputs, epoch_size_log2, opts)?;
 
     // Verify-side state, rebuilt independently of the prover: `register_init` chains
@@ -1193,6 +1211,58 @@ mod tests {
             .unwrap()
             .is_none(),
             "a zero-entry ELF (zero epochs) must be rejected, not accepted as empty"
+        );
+    }
+
+    // Exactly-2-epoch discriminator for the `is_final` lookahead: the minimal case that
+    // exercises the false→true transition exactly once. `epoch_size_log2` is derived from
+    // the measured cycle count as the largest power of two strictly below `total`, so
+    // `2^L < total <= 2^(L+1)` ⟹ exactly 2 epochs — pinning `num_epochs() == 2` (not just
+    // `> 1`) and confirming the streaming path still equals the two-phase path. Guards
+    // against a lookahead/label off-by-one at the tightest enumeration boundary.
+    #[test]
+    fn test_streaming_exactly_two_epochs() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let total = Executor::new(&Elf::load(&elf_bytes).unwrap(), vec![])
+            .unwrap()
+            .run()
+            .unwrap()
+            .logs
+            .len();
+        let epoch_size_log2 = (total as u64 - 1).ilog2();
+        assert!(
+            epoch_size_log2 >= 2,
+            "program ({total} cycles) too short to derive a valid 2-epoch split"
+        );
+
+        let bundle = prove_continuation(
+            &elf_bytes,
+            &[],
+            epoch_size_log2,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            bundle.num_epochs(),
+            2,
+            "epoch_size_log2={epoch_size_log2} over {total} cycles must yield exactly 2 epochs"
+        );
+        let two_phase =
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap();
+        assert!(two_phase.is_some());
+
+        let streaming = prove_and_verify_continuation(
+            &elf_bytes,
+            &[],
+            epoch_size_log2,
+            &ProofOptions::default_test_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            streaming, two_phase,
+            "streaming self-verify diverged from prove+verify_continuation at exactly 2 epochs"
         );
     }
 
