@@ -124,7 +124,7 @@ pub(crate) fn absorb_statement(
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V1";
+const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V2";
 const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V1";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before
