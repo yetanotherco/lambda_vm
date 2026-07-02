@@ -2209,18 +2209,6 @@ pub trait IsStarkProver<
             }
         }
 
-        // Pre-fork all transcripts now that the shared aux root is bound (cheap,
-        // sequential — must match verifier ordering). Domain-separated by table
-        // index so per-table proving stays independent.
-        let mut table_transcripts: Vec<_> = (0..num_airs)
-            .map(|idx| {
-                let mut t = transcript.clone();
-                if num_airs > 1 {
-                    t.append_bytes(&(idx as u64).to_le_bytes());
-                }
-                t
-            })
-            .collect();
 
         // Build commitments and cached LDEs as separate vecs:
         // commitments are borrowed in Phase D, LDEs are consumed by value.
@@ -2279,11 +2267,13 @@ pub trait IsStarkProver<
         Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
 
         // =====================================================================
-        // Rounds 2-4: Parallel per-table proving in chunks of K
+        // Rounds 2-4: linear shared transcript (unified-shard; forks dropped)
         // =====================================================================
-        // Each chunk of K tables is processed in parallel. Cached LDE columns
-        // from Phase A/C are consumed here (zero-copy move), eliminating the
-        // expensive reconstruct_round1 recomputation.
+        // The forked-per-table transcript is gone. Round 2 composition roots are
+        // batched into ONE MMCS root; round 3 (z, OOD) and round 4 (FRI) run
+        // per-table sequentially on the shared transcript with PER-TABLE z.
+        // NOTE: round 4 is still per-table here — the single batched FRI and the
+        // shard proof format land in the next step.
 
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
@@ -2295,91 +2285,187 @@ pub trait IsStarkProver<
             crate::instruments::TableSubOps,
         )> = Vec::with_capacity(num_airs);
 
-        let mut proofs = Vec::with_capacity(num_airs);
-        let mut lde_drain = cached_ldes.into_iter();
-        for chunk_start in (0..num_airs).step_by(k) {
-            let chunk_end = (chunk_start + k).min(num_airs);
-            let chunk_size = chunk_end - chunk_start;
-
-            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
-                lde_drain.by_ref().take(chunk_size).collect();
-            let chunk_commitments = &commitments[chunk_start..chunk_end];
-            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
-
-            #[cfg(feature = "parallel")]
-            let iter = chunk_ldes
-                .into_par_iter()
-                .zip(chunk_commitments.par_iter())
-                .zip(chunk_transcripts.par_iter_mut())
-                .enumerate();
-            #[cfg(not(feature = "parallel"))]
-            let iter = chunk_ldes
-                .into_iter()
-                .zip(chunk_commitments.iter())
-                .zip(chunk_transcripts.iter_mut())
-                .enumerate();
-
-            let chunk_results: Vec<Result<_, ProvingError>> = iter
-                .map(|(j, ((lde, commitment), table_transcript))| {
-                    let idx = chunk_start + j;
-                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
-                    let _ = trace; // used by instruments
-                    let domain = &domains[idx];
-
-                    #[cfg(feature = "instruments")]
-                    let table_start = Instant::now();
-
-                    // Build Round1 from cached LDE (consumed by value, no recomputation).
-                    let round_1_result =
-                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
-
-                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
-                        table_transcript.append_field_element(&bpi.table_contribution);
-                    }
-
-                    let proof = Self::prove_rounds_2_to_4(
-                        *air,
-                        *pub_inputs,
-                        &round_1_result,
-                        table_transcript,
-                        domain,
-                        &twiddle_caches[idx],
-                    )?;
-
-                    #[cfg(feature = "instruments")]
-                    let table_timing = {
-                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
-                        (
-                            air.name().to_string(),
-                            trace.num_rows(),
-                            table_start.elapsed(),
-                            sub_ops,
-                        )
-                    };
-
-                    #[cfg(feature = "instruments")]
-                    return Ok((proof, table_timing));
-                    #[cfg(not(feature = "instruments"))]
-                    Ok(proof)
-                })
-                .collect();
-
-            for result in chunk_results {
-                #[cfg(feature = "instruments")]
-                {
-                    let (proof, timing) = result?;
-                    proofs.push(proof);
-                    table_timings.push(timing);
-                }
-                #[cfg(not(feature = "instruments"))]
-                proofs.push(result?);
+        // Bus contributions bind first (read from the commitments — the same
+        // value build_round1 copies into Round1), before any round-2 challenge.
+        for c in commitments.iter() {
+            if let Some(bpi) = c.bus_public_inputs.as_ref() {
+                transcript.append_field_element(&bpi.table_contribution);
             }
+        }
+
+        // <<<< Receive per-table challenge: beta_i (one per table, sequential).
+        let betas: Vec<FieldElement<FieldExtension>> = (0..num_airs)
+            .map(|_| transcript.sample_field_element())
+            .collect();
+
+        // Round 2 (parallel over tables): build Round1 from the cached LDE
+        // (consumed) and compute the composition polynomial. Round1 is built and
+        // consumed inside the same task, so no &Round1 crosses threads.
+        #[allow(clippy::type_complexity)]
+        let round_12: Vec<
+            Result<(Round1<Field, FieldExtension>, Round2<FieldExtension>), ProvingError>,
+        > = {
+            #[cfg(feature = "parallel")]
+            let iter = cached_ldes.into_par_iter().enumerate();
+            #[cfg(not(feature = "parallel"))]
+            let iter = cached_ldes.into_iter().enumerate();
+            iter.map(|(idx, lde)| {
+                let air = air_trace_pairs[idx].0;
+                let pub_inputs = air_trace_pairs[idx].2;
+                let domain = &domains[idx];
+                let round_1_result =
+                    commitments[idx].build_round1(lde, air.step_size(), domain.blowup_factor);
+
+                let trace_length = domain.interpolation_domain_size;
+                let num_boundary_constraints = air
+                    .boundary_constraints(
+                        pub_inputs,
+                        &round_1_result.rap_challenges,
+                        round_1_result.bus_public_inputs.as_ref(),
+                        trace_length,
+                    )
+                    .constraints
+                    .len();
+                let num_transition_constraints = air.context().num_transition_constraints;
+                let mut coefficients: Vec<_> =
+                    core::iter::successors(Some(FieldElement::one()), |x| Some(x * betas[idx]))
+                        .take(num_boundary_constraints + num_transition_constraints)
+                        .collect();
+                let transition_coefficients: Vec<_> =
+                    coefficients.drain(..num_transition_constraints).collect();
+                let boundary_coefficients = coefficients;
+
+                let round_2_result = Self::round_2_compute_composition_polynomial(
+                    air,
+                    pub_inputs,
+                    domain,
+                    &twiddle_caches[idx],
+                    &round_1_result,
+                    &transition_coefficients,
+                    &boundary_coefficients,
+                )?;
+                Ok((round_1_result, round_2_result))
+            })
+            .collect()
+        };
+        let mut round1s: Vec<Round1<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        let mut round2s: Vec<Round2<FieldExtension>> = Vec::with_capacity(num_airs);
+        for r in round_12 {
+            let (r1, r2) = r?;
+            round1s.push(r1);
+            round2s.push(r2);
+        }
+
+        // >>>> Send commitment: ONE batched composition-poly root over all
+        // tables' composition parts (mixed-height MMCS). Transient — round 4
+        // still opens the per-table composition trees.
+        {
+            let mut comp_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
+                Vec::with_capacity(num_airs);
+            for r2 in round2s.iter() {
+                let cols = &r2.lde_composition_poly_evaluations;
+                let width = cols.len();
+                if width == 0 {
+                    continue;
+                }
+                let num_rows = cols[0].len();
+                let log_height = num_rows.trailing_zeros() as usize;
+                let mut data: Vec<FieldElement<FieldExtension>> =
+                    Vec::with_capacity(num_rows * width);
+                for r in 0..num_rows {
+                    let br = reverse_index(r, num_rows as u64);
+                    for col in cols.iter() {
+                        data.push(col[br]);
+                    }
+                }
+                comp_mats.push((data, log_height, width));
+            }
+            if !comp_mats.is_empty() {
+                let batched_comp_mmcs = MixedMmcs::<FieldExtension>::commit(&comp_mats);
+                transcript.append_bytes(&batched_comp_mmcs.root());
+            }
+        }
+
+        // Round 3 + Round 4 per table, sequentially on the shared transcript.
+        let mut proofs = Vec::with_capacity(num_airs);
+        for idx in 0..num_airs {
+            let air = air_trace_pairs[idx].0;
+            let pub_inputs = air_trace_pairs[idx].2;
+            let domain = &domains[idx];
+            let round_1_result = &round1s[idx];
+            let round_2_result = &round2s[idx];
+
+            #[cfg(feature = "instruments")]
+            let table_start = Instant::now();
+
+            // <<<< Receive per-table challenge: z_i
+            let z = transcript.sample_z_ood(
+                &domain.lde_roots_of_unity_coset,
+                &domain.trace_roots_of_unity,
+            );
+
+            let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+                air,
+                domain,
+                round_1_result,
+                round_2_result,
+                &z,
+            );
+
+            // >>>> Send values: t_j(z g^k)
+            for col in round_3_result.trace_ood_evaluations.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
+            }
+            // >>>> Send values: H_i(z^N)
+            for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+                transcript.append_field_element(element);
+            }
+
+            let round_4_result =
+                Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+                    air,
+                    domain,
+                    round_1_result,
+                    round_2_result,
+                    &round_3_result,
+                    &z,
+                    transcript,
+                );
+
+            #[cfg(feature = "instruments")]
+            {
+                let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                table_timings.push((
+                    air.name().to_string(),
+                    air_trace_pairs[idx].1.num_rows(),
+                    table_start.elapsed(),
+                    sub_ops,
+                ));
+            }
+
+            proofs.push(StarkProof {
+                lde_trace_main_merkle_root: round_1_result.main.root,
+                lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
+                lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
+                trace_ood_evaluations: round_3_result.trace_ood_evaluations,
+                composition_poly_root: round_2_result.composition_poly_root,
+                composition_poly_parts_ood_evaluation: round_3_result
+                    .composition_poly_parts_ood_evaluation,
+                fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
+                fri_last_value: round_4_result.fri_last_value,
+                query_list: round_4_result.query_list,
+                deep_poly_openings: round_4_result.deep_poly_openings,
+                nonce: round_4_result.nonce,
+                bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+                public_inputs: pub_inputs.clone(),
+                trace_length: domain.interpolation_domain_size,
+            });
         }
 
         #[cfg(feature = "instruments")]
         {
-            // Store timing data for the top-level report in prove_with_options.
-            // Uses a thread-local to avoid changing multi_prove's return type.
             crate::instruments::store(crate::instruments::MultiProveTiming {
                 prepass: prepass_elapsed,
                 main_commits: main_commits_elapsed,
@@ -2422,170 +2508,6 @@ pub trait IsStarkProver<
         .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
 
-    // TODO: propagate errors instead of unwrap() in open_deep_composition_poly and FRI operations
-    /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
-    /// Warning: the transcript must be safely initialized before passing it to this method.
-    fn prove_rounds_2_to_4(
-        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        pub_inputs: &PI,
-        round_1_result: &Round1<Field, FieldExtension>,
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-        domain: &Domain<Field>,
-        twiddles: &LdeTwiddles<Field>,
-    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
-    where
-        FieldElement<Field>: AsBytes,
-        FieldElement<FieldExtension>: AsBytes,
-        PI: Send + Sync + Clone,
-    {
-        log::debug!("Started proof generation...");
-
-        // ===================================
-        // ==========|   Round 2   |==========
-        // ===================================
-
-        // <<<< Receive challenge: 𝛽
-        let beta = transcript.sample_field_element();
-        let trace_length = domain.interpolation_domain_size;
-        let num_boundary_constraints = air
-            .boundary_constraints(
-                pub_inputs,
-                &round_1_result.rap_challenges,
-                round_1_result.bus_public_inputs.as_ref(),
-                trace_length,
-            )
-            .constraints
-            .len();
-
-        let num_transition_constraints = air.context().num_transition_constraints;
-
-        let mut coefficients: Vec<_> =
-            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
-                .take(num_boundary_constraints + num_transition_constraints)
-                .collect();
-
-        let transition_coefficients: Vec<_> =
-            coefficients.drain(..num_transition_constraints).collect();
-        let boundary_coefficients = coefficients;
-
-        let round_2_result = Self::round_2_compute_composition_polynomial(
-            air,
-            pub_inputs,
-            domain,
-            twiddles,
-            round_1_result,
-            &transition_coefficients,
-            &boundary_coefficients,
-        )?;
-
-        // >>>> Send commitments: [H₁], [H₂]
-        transcript.append_bytes(&round_2_result.composition_poly_root);
-
-        // ===================================
-        // ==========|   Round 3   |==========
-        // ===================================
-
-        // <<<< Receive challenge: z
-        let z = transcript.sample_z_ood(
-            &domain.lde_roots_of_unity_coset,
-            &domain.trace_roots_of_unity,
-        );
-
-        #[cfg(feature = "instruments")]
-        let t_r3 = Instant::now();
-        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
-            air,
-            domain,
-            round_1_result,
-            &round_2_result,
-            &z,
-        );
-        #[cfg(feature = "instruments")]
-        let round_3_dur = t_r3.elapsed();
-
-        // >>>> Send values: tⱼ(zgᵏ)
-        let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
-        for col in trace_ood_evaluations_columns.iter() {
-            for elem in col.iter() {
-                transcript.append_field_element(elem);
-            }
-        }
-
-        // >>>> Send values: Hᵢ(z^N)
-        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
-            transcript.append_field_element(element);
-        }
-
-        // ===================================
-        // ==========|   Round 4   |==========
-        // ===================================
-
-        // Part of this round is running FRI, which is an interactive
-        // protocol on its own. Therefore we pass it the transcript
-        // to simulate the interactions with the verifier.
-        let round_4_result = Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
-            air,
-            domain,
-            round_1_result,
-            &round_2_result,
-            &round_3_result,
-            &z,
-            transcript,
-        );
-
-        #[cfg(feature = "instruments")]
-        {
-            let zero = Duration::ZERO;
-            let (r2_constraints, r2_fft, r2_merkle) =
-                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
-            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
-                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
-            crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
-                constraints: r2_constraints,
-                comp_decompose: r2_fft,
-                comp_commit: r2_merkle,
-                ood: round_3_dur,
-                deep_comp: r4_deep_comp,
-                deep_extend: r4_fft,
-                fri_commit: r4_merkle,
-                queries: r4_queries,
-            });
-        }
-
-        log::debug!("End proof generation");
-
-        Ok(StarkProof {
-            // [t]
-            lde_trace_main_merkle_root: round_1_result.main.root,
-            // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
-            // For preprocessed tables: commitment to precomputed columns only
-            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
-            // tⱼ(zgᵏ)
-            trace_ood_evaluations: round_3_result.trace_ood_evaluations,
-            // [H₁] and [H₂]
-            composition_poly_root: round_2_result.composition_poly_root,
-            // Hᵢ(z^N)
-            composition_poly_parts_ood_evaluation: round_3_result
-                .composition_poly_parts_ood_evaluation,
-            // [pₖ]
-            fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-            // pₙ
-            fri_last_value: round_4_result.fri_last_value,
-            // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
-            query_list: round_4_result.query_list,
-            // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)
-            // Open(H₁(D_LDE, -𝜐ᵢ), Open(H₂(D_LDE, -𝜐ᵢ), Open(tⱼ(D_LDE), -𝜐ᵢ)
-            deep_poly_openings: round_4_result.deep_poly_openings,
-            // nonce obtained from grinding
-            nonce: round_4_result.nonce,
-            // Bus interaction public inputs (for boundary constraints and bus balance check)
-            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
-            // Public inputs for boundary constraints
-            public_inputs: pub_inputs.clone(),
-            trace_length: domain.interpolation_domain_size,
-        })
-    }
 }
 
 /// Print a global bus balance report aggregating per-bus sums across all tables.
