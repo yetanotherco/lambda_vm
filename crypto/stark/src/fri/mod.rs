@@ -56,9 +56,12 @@ where
     // had never been tried.
     #[cfg(feature = "cuda")]
     {
-        // GPU FRI commit is disabled unconditionally (see `try_fri_commit_gpu`
-        // in gpu_lde.rs for the full explanation). The CPU fallback below
-        // handles all cases correctly, including early termination.
+        // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
+        // drives the same commit phase on-device (Goldilocks + Ext3, above the
+        // LDE size threshold, and only when folding actually happens) and returns
+        // `Some` with the final-polynomial coefficients. It returns `None` on any
+        // precondition miss or cudarc error — restoring the transcript first — so
+        // the CPU path below then runs as if the GPU had never been tried.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
             _number_layers,
             &evals,
