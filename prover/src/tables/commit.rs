@@ -50,7 +50,11 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::{AddConstraint, AddOperand};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
+use crate::constraints::templates::{
+    AddConstraint, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
+};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -849,5 +853,65 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CommitConstr
         E: IsField,
     {
         self.compute(step)
+    }
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The COMMIT table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`create_constraints`] index-for-index (8 constraints):
+/// - idx 0-2: `IS_BIT` on `first`, `end`, `μ`;
+/// - idx 3:   `(first + end)·(1 − μ) = 0` (first/end ⇒ μ);
+/// - idx 4,5: `ADD` pair `address + 1 = address_incr` (unconditional);
+/// - idx 6,7: `ADD` pair `count_decr + 1 = count` (unconditional).
+pub struct CommitConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut m = vec![
+            is_bit_meta(0, false),      // first
+            is_bit_meta(1, false),      // end
+            is_bit_meta(2, false),      // μ
+            ConstraintMeta::base(3, 2), // (first + end)·(1 − μ)
+        ];
+        m.extend(add_pair_meta(4, false)); // idx 4,5: address + 1 = address_incr
+        m.extend(add_pair_meta(6, false)); // idx 6,7: count_decr + 1 = count
+        m
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0-2: IS_BIT for first, end, mu
+        emit_is_bit(b, 0, cols::FIRST, None);
+        emit_is_bit(b, 1, cols::END, None);
+        emit_is_bit(b, 2, cols::MU, None);
+
+        // idx 3: (first + end) * (1 - mu)
+        let one = b.one();
+        let first = b.main(0, cols::FIRST);
+        let end = b.main(0, cols::END);
+        let mu = b.main(0, cols::MU);
+        b.emit_base(3, (first + end) * (one - mu));
+
+        // idx 4,5: ADD template for address + 1 = address_incr (unconditional)
+        emit_add_pair(
+            b,
+            4,
+            &[],
+            &AddOperand::dword(cols::ADDRESS_0),
+            &AddOperand::constant(1),
+            &AddOperand::from_dword_hl(cols::ADDRESS_INCR_0),
+        );
+
+        // idx 6,7: SUB via ADD: count_decr + 1 = count (unconditional)
+        emit_add_pair(
+            b,
+            6,
+            &[],
+            &AddOperand::from_dword_hl(cols::COUNT_DECR_0),
+            &AddOperand::constant(1),
+            &AddOperand::dword(cols::COUNT_0),
+        );
     }
 }

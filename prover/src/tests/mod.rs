@@ -19,6 +19,8 @@ pub mod constraint_emit_tests;
 #[cfg(test)]
 pub mod constraint_set_tests_a;
 #[cfg(test)]
+pub mod constraint_set_tests_b;
+#[cfg(test)]
 pub mod constraints_tests;
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod count_table_lengths_drift_tests;

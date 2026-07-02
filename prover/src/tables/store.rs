@@ -26,8 +26,10 @@ use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing}
 use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::new_is_bit_constraints;
+use crate::constraints::templates::{emit_is_bit, is_bit_meta, new_is_bit_constraints};
 
 // =========================================================================
 // Column indices for STORE table
@@ -334,4 +336,49 @@ pub fn store_constraints(
     idx += 1;
 
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The STORE table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`store_constraints`] index-for-index:
+/// - idx 0-3: `IS_BIT` on `write2`, `write4`, `write8`, `μ` (unconditional);
+/// - idx 4:   `(Σ width)·(1 − Σ width) = 0` (width sum is a bit);
+/// - idx 5:   `(Σ width)·(1 − μ) = 0` (width ⇒ μ).
+pub struct StoreConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for StoreConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            is_bit_meta(0, false),      // write2
+            is_bit_meta(1, false),      // write4
+            is_bit_meta(2, false),      // write8
+            is_bit_meta(3, false),      // μ
+            ConstraintMeta::base(4, 2), // width sum is bit
+            ConstraintMeta::base(5, 2), // width ⇒ μ
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        emit_is_bit(b, 0, cols::WRITE2, None);
+        emit_is_bit(b, 1, cols::WRITE4, None);
+        emit_is_bit(b, 2, cols::WRITE8, None);
+        emit_is_bit(b, 3, cols::MU, None);
+
+        let w2 = b.main(0, cols::WRITE2);
+        let w4 = b.main(0, cols::WRITE4);
+        let w8 = b.main(0, cols::WRITE8);
+        let sum = w2 + w4 + w8;
+
+        // width sum is bit: sum * (1 - sum)
+        let one = b.one();
+        b.emit_base(4, sum.clone() * (one - sum.clone()));
+
+        // width ⇒ μ: sum * (1 - μ)
+        let one = b.one();
+        let mu = b.main(0, cols::MU);
+        b.emit_base(5, sum * (one - mu));
+    }
 }

@@ -28,6 +28,7 @@
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsField, IsSubFieldOf};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::table::TableView;
@@ -563,6 +564,107 @@ pub fn branch_constraints(constraint_idx_start: usize) -> (Vec<BranchConstraint>
         BranchConstraint::new(BranchConstraintKind::JalrIsBit, next()),
     ];
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// `(unmasked_0, unmasked_1)` — the next-pc value repacked into two words,
+/// as builder expressions (twin of [`BranchConstraint::compute_next_pc_unmasked`]):
+///
+/// ```text
+/// unmasked_0 = unmasked_low_byte + next_pc_low_1·2⁸ + next_pc_high_0·2¹⁶
+/// unmasked_1 = next_pc_high_1 + next_pc_high_2·2¹⁶
+/// ```
+fn next_pc_unmasked_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+) -> (B::Expr, B::Expr) {
+    let shift_8 = b.const_base(SHIFT_8);
+    let shift_16 = b.const_base(SHIFT_16);
+    let unmasked_0 = b.main(0, cols::UNMASKED_LOW_BYTE)
+        + b.main(0, cols::NEXT_PC_LOW_1) * shift_8
+        + b.main(0, cols::NEXT_PC_HIGH_0) * shift_16.clone();
+    let unmasked_1 = b.main(0, cols::NEXT_PC_HIGH_1) + b.main(0, cols::NEXT_PC_HIGH_2) * shift_16;
+    (unmasked_0, unmasked_1)
+}
+
+/// `carry_0 = (base_0 + offset_0 − unmasked_0)·2⁻³²` (twin of
+/// [`BranchConstraint::compute_carry_0_for`]).
+fn carry_0_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    base_col_0: usize,
+) -> B::Expr {
+    let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+    let (unmasked_0, _) = next_pc_unmasked_expr(b);
+    (b.main(0, base_col_0) + b.main(0, cols::OFFSET_0) - unmasked_0) * inv_2_32
+}
+
+/// `carry_1 = (base_1 + offset_1 + carry_0 − unmasked_1)·2⁻³²` (twin of
+/// [`BranchConstraint::compute_carry_1_for`]).
+fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    base_col_0: usize,
+    base_col_1: usize,
+) -> B::Expr {
+    let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+    let carry_0 = carry_0_expr(b, base_col_0);
+    let (_, unmasked_1) = next_pc_unmasked_expr(b);
+    (b.main(0, base_col_1) + b.main(0, cols::OFFSET_1) + carry_0 - unmasked_1) * inv_2_32
+}
+
+/// The BRANCH table's transition constraints as a single [`ConstraintSet`],
+/// mirroring [`branch_constraints`] index-for-index (5 constraints):
+/// - idx 0: `(1 − JALR)·carry_0·(1 − carry_0)` on the pc path (degree 3);
+/// - idx 1: `(1 − JALR)·carry_1·(1 − carry_1)` on the pc path (degree 3);
+/// - idx 2: `JALR·carry_0·(1 − carry_0)` on the register path (degree 3);
+/// - idx 3: `JALR·carry_1·(1 − carry_1)` on the register path (degree 3);
+/// - idx 4: `JALR·(1 − JALR)` (degree 2).
+pub struct BranchConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 3), // PcCarry0IsBit
+            ConstraintMeta::base(1, 3), // PcCarry1IsBit
+            ConstraintMeta::base(2, 3), // RegCarry0IsBit
+            ConstraintMeta::base(3, 3), // RegCarry1IsBit
+            ConstraintMeta::base(4, 2), // JalrIsBit
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: (1 - JALR) * carry_0(pc) * (1 - carry_0)
+        let one = b.one();
+        let cond = one - b.main(0, cols::JALR);
+        let c = carry_0_expr(b, cols::PC_0);
+        let one = b.one();
+        b.emit_base(0, cond * c.clone() * (one - c));
+
+        // idx 1: (1 - JALR) * carry_1(pc) * (1 - carry_1)
+        let one = b.one();
+        let cond = one - b.main(0, cols::JALR);
+        let c = carry_1_expr(b, cols::PC_0, cols::PC_1);
+        let one = b.one();
+        b.emit_base(1, cond * c.clone() * (one - c));
+
+        // idx 2: JALR * carry_0(register) * (1 - carry_0)
+        let cond = b.main(0, cols::JALR);
+        let c = carry_0_expr(b, cols::REGISTER_0);
+        let one = b.one();
+        b.emit_base(2, cond * c.clone() * (one - c));
+
+        // idx 3: JALR * carry_1(register) * (1 - carry_1)
+        let cond = b.main(0, cols::JALR);
+        let c = carry_1_expr(b, cols::REGISTER_0, cols::REGISTER_1);
+        let one = b.one();
+        b.emit_base(3, cond * c.clone() * (one - c));
+
+        // idx 4: JALR * (1 - JALR)
+        let one = b.one();
+        let jalr = b.main(0, cols::JALR);
+        b.emit_base(4, jalr.clone() * (one - jalr));
+    }
 }
 
 // =========================================================================

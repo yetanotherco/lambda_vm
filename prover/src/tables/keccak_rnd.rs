@@ -29,6 +29,7 @@
 //! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
 use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -931,4 +932,35 @@ pub fn create_constraints(
         }
     }
     (constraints, idx)
+}
+
+// =========================================================================
+// Single-source constraint set (ConstraintBuilder front-end)
+// =========================================================================
+
+/// The KECCAK round table's transition constraints as a single
+/// [`ConstraintSet`], mirroring [`create_constraints`] index-for-index (20
+/// constraints): for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
+/// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
+pub struct KeccakRndConstraints;
+
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // 20 conditional IS_BIT constraints → degree 3.
+        (0..20)
+            .map(|i| crate::constraints::templates::is_bit_meta(i, true))
+            .collect()
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        use crate::constraints::templates::emit_is_bit;
+
+        let mut idx = 0;
+        for x in 0..5 {
+            for hw in 0..4 {
+                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), Some(cols::MU));
+                idx += 1;
+            }
+        }
+    }
 }
