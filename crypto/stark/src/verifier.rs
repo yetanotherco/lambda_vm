@@ -210,9 +210,13 @@ pub trait IsStarkVerifier<
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        air.transition_constraints().iter().for_each(|c| {
-            denominators[c.constraint_idx()] =
-                c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
+        air.constraints_meta().iter().for_each(|m| {
+            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
+                m,
+                &challenges.z,
+                &domain.trace_primitive_root,
+                trace_length,
+            );
         });
 
         let transition_c_i_evaluations_sum = itertools::izip!(

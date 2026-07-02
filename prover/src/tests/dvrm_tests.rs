@@ -4,7 +4,7 @@ use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
 use crate::tables::dvrm::{
-    DvrmOperation, bus_interactions, cols, dvrm_constraints, generate_dvrm_trace,
+    DvrmConstraints, DvrmOperation, bus_interactions, cols, dvrm_constraints, generate_dvrm_trace,
 };
 use crate::tables::types::FE;
 use crate::test_utils::{
@@ -420,7 +420,7 @@ fn test_padding_row() {
 /// AIR — no explicit div-by-zero remainder constraint is needed.
 #[test]
 fn test_dvrm_rejects_false_div_by_zero_remainder() {
-    let air = busless_air(cols::NUM_COLUMNS, dvrm_constraints(0).0);
+    let air = busless_air(cols::NUM_COLUMNS, DvrmConstraints);
     // numerator = 20, denominator = 0 => div-by-zero, honest remainder = 20.
     let mut trace = generate_dvrm_trace(&[(DvrmOperation::new(20, 0, UNSIGNED), true)]);
     assert!(

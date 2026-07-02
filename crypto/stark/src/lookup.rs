@@ -5,6 +5,9 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintMeta, ConstraintSet, ProverEvalFolder, VerifierEvalFolder, num_base_from_meta,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -801,19 +804,35 @@ impl BusValue {
 // =============================================================================
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
+///
+/// `CS` is the table's [`ConstraintSet`]: its single `eval` body emits the
+/// table's base-field transition constraints, and the framework appends the
+/// LogUp constraints (generated from [`Self::logup`]) after them. One body
+/// serves the compiled prover folder, the verifier folder, and IR capture.
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
+    CS: ConstraintSet<F, E>,
 > {
     context: AirContext,
     step_size: usize,
     trace_layout: (usize, usize),
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
-    /// Number of domain (base-field) constraints. These come before LogUp constraints
-    /// in the transition_constraints vec and use the cheaper F×E accumulation path.
-    num_base_constraints: usize,
+    /// The table's single-source constraint set (base-field constraints).
+    constraint_set: CS,
+    /// The LogUp layout: the framework generates the LogUp (extension)
+    /// constraints from this and appends them after the `constraint_set` ones.
+    logup: LogUpLayout,
+    /// Idx-ordered metadata for all transition constraints:
+    /// `constraint_set.meta()` (base prefix) followed by `logup_meta` (ext).
+    meta: Vec<ConstraintMeta>,
+    /// Number of base-field constraints (the `RootKind::Base` prefix length of
+    /// `meta`) — these use the cheaper F×E accumulation path.
+    num_base: usize,
+    /// Lazily captured flat IR of every transition constraint, built once on
+    /// first request (prover/GPU/tests only — the verify path never forces it).
+    constraint_program: std::sync::OnceLock<crate::constraint_ir::ConstraintProgram<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -832,7 +851,8 @@ impl<
     E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
-> AirWithBuses<F, E, B, PI>
+    CS: ConstraintSet<F, E>,
+> AirWithBuses<F, E, B, PI, CS>
 {
     /// Creates an AirWithBuses with LogUp-specific transition constraints.
     /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
@@ -850,41 +870,20 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
+        constraint_set: CS,
     ) -> Self {
-        // Domain constraints are passed in first; LogUp constraints are appended below.
-        // The domain constraints use the F×E accumulation path (3 muls vs 9).
-        let num_base_constraints = transition_constraints.len();
-
+        // Base-field (table) constraints come from the constraint set; LogUp
+        // (extension) constraints are appended by the framework from the layout.
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
+        let num_term_columns = logup.num_term_columns;
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
-        let absorbed =
-            auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
-
-        // Create batched term constraints for committed pairs only
-        for pair_idx in 0..num_committed_pairs {
-            let constraint = LookupBatchedTermConstraint::new(
-                auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
-                auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
-                pair_idx,
-                transition_constraints.len(),
-            );
-            transition_constraints.push(Box::new(constraint));
-        }
-
-        let num_term_columns = num_committed_pairs;
-
-        // Add the accumulated constraint with absorbed interactions
-        if num_interactions > 0 {
-            let accumulated_constraint = LookupAccumulatedConstraint::new(
-                transition_constraints.len(),
-                num_term_columns,
-                absorbed,
-            );
-            transition_constraints.push(Box::new(accumulated_constraint));
-        }
+        // meta = constraint_set base-prefix meta + appended LogUp ext meta.
+        let mut meta = constraint_set.meta();
+        let num_base = num_base_from_meta(&meta);
+        // The set is entirely base-field (its meta is a Base prefix).
+        debug_assert_eq!(num_base, meta.len(), "constraint set meta must be all-base");
+        meta.extend(logup_meta(&logup, meta.len()));
 
         // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
@@ -895,7 +894,7 @@ impl<
         let trace_layout = (num_main_columns, num_aux_columns);
 
         // Compute max bus elements across all interactions for alpha power count
-        let max_bus_elements = auxiliary_trace_build_data
+        let max_bus_elements = logup
             .interactions
             .iter()
             .map(|i| i.num_bus_elements())
@@ -907,15 +906,18 @@ impl<
             proof_options: proof_options.clone(),
             trace_columns: trace_layout.0 + trace_layout.1,
             transition_offsets: vec![0, 1],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
             step_size,
             trace_layout,
-            transition_constraints,
-            num_base_constraints,
+            constraint_set,
+            logup,
+            meta,
+            num_base,
+            constraint_program: std::sync::OnceLock::new(),
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -961,12 +963,13 @@ impl<
     }
 }
 
-impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
+impl<F, E, B, PI, CS> crate::traits::AIR for AirWithBuses<F, E, B, PI, CS>
 where
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
+    CS: ConstraintSet<F, E>,
 {
     type Field = F;
 
@@ -1003,12 +1006,7 @@ where
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        let max_degree = self
-            .transition_constraints
-            .iter()
-            .map(|c| c.degree())
-            .max()
-            .unwrap_or(1);
+        let max_degree = self.meta.iter().map(|m| m.degree).max().unwrap_or(1);
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1023,13 +1021,57 @@ where
     }
 
     fn num_base_transition_constraints(&self) -> usize {
-        self.num_base_constraints
+        self.num_base
     }
 
-    fn transition_constraints(
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
+    }
+
+    fn compute_transition_prover(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+        ctx: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        // One folder pass runs BOTH the table constraint set and the LogUp
+        // emission; LogUp constraints are appended after the set's (idx offset
+        // by the base-constraint count).
+        run_air_transition_prover(
+            &self.constraint_set,
+            &self.logup,
+            ctx,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        ctx: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_air_transition_verifier(
+            &self.constraint_set,
+            &self.logup,
+            self.num_base,
+            self.meta.len(),
+            ctx,
+        )
+    }
+
+    fn constraint_program(
+        &self,
+    ) -> &crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension> {
+        // Lazily captured once (prover/GPU/tests only — the verify path never
+        // calls this). Runs the table set AND the LogUp emission through one
+        // CaptureBuilder, matching the folder emission order/indexing exactly.
+        self.constraint_program.get_or_init(|| {
+            let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
+            self.constraint_set.eval(&mut cb);
+            emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+            let (prog, _degrees) = cb.finish(self.num_base);
+            prog
+        })
     }
 
     fn build_auxiliary_trace(
@@ -1729,7 +1771,7 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
 // This is value-preserving (adding `0·α` is a no-op) and only costs a few extra
 // base×ext muls per row.
 
-use crate::constraints::builder::{ConstraintBuilder, ConstraintMeta};
+use crate::constraints::builder::ConstraintBuilder;
 
 /// Config describing an [`AirWithBuses`] table's LogUp layout, exactly as
 /// computed by [`AirWithBuses::new`] from the interaction list (via
@@ -2143,6 +2185,72 @@ pub fn logup_meta(layout: &LogUpLayout, idx_start: usize) -> Vec<ConstraintMeta>
     let absorbed_len = layout.absorbed().len();
     meta.push(ConstraintMeta::ext(idx, 1 + absorbed_len));
     meta
+}
+
+/// Run an [`AirWithBuses`] table's transition constraints through the
+/// [`ProverEvalFolder`] in ONE pass: the constraint set's base-field body
+/// followed by the appended LogUp constraints (idx offset by `num_base`, the
+/// base-prefix length). `base_evals` is sized `num_base`; `ext_evals` the total
+/// constraint count.
+fn run_air_transition_prover<F, E, CS>(
+    constraint_set: &CS,
+    logup: &LogUpLayout,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+    base_evals: &mut [FieldElement<F>],
+    ext_evals: &mut [FieldElement<E>],
+) where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let num_base = base_evals.len();
+    let mut folder = ProverEvalFolder::new(ctx, base_evals, ext_evals);
+    constraint_set.eval(&mut folder);
+    emit_logup_constraints(&mut folder, logup, num_base);
+    folder.assert_all_emitted();
+}
+
+/// Run an [`AirWithBuses`] table's transition constraints at a single point,
+/// returning every constraint value in the extension field: the constraint
+/// set's base-field body (promoted) followed by the appended LogUp constraints.
+///
+/// A Verifier context runs the [`VerifierEvalFolder`] (the OOD/recursion path).
+/// A Prover context is also accepted — debug trace validation calls this with a
+/// prover frame — by running the [`ProverEvalFolder`] and promoting the
+/// base-prefix results, mirroring the old boxed path.
+fn run_air_transition_verifier<F, E, CS>(
+    constraint_set: &CS,
+    logup: &LogUpLayout,
+    num_base: usize,
+    num_constraints: usize,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let mut ext_evals = vec![FieldElement::<E>::zero(); num_constraints];
+    match ctx {
+        TransitionEvaluationContext::Verifier { .. } => {
+            let mut folder = VerifierEvalFolder::new(ctx, &mut ext_evals);
+            constraint_set.eval(&mut folder);
+            emit_logup_constraints(&mut folder, logup, num_base);
+            folder.assert_all_emitted();
+        }
+        TransitionEvaluationContext::Prover { .. } => {
+            let mut base_evals = vec![FieldElement::<F>::zero(); num_base];
+            let mut folder = ProverEvalFolder::new(ctx, &mut base_evals, &mut ext_evals);
+            constraint_set.eval(&mut folder);
+            emit_logup_constraints(&mut folder, logup, num_base);
+            folder.assert_all_emitted();
+            // Promote the base-prefix results into the extension slots.
+            for (slot, base) in ext_evals.iter_mut().zip(base_evals) {
+                *slot = base.to_extension();
+            }
+        }
+    }
+    ext_evals
 }
 
 /// Constraint for a batched pair of interactions sharing one aux column.
@@ -2642,14 +2750,10 @@ mod logup_single_source_tests {
             // --- verifier-side: embed the same frame into the extension ---
             let embed_step = |step: &TableView<Gl, Ext3>| -> TableView<Ext3, Ext3> {
                 let main: Vec<Fp3> = (0..num_main_cols)
-                    .map(|c| {
-                        step.get_main_evaluation_element(0, c)
-                            .clone()
-                            .to_extension()
-                    })
+                    .map(|c| step.get_main_evaluation_element(0, c).to_extension())
                     .collect();
                 let aux: Vec<Fp3> = (0..n_aux)
-                    .map(|c| step.get_aux_evaluation_element(0, c).clone())
+                    .map(|c| *step.get_aux_evaluation_element(0, c))
                     .collect();
                 TableView::new(vec![main], vec![aux])
             };

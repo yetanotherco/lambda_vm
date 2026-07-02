@@ -5,7 +5,6 @@ use crate::{
             ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
-        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -17,130 +16,6 @@ use math::{
     traits::AsBytes,
 };
 use std::marker::PhantomData;
-
-#[derive(Clone)]
-struct ShiftedFibTransition1<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> ShiftedFibTransition1<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for ShiftedFibTransition1<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_row = frame.get_evaluation_step(0);
-        let second_row = frame.get_evaluation_step(1);
-
-        let a0_1 = first_row.get_main_evaluation_element(0, 1);
-        let a1_0 = second_row.get_main_evaluation_element(0, 0);
-
-        let res = a1_0 - a0_1;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-#[derive(Clone)]
-struct ShiftedFibTransition2<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> ShiftedFibTransition2<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for ShiftedFibTransition2<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_row = frame.get_evaluation_step(0);
-        let second_row = frame.get_evaluation_step(1);
-
-        let a0_0 = first_row.get_main_evaluation_element(0, 0);
-        let a0_1 = first_row.get_main_evaluation_element(0, 1);
-        let a1_1 = second_row.get_main_evaluation_element(0, 1);
-
-        let res = a1_1 - a0_0 - a0_1;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct PublicInputs<F>
@@ -163,9 +38,9 @@ where
     }
 }
 
-/// Single-body [`ConstraintSet`] for [`Fibonacci2ColsShifted`]: the same
-/// constraints as `ShiftedFibTransition1` + `ShiftedFibTransition2`, written
-/// once against the [`ConstraintBuilder`].
+/// Single-body [`ConstraintSet`] for [`Fibonacci2ColsShifted`]: the two
+/// shifted-Fibonacci recurrences, written once against the
+/// [`ConstraintBuilder`].
 pub struct Fibonacci2ColsShiftedConstraints<F: IsFFTField> {
     phantom: PhantomData<F>,
 }
@@ -209,7 +84,8 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
 /// The AIR for to a 2 column trace, where each column is a Fibonacci sequence and the
@@ -229,23 +105,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let transition_constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(ShiftedFibTransition1::new()),
-            Box::new(ShiftedFibTransition2::new()),
-        ];
+        let meta = Fibonacci2ColsShiftedConstraints::<F>::default().meta();
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             transition_offsets: vec![0, 1],
-            num_transition_constraints: 2,
+            num_transition_constraints: meta.len(),
             trace_columns: 2,
         };
 
         Self {
             context,
-            transition_constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -266,10 +138,8 @@ where
         BoundaryConstraints::from_constraints(vec![initial_condition, claimed_value_constraint])
     }
 
-    fn transition_constraints(
-        &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
     }
 
     fn compute_transition_prover(

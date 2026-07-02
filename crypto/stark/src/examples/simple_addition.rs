@@ -10,7 +10,6 @@ use crate::{
             ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
-        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -19,69 +18,8 @@ use crate::{
 };
 use math::field::{element::FieldElement, traits::IsFFTField};
 
-/// Transition constraint: col0 + col1 = col2
-/// This constraint is applied at every row (end_exemptions = 0).
-#[derive(Clone)]
-struct AdditionConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> AdditionConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for AdditionConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let current_step = frame.get_evaluation_step(0);
-
-        let col0 = current_step.get_main_evaluation_element(0, 0);
-        let col1 = current_step.get_main_evaluation_element(0, 1);
-        let col2 = current_step.get_main_evaluation_element(0, 2);
-
-        // Constraint: col0 + col1 - col2 = 0
-        let res = col0 + col1 - col2;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-/// Single-body [`ConstraintSet`] for [`SimpleAdditionAIR`]: the same
-/// constraint as `AdditionConstraint`, written once against the
-/// [`ConstraintBuilder`].
+/// Single-body [`ConstraintSet`] for [`SimpleAdditionAIR`]: `col0 + col1 = col2`
+/// (applied at every row), written once against the [`ConstraintBuilder`].
 pub struct SimpleAdditionConstraints<F: IsFFTField> {
     phantom: PhantomData<F>,
 }
@@ -117,7 +55,8 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -145,20 +84,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![Box::new(AdditionConstraint::new())];
+        let meta = SimpleAdditionConstraints::<F>::default().meta();
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 3,            // col0, col1, col2
             transition_offsets: vec![0], // Only need current step
-            num_transition_constraints: constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
-            constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -177,10 +115,8 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
 
-    fn transition_constraints(
-        &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
     }
 
     fn compute_transition_prover(

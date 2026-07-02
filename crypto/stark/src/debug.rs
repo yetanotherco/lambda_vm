@@ -89,12 +89,11 @@ pub fn validate_trace<
         });
 
     // --------- VALIDATE TRANSITION CONSTRAINTS -----------
-    let n_transition_constraints = air.context().num_transition_constraints;
-    let exemption_steps: Vec<usize> =
-        std::iter::repeat_n(lde_trace.num_steps(), n_transition_constraints)
-            .zip(air.transition_constraints())
-            .map(|(trace_steps, constraint)| trace_steps - constraint.end_exemptions())
-            .collect();
+    let exemption_steps: Vec<usize> = air
+        .constraints_meta()
+        .iter()
+        .map(|m| lde_trace.num_steps() - m.end_exemptions)
+        .collect();
 
     let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
         if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {

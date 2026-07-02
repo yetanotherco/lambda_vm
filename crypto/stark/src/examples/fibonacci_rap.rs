@@ -7,7 +7,6 @@ use crate::{
             ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
-        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -29,139 +28,8 @@ fn resize_to_next_power_of_two<F: IsFFTField>(trace_columns: &mut [Vec<FieldElem
     }
 }
 
-#[derive(Clone)]
-struct FibConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> FibConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn end_exemptions(&self) -> usize {
-        // NOTE: This is hard-coded for the example of steps = 16 in the integration tests.
-        // If that number changes in the test, this should be changed too or the test will fail.
-        3 + 32 - 16 - 1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-        let third_step = frame.get_evaluation_step(2);
-
-        let a0 = first_step.get_main_evaluation_element(0, 0);
-        let a1 = second_step.get_main_evaluation_element(0, 0);
-        let a2 = third_step.get_main_evaluation_element(0, 0);
-
-        let res = a2 - a1 - a0;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-#[derive(Clone)]
-struct PermutationConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> PermutationConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for PermutationConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        // Auxiliary constraints
-        let z_i = first_step.get_aux_evaluation_element(0, 0);
-        let z_i_plus_one = second_step.get_aux_evaluation_element(0, 0);
-        let gamma = &rap_challenges[0];
-
-        let a_i = first_step.get_main_evaluation_element(0, 0);
-        let b_i = first_step.get_main_evaluation_element(0, 1);
-
-        let res = z_i_plus_one * (b_i + gamma) - z_i * (a_i + gamma);
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-/// Single-body [`ConstraintSet`] for [`FibonacciRAP`]: the same constraints
-/// as `FibConstraint` + `PermutationConstraint`, written once against the
+/// Single-body [`ConstraintSet`] for [`FibonacciRAP`]: the Fibonacci
+/// recurrence plus the RAP permutation constraint, written once against the
 /// [`ConstraintBuilder`]. The permutation constraint reads the auxiliary
 /// (RAP) column and the interaction challenge, so it is an `Ext` constraint
 /// after the `Base` prefix.
@@ -174,7 +42,7 @@ where
     fn meta(&self) -> Vec<ConstraintMeta> {
         vec![
             // idx 0: fibonacci; end exemptions hard-coded for the steps = 16
-            // integration tests (see `FibConstraint::end_exemptions`).
+            // integration tests.
             ConstraintMeta::base(0, 1).with_end_exemptions(3 + 32 - 16 - 1),
             // idx 1: permutation; reads the next row ⇒ 1 end exemption.
             ConstraintMeta::ext(1, 2).with_end_exemptions(1),
@@ -206,7 +74,8 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
@@ -234,23 +103,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let transition_constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(FibConstraint::new()),
-            Box::new(PermutationConstraint::new()),
-        ];
+        let meta = ConstraintSet::<F, F>::meta(&FibonacciRAPConstraints);
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 3,
             transition_offsets: vec![0, 1, 2],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
-            transition_constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -317,10 +182,8 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1, a0_aux])
     }
 
-    fn transition_constraints(
-        &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
     }
 
     fn compute_transition_prover(

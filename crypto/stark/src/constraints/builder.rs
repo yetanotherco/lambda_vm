@@ -238,6 +238,20 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B);
 }
 
+/// A [`ConstraintSet`] with no transition constraints — for tables whose
+/// soundness rests entirely on their bus (LogUp) interactions (e.g. BITWISE,
+/// PAGE, REGISTER, the continuation GLOBAL_MEMORY / global L2G sub-tables).
+/// The framework still appends the LogUp constraints; this contributes nothing
+/// before them.
+pub struct EmptyConstraints;
+
+impl<F: IsField, E: IsField> ConstraintSet<F, E> for EmptyConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        Vec::new()
+    }
+    fn eval<B: ConstraintBuilder<F, E>>(&self, _b: &mut B) {}
+}
+
 // =============================================================================
 // Shared AIR plumbing: run a ConstraintSet through the folders
 // =============================================================================

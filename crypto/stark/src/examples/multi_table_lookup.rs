@@ -5,7 +5,7 @@
 //! together with `AirWithBuses` in the engine-switch phase.
 
 use crate::{
-    constraints::transition::TransitionConstraintEvaluator,
+    constraints::builder::EmptyConstraints,
     lookup::{
         AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
         NullBoundaryConstraintBuilder, Packing,
@@ -33,9 +33,7 @@ impl From<BusId> for u64 {
 
 pub fn new_cpu_air_with_lookup(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with ADD table (CPU sends to ADD bus)
@@ -58,15 +56,13 @@ pub fn new_cpu_air_with_lookup(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 pub fn new_mul_air_with_lookup(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (MUL table receives from MUL bus)
@@ -83,15 +79,13 @@ pub fn new_mul_air_with_lookup(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 pub fn new_add_air_with_lookup(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![
             // Interaction with CPU table (ADD table receives from ADD bus)
@@ -108,6 +102,6 @@ pub fn new_add_air_with_lookup(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }

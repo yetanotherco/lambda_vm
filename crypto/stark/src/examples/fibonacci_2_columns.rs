@@ -8,7 +8,6 @@ use crate::{
             ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
-        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -17,135 +16,8 @@ use crate::{
 };
 use math::field::{element::FieldElement, traits::IsFFTField};
 
-#[derive(Clone)]
-struct FibTransition1<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> FibTransition1<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for FibTransition1<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        // s_{0, i+1} = s_{0, i} + s_{1, i}
-        let s0_0 = first_step.get_main_evaluation_element(0, 0);
-        let s0_1 = first_step.get_main_evaluation_element(0, 1);
-        let s1_0 = second_step.get_main_evaluation_element(0, 0);
-
-        let res = s1_0 - s0_0 - s0_1;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-#[derive(Clone)]
-struct FibTransition2<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> FibTransition2<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for FibTransition2<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        // s_{1, i+1} = s_{1, i} + s_{0, i+1}
-        let s0_1 = first_step.get_main_evaluation_element(0, 1);
-        let s1_0 = second_step.get_main_evaluation_element(0, 0);
-        let s1_1 = second_step.get_main_evaluation_element(0, 1);
-
-        let res = s1_1 - s0_1 - s1_0;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-/// Single-body [`ConstraintSet`] for [`Fibonacci2ColsAIR`]: the same
-/// constraints as `FibTransition1` + `FibTransition2`, written once against
-/// the [`ConstraintBuilder`].
+/// Single-body [`ConstraintSet`] for [`Fibonacci2ColsAIR`]: the two row-major
+/// Fibonacci recurrences, written once against the [`ConstraintBuilder`].
 pub struct Fibonacci2ColsConstraints<F: IsFFTField> {
     phantom: PhantomData<F>,
 }
@@ -189,7 +61,8 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
 /// The AIR for to a 2 column trace, where the columns form a Fibonacci sequence when
@@ -207,23 +80,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(FibTransition1::new()),
-            Box::new(FibTransition2::new()),
-        ];
+        let meta = Fibonacci2ColsConstraints::<F>::default().meta();
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             transition_offsets: vec![0, 1],
-            num_transition_constraints: constraints.len(),
+            num_transition_constraints: meta.len(),
             trace_columns: 2,
         };
 
         Self {
             context,
-            constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -240,8 +109,8 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
 
-    fn transition_constraints(&self) -> &Vec<Box<dyn TransitionConstraintEvaluator<F, F>>> {
-        &self.constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
     }
 
     fn compute_transition_prover(

@@ -42,6 +42,9 @@ use executor::vm::execution::Executor;
 use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
+use stark::constraints::builder::{
+    ConstraintBuilder, ConstraintMeta, ConstraintSet, EmptyConstraints,
+};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
@@ -65,11 +68,6 @@ use crate::{
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
-
-fn empty_constraints()
--> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
-    vec![]
-}
 
 /// Fresh transcript seeded with the epoch's statement (ELF, public output, table
 /// layout) and `epoch_label` (its position). The epoch's prove, verify, and
@@ -112,11 +110,18 @@ fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E
 /// "`MU ∈ {0,1}`" explicit on the table itself rather than relying on that
 /// cross-bus argument. Lives on the epoch-local air; the global proof commits the
 /// identical trace (root-bound), so it inherits it.
-fn l2g_constraints()
--> Vec<Box<dyn stark::constraints::transition::TransitionConstraintEvaluator<F, E>>> {
-    use crate::constraints::templates::IsBitConstraint;
-    use stark::constraints::transition::TransitionConstraint;
-    vec![IsBitConstraint::unconditional(local_to_global::cols::MU, 0).boxed()]
+/// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
+/// (`MU·(1−MU) = 0`) at constraint index 0.
+struct L2gMemoryConstraints;
+
+impl ConstraintSet<F, E> for L2gMemoryConstraints {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // IS_BIT(MU), unconditional → degree 2.
+        vec![ConstraintMeta::base(0, 2)]
+    }
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        crate::constraints::templates::emit_is_bit(b, 0, local_to_global::cols::MU, None);
+    }
 }
 
 /// Local-to-global AIR on the cross-epoch GlobalMemory bus (used in the global proof).
@@ -134,7 +139,7 @@ fn l2g_constraints()
 fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -142,7 +147,7 @@ fn l2g_global_air(
         },
         opts,
         1,
-        empty_constraints(),
+        EmptyConstraints,
     )
 }
 
@@ -155,7 +160,7 @@ fn l2g_global_air(
 fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
     let interactions = [
         local_to_global::memory_bus_interactions(),
         local_to_global::range_check_interactions(epoch_label),
@@ -166,7 +171,7 @@ fn l2g_memory_air(
         AuxiliaryTraceBuildData { interactions },
         opts,
         1,
-        l2g_constraints(),
+        L2gMemoryConstraints,
     )
 }
 
@@ -181,7 +186,7 @@ fn l2g_memory_air(
 fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let air = AirWithBuses::new(
         global_memory::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -189,7 +194,7 @@ fn global_memory_air(
         },
         opts,
         1,
-        empty_constraints(),
+        EmptyConstraints,
     );
     let commitment = if config.init_values.is_some() {
         page::compute_precomputed_commitment(config, opts)

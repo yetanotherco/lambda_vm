@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
@@ -7,7 +5,6 @@ use crate::{
             ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
-        transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -18,124 +15,8 @@ use math::field::{element::FieldElement, goldilocks::GoldilocksField, traits::Is
 
 type StarkField = GoldilocksField;
 
-#[derive(Clone)]
-struct FibConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-impl<F: IsFFTField> FibConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        1
-    }
-
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn end_exemptions(&self) -> usize {
-        2
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-        let third_step = frame.get_evaluation_step(2);
-
-        let a0 = first_step.get_main_evaluation_element(0, 1);
-        let a1 = second_step.get_main_evaluation_element(0, 1);
-        let a2 = third_step.get_main_evaluation_element(0, 1);
-
-        let res = a2 - a1 - a0;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-#[derive(Clone)]
-struct BitConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-impl<F: IsFFTField> BitConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for BitConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-
-        let bit = first_step.get_main_evaluation_element(0, 0);
-
-        let res = bit * (bit - FieldElement::<F>::one());
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-/// Single-body [`ConstraintSet`] for [`DummyAIR`]: the same constraints as
-/// `FibConstraint` + `BitConstraint`, written once against the
+/// Single-body [`ConstraintSet`] for [`DummyAIR`]: a fibonacci recurrence on
+/// column 1 and an IS_BIT on column 0, written once against the
 /// [`ConstraintBuilder`].
 #[derive(Default)]
 pub struct DummyConstraints;
@@ -166,7 +47,7 @@ impl ConstraintSet<StarkField, StarkField> for DummyConstraints {
 
 pub struct DummyAIR {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<StarkField, StarkField>>>,
+    meta: Vec<ConstraintMeta>,
 }
 
 impl AIR for DummyAIR {
@@ -179,24 +60,16 @@ impl AIR for DummyAIR {
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let transition_constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(FibConstraint::new()),
-            Box::new(BitConstraint::new()),
-        ];
+        let meta = DummyConstraints.meta();
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 2,
             transition_offsets: vec![0, 1, 2],
-            num_transition_constraints: 2,
+            num_transition_constraints: meta.len(),
         };
 
-        Self {
-            context,
-            transition_constraints,
-        }
+        Self { context, meta }
     }
 
     fn boundary_constraints(
@@ -212,10 +85,8 @@ impl AIR for DummyAIR {
         BoundaryConstraints::from_constraints(vec![a0, a1])
     }
 
-    fn transition_constraints(
-        &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
     }
 
     fn compute_transition_prover(

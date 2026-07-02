@@ -4,7 +4,7 @@ use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
 
 use crate::tables::mul::{
-    MulOperation, bus_interactions, cols, generate_mul_trace, mul_constraints,
+    MulConstraints, MulOperation, bus_interactions, cols, generate_mul_trace, mul_constraints,
 };
 use crate::tables::types::FE;
 use crate::test_utils::{
@@ -315,7 +315,7 @@ fn test_identity_multiplication() {
 /// `RawProduct` convolution, evaluated in isolation over a bus-less AIR.
 #[test]
 fn test_mul_rejects_false_product() {
-    let air = busless_air(cols::NUM_COLUMNS, mul_constraints(0).0);
+    let air = busless_air(cols::NUM_COLUMNS, MulConstraints);
     let mut trace = generate_mul_trace(&[(MulOperation::new(20, false, 20, false), false)]);
     assert!(
         validate_busless(&air, &trace),
