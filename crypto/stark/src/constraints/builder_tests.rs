@@ -15,7 +15,7 @@ use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
 use math::field::goldilocks::GoldilocksField as Fp;
 
-use crate::constraint_ir::{eval_program, eval_program_verifier};
+use crate::constraint_ir::{Dim, eval_program, eval_program_verifier};
 use crate::constraints::builder::{
     CaptureBuilder, ConstraintBuilder, ConstraintMeta, ConstraintSet, ProverEvalFolder, RootKind,
     VerifierEvalFolder, num_base_from_meta,
@@ -438,4 +438,244 @@ fn verifier_folder_missing_emit_asserts() {
     let x = folder.main(0, 0);
     folder.emit_base(1, x);
     folder.assert_all_emitted();
+}
+
+// =============================================================================
+// PR-2 pre-flight: num_base alignment guard (release-checked)
+// =============================================================================
+
+/// A capture wrapper that records which `emit_*` sink each constraint index
+/// used, so the meta-derived `num_base` can be checked against the body's
+/// actual base-emit count (the folders route by the sink called; the
+/// interpreter routes by `c < prog.num_base` — these must agree).
+struct CountingCapture {
+    inner: CaptureBuilder<Fp, Ext>,
+    base_idxs: Vec<usize>,
+    ext_idxs: Vec<usize>,
+}
+
+impl ConstraintBuilder<Fp, Ext> for CountingCapture {
+    type Expr = crate::constraints::builder::IrExpr;
+    type ExprE = crate::constraints::builder::IrExpr;
+
+    fn main(&self, offset: usize, col: usize) -> Self::Expr {
+        self.inner.main(offset, col)
+    }
+    fn aux(&self, offset: usize, col: usize) -> Self::ExprE {
+        self.inner.aux(offset, col)
+    }
+    fn periodic(&self, idx: usize) -> Self::Expr {
+        self.inner.periodic(idx)
+    }
+    fn challenge(&self, idx: usize) -> Self::ExprE {
+        self.inner.challenge(idx)
+    }
+    fn alpha_pow(&self, idx: usize) -> Self::ExprE {
+        self.inner.alpha_pow(idx)
+    }
+    fn table_offset(&self) -> Self::ExprE {
+        self.inner.table_offset()
+    }
+    fn const_base(&self, v: u64) -> Self::Expr {
+        self.inner.const_base(v)
+    }
+    fn const_signed(&self, v: i64) -> Self::Expr {
+        self.inner.const_signed(v)
+    }
+    fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr) {
+        self.base_idxs.push(constraint_idx);
+        self.inner.emit_base(constraint_idx, e);
+    }
+    fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE) {
+        self.ext_idxs.push(constraint_idx);
+        self.inner.emit_ext(constraint_idx, e);
+    }
+}
+
+/// `num_base` has two independent sources of truth: the meta Base-prefix
+/// (what the engine wires everywhere) and which `emit_*` sink the body
+/// actually calls (what the folders route by; the interpreter panics via
+/// `.as_base()` if `prog.num_base` disagrees with the root dims). This
+/// asserts they all agree for the sample set — with plain (release-checked)
+/// asserts, per plan §5.9.0.
+#[test]
+fn num_base_from_meta_matches_captured_base_emits() {
+    let meta = SampleSet.meta();
+    let num_base = num_base_from_meta(&meta);
+
+    let mut counting = CountingCapture {
+        inner: CaptureBuilder::new(),
+        base_idxs: Vec::new(),
+        ext_idxs: Vec::new(),
+    };
+    SampleSet.eval(&mut counting);
+    let CountingCapture {
+        inner,
+        mut base_idxs,
+        mut ext_idxs,
+    } = counting;
+    let (prog, _degrees) = inner.finish(num_base);
+
+    // 1. The body's base-emit count equals the meta-derived num_base, and the
+    //    emitted indices are exactly the meta prefix / suffix.
+    base_idxs.sort_unstable();
+    ext_idxs.sort_unstable();
+    assert_eq!(base_idxs.len(), num_base);
+    assert_eq!(base_idxs, (0..num_base).collect::<Vec<_>>());
+    assert_eq!(ext_idxs, (num_base..meta.len()).collect::<Vec<_>>());
+
+    // 2. The interpreter's routing criterion agrees: every base-prefix root is
+    //    Dim::Base (otherwise eval_program's `.as_base()` would panic) and
+    //    every remaining root is Dim::Ext.
+    assert_eq!(prog.num_base, num_base);
+    assert_eq!(prog.roots.len(), meta.len());
+    for (c, &root) in prog.roots.iter().enumerate() {
+        let dim = prog.dims[root as usize];
+        if c < num_base {
+            assert_eq!(dim, Dim::Base, "base-prefix constraint {c} has an ext root");
+        } else {
+            assert_eq!(dim, Dim::Ext, "ext constraint {c} has a base root");
+        }
+    }
+}
+
+// =============================================================================
+// PR-2 pre-flight: next-row aux read + two alpha indices (LogUp shape)
+// =============================================================================
+
+/// LogUp-accumulator-shaped sample: the real 1-/2-absorbed LogUp bodies read
+/// `aux(1, col)` (next-row accumulator) and use several alpha powers — the
+/// primary sample covers neither.
+struct NextRowLogUpSet;
+
+mod lcols {
+    /// A main witness column.
+    pub const VAL: usize = 0;
+    pub const NUM_MAIN: usize = 1;
+    /// Aux: a term column and the accumulator.
+    pub const TERM: usize = 0;
+    pub const ACC: usize = 1;
+    pub const NUM_AUX: usize = 2;
+}
+
+impl ConstraintSet<Fp, Ext> for NextRowLogUpSet {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 1),
+            ConstraintMeta::ext(1, 1).with_end_exemptions(1),
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<Fp, Ext>>(&self, b: &mut B) {
+        // idx 0 (base): next-row main read — main(1, VAL) − main(0, VAL).
+        let cur = b.main(0, lcols::VAL);
+        let next = b.main(1, lcols::VAL);
+        b.emit_base(0, next - cur);
+
+        // idx 1 (ext): acc' − acc − (challenge₀·α₀ + term·α₁) + L/N,
+        // with acc' read from the NEXT row (aux offset 1).
+        let acc = b.aux(0, lcols::ACC);
+        let acc_next = b.aux(1, lcols::ACC);
+        let term = b.aux(0, lcols::TERM);
+        let ch = b.challenge(0);
+        let a0 = b.alpha_pow(0);
+        let a1 = b.alpha_pow(1);
+        let off = b.table_offset();
+        b.emit_ext(1, acc_next - acc - (ch * a0 + term * a1) + off);
+    }
+}
+
+/// Three-way differential for [`NextRowLogUpSet`] on random two-step frames:
+/// prover folder == direct arithmetic == interpreted capture, and verifier
+/// folder == interpreted capture.
+#[test]
+fn next_row_aux_and_multi_alpha_folder_matches_capture() {
+    let meta = NextRowLogUpSet.meta();
+    let num_base = num_base_from_meta(&meta);
+    let mut cb = CaptureBuilder::<Fp, Ext>::new();
+    NextRowLogUpSet.eval(&mut cb);
+    let (prog, degrees) = cb.finish(num_base);
+    for &(idx, measured) in &degrees {
+        assert_eq!(measured, meta[idx].degree, "constraint {idx} degree");
+    }
+
+    let shifts = PackingShifts::<Fp>::new();
+    let vshifts = PackingShifts::<Ext>::new();
+    let mut rng = SplitMix64(0x0004_F01D_u64 ^ 0xABCD);
+    for trial in 0..TRIALS {
+        // Two frame steps with distinct main and aux rows.
+        let rows: Vec<Vec<FpE>> = (0..2)
+            .map(|_| (0..lcols::NUM_MAIN).map(|_| rng.fp()).collect())
+            .collect();
+        let auxs: Vec<Vec<ExtE>> = (0..2)
+            .map(|_| (0..lcols::NUM_AUX).map(|_| rng.ext()).collect())
+            .collect();
+        let challenges = vec![rng.ext()];
+        let alphas = vec![rng.ext(), rng.ext()];
+        let offset = rng.ext();
+
+        // --- prover folder vs direct arithmetic vs interpreter ---
+        let steps: Vec<TableView<Fp, Ext>> = (0..2)
+            .map(|s| TableView::new(vec![rows[s].clone()], vec![auxs[s].clone()]))
+            .collect();
+        let frame = Frame::<Fp, Ext>::new(steps);
+        let periodic: Vec<FpE> = vec![];
+        let ctx = TransitionEvaluationContext::new_prover(
+            &frame,
+            &periodic,
+            &challenges,
+            &alphas,
+            &offset,
+            &shifts,
+        );
+
+        let mut folder_base = vec![FpE::zero(); num_base];
+        let mut folder_ext = vec![ExtE::zero(); meta.len()];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut folder_base, &mut folder_ext);
+        NextRowLogUpSet.eval(&mut folder);
+        folder.assert_all_emitted();
+
+        let direct_base = rows[1][lcols::VAL] - rows[0][lcols::VAL];
+        let direct_ext = auxs[1][lcols::ACC]
+            - auxs[0][lcols::ACC]
+            - (challenges[0] * alphas[0] + auxs[0][lcols::TERM] * alphas[1])
+            + offset;
+        assert_eq!(folder_base[0], direct_base, "trial {trial} base direct");
+        assert_eq!(folder_ext[1], direct_ext, "trial {trial} ext direct");
+
+        let mut interp_base = vec![FpE::zero(); num_base];
+        let mut interp_ext = vec![ExtE::zero(); meta.len()];
+        eval_program(&prog, &ctx, &mut interp_base, &mut interp_ext);
+        assert_eq!(folder_base, interp_base, "trial {trial} base interp");
+        assert_eq!(folder_ext[1], interp_ext[1], "trial {trial} ext interp");
+
+        // --- verifier folder vs interpreter ---
+        let steps_e: Vec<TableView<Ext, Ext>> = (0..2)
+            .map(|s| {
+                TableView::new(
+                    vec![rows[s].iter().map(|x| x.to_extension()).collect()],
+                    vec![auxs[s].clone()],
+                )
+            })
+            .collect();
+        let frame_e = Frame::<Ext, Ext>::new(steps_e);
+        let periodic_e: Vec<ExtE> = vec![];
+        let vctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
+            &frame_e,
+            &periodic_e,
+            &challenges,
+            &alphas,
+            &offset,
+            &vshifts,
+        );
+
+        let mut vfolder_ext = vec![ExtE::zero(); meta.len()];
+        let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vfolder_ext);
+        NextRowLogUpSet.eval(&mut vfolder);
+        vfolder.assert_all_emitted();
+
+        let mut vinterp_ext = vec![ExtE::zero(); meta.len()];
+        eval_program_verifier(&prog, &vctx, &mut vinterp_ext);
+        assert_eq!(vfolder_ext, vinterp_ext, "trial {trial} verifier interp");
+    }
 }
