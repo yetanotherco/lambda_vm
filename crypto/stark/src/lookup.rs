@@ -1708,6 +1708,443 @@ fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
     z - &linear_combination
 }
 
+// =============================================================================
+// LogUp single-source constraints (ConstraintBuilder front-end)
+// =============================================================================
+//
+// The LogUp transition constraints are generated from the interaction config
+// (a [`LogUpLayout`]) through the generic [`ConstraintBuilder`], so ONE body
+// serves the compiled prover folder, the verifier folder and IR capture. These
+// are the single-source twins of the boxed `LookupBatchedTermConstraint` /
+// `LookupAccumulatedConstraint` structs (which stay for now as the differential
+// oracle; the engine switch deletes them).
+//
+// All LogUp constraints use the default zerofier shape (every row, no
+// exemptions) — the structs override none of period/offset/exemptions — so
+// [`logup_meta`] emits plain [`RootKind::Ext`] entries.
+//
+// Honesty note (matches the runtime body): `BusValue::Linear`'s data-dependent
+// "skip the multiply when the row value is zero" optimization is NOT reproduced
+// here — the constraint body is row-agnostic and always emits the multiply.
+// This is value-preserving (adding `0·α` is a no-op) and only costs a few extra
+// base×ext muls per row.
+
+use crate::constraints::builder::{ConstraintBuilder, ConstraintMeta};
+
+/// Config describing an [`AirWithBuses`] table's LogUp layout, exactly as
+/// computed by [`AirWithBuses::new`] from the interaction list (via
+/// [`split_interactions`]). This is the plain-data replacement for the
+/// per-constraint `LookupBatchedTermConstraint` / `LookupAccumulatedConstraint`
+/// objects: [`emit_logup_constraints`] reads it to generate every LogUp
+/// constraint, and [`logup_meta`] reads it for the metadata.
+#[derive(Clone)]
+pub struct LogUpLayout {
+    /// All interactions, in the order they were registered. The first
+    /// `2 * num_committed_pairs` are the committed (batched) pairs; the last
+    /// 1–2 are absorbed into the accumulated constraint.
+    pub interactions: Vec<BusInteraction>,
+    /// Number of committed batched pairs (each gets one aux term column).
+    pub num_committed_pairs: usize,
+    /// Number of committed term columns (`= num_committed_pairs`).
+    pub num_term_columns: usize,
+    /// Index of the accumulated column (`= num_term_columns`).
+    pub acc_column_idx: usize,
+}
+
+impl LogUpLayout {
+    /// Derive the LogUp layout from an interaction list, mirroring the split
+    /// [`AirWithBuses::new`] performs.
+    pub fn from_interactions(interactions: Vec<BusInteraction>) -> Self {
+        let num_interactions = interactions.len();
+        let (num_committed_pairs, _absorbed_count) = split_interactions(num_interactions);
+        let num_term_columns = num_committed_pairs;
+        Self {
+            interactions,
+            num_committed_pairs,
+            num_term_columns,
+            acc_column_idx: num_term_columns,
+        }
+    }
+
+    /// The absorbed interactions (last 1–2), folded into the accumulated
+    /// constraint. Empty when there are no interactions.
+    fn absorbed(&self) -> &[BusInteraction] {
+        let n = self.interactions.len();
+        if n == 0 {
+            return &[];
+        }
+        let (_, absorbed_count) = split_interactions(n);
+        &self.interactions[n - absorbed_count..]
+    }
+
+    /// Number of LogUp transition constraints this layout produces:
+    /// one per committed pair (batched term) plus one accumulated constraint
+    /// when there is at least one interaction.
+    pub fn num_constraints(&self) -> usize {
+        if self.interactions.is_empty() {
+            0
+        } else {
+            self.num_committed_pairs + 1
+        }
+    }
+}
+
+/// Capture a [`Multiplicity`] as a base-field expression, mirroring
+/// [`Multiplicity::evaluate_with`] (via [`compute_multiplicity_from_step`]).
+fn emit_multiplicity<F, E, B>(b: &B, multiplicity: &Multiplicity, offset: usize) -> B::Expr
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    match multiplicity {
+        Multiplicity::One => b.one(),
+        Multiplicity::Column(col) => b.main(offset, *col),
+        Multiplicity::Sum(a, c) => b.main(offset, *a) + b.main(offset, *c),
+        Multiplicity::Negated(col) => b.one() - b.main(offset, *col),
+        Multiplicity::Diff(a, c) => b.main(offset, *a) - b.main(offset, *c),
+        Multiplicity::Sum3(a, c, d) => b.main(offset, *a) + b.main(offset, *c) + b.main(offset, *d),
+        Multiplicity::Linear(terms) => emit_linear_terms(b, terms, offset),
+    }
+}
+
+/// Capture a slice of [`LinearTerm`]s as a base-field sum, mirroring the
+/// `Multiplicity::Linear` arm of [`Multiplicity::evaluate_with`] (`Σ terms`,
+/// starting from zero).
+fn emit_linear_terms<F, E, B>(b: &B, terms: &[LinearTerm], offset: usize) -> B::Expr
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let mut result = b.const_base(0);
+    for term in terms {
+        match *term {
+            LinearTerm::Column {
+                coefficient,
+                column,
+            } => {
+                result = result + b.main(offset, column) * b.const_signed(coefficient);
+            }
+            LinearTerm::ColumnUnsigned {
+                coefficient,
+                column,
+            } => {
+                result = result + b.main(offset, column) * b.const_base(coefficient);
+            }
+            LinearTerm::Constant(value) => {
+                result = result + b.const_signed(value);
+            }
+        }
+    }
+    result
+}
+
+/// Capture a [`Packing`]'s fingerprint contribution as a sum of extension
+/// terms, mirroring [`Packing::accumulate_fingerprint_with`]. Terms are pushed
+/// to `acc` (`col_expr * alpha_power`, base operand LEFT); returns the number
+/// of alpha powers consumed (`= packing.num_bus_elements()`). Field addition is
+/// associative and commutative, so this row-agnostic accumulation is
+/// value-identical to the runtime body regardless of grouping.
+fn emit_packing_fingerprint<F, E, B>(
+    b: &B,
+    packing: Packing,
+    start_col: usize,
+    offset: usize,
+    alpha_offset: usize,
+    acc: &mut Vec<B::ExprE>,
+) -> usize
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let col = |c: usize| b.main(offset, c);
+    let alpha = |i: usize| b.alpha_pow(alpha_offset + i);
+    let shift_8 = || b.const_base(SHIFT_8);
+    let shift_16 = || b.const_base(SHIFT_16);
+    let shift_24 = || b.const_base(SHIFT_8 * SHIFT_16);
+
+    match packing {
+        Packing::Direct => {
+            acc.push(col(start_col) * alpha(0));
+            1
+        }
+        Packing::Word2L => {
+            let combined = col(start_col) + col(start_col + 1) * shift_16();
+            acc.push(combined * alpha(0));
+            1
+        }
+        Packing::Word4L => {
+            let combined = col(start_col)
+                + col(start_col + 1) * shift_8()
+                + col(start_col + 2) * shift_16()
+                + col(start_col + 3) * shift_24();
+            acc.push(combined * alpha(0));
+            1
+        }
+        Packing::DWordWL => {
+            acc.push(col(start_col) * alpha(0));
+            acc.push(col(start_col + 1) * alpha(1));
+            2
+        }
+        Packing::DWordHHW => {
+            acc.push(col(start_col) * alpha(0));
+            let w = col(start_col + 1) + col(start_col + 2) * shift_16();
+            acc.push(w * alpha(1));
+            2
+        }
+        Packing::DWordWHH => {
+            let w = col(start_col) + col(start_col + 1) * shift_16();
+            acc.push(w * alpha(0));
+            acc.push(col(start_col + 2) * alpha(1));
+            2
+        }
+        Packing::DWordHL => {
+            let w0 = col(start_col) + col(start_col + 1) * shift_16();
+            acc.push(w0 * alpha(0));
+            let w1 = col(start_col + 2) + col(start_col + 3) * shift_16();
+            acc.push(w1 * alpha(1));
+            2
+        }
+        Packing::DWordBL => {
+            let w0 = col(start_col)
+                + col(start_col + 1) * shift_8()
+                + col(start_col + 2) * shift_16()
+                + col(start_col + 3) * shift_24();
+            acc.push(w0 * alpha(0));
+            let w1 = col(start_col + 4)
+                + col(start_col + 5) * shift_8()
+                + col(start_col + 6) * shift_16()
+                + col(start_col + 7) * shift_24();
+            acc.push(w1 * alpha(1));
+            2
+        }
+        Packing::QuadHL => {
+            for i in 0..4 {
+                let c = start_col + i * 2;
+                let w = col(c) + col(c + 1) * shift_16();
+                acc.push(w * alpha(i));
+            }
+            4
+        }
+        Packing::QuadWL => {
+            for i in 0..4 {
+                acc.push(col(start_col + i) * alpha(i));
+            }
+            4
+        }
+    }
+}
+
+/// Capture a [`BusValue`]'s fingerprint contribution into `acc`, mirroring
+/// [`BusValue::accumulate_fingerprint_from_step`]. Returns the number of alpha
+/// powers consumed.
+fn emit_busvalue_fingerprint<F, E, B>(
+    b: &B,
+    bv: &BusValue,
+    offset: usize,
+    alpha_offset: usize,
+    acc: &mut Vec<B::ExprE>,
+) -> usize
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    match bv {
+        BusValue::Packed {
+            start_column,
+            packing,
+        } => emit_packing_fingerprint::<F, E, B>(
+            b,
+            *packing,
+            *start_column,
+            offset,
+            alpha_offset,
+            acc,
+        ),
+        BusValue::Linear(terms) => {
+            // Value-preserving: always emit the multiply (see the module note).
+            let result = emit_linear_terms(b, terms, offset);
+            acc.push(result * b.alpha_pow(alpha_offset));
+            1
+        }
+    }
+}
+
+/// Capture an interaction's fingerprint as an extension expression, mirroring
+/// [`compute_fingerprint_from_step`]: `z - (bus_id + α·v[0] + α²·v[1] + ...)`.
+///
+/// `α⁰ = 1`: the bus-id term needs no multiply and is added as a base constant.
+fn emit_fingerprint<F, E, B>(b: &B, interaction: &BusInteraction, offset: usize) -> B::ExprE
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let z = b.challenge(0);
+    let bus = b.const_base(interaction.bus_id);
+    // Collect the α·value terms, then fold. Field addition is associative and
+    // commutative, so the grouping does not change the value.
+    let mut terms: Vec<B::ExprE> = Vec::new();
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        alpha_idx += emit_busvalue_fingerprint::<F, E, B>(b, bv, offset, alpha_idx, &mut terms);
+    }
+    // lc = bus_id + Σ terms  (base + ext = ext, base operand LEFT).
+    let mut iter = terms.into_iter();
+    let lc = match iter.next() {
+        Some(first) => {
+            let mut lc = bus + first;
+            for t in iter {
+                lc = lc + t;
+            }
+            lc
+        }
+        // No values: fingerprint is z - bus_id. `bus` is base, `z` is ext, and
+        // the tower only implements base − ext (base operand LEFT), so write
+        // z − bus as −(bus − z).
+        None => return -(bus - z),
+    };
+    z - lc
+}
+
+/// Emit the batched-term constraint for committed pair `pair_idx`, mirroring
+/// `LookupBatchedTermConstraint::capture`:
+/// `c · fp_a · fp_b − sign_a·m_a·fp_b − sign_b·m_b·fp_a` (degree 3).
+fn emit_logup_batched_term<F, E, B>(b: &mut B, layout: &LogUpLayout, pair_idx: usize, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let interaction_a = &layout.interactions[pair_idx * 2];
+    let interaction_b = &layout.interactions[pair_idx * 2 + 1];
+    let term_column_idx = pair_idx;
+
+    let c = b.aux(0, term_column_idx);
+    let m_a = emit_multiplicity::<F, E, B>(b, &interaction_a.multiplicity, 0);
+    let m_b = emit_multiplicity::<F, E, B>(b, &interaction_b.multiplicity, 0);
+    let fp_a = emit_fingerprint::<F, E, B>(b, interaction_a, 0);
+    let fp_b = emit_fingerprint::<F, E, B>(b, interaction_b, 0);
+
+    // is_sender is a compile-time bool, resolved as add vs neg instead of an
+    // ext×ext sign multiply (same optimization as the runtime body). m·fp is
+    // base×ext = ext (base operand LEFT).
+    let term_a = m_a * fp_b.clone();
+    let term_a = if interaction_a.is_sender {
+        term_a
+    } else {
+        -term_a
+    };
+    let term_b = m_b * fp_a.clone();
+    let term_b = if interaction_b.is_sender {
+        term_b
+    } else {
+        -term_b
+    };
+
+    // c · fp_a · fp_b: c is aux (ext), so this is ext throughout.
+    let main = c * fp_a * fp_b;
+    b.emit_ext(idx, main - term_a - term_b);
+}
+
+/// Emit the accumulated constraint (with 1–2 absorbed interactions), mirroring
+/// `LookupAccumulatedConstraint::capture`. `acc_curr` reads row 0; `acc_next`,
+/// the committed-term sum and the absorbed fingerprints/multiplicities all read
+/// the NEXT row (offset 1).
+///
+/// - 1 absorbed: `(acc_next − acc_curr − Σterms + L/N)·f − sign·m` (degree 2)
+/// - 2 absorbed: `(…)·f₁·f₂ − sign₁·m₁·f₂ − sign₂·m₂·f₁` (degree 3)
+fn emit_logup_accumulated<F, E, B>(b: &mut B, layout: &LogUpLayout, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let acc_curr = b.aux(0, layout.acc_column_idx);
+    let acc_next = b.aux(1, layout.acc_column_idx);
+
+    // delta = acc_next − acc_curr − Σ committed_terms(next) + L/N
+    let mut delta = acc_next - acc_curr;
+    for i in 0..layout.num_term_columns {
+        delta = delta - b.aux(1, i);
+    }
+    delta = delta + b.table_offset();
+
+    let absorbed = layout.absorbed();
+    let root = match absorbed.len() {
+        1 => {
+            // delta · f − sign · m
+            let m = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
+            let f = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
+            let mt = if absorbed[0].is_sender { m } else { -m };
+            // delta · f is ext; `mt` is base. The tower only implements base −
+            // ext (base operand LEFT), so write `delta·f − mt` as `−(mt − delta·f)`.
+            -(mt - delta * f)
+        }
+        2 => {
+            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1
+            let m1 = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
+            let m2 = emit_multiplicity::<F, E, B>(b, &absorbed[1].multiplicity, 1);
+            let f1 = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
+            let f2 = emit_fingerprint::<F, E, B>(b, &absorbed[1], 1);
+
+            let term1 = m1 * f2.clone();
+            let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+            let term2 = m2 * f1.clone();
+            let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+            delta * f1 * f2 - term1 - term2
+        }
+        _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+    };
+
+    b.emit_ext(idx, root);
+}
+
+/// Emit every LogUp transition constraint for `layout` through the builder,
+/// starting at absolute constraint index `idx_base` (the table's base-constraint
+/// count). Committed batched terms come first (one per committed pair), then the
+/// single accumulated constraint. Emits nothing when there are no interactions.
+pub fn emit_logup_constraints<F, E, B>(b: &mut B, layout: &LogUpLayout, idx_base: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    if layout.interactions.is_empty() {
+        return;
+    }
+    let mut idx = idx_base;
+    for pair_idx in 0..layout.num_committed_pairs {
+        emit_logup_batched_term::<F, E, B>(b, layout, pair_idx, idx);
+        idx += 1;
+    }
+    emit_logup_accumulated::<F, E, B>(b, layout, idx);
+}
+
+/// The idx-ordered [`ConstraintMeta`] for `layout`'s LogUp constraints, starting
+/// at `idx_start`. Reproduces the boxed structs' answers exactly: batched terms
+/// are degree 3; the accumulated constraint is degree `1 + absorbed.len()`
+/// (2 for one absorbed, 3 for two). All are [`RootKind::Ext`] with the default
+/// zerofier shape (period 1, offset 0, no exemptions) — the structs override
+/// none of those.
+pub fn logup_meta(layout: &LogUpLayout, idx_start: usize) -> Vec<ConstraintMeta> {
+    let mut meta = Vec::with_capacity(layout.num_constraints());
+    if layout.interactions.is_empty() {
+        return meta;
+    }
+    let mut idx = idx_start;
+    for _ in 0..layout.num_committed_pairs {
+        meta.push(ConstraintMeta::ext(idx, 3)); // c · fp_a · fp_b
+        idx += 1;
+    }
+    let absorbed_len = layout.absorbed().len();
+    meta.push(ConstraintMeta::ext(idx, 1 + absorbed_len));
+    meta
+}
+
 /// Constraint for a batched pair of interactions sharing one aux column.
 ///
 /// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
@@ -2001,6 +2438,357 @@ where
 
         if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
             *eval = res;
+        }
+    }
+}
+
+#[cfg(test)]
+mod logup_single_source_tests {
+    //! Differential tests for the single-source LogUp constraint bodies
+    //! ([`emit_logup_constraints`]) against the OLD boxed constraint structs
+    //! (`LookupBatchedTermConstraint` / `LookupAccumulatedConstraint`) that stay
+    //! in-branch as the transcription oracle until the final deletion phase.
+    //!
+    //! For every layout we compare, on 1000 random two-step frames (off-trace
+    //! points where a weakened or slipped transcription diverges with
+    //! overwhelming probability):
+    //!   1. [`ProverEvalFolder`] output == old `evaluate_prover` (ext slots);
+    //!   2. [`VerifierEvalFolder`] output == old `evaluate_verifier`;
+    //!   3. capture → flatten → interpret == old `evaluate_verifier`.
+    //!
+    //! Coverage: the accumulated constraint's 1-absorbed AND 2-absorbed branches
+    //! (the latter reads `aux(1, ·)` next-row cells), the batched-term
+    //! constraint, and every [`Packing`] variant's fingerprint contribution.
+    use super::*;
+    use crate::constraint_ir::{eval_program, eval_program_verifier};
+    use crate::constraints::builder::{
+        CaptureBuilder, ProverEvalFolder, RootKind, VerifierEvalFolder, num_base_from_meta,
+    };
+    use crate::frame::Frame;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type Fp = FieldElement<Gl>;
+    type Fp3 = FieldElement<Ext3>;
+
+    const TRIALS: usize = 1000;
+
+    /// A tiny deterministic SplitMix64 PRNG (no `rand` dependency).
+    struct SplitMix64 {
+        state: u64,
+    }
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Build the OLD boxed constraints for a layout, index-for-index with
+    /// [`emit_logup_constraints`]: committed batched terms first (idx `idx_base`
+    /// onward), then the accumulated constraint.
+    fn old_boxed(
+        layout: &LogUpLayout,
+        idx_base: usize,
+    ) -> Vec<Box<dyn TransitionConstraintEvaluator<Gl, Ext3>>> {
+        let mut out: Vec<Box<dyn TransitionConstraintEvaluator<Gl, Ext3>>> = Vec::new();
+        let mut idx = idx_base;
+        for pair_idx in 0..layout.num_committed_pairs {
+            out.push(Box::new(LookupBatchedTermConstraint::new(
+                layout.interactions[pair_idx * 2].clone(),
+                layout.interactions[pair_idx * 2 + 1].clone(),
+                pair_idx,
+                idx,
+            )));
+            idx += 1;
+        }
+        if !layout.interactions.is_empty() {
+            out.push(Box::new(LookupAccumulatedConstraint::new(
+                idx,
+                layout.num_term_columns,
+                layout.absorbed().to_vec(),
+            )));
+        }
+        out
+    }
+
+    /// Number of aux columns the layout uses: committed term columns + the
+    /// accumulated column.
+    fn num_aux_cols(layout: &LogUpLayout) -> usize {
+        if layout.interactions.is_empty() {
+            0
+        } else {
+            layout.num_term_columns + 1
+        }
+    }
+
+    fn rand_fp3(rng: &mut SplitMix64) -> Fp3 {
+        FieldElement::<Ext3>::new([
+            Fp::from(rng.next_u64()),
+            Fp::from(rng.next_u64()),
+            Fp::from(rng.next_u64()),
+        ])
+    }
+
+    /// The full three-way differential check for one layout, on `TRIALS` random
+    /// two-step frames.
+    fn check_layout(label: &str, layout: &LogUpLayout, num_main_cols: usize) {
+        let n_base = 0usize; // LogUp constraints are all extension-rooted.
+        let old = old_boxed(layout, n_base);
+        let n = old.len();
+        assert_eq!(n, layout.num_constraints(), "[{label}] constraint count");
+
+        // Meta parity vs the old boxed objects.
+        let meta = logup_meta(layout, n_base);
+        assert_eq!(meta.len(), n, "[{label}] meta count");
+        let num_base = num_base_from_meta(&meta);
+        assert_eq!(num_base, 0, "[{label}] LogUp meta is all-ext");
+        for (i, m) in meta.iter().enumerate() {
+            let c = old.iter().find(|c| c.constraint_idx() == i).expect("dense");
+            assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
+            assert_eq!(m.kind, RootKind::Ext, "[{label}] meta kind {i}");
+            assert_eq!(m.degree, c.degree(), "[{label}] degree {i}");
+            assert_eq!(m.period, c.period(), "[{label}] period {i}");
+            assert_eq!(m.offset, c.offset(), "[{label}] offset {i}");
+            assert_eq!(
+                m.end_exemptions,
+                c.end_exemptions(),
+                "[{label}] end_exempt {i}"
+            );
+        }
+
+        // Capture once; tree-measured degree <= declared.
+        let mut cb = CaptureBuilder::<Gl, Ext3>::new();
+        emit_logup_constraints(&mut cb, layout, n_base);
+        let (prog, degrees) = cb.finish(num_base);
+        assert!(prog.complete, "[{label}] capture must be complete");
+        assert_eq!(degrees.len(), n, "[{label}] one emit per constraint");
+        for &(idx, measured) in &degrees {
+            assert!(
+                measured <= meta[idx].degree,
+                "[{label}] constraint {idx}: tree degree {measured} exceeds declared {}",
+                meta[idx].degree
+            );
+        }
+
+        let n_aux = num_aux_cols(layout);
+        let shifts = PackingShifts::<Gl>::new();
+        let vshifts = PackingShifts::<Ext3>::new();
+        let no_periodic: Vec<Fp> = vec![];
+        let no_periodic_e: Vec<Fp3> = vec![];
+
+        for trial in 0..TRIALS {
+            let mut rng = SplitMix64::new(0xC0FF_EE00_u64 ^ (label.len() as u64) ^ trial as u64);
+
+            // Random two-step prover frame.
+            let mk_step = |rng: &mut SplitMix64| {
+                let main: Vec<Fp> = (0..num_main_cols)
+                    .map(|_| Fp::from(rng.next_u64()))
+                    .collect();
+                let aux: Vec<Fp3> = (0..n_aux).map(|_| rand_fp3(rng)).collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let frame = Frame::<Gl, Ext3>::new(vec![mk_step(&mut rng), mk_step(&mut rng)]);
+            let rap_challenges = vec![rand_fp3(&mut rng), rand_fp3(&mut rng)]; // [z, alpha]
+            let alpha_powers: Vec<Fp3> = (0..12).map(|_| rand_fp3(&mut rng)).collect();
+            let table_offset = rand_fp3(&mut rng);
+
+            let prover_ctx = TransitionEvaluationContext::new_prover(
+                &frame,
+                &no_periodic,
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+                &shifts,
+            );
+
+            // --- old prover-side reference: evaluate_prover into ext slots ---
+            let mut old_base = vec![Fp::zero(); n_base];
+            let mut old_ext = vec![Fp3::zero(); n];
+            for c in old.iter() {
+                c.evaluate_prover(&prover_ctx, &mut old_base, &mut old_ext);
+            }
+
+            // --- 1. ProverEvalFolder == old evaluate_prover ---
+            let mut base_out = vec![Fp::zero(); n_base];
+            let mut ext_out = vec![Fp3::zero(); n];
+            let mut folder = ProverEvalFolder::new(&prover_ctx, &mut base_out, &mut ext_out);
+            emit_logup_constraints(&mut folder, layout, n_base);
+            folder.assert_all_emitted();
+            for i in 0..n {
+                assert_eq!(
+                    ext_out[i], old_ext[i],
+                    "[{label}] prover folder mismatch, constraint {i}, trial {trial}"
+                );
+            }
+
+            // --- 3. capture → interpret == old evaluate_prover ---
+            let mut ir_base = vec![Fp::zero(); n_base];
+            let mut ir_ext = vec![Fp3::zero(); n];
+            eval_program(&prog, &prover_ctx, &mut ir_base, &mut ir_ext);
+            for i in 0..n {
+                assert_eq!(
+                    ir_ext[i], old_ext[i],
+                    "[{label}] interpreter mismatch, constraint {i}, trial {trial}"
+                );
+            }
+
+            // --- verifier-side: embed the same frame into the extension ---
+            let embed_step = |step: &TableView<Gl, Ext3>| -> TableView<Ext3, Ext3> {
+                let main: Vec<Fp3> = (0..num_main_cols)
+                    .map(|c| {
+                        step.get_main_evaluation_element(0, c)
+                            .clone()
+                            .to_extension()
+                    })
+                    .collect();
+                let aux: Vec<Fp3> = (0..n_aux)
+                    .map(|c| step.get_aux_evaluation_element(0, c).clone())
+                    .collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let vframe: Frame<Ext3, Ext3> = Frame::new(vec![
+                embed_step(frame.get_evaluation_step(0)),
+                embed_step(frame.get_evaluation_step(1)),
+            ]);
+            let vctx = TransitionEvaluationContext::<Gl, Ext3>::new_verifier(
+                &vframe,
+                &no_periodic_e,
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+                &vshifts,
+            );
+            let mut old_vext = vec![Fp3::zero(); n];
+            for c in old.iter() {
+                c.evaluate_verifier(&vctx, &mut old_vext);
+            }
+
+            // --- 2. VerifierEvalFolder == old evaluate_verifier ---
+            let mut vext_out = vec![Fp3::zero(); n];
+            let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
+            emit_logup_constraints(&mut vfolder, layout, n_base);
+            vfolder.assert_all_emitted();
+            for i in 0..n {
+                assert_eq!(
+                    vext_out[i], old_vext[i],
+                    "[{label}] verifier folder mismatch, constraint {i}, trial {trial}"
+                );
+            }
+
+            // capture → interpret (verifier) == old evaluate_verifier ---
+            let mut ir_vext = vec![Fp3::zero(); n];
+            eval_program_verifier(&prog, &vctx, &mut ir_vext);
+            for i in 0..n {
+                assert_eq!(
+                    ir_vext[i], old_vext[i],
+                    "[{label}] verifier interpreter mismatch, constraint {i}, trial {trial}"
+                );
+            }
+        }
+    }
+
+    /// A sender interaction with a `Direct`-packed value at column 1.
+    fn direct_sender(bus_id: u64) -> BusInteraction {
+        BusInteraction::sender(
+            bus_id,
+            Multiplicity::Column(0),
+            vec![BusValue::Packed {
+                start_column: 1,
+                packing: Packing::Direct,
+            }],
+        )
+    }
+
+    /// A receiver interaction with a single `column(3)` value.
+    fn column_receiver(bus_id: u64) -> BusInteraction {
+        BusInteraction::receiver(bus_id, Multiplicity::Column(2), vec![BusValue::column(3)])
+    }
+
+    #[test]
+    fn logup_one_absorbed_matches_old() {
+        // 3 interactions → split(3) = (1 committed pair, 1 absorbed):
+        //   idx 0: batched term (interactions 0,1)
+        //   idx 1: accumulated, 1 absorbed (interaction 2), degree 2.
+        let interactions = vec![direct_sender(7), column_receiver(11), direct_sender(13)];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 1, "must exercise 1-absorbed");
+        check_layout("one_absorbed", &layout, 8);
+    }
+
+    #[test]
+    fn logup_two_absorbed_matches_old() {
+        // 4 interactions → split(4) = (1 committed pair, 2 absorbed):
+        //   idx 0: batched term (interactions 0,1)
+        //   idx 1: accumulated, 2 absorbed (interactions 2,3), degree 3.
+        let interactions = vec![
+            direct_sender(7),
+            column_receiver(11),
+            direct_sender(13),
+            column_receiver(17),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 2, "must exercise 2-absorbed");
+        check_layout("two_absorbed", &layout, 8);
+    }
+
+    #[test]
+    fn logup_two_interactions_absorbed_only() {
+        // 2 interactions → split(2) = (0 committed pairs, 2 absorbed): the
+        // accumulated constraint alone, degree 3, no batched term.
+        let interactions = vec![direct_sender(7), column_receiver(11)];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 0);
+        assert_eq!(layout.num_constraints(), 1);
+        check_layout("two_absorbed_only", &layout, 8);
+    }
+
+    #[test]
+    fn logup_matches_old_for_all_packing_variants() {
+        // Drive every Packing arm through the fingerprint of a committed pair
+        // and an absorbed interaction. DWordBL/QuadHL are the widest (8 cols);
+        // give a generous column budget.
+        const ALL_PACKINGS: [Packing; 10] = [
+            Packing::Direct,
+            Packing::Word2L,
+            Packing::Word4L,
+            Packing::DWordWL,
+            Packing::DWordHHW,
+            Packing::DWordWHH,
+            Packing::DWordHL,
+            Packing::DWordBL,
+            Packing::QuadHL,
+            Packing::QuadWL,
+        ];
+        for packing in ALL_PACKINGS {
+            // 3 interactions: two committed (pair) + one absorbed, all using the
+            // packing at column 0.
+            let mk = |bus: u64, sender: bool| {
+                let values = vec![BusValue::Packed {
+                    start_column: 0,
+                    packing,
+                }];
+                if sender {
+                    BusInteraction::sender(bus, Multiplicity::One, values)
+                } else {
+                    BusInteraction::receiver(bus, Multiplicity::One, values)
+                }
+            };
+            let interactions = vec![mk(3, true), mk(5, false), mk(7, true)];
+            let layout = LogUpLayout::from_interactions(interactions);
+            check_layout(
+                &format!("packing_{packing:?}"),
+                &layout,
+                packing.num_columns(),
+            );
         }
     }
 }
