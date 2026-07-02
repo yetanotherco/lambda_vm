@@ -130,11 +130,19 @@ run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits
   echo "$t"
 }
 
-# The baseline always proves its own proof.
+# Both sides prove their own proof: needed for the proof-size row, and per-side
+# verify needs both. The verify MODE below only decides which proof each side verifies.
 echo "==> Proving with the baseline binary"
 prove_once "$WORK/cli_B" "$PROOF_B"
+echo "==> Proving with the PR binary"
+prove_once "$WORK/cli_A" "$PROOF_A"
 
-# Decide whether both sides can share the baseline's proof.
+# Proof sizes (bytes), captured before the proofs are removed below.
+SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
+SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+
+# Decide whether both sides can VERIFY one shared proof (baseline's) — tightest
+# timing precision — or must verify their own (when the PR changes the proof format).
 per_side=0
 case "$PROVE_PER_SIDE" in
   1) per_side=1 ;;
@@ -142,22 +150,19 @@ case "$PROVE_PER_SIDE" in
   *)  # auto: can the PR binary deserialize + verify the baseline's proof?
       if [ -z "$(verify_time "$WORK/cli_A" "$PROOF_B")" ]; then
         echo "==> PR binary cannot verify the baseline's proof (likely a proof-format change);"
-        echo "    switching to per-side proofs (set PROVE_PER_SIDE=0 to force shared)."
+        echo "    verifying per-side (set PROVE_PER_SIDE=0 to force shared)."
         per_side=1
       fi ;;
 esac
 
 if [ "$per_side" = "1" ]; then
   MODE="per-side"
-  echo "==> Per-side mode: each binary proves and verifies its OWN proof."
-  echo "    ABBA still cancels time-drift, but not proof-specific variance."
-  echo "==> Proving with the PR binary"
-  prove_once "$WORK/cli_A" "$PROOF_A"
+  echo "==> Per-side verify: each binary verifies its OWN proof."
   PROOF_FOR_A="$PROOF_A"
   PROOF_FOR_B="$PROOF_B"
 else
   MODE="shared"
-  echo "==> Shared-proof mode: both sides verify the baseline's proof (best precision)."
+  echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
   PROOF_FOR_A="$PROOF_B"
   PROOF_FOR_B="$PROOF_B"
 fi
@@ -177,7 +182,7 @@ done
 rm -f "$PROOF_A" "$PROOF_B"
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-MODE="$MODE" python3 - "$WORK/pairs.csv" <<'PY'
+SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" python3 - "$WORK/pairs.csv" <<'PY'
 import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
@@ -261,16 +266,20 @@ drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
 # Markdown table (rendered directly in the PR comment) + paired detail.
 sign = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
 icon = "🟢" if (lo > 0 and p < 0.05) else "🔴" if (hi < 0 and p < 0.05) else "⚪"
-print("\n=== Verify ABBA result  (improvement: + = PR faster) ===")
+print("\n=== Verify ABBA result  (improvement: + = better) ===")
 print()
-if os.environ.get('MODE') == 'per-side':
-    print("<sub>⚠️ Per-side proofs: this PR changes the proof format, so each side "
-          "proved and verified its own proof. ABBA cancels time-drift but not "
-          "proof-specific variance — treat small deltas cautiously.</sub>")
-    print()
-print("| Metric | main | PR | Δ (paired) |")
-print("|--------|------|----|------------|")
+
+# Proof size row: exact (the .bin byte size), no ABBA. + = PR smaller = better.
+size_b = float(os.environ.get('SIZE_B', 0))   # main
+size_a = float(os.environ.get('SIZE_A', 0))   # PR
+size_impr = (size_b - size_a) / size_b * 100.0 if size_b else 0.0
+size_icon = "🟢" if size_impr > 0.005 else "🔴" if size_impr < -0.005 else "⚪"
+to_mib = lambda b: b / (1024.0 * 1024.0)
+
+print("| Metric | main | PR | Δ (+=better) |")
+print("|--------|------|----|--------------|")
 print(f"| **Verify time** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+print(f"| **Proof size** | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
 print()
 print("```")
 print(f"  pairs: {n}   mean A (PR): {mA:.3f}s   mean B (main): {mB:.3f}s")
