@@ -1967,7 +1967,9 @@ where
         BusValue::Linear(terms) => {
             // Routed through the builder so the prover folder can zero-skip
             // the multiply (Linear is where the constant-0 bus-width padding
-            // lives). Value-identical either way.
+            // lives; the packed contributions above fold unconditionally —
+            // their elements are real trace columns with no zero-heavy
+            // padding). Value-identical either way.
             let result = emit_linear_terms(b, terms, offset);
             (b.fold_fingerprint_term(fp, result, alpha_offset), 1)
         }

@@ -196,6 +196,10 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
     }
 
     /// An extension-field constant, deduplicated by value.
+    ///
+    /// No production body produces one today (constraints reach the
+    /// extension only through trace/challenge leaves); kept for IR
+    /// completeness and GPU-side lowering.
     pub fn const_ext(&mut self, v: FieldElement<E>) -> Expr {
         self.intern_ext(v)
     }
@@ -233,6 +237,9 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
     }
 
     /// Explicitly embed a base value into the extension ([`Dim::Ext`]).
+    ///
+    /// Unreachable from the single-body capture path (mixed base×ext ops
+    /// embed implicitly); kept for IR completeness and GPU-side lowering.
     pub fn embed(&mut self, a: Expr) -> Expr {
         self.push(Op::Embed(a.id), Dim::Ext)
     }

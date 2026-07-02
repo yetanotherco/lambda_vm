@@ -29,7 +29,7 @@ pub fn end_exemptions_roots<F: IsField>(
     // The last row of the trace is g^(N-1); walking backward by g^-1 = g^(N-1)
     // gives the remaining end-exemption roots.
     let decrement = trace_primitive_root.pow(trace_length - 1);
-    let mut current = trace_primitive_root.pow(trace_length - 1);
+    let mut current = decrement.clone();
     let mut roots = Vec::with_capacity(end_exemptions);
     for _ in 0..end_exemptions {
         roots.push(current.clone());

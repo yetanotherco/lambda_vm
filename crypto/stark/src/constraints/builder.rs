@@ -226,6 +226,12 @@ pub fn num_base_from_meta(meta: &[ConstraintMeta]) -> usize {
 }
 
 /// One table's constraints: metadata + THE single body.
+///
+/// `meta()` and `eval` are parallel index walks that must agree entry for
+/// entry: `meta()[i]` describes the constraint `eval` emits at index `i`
+/// (kind, declared degree). The differential tests enforce the pairing
+/// (exact-once emission, declared == measured degree); keep the two methods
+/// side by side when editing a set.
 pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
     /// Idx-ordered metadata (see [`num_base_from_meta`] for the invariants).
     fn meta(&self) -> Vec<ConstraintMeta>;
