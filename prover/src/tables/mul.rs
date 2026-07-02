@@ -709,25 +709,11 @@ impl MulConstraints {
         x.clone() * (one - x)
     }
 
-    /// `sign_fill · is_neg` for both operands — shared by all four
-    /// [`Self::raw_product`] constraints, so computed once per row.
-    fn sign_fills<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
-        b: &B,
-    ) -> (B::Expr, B::Expr) {
-        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
-        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
-        let sign_fill = b.const_base(SIGN_FILL);
-        (sign_fill.clone() * lhs_is_neg, sign_fill * rhs_is_neg)
-    }
-
     /// `raw_product[i] − Σ_k 2^(16k)·Σ_j lhs_ext[j]·rhs_ext[idx−j]` (idx = 2i+k).
     /// Mirrors [`MulConstraint::compute_raw_product_constraint`] exactly.
-    /// `lhs_hi`/`rhs_hi` are the [`Self::sign_fills`] products.
     fn raw_product<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,
-        lhs_hi: B::Expr,
-        rhs_hi: B::Expr,
     ) -> B::Expr {
         let lhs = [
             b.main(0, cols::LHS_0),
@@ -741,8 +727,16 @@ impl MulConstraints {
             b.main(0, cols::RHS_2),
             b.main(0, cols::RHS_3),
         ];
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
 
         // Sign-extended values: [0..4] = halfwords, [4..8] = sign_fill * is_neg.
+        // Known redundancy: the two sign-fill products are rebuilt in each of
+        // the four raw_product constraints. Hoisting them was tried and showed
+        // no measurable speedup (ABBA), so the body keeps the declarative form.
+        let sign_fill = b.const_base(SIGN_FILL);
+        let lhs_hi = sign_fill.clone() * lhs_is_neg;
+        let rhs_hi = sign_fill * rhs_is_neg;
         let lhs_ext: [B::Expr; 8] = [
             lhs[0].clone(),
             lhs[1].clone(),
@@ -829,11 +823,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
         let one = b.one();
         b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
 
-        // idx 4..8: raw_product convolution for i = 0..4. The sign-fill
-        // products are shared across all four constraints.
-        let (lhs_hi, rhs_hi) = Self::sign_fills(b);
+        // idx 4..8: raw_product convolution for i = 0..4.
         for i in 0..4 {
-            let root = Self::raw_product(b, i, lhs_hi.clone(), rhs_hi.clone());
+            let root = Self::raw_product(b, i);
             b.emit_base(4 + i, root);
         }
     }

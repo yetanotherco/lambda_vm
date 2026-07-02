@@ -377,28 +377,31 @@ fn next_pc_unmasked_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensi
 }
 
 /// `carry_0 = (base_0 + offset_0 − unmasked_0)·2⁻³²` (twin of
-/// [`BranchConstraint::compute_carry_0_for`]). Takes `unmasked_0` from
-/// [`next_pc_unmasked_expr`] so the body computes the repack once per row
-/// (it is shared by the pc and register paths).
+/// [`BranchConstraint::compute_carry_0_for`]).
 fn carry_0_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
     base_col_0: usize,
-    unmasked_0: B::Expr,
 ) -> B::Expr {
     let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+    let (unmasked_0, _) = next_pc_unmasked_expr(b);
     (b.main(0, base_col_0) + b.main(0, cols::OFFSET_0) - unmasked_0) * inv_2_32
 }
 
 /// `carry_1 = (base_1 + offset_1 + carry_0 − unmasked_1)·2⁻³²` (twin of
-/// [`BranchConstraint::compute_carry_1_for`]). Takes the path's `carry_0`
-/// and the shared `unmasked_1` so neither is recomputed.
+/// [`BranchConstraint::compute_carry_1_for`]).
+///
+/// Known redundancy: this rebuilds the carry_0 expression (and the unmasked
+/// next-pc repack) that the sibling constraints also compute. Sharing them
+/// across the four carry constraints was tried and showed no measurable
+/// speedup (ABBA), so the helpers stay self-contained.
 fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &B,
+    base_col_0: usize,
     base_col_1: usize,
-    carry_0: B::Expr,
-    unmasked_1: B::Expr,
 ) -> B::Expr {
     let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+    let carry_0 = carry_0_expr(b, base_col_0);
+    let (_, unmasked_1) = next_pc_unmasked_expr(b);
     (b.main(0, base_col_1) + b.main(0, cols::OFFSET_1) + carry_0 - unmasked_1) * inv_2_32
 }
 
@@ -423,35 +426,31 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        // The unmasked next-pc repack and each path's carry_0 are shared
-        // across the four carry constraints — computed once per row.
-        let (unmasked_0, unmasked_1) = next_pc_unmasked_expr(b);
-        let pc_c0 = carry_0_expr(b, cols::PC_0, unmasked_0.clone());
-        let pc_c1 = carry_1_expr(b, cols::PC_1, pc_c0.clone(), unmasked_1.clone());
-        let reg_c0 = carry_0_expr(b, cols::REGISTER_0, unmasked_0);
-        let reg_c1 = carry_1_expr(b, cols::REGISTER_1, reg_c0.clone(), unmasked_1);
-
         // idx 0: (1 - JALR) * carry_0(pc) * (1 - carry_0)
         let one = b.one();
         let cond = one - b.main(0, cols::JALR);
+        let c = carry_0_expr(b, cols::PC_0);
         let one = b.one();
-        b.emit_base(0, cond * pc_c0.clone() * (one - pc_c0));
+        b.emit_base(0, cond * c.clone() * (one - c));
 
         // idx 1: (1 - JALR) * carry_1(pc) * (1 - carry_1)
         let one = b.one();
         let cond = one - b.main(0, cols::JALR);
+        let c = carry_1_expr(b, cols::PC_0, cols::PC_1);
         let one = b.one();
-        b.emit_base(1, cond * pc_c1.clone() * (one - pc_c1));
+        b.emit_base(1, cond * c.clone() * (one - c));
 
         // idx 2: JALR * carry_0(register) * (1 - carry_0)
         let cond = b.main(0, cols::JALR);
+        let c = carry_0_expr(b, cols::REGISTER_0);
         let one = b.one();
-        b.emit_base(2, cond * reg_c0.clone() * (one - reg_c0));
+        b.emit_base(2, cond * c.clone() * (one - c));
 
         // idx 3: JALR * carry_1(register) * (1 - carry_1)
         let cond = b.main(0, cols::JALR);
+        let c = carry_1_expr(b, cols::REGISTER_0, cols::REGISTER_1);
         let one = b.one();
-        b.emit_base(3, cond * reg_c1.clone() * (one - reg_c1));
+        b.emit_base(3, cond * c.clone() * (one - c));
 
         // idx 4: JALR * (1 - JALR)
         let one = b.one();

@@ -502,6 +502,11 @@ impl LoadConstraints {
     }
 
     /// `signed · sign_bit · 255` — the sign-extended byte value.
+    ///
+    /// Known redundancy: each extension constraint below rebuilds this
+    /// product. Hoisting it to one per-row local was tried and showed no
+    /// measurable speedup (ABBA), so the constraints keep the declarative
+    /// per-emit form.
     fn extended<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
         let signed = b.main(0, cols::SIGNED);
         let sign_bit = b.main(0, cols::SIGN_BIT);
@@ -556,17 +561,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
         let one = b.one();
         b.emit_base(5, read_sum * (one - mu));
 
-        // The sign-extension value is shared by all seven extension
-        // constraints below — compute its two multiplies once per row.
-        let extended = Self::extended(b);
-
         // idx 6..10: ExtensionHigh(i) for i in 4..8:
         // (1 - read8) * (res[i] - signed*sign_bit*255)
         for (offset, i) in (4..8).enumerate() {
             let read8 = b.main(0, cols::READ8);
             let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
             let one = b.one();
-            b.emit_base(6 + offset, (one - read8) * (res_i - extended.clone()));
+            b.emit_base(6 + offset, (one - read8) * (res_i - expected));
         }
 
         // idx 10,11: ExtensionMid(i) for i in 2..4:
@@ -575,11 +577,9 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
             let read4 = b.main(0, cols::READ4);
             let read8 = b.main(0, cols::READ8);
             let res_i = b.main(0, cols::RES[i]);
+            let expected = Self::extended(b);
             let one = b.one();
-            b.emit_base(
-                10 + offset,
-                (one - read4 - read8) * (res_i - extended.clone()),
-            );
+            b.emit_base(10 + offset, (one - read4 - read8) * (res_i - expected));
         }
 
         // idx 12: ExtensionLow:
@@ -588,7 +588,8 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
         let read4 = b.main(0, cols::READ4);
         let read8 = b.main(0, cols::READ8);
         let res_1 = b.main(0, cols::RES[1]);
+        let expected = Self::extended(b);
         let one = b.one();
-        b.emit_base(12, (one - read2 - read4 - read8) * (res_1 - extended));
+        b.emit_base(12, (one - read2 - read4 - read8) * (res_1 - expected));
     }
 }
