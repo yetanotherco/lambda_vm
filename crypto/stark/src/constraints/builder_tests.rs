@@ -1,0 +1,441 @@
+//! Tests for the `ConstraintBuilder` framework: one sample [`ConstraintSet`]
+//! (EqXor-shaped, IsBit-shaped and Add-carry-pair-shaped bodies, plus a
+//! LogUp-shaped extension constraint) checked three ways on random rows:
+//!
+//! 1. `ProverEvalFolder` output == direct `FieldElement` arithmetic;
+//! 2. `ProverEvalFolder` output == `eval_program` over the captured program;
+//! 3. `VerifierEvalFolder` output == `eval_program_verifier` over the captured
+//!    program;
+//!
+//! plus: capture-measured degrees == declared `meta.degree`, the meta
+//! Base-prefix/density invariants, and the folders' debug-build
+//! exactly-once/completeness asserts.
+
+use math::field::element::FieldElement;
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext;
+use math::field::goldilocks::GoldilocksField as Fp;
+
+use crate::constraint_ir::{eval_program, eval_program_verifier};
+use crate::constraints::builder::{
+    CaptureBuilder, ConstraintBuilder, ConstraintMeta, ConstraintSet, ProverEvalFolder, RootKind,
+    VerifierEvalFolder, num_base_from_meta,
+};
+use crate::frame::Frame;
+use crate::lookup::PackingShifts;
+use crate::table::TableView;
+use crate::traits::TransitionEvaluationContext;
+
+type FpE = FieldElement<Fp>;
+type ExtE = FieldElement<Ext>;
+
+const TRIALS: usize = 1000;
+
+/// Deterministic SplitMix64.
+struct SplitMix64(u64);
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+    fn fp(&mut self) -> FpE {
+        FpE::from(self.next_u64())
+    }
+    fn ext(&mut self) -> ExtE {
+        ExtE::from_raw([self.fp(), self.fp(), self.fp()])
+    }
+}
+
+// =============================================================================
+// The sample table: local column layout + single body
+// =============================================================================
+
+mod cols {
+    // EqXor: res = eq XOR invert.
+    pub const RES: usize = 0;
+    pub const EQ: usize = 1;
+    pub const INVERT: usize = 2;
+    // IsBit.
+    pub const BIT: usize = 3;
+    // Add carry pair (64-bit add split in 32-bit halves), gated by COND.
+    pub const COND: usize = 4;
+    pub const LHS_LO: usize = 5;
+    pub const LHS_HI: usize = 6;
+    pub const RHS_LO: usize = 7;
+    pub const RHS_HI: usize = 8;
+    pub const SUM_LO: usize = 9;
+    pub const SUM_HI: usize = 10;
+    pub const NUM_COLS: usize = 11;
+}
+
+/// `2^-32` as a canonical Goldilocks `u64` (the add-carry repack constant).
+fn inv_shift_32() -> u64 {
+    *FpE::from(1u64 << 32).inv().unwrap().value()
+}
+
+/// Sample table: 4 base constraints + 1 LogUp-shaped extension constraint.
+struct SampleSet;
+
+impl ConstraintSet<Fp, Ext> for SampleSet {
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            ConstraintMeta::base(0, 2), // EqXor
+            ConstraintMeta::base(1, 2), // IsBit
+            ConstraintMeta::base(2, 3), // add carry 0 (cond-gated bit check)
+            ConstraintMeta::base(3, 3), // add carry 1
+            ConstraintMeta::ext(4, 1),  // LogUp-shaped
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<Fp, Ext>>(&self, b: &mut B) {
+        // idx 0 — EqXor: res − (eq + invert − 2·eq·invert).
+        let res = b.main(0, cols::RES);
+        let eq = b.main(0, cols::EQ);
+        let invert = b.main(0, cols::INVERT);
+        let two = b.const_base(2);
+        b.emit_base(0, res - (eq.clone() + invert.clone() - two * eq * invert));
+
+        // idx 1 — IsBit: x·(1 − x).
+        let x = b.main(0, cols::BIT);
+        let one = b.one();
+        b.emit_base(1, x.clone() * (one - x));
+
+        // idx 2, 3 — the add carry pair:
+        //   carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²
+        //   carry_1 = (lhs.hi + rhs.hi + carry_0 − sum.hi)·2⁻³²
+        //   emit cond·carry_i·(1 − carry_i).
+        let inv_2_32 = b.const_base(inv_shift_32());
+        let lhs_lo = b.main(0, cols::LHS_LO);
+        let lhs_hi = b.main(0, cols::LHS_HI);
+        let rhs_lo = b.main(0, cols::RHS_LO);
+        let rhs_hi = b.main(0, cols::RHS_HI);
+        let sum_lo = b.main(0, cols::SUM_LO);
+        let sum_hi = b.main(0, cols::SUM_HI);
+        let cond = b.main(0, cols::COND);
+        let one = b.one();
+        let carry_0 = (lhs_lo + rhs_lo - sum_lo) * inv_2_32.clone();
+        let carry_1 = (lhs_hi + rhs_hi + carry_0.clone() - sum_hi) * inv_2_32;
+        b.emit_base(2, cond.clone() * carry_0.clone() * (one.clone() - carry_0));
+        b.emit_base(3, cond * carry_1.clone() * (one - carry_1));
+
+        // idx 4 — LogUp-shaped: (challenge₀ + aux₀)·alpha₀ − L/N.
+        let ch = b.challenge(0);
+        let au = b.aux(0, 0);
+        let alpha = b.alpha_pow(0);
+        let off = b.table_offset();
+        b.emit_ext(4, (ch + au) * alpha - off);
+    }
+}
+
+const NUM_BASE: usize = 4;
+const NUM_CONSTRAINTS: usize = 5;
+
+/// Direct `FieldElement` arithmetic reference for the sample set's base
+/// constraints on a main row.
+fn direct_base(row: &[FpE]) -> [FpE; NUM_BASE] {
+    let two = FpE::from(2u64);
+    let one = FpE::one();
+    let inv = FpE::from(1u64 << 32).inv().unwrap();
+
+    let c0 = row[cols::RES]
+        - (row[cols::EQ] + row[cols::INVERT] - two * row[cols::EQ] * row[cols::INVERT]);
+    let c1 = row[cols::BIT] * (one - row[cols::BIT]);
+    let carry_0 = (row[cols::LHS_LO] + row[cols::RHS_LO] - row[cols::SUM_LO]) * inv;
+    let carry_1 = (row[cols::LHS_HI] + row[cols::RHS_HI] + carry_0 - row[cols::SUM_HI]) * inv;
+    let c2 = row[cols::COND] * carry_0 * (one - carry_0);
+    let c3 = row[cols::COND] * carry_1 * (one - carry_1);
+    [c0, c1, c2, c3]
+}
+
+/// Direct reference for the extension constraint.
+fn direct_ext(aux0: &ExtE, challenge0: &ExtE, alpha0: &ExtE, offset: &ExtE) -> ExtE {
+    (*challenge0 + *aux0) * *alpha0 - *offset
+}
+
+/// One random trial's inputs.
+struct TrialData {
+    row: Vec<FpE>,
+    aux0: ExtE,
+    challenge0: ExtE,
+    alpha0: ExtE,
+    offset: ExtE,
+}
+
+fn random_trial(rng: &mut SplitMix64) -> TrialData {
+    TrialData {
+        row: (0..cols::NUM_COLS).map(|_| rng.fp()).collect(),
+        aux0: rng.ext(),
+        challenge0: rng.ext(),
+        alpha0: rng.ext(),
+        offset: rng.ext(),
+    }
+}
+
+// =============================================================================
+// The three-way differential checks
+// =============================================================================
+
+#[test]
+fn prover_folder_matches_direct_arithmetic() {
+    let shifts = PackingShifts::<Fp>::new();
+    let mut rng = SplitMix64(0x0001_F01D_u64 ^ 0xABCD);
+    for trial in 0..TRIALS {
+        let t = random_trial(&mut rng);
+        let step = TableView::<Fp, Ext>::new(vec![t.row.clone()], vec![vec![t.aux0]]);
+        let frame = Frame::<Fp, Ext>::new(vec![step]);
+        let periodic: Vec<FpE> = vec![];
+        let challenges = vec![t.challenge0];
+        let alphas = vec![t.alpha0];
+        let ctx = TransitionEvaluationContext::new_prover(
+            &frame,
+            &periodic,
+            &challenges,
+            &alphas,
+            &t.offset,
+            &shifts,
+        );
+
+        let mut base_out = vec![FpE::zero(); NUM_BASE];
+        let mut ext_out = vec![ExtE::zero(); NUM_CONSTRAINTS];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
+        SampleSet.eval(&mut folder);
+        folder.assert_all_emitted();
+
+        let expected_base = direct_base(&t.row);
+        for (i, expected) in expected_base.iter().enumerate() {
+            assert_eq!(&base_out[i], expected, "base constraint {i}, trial {trial}");
+        }
+        let expected_ext = direct_ext(&t.aux0, &t.challenge0, &t.alpha0, &t.offset);
+        assert_eq!(ext_out[4], expected_ext, "ext constraint, trial {trial}");
+    }
+}
+
+#[test]
+fn prover_folder_matches_interpreted_capture() {
+    // Capture once (setup-time), interpret per row.
+    let mut cb = CaptureBuilder::<Fp, Ext>::new();
+    SampleSet.eval(&mut cb);
+    let (prog, _degrees) = cb.finish(NUM_BASE);
+
+    let shifts = PackingShifts::<Fp>::new();
+    let mut rng = SplitMix64(0x0002_F01D_u64 ^ 0xABCD);
+    for trial in 0..TRIALS {
+        let t = random_trial(&mut rng);
+        let step = TableView::<Fp, Ext>::new(vec![t.row.clone()], vec![vec![t.aux0]]);
+        let frame = Frame::<Fp, Ext>::new(vec![step]);
+        let periodic: Vec<FpE> = vec![];
+        let challenges = vec![t.challenge0];
+        let alphas = vec![t.alpha0];
+        let ctx = TransitionEvaluationContext::new_prover(
+            &frame,
+            &periodic,
+            &challenges,
+            &alphas,
+            &t.offset,
+            &shifts,
+        );
+
+        let mut folder_base = vec![FpE::zero(); NUM_BASE];
+        let mut folder_ext = vec![ExtE::zero(); NUM_CONSTRAINTS];
+        let mut folder = ProverEvalFolder::new(&ctx, &mut folder_base, &mut folder_ext);
+        SampleSet.eval(&mut folder);
+        folder.assert_all_emitted();
+
+        let mut interp_base = vec![FpE::zero(); NUM_BASE];
+        let mut interp_ext = vec![ExtE::zero(); NUM_CONSTRAINTS];
+        eval_program(&prog, &ctx, &mut interp_base, &mut interp_ext);
+
+        assert_eq!(folder_base, interp_base, "base evals, trial {trial}");
+        assert_eq!(folder_ext[4], interp_ext[4], "ext eval, trial {trial}");
+    }
+}
+
+#[test]
+fn verifier_folder_matches_interpreted_capture() {
+    let mut cb = CaptureBuilder::<Fp, Ext>::new();
+    SampleSet.eval(&mut cb);
+    let (prog, _degrees) = cb.finish(NUM_BASE);
+
+    let shifts = PackingShifts::<Ext>::new();
+    let mut rng = SplitMix64(0x0003_F01D_u64 ^ 0xABCD);
+    for trial in 0..TRIALS {
+        let t = random_trial(&mut rng);
+        // The verifier frame holds only extension elements (OOD evaluations).
+        let row_e: Vec<ExtE> = t.row.iter().map(|x| x.to_extension()).collect();
+        let step = TableView::<Ext, Ext>::new(vec![row_e], vec![vec![t.aux0]]);
+        let frame = Frame::<Ext, Ext>::new(vec![step]);
+        let periodic: Vec<ExtE> = vec![];
+        let challenges = vec![t.challenge0];
+        let alphas = vec![t.alpha0];
+        let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
+            &frame,
+            &periodic,
+            &challenges,
+            &alphas,
+            &t.offset,
+            &shifts,
+        );
+
+        let mut folder_ext = vec![ExtE::zero(); NUM_CONSTRAINTS];
+        let mut folder = VerifierEvalFolder::new(&ctx, &mut folder_ext);
+        SampleSet.eval(&mut folder);
+        folder.assert_all_emitted();
+
+        let mut interp_ext = vec![ExtE::zero(); NUM_CONSTRAINTS];
+        eval_program_verifier(&prog, &ctx, &mut interp_ext);
+
+        assert_eq!(folder_ext, interp_ext, "ood evals, trial {trial}");
+    }
+}
+
+// =============================================================================
+// Degree measurement + meta invariants
+// =============================================================================
+
+#[test]
+fn capture_measured_degrees_match_declared_meta() {
+    let mut cb = CaptureBuilder::<Fp, Ext>::new();
+    SampleSet.eval(&mut cb);
+    let (prog, degrees) = cb.finish(NUM_BASE);
+    assert!(prog.complete);
+    assert_eq!(prog.roots.len(), NUM_CONSTRAINTS);
+
+    let meta = SampleSet.meta();
+    assert_eq!(degrees.len(), meta.len());
+    for (i, &(idx, measured)) in degrees.iter().enumerate() {
+        assert_eq!(idx, i, "emit order != idx order");
+        assert_eq!(
+            measured, meta[idx].degree,
+            "constraint {idx}: tree-measured degree {measured} != declared {}",
+            meta[idx].degree
+        );
+    }
+}
+
+#[test]
+fn meta_base_prefix_gives_num_base() {
+    assert_eq!(num_base_from_meta(&SampleSet.meta()), NUM_BASE);
+
+    // Pure-base and pure-ext lists.
+    let pure_base = vec![ConstraintMeta::base(0, 1), ConstraintMeta::base(1, 2)];
+    assert_eq!(num_base_from_meta(&pure_base), 2);
+    let pure_ext = vec![ConstraintMeta::ext(0, 1), ConstraintMeta::ext(1, 1)];
+    assert_eq!(num_base_from_meta(&pure_ext), 0);
+    assert_eq!(num_base_from_meta(&[]), 0);
+
+    // RootKind sanity on the sample.
+    let meta = SampleSet.meta();
+    assert!(meta[..NUM_BASE].iter().all(|m| m.kind == RootKind::Base));
+    assert!(meta[NUM_BASE..].iter().all(|m| m.kind == RootKind::Ext));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "must form a prefix")]
+fn meta_base_after_ext_panics() {
+    let bad = vec![
+        ConstraintMeta::base(0, 1),
+        ConstraintMeta::ext(1, 1),
+        ConstraintMeta::base(2, 1),
+    ];
+    num_base_from_meta(&bad);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "dense and idx-ordered")]
+fn meta_non_dense_panics() {
+    let bad = vec![ConstraintMeta::base(0, 1), ConstraintMeta::base(2, 1)];
+    num_base_from_meta(&bad);
+}
+
+// =============================================================================
+// Folder completeness asserts (debug builds)
+// =============================================================================
+
+/// Run a body that emits only constraint 0 of 2, then check completeness.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "never emitted")]
+fn prover_folder_missing_emit_asserts() {
+    let shifts = PackingShifts::<Fp>::new();
+    let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
+    let frame = Frame::<Fp, Ext>::new(vec![step]);
+    let periodic: Vec<FpE> = vec![];
+    let challenges: Vec<ExtE> = vec![];
+    let alphas: Vec<ExtE> = vec![];
+    let offset = ExtE::zero();
+    let ctx = TransitionEvaluationContext::new_prover(
+        &frame,
+        &periodic,
+        &challenges,
+        &alphas,
+        &offset,
+        &shifts,
+    );
+
+    let mut base_out = vec![FpE::zero(); 2];
+    let mut ext_out = vec![ExtE::zero(); 2];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
+    let x = folder.main(0, 0);
+    folder.emit_base(0, x); // constraint 1 never emitted
+    folder.assert_all_emitted();
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "emitted twice")]
+fn prover_folder_double_emit_asserts() {
+    let shifts = PackingShifts::<Fp>::new();
+    let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
+    let frame = Frame::<Fp, Ext>::new(vec![step]);
+    let periodic: Vec<FpE> = vec![];
+    let challenges: Vec<ExtE> = vec![];
+    let alphas: Vec<ExtE> = vec![];
+    let offset = ExtE::zero();
+    let ctx = TransitionEvaluationContext::new_prover(
+        &frame,
+        &periodic,
+        &challenges,
+        &alphas,
+        &offset,
+        &shifts,
+    );
+
+    let mut base_out = vec![FpE::zero(); 2];
+    let mut ext_out = vec![ExtE::zero(); 2];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
+    let x = folder.main(0, 0);
+    folder.emit_base(0, x);
+    let x = folder.main(0, 0);
+    folder.emit_base(0, x);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "never emitted")]
+fn verifier_folder_missing_emit_asserts() {
+    let shifts = PackingShifts::<Ext>::new();
+    let step = TableView::<Ext, Ext>::new(vec![vec![ExtE::zero(); cols::NUM_COLS]], vec![vec![]]);
+    let frame = Frame::<Ext, Ext>::new(vec![step]);
+    let periodic: Vec<ExtE> = vec![];
+    let challenges: Vec<ExtE> = vec![];
+    let alphas: Vec<ExtE> = vec![];
+    let offset = ExtE::zero();
+    let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
+        &frame,
+        &periodic,
+        &challenges,
+        &alphas,
+        &offset,
+        &shifts,
+    );
+
+    let mut ext_out = vec![ExtE::zero(); 2];
+    let mut folder = VerifierEvalFolder::new(&ctx, &mut ext_out);
+    let x = folder.main(0, 0);
+    folder.emit_base(1, x);
+    folder.assert_all_emitted();
+}
