@@ -25,6 +25,9 @@ pub mod builder;
 pub mod interp;
 pub mod ir;
 
+#[cfg(test)]
+mod tests;
+
 pub use builder::{Expr, IrBuilder};
 pub use interp::{eval_program, eval_program_base, eval_program_verifier};
 pub use ir::{ConstraintProgram, Dim, Op};
