@@ -164,12 +164,6 @@ pub trait IsStarkVerifier<
                 .map(|((num, den), beta)| num * den * beta)
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
-        let periodic_values = air
-            .get_periodic_column_polynomials(trace_length)
-            .iter()
-            .map(|poly| poly.evaluate(&challenges.z))
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
@@ -199,7 +193,6 @@ pub trait IsStarkVerifier<
         let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
-            &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,

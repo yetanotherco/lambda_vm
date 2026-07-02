@@ -54,14 +54,12 @@ impl<F: IsSubFieldOf<E>, E: IsField> Value<F, E> {
 }
 
 /// Shared forward pass: evaluate every node, then return the value array.
-/// `resolve_var` resolves `Op::Var` leaves; `resolve_periodic` resolves
-/// `Op::Periodic`; the remaining uniforms are read from field-agnostic closures
-/// so prover/verifier share this one walk.
+/// `resolve_var` resolves `Op::Var` leaves; the remaining uniforms are read
+/// from field-agnostic closures so prover/verifier share this one walk.
 #[allow(clippy::too_many_arguments)]
-fn run<F, E, FVar, FPeriodic, FChallenge, FAlpha, FOffset>(
+fn run<F, E, FVar, FChallenge, FAlpha, FOffset>(
     prog: &ConstraintProgram<F, E>,
     resolve_var: FVar,
-    resolve_periodic: FPeriodic,
     resolve_challenge: FChallenge,
     resolve_alpha: FAlpha,
     resolve_offset: FOffset,
@@ -70,7 +68,6 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
     FVar: Fn(bool, u8, u8, u16) -> Value<F, E>,
-    FPeriodic: Fn(u16) -> Value<F, E>,
     FChallenge: Fn(u16) -> FieldElement<E>,
     FAlpha: Fn(u16) -> FieldElement<E>,
     FOffset: Fn() -> FieldElement<E>,
@@ -87,7 +84,6 @@ where
                 row,
                 col,
             } => resolve_var(main, offset, row, col),
-            Op::Periodic { idx } => resolve_periodic(idx),
             Op::RapChallenge { idx } => Value::Ext(resolve_challenge(idx)),
             Op::AlphaPow { idx } => Value::Ext(resolve_alpha(idx)),
             Op::TableOffset => Value::Ext(resolve_offset()),
@@ -156,7 +152,6 @@ where
             assert_eq!(row, 0, "minimal set reads row 0 only");
             Value::Base(main_row[col as usize].clone())
         },
-        |_idx| panic!("periodic leaves are not part of the minimal algebraic set"),
         |_idx| panic!("challenge leaves are not part of the minimal algebraic set"),
         |_idx| panic!("alpha_power leaves are not part of the minimal algebraic set"),
         || panic!("table_offset leaves are not part of the minimal algebraic set"),
@@ -181,7 +176,6 @@ pub fn eval_program<F, E>(
 {
     let TransitionEvaluationContext::Prover {
         frame,
-        periodic_values,
         rap_challenges,
         logup_alpha_powers,
         logup_table_offset,
@@ -202,7 +196,6 @@ pub fn eval_program<F, E>(
                 Value::Ext(step.get_aux_evaluation_element(0, col as usize).clone())
             }
         },
-        |idx| Value::Base(periodic_values[idx as usize].clone()),
         |idx| rap_challenges[idx as usize].clone(),
         |idx| logup_alpha_powers[idx as usize].clone(),
         || (*logup_table_offset).clone(),
@@ -234,7 +227,6 @@ pub fn eval_program_verifier<F, E>(
 {
     let TransitionEvaluationContext::Verifier {
         frame,
-        periodic_values,
         rap_challenges,
         logup_alpha_powers,
         logup_table_offset,
@@ -255,7 +247,6 @@ pub fn eval_program_verifier<F, E>(
                 Value::Ext(step.get_aux_evaluation_element(0, col as usize).clone())
             }
         },
-        |idx| Value::Ext(periodic_values[idx as usize].clone()),
         |idx| rap_challenges[idx as usize].clone(),
         |idx| logup_alpha_powers[idx as usize].clone(),
         || (*logup_table_offset).clone(),

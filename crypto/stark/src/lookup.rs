@@ -2321,8 +2321,6 @@ mod logup_single_source_tests {
         let n_aux = num_aux_cols(layout);
         let shifts = PackingShifts::<Gl>::new();
         let vshifts = PackingShifts::<Ext3>::new();
-        let no_periodic: Vec<Fp> = vec![];
-        let no_periodic_e: Vec<Fp3> = vec![];
 
         for trial in 0..TRIALS {
             let mut rng = SplitMix64::new(0xC0FF_EE00_u64 ^ (label.len() as u64) ^ trial as u64);
@@ -2342,7 +2340,6 @@ mod logup_single_source_tests {
 
             let prover_ctx = TransitionEvaluationContext::new_prover(
                 &frame,
-                &no_periodic,
                 &rap_challenges,
                 &alpha_powers,
                 &table_offset,
@@ -2382,7 +2379,6 @@ mod logup_single_source_tests {
             ]);
             let vctx = TransitionEvaluationContext::<Gl, Ext3>::new_verifier(
                 &vframe,
-                &no_periodic_e,
                 &rap_challenges,
                 &alpha_powers,
                 &table_offset,

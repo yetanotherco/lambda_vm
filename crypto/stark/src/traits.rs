@@ -1,12 +1,9 @@
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, IsField, IsSubFieldOf},
-    },
-    polynomial::Polynomial,
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
 use crate::{
@@ -54,13 +51,11 @@ impl<F: IsField> ZerofierEvaluations<F> {
 }
 
 /// Key identifying a unique zerofier shape — constraints with the same key share
-/// the same zerofier evaluations on the extended domain.
+/// the same zerofier evaluations on the extended domain. Every constraint
+/// applies to every row, so the shape is fully determined by its end
+/// exemptions.
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
 struct ZerofierGroupKey {
-    period: usize,
-    offset: usize,
-    exemptions_period: Option<usize>,
-    periodic_exemptions_offset: Option<usize>,
     end_exemptions: usize,
 }
 
@@ -77,7 +72,6 @@ where
 {
     Prover {
         frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -85,7 +79,6 @@ where
     },
     Verifier {
         frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -100,7 +93,6 @@ where
 {
     pub fn new_prover(
         frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -108,7 +100,6 @@ where
     ) -> Self {
         Self::Prover {
             frame,
-            periodic_values,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
@@ -118,7 +109,6 @@ where
 
     pub fn new_verifier(
         frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
@@ -126,7 +116,6 @@ where
     ) -> Self {
         Self::Verifier {
             frame,
-            periodic_values,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
@@ -295,30 +284,6 @@ pub trait AIR: Send + Sync {
         self.context().num_transition_constraints
     }
 
-    fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
-        vec![]
-    }
-
-    fn get_periodic_column_polynomials(
-        &self,
-        trace_length: usize,
-    ) -> Vec<Polynomial<FieldElement<Self::Field>>> {
-        let mut result = Vec::new();
-        for periodic_column in self.get_periodic_column_values() {
-            let values: Vec<_> = periodic_column
-                .iter()
-                .cycle()
-                .take(trace_length)
-                .cloned()
-                .collect();
-            let poly =
-                Polynomial::<FieldElement<Self::Field>>::interpolate_fft::<Self::Field>(&values)
-                    .unwrap();
-            result.push(poly);
-        }
-        result
-    }
-
     /// Compute zerofier evaluations as deduplicated groups with index mapping.
     ///
     /// Each unique zerofier (keyed by period/offset/exemption parameters) is
@@ -336,10 +301,6 @@ pub trait AIR: Send + Sync {
 
         meta.iter().for_each(|m| {
             let key = ZerofierGroupKey {
-                period: m.period,
-                offset: m.offset,
-                exemptions_period: m.exemptions_period,
-                periodic_exemptions_offset: m.periodic_exemptions_offset,
                 end_exemptions: m.end_exemptions,
             };
             let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {

@@ -196,13 +196,11 @@ fn frame_offset_reads_next_step() {
     let step0 = TableView::<Fp, Ext>::new(vec![vec![fp(10)]], vec![vec![]]);
     let step1 = TableView::<Fp, Ext>::new(vec![vec![fp(17)]], vec![vec![]]);
     let frame = Frame::<Fp, Ext>::new(vec![step0, step1]);
-    let periodic: Vec<FpE> = vec![];
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &periodic, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals: Vec<ExtE> = vec![];
@@ -232,13 +230,11 @@ fn mixed_base_ext_auto_embeds() {
     let aux_val = ext3(2, 3, 4);
     let step = TableView::<Fp, Ext>::new(vec![vec![main_val]], vec![vec![aux_val]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let periodic: Vec<FpE> = vec![];
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &periodic, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -267,13 +263,11 @@ fn explicit_embed_and_ext_neg() {
     let aux_val = ext3(1, 2, 3);
     let step = TableView::<Fp, Ext>::new(vec![vec![fp(9)]], vec![vec![aux_val]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let periodic: Vec<FpE> = vec![];
     let rap: Vec<ExtE> = vec![];
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &periodic, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -282,25 +276,25 @@ fn explicit_embed_and_ext_neg() {
 }
 
 // ------------------------------------------------------------------------
-// Every leaf kind: periodic, challenge, alpha_power, table_offset, aux.
+// Every leaf kind: main, challenge, alpha_power, table_offset, aux.
 // ------------------------------------------------------------------------
 
 #[test]
 fn all_leaf_kinds_logup_shaped() {
     // A LogUp-shaped expression touching every leaf variety:
-    //   periodic(0) * challenge(0) + alpha_pow(1) * aux(0,3) - table_offset()
+    //   main(0,0) * challenge(0) + alpha_pow(1) * aux(0,3) - table_offset()
     let mut b = IrBuilder::<Fp, Ext>::new();
-    let p = b.periodic(0); // Base
+    let m = b.main(0, 0); // Base
     let ch = b.challenge(0); // Ext
     let ap = b.alpha_power(1); // Ext
     let au = b.aux(0, 3); // Ext
     let off = b.table_offset(); // Ext
-    assert_eq!(p.dim(), Dim::Base);
+    assert_eq!(m.dim(), Dim::Base);
     assert_eq!(ch.dim(), Dim::Ext);
     assert_eq!(ap.dim(), Dim::Ext);
     assert_eq!(au.dim(), Dim::Ext);
     assert_eq!(off.dim(), Dim::Ext);
-    let t1 = b.mul(p, ch); // Base×Ext → Ext
+    let t1 = b.mul(m, ch); // Base×Ext → Ext
     let t2 = b.mul(ap, au); // Ext×Ext → Ext
     let s = b.add(t1, t2);
     let res = b.sub(s, off);
@@ -308,23 +302,22 @@ fn all_leaf_kinds_logup_shaped() {
     b.emit(0, res);
     let prog = b.finish(0);
 
-    let periodic = vec![fp(6)];
+    let main_row = vec![fp(6)];
     let rap = vec![ext3(1, 0, 0), ext3(2, 2, 2)];
     let alpha = vec![ext3(9, 9, 9), ext3(3, 1, 4)];
     let offset = ext3(7, 7, 7);
     let aux_row = vec![ext3(0, 0, 0), ext3(0, 0, 0), ext3(0, 0, 0), ext3(5, 5, 5)];
 
     let expected = {
-        let t1 = periodic[0] * rap[0]; // periodic(0) * challenge(0)
+        let t1 = main_row[0] * rap[0]; // main(0,0) * challenge(0)
         let t2 = alpha[1] * aux_row[3];
         (t1 + t2) - offset
     };
 
-    let step = TableView::<Fp, Ext>::new(vec![vec![]], vec![aux_row]);
+    let step = TableView::<Fp, Ext>::new(vec![main_row], vec![aux_row]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
     let shifts = PackingShifts::<Fp>::new();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &periodic, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -357,13 +350,11 @@ fn prover_entry_point_splits_base_and_ext() {
     let aux_val = ext3(2, 0, 1);
     let step = TableView::<Fp, Ext>::new(vec![vec![fp(30), fp(12)]], vec![vec![aux_val]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let periodic: Vec<FpE> = vec![];
     let rap: Vec<ExtE> = vec![];
     let alpha = vec![ext3(3, 3, 3)];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &periodic, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -384,13 +375,12 @@ fn verifier_entry_point_promotes_base_roots() {
         vec![vec![aux_val]],
     );
     let frame = Frame::<Ext, Ext>::new(vec![step]);
-    let periodic: Vec<ExtE> = vec![];
     let rap: Vec<ExtE> = vec![];
     let alpha = vec![ext3(3, 3, 3)];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Ext>::new();
     let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
-        &frame, &periodic, &rap, &alpha, &offset, &shifts,
+        &frame, &rap, &alpha, &offset, &shifts,
     );
 
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -491,14 +481,12 @@ fn non_goldilocks_reflexive_tower_builds_and_interprets() {
     // Full prover entry point with F = E = G.
     let step = TableView::<G, G>::new(vec![vec![g(6), g(7)]], vec![vec![g(4)]]);
     let frame = Frame::<G, G>::new(vec![step]);
-    let periodic: Vec<GE> = vec![];
     let rap: Vec<GE> = vec![];
     let alpha: Vec<GE> = vec![];
     let offset = g(0);
     let shifts = PackingShifts::<G>::new();
-    let ctx = TransitionEvaluationContext::<G, G>::new_prover(
-        &frame, &periodic, &rap, &alpha, &offset, &shifts,
-    );
+    let ctx =
+        TransitionEvaluationContext::<G, G>::new_prover(&frame, &rap, &alpha, &offset, &shifts);
     let mut base_evals = vec![GE::zero()];
     let mut ext_evals = vec![GE::zero(), GE::zero()];
     eval_program(&prog, &ctx, &mut base_evals, &mut ext_evals);
@@ -506,9 +494,8 @@ fn non_goldilocks_reflexive_tower_builds_and_interprets() {
     assert_eq!(ext_evals[1], g(4) + g(10));
 
     // Verifier entry point too (the frame is Frame<G, G> either way here).
-    let vctx = TransitionEvaluationContext::<G, G>::new_verifier(
-        &frame, &periodic, &rap, &alpha, &offset, &shifts,
-    );
+    let vctx =
+        TransitionEvaluationContext::<G, G>::new_verifier(&frame, &rap, &alpha, &offset, &shifts);
     let mut v_evals = vec![GE::zero(), GE::zero()];
     eval_program_verifier(&prog, &vctx, &mut v_evals);
     assert_eq!(v_evals[0], g(6) * g(7) + g(3));

@@ -136,11 +136,6 @@ impl<F: IsField, E: IsField> IrBuilder<F, E> {
         )
     }
 
-    /// A periodic column read at the current row ([`Dim::Base`]).
-    pub fn periodic(&mut self, idx: usize) -> Expr {
-        self.push(Op::Periodic { idx: idx as u16 }, Dim::Base)
-    }
-
     /// A LogUp RAP challenge, uniform per proof ([`Dim::Ext`]).
     pub fn challenge(&mut self, idx: usize) -> Expr {
         self.push(Op::RapChallenge { idx: idx as u16 }, Dim::Ext)

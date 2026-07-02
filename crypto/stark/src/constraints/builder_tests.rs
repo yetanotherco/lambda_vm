@@ -185,12 +185,10 @@ fn prover_folder_matches_direct_arithmetic() {
         let t = random_trial(&mut rng);
         let step = TableView::<Fp, Ext>::new(vec![t.row.clone()], vec![vec![t.aux0]]);
         let frame = Frame::<Fp, Ext>::new(vec![step]);
-        let periodic: Vec<FpE> = vec![];
         let challenges = vec![t.challenge0];
         let alphas = vec![t.alpha0];
         let ctx = TransitionEvaluationContext::new_prover(
             &frame,
-            &periodic,
             &challenges,
             &alphas,
             &t.offset,
@@ -225,12 +223,10 @@ fn prover_folder_matches_interpreted_capture() {
         let t = random_trial(&mut rng);
         let step = TableView::<Fp, Ext>::new(vec![t.row.clone()], vec![vec![t.aux0]]);
         let frame = Frame::<Fp, Ext>::new(vec![step]);
-        let periodic: Vec<FpE> = vec![];
         let challenges = vec![t.challenge0];
         let alphas = vec![t.alpha0];
         let ctx = TransitionEvaluationContext::new_prover(
             &frame,
-            &periodic,
             &challenges,
             &alphas,
             &t.offset,
@@ -266,12 +262,10 @@ fn verifier_folder_matches_interpreted_capture() {
         let row_e: Vec<ExtE> = t.row.iter().map(|x| x.to_extension()).collect();
         let step = TableView::<Ext, Ext>::new(vec![row_e], vec![vec![t.aux0]]);
         let frame = Frame::<Ext, Ext>::new(vec![step]);
-        let periodic: Vec<ExtE> = vec![];
         let challenges = vec![t.challenge0];
         let alphas = vec![t.alpha0];
         let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
             &frame,
-            &periodic,
             &challenges,
             &alphas,
             &t.offset,
@@ -363,18 +357,11 @@ fn prover_folder_missing_emit_asserts() {
     let shifts = PackingShifts::<Fp>::new();
     let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let periodic: Vec<FpE> = vec![];
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let ctx = TransitionEvaluationContext::new_prover(
-        &frame,
-        &periodic,
-        &challenges,
-        &alphas,
-        &offset,
-        &shifts,
-    );
+    let ctx =
+        TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
 
     let mut base_out = vec![FpE::zero(); 2];
     let mut ext_out = vec![ExtE::zero(); 2];
@@ -391,18 +378,11 @@ fn prover_folder_double_emit_asserts() {
     let shifts = PackingShifts::<Fp>::new();
     let step = TableView::<Fp, Ext>::new(vec![vec![FpE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
-    let periodic: Vec<FpE> = vec![];
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
-    let ctx = TransitionEvaluationContext::new_prover(
-        &frame,
-        &periodic,
-        &challenges,
-        &alphas,
-        &offset,
-        &shifts,
-    );
+    let ctx =
+        TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
 
     let mut base_out = vec![FpE::zero(); 2];
     let mut ext_out = vec![ExtE::zero(); 2];
@@ -420,13 +400,11 @@ fn verifier_folder_missing_emit_asserts() {
     let shifts = PackingShifts::<Ext>::new();
     let step = TableView::<Ext, Ext>::new(vec![vec![ExtE::zero(); cols::NUM_COLS]], vec![vec![]]);
     let frame = Frame::<Ext, Ext>::new(vec![step]);
-    let periodic: Vec<ExtE> = vec![];
     let challenges: Vec<ExtE> = vec![];
     let alphas: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let ctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
         &frame,
-        &periodic,
         &challenges,
         &alphas,
         &offset,
@@ -463,9 +441,6 @@ impl ConstraintBuilder<Fp, Ext> for CountingCapture {
     }
     fn aux(&self, offset: usize, col: usize) -> Self::ExprE {
         self.inner.aux(offset, col)
-    }
-    fn periodic(&self, idx: usize) -> Self::Expr {
-        self.inner.periodic(idx)
     }
     fn challenge(&self, idx: usize) -> Self::ExprE {
         self.inner.challenge(idx)
@@ -619,15 +594,8 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
             .map(|s| TableView::new(vec![rows[s].clone()], vec![auxs[s].clone()]))
             .collect();
         let frame = Frame::<Fp, Ext>::new(steps);
-        let periodic: Vec<FpE> = vec![];
-        let ctx = TransitionEvaluationContext::new_prover(
-            &frame,
-            &periodic,
-            &challenges,
-            &alphas,
-            &offset,
-            &shifts,
-        );
+        let ctx =
+            TransitionEvaluationContext::new_prover(&frame, &challenges, &alphas, &offset, &shifts);
 
         let mut folder_base = vec![FpE::zero(); num_base];
         let mut folder_ext = vec![ExtE::zero(); meta.len()];
@@ -659,10 +627,8 @@ fn next_row_aux_and_multi_alpha_folder_matches_capture() {
             })
             .collect();
         let frame_e = Frame::<Ext, Ext>::new(steps_e);
-        let periodic_e: Vec<ExtE> = vec![];
         let vctx = TransitionEvaluationContext::<Fp, Ext>::new_verifier(
             &frame_e,
-            &periodic_e,
             &challenges,
             &alphas,
             &offset,

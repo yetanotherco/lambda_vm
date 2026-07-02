@@ -2,12 +2,12 @@
 //!
 //! The production zerofier path: `AIR::transition_zerofier_evaluations_grouped`
 //! (prover) and the verifier's OOD zerofier denominators both evaluate these
-//! over each constraint's plain metadata (`period` / `offset` /
-//! `exemptions_period` / `periodic_exemptions_offset` / `end_exemptions`).
-//! The bodies were relocated verbatim from the deleted boxed-constraint trait's
-//! default methods (equivalence was asserted by migration-time tests).
-
-use core::ops::Div;
+//! over each constraint's plain metadata. Every constraint applies to every
+//! row of the trace, so the zerofier is `x^N − 1` corrected by the constraint's
+//! `end_exemptions` (the last rows it must skip).
+//! The bodies were relocated from the deleted boxed-constraint trait's default
+//! methods, specialized to the every-row shape (equivalence was asserted by
+//! migration-time tests).
 
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
@@ -29,11 +29,10 @@ pub fn end_exemptions_roots<F: IsField>(
     if end_exemptions == 0 {
         return Vec::new();
     }
-    // Last row in the constraint's evaluation domain is g^(offset + N - period);
-    // walking backward by g^period gives the remaining end-exemption roots.
-    let period = meta.period;
-    let decrement = trace_primitive_root.pow(trace_length - period);
-    let mut current = trace_primitive_root.pow(meta.offset + trace_length - period);
+    // The last row of the trace is g^(N-1); walking backward by g^-1 = g^(N-1)
+    // gives the remaining end-exemption roots.
+    let decrement = trace_primitive_root.pow(trace_length - 1);
+    let mut current = trace_primitive_root.pow(trace_length - 1);
     let mut roots = Vec::with_capacity(end_exemptions);
     for _ in 0..end_exemptions {
         roots.push(current.clone());
@@ -70,122 +69,57 @@ pub fn end_exemptions_lde_evaluations<F: IsFFTField>(
 
 /// Compute evaluations of the constraint's zerofier over a LDE domain.
 ///
-/// With no end exemptions the zerofier is cyclic, so a short period-length
-/// vector is returned and the consumer cycles it (same contract as the trait
-/// default this body was moved from).
-#[allow(unstable_name_collisions)]
+/// With no end exemptions the zerofier `1/(x^N − 1)` is cyclic over the LDE
+/// coset, so a short blowup-length vector is returned and the consumer cycles
+/// it (same contract as the trait default this body was moved from).
 pub fn zerofier_evaluations_on_extended_domain<F: IsFFTField>(
     meta: &ConstraintMeta,
     domain: &Domain<F>,
 ) -> Vec<FieldElement<F>> {
     let blowup_factor = domain.blowup_factor;
     let trace_length = domain.trace_roots_of_unity.len();
-    let trace_primitive_root = &domain.trace_primitive_root;
     let coset_offset = &domain.coset_offset;
     let lde_root_order = u64::from((blowup_factor * trace_length).trailing_zeros());
     let lde_root = F::get_primitive_root_of_unity(lde_root_order).unwrap();
 
-    // If there is an exemptions period defined for this constraint, the evaluations are calculated directly
-    // by computing P_exemptions(x) / Zerofier(x)
-    if let Some(exemptions_period) = meta.exemptions_period {
-        debug_assert!(exemptions_period.is_multiple_of(meta.period));
-        debug_assert!(meta.periodic_exemptions_offset.is_some());
+    // The zerofiers are computed as the numerator, then inverted using batch
+    // inverse and then multiplied by P_exemptions(x). This way we don't do
+    // useless divisions. x^N over the LDE coset repeats after blowup_factor
+    // points, so only those are computed.
+    let last_exponent = blowup_factor;
+    let denominator_offset = FieldElement::<F>::one();
+    let denominator_step = lde_root.pow(trace_length);
+    let mut denominator_eval = coset_offset.pow(trace_length);
 
-        // The elements of the domain have order `trace_length * blowup_factor`, so the zerofier evaluations
-        // without the end exemptions, repeat their values after `blowup_factor * exemptions_period` iterations,
-        // so we only need to compute those.
-        let last_exponent = blowup_factor * exemptions_period;
-        let numerator_power = trace_length / exemptions_period;
-        let denominator_power = trace_length / meta.period;
-        let offset_exponent =
-            trace_length * meta.periodic_exemptions_offset.unwrap() / exemptions_period;
-        let numerator_offset = trace_primitive_root.pow(offset_exponent);
-        let denominator_offset = trace_primitive_root.pow(meta.offset * denominator_power);
-        let numerator_step = lde_root.pow(numerator_power);
-        let denominator_step = lde_root.pow(denominator_power);
-        let mut numerator_eval = coset_offset.pow(numerator_power);
-        let mut denominator_eval = coset_offset.pow(denominator_power);
-
-        let mut numerators = Vec::with_capacity(last_exponent);
-        let mut denominators = Vec::with_capacity(last_exponent);
-        for _ in 0..last_exponent {
-            numerators.push(&numerator_eval - &numerator_offset);
-            denominators.push(&denominator_eval - &denominator_offset);
-            numerator_eval = &numerator_eval * &numerator_step;
-            denominator_eval = &denominator_eval * &denominator_step;
-        }
-
-        // Batch inversion: O(3N) muls + 1 inversion instead of N individual inversions.
-        // Denominators are guaranteed non-zero because the sets of powers of
-        // `offset_times_x` and `trace_primitive_root` are disjoint, provided that the
-        // offset is neither an element of the interpolation domain nor part of a
-        // subgroup with order less than n.
-        FieldElement::inplace_batch_inverse(&mut denominators).unwrap();
-
-        let evaluations: Vec<_> = numerators
-            .iter()
-            .zip(denominators.iter())
-            .map(|(num, denom_inv)| num * denom_inv)
-            .collect();
-
-        // Mirror the else-branch fast path: with no end exemptions the zerofier stays
-        // cyclic, so return the short period-length vector and let the consumer cycle.
-        if meta.end_exemptions == 0 {
-            return evaluations;
-        }
-
-        let end_exemption_evaluations = end_exemptions_lde_evaluations(meta, domain);
-
-        let cycled_evaluations = evaluations
-            .iter()
-            .cycle()
-            .take(end_exemption_evaluations.len());
-
-        core::iter::zip(cycled_evaluations, end_exemption_evaluations)
-            .map(|(eval, exemption_eval)| eval * exemption_eval)
-            .collect()
-
-    // In this else branch, the zerofiers are computed as the numerator, then inverted
-    // using batch inverse and then multiplied by P_exemptions(x). This way we don't do
-    // useless divisions.
-    } else {
-        let last_exponent = blowup_factor * meta.period;
-        let denominator_power = trace_length / meta.period;
-        let denominator_offset = trace_primitive_root.pow(meta.offset * denominator_power);
-        let denominator_step = lde_root.pow(denominator_power);
-        let mut denominator_eval = coset_offset.pow(denominator_power);
-
-        let mut evaluations = Vec::with_capacity(last_exponent);
-        for _ in 0..last_exponent {
-            evaluations.push(&denominator_eval - &denominator_offset);
-            denominator_eval = &denominator_eval * &denominator_step;
-        }
-
-        FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
-
-        // Fast path: when end_exemptions == 0 there are no exemption roots, so
-        // the zerofier stays cyclic — return the short period-length vector
-        // directly instead of expanding it over the full LDE domain.
-        if meta.end_exemptions == 0 {
-            return evaluations;
-        }
-
-        let end_exemption_evaluations = end_exemptions_lde_evaluations(meta, domain);
-
-        let cycled_evaluations = evaluations
-            .iter()
-            .cycle()
-            .take(end_exemption_evaluations.len());
-
-        core::iter::zip(cycled_evaluations, end_exemption_evaluations)
-            .map(|(eval, exemption_eval)| eval * exemption_eval)
-            .collect()
+    let mut evaluations = Vec::with_capacity(last_exponent);
+    for _ in 0..last_exponent {
+        evaluations.push(&denominator_eval - &denominator_offset);
+        denominator_eval = &denominator_eval * &denominator_step;
     }
+
+    FieldElement::inplace_batch_inverse(&mut evaluations).unwrap();
+
+    // Fast path: when end_exemptions == 0 there are no exemption roots, so
+    // the zerofier stays cyclic — return the short blowup-length vector
+    // directly instead of expanding it over the full LDE domain.
+    if meta.end_exemptions == 0 {
+        return evaluations;
+    }
+
+    let end_exemption_evaluations = end_exemptions_lde_evaluations(meta, domain);
+
+    let cycled_evaluations = evaluations
+        .iter()
+        .cycle()
+        .take(end_exemption_evaluations.len());
+
+    core::iter::zip(cycled_evaluations, end_exemption_evaluations)
+        .map(|(eval, exemption_eval)| eval * exemption_eval)
+        .collect()
 }
 
 /// Evaluation of the constraint's zerofier at some point `z`, which may be in
 /// a field extension.
-#[allow(unstable_name_collisions)]
 pub fn evaluate_zerofier<F, E>(
     meta: &ConstraintMeta,
     z: &FieldElement<E>,
@@ -203,27 +137,9 @@ where
         acc * -(root.clone() - z.clone())
     });
 
-    if let Some(exemptions_period) = meta.exemptions_period {
-        debug_assert!(exemptions_period.is_multiple_of(meta.period));
-        debug_assert!(meta.periodic_exemptions_offset.is_some());
-
-        let periodic_exemptions_offset = meta.periodic_exemptions_offset.unwrap();
-        let offset_exponent = trace_length * periodic_exemptions_offset / exemptions_period;
-
-        let numerator =
-            -trace_primitive_root.pow(offset_exponent) + z.pow(trace_length / exemptions_period);
-        let denominator = -trace_primitive_root.pow(meta.offset * trace_length / meta.period)
-            + z.pow(trace_length / meta.period);
-        // The denominator is non-zero: z is sampled outside the set of primitive roots.
-        return numerator
-            .div(denominator)
-            .expect("zerofier denominator is non-zero: z is sampled out-of-domain")
-            * &end_exemptions_eval;
-    }
-
-    (-trace_primitive_root.pow(meta.offset * trace_length / meta.period)
-        + z.pow(trace_length / meta.period))
-    .inv()
-    .unwrap()
+    // 1/(z^N − 1), times the end-exemptions correction.
+    (-FieldElement::<F>::one() + z.pow(trace_length))
+        .inv()
+        .unwrap()
         * &end_exemptions_eval
 }

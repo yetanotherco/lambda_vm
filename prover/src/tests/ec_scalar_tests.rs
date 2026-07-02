@@ -27,8 +27,7 @@ fn eval_row(trace: &TraceTable<GoldilocksField, GoldilocksExtension>, row: usize
     let shifts = PackingShifts::<GoldilocksField>::new();
     let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
     let offset_e = FieldElement::<GoldilocksExtension>::zero();
-    let ctx =
-        TransitionEvaluationContext::new_prover(&frame, &[], &no_e, &no_e, &offset_e, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(&frame, &no_e, &no_e, &offset_e, &shifts);
     let mut base = vec![FE::zero(); n];
     let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
     let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);

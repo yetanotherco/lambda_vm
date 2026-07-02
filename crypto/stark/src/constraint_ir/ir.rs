@@ -56,9 +56,6 @@ pub enum Op {
         /// Column index.
         col: u16,
     },
-    /// A periodic column read: `periodic_values[idx]` at the current row
-    /// ([`Dim::Base`]).
-    Periodic { idx: u16 },
     /// A LogUp RAP challenge: `rap_challenges[idx]` ([`Dim::Ext`], uniform per
     /// proof).
     RapChallenge { idx: u16 },

@@ -103,7 +103,6 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     // ---- leaves ---------------------------------------------------------
     fn main(&self, offset: usize, col: usize) -> Self::Expr;
     fn aux(&self, offset: usize, col: usize) -> Self::ExprE;
-    fn periodic(&self, idx: usize) -> Self::Expr;
     /// `rap_challenges[idx]`.
     fn challenge(&self, idx: usize) -> Self::ExprE;
     /// `logup_alpha_powers[idx]`.
@@ -142,6 +141,10 @@ pub enum RootKind {
 /// Per-constraint metadata: plain data replacing the per-constraint trait
 /// objects. `Base` entries MUST form a prefix of an idx-ordered, dense list —
 /// see [`num_base_from_meta`].
+///
+/// Every constraint applies to every row (up to `end_exemptions` rows at the
+/// end of the trace); there is no per-constraint period/offset/periodic
+/// exemption machinery.
 #[derive(Clone, Debug)]
 pub struct ConstraintMeta {
     pub constraint_idx: usize,
@@ -149,14 +152,6 @@ pub struct ConstraintMeta {
     pub kind: RootKind,
     /// Declared degree; asserted == tree-measured degree (host-side test).
     pub degree: usize,
-    /// Periodicity of application over the trace (default 1: every row).
-    pub period: usize,
-    /// Offset for periodic application (default 0).
-    pub offset: usize,
-    /// Periodicity of rows exempted within the applied rows (default None).
-    pub exemptions_period: Option<usize>,
-    /// Offset for the periodic exemptions (default None).
-    pub periodic_exemptions_offset: Option<usize>,
     /// Number of exempted rows at the end of the trace (default 0).
     pub end_exemptions: usize,
 }
@@ -169,10 +164,6 @@ impl ConstraintMeta {
             constraint_idx,
             kind: RootKind::Base,
             degree,
-            period: 1,
-            offset: 0,
-            exemptions_period: None,
-            periodic_exemptions_offset: None,
             end_exemptions: 0,
         }
     }
@@ -183,22 +174,6 @@ impl ConstraintMeta {
             kind: RootKind::Ext,
             ..Self::base(constraint_idx, degree)
         }
-    }
-
-    pub fn with_period(mut self, period: usize) -> Self {
-        self.period = period;
-        self
-    }
-
-    pub fn with_offset(mut self, offset: usize) -> Self {
-        self.offset = offset;
-        self
-    }
-
-    pub fn with_exemptions(mut self, exemptions_period: usize, exemptions_offset: usize) -> Self {
-        self.exemptions_period = Some(exemptions_period);
-        self.periodic_exemptions_offset = Some(exemptions_offset);
-        self
     }
 
     pub fn with_end_exemptions(mut self, end_exemptions: usize) -> Self {
@@ -377,7 +352,6 @@ where
     E: IsField,
 {
     frame: &'a Frame<F, E>,
-    periodic: &'a [FieldElement<F>],
     challenges: &'a [FieldElement<E>],
     alphas: &'a [FieldElement<E>],
     logup_table_offset: &'a FieldElement<E>,
@@ -403,7 +377,6 @@ where
     ) -> Self {
         let TransitionEvaluationContext::Prover {
             frame,
-            periodic_values,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
@@ -415,7 +388,6 @@ where
         let num_constraints = base_out.len().max(ext_out.len());
         Self {
             frame,
-            periodic: periodic_values,
             challenges: rap_challenges,
             alphas: logup_alpha_powers,
             logup_table_offset,
@@ -451,9 +423,6 @@ where
             .get_evaluation_step(offset)
             .get_aux_evaluation_element(0, col)
             .clone()
-    }
-    fn periodic(&self, idx: usize) -> FieldElement<F> {
-        self.periodic[idx].clone()
     }
     fn challenge(&self, idx: usize) -> FieldElement<E> {
         self.challenges[idx].clone()
@@ -503,7 +472,6 @@ where
     E: IsField,
 {
     frame: &'a Frame<E, E>,
-    periodic: &'a [FieldElement<E>],
     challenges: &'a [FieldElement<E>],
     alphas: &'a [FieldElement<E>],
     logup_table_offset: &'a FieldElement<E>,
@@ -528,7 +496,6 @@ where
     ) -> Self {
         let TransitionEvaluationContext::Verifier {
             frame,
-            periodic_values,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
@@ -540,7 +507,6 @@ where
         let num_constraints = ext_out.len();
         Self {
             frame,
-            periodic: periodic_values,
             challenges: rap_challenges,
             alphas: logup_alpha_powers,
             logup_table_offset,
@@ -577,9 +543,6 @@ where
             .get_aux_evaluation_element(0, col)
             .clone()
     }
-    fn periodic(&self, idx: usize) -> FieldElement<E> {
-        self.periodic[idx].clone()
-    }
     fn challenge(&self, idx: usize) -> FieldElement<E> {
         self.challenges[idx].clone()
     }
@@ -610,7 +573,7 @@ where
 // 3. CaptureBuilder — owned expression tree, flattened into the flat IR
 // =============================================================================
 
-/// One node of the capture tree. `degree` is eager (leaf var/periodic = 1,
+/// One node of the capture tree. `degree` is eager (leaf var = 1,
 /// constants/uniforms = 0, mul sums, add/sub max, neg passthrough — p3's
 /// `degree_multiple`).
 struct TreeNode {
@@ -628,7 +591,6 @@ enum TreeKind {
         offset: u8,
         col: u16,
     },
-    Periodic(u16),
     Challenge(u16),
     AlphaPow(u16),
     TableOffset,
@@ -742,7 +704,6 @@ impl<F: IsField, E: IsField> CaptureBuilder<F, E> {
         match &e.0.kind {
             TreeKind::Main { offset, col } => self.ir.main(*offset, *col as usize),
             TreeKind::Aux { offset, col } => self.ir.aux(*offset, *col as usize),
-            TreeKind::Periodic(idx) => self.ir.periodic(*idx as usize),
             TreeKind::Challenge(idx) => self.ir.challenge(*idx as usize),
             TreeKind::AlphaPow(idx) => self.ir.alpha_power(*idx as usize),
             TreeKind::TableOffset => self.ir.table_offset(),
@@ -796,9 +757,6 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
             Dim::Ext,
             1,
         )
-    }
-    fn periodic(&self, idx: usize) -> IrExpr {
-        IrExpr::leaf(TreeKind::Periodic(idx as u16), Dim::Base, 1)
     }
     fn challenge(&self, idx: usize) -> IrExpr {
         IrExpr::leaf(TreeKind::Challenge(idx as u16), Dim::Ext, 0)

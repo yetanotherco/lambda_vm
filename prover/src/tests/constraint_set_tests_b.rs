@@ -83,8 +83,6 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
 
     let shifts = PackingShifts::<Gl>::new();
     let vshifts = PackingShifts::<Gl3>::new();
-    let no_periodic: Vec<FE> = vec![];
-    let no_periodic_e: Vec<Fp3> = vec![];
     let no_ch: Vec<Fp3> = vec![];
     let offset_e = Fp3::zero();
 
@@ -95,14 +93,8 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
 
         // --- ProverEvalFolder (base) ---
         let frame = Frame::<Gl, Gl3>::new(vec![TableView::new(vec![row.clone()], vec![vec![]])]);
-        let ctx = TransitionEvaluationContext::new_prover(
-            &frame,
-            &no_periodic,
-            &no_ch,
-            &no_ch,
-            &offset_e,
-            &shifts,
-        );
+        let ctx =
+            TransitionEvaluationContext::new_prover(&frame, &no_ch, &no_ch, &offset_e, &shifts);
         let mut base_out = vec![FE::zero(); n];
         let mut ext_out = vec![Fp3::zero(); n];
         let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
@@ -113,12 +105,7 @@ fn check_table<CS: ConstraintSet<Gl, Gl3>>(label: &str, set: &CS, num_cols: usiz
         let frame_e =
             Frame::<Gl3, Gl3>::new(vec![TableView::new(vec![row_e.clone()], vec![vec![]])]);
         let vctx = TransitionEvaluationContext::<Gl, Gl3>::new_verifier(
-            &frame_e,
-            &no_periodic_e,
-            &no_ch,
-            &no_ch,
-            &offset_e,
-            &vshifts,
+            &frame_e, &no_ch, &no_ch, &offset_e, &vshifts,
         );
         let mut vext_out = vec![Fp3::zero(); n];
         let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
