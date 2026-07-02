@@ -3,6 +3,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -224,6 +228,55 @@ where
     }
 }
 
+/// Single-body [`ConstraintSet`] for [`ReadOnlyRAP`]: the same constraints
+/// as `ContinuityConstraint` + `SingleValueConstraint` +
+/// `PermutationConstraint`, written once against the [`ConstraintBuilder`].
+/// The permutation constraint reads the auxiliary (RAP) column and the
+/// interaction challenges, so it is an `Ext` constraint after the `Base`
+/// prefix.
+pub struct ReadOnlyRAPConstraints;
+
+impl<F> ConstraintSet<F, F> for ReadOnlyRAPConstraints
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        // All three read the next row ⇒ 1 end exemption each.
+        vec![
+            ConstraintMeta::base(0, 2).with_end_exemptions(1), // continuity
+            ConstraintMeta::base(1, 2).with_end_exemptions(1), // single value
+            ConstraintMeta::ext(2, 2).with_end_exemptions(1),  // permutation
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let a_sorted_0 = b.main(0, 2);
+        let a_sorted_1 = b.main(1, 2);
+        let v_sorted_0 = b.main(0, 3);
+        let v_sorted_1 = b.main(1, 3);
+        let one = b.one();
+        let addr_diff = a_sorted_1 - a_sorted_0;
+
+        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        b.emit_base(0, addr_diff.clone() * (addr_diff.clone() - one.clone()));
+        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        b.emit_base(1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
+
+        // (z - (a'_{i+1} + α * v'_{i+1})) * p_{i+1} = (z - (a_{i+1} + α * v_{i+1})) * p_i
+        let p0 = b.aux(0, 0);
+        let p1 = b.aux(1, 0);
+        let z = b.challenge(0);
+        let alpha = b.challenge(1);
+        let a1 = b.main(1, 0);
+        let v1 = b.main(1, 1);
+        let a_sorted_1 = b.main(1, 2);
+        let v_sorted_1 = b.main(1, 3);
+        let sorted_fp = z.clone() - (a_sorted_1 + v_sorted_1 * alpha.clone());
+        let unsorted_fp = z - (a1 + v1 * alpha);
+        b.emit_ext(2, sorted_fp * p1 - unsorted_fp * p0);
+    }
+}
+
 pub struct ReadOnlyRAP<F>
 where
     F: IsFFTField,
@@ -367,6 +420,36 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &ReadOnlyRAPConstraints,
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &ReadOnlyRAPConstraints,
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&ConstraintSet::<F, F>::meta(&ReadOnlyRAPConstraints))
     }
 
     fn context(&self) -> &AirContext {

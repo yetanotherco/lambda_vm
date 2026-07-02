@@ -3,6 +3,10 @@ use std::{marker::PhantomData, ops::Div};
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
         transition::TransitionConstraintEvaluator,
     },
     context::AirContext,
@@ -156,6 +160,47 @@ where
     }
 }
 
+/// Single-body [`ConstraintSet`] for [`FibonacciRAP`]: the same constraints
+/// as `FibConstraint` + `PermutationConstraint`, written once against the
+/// [`ConstraintBuilder`]. The permutation constraint reads the auxiliary
+/// (RAP) column and the interaction challenge, so it is an `Ext` constraint
+/// after the `Base` prefix.
+pub struct FibonacciRAPConstraints;
+
+impl<F> ConstraintSet<F, F> for FibonacciRAPConstraints
+where
+    F: IsFFTField + Send + Sync,
+{
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        vec![
+            // idx 0: fibonacci; end exemptions hard-coded for the steps = 16
+            // integration tests (see `FibConstraint::end_exemptions`).
+            ConstraintMeta::base(0, 1).with_end_exemptions(3 + 32 - 16 - 1),
+            // idx 1: permutation; reads the next row ⇒ 1 end exemption.
+            ConstraintMeta::ext(1, 2).with_end_exemptions(1),
+        ]
+    }
+
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        // a_{i+2} = a_{i+1} + a_i on column 0.
+        let a0 = b.main(0, 0);
+        let a1 = b.main(1, 0);
+        let a2 = b.main(2, 0);
+        b.emit_base(0, a2 - a1 - a0);
+
+        // z_{i+1} * (b_i + gamma) = z_i * (a_i + gamma)
+        let z_i = b.aux(0, 0);
+        let z_i_plus_one = b.aux(1, 0);
+        let gamma = b.challenge(0);
+        let a_i = b.main(0, 0);
+        let b_i = b.main(0, 1);
+        b.emit_ext(
+            1,
+            z_i_plus_one * (b_i + gamma.clone()) - z_i * (a_i + gamma),
+        );
+    }
+}
+
 pub struct FibonacciRAP<F>
 where
     F: IsFFTField,
@@ -276,6 +321,36 @@ where
         &self,
     ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
         &self.transition_constraints
+    }
+
+    fn compute_transition_prover(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &FibonacciRAPConstraints,
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &FibonacciRAPConstraints,
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&ConstraintSet::<F, F>::meta(&FibonacciRAPConstraints))
     }
 
     fn context(&self) -> &AirContext {
