@@ -16,6 +16,7 @@ use math_cuda::{CudaSlice, CudaStream};
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
+use crypto::merkle_tree::proof::Proof;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -23,9 +24,10 @@ use math::field::goldilocks::GoldilocksField;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::traits::AsBytes;
 
-use crate::config::FriLayerMerkleTreeBackend;
+use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
+use crate::fri::fri_decommit::FriDecommitment;
 use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::trace::LDETraceTable;
 
@@ -430,7 +432,9 @@ pub fn gpu_leaf_hash_calls() -> u64 {
 }
 
 /// Row-major GPU path: single H2D → row-major NTT → row-major Keccak →
-/// Merkle → single D2H. No column extraction or CPU-side transpose.
+/// Merkle → single D2H. Keeps the Merkle tree resident on device (in the
+/// handle's `.tree`); the returned host `MerkleTree` is root only, so query
+/// openings gather paths from the device tree via [`gather_proofs_dev`].
 pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     row_major: &[FieldElement<E>],
     n: usize,
@@ -468,7 +472,8 @@ where
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    let (nodes_bytes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+    // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
         n,
         m,
@@ -487,11 +492,10 @@ where
         )
     };
 
-    let nodes: Vec<[u8; 32]> = nodes_bytes
-        .chunks_exact(32)
-        .map(|c| c.try_into().expect("32-byte chunk"))
-        .collect();
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
+    // serves openings; only the commitment root lives on host.
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle, lde_out))
 }
 
@@ -537,15 +541,15 @@ where
     GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
-    let (nodes_bytes, handle, lde_u64) =
-        math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
-            raw,
-            n,
-            m,
-            blowup_factor,
-            &weights_u64,
-        )
-        .ok()?;
+    // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
 
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == Fp3 = [u64;3]).
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -561,11 +565,10 @@ where
         )
     };
 
-    let nodes: Vec<[u8; 32]> = nodes_bytes
-        .chunks_exact(32)
-        .map(|c| c.try_into().expect("32-byte chunk"))
-        .collect();
-    let tree = MerkleTree::<B>::from_precomputed_nodes(nodes)?;
+    // Root-only host tree: the device tree (`handle.tree`) holds the nodes and
+    // serves openings; only the commitment root lives on host.
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
     Some((tree, handle, lde_out))
 }
 
@@ -744,7 +747,7 @@ where
 /// recomputes on CPU.
 pub(crate) fn try_build_comp_poly_tree_gpu<E, B>(
     lde_parts: &[Vec<FieldElement<E>>],
-) -> Option<MerkleTree<B>>
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
 where
     E: IsField + 'static,
     B: IsMerkleTreeBackend<Node = [u8; 32]>,
@@ -777,29 +780,17 @@ where
         })
         .collect();
 
-    let nodes_bytes = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3(&raw_parts) {
-        Ok(v) => v,
+    // Keep the composition tree resident on device, so the whole tree copy to
+    // host is eliminated. R4 composition openings gather paths from the device
+    // tree (`gather_proofs_dev`); the returned host tree is root only.
+    let dev_tree = match math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&raw_parts) {
+        Ok(t) => t,
         Err(_) => return None,
     };
-
-    // lde_size is an even power of two >= 2, so 2*num_leaves == lde_size and
-    // tight_total_nodes = lde_size - 1 >= 1. No overflow or underflow possible.
-    let tight_total_nodes = lde_size - 1;
-    let expected_byte_len = tight_total_nodes
-        .checked_mul(32)
-        .expect("comp-poly node byte length overflow");
-    debug_assert_eq!(nodes_bytes.len(), expected_byte_len);
-
-    let nodes: Vec<[u8; 32]> = nodes_bytes
-        .chunks_exact(32)
-        .map(|c| {
-            c.try_into()
-                .expect("chunks_exact(32) yields exactly 32 bytes")
-        })
-        .collect();
+    debug_assert_eq!(dev_tree.leaves_len, lde_size / 2);
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
-    // Falls back to CPU on `None`, matching the R1 paths (lines 496, 557).
-    MerkleTree::<B>::from_precomputed_nodes(nodes)
+    let host = MerkleTree::<B>::from_root(dev_tree.root);
+    Some((host, dev_tree))
 }
 
 /// R3 GPU dispatch: batched strided barycentric OOD evaluation over the main
@@ -1424,16 +1415,65 @@ pub(crate) fn try_inv_denoms_dev_with_stream<F, E>(
     coset_base: &[FieldElement<F>],
     z_scalars: &[FieldElement<E>],
     sign: math_cuda::inverse::DenomSign,
+    bound_stream: Option<Arc<CudaStream>>,
 ) -> Option<(CudaSlice<u64>, Arc<CudaStream>)>
 where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    let be = math_cuda::device::backend().ok()?;
-    let stream = be.next_stream();
+    // Use the caller's per-table session stream when provided, so this table's
+    // R3/R4 device chain serialises on one queue; otherwise grab a pool stream.
+    let stream = match bound_stream {
+        Some(s) => s,
+        None => math_cuda::device::backend().ok()?.next_stream(),
+    };
     let handle =
         try_compute_and_invert_inv_denoms_dev::<F, E>(coset_base, z_scalars, sign, &stream)?;
     Some((handle, stream))
+}
+
+/// Gather Merkle authentication paths on device for `positions` (leaf indices),
+/// returning one [`Proof`] per position in the same order. Byte-identical to
+/// the host `MerkleTree::get_proof_by_pos` (guarded by the `merkle_gather`
+/// parity test), so R4 query openings can source proofs from the resident
+/// device tree instead of the host tree. Returns `None` on any cudarc error
+/// (the caller then falls back to the host tree).
+pub(crate) fn gather_proofs_dev(
+    tree: &math_cuda::lde::GpuMerkleTree,
+    positions: &[usize],
+    stream: &Arc<CudaStream>,
+) -> Option<Vec<Proof<Commitment>>> {
+    if positions.is_empty() {
+        return Some(Vec::new());
+    }
+    // Positions index an LDE that `assert_u32_domain` keeps within u32; guard the
+    // cast so any future relaxation fails loudly instead of wrapping silently.
+    debug_assert!(
+        positions.iter().all(|&p| p <= u32::MAX as usize),
+        "gather_proofs_dev: position exceeds u32 range"
+    );
+    let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
+    let bytes = math_cuda::merkle::gather_merkle_paths_dev(
+        &tree.nodes,
+        tree.leaves_len,
+        &positions_u32,
+        stream,
+    )
+    .ok()?;
+    let depth = tree.leaves_len.trailing_zeros() as usize;
+    debug_assert_eq!(bytes.len(), positions.len() * depth * 32);
+    let mut proofs = Vec::with_capacity(positions.len());
+    for q in 0..positions.len() {
+        let mut merkle_path = Vec::with_capacity(depth);
+        for level in 0..depth {
+            let off = (q * depth + level) * 32;
+            let mut node: Commitment = [0u8; 32];
+            node.copy_from_slice(&bytes[off..off + 32]);
+            merkle_path.push(node);
+        }
+        proofs.push(Proof { merkle_path });
+    }
+    Some(proofs)
 }
 
 /// R3 OOD device-side context: bundles the inverted denominators, the
@@ -1459,6 +1499,7 @@ pub(crate) struct R3DevContext {
 pub(crate) fn try_prep_r3_dev_context<F, E>(
     coset_base: &[FieldElement<F>],
     z_scalars: &[FieldElement<E>],
+    bound_stream: Option<Arc<CudaStream>>,
 ) -> Option<R3DevContext>
 where
     F: IsField + 'static,
@@ -1480,8 +1521,12 @@ where
         return None;
     }
 
-    let be = math_cuda::device::backend().ok()?;
-    let stream = be.next_stream();
+    // Per-table session stream when provided (shares the queue with R4 DEEP for
+    // this table); otherwise a pool stream.
+    let stream = match bound_stream {
+        Some(s) => s,
+        None => math_cuda::device::backend().ok()?.next_stream(),
+    };
 
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
@@ -1606,7 +1651,7 @@ where
         let zeta_ptr = &zeta as *const FieldElement<E> as *const u64;
         let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-        let (root, layer_evals_u64, nodes_bytes) = match state.fold_and_commit_layer(zeta_raw) {
+        let (layer_evals_u64, dev_tree) = match state.fold_and_commit_layer(zeta_raw) {
             Ok(v) => v,
             Err(_) => {
                 *transcript = transcript_snapshot.clone();
@@ -1614,23 +1659,18 @@ where
             }
         };
 
-        // Build the FriLayer: ext3 evals + Merkle tree from precomputed nodes.
+        // Build the FriLayer: ext3 evals and a root only host tree. The layer
+        // tree stays resident on device in `gpu_tree`; query openings gather
+        // paths from it via `gather_proofs_dev`.
         let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
-
-        debug_assert!(nodes_bytes.len().is_multiple_of(32));
-        let nodes: Vec<[u8; 32]> = nodes_bytes
-            .chunks_exact(32)
-            .map(|c| c.try_into().expect("chunks_exact(32) yields 32 bytes"))
-            .collect();
-        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_precomputed_nodes(nodes)
-            .expect("FRI commit: precomputed nodes form a valid tree");
-
-        fri_layer_list.push(FriLayer::new(&evaluation, merkle_tree));
+        let root = dev_tree.root;
+        let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
+        let mut layer = FriLayer::new(&evaluation, merkle_tree);
+        layer.gpu_tree = Some(dev_tree);
+        fri_layer_list.push(layer);
 
         // >>>> Send commitment: [p_k]
-        let mut root_arr = [0u8; 32];
-        root_arr.copy_from_slice(&root);
-        transcript.append_bytes(&root_arr);
+        transcript.append_bytes(&root);
     }
 
     // Final (uncommitted) fold to the terminal codeword. n_out == terminal_len
@@ -1666,4 +1706,80 @@ where
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
     Some((final_poly_coeffs, fri_layer_list))
+}
+
+/// GPU FRI query phase: gather each layer's paths on device instead of walking
+/// host trees. For layer `l` and query `iota` the opened position is
+/// `(iota >> l) >> 1`, matching [`crate::fri::query_phase`]. Paths for all
+/// queries are gathered in one batched call per layer. The layer evaluations
+/// (`evaluation[index ^ 1]`) are read from the host Vecs as before.
+///
+/// Returns None when there are no layers or the layers are host trees (CPU
+/// commit), so the caller falls back to the host walk.
+pub(crate) fn try_fri_query_phase_gpu<E>(
+    fri_layers: &[FriLayer<E, FriLayerMerkleTreeBackend<E>>],
+    iotas: &[usize],
+) -> Option<Vec<FriDecommitment<E>>>
+where
+    E: IsField,
+    FieldElement<E>: AsBytes + Sync + Send,
+{
+    if fri_layers.is_empty() {
+        return None;
+    }
+    // The GPU FRI commit sets `gpu_tree` on every layer as a group; the CPU
+    // commit sets none. Host trees fall back to the host walk. When the layers
+    // are device resident the host trees are root only, so the gather below must
+    // succeed (a failure is a hard abort, not a silent walk). The residency is
+    // all or nothing; assert it so a future partial-build can never route a
+    // root-only layer through the host walk and ship empty proofs.
+    let first_resident = fri_layers[0].gpu_tree.is_some();
+    debug_assert!(
+        fri_layers
+            .iter()
+            .all(|l| l.gpu_tree.is_some() == first_resident),
+        "FRI layer residency must be all or nothing"
+    );
+    if !first_resident {
+        return None;
+    }
+    let stream = math_cuda::device::backend()
+        .expect("cuda backend for device-resident FRI query")
+        .next_stream();
+    let num_layers = fri_layers.len();
+
+    // Batched gather: one call per layer over all queries.
+    let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(num_layers);
+    for (l, layer) in fri_layers.iter().enumerate() {
+        let tree = layer
+            .gpu_tree
+            .as_ref()
+            .expect("FRI layers are device-resident as a group");
+        let positions: Vec<usize> = iotas.iter().map(|&iota| (iota >> l) >> 1).collect();
+        per_layer_proofs.push(
+            gather_proofs_dev(tree, &positions, &stream)
+                .expect("device FRI-layer gather failed; resident tree has no host fallback"),
+        );
+    }
+
+    // Reassemble per-query decommitments, matching the host walk's order.
+    let decommits = iotas
+        .iter()
+        .enumerate()
+        .map(|(q, &iota)| {
+            let mut layers_evaluations_sym = Vec::with_capacity(num_layers);
+            let mut layers_auth_paths = Vec::with_capacity(num_layers);
+            let mut index = iota;
+            for (l, layer) in fri_layers.iter().enumerate() {
+                layers_evaluations_sym.push(layer.evaluation[index ^ 1].clone());
+                layers_auth_paths.push(per_layer_proofs[l][q].clone());
+                index >>= 1;
+            }
+            FriDecommitment {
+                layers_auth_paths,
+                layers_evaluations_sym,
+            }
+        })
+        .collect();
+    Some(decommits)
 }

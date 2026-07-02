@@ -781,11 +781,17 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_total");
+    #[cfg(feature = "instruments")]
     let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
@@ -795,6 +801,8 @@ pub fn prove_with_options_and_inputs(
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_execute = stark::instruments::heap_bytes();
@@ -802,6 +810,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("trace_build");
 
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
@@ -824,6 +834,8 @@ pub fn prove_with_options_and_inputs(
     drop(result);
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_trace = stark::instruments::heap_bytes();
@@ -831,6 +843,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -846,6 +860,8 @@ pub fn prove_with_options_and_inputs(
         None,
     );
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
@@ -874,6 +890,8 @@ pub fn prove_with_options_and_inputs(
     );
 
     // Phase 4: Prove (multi_prove)
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("proving");
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
@@ -881,6 +899,8 @@ pub fn prove_with_options_and_inputs(
         storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     #[cfg(feature = "instruments")]
     {
@@ -896,6 +916,14 @@ pub fn prove_with_options_and_inputs(
                 after_air: heap_after_air,
             },
         );
+        // Accurate wall-clock span tree (the trustworthy per-step breakdown).
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
     }
 
     Ok(VmProof {
