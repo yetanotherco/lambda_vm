@@ -1845,20 +1845,22 @@ where
     result
 }
 
-/// Capture a [`Packing`]'s fingerprint contribution as a sum of extension
-/// terms, mirroring [`Packing::accumulate_fingerprint_with`]. Terms are pushed
-/// to `acc` (`col_expr * alpha_power`, base operand LEFT); returns the number
-/// of alpha powers consumed (`= packing.num_bus_elements()`). Field addition is
-/// associative and commutative, so this row-agnostic accumulation is
-/// value-identical to the runtime body regardless of grouping.
+/// Fold a [`Packing`]'s fingerprint contribution into the running fingerprint
+/// `fp`, mirroring [`Packing::accumulate_fingerprint_with`]. Each bus element
+/// subtracts one `col_expr * alpha_power` term (base operand LEFT) from `fp` —
+/// see [`emit_fingerprint`] for why terms are subtracted rather than summed.
+/// Returns the updated fingerprint and the number of alpha powers consumed
+/// (`= packing.num_bus_elements()`). Field addition is associative and
+/// commutative, so this row-agnostic accumulation is value-identical to the
+/// runtime body regardless of grouping.
 fn emit_packing_fingerprint<F, E, B>(
     b: &B,
     packing: Packing,
     start_col: usize,
     offset: usize,
     alpha_offset: usize,
-    acc: &mut Vec<B::ExprE>,
-) -> usize
+    mut fp: B::ExprE,
+) -> (B::ExprE, usize)
 where
     F: IsField,
     E: IsField,
@@ -1871,87 +1873,77 @@ where
     let shift_24 = || b.const_base(SHIFT_8 * SHIFT_16);
 
     match packing {
-        Packing::Direct => {
-            acc.push(col(start_col) * alpha(0));
-            1
-        }
+        Packing::Direct => (fp - col(start_col) * alpha(0), 1),
         Packing::Word2L => {
             let combined = col(start_col) + col(start_col + 1) * shift_16();
-            acc.push(combined * alpha(0));
-            1
+            (fp - combined * alpha(0), 1)
         }
         Packing::Word4L => {
             let combined = col(start_col)
                 + col(start_col + 1) * shift_8()
                 + col(start_col + 2) * shift_16()
                 + col(start_col + 3) * shift_24();
-            acc.push(combined * alpha(0));
-            1
+            (fp - combined * alpha(0), 1)
         }
         Packing::DWordWL => {
-            acc.push(col(start_col) * alpha(0));
-            acc.push(col(start_col + 1) * alpha(1));
-            2
+            fp = fp - col(start_col) * alpha(0);
+            (fp - col(start_col + 1) * alpha(1), 2)
         }
         Packing::DWordHHW => {
-            acc.push(col(start_col) * alpha(0));
+            fp = fp - col(start_col) * alpha(0);
             let w = col(start_col + 1) + col(start_col + 2) * shift_16();
-            acc.push(w * alpha(1));
-            2
+            (fp - w * alpha(1), 2)
         }
         Packing::DWordWHH => {
             let w = col(start_col) + col(start_col + 1) * shift_16();
-            acc.push(w * alpha(0));
-            acc.push(col(start_col + 2) * alpha(1));
-            2
+            fp = fp - w * alpha(0);
+            (fp - col(start_col + 2) * alpha(1), 2)
         }
         Packing::DWordHL => {
             let w0 = col(start_col) + col(start_col + 1) * shift_16();
-            acc.push(w0 * alpha(0));
+            fp = fp - w0 * alpha(0);
             let w1 = col(start_col + 2) + col(start_col + 3) * shift_16();
-            acc.push(w1 * alpha(1));
-            2
+            (fp - w1 * alpha(1), 2)
         }
         Packing::DWordBL => {
             let w0 = col(start_col)
                 + col(start_col + 1) * shift_8()
                 + col(start_col + 2) * shift_16()
                 + col(start_col + 3) * shift_24();
-            acc.push(w0 * alpha(0));
+            fp = fp - w0 * alpha(0);
             let w1 = col(start_col + 4)
                 + col(start_col + 5) * shift_8()
                 + col(start_col + 6) * shift_16()
                 + col(start_col + 7) * shift_24();
-            acc.push(w1 * alpha(1));
-            2
+            (fp - w1 * alpha(1), 2)
         }
         Packing::QuadHL => {
             for i in 0..4 {
                 let c = start_col + i * 2;
                 let w = col(c) + col(c + 1) * shift_16();
-                acc.push(w * alpha(i));
+                fp = fp - w * alpha(i);
             }
-            4
+            (fp, 4)
         }
         Packing::QuadWL => {
             for i in 0..4 {
-                acc.push(col(start_col + i) * alpha(i));
+                fp = fp - col(start_col + i) * alpha(i);
             }
-            4
+            (fp, 4)
         }
     }
 }
 
-/// Capture a [`BusValue`]'s fingerprint contribution into `acc`, mirroring
-/// [`BusValue::accumulate_fingerprint_from_step`]. Returns the number of alpha
-/// powers consumed.
+/// Fold a [`BusValue`]'s fingerprint contribution into the running fingerprint
+/// `fp`, mirroring [`BusValue::accumulate_fingerprint_from_step`]. Returns the
+/// updated fingerprint and the number of alpha powers consumed.
 fn emit_busvalue_fingerprint<F, E, B>(
     b: &B,
     bv: &BusValue,
     offset: usize,
     alpha_offset: usize,
-    acc: &mut Vec<B::ExprE>,
-) -> usize
+    fp: B::ExprE,
+) -> (B::ExprE, usize)
 where
     F: IsField,
     E: IsField,
@@ -1967,13 +1959,12 @@ where
             *start_column,
             offset,
             alpha_offset,
-            acc,
+            fp,
         ),
         BusValue::Linear(terms) => {
             // Value-preserving: always emit the multiply (see the module note).
             let result = emit_linear_terms(b, terms, offset);
-            acc.push(result * b.alpha_pow(alpha_offset));
-            1
+            (fp - result * b.alpha_pow(alpha_offset), 1)
         }
     }
 }
@@ -1982,6 +1973,14 @@ where
 /// `z - (bus_id + α·v[0] + α²·v[1] + ...)`.
 ///
 /// `α⁰ = 1`: the bus-id term needs no multiply and is added as a base constant.
+///
+/// The subtraction is distributed: the fingerprint starts at `z − bus_id` and
+/// each α·value term is subtracted as it is emitted. Field addition is
+/// associative and commutative, so this is value-identical to
+/// `z − (bus + Σ terms)` — and it keeps the running value in ONE extension
+/// accumulator. The prover folder runs this body once per LDE row, where
+/// collecting the terms in a `Vec` costs a heap allocation per fingerprint
+/// per row.
 fn emit_fingerprint<F, E, B>(b: &B, interaction: &BusInteraction, offset: usize) -> B::ExprE
 where
     F: IsField,
@@ -1990,29 +1989,16 @@ where
 {
     let z = b.challenge(0);
     let bus = b.const_base(interaction.bus_id);
-    // Collect the α·value terms, then fold. Field addition is associative and
-    // commutative, so the grouping does not change the value.
-    let mut terms: Vec<B::ExprE> = Vec::new();
+    // `bus` is base and `z` ext; the tower only implements base − ext (base
+    // operand LEFT), so z − bus is written −(bus − z).
+    let mut fp = -(bus - z);
     let mut alpha_idx = 1;
     for bv in &interaction.values {
-        alpha_idx += emit_busvalue_fingerprint::<F, E, B>(b, bv, offset, alpha_idx, &mut terms);
+        let (next, consumed) = emit_busvalue_fingerprint::<F, E, B>(b, bv, offset, alpha_idx, fp);
+        fp = next;
+        alpha_idx += consumed;
     }
-    // lc = bus_id + Σ terms  (base + ext = ext, base operand LEFT).
-    let mut iter = terms.into_iter();
-    let lc = match iter.next() {
-        Some(first) => {
-            let mut lc = bus + first;
-            for t in iter {
-                lc = lc + t;
-            }
-            lc
-        }
-        // No values: fingerprint is z - bus_id. `bus` is base, `z` is ext, and
-        // the tower only implements base − ext (base operand LEFT), so write
-        // z − bus as −(bus − z).
-        None => return -(bus - z),
-    };
-    z - lc
+    fp
 }
 
 /// Emit the batched-term constraint for committed pair `pair_idx`:
