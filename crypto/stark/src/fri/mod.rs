@@ -76,7 +76,18 @@ where
     // terminal_len = 2^(blowup_log + k), clamped to initial_len for tiny inputs.
     let initial_len = evals.len();
     let k = final_poly_log_degree as usize;
-    let terminal_len = ((1usize << blowup_log) << k).min(initial_len);
+    // Compute `min(2^(blowup_log + k), initial_len)` without materializing the
+    // shift: an out-of-range `k` (prover self-misconfiguration) would make
+    // `2^(blowup_log + k)` overflow to 0, and the `initial_len / terminal_len`
+    // below would then divide by zero. Clamping to `initial_len` first degrades
+    // gracefully to no early termination, mirroring the verifier's own
+    // `expected_k = min(k, root_order)` clamp.
+    let terminal_shift = blowup_log as usize + k;
+    let terminal_len = if terminal_shift >= initial_len.trailing_zeros() as usize {
+        initial_len
+    } else {
+        1usize << terminal_shift
+    };
     let total_folds = (initial_len / terminal_len).trailing_zeros() as usize;
     let num_committed = total_folds.saturating_sub(1);
 

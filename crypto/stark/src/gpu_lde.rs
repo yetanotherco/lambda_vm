@@ -1631,8 +1631,15 @@ where
 
     // Early-termination schedule (mirrors commit_phase_from_evaluations):
     // terminal_len = 2^(blowup_log + final_poly_log_degree), clamped to n0.
+    // Clamp without materializing the shift so an out-of-range `k` cannot
+    // overflow `terminal_len` to 0 (see `commit_phase_from_evaluations`).
     let k = final_poly_log_degree as usize;
-    let terminal_len = ((1usize << blowup_log) << k).min(n0);
+    let terminal_shift = blowup_log as usize + k;
+    let terminal_len = if terminal_shift >= n0.trailing_zeros() as usize {
+        n0
+    } else {
+        1usize << terminal_shift
+    };
     let total_folds = (n0 / terminal_len).trailing_zeros() as usize;
     // The GPU path only runs above gpu_lde_threshold(); tiny clamped traces
     // (total_folds == 0) are handled by the CPU fallback.

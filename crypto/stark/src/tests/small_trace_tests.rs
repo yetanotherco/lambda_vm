@@ -204,6 +204,43 @@ fn test_prove_verify_k0() {
     );
 }
 
+/// Prove + verify with an oversized `fri_final_poly_log_degree`. A `k` this large
+/// used to overflow `2^(blowup_log + k)` to 0 in the prover, dividing by zero.
+/// It must instead clamp to no early termination (terminal_len == initial_len,
+/// total_folds == 0) and still verify, mirroring the verifier's `min(k, root_order)`.
+#[test_log::test]
+fn test_prove_verify_oversized_k_clamps() {
+    let mut trace = simple_addition_trace::<GoldilocksField>(1024);
+    let mut proof_options = ProofOptions::default_test_options();
+    proof_options.fri_final_poly_log_degree = 63;
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("prover must clamp an oversized k instead of overflowing");
+
+    assert!(
+        proof.fri_layers_merkle_roots.is_empty(),
+        "an oversized k must clamp to no early termination (no committed layers)"
+    );
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "clamped oversized-k proof must verify"
+    );
+}
+
 /// Prove + verify with `blowup_factor = 4` (blowup_log = 2). This is the only
 /// test exercising a blowup > 2, so the terminal-codeword decimation
 /// (`step_by(blowup)`) and the coset FFT run with a non-trivial blowup factor.
