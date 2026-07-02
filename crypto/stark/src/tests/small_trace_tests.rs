@@ -166,6 +166,76 @@ fn test_prove_verify_single_fold() {
     );
 }
 
+/// Prove + verify with k=0: FRI folds all the way down to a single-coefficient
+/// terminal polynomial (the closest analog to the old fold-to-constant behavior).
+/// With a 1024-row trace: expected_k=0, total_folds=10, fri_final_poly_coeffs.len()=1,
+/// fri_layers_merkle_roots.len()=9. Exercises the maximal-fold path.
+#[test_log::test]
+fn test_prove_verify_k0() {
+    let mut trace = simple_addition_trace::<GoldilocksField>(1024);
+    let mut proof_options = ProofOptions::default_test_options();
+    proof_options.fri_final_poly_log_degree = 0;
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("prover must succeed with k=0");
+
+    assert_eq!(
+        proof.fri_final_poly_coeffs.len(),
+        1,
+        "k=0 must emit a single terminal coefficient"
+    );
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "k=0 proof must verify"
+    );
+}
+
+/// Prove + verify with `blowup_factor = 4` (blowup_log = 2). This is the only
+/// test exercising a blowup > 2, so the terminal-codeword decimation
+/// (`step_by(blowup)`) and the coset FFT run with a non-trivial blowup factor.
+#[test_log::test]
+fn test_prove_verify_blowup4() {
+    let mut trace = simple_addition_trace::<GoldilocksField>(1024);
+    let mut proof_options = ProofOptions::default_test_options();
+    proof_options.blowup_factor = 4;
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("prover must succeed with blowup_factor=4");
+
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "blowup_factor=4 proof must verify"
+    );
+}
+
 /// Test that verification fails when using wrong public inputs.
 /// This ensures the boundary constraints are actually enforced.
 #[test_log::test]
@@ -460,6 +530,99 @@ fn padded_fri_decommitment_is_rejected() {
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
         "Verifier must reject a proof whose per-query FRI decommitment layers are padded"
+    );
+}
+
+/// Soundness (single-fold regime, total_folds=1 ⇒ num_committed=0): the honest
+/// decommitment carries zero layers. Padding it must be rejected by the per-query
+/// decommitment length check, which runs for every regime — not only multi-fold.
+#[test_log::test]
+fn padded_decommitment_rejected_single_fold() {
+    let mut trace = simple_addition_trace::<GoldilocksField>(256);
+    let proof_options = ProofOptions::default_test_options();
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+    let mut proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("prover must succeed (single-fold)");
+
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "precondition: single-fold proof must verify"
+    );
+    assert!(
+        proof.query_list[0].layers_evaluations_sym.is_empty(),
+        "precondition: single-fold has zero committed layers"
+    );
+
+    for decommitment in proof.query_list.iter_mut() {
+        decommitment.layers_evaluations_sym.push(Felt::zero());
+    }
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject a padded decommitment in the single-fold regime"
+    );
+}
+
+/// Soundness (no-fold/clamp regime, total_folds=0 ⇒ num_committed=0): same as
+/// above but on the clamped tiny-trace path, which also has zero committed layers.
+#[test_log::test]
+fn padded_decommitment_rejected_no_fold() {
+    let mut trace = simple_addition_trace::<GoldilocksField>(8);
+    let proof_options = ProofOptions::default_test_options();
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: Felt::from(1u64),
+        b: Felt::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+    let mut proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .expect("prover must succeed (clamp/no-fold)");
+
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "precondition: clamped proof must verify"
+    );
+    assert!(
+        proof.query_list[0].layers_evaluations_sym.is_empty(),
+        "precondition: no-fold has zero committed layers"
+    );
+
+    for decommitment in proof.query_list.iter_mut() {
+        decommitment.layers_evaluations_sym.push(Felt::zero());
+    }
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject a padded decommitment in the no-fold regime"
     );
 }
 
