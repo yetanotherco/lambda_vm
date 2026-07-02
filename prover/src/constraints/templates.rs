@@ -509,3 +509,156 @@ pub fn new_is_bit_constraints(
 
     (constraints, constraint_idx_start + value_cols.len())
 }
+
+// =========================================================================
+// Single-body emit functions (ConstraintBuilder front-end)
+// =========================================================================
+//
+// Non-destructive twins of the boxed constraint structs above, written once
+// against the generic `ConstraintBuilder` so one body serves the compiled
+// prover folder, the verifier folder and IR capture. The structs stay for
+// now (they are the differential oracle for the emit functions); the table
+// conversion deletes them.
+//
+// Each `emit_*` takes the constraint index it emits at; the matching
+// `*_meta` returns the idx-ordered metadata (declared degree; default
+// zerofier shape — none of these templates override period/offset/
+// exemptions).
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta};
+
+/// IS_BIT: `x·(1−x)`, optionally gated by a condition column:
+/// `cond·x·(1−x)`. Twin of [`IsBitConstraint`].
+pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    value_col: usize,
+    cond_col: Option<usize>,
+) {
+    let x = b.main(0, value_col);
+    let one = b.one();
+    let root = match cond_col {
+        Some(c) => {
+            let cond = b.main(0, c);
+            cond * x.clone() * (one - x)
+        }
+        None => x.clone() * (one - x),
+    };
+    b.emit_base(idx, root);
+}
+
+/// Metadata for [`emit_is_bit`]: degree 3 gated, 2 ungated.
+pub fn is_bit_meta(idx: usize, conditional: bool) -> ConstraintMeta {
+    ConstraintMeta::base(idx, if conditional { 3 } else { 2 })
+}
+
+/// One [`AddLinearTerm`]: `column · coefficient` or a constant
+/// (matches `AddLinearTerm::eval`'s operand order).
+fn add_term_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    t: &AddLinearTerm,
+) -> B::Expr {
+    match t {
+        AddLinearTerm::Column {
+            coefficient,
+            column,
+        } => b.main(0, *column) * b.const_signed(*coefficient),
+        AddLinearTerm::Constant(v) => b.const_signed(*v),
+    }
+}
+
+/// Sum of terms, from zero (matches `eval_terms`).
+fn add_terms_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    terms: &[AddLinearTerm],
+) -> B::Expr {
+    let mut acc = b.zero();
+    for t in terms {
+        acc = acc + add_term_expr(b, t);
+    }
+    acc
+}
+
+/// An operand's low word (matches `AddOperand::eval_lo`).
+fn add_operand_lo<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    op: &AddOperand,
+) -> B::Expr {
+    match op {
+        AddOperand::DWordWL { start_column } => b.main(0, *start_column),
+        AddOperand::Linear { lo, .. } => add_terms_expr(b, lo),
+    }
+}
+
+/// An operand's high word (matches `AddOperand::eval_hi`).
+fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    op: &AddOperand,
+) -> B::Expr {
+    match op {
+        AddOperand::DWordWL { start_column } => b.main(0, *start_column + 1),
+        AddOperand::Linear { hi, .. } => add_terms_expr(b, hi),
+    }
+}
+
+/// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`
+/// (twin of [`AddConstraint::new_pair`]):
+///
+/// ```text
+/// carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²
+/// carry_1 = (lhs.hi + rhs.hi + carry_0 − sum.hi)·2⁻³²
+/// emit:     [cond·] carry_i·(1 − carry_i)      at idx, idx+1
+/// ```
+///
+/// `cond` is the sum of the `cond_cols` flags (empty = unconditional).
+pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    cond_cols: &[usize],
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) {
+    let inv_2_32 = b.const_base(INV_SHIFT_32);
+    let carry_0 = (add_operand_lo(b, lhs) + add_operand_lo(b, rhs) - add_operand_lo(b, sum))
+        * inv_2_32.clone();
+    let carry_1 = (add_operand_hi(b, lhs) + add_operand_hi(b, rhs) + carry_0.clone()
+        - add_operand_hi(b, sum))
+        * inv_2_32;
+
+    let cond = |b: &B| -> Option<B::Expr> {
+        if cond_cols.is_empty() {
+            None
+        } else {
+            let mut acc = b.zero();
+            for &c in cond_cols {
+                acc = acc + b.main(0, c);
+            }
+            Some(acc)
+        }
+    };
+    let bit = |b: &B, cond: Option<B::Expr>, carry: B::Expr| -> B::Expr {
+        let one = b.one();
+        match cond {
+            Some(c) => c * carry.clone() * (one - carry),
+            None => carry.clone() * (one - carry),
+        }
+    };
+
+    let c0 = cond(b);
+    let root_0 = bit(b, c0, carry_0);
+    b.emit_base(idx, root_0);
+    let c1 = cond(b);
+    let root_1 = bit(b, c1, carry_1);
+    b.emit_base(idx + 1, root_1);
+}
+
+/// Metadata for [`emit_add_pair`]: two constraints at `idx`, `idx + 1`;
+/// degree 3 gated, 2 ungated.
+pub fn add_pair_meta(idx: usize, conditional: bool) -> [ConstraintMeta; 2] {
+    let degree = if conditional { 3 } else { 2 };
+    [
+        ConstraintMeta::base(idx, degree),
+        ConstraintMeta::base(idx + 1, degree),
+    ]
+}
