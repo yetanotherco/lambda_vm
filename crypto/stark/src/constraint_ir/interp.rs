@@ -175,7 +175,7 @@ pub fn eval_program<F, E>(
     E: IsField,
 {
     let TransitionEvaluationContext::Prover {
-        frame,
+        rows,
         rap_challenges,
         logup_alpha_powers,
         logup_table_offset,
@@ -188,12 +188,11 @@ pub fn eval_program<F, E>(
     let values = run(
         prog,
         |main, offset, row, col| {
-            let step: &TableView<F, E> = frame.get_evaluation_step(offset as usize);
             debug_assert_eq!(row, 0, "tables read row 0 of each frame step");
             if main {
-                Value::Base(step.get_main_evaluation_element(0, col as usize).clone())
+                Value::Base(rows.main(offset as usize, col as usize).clone())
             } else {
-                Value::Ext(step.get_aux_evaluation_element(0, col as usize).clone())
+                Value::Ext(rows.aux(offset as usize, col as usize).clone())
             }
         },
         |idx| rap_challenges[idx as usize].clone(),

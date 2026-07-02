@@ -100,8 +100,13 @@ where
 
         // --- ProverEvalFolder (base) ---
         let frame = Frame::<Gl, Gl3>::new(vec![TableView::new(vec![row.clone()], vec![vec![]])]);
-        let ctx =
-            TransitionEvaluationContext::new_prover(&frame, &no_ch, &no_ch, &offset_e, &shifts);
+        let ctx = TransitionEvaluationContext::new_prover(
+            frame.as_row_frame(),
+            &no_ch,
+            &no_ch,
+            &offset_e,
+            &shifts,
+        );
         let mut base_out = vec![FE::zero(); n];
         let mut ext_out = vec![Fp3::zero(); n];
         let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);

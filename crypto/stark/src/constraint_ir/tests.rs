@@ -200,7 +200,13 @@ fn frame_offset_reads_next_step() {
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals: Vec<ExtE> = vec![];
@@ -234,7 +240,13 @@ fn mixed_base_ext_auto_embeds() {
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -267,7 +279,13 @@ fn explicit_embed_and_ext_neg() {
     let alpha: Vec<ExtE> = vec![];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -317,7 +335,13 @@ fn all_leaf_kinds_logup_shaped() {
     let step = TableView::<Fp, Ext>::new(vec![main_row], vec![aux_row]);
     let frame = Frame::<Fp, Ext>::new(vec![step]);
     let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
 
     let mut base_evals: Vec<FpE> = vec![];
     let mut ext_evals = vec![ExtE::zero()];
@@ -354,7 +378,13 @@ fn prover_entry_point_splits_base_and_ext() {
     let alpha = vec![ext3(3, 3, 3)];
     let offset = ExtE::zero();
     let shifts = PackingShifts::<Fp>::new();
-    let ctx = TransitionEvaluationContext::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
 
     let mut base_evals = vec![FpE::zero()];
     let mut ext_evals = vec![ExtE::zero(), ExtE::zero()];
@@ -485,8 +515,13 @@ fn non_goldilocks_reflexive_tower_builds_and_interprets() {
     let alpha: Vec<GE> = vec![];
     let offset = g(0);
     let shifts = PackingShifts::<G>::new();
-    let ctx =
-        TransitionEvaluationContext::<G, G>::new_prover(&frame, &rap, &alpha, &offset, &shifts);
+    let ctx = TransitionEvaluationContext::<G, G>::new_prover(
+        frame.as_row_frame(),
+        &rap,
+        &alpha,
+        &offset,
+        &shifts,
+    );
     let mut base_evals = vec![GE::zero()];
     let mut ext_evals = vec![GE::zero(), GE::zero()];
     eval_program(&prog, &ctx, &mut base_evals, &mut ext_evals);
