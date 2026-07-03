@@ -214,7 +214,8 @@ pub fn private_input_page_bases(num_private_input_pages: usize) -> impl Iterator
 /// verifiers bound the deserialized, untrusted count with this before sizing AIRs.
 pub fn max_private_input_pages() -> usize {
     use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
-    (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES).div_ceil(DEFAULT_PAGE_SIZE)
+    (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES)
+        .div_ceil(DEFAULT_PAGE_SIZE)
 }
 
 // =========================================================================
