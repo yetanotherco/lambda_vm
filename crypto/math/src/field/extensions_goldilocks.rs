@@ -557,9 +557,9 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
 
     #[inline(always)]
     fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
-        self.value()[0].stream_bytes(sink);
-        self.value()[1].stream_bytes(sink);
-        self.value()[2].stream_bytes(sink);
+        let mut buf = [0u8; 24];
+        crate::traits::ByteConversion::write_bytes_be(self, &mut buf);
+        sink(&buf);
     }
 }
 
