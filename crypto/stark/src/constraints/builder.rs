@@ -129,10 +129,12 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     /// Extension-field (LogUp) counterpart of [`Self::emit_base_rows`].
     fn emit_ext_rows(&mut self, constraint_idx: usize, rows: RowDomain, e: Self::ExprE);
     /// Record a base-field constraint that applies to every row (common case).
+    #[inline]
     fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr) {
         self.emit_base_rows(constraint_idx, RowDomain::ALL, e);
     }
     /// Record an extension-field (LogUp) constraint that applies to every row.
+    #[inline]
     fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE) {
         self.emit_ext_rows(constraint_idx, RowDomain::ALL, e);
     }
@@ -607,10 +609,12 @@ where
         FieldElement::<F>::from(v)
     }
 
+    #[inline]
     fn emit_base_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<F>) {
         self.tracker.mark(constraint_idx);
         self.base_out[constraint_idx] = e;
     }
+    #[inline]
     fn emit_ext_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<E>) {
         debug_assert!(
             constraint_idx >= self.base_out.len(),
