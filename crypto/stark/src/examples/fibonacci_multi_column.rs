@@ -113,7 +113,7 @@ where
 
 /// Public inputs for the multi-column Fibonacci AIR.
 /// Contains the initial values (first two elements) for each column.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FibonacciMultiColumnPublicInputs<F: IsFFTField> {
     /// Initial values for each column: (a0, a1) pairs
     pub initial_values: Vec<(FieldElement<F>, FieldElement<F>)>,

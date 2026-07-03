@@ -38,8 +38,9 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         grinding_factor: 1,
     };
 
-/// Prove `inner_elf` under `opts` and postcard-encode `(proof, elf, opts, vkey)`
-/// into the guest's private-input blob. Returns the proof and the blob.
+/// Prove `inner_elf` under `opts` and rkyv-encode a `RecursionInput` into the
+/// guest's private-input blob (magic/version prefix + archive). Returns the
+/// proof and the blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
@@ -66,10 +67,15 @@ fn prove_inner_and_encode_blob(
     );
     let vkey =
         crate::VmVerifyingKey::from_elf_and_options(&elf_for_vkey, opts, None, &page_configs);
-    let blob = postcard::to_allocvec(&(&inner_proof, &inner_elf, opts, &vkey))
-        .expect("postcard encode failed");
-    eprintln!("[{tag}] postcard blob: {} bytes", blob.len());
-    (inner_proof, blob)
+    let input = crate::RecursionInput {
+        vm_proof: inner_proof,
+        inner_elf: inner_elf.to_vec(),
+        options: opts.clone(),
+        vkey,
+    };
+    let blob = crate::encode_recursion_input(&input).expect("encode recursion input");
+    eprintln!("[{tag}] rkyv blob: {} bytes", blob.len());
+    (input.vm_proof, blob)
 }
 
 /// Whether to also prove the guest's own execution after handing it the proof.
@@ -210,7 +216,7 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
 /// so `multi_verify`'s per-table `3,4,5,6` repetition re-attributes cycles to
 /// the correct step on each table's `6->3` transition instead of latching at 6.
 const STEP_LABELS: [&str; 7] = [
-    "0. setup (alloc init + postcard decode)",
+    "0. setup (alloc init + blob prefix check)",
     "1. airs_and_bus_balance (Elf::load/VmAirs::new preprocessed FFT+Merkle/bus balance)",
     "2. multi_verify setup (transcript replay phase A/B, per-table fork)",
     "3. step 1: replay_rounds_after_round_1",
@@ -509,50 +515,60 @@ fn run_recursion_pipeline(
     );
 }
 
-/// Decode the blob on the host and verify — a cheap guard on the encode/decode
-/// contract without running the VM.
+/// Verify the blob on the host exactly as the guest does (zero-copy through
+/// `verify_recursion_blob`) — a cheap guard on the encode/verify contract
+/// without running the VM. Also checks the guest's misaligned read conditions
+/// and that a tampered proof is rejected.
 #[test]
 #[ignore = "needs prebuilt guest ELF (make compile-recursion-elfs)"]
 fn test_recursion_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let (_inner, blob) =
+    let (inner_proof, blob) =
         prove_inner_and_encode_blob("roundtrip", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
-    // Decode exactly as the guest does.
-    let decoded: Result<
-        (
-            crate::VmProof,
-            Vec<u8>,
-            crate::ProofOptions,
-            crate::VmVerifyingKey,
-        ),
-        _,
-    > = postcard::from_bytes(&blob);
-    let (vm_proof, inner_elf, options, vkey) = match decoded {
-        Ok(t) => t,
-        Err(e) => panic!("[roundtrip] postcard DECODE failed (this is the guest panic): {e}"),
-    };
-    eprintln!(
-        "[roundtrip] decode ok: elf {} bytes, blowup {}",
-        inner_elf.len(),
-        options.blowup_factor
+    let verification = crate::verify_recursion_blob(&blob).expect("verify_recursion_blob errored");
+    assert!(verification.ok, "zero-copy path must accept a valid proof");
+    assert_eq!(
+        verification.public_output, inner_proof.public_output,
+        "public output must round-trip through the blob"
+    );
+    assert_eq!(
+        verification.vk_digest, inner_proof.vk_digest,
+        "vk digest must match the proof's"
     );
 
-    match crate::verify_with_options_with_vkey(
-        &vm_proof,
-        &inner_elf,
-        &options,
-        None,
-        None,
-        Some(&vkey),
-    ) {
-        Ok(true) => eprintln!("[roundtrip] verify ok=true — guest path is sound"),
-        Ok(false) => panic!(
-            "[roundtrip] verify returned FALSE (guest hits assert!(ok)) — proof did not survive the postcard round-trip"
-        ),
-        Err(e) => panic!("[roundtrip] verify ERRORED (guest hits .expect): {e:?}"),
-    }
+    // Host buffers carry no alignment guarantee, so `verify_recursion_blob`
+    // must accept the blob at any base alignment (falling back to an aligned
+    // copy when needed). The plain call above already exercises the common
+    // misaligned case (`Vec` base + 12-byte prefix → 4-aligned archive);
+    // shifting the base by 4 covers another residue class.
+    let mut padded: Vec<u8> = Vec::with_capacity(blob.len() + 4);
+    padded.extend_from_slice(&[0u8; 4]);
+    padded.extend_from_slice(&blob);
+    let ok_shifted = crate::verify_recursion_blob(&padded[4..])
+        .expect("verify_recursion_blob errored on shifted buffer")
+        .ok;
+    assert!(ok_shifted, "path must accept the proof from a shifted buffer");
+
+    // A bad magic must be rejected before the unsafe access.
+    let mut bad_magic = blob.clone();
+    bad_magic[0] ^= 0xFF;
+    assert!(
+        crate::verify_recursion_blob(&bad_magic).is_err(),
+        "bad magic must be rejected"
+    );
+
+    // Soundness: a single-byte tamper in the proof payload must make the
+    // zero-copy verifier reject (Fiat-Shamir / Merkle openings stop matching).
+    let mut tampered = blob.clone();
+    let tamper_idx = tampered.len() - 64;
+    tampered[tamper_idx] ^= 0x01;
+    let tampered_result = crate::verify_recursion_blob(&tampered);
+    assert!(
+        !matches!(tampered_result.map(|v| v.ok), Ok(true)),
+        "zero-copy verifier must NOT accept a tampered proof"
+    );
 }
 
 // === Execute-only tier ========================================================

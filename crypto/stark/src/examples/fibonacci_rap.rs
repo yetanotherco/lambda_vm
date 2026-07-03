@@ -164,7 +164,7 @@ where
     transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FibonacciRAPPublicInputs<F>
 where
     F: IsFFTField,

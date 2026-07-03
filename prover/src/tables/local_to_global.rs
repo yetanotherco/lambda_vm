@@ -83,7 +83,7 @@ pub const GENESIS_EPOCH: u64 = 0;
 pub const MAX_EPOCHS: u64 = 1 << 20;
 
 /// A cell's state when an epoch first touches it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct InitClaim {
     /// Value the cell held when this epoch first touched it.
     pub value: u64,
@@ -94,7 +94,7 @@ pub struct InitClaim {
 }
 
 /// A cell's state at the end of the epoch that touched it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct FiniClaim {
     /// Value the cell holds at this epoch's end.
     pub value: u64,
@@ -105,7 +105,7 @@ pub struct FiniClaim {
 }
 
 /// The init/fini boundary claims for a single touched cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct CellBoundary {
     pub address: u64,
     pub init: InitClaim,

@@ -41,12 +41,18 @@ impl std::fmt::Debug for TableMmapBacking {
 /// the STARK protocol implementation, such as the `TraceTable` and the `EvaluationFrame`.
 /// Since this struct is a representation of a two-dimensional table, all rows should have the same
 /// length.
-#[derive(Default, Debug, serde::Deserialize)]
+#[derive(Default, Debug)]
 #[cfg_attr(
     not(feature = "disk-spill"),
-    derive(serde::Serialize, Clone, PartialEq, Eq)
+    derive(
+        Clone,
+        PartialEq,
+        Eq,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
 )]
-#[serde(bound = "")]
 pub struct Table<F: IsField> {
     /// Row-major backing store. Crate-private: external callers must go through
     /// the spill-safe accessors (`get`/`get_row`/`set`) rather than indexing the
@@ -55,47 +61,140 @@ pub struct Table<F: IsField> {
     pub width: usize,
     pub height: usize,
     #[cfg(feature = "disk-spill")]
-    #[serde(skip)]
     pub(crate) mmap_backing: Option<TableMmapBacking>,
 }
 
+// Manual rkyv impl under disk-spill: the derive can't handle `mmap_backing`,
+// and serialization must read through `row_major_data()` so a spilled table
+// archives its mmap contents (deserializing always yields an unspilled table).
+// The archived layout matches what the derive generates without disk-spill, so
+// both configurations produce byte-identical archives.
 #[cfg(feature = "disk-spill")]
-impl<F: IsField> serde::Serialize for Table<F>
-where
-    FieldElement<F>: serde::Serialize,
-{
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeStruct;
-        let mut s = serializer.serialize_struct("Table", 3)?;
-        if self.mmap_backing.is_some() {
-            s.serialize_field("data", &MmapDataSeq(self))?;
-        } else {
-            s.serialize_field("data", &self.data)?;
+mod archived_table {
+    use super::{FieldElement, IsField, Table};
+    use math::field::element::ArchivedFieldElement;
+    use rkyv::rancor::Fallible;
+    use rkyv::ser::{Allocator, Writer};
+    use rkyv::vec::{ArchivedVec, VecResolver};
+    use rkyv::{Archive, Deserialize, Place, Portable, Serialize};
+
+    #[derive(Portable, rkyv::bytecheck::CheckBytes)]
+    #[bytecheck(crate = rkyv::bytecheck)]
+    #[repr(C)]
+    pub struct ArchivedTable<F: IsField>
+    where
+        F::BaseType: Archive,
+    {
+        pub data: ArchivedVec<ArchivedFieldElement<F>>,
+        pub width: rkyv::primitive::ArchivedUsize,
+        pub height: rkyv::primitive::ArchivedUsize,
+    }
+
+    pub struct TableResolver {
+        data: VecResolver,
+    }
+
+    impl<F: IsField> Archive for Table<F>
+    where
+        F::BaseType: Archive,
+    {
+        type Archived = ArchivedTable<F>;
+        type Resolver = TableResolver;
+
+        fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+            rkyv::munge::munge!(let ArchivedTable { data, width, height } = out);
+            ArchivedVec::resolve_from_len(self.width * self.height, resolver.data, data);
+            self.width.resolve((), width);
+            self.height.resolve((), height);
         }
-        s.serialize_field("width", &self.width)?;
-        s.serialize_field("height", &self.height)?;
-        s.end()
+    }
+
+    impl<F: IsField, S> Serialize<S> for Table<F>
+    where
+        F::BaseType: Archive,
+        FieldElement<F>: Serialize<S>,
+        S: Fallible + Allocator + Writer + ?Sized,
+    {
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            Ok(TableResolver {
+                data: ArchivedVec::serialize_from_slice(self.row_major_data(), serializer)?,
+            })
+        }
+    }
+
+    impl<F: IsField, D> Deserialize<Table<F>, D> for ArchivedTable<F>
+    where
+        F::BaseType: Archive,
+        ArchivedFieldElement<F>: Deserialize<FieldElement<F>, D>,
+        D: Fallible + ?Sized,
+    {
+        fn deserialize(&self, deserializer: &mut D) -> Result<Table<F>, D::Error> {
+            Ok(Table {
+                data: self.data.deserialize(deserializer)?,
+                width: self.width.to_native() as usize,
+                height: self.height.to_native() as usize,
+                mmap_backing: None,
+            })
+        }
     }
 }
 
 #[cfg(feature = "disk-spill")]
-struct MmapDataSeq<'a, F: IsField>(&'a Table<F>);
+pub use archived_table::ArchivedTable;
 
-#[cfg(feature = "disk-spill")]
-impl<F: IsField> serde::Serialize for MmapDataSeq<'_, F>
+/// Read API over an rkyv-archived [`Table`], used by the verifier to consume
+/// the out-of-domain evaluations straight from the proof buffer. On
+/// little-endian targets the element data is viewed in place with no copy.
+#[cfg(target_endian = "little")]
+impl<F: IsField> ArchivedTable<F>
 where
-    FieldElement<F>: serde::Serialize,
+    F::BaseType: rkyv::Archive,
 {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::SerializeSeq;
-        let table = self.0;
-        let mut seq = serializer.serialize_seq(Some(table.width * table.height))?;
-        for r in 0..table.height {
-            for elem in table.get_row(r) {
-                seq.serialize_element(elem)?;
-            }
-        }
-        seq.end()
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width.to_native() as usize
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.height.to_native() as usize
+    }
+
+    /// Full row-major element data, viewed in place.
+    #[inline]
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        math::field::element::ArchivedFieldElement::slice_as_native(self.data.as_slice())
+    }
+
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. A malformed archive can
+    /// advertise dimensions that disagree with the data length; callers must
+    /// reject such tables before row access.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width()
+            .checked_mul(self.height())
+            .is_some_and(|n| n == self.data.len())
+    }
+
+    /// Row `row_idx` as a native field-element slice (no copy).
+    #[inline]
+    pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
+        let width = self.width();
+        let start = row_idx * width;
+        &self.row_major_data()[start..start + width]
+    }
+
+    /// Build a [`Frame`] over this table, identical to [`Table::into_frame`].
+    /// Only the small OOD frame is materialized (bounded by `step_size × width`),
+    /// never the whole proof.
+    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F>
+    where
+        F: IsSubFieldOf<F>,
+    {
+        frame_from_rows(self.height(), step_size, main_trace_columns, |row_idx| {
+            self.get_row(row_idx)
+        })
     }
 }
 
@@ -361,27 +460,47 @@ impl<F: IsField> Table<F> {
     /// Given a step size, converts the given table into a `Frame`.
     /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
     pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
-        debug_assert!(self.height.is_multiple_of(step_size));
-        let steps = (0..self.height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
+        frame_from_rows(self.height, step_size, main_trace_columns, |row_idx| {
+            self.get_row(row_idx)
+        })
     }
+}
+
+/// Build a [`Frame`] from `height` rows accessed via `get_row`, splitting each
+/// row at `main_trace_columns` into main/aux. Shared by [`Table::into_frame`]
+/// and the zero-copy `OodTableRef::into_frame` so both produce identical frames.
+///
+/// Only the small out-of-domain frame is materialized here (bounded by
+/// `step_size × width`), never the full trace.
+pub fn frame_from_rows<'a, F>(
+    height: usize,
+    step_size: usize,
+    main_trace_columns: usize,
+    get_row: impl Fn(usize) -> &'a [FieldElement<F>],
+) -> Frame<F, F>
+where
+    F: IsSubFieldOf<F> + IsField + 'a,
+{
+    debug_assert!(height.is_multiple_of(step_size));
+    let steps = (0..height)
+        .step_by(step_size)
+        .map(|initial_row_idx| {
+            let end_row_idx = initial_row_idx + step_size;
+
+            let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+            let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+
+            (initial_row_idx..end_row_idx).for_each(|row_idx| {
+                let row = get_row(row_idx);
+                step_main_data.push(row[..main_trace_columns].to_vec());
+                step_aux_data.push(row[main_trace_columns..].to_vec());
+            });
+
+            TableView::new(step_main_data, step_aux_data)
+        })
+        .collect();
+
+    Frame::new(steps)
 }
 
 /// A view of a contiguous subset of rows of a table.

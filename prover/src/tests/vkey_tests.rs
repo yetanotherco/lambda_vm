@@ -80,10 +80,11 @@ fn test_vkey_roundtrip() {
     let vkey_again = VmVerifyingKey::from_elf_and_options(&elf, &options, None, &page_configs);
     assert_eq!(vkey, vkey_again, "vkey derivation must be deterministic");
 
-    // postcard round-trip preserves every field.
-    let encoded = postcard::to_allocvec(&vkey).expect("postcard encode");
-    let decoded: VmVerifyingKey = postcard::from_bytes(&encoded).expect("postcard decode");
-    assert_eq!(vkey, decoded, "postcard round-trip must preserve the vkey");
+    // rkyv round-trip preserves every field.
+    let encoded = rkyv::to_bytes::<rkyv::rancor::Error>(&vkey).expect("rkyv encode");
+    let decoded: VmVerifyingKey =
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&encoded).expect("rkyv decode");
+    assert_eq!(vkey, decoded, "rkyv round-trip must preserve the vkey");
     assert_eq!(
         decoded.compute_digest(),
         digest_before,

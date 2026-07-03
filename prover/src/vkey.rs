@@ -61,7 +61,7 @@ const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
 
 /// Cached preprocessed-table commitments the verifier would otherwise
 /// recompute on every call.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VmVerifyingKey {
     /// Layout version. See [`VKEY_VERSION`].
     pub version: u32,
@@ -135,13 +135,43 @@ impl VmVerifyingKey {
         }
     }
 
-    /// Keccak256 fingerprint of the postcard-serialized vkey. Stable as long
-    /// as the field layout (and [`VKEY_VERSION`]) does not change.
+    /// Keccak256 fingerprint of a canonical, framework-free encoding of the
+    /// vkey: every field is absorbed fixed-width (integers as little-endian
+    /// u64/u8, commitments raw, `pages` length-prefixed), so the encoding is
+    /// injective and stable as long as the field layout (and [`VKEY_VERSION`])
+    /// does not change. The exhaustive destructure makes any field added to
+    /// `VmVerifyingKey` a compile error here — the signal to extend the
+    /// absorption below and bump [`VKEY_VERSION`].
     pub fn compute_digest(&self) -> [u8; 32] {
-        let bytes = postcard::to_allocvec(self)
-            .expect("postcard serialization of VmVerifyingKey must succeed");
+        let Self {
+            version,
+            options:
+                ProofOptions {
+                    blowup_factor,
+                    fri_number_of_queries,
+                    coset_offset,
+                    grinding_factor,
+                },
+            bitwise,
+            decode,
+            register,
+            keccak_rc,
+            pages,
+        } = self;
         let mut hasher = Keccak256::new();
-        hasher.update(&bytes);
+        hasher.update(version.to_le_bytes());
+        hasher.update([*blowup_factor]);
+        hasher.update((*fri_number_of_queries as u64).to_le_bytes());
+        hasher.update(coset_offset.to_le_bytes());
+        hasher.update([*grinding_factor]);
+        hasher.update(bitwise);
+        hasher.update(decode);
+        hasher.update(register);
+        hasher.update(keccak_rc);
+        hasher.update((pages.len() as u64).to_le_bytes());
+        for page in pages {
+            hasher.update(page);
+        }
         hasher.finalize().into()
     }
 }

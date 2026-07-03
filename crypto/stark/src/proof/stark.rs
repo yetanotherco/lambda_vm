@@ -8,8 +8,7 @@ use crate::{
     config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
 };
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 /// Opening of a bit-reversed, row-paired commitment at one FRI query.
 ///
 /// The queried row and its symmetric counterpart (LDE positions `2·iota`,
@@ -22,8 +21,7 @@ pub struct PolynomialOpenings<F: IsField> {
     pub evaluations_sym: Vec<FieldElement<F>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "")]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     pub composition_poly: PolynomialOpenings<E>,
     pub main_trace_polys: PolynomialOpenings<F>,
@@ -35,8 +33,7 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Length of the execution trace
     pub trace_length: usize,
@@ -78,8 +75,7 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
-#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+#[derive(Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
 }

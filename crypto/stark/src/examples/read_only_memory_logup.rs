@@ -360,7 +360,7 @@ where
     transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct LogReadOnlyPublicInputs<F>
 where
     F: IsFFTField + Send + Sync,

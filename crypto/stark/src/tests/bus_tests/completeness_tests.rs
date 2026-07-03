@@ -377,9 +377,10 @@ fn test_serialization_roundtrip() {
         multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     // Serialize and deserialize
-    let serialized = serde_cbor::to_vec(&multi_proof).expect("serialization failed");
+    let serialized =
+        rkyv::to_bytes::<rkyv::rancor::Error>(&multi_proof).expect("serialization failed");
     let deserialized: crate::proof::stark::MultiProof<F, E, ()> =
-        serde_cbor::from_slice(&serialized).expect("deserialization failed");
+        rkyv::from_bytes::<_, rkyv::rancor::Error>(&serialized).expect("deserialization failed");
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];

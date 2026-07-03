@@ -247,7 +247,7 @@ struct EpochStart<'a> {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
@@ -278,8 +278,8 @@ struct EpochProof {
 /// rebuild the genesis image — bound by the global proof's genesis-from-ELF check).
 ///
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
-/// serde, so it round-trips through `bincode` exactly like a monolithic `VmProof`.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// rkyv, so it round-trips through the same archive format as a monolithic `VmProof`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
@@ -496,9 +496,19 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
+    let proof_bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&epoch.proof) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    // SAFETY: `proof_bytes` was produced by `rkyv::to_bytes` on the line above.
+    let archived = unsafe {
+        rkyv::access_unchecked::<stark::proof::stark::ArchivedMultiProof<F, E, ()>>(&proof_bytes)
+    };
+    let archived_proofs = archived.proofs.as_slice();
+
     let expected = match compute_expected_commit_bus_balance(
         &refs,
-        &epoch.proof,
+        archived_proofs,
         &epoch.public_output,
         commit_start_index,
         &mut seed(),
@@ -507,7 +517,7 @@ fn verify_epoch(
         None => return false,
     };
 
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
+    if !Verifier::multi_verify_archived(&refs, archived_proofs, &mut seed(), &expected) {
         return false;
     }
 
@@ -1030,17 +1040,18 @@ mod tests {
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
-    // A bundle survives a bincode round-trip and still verifies to the same output —
+    // A bundle survives an rkyv round-trip and still verifies to the same output —
     // the serialization path the CLI's `prove`/`verify --continuations` relies on.
     #[test]
-    fn test_continuation_bincode_roundtrip() {
+    fn test_continuation_rkyv_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let bundle =
             prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
 
-        let bytes = bincode::serialize(&bundle).unwrap();
-        let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
+        let restored: ContinuationProof =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
 
         let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
             .unwrap();

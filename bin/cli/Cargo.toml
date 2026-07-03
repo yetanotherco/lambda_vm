@@ -9,7 +9,7 @@ executor = { path = "../../executor" }
 prover = { path = "../../prover", package = "lambda-vm-prover" }
 stark = { path = "../../crypto/stark" }
 clap = { version = "4.3.10", features = ["derive"] }
-bincode = "1"
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"], optional = true }
 env_logger = "0.11"

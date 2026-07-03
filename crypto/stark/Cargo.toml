@@ -9,16 +9,13 @@ crate-type = ["cdylib", "rlib"]
 
 
 [dependencies]
-math = { path = "../math", features = [
-    "std",
-    "lambdaworks-serde-binary",
-] }
-crypto = { path = "../crypto", features = ["std", "serde"] }
+math = { path = "../math", features = ["std", "rkyv"] }
+crypto = { path = "../crypto", features = ["std", "rkyv"] }
 thiserror = "1.0.38"
 log = "0.4.17"
 sha3 = "0.10.8"
-serde = { version = "1.0", features = ["derive"] }
 itertools = "0.11.0"
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
 
 # Parallelization crates
 rayon = { version = "1.8.0", optional = true }
@@ -32,9 +29,7 @@ math-cuda = { path = "../math-cuda", optional = true }
 
 # wasm
 wasm-bindgen = { version = "0.2", optional = true }
-serde-wasm-bindgen = { version = "0.5", optional = true }
 web-sys = { version = "0.3.64", features = ['console'], optional = true }
-serde_cbor = { version = "0.11.1" }
 
 [dev-dependencies]
 criterion = { version = "0.4", default-features = false }
@@ -53,7 +48,7 @@ debug-checks = []                                                    # Enables v
 parallel = ["dep:rayon", "crypto/parallel"]
 cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
-wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
+wasm = ["dep:wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
 
 

@@ -1,12 +1,16 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
-//! Private input layout (postcard-encoded):
-//!   `(VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)`
-//! where the `Vec<u8>` holds the inner program's ELF bytes and `ProofOptions`
-//! specifies the parameters the inner prover used. Commits
-//! `vk_digest ‖ inner public output` on success: every input here is
-//! prover-supplied, so soundness comes from the outer verifier checking
-//! the committed digest against one derived from the trusted inner ELF.
+//! Private input layout: a 12-byte `"LVMR" + version + reserved` prefix
+//! followed by an rkyv archive of `lambda_vm_prover::RecursionInput`
+//! `{ vm_proof, inner_elf, options, vkey }`. The prefix 16-aligns the archive
+//! in guest memory (the executor maps the payload at `PRIVATE_INPUT_START + 4`,
+//! which is only 4-aligned) and tags the format so the guest rejects a
+//! wrong-format blob before the unsafe access. The proof is verified **in
+//! place** via `verify_recursion_blob` — no deserialization pass, no owned
+//! `VmProof`. Commits `vk_digest ‖ inner public output` on success: every
+//! input here is prover-supplied, so soundness comes from the outer verifier
+//! checking the committed digest against one derived from the trusted inner
+//! ELF.
 //!
 //! Not `no_std` (std/alloc are available — `build-std` provides them, and the
 //! prover links as a normal std crate; its prove-side code is dead-code
@@ -16,8 +20,6 @@
 //! than the target's default heap provides.
 
 #![no_main]
-
-use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
 
 #[unsafe(export_name = "main")]
 pub fn main() -> ! {
@@ -31,27 +33,20 @@ pub fn main() -> ! {
         lambda_vm_syscalls::syscalls::sys_panic(PANIC_MSG.as_ptr(), PANIC_MSG.len())
     }));
 
-    let blob = lambda_vm_syscalls::syscalls::get_private_input();
-    let (vm_proof, inner_elf, options, vkey): (VmProof, Vec<u8>, ProofOptions, VmVerifyingKey) =
-        postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
+    // Zero-copy: borrow the blob straight from the mapped private-input region.
+    // The 12-byte prefix puts the archive at a 16-aligned guest address, so the
+    // verifier's in-place doubleword loads don't trap.
+    let blob = lambda_vm_syscalls::syscalls::get_private_input_slice();
     lambda_vm_prover::profile_markers::step_marker::<
         { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
     >();
 
-    let ok = lambda_vm_prover::verify_with_options_with_vkey(
-        &vm_proof,
-        &inner_elf,
-        &options,
-        None,
-        None,
-        Some(&vkey),
-    )
-    .expect("verify errored");
-    assert!(ok, "inner proof failed verification");
+    let verification = lambda_vm_prover::verify_recursion_blob(blob).expect("verify errored");
+    assert!(verification.ok, "inner proof failed verification");
 
-    let mut output = Vec::with_capacity(32 + vm_proof.public_output.len());
-    output.extend_from_slice(&vkey.compute_digest());
-    output.extend_from_slice(&vm_proof.public_output);
+    let mut output = Vec::with_capacity(32 + verification.public_output.len());
+    output.extend_from_slice(&verification.vk_digest);
+    output.extend_from_slice(verification.public_output);
     lambda_vm_syscalls::syscalls::commit(&output);
     lambda_vm_syscalls::syscalls::sys_halt();
 }

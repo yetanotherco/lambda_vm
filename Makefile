@@ -2,7 +2,7 @@
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration test-ethrex \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -255,8 +255,14 @@ update-ethrex-fixture-checksums:
 check-ethrex-fixture-checksums:
 	python3 tooling/ethrex-fixtures/update_readme_checksums.py --check
 
+# Detached workspace: ethrex pins rkyv `unaligned`, which must not feature-unify
+# with the main workspace's aligned proof format (see tooling/ethrex-tests).
+test-ethrex: compile-programs-rust
+	cd tooling/ethrex-tests && cargo test
+
 test: compile-programs
 	cargo test
+	$(MAKE) test-ethrex
 
 # === Quick test shortcuts ===
 

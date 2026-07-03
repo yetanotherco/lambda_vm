@@ -83,7 +83,7 @@ where
     constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct SimpleAdditionPublicInputs<F>
 where
     F: IsFFTField,
