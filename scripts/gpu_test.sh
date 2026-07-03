@@ -44,6 +44,17 @@ nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 # conservative CUDA version binds a known driver-symbol set instead. (This is cudarc's
 # host-side driver-API floor — independent of the PTX/driver version the offer filter targets.)
 log "pinning cudarc to $CUDARC_PIN"
+# Guard the sed anchors: if math-cuda's cudarc features are ever renamed/reformatted, a silent
+# no-op here would bring the fallback-latest driver-symbol panic back with a confusing signature.
+for anchor in '"cuda-version-from-build-system"' '"fallback-latest"'; do
+    grep -qF "$anchor" crypto/math-cuda/Cargo.toml \
+        || { echo "ERROR: sed anchor $anchor not found in crypto/math-cuda/Cargo.toml — update this script's cudarc pin" >&2; exit 1; }
+done
+# Restore the tracked file on exit so a manual run on a dev box doesn't leave the tree dirty
+# (CI doesn't need this — the workflow re-checks-out before every run — but it's harmless there).
+CUDARC_TOML_BACKUP="$(mktemp)"
+cp crypto/math-cuda/Cargo.toml "$CUDARC_TOML_BACKUP"
+trap 'cp "$CUDARC_TOML_BACKUP" crypto/math-cuda/Cargo.toml; rm -f "$CUDARC_TOML_BACKUP"' EXIT
 sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
     crypto/math-cuda/Cargo.toml
 

@@ -232,8 +232,9 @@ jobs:
               } >> "$GITHUB_STEP_SUMMARY"
               echo "instance $IID ready — proceeding to tests"
               exit 0
+            else
+              rc=$?
             fi
-            rc=$?
             echo "::warning::instance $IID not ready (rc=$rc: 1=timeout, 2=image/scheduling failure); destroying and trying another host"
             destroy "$IID"; rm -f "$RUNNER_TEMP/vast_instance_id"
           done
@@ -267,7 +268,10 @@ jobs:
           # so we test exactly what will land. workflow_dispatch: the chosen branch ref.
           REF: ${{ github.ref }}
         run: |
-          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # ServerAlive*: ConnectTimeout only covers connection setup; without keepalives a box
+          # that wedges or drops off the network mid-suite would hang this step silently until
+          # the 240-minute job timeout. 60s x 10 fails the run ~10 minutes after the box goes dark.
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
           # Defense-in-depth: never interpolate an unvalidated ref into the remote `bash -lc`.
           case "$REF" in
             ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid ref: '$REF'"; exit 1 ;;
@@ -327,9 +331,20 @@ jobs:
                 echo; echo "No individual test failures parsed (build/infra error?). Last lines:"
                 echo '```'; tail -n 40 "$OUT" 2>/dev/null || echo "(no output captured)"; echo '```'
               fi
-              echo; echo "<sub>Full output is in the \"Run GPU tests\" step log.</sub>"
+              echo; echo "<sub>Full output: \"Run GPU tests\" step log, or the \`gpu-test-log\` artifact (survives UI log truncation).</sub>"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      # The step log gets truncated/rotated in the UI for multi-hour runs (see the machine-info
+      # comment above); the artifact keeps the complete output retrievable.
+      - name: Upload full test log
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-log
+          path: ${{ runner.temp }}/gpu_test_out.txt
+          if-no-files-found: ignore
+          retention-days: 14
 
       # --- Teardown: ALWAYS destroy the instance (cost guardrail) ---
       - name: Destroy instance
