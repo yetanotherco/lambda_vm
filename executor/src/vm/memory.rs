@@ -51,6 +51,11 @@ pub const MAX_PRIVATE_INPUT_SIZE: u64 = 64 * 1024 * 1024;
 /// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
 /// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+/// Size in bytes of the private input's wire-format length prefix (the `u32` LE
+/// written at `PRIVATE_INPUT_START_INDEX` by [`Memory::store_private_inputs`]; the
+/// data follows at `+ PRIVATE_INPUT_LENGTH_PREFIX_BYTES`). Single source of truth
+/// for every page-span computation over the private-input region.
+pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
 #[derive(Default, Debug, Clone)]
 pub struct Memory {
@@ -231,7 +236,10 @@ impl Memory {
         let len_u32 =
             u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
         self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
-        self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
+        self.set_bytes_aligned(
+            PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
+            &inputs,
+        )?;
         Ok(())
     }
 

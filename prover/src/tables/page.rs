@@ -156,6 +156,69 @@ impl PageConfig {
 }
 
 // =========================================================================
+// Private-input page math (shared by the monolithic and continuation paths)
+// =========================================================================
+
+/// Number of pages the private input occupies, starting at
+/// `PRIVATE_INPUT_START_INDEX`. The wire format is the 4-byte length prefix plus
+/// the data ([`Memory::store_private_inputs`]), and `PRIVATE_INPUT_START_INDEX` is
+/// page-aligned, so the span is `ceil((prefix + len) / page_size)` consecutive
+/// pages (0 when there is no input).
+///
+/// SINGLE source of truth: the monolithic trace builder, the continuation prover,
+/// and both verifiers' classification all derive from this count — a divergence
+/// would make one path build a private page preprocessed (ELF-recomputed) while
+/// the other commits it, which is a soundness bug, so do not reimplement it.
+///
+/// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
+pub fn private_input_page_count(private_inputs: &[u8]) -> usize {
+    use executor::vm::memory::PRIVATE_INPUT_LENGTH_PREFIX_BYTES;
+    if private_inputs.is_empty() {
+        return 0;
+    }
+    (PRIVATE_INPUT_LENGTH_PREFIX_BYTES + private_inputs.len()).div_ceil(DEFAULT_PAGE_SIZE)
+}
+
+/// Whether `page_base` is one of the first `num_private_input_pages` pages starting
+/// at `PRIVATE_INPUT_START_INDEX` — the page-aligned span private input actually
+/// occupies (see [`private_input_page_count`]). Classifying by the count (not the
+/// raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) keeps prover and
+/// verifier in lockstep regardless of whether the region end is page-aligned.
+///
+/// NOTE: a page classified private is built non-preprocessed, so its genesis is NOT
+/// recomputed from the ELF. This is safe because the private-input area is reserved
+/// and the reservation is enforced: `Elf::load` rejects any loadable segment
+/// reaching at/above `PRIVATE_INPUT_START_INDEX`
+/// (`ElfError::SegmentInPrivateInputRegion`) — covering every page this function
+/// can classify private — so no ELF-declared data can live there and have its
+/// genesis go unbound.
+pub fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    let page_size = DEFAULT_PAGE_SIZE as u64;
+    let end = PRIVATE_INPUT_START_INDEX + num_private_input_pages as u64 * page_size;
+    (PRIVATE_INPUT_START_INDEX..end).contains(&page_base)
+}
+
+/// The page bases of the first `num_private_input_pages` private-input pages, in
+/// ascending order — the enumeration counterpart of [`is_private_input_page`]
+/// (`is_private_input_page(b, n)` holds exactly for the aligned bases this yields).
+pub fn private_input_page_bases(num_private_input_pages: usize) -> impl Iterator<Item = u64> {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    let page_size = DEFAULT_PAGE_SIZE as u64;
+    (0..num_private_input_pages as u64).map(move |i| PRIVATE_INPUT_START_INDEX + i * page_size)
+}
+
+/// Upper bound on `num_private_input_pages` any honest proof can claim: the span of
+/// a MAX-size input including its length prefix — no slack (an honest max-size
+/// input occupies exactly this many pages). Both the monolithic and continuation
+/// verifiers bound the deserialized, untrusted count with this before sizing AIRs.
+pub fn max_private_input_pages() -> usize {
+    use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
+    (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES)
+        .div_ceil(DEFAULT_PAGE_SIZE)
+}
+
+// =========================================================================
 // Trace generation
 // =========================================================================
 

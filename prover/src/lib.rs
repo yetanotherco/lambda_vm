@@ -192,6 +192,9 @@ pub enum Error {
     InvalidContinuationEpochSize(String),
     /// Continuation proof construction hit an internal invariant failure.
     ContinuationInvariant(String),
+    /// Continuation bundle is structurally malformed (fails validation before
+    /// any proof is checked).
+    MalformedContinuationBundle(String),
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
@@ -213,6 +216,9 @@ impl fmt::Display for Error {
             }
             Error::ContinuationInvariant(msg) => {
                 write!(f, "continuation invariant failed: {msg}")
+            }
+            Error::MalformedContinuationBundle(msg) => {
+                write!(f, "malformed continuation bundle: {msg}")
             }
             Error::HaltInNonFinalEpoch => {
                 write!(
@@ -960,13 +966,10 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
-    // Bound num_private_input_pages before allocating PageConfigs. The tight max is the
-    // honest span of a MAX-size input plus its 4-byte length prefix:
-    // ceil((MAX_PRIVATE_INPUT_SIZE + 4) / DEFAULT_PAGE_SIZE) pages (no slack).
+    // Bound num_private_input_pages before allocating PageConfigs — the tight honest
+    // max, shared with the continuation verifier (see `page::max_private_input_pages`).
     {
-        use crate::tables::page::DEFAULT_PAGE_SIZE;
-        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE);
+        let max_pages = crate::tables::page::max_private_input_pages();
         if vm_proof.num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
                 "num_private_input_pages ({}) exceeds max ({max_pages})",
