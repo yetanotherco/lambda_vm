@@ -269,7 +269,7 @@ pub enum Relation {
 //   4     : NEXT_OP · (1 − MU)
 //   then for (Lambda,C0),(Xr,C1),(Yr,C2): 64 ConvCarry (i=0..64) + 1 ColIsZero.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// ECDAS transition constraints as a single-source [`ConstraintSet`] (200
 /// total). No column configuration needed (the layout is fixed via `cols`).
@@ -405,51 +405,24 @@ impl EcdasConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(200);
-        // idx 0,1,2: IS_BIT(MU/OP/NEXT_OP), degree 2.
-        for i in 0..3 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        // idx 3: OP·NEXT_OP, idx 4: NEXT_OP·(1−MU) — degree 2.
-        m.push(ConstraintMeta::base(3, 2));
-        m.push(ConstraintMeta::base(4, 2));
-        // Per relation: 64 ConvCarry + 1 ColIsZero.
-        let mut idx = 5;
-        for relation in [Relation::Lambda, Relation::Xr, Relation::Yr] {
-            let conv_degree = match relation {
-                Relation::Lambda => 3, // op · (λ · Δx)
-                Relation::Xr | Relation::Yr => 2,
-            };
-            for _ in 0..64 {
-                m.push(ConstraintMeta::base(idx, conv_degree));
-                idx += 1;
-            }
-            m.push(ConstraintMeta::base(idx, 1)); // ColIsZero c_63
-            idx += 1;
-        }
-        debug_assert_eq!(m.len(), 200);
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1,2: unconditional IS_BIT `x·(1−x)` on [MU, OP, NEXT_OP].
         for (i, col) in [cols::MU, cols::OP, cols::NEXT_OP].into_iter().enumerate() {
             let x = b.main(0, col);
             let one = b.one();
-            b.emit_base(i, x.clone() * (one - x));
+            b.emit_base(i, 2, x.clone() * (one - x));
         }
 
         // idx 3: OP · NEXT_OP = 0.
         let op = b.main(0, cols::OP);
         let next_op = b.main(0, cols::NEXT_OP);
-        b.emit_base(3, op * next_op);
+        b.emit_base(3, 2, op * next_op);
 
         // idx 4: NEXT_OP · (1 − MU) = 0.
         let next_op = b.main(0, cols::NEXT_OP);
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(4, next_op * (one - mu));
+        b.emit_base(4, 2, next_op * (one - mu));
 
         // Per relation: 64 ConvCarry (i=0..64) + 1 ColIsZero(c_63).
         let mut idx = 5;
@@ -458,13 +431,19 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
             (Relation::Xr, cols::C1),
             (Relation::Yr, cols::C2),
         ] {
+            // ConvCarry degree: Lambda has the op·(λ·Δx) term (degree 3);
+            // Xr/Yr are degree 2.
+            let conv_degree = match relation {
+                Relation::Lambda => 3,
+                Relation::Xr | Relation::Yr => 2,
+            };
             for i in 0..64 {
                 let root = Self::conv_carry(b, relation, i);
-                b.emit_base(idx, root);
+                b.emit_base(idx, conv_degree, root);
                 idx += 1;
             }
             let c_last = b.main(0, c_base + 63);
-            b.emit_base(idx, c_last);
+            b.emit_base(idx, 1, c_last); // ColIsZero c_63
             idx += 1;
         }
     }

@@ -20,16 +20,10 @@ use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
 use crate::constraints::cpu::{
-    arg2_exclusive_meta, arg2_meta, branch_cond_meta, branch_rvd_meta, mem_flags_bit_meta,
-    next_pc_add_meta, product_zero_meta, reg_not_read_is_zero_meta, rvd_eq_res_meta,
-};
-use crate::constraints::cpu::{
     emit_arg2, emit_arg2_exclusive, emit_branch_cond, emit_branch_rvd_pair, emit_mem_flags_bit,
     emit_next_pc_add_pair, emit_product_zero, emit_reg_not_read_is_zero, emit_rvd_eq_res,
 };
-use crate::constraints::templates::{
-    AddLinearTerm, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddLinearTerm, AddOperand, emit_add_pair, emit_is_bit};
 use crate::tables::cpu::cols;
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
@@ -167,10 +161,14 @@ fn check_emit<T: EmitBody>(label: &str, body: &T, meta: &[ConstraintMeta]) {
 #[test]
 fn emit_is_bit_folder_capture_agree() {
     emit_body!(Uncond, 1, |b| { emit_is_bit(b, 0, 7, None) });
-    check_emit("is_bit_unconditional", &Uncond, &[is_bit_meta(0, false)]);
+    check_emit(
+        "is_bit_unconditional",
+        &Uncond,
+        &[ConstraintMeta::base(0, 2)],
+    );
 
     emit_body!(Cond, 1, |b| { emit_is_bit(b, 0, 5, Some(3)) });
-    check_emit("is_bit_conditional", &Cond, &[is_bit_meta(0, true)]);
+    check_emit("is_bit_conditional", &Cond, &[ConstraintMeta::base(0, 3)]);
 }
 
 // =============================================================================
@@ -179,7 +177,12 @@ fn emit_is_bit_folder_capture_agree() {
 
 /// Run the pair check for one `conditional` flag.
 fn check_add_pair_case<T: EmitBody>(label: &str, body: &T, conditional: bool) {
-    check_emit(label, body, &add_pair_meta(0, conditional));
+    let d = if conditional { 3 } else { 2 };
+    check_emit(
+        label,
+        body,
+        &[ConstraintMeta::base(0, d), ConstraintMeta::base(1, d)],
+    );
 }
 
 #[test]
@@ -250,22 +253,22 @@ fn emit_add_pair_multi_cond_bytes() {
 #[test]
 fn emit_product_zero_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_product_zero(b, 0, 12, 17) });
-    check_emit("product_zero", &Body, &[product_zero_meta(0)]);
+    check_emit("product_zero", &Body, &[ConstraintMeta::base(0, 2)]);
 }
 
 #[test]
 fn emit_arg2_exclusive_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_arg2_exclusive(b, 0, cols::IMM_0) });
-    check_emit("arg2_exclusive_imm0", &Body0, &[arg2_exclusive_meta(0)]);
+    check_emit("arg2_exclusive_imm0", &Body0, &[ConstraintMeta::base(0, 3)]);
 
     emit_body!(Body1, 1, |b| { emit_arg2_exclusive(b, 0, cols::IMM_1) });
-    check_emit("arg2_exclusive_imm1", &Body1, &[arg2_exclusive_meta(0)]);
+    check_emit("arg2_exclusive_imm1", &Body1, &[ConstraintMeta::base(0, 3)]);
 }
 
 #[test]
 fn emit_mem_flags_bit_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_mem_flags_bit(b, 0) });
-    check_emit("mem_flags_bit", &Body, &[mem_flags_bit_meta(0)]);
+    check_emit("mem_flags_bit", &Body, &[ConstraintMeta::base(0, 3)]);
 }
 
 #[test]
@@ -276,7 +279,7 @@ fn emit_reg_not_read_is_zero_folder_capture_agree() {
     check_emit(
         "reg_not_read_is_zero_rv1",
         &Body,
-        &[reg_not_read_is_zero_meta(0)],
+        &[ConstraintMeta::base(0, 2)],
     );
 
     emit_body!(Body2, 1, |b| {
@@ -285,7 +288,7 @@ fn emit_reg_not_read_is_zero_folder_capture_agree() {
     check_emit(
         "reg_not_read_is_zero_rv2",
         &Body2,
-        &[reg_not_read_is_zero_meta(0)],
+        &[ConstraintMeta::base(0, 2)],
     );
 }
 
@@ -296,33 +299,41 @@ fn emit_reg_not_read_is_zero_folder_capture_agree() {
 #[test]
 fn emit_arg2_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_arg2(b, 0, 0) });
-    check_emit("arg2_word0", &Body0, &[arg2_meta(0)]);
+    check_emit("arg2_word0", &Body0, &[ConstraintMeta::base(0, 2)]);
     emit_body!(Body1, 1, |b| { emit_arg2(b, 0, 1) });
-    check_emit("arg2_word1", &Body1, &[arg2_meta(0)]);
+    check_emit("arg2_word1", &Body1, &[ConstraintMeta::base(0, 2)]);
 }
 
 #[test]
 fn emit_rvd_eq_res_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_rvd_eq_res(b, 0, 0) });
-    check_emit("rvd_eq_res_word0", &Body0, &[rvd_eq_res_meta(0)]);
+    check_emit("rvd_eq_res_word0", &Body0, &[ConstraintMeta::base(0, 2)]);
     emit_body!(Body1, 1, |b| { emit_rvd_eq_res(b, 0, 1) });
-    check_emit("rvd_eq_res_word1", &Body1, &[rvd_eq_res_meta(0)]);
+    check_emit("rvd_eq_res_word1", &Body1, &[ConstraintMeta::base(0, 2)]);
 }
 
 #[test]
 fn emit_branch_rvd_pair_folder_capture_agree() {
     emit_body!(Body, 2, |b| { emit_branch_rvd_pair(b, 0) });
-    check_emit("branch_rvd_pair", &Body, &branch_rvd_meta(0));
+    check_emit(
+        "branch_rvd_pair",
+        &Body,
+        &[ConstraintMeta::base(0, 3), ConstraintMeta::base(1, 3)],
+    );
 }
 
 #[test]
 fn emit_branch_cond_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_branch_cond(b, 0) });
-    check_emit("branch_cond", &Body, &[branch_cond_meta(0)]);
+    check_emit("branch_cond", &Body, &[ConstraintMeta::base(0, 3)]);
 }
 
 #[test]
 fn emit_next_pc_add_pair_folder_capture_agree() {
     emit_body!(Body, 2, |b| { emit_next_pc_add_pair(b, 0) });
-    check_emit("next_pc_add_pair", &Body, &next_pc_add_meta(0));
+    check_emit(
+        "next_pc_add_pair",
+        &Body,
+        &[ConstraintMeta::base(0, 3), ConstraintMeta::base(1, 3)],
+    );
 }

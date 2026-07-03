@@ -24,11 +24,9 @@ use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
 };
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use crate::constraints::templates::{
-    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
 // =========================================================================
 // Column indices for CPU32 table
@@ -602,31 +600,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct Cpu32Constraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(32);
-        // idx 0-6: IS_BIT (unconditional, degree 2).
-        for i in 0..7 {
-            m.push(is_bit_meta(i, false));
-        }
-        // idx 7,8: ADD pair gated on ADD (conditional, degree 3).
-        m.extend(add_pair_meta(7, true));
-        // idx 9,10: SUB pair gated on SUB (conditional, degree 3).
-        m.extend(add_pair_meta(9, true));
-        // idx 11-16: RegZero (degree 2).
-        for i in 11..17 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        // idx 17-22: sign-extension arithmetic (linear, degree 1).
-        for i in 17..23 {
-            m.push(ConstraintMeta::base(i, 1));
-        }
-        // idx 23-31: sign-zero, arg2-exclusive, flag ⇒ μ (all degree 2).
-        for i in 23..32 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0-6: IS_BIT on the flag columns and the multiplicity.
         for (i, &col) in [
@@ -677,7 +650,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
             let one = b.one();
             let read = b.main(0, read_col);
             let value = b.main(0, value_col);
-            b.emit_base(idx, (one - read) * value);
+            b.emit_base(idx, 2, (one - read) * value);
             idx += 1;
         }
 
@@ -689,41 +662,41 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
         let e = b.main(0, cols::ARG1_0)
             - b.main(0, cols::RV1_0)
             - shift16.clone() * b.main(0, cols::RV1_1);
-        b.emit_base(17, e);
+        b.emit_base(17, 1, e);
         // Arg1Hi: arg1_1 - hi_fill·rv1_sign
         let e = b.main(0, cols::ARG1_1) - hi_fill.clone() * b.main(0, cols::RV1_SIGN);
-        b.emit_base(18, e);
+        b.emit_base(18, 1, e);
         // Arg2Lo: arg2_0 - rv2_0 - shift16·rv2_1 - imm_0
         let e = b.main(0, cols::ARG2_0)
             - b.main(0, cols::RV2_0)
             - shift16.clone() * b.main(0, cols::RV2_1)
             - b.main(0, cols::IMM_0);
-        b.emit_base(19, e);
+        b.emit_base(19, 1, e);
         // Arg2Hi: arg2_1 - hi_fill·rv2_sign - imm_1
         let e = b.main(0, cols::ARG2_1)
             - hi_fill.clone() * b.main(0, cols::RV2_SIGN)
             - b.main(0, cols::IMM_1);
-        b.emit_base(20, e);
+        b.emit_base(20, 1, e);
         // RvdLo: rvd_0 - res_0 - shift16·res_1
         let e = b.main(0, cols::RVD_0) - b.main(0, cols::RES_0) - shift16 * b.main(0, cols::RES_1);
-        b.emit_base(21, e);
+        b.emit_base(21, 1, e);
         // RvdHi: rvd_1 - hi_fill·res_sign
         let e = b.main(0, cols::RVD_1) - hi_fill * b.main(0, cols::RES_SIGN);
-        b.emit_base(22, e);
+        b.emit_base(22, 1, e);
 
         // idx 23,24: (1 - signed)·sign — sign bit is zero when unsigned.
         for (i, sign_col) in [cols::RV1_SIGN, cols::RV2_SIGN].into_iter().enumerate() {
             let one = b.one();
             let signed = b.main(0, cols::SIGNED);
             let sign = b.main(0, sign_col);
-            b.emit_base(23 + i, (one - signed) * sign);
+            b.emit_base(23 + i, 2, (one - signed) * sign);
         }
 
         // idx 25,26: read_register2·imm[i] (arg2 multiplex exclusivity).
         for (i, imm_col) in [cols::IMM_0, cols::IMM_1].into_iter().enumerate() {
             let rr2 = b.main(0, cols::READ_REGISTER2);
             let imm = b.main(0, imm_col);
-            b.emit_base(25 + i, rr2 * imm);
+            b.emit_base(25 + i, 2, rr2 * imm);
         }
 
         // idx 27-31: (1 - μ)·flag — flag must be 0 on padding rows.
@@ -740,7 +713,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
             let one = b.one();
             let mu = b.main(0, cols::MU);
             let flag = b.main(0, flag_col);
-            b.emit_base(27 + i, (one - mu) * flag);
+            b.emit_base(27 + i, 2, (one - mu) * flag);
         }
     }
 }

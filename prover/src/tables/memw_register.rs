@@ -41,7 +41,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
@@ -367,10 +367,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct MemwRegisterConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwRegisterConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        (0..3).map(|i| ConstraintMeta::base(i, 2)).collect()
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1: IS_BIT<μ_read>, IS_BIT<μ_write>
         emit_is_bit(b, 0, cols::MU_READ, None);
@@ -379,6 +375,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwRegisterConstra
         // idx 2: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum), μ_sum = μ_read + μ_write
         let one = b.one();
         let mu_sum = b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE);
-        b.emit_base(2, mu_sum.clone() * (one - mu_sum));
+        b.emit_base(2, 2, mu_sum.clone() * (one - mu_sum));
     }
 }

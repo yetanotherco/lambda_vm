@@ -119,10 +119,34 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     }
 
     // ---- sinks ----------------------------------------------------------
-    /// Record base-field constraint `constraint_idx`'s value.
-    fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr);
-    /// Record extension-field (LogUp) constraint `constraint_idx`'s value.
-    fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE);
+    /// Record base-field constraint `constraint_idx`'s value, declaring its
+    /// polynomial `degree` and the number of trailing rows it is exempt from
+    /// (`end_exemptions`). Declaring these AT the emit site is what lets
+    /// [`ConstraintSet::meta`] be *derived* from this single body (via
+    /// [`MetaBuilder`]) instead of hand-maintained as a parallel list.
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        e: Self::Expr,
+    );
+    /// Extension-field (LogUp) counterpart of [`Self::emit_base_exempt`].
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        e: Self::ExprE,
+    );
+    /// Record a base-field constraint with no end-exemptions (the common case).
+    fn emit_base(&mut self, constraint_idx: usize, degree: usize, e: Self::Expr) {
+        self.emit_base_exempt(constraint_idx, degree, 0, e);
+    }
+    /// Record an extension-field (LogUp) constraint with no end-exemptions.
+    fn emit_ext(&mut self, constraint_idx: usize, degree: usize, e: Self::ExprE) {
+        self.emit_ext_exempt(constraint_idx, degree, 0, e);
+    }
 
     // ---- folds ----------------------------------------------------------
     /// Fold one α·value term into a running LogUp fingerprint:
@@ -225,19 +249,26 @@ pub fn num_base_from_meta(meta: &[ConstraintMeta]) -> usize {
     num_base
 }
 
-/// One table's constraints: metadata + THE single body.
+/// One table's constraints: THE single body.
 ///
-/// `meta()` and `eval` are parallel index walks that must agree entry for
-/// entry: `meta()[i]` describes the constraint `eval` emits at index `i`
-/// (kind, declared degree). The differential tests enforce the pairing
-/// (exact-once emission, declared == measured degree); keep the two methods
-/// side by side when editing a set.
+/// `eval` is the sole source of truth — it emits every constraint once,
+/// declaring each one's kind (via `emit_base`/`emit_ext`), degree, and
+/// end-exemptions at the emit site. `meta()` is DERIVED from it by running the
+/// same body through a [`MetaBuilder`], so there is no parallel list to keep in
+/// sync. See [`num_base_from_meta`] for the invariants the derived metadata
+/// upholds.
 pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
-    /// Idx-ordered metadata (see [`num_base_from_meta`] for the invariants).
-    fn meta(&self) -> Vec<ConstraintMeta>;
-    /// The single constraint body: emits every constraint in `meta()` exactly
-    /// once.
+    /// The single constraint body: emits every constraint exactly once.
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B);
+
+    /// Idx-ordered metadata, derived by running [`Self::eval`] through a
+    /// [`MetaBuilder`] (which records the `{kind, degree, end_exemptions}`
+    /// declared at each `emit_*`). Never overridden — the body is the source.
+    fn meta(&self) -> Vec<ConstraintMeta> {
+        let mut mb = MetaBuilder::new();
+        self.eval(&mut mb);
+        mb.into_meta()
+    }
 }
 
 /// A [`ConstraintSet`] with no transition constraints — for tables whose
@@ -248,10 +279,126 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
 pub struct EmptyConstraints;
 
 impl<F: IsField, E: IsField> ConstraintSet<F, E> for EmptyConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        Vec::new()
-    }
     fn eval<B: ConstraintBuilder<F, E>>(&self, _b: &mut B) {}
+}
+
+// =============================================================================
+// MetaBuilder — derive ConstraintMeta by running the body with no arithmetic
+// =============================================================================
+
+/// No-op expression for [`MetaBuilder`]: every leaf and operator yields `Nil`,
+/// so running a constraint body over it does no field work — it only drives the
+/// `emit_*` calls, which is all metadata derivation needs.
+#[derive(Clone, Copy)]
+pub struct Nil;
+
+impl core::ops::Add for Nil {
+    type Output = Nil;
+    fn add(self, _rhs: Nil) -> Nil {
+        Nil
+    }
+}
+impl core::ops::Sub for Nil {
+    type Output = Nil;
+    fn sub(self, _rhs: Nil) -> Nil {
+        Nil
+    }
+}
+impl core::ops::Mul for Nil {
+    type Output = Nil;
+    fn mul(self, _rhs: Nil) -> Nil {
+        Nil
+    }
+}
+impl core::ops::Neg for Nil {
+    type Output = Nil;
+    fn neg(self) -> Nil {
+        Nil
+    }
+}
+
+/// Derives [`ConstraintMeta`] from a [`ConstraintSet`] body: a metadata-only
+/// [`ConstraintBuilder`] whose leaves/operators are no-ops and whose `emit_*`
+/// sinks record `{constraint_idx, kind, degree, end_exemptions}`. Runs once at
+/// setup — never on the per-row prover path.
+pub struct MetaBuilder {
+    metas: Vec<ConstraintMeta>,
+}
+
+impl MetaBuilder {
+    pub fn new() -> Self {
+        Self { metas: Vec::new() }
+    }
+
+    /// The recorded metadata, sorted by `constraint_idx` (emission order need
+    /// not match index order; the sort restores the dense idx-ordering
+    /// [`num_base_from_meta`] expects).
+    pub fn into_meta(mut self) -> Vec<ConstraintMeta> {
+        self.metas.sort_by_key(|m| m.constraint_idx);
+        self.metas
+    }
+}
+
+impl Default for MetaBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for MetaBuilder {
+    type Expr = Nil;
+    type ExprE = Nil;
+
+    fn main(&self, _offset: usize, _col: usize) -> Nil {
+        Nil
+    }
+    fn aux(&self, _offset: usize, _col: usize) -> Nil {
+        Nil
+    }
+    fn challenge(&self, _idx: usize) -> Nil {
+        Nil
+    }
+    fn alpha_pow(&self, _idx: usize) -> Nil {
+        Nil
+    }
+    fn table_offset(&self) -> Nil {
+        Nil
+    }
+    fn const_base(&self, _v: u64) -> Nil {
+        Nil
+    }
+    fn const_signed(&self, _v: i64) -> Nil {
+        Nil
+    }
+
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        _e: Nil,
+    ) {
+        self.metas.push(ConstraintMeta {
+            constraint_idx,
+            kind: RootKind::Base,
+            degree,
+            end_exemptions,
+        });
+    }
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        _e: Nil,
+    ) {
+        self.metas.push(ConstraintMeta {
+            constraint_idx,
+            kind: RootKind::Ext,
+            degree,
+            end_exemptions,
+        });
+    }
 }
 
 // =============================================================================
@@ -460,11 +607,23 @@ where
         FieldElement::<F>::from(v)
     }
 
-    fn emit_base(&mut self, constraint_idx: usize, e: FieldElement<F>) {
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: FieldElement<F>,
+    ) {
         self.tracker.mark(constraint_idx);
         self.base_out[constraint_idx] = e;
     }
-    fn emit_ext(&mut self, constraint_idx: usize, e: FieldElement<E>) {
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: FieldElement<E>,
+    ) {
         debug_assert!(
             constraint_idx >= self.base_out.len(),
             "emit_ext with a base-prefix index {constraint_idx}"
@@ -593,11 +752,23 @@ where
         FieldElement::<F>::from(v).to_extension::<E>()
     }
 
-    fn emit_base(&mut self, constraint_idx: usize, e: FieldElement<E>) {
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: FieldElement<E>,
+    ) {
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
     }
-    fn emit_ext(&mut self, constraint_idx: usize, e: FieldElement<E>) {
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: FieldElement<E>,
+    ) {
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
     }
@@ -814,13 +985,27 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
         IrExpr::leaf(TreeKind::ConstSigned(v), Dim::Base, 0)
     }
 
-    fn emit_base(&mut self, constraint_idx: usize, e: IrExpr) {
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: IrExpr,
+    ) {
         debug_assert_eq!(e.0.dim, Dim::Base, "emit_base on an extension expression");
         let root = self.flatten(&e);
         self.ir.emit(constraint_idx, root);
+        // Record the TREE-MEASURED degree (not the declared one) so the
+        // host-side test can assert measured <= declared.
         self.degrees.push((constraint_idx, e.degree()));
     }
-    fn emit_ext(&mut self, constraint_idx: usize, e: IrExpr) {
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        _degree: usize,
+        _end_exemptions: usize,
+        e: IrExpr,
+    ) {
         let root = self.flatten(&e);
         self.ir.emit(constraint_idx, root);
         self.degrees.push((constraint_idx, e.degree()));

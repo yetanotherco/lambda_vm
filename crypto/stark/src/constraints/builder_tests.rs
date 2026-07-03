@@ -78,28 +78,22 @@ fn inv_shift_32() -> u64 {
 struct SampleSet;
 
 impl ConstraintSet<Fp, Ext> for SampleSet {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 2), // EqXor
-            ConstraintMeta::base(1, 2), // IsBit
-            ConstraintMeta::base(2, 3), // add carry 0 (cond-gated bit check)
-            ConstraintMeta::base(3, 3), // add carry 1
-            ConstraintMeta::ext(4, 1),  // LogUp-shaped
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<Fp, Ext>>(&self, b: &mut B) {
-        // idx 0 — EqXor: res − (eq + invert − 2·eq·invert).
+        // idx 0 — EqXor (degree 2): res − (eq + invert − 2·eq·invert).
         let res = b.main(0, cols::RES);
         let eq = b.main(0, cols::EQ);
         let invert = b.main(0, cols::INVERT);
         let two = b.const_base(2);
-        b.emit_base(0, res - (eq.clone() + invert.clone() - two * eq * invert));
+        b.emit_base(
+            0,
+            2,
+            res - (eq.clone() + invert.clone() - two * eq * invert),
+        );
 
-        // idx 1 — IsBit: x·(1 − x).
+        // idx 1 — IsBit (degree 2): x·(1 − x).
         let x = b.main(0, cols::BIT);
         let one = b.one();
-        b.emit_base(1, x.clone() * (one - x));
+        b.emit_base(1, 2, x.clone() * (one - x));
 
         // idx 2, 3 — the add carry pair:
         //   carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²
@@ -116,15 +110,20 @@ impl ConstraintSet<Fp, Ext> for SampleSet {
         let one = b.one();
         let carry_0 = (lhs_lo + rhs_lo - sum_lo) * inv_2_32.clone();
         let carry_1 = (lhs_hi + rhs_hi + carry_0.clone() - sum_hi) * inv_2_32;
-        b.emit_base(2, cond.clone() * carry_0.clone() * (one.clone() - carry_0));
-        b.emit_base(3, cond * carry_1.clone() * (one - carry_1));
+        // idx 2, 3 — degree 3 (cond·carry·(1−carry)).
+        b.emit_base(
+            2,
+            3,
+            cond.clone() * carry_0.clone() * (one.clone() - carry_0),
+        );
+        b.emit_base(3, 3, cond * carry_1.clone() * (one - carry_1));
 
-        // idx 4 — LogUp-shaped: (challenge₀ + aux₀)·alpha₀ − L/N.
+        // idx 4 — LogUp-shaped (degree 1): (challenge₀ + aux₀)·alpha₀ − L/N.
         let ch = b.challenge(0);
         let au = b.aux(0, 0);
         let alpha = b.alpha_pow(0);
         let off = b.table_offset();
-        b.emit_ext(4, (ch + au) * alpha - off);
+        b.emit_ext(4, 1, (ch + au) * alpha - off);
     }
 }
 
@@ -360,7 +359,7 @@ fn prover_folder_missing_emit_asserts() {
     let mut ext_out = vec![ExtE::zero(); 2];
     let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
     let x = folder.main(0, 0);
-    folder.emit_base(0, x); // constraint 1 never emitted
+    folder.emit_base(0, 1, x); // constraint 1 never emitted
     folder.assert_all_emitted();
 }
 
@@ -384,9 +383,9 @@ fn prover_folder_double_emit_asserts() {
     let mut ext_out = vec![ExtE::zero(); 2];
     let mut folder = ProverEvalFolder::new(&ctx, &mut base_out, &mut ext_out);
     let x = folder.main(0, 0);
-    folder.emit_base(0, x);
+    folder.emit_base(0, 1, x);
     let x = folder.main(0, 0);
-    folder.emit_base(0, x);
+    folder.emit_base(0, 1, x);
 }
 
 #[cfg(debug_assertions)]
@@ -404,7 +403,7 @@ fn verifier_folder_missing_emit_asserts() {
     let mut ext_out = vec![ExtE::zero(); 2];
     let mut folder = VerifierEvalFolder::new(&ctx, &mut ext_out);
     let x = folder.main(0, 0);
-    folder.emit_base(1, x);
+    folder.emit_base(1, 1, x);
     folder.assert_all_emitted();
 }
 
@@ -447,13 +446,27 @@ impl ConstraintBuilder<Fp, Ext> for CountingCapture {
     fn const_signed(&self, v: i64) -> Self::Expr {
         self.inner.const_signed(v)
     }
-    fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr) {
+    fn emit_base_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        e: Self::Expr,
+    ) {
         self.base_idxs.push(constraint_idx);
-        self.inner.emit_base(constraint_idx, e);
+        self.inner
+            .emit_base_exempt(constraint_idx, degree, end_exemptions, e);
     }
-    fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE) {
+    fn emit_ext_exempt(
+        &mut self,
+        constraint_idx: usize,
+        degree: usize,
+        end_exemptions: usize,
+        e: Self::ExprE,
+    ) {
         self.ext_idxs.push(constraint_idx);
-        self.inner.emit_ext(constraint_idx, e);
+        self.inner
+            .emit_ext_exempt(constraint_idx, degree, end_exemptions, e);
     }
 }
 
@@ -524,20 +537,13 @@ mod lcols {
 }
 
 impl ConstraintSet<Fp, Ext> for NextRowLogUpSet {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 1),
-            ConstraintMeta::ext(1, 1).with_end_exemptions(1),
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<Fp, Ext>>(&self, b: &mut B) {
-        // idx 0 (base): next-row main read — main(1, VAL) − main(0, VAL).
+        // idx 0 (base, degree 1): next-row main read — main(1, VAL) − main(0, VAL).
         let cur = b.main(0, lcols::VAL);
         let next = b.main(1, lcols::VAL);
-        b.emit_base(0, next - cur);
+        b.emit_base(0, 1, next - cur);
 
-        // idx 1 (ext): acc' − acc − (challenge₀·α₀ + term·α₁) + L/N,
+        // idx 1 (ext, degree 1, 1 end exemption): acc' − acc − (challenge₀·α₀ + term·α₁) + L/N,
         // with acc' read from the NEXT row (aux offset 1).
         let acc = b.aux(0, lcols::ACC);
         let acc_next = b.aux(1, lcols::ACC);
@@ -546,7 +552,7 @@ impl ConstraintSet<Fp, Ext> for NextRowLogUpSet {
         let a0 = b.alpha_pow(0);
         let a1 = b.alpha_pow(1);
         let off = b.table_offset();
-        b.emit_ext(1, acc_next - acc - (ch * a0 + term * a1) + off);
+        b.emit_ext_exempt(1, 1, 1, acc_next - acc - (ch * a0 + term * a1) + off);
     }
 }
 

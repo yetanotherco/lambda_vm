@@ -22,26 +22,18 @@ type StarkField = GoldilocksField;
 pub struct DummyConstraints;
 
 impl ConstraintSet<StarkField, StarkField> for DummyConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            // idx 0: fibonacci on column 1; reads two next rows ⇒ 2 end exemptions.
-            ConstraintMeta::base(0, 1).with_end_exemptions(2),
-            // idx 1: IS_BIT on column 0, every row.
-            ConstraintMeta::base(1, 2),
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<StarkField, StarkField>>(&self, b: &mut B) {
-        // a_{i+2} = a_{i+1} + a_i on column 1.
+        // idx 0: a_{i+2} = a_{i+1} + a_i on column 1; reads two next rows ⇒ 2
+        // end exemptions.
         let a0 = b.main(0, 1);
         let a1 = b.main(1, 1);
         let a2 = b.main(2, 1);
-        b.emit_base(0, a2 - a1 - a0);
+        b.emit_base_exempt(0, 1, 2, a2 - a1 - a0);
 
-        // bit * (bit - 1) = 0 on column 0.
+        // idx 1: IS_BIT on column 0, every row. bit * (bit - 1) = 0.
         let bit = b.main(0, 0);
         let one = b.one();
-        b.emit_base(1, bit.clone() * (bit - one));
+        b.emit_base(1, 2, bit.clone() * (bit - one));
     }
 }
 

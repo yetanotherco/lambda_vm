@@ -19,7 +19,7 @@ use executor::vm::instruction::execution::KECCAK_SYSCALL_NUMBER;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::{AddOperand, INV_SHIFT_32};
@@ -464,19 +464,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct KeccakConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(51);
-        for lane_idx in 0..25 {
-            // ADD pair is conditional on μ → degree 3.
-            m.extend(crate::constraints::templates::add_pair_meta(
-                lane_idx * 2,
-                true,
-            ));
-        }
-        m.push(ConstraintMeta::base(50, 2)); // μ · carry_1
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         use crate::constraints::templates::emit_add_pair;
 
@@ -514,6 +501,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         let carry_0 = (addr_lo + c192 - ptr_lo) * inv_2_32.clone();
         let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
         let mu = b.main(0, cols::MU);
-        b.emit_base(50, mu * carry_1);
+        b.emit_base(50, 2, mu * carry_1);
     }
 }

@@ -689,7 +689,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 //   2: LhsSign                  3: RhsSign
 //   4..8: RawProduct(0..4)
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// MUL table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the MUL layout is fixed via `cols`).
@@ -787,42 +787,29 @@ impl MulConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 2), // SignedIsBit(LHS_SIGNED)
-            ConstraintMeta::base(1, 2), // SignedIsBit(RHS_SIGNED)
-            ConstraintMeta::base(2, 2), // LhsSign
-            ConstraintMeta::base(3, 2), // RhsSign
-            ConstraintMeta::base(4, 2), // RawProduct(0)
-            ConstraintMeta::base(5, 2), // RawProduct(1)
-            ConstraintMeta::base(6, 2), // RawProduct(2)
-            ConstraintMeta::base(7, 2), // RawProduct(3)
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
         let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);
-        b.emit_base(0, is_bit_lhs);
+        b.emit_base(0, 2, is_bit_lhs);
         let is_bit_rhs = Self::signed_is_bit(b, cols::RHS_SIGNED);
-        b.emit_base(1, is_bit_rhs);
+        b.emit_base(1, 2, is_bit_rhs);
 
         // idx 2: LhsSign: (1 - lhs_signed) * lhs_is_negative
         let lhs_signed = b.main(0, cols::LHS_SIGNED);
         let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
         let one = b.one();
-        b.emit_base(2, (one - lhs_signed) * lhs_is_neg);
+        b.emit_base(2, 2, (one - lhs_signed) * lhs_is_neg);
 
         // idx 3: RhsSign: (1 - rhs_signed) * rhs_is_negative
         let rhs_signed = b.main(0, cols::RHS_SIGNED);
         let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
         let one = b.one();
-        b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
+        b.emit_base(3, 2, (one - rhs_signed) * rhs_is_neg);
 
         // idx 4..8: raw_product convolution for i = 0..4.
         for i in 0..4 {
             let root = Self::raw_product(b, i);
-            b.emit_base(4 + i, root);
+            b.emit_base(4 + i, 2, root);
         }
     }
 }

@@ -32,16 +32,12 @@ impl<F> ConstraintSet<F, F> for SimpleFibonacciConstraints<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // idx 0: a_{i+2} = a_{i+1} + a_i; reads two next rows ⇒ 2 end exemptions.
-        vec![ConstraintMeta::base(0, 1).with_end_exemptions(2)]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let a0 = b.main(0, 0);
         let a1 = b.main(1, 0);
         let a2 = b.main(2, 0);
-        b.emit_base(0, a2 - a1 - a0);
+        // idx 0: a_{i+2} = a_{i+1} + a_i; reads two next rows ⇒ 2 end exemptions.
+        b.emit_base_exempt(0, 1, 2, a2 - a1 - a0);
     }
 }
 

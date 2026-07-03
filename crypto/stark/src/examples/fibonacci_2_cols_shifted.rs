@@ -57,25 +57,16 @@ impl<F> ConstraintSet<F, F> for Fibonacci2ColsShiftedConstraints<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            // idx 0: Col0_{i+1} = Col1_i; reads the next row ⇒ 1 end exemption.
-            ConstraintMeta::base(0, 1).with_end_exemptions(1),
-            // idx 1: Col1_{i+1} = Col0_i + Col1_i; reads the next row ⇒ 1 end exemption.
-            ConstraintMeta::base(1, 1).with_end_exemptions(1),
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let a0_0 = b.main(0, 0);
         let a0_1 = b.main(0, 1);
         let a1_0 = b.main(1, 0);
         let a1_1 = b.main(1, 1);
 
-        // Col0_{i+1} = Col1_i
-        b.emit_base(0, a1_0 - a0_1.clone());
-        // Col1_{i+1} = Col0_i + Col1_i
-        b.emit_base(1, a1_1 - a0_0 - a0_1);
+        // idx 0: Col0_{i+1} = Col1_i; reads the next row ⇒ 1 end exemption.
+        b.emit_base_exempt(0, 1, 1, a1_0 - a0_1.clone());
+        // idx 1: Col1_{i+1} = Col0_i + Col1_i; reads the next row ⇒ 1 end exemption.
+        b.emit_base_exempt(1, 1, 1, a1_1 - a0_0 - a0_1);
     }
 }
 

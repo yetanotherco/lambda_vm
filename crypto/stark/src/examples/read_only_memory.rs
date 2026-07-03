@@ -31,15 +31,6 @@ impl<F> ConstraintSet<F, F> for ReadOnlyRAPConstraints
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // All three read the next row ⇒ 1 end exemption each.
-        vec![
-            ConstraintMeta::base(0, 2).with_end_exemptions(1), // continuity
-            ConstraintMeta::base(1, 2).with_end_exemptions(1), // single value
-            ConstraintMeta::ext(2, 2).with_end_exemptions(1),  // permutation
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let a_sorted_0 = b.main(0, 2);
         let a_sorted_1 = b.main(1, 2);
@@ -48,10 +39,16 @@ where
         let one = b.one();
         let addr_diff = a_sorted_1 - a_sorted_0;
 
-        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-        b.emit_base(0, addr_diff.clone() * (addr_diff.clone() - one.clone()));
-        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-        b.emit_base(1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
+        // All three read the next row ⇒ degree 2, 1 end exemption each.
+        // idx 0 — continuity: (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        b.emit_base_exempt(
+            0,
+            2,
+            1,
+            addr_diff.clone() * (addr_diff.clone() - one.clone()),
+        );
+        // idx 1 — single value: (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        b.emit_base_exempt(1, 2, 1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
 
         // (z - (a'_{i+1} + α * v'_{i+1})) * p_{i+1} = (z - (a_{i+1} + α * v_{i+1})) * p_i
         let p0 = b.aux(0, 0);
@@ -64,7 +61,8 @@ where
         let v_sorted_1 = b.main(1, 3);
         let sorted_fp = z.clone() - (a_sorted_1 + v_sorted_1 * alpha.clone());
         let unsorted_fp = z - (a1 + v1 * alpha);
-        b.emit_ext(2, sorted_fp * p1 - unsorted_fp * p0);
+        // idx 2 — permutation (degree 2, 1 end exemption).
+        b.emit_ext_exempt(2, 2, 1, sorted_fp * p1 - unsorted_fp * p0);
     }
 }
 

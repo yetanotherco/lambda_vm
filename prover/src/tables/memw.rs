@@ -33,7 +33,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::emit_is_bit;
@@ -860,25 +860,17 @@ fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) ->
 pub struct MemwConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(15);
-        for i in 0..15 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum)
         let one = b.one();
         let mu_sum = mu_sum_expr(b);
-        b.emit_base(0, mu_sum.clone() * (one - mu_sum));
+        b.emit_base(0, 2, mu_sum.clone() * (one - mu_sum));
 
         // idx 1: w2 ⇒ μ_sum = w2 * (1 - μ_sum)
         let one = b.one();
         let w2 = w2_expr(b);
         let mu_sum = mu_sum_expr(b);
-        b.emit_base(1, w2 * (one - mu_sum));
+        b.emit_base(1, 2, w2 * (one - mu_sum));
 
         // idx 2,3: IS_BIT<μ_read>, IS_BIT<μ_write>
         emit_is_bit(b, 2, cols::MU_READ, None);
@@ -900,6 +892,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwConstraints {
         // idx 14: IS_BIT<w2> = w2 * (1 - w2)
         let one = b.one();
         let w2 = w2_expr(b);
-        b.emit_base(idx, w2.clone() * (one - w2));
+        b.emit_base(idx, 2, w2.clone() * (one - w2));
     }
 }
