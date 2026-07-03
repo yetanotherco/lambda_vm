@@ -397,7 +397,7 @@ fn coset_lde_row_major_inner(
     blowup_factor: usize,
     weights: &[u64],
     what: &str,
-) -> Result<(Vec<u8>, CudaSlice<u64>, Vec<u64>)> {
+) -> Result<(GpuMerkleTree, CudaSlice<u64>, Vec<u64>)> {
     assert_eq!(row_major.len(), n * total_cols);
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
@@ -489,33 +489,44 @@ fn coset_lde_row_major_inner(
         out
     };
 
-    let mut nodes_out = vec![0u8; nodes_bytes];
-    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, &mut nodes_out)?;
+    // Keep the Merkle tree resident on device; copy only the 32 byte root so the
+    // commitment is available without copying the whole tree. Query openings
+    // gather paths from the device tree (see merkle::gather_merkle_paths_dev).
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
 
-    // Transpose row-major buf → column-major for the handle. Downstream kernels
-    // (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
+    // Transpose row-major buf into column-major for the handle. Downstream
+    // kernels (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, total_cols, lde_u64)?;
-    // Synchronize before returning: the handle crosses stream boundaries — downstream
-    // consumers call be.next_stream() and read handle.buf on a different stream.
-    // Without this, a barycentric or DEEP kernel can start before the transpose finishes.
+    // Synchronize before returning: the handle crosses stream boundaries.
+    // Downstream consumers call be.next_stream() and read handle.buf on a
+    // different stream, and the root copy above must have landed.
     stream.synchronize()?;
 
-    Ok((nodes_out, col_major_dev, lde_out))
+    let tree = GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    };
+    Ok((tree, col_major_dev, lde_out))
 }
 
-/// Row-major LDE + Keccak + Merkle, all on-device.
+/// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
+/// resident on device (in the handle's `tree`). The host tree is not built, so
+/// the whole tree copy to host is eliminated; query openings gather paths from
+/// the device tree.
 ///
-/// Input: `row_major` is a flat `n * m` slice in row-major order.
-/// Returns (merkle_nodes, GpuLdeBase handle, row-major LDE Vec).
-/// The returned handle is column-major (as required by downstream GPU kernels).
+/// Input: `row_major` is a flat `n * m` slice in row-major order. Returns the
+/// `GpuLdeBase` handle (column-major buf, plus the device tree) and the
+/// row-major LDE Vec.
 pub fn coset_lde_row_major_with_merkle_tree_keep(
     row_major: &[u64],
     n: usize,
     m: usize,
     blowup_factor: usize,
     weights: &[u64],
-) -> Result<(Vec<u8>, GpuLdeBase, Vec<u64>)> {
-    let (nodes_out, col_major_dev, lde_out) = coset_lde_row_major_inner(
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
         row_major,
         n,
         m,
@@ -527,8 +538,9 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         buf: Arc::new(col_major_dev),
         m,
         lde_size: n * blowup_factor,
+        tree: Some(tree),
     };
-    Ok((nodes_out, handle, lde_out))
+    Ok((handle, lde_out))
 }
 
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
@@ -547,8 +559,8 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     m: usize,
     blowup_factor: usize,
     weights: &[u64],
-) -> Result<(Vec<u8>, GpuLdeExt3, Vec<u64>)> {
-    let (nodes_out, col_major_dev, lde_out) = coset_lde_row_major_inner(
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
         row_major,
         n,
         m * 3,
@@ -560,18 +572,24 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         buf: Arc::new(col_major_dev),
         m,
         lde_size: n * blowup_factor,
+        tree: Some(tree),
     };
-    Ok((nodes_out, handle, lde_out))
+    Ok((handle, lde_out))
 }
 
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
+///
+/// `tree` optionally carries the main trace Merkle tree kept resident on device
+/// (the keep path), so R4 query openings gather paths on device instead of
+/// copying the whole tree to host. None on the CPU path.
 #[derive(Clone)]
 pub struct GpuLdeBase {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+    pub tree: Option<GpuMerkleTree>,
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -582,6 +600,23 @@ pub struct GpuLdeExt3 {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+    /// Optionally the aux or composition Merkle tree kept resident on device
+    /// (the keep path), so R4 openings gather paths on device. None otherwise.
+    pub tree: Option<GpuMerkleTree>,
+}
+
+/// Merkle tree kept resident on device after a commit, so query openings gather
+/// paths on device instead of copying the whole tree to host. Node layout
+/// matches the CPU tree (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]`
+/// are inner nodes (root at 0), `nodes[leaves_len-1..]` are the leaves, each 32
+/// bytes. Freed when the `nodes` Arc drops.
+#[derive(Clone)]
+pub struct GpuMerkleTree {
+    pub nodes: Arc<CudaSlice<u8>>,
+    pub leaves_len: usize,
+    /// The Merkle root (node 0), copied to host at build time so the commitment
+    /// is available without copying the whole tree.
+    pub root: [u8; 32],
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
@@ -1141,6 +1176,7 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
             buf: Arc::new(buf),
             m,
             lde_size,
+            tree: None,
         }))
     } else {
         drop(buf);
@@ -1331,6 +1367,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             buf: std::sync::Arc::new(buf),
             m,
             lde_size,
+            tree: None,
         }))
     } else {
         drop(buf);

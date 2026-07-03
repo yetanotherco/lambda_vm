@@ -1,7 +1,153 @@
 use std::cell::RefCell;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+// Wall clock span timeline: the trustworthy per step latency breakdown.
+//
+// Spans open and close on the main thread at phase boundaries. They do not
+// overlap and sum to their parent, so the tree is a true latency breakdown
+// (unlike the accum_* thread local sub timers below, which sum per worker CPU
+// time across rayon threads and can exceed 100%). A parallel region is one span
+// around the blocking call; its internal split is reported separately as CPU
+// time, never mixed into the wall tree.
+//
+//     let _s = instruments::span("trace_build");   // RAII, stops on drop
+//
+// Instant::now() is about 20 ns, fine at phase granularity, not in per op loops.
+
+#[derive(Clone, Debug)]
+pub struct SpanRecord {
+    pub label: &'static str,
+    pub depth: u16,
+    pub wall: Duration,
+    /// Open-order, so the tree reconstructs in start-order (records push on close).
+    pub order: u32,
+    /// Wall clock epoch (ns) when the span opened, for aligning with external
+    /// samplers (e.g. nvidia-smi GPU util) to attribute device busy time per step.
+    pub start_ns: u128,
+}
+
+static TIMELINE: Mutex<Vec<SpanRecord>> = Mutex::new(Vec::new());
+static SPAN_ORDER: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
+}
+
+#[must_use]
+pub struct SpanGuard {
+    label: &'static str,
+    depth: u16,
+    order: u32,
+    start: Instant,
+    start_ns: u128,
+}
+
+/// Open a wall-clock span; records elapsed time when the guard drops.
+pub fn span(label: &'static str) -> SpanGuard {
+    let depth = SPAN_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
+    let order = SPAN_ORDER.fetch_add(1, Ordering::Relaxed) as u32;
+    let start_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    SpanGuard {
+        label,
+        depth,
+        order,
+        start: Instant::now(),
+        start_ns,
+    }
+}
+
+impl Drop for SpanGuard {
+    fn drop(&mut self) {
+        let wall = self.start.elapsed();
+        SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        if let Ok(mut t) = TIMELINE.lock() {
+            t.push(SpanRecord {
+                label: self.label,
+                depth: self.depth,
+                wall,
+                order: self.order,
+                start_ns: self.start_ns,
+            });
+        }
+    }
+}
+
+/// Clear recorded spans. Call at the start of a measured prove.
+pub fn reset_timeline() {
+    SPAN_ORDER.store(0, Ordering::Relaxed);
+    SPAN_DEPTH.with(|d| d.set(0));
+    if let Ok(mut t) = TIMELINE.lock() {
+        t.clear();
+    }
+}
+
+/// Drain recorded spans, sorted in start-order (ready for the tree).
+pub fn take_timeline() -> Vec<SpanRecord> {
+    let mut spans = TIMELINE
+        .lock()
+        .map(|mut t| std::mem::take(&mut *t))
+        .unwrap_or_default();
+    spans.sort_by_key(|s| s.order);
+    spans
+}
+
+/// Indented wall-clock tree with % of the root span.
+pub fn format_timeline(spans: &[SpanRecord]) -> String {
+    use std::fmt::Write;
+    if spans.is_empty() {
+        return String::new();
+    }
+    let total_s = spans
+        .first()
+        .map(|s| s.wall.as_secs_f64())
+        .unwrap_or(1e-9)
+        .max(1e-9);
+    let mut out = String::from("=== TIMELINE (wall-clock) ===\n");
+    for s in spans {
+        let indent = "  ".repeat(s.depth as usize);
+        let pct = 100.0 * s.wall.as_secs_f64() / total_s;
+        let _ = writeln!(
+            out,
+            "{:<42} {:>10.3?} {:>6.1}%",
+            format!("{indent}{}", s.label),
+            s.wall,
+            pct
+        );
+    }
+    out
+}
+
+/// JSON array of `{label, depth, wall_ns, order}` for diffing / plotting.
+pub fn timeline_json(spans: &[SpanRecord]) -> String {
+    let mut out = String::from("[");
+    for (i, s) in spans.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // Escape the label so a quote or backslash cannot break the JSON.
+        let label = s.label.replace('\\', "\\\\").replace('"', "\\\"");
+        out.push_str(&format!(
+            "{{\"label\":\"{}\",\"depth\":{},\"wall_ns\":{},\"order\":{},\"start_ns\":{}}}",
+            label,
+            s.depth,
+            s.wall.as_nanos(),
+            s.order,
+            s.start_ns
+        ));
+    }
+    out.push(']');
+    out
+}
 
 static HEAP_READER: OnceLock<fn() -> Option<usize>> = OnceLock::new();
 
@@ -122,8 +268,8 @@ pub fn take_r1_sub() -> Round1SubOps {
 /// Reset all instrument state. Call at the start of `multi_prove` to avoid
 /// stale data from a previous run in the same process.
 ///
-/// Note: thread-local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
-/// for the calling thread. Rayon worker threads are not reset — stale data is
+/// Note: thread local stores (R2_SUB, R4_SUB, ROUND_SUB_OPS) are only cleared
+/// for the calling thread. Rayon worker threads are not reset, so stale data is
 /// possible if a previous run panicked without consuming stored values.
 /// In practice this is safe because store/take pairs always execute within the
 /// same rayon task closure.

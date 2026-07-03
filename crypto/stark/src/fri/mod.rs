@@ -119,6 +119,14 @@ pub fn query_phase<F: IsField>(
 where
     FieldElement<F>: AsBytes + Sync + Send,
 {
+    // GPU fast path: gather every layer's authentication paths on device (the
+    // layer trees stay resident from the GPU commit). Falls back to the host
+    // walk below if any layer lacks a device tree.
+    #[cfg(feature = "cuda")]
+    if let Some(decommits) = crate::gpu_lde::try_fri_query_phase_gpu::<F>(fri_layers, iotas) {
+        return decommits;
+    }
+
     if !fri_layers.is_empty() {
         let num_layers = fri_layers.len();
         iotas
