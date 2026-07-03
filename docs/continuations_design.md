@@ -462,8 +462,8 @@ The integrated `prove_and_verify_continuation` proves and verifies in one
 **streaming** pass: it proves each epoch, verifies it inline with `verify_epoch`,
 and drops that epoch's `MultiProof` — retaining only the small
 `boundary`/`l2g_root`/`public_output` — before building and verifying the one
-global proof. This bounds its retained-proof memory to a single epoch at a time
-instead of holding all *N*. It is a faithful in-process mirror of
+global proof. This bounds its retained-proof memory to O(1) epochs (at most two are
+live across the one-epoch `is_final` lookahead) instead of holding all *N*. It is a faithful in-process mirror of
 `verify_continuation` (it derives `is_final`/`label` **positionally** — a one-epoch
 lookahead for `is_final` — and chains `register_init` from each verified epoch's
 `reg_fini`, never trusting the prover), but it is **not** a substitute for verifying

@@ -34,7 +34,8 @@
 //! `ContinuationProof` bundle and `verify_continuation` checks it from the bundle
 //! and ELF alone; `prove_and_verify_continuation` proves and verifies in one
 //! streaming pass, verifying and dropping each epoch proof so its retained-proof
-//! memory stays bounded to a single epoch.
+//! memory stays bounded to O(1) epochs (at most two are live across the one-epoch
+//! `is_final` lookahead) instead of collecting all of them.
 
 use std::collections::HashMap;
 
@@ -1230,6 +1231,12 @@ mod tests {
             .unwrap()
             .logs
             .len();
+        // Guard before the arithmetic: `total - 1` underflows and `ilog2(0)` panics
+        // for total <= 1, so check the precondition first rather than after.
+        assert!(
+            total >= 2,
+            "program ({total} cycles) too short to derive a valid 2-epoch split"
+        );
         let epoch_size_log2 = (total as u64 - 1).ilog2();
         assert!(
             epoch_size_log2 >= 2,
