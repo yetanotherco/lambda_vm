@@ -16,9 +16,9 @@ use crate::{
         DeepPolynomialOpeningView, FriDecommitmentView, PolynomialOpeningsView, StarkProofView,
     },
 };
-pub use crate::proof::view::PiDeserializer;
+pub use crate::proof::view::{PiDeserializer};
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::proof::verify_merkle_path;
+use crypto::merkle_tree::proof::verify_merkle_path_from_hash;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -413,9 +413,16 @@ pub trait IsStarkVerifier<
         E::BaseType: rkyv::Archive,
         Field: IsSubFieldOf<E>,
     {
-        let mut value = opening.evaluations().to_vec();
-        value.extend_from_slice(opening.evaluations_sym());
-        verify_merkle_path::<BatchedMerkleTreeBackend<E>>(opening.merkle_path(), root, iota, &value)
+        let leaf_hash = BatchedMerkleTreeBackend::<E>::hash_data_parts(&[
+            &opening.evaluations(),
+            &opening.evaluations_sym(),
+        ]);
+        verify_merkle_path_from_hash::<BatchedMerkleTreeBackend<E>>(
+            opening.merkle_path(),
+            root,
+            iota,
+            leaf_hash,
+        )
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
@@ -465,6 +472,8 @@ pub trait IsStarkVerifier<
 
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
+    /// The composition-poly opening has the identical row-pair leaf layout as
+    /// `verify_opening_pair`, so it's the same check with `E = FieldExtension`.
     fn verify_composition_poly_opening(
         deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
@@ -474,15 +483,10 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let composition_poly = deep_poly_openings.composition_poly();
-        let mut value = composition_poly.evaluations().to_vec();
-        value.extend_from_slice(composition_poly.evaluations_sym());
-
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
-            composition_poly.merkle_path(),
-            composition_poly_merkle_root,
+        Self::verify_opening_pair::<FieldExtension>(
+            deep_poly_openings.composition_poly(),
+            &composition_poly_merkle_root,
             *iota,
-            &value,
         )
     }
 
@@ -524,17 +528,21 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
+        let (first, second) = if iota % 2 == 1 {
+            (evaluation_sym, evaluation)
         } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
+            (evaluation, evaluation_sym)
         };
+        let leaf_hash = BatchedMerkleTreeBackend::<FieldExtension>::hash_data_parts(&[
+            core::slice::from_ref(first),
+            core::slice::from_ref(second),
+        ]);
 
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        verify_merkle_path_from_hash::<BatchedMerkleTreeBackend<FieldExtension>>(
             auth_path_sym,
             merkle_root,
             iota >> 1,
-            &evaluations,
+            leaf_hash,
         )
     }
 

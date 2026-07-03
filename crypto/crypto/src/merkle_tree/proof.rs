@@ -30,14 +30,28 @@ pub struct Proof<T: PartialEq + Eq> {
 pub fn verify_merkle_path<B>(
     merkle_path: &[B::Node],
     root_hash: &B::Node,
-    mut index: usize,
+    index: usize,
     value: &B::Data,
 ) -> bool
 where
     B: IsMerkleTreeBackend,
 {
-    let mut hashed_value = B::hash_data(value);
+    verify_merkle_path_from_hash::<B>(merkle_path, root_hash, index, B::hash_data(value))
+}
 
+/// Same check as [`verify_merkle_path`], starting from an already-computed leaf
+/// hash. Lets callers that can hash their leaf data more efficiently than the
+/// backend's `hash_data` (e.g. hashing several slices without concatenating
+/// them first) still walk the shared path-verification logic.
+pub fn verify_merkle_path_from_hash<B>(
+    merkle_path: &[B::Node],
+    root_hash: &B::Node,
+    mut index: usize,
+    mut hashed_value: B::Node,
+) -> bool
+where
+    B: IsMerkleTreeBackend,
+{
     for sibling_node in merkle_path.iter() {
         if index.is_multiple_of(2) {
             hashed_value = B::hash_new_parent(&hashed_value, sibling_node);

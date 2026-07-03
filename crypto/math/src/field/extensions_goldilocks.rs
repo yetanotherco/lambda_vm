@@ -554,6 +554,13 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
     }
+
+    #[inline(always)]
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        self.value()[0].stream_bytes(sink);
+        self.value()[1].stream_bytes(sink);
+        self.value()[2].stream_bytes(sink);
+    }
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {

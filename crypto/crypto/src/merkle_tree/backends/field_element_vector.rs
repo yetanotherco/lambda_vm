@@ -39,8 +39,8 @@ where
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input[0].as_bytes());
-        hasher.update(input[1].as_bytes());
+        input[0].stream_bytes(&mut |b| hasher.update(b));
+        input[1].stream_bytes(&mut |b| hasher.update(b));
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -86,6 +86,25 @@ where
         result.copy_from_slice(&hasher.finalize());
         result
     }
+
+    /// Hashes the concatenation of `parts` (each a slice of field elements) as a
+    /// single leaf, without allocating a buffer to concatenate them first. Byte-
+    /// identical to hashing `parts.concat()` via [`Self::hash_data`].
+    pub fn hash_data_parts(parts: &[&[FieldElement<F>]]) -> [u8; NUM_BYTES]
+    where
+        F: IsField,
+        FieldElement<F>: AsBytes,
+    {
+        let mut hasher = D::new();
+        for part in parts {
+            for element in part.iter() {
+                element.stream_bytes(&mut |b| hasher.update(b));
+            }
+        }
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&hasher.finalize());
+        result
+    }
 }
 
 impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
@@ -100,13 +119,7 @@ where
     type Data = Vec<FieldElement<F>>;
 
     fn hash_data(input: &Vec<FieldElement<F>>) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        for element in input.iter() {
-            hasher.update(element.as_bytes());
-        }
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        Self::hash_data_parts(&[input.as_slice()])
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
