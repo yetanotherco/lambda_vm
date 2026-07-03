@@ -731,13 +731,20 @@ impl<'a> EpochDriver<'a> {
             .map_err(|e| Error::Execution(format!("{e}")))?
         {
             Some(logs) => logs.to_vec(),
-            // `resume_with_limit` returns `None` only when `pc == 0` at entry, which the
-            // guard above already handles — so this arm is effectively unreachable today.
-            // Kept as a graceful terminator (not `unreachable!`) so that if a future
-            // change makes the executor stop for another reason, the driver ends cleanly
-            // rather than panicking; a resulting `is_final` disagreement would be caught
-            // by `verify_epoch` on the streaming path, never silently accepted.
-            None => return Ok(None),
+            // Unreachable today: `resume_with_limit` returns `None` only when `pc == 0`
+            // at entry, which the guard above already handles. If a future executor
+            // change makes it stop mid-run for another reason, fail loudly at the cause
+            // (still no panic) rather than ending the driver cleanly: a clean end here
+            // would make `prove_continuation` emit a bundle whose last epoch lacks HALT
+            // — never verifiable, with no diagnostic linking the later rejection back
+            // to the early stop.
+            None => {
+                return Err(Error::ContinuationInvariant(
+                    "executor stopped mid-run without halting (resume_with_limit \
+                     returned None with pc != 0 at epoch entry)"
+                        .to_string(),
+                ));
+            }
         };
         let is_final = self.executor.pc() == 0;
 
@@ -886,6 +893,10 @@ pub fn verify_continuation(
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
+    // NOTE: `prove_and_verify_continuation` mirrors this loop and the tail checks below
+    // inline over streamed epochs. Any check added or changed here MUST be mirrored
+    // there — the differential test only exercises honest proofs, so it cannot catch a
+    // rejection check missing from one of the two copies.
     for (index, epoch) in bundle.epochs.iter().enumerate() {
         let is_final = index == n - 1;
         let label = local_to_global::epoch_label(index as u64);
@@ -950,9 +961,12 @@ pub fn prove_and_verify_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
-    // Match `verify_continuation`'s up-front bound so the two paths surface the same
-    // error on an oversized input (the executor also rejects it, but with a different
-    // variant).
+    // Match `verify_continuation`'s up-front bound so this function and the standalone
+    // verifier surface the same error variant for an oversized input, and fail fast
+    // before the executor copies it. (The two-phase composition `prove_continuation` +
+    // `verify_continuation` instead fails inside `Executor::new` with
+    // `Error::Execution` — `prove_continuation` runs first, so the verifier's bound is
+    // never reached on that path.)
     if private_inputs.len() as u64 > MAX_PRIVATE_INPUT_SIZE {
         return Err(Error::InvalidTableCounts(format!(
             "private input size ({}) exceeds max ({MAX_PRIVATE_INPUT_SIZE})",
@@ -964,6 +978,9 @@ pub fn prove_and_verify_continuation(
 
     // Verify-side state, rebuilt independently of the prover: `register_init` chains
     // from each verified epoch's bound `reg_fini` (epoch 0 from the ELF entry point).
+    // NOTE: this loop and the tail checks below are an inline mirror of
+    // `verify_continuation`'s — any check added or changed there MUST be mirrored here
+    // (see the matching note on its epoch loop).
     let mut register_init = register::register_init_from_entry_point(driver.elf.entry_point);
     let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
     let mut epoch_roots: Vec<Commitment> = Vec::new();
@@ -972,7 +989,10 @@ pub fn prove_and_verify_continuation(
 
     // One-epoch lookahead: `is_final` is derived from whether another epoch actually
     // follows (positional), not from a flag the prover stored, so a driver enumeration
-    // bug cannot be silently self-consistent between the prove and verify halves.
+    // bug (an off-by-one or reorder) cannot be silently self-consistent between the
+    // prove and verify halves. Both halves ultimately observe the same in-process
+    // executor, so this buys mirror fidelity with `verify_continuation`'s positional
+    // derivation, not independence from the prover.
     let mut pending = driver.next()?;
     while let Some(epoch) = pending {
         let next = driver.next()?;
@@ -998,6 +1018,12 @@ pub fn prove_and_verify_continuation(
         // Keep only what the global step + final checks need; the MultiProof drops here.
         // `epoch` is owned, so `reg_fini` moves out (no clone) into the next epoch's
         // derived init — the cross-epoch register chain, checked independently here.
+        // Unlike `verify_continuation` there is deliberately no `reg_fini` length guard:
+        // there it is deserialized and untrusted, while here it comes from in-process
+        // `prove_epoch` (`fini_from_trace` always yields exactly NUM_REGISTER_ADDRESSES
+        // entries). A wrong length would be an internal invariant bug and should fail
+        // loudly (the debug_assert in `compute_precomputed_commitment_with_fini`)
+        // rather than be reported as a rejected proof.
         let EpochProof {
             boundary,
             l2g_root,
@@ -1497,6 +1523,27 @@ mod tests {
         bundle.private_inputs = vec![0; MAX_PRIVATE_INPUT_SIZE as usize + 1];
         assert!(matches!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
+            Err(Error::InvalidTableCounts(_))
+        ));
+    }
+
+    // Negative: the streaming path's up-front private-input bound must reject an
+    // oversized input with the same variant as `verify_continuation` (its documented
+    // mirror). Pins the guard itself: without it the executor rejects the same input
+    // later, but with `Error::Execution`. Fires before any proving, so the test only
+    // costs the one oversized allocation.
+    #[test]
+    fn test_streaming_rejects_oversized_private_inputs() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let oversized = vec![0; MAX_PRIVATE_INPUT_SIZE as usize + 1];
+        assert!(matches!(
+            prove_and_verify_continuation(
+                &elf_bytes,
+                &oversized,
+                4,
+                &ProofOptions::default_test_options()
+            ),
             Err(Error::InvalidTableCounts(_))
         ));
     }
