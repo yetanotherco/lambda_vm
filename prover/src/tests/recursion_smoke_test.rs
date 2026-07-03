@@ -441,9 +441,8 @@ fn run_profile(
 }
 
 /// Core pipeline: prove the inner program, run the guest to `mode`, assert it
-/// committed `vk_digest ‖ inner public output` — the outer-verifier check:
-/// the digest of the vkey used in-guest must match one derived on the host
-/// from the trusted inner ELF.
+/// committed the expected `RecursionCommitment`, and run the outer-verifier
+/// check (`verify_recursion_commitment`) against the trusted inner ELF.
 fn run_recursion_pipeline_with_options(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -482,13 +481,27 @@ fn run_recursion_pipeline_with_options(
         OuterMode::Prove => prove_outer_and_commit(label, &recursion_elf_bytes, &blob),
     };
 
-    let mut expected = inner_proof.vk_digest.to_vec();
-    expected.extend_from_slice(&inner_proof.public_output);
+    let commitment: crate::RecursionCommitment =
+        postcard::from_bytes(&committed).expect("decode recursion commitment");
+    let expected = crate::RecursionCommitment {
+        elf_digest: crate::elf_digest(inner_elf_bytes),
+        vk_digest: inner_proof.vk_digest,
+        options: inner_proof_options.clone(),
+        table_counts: inner_proof.table_counts.clone(),
+        num_private_input_pages: inner_proof.num_private_input_pages,
+        runtime_page_ranges: inner_proof.runtime_page_ranges.clone(),
+        public_output: inner_proof.public_output.clone(),
+    };
     assert_eq!(
-        committed, expected,
-        "recursion guest must commit vk_digest ‖ inner public output"
+        commitment, expected,
+        "recursion guest must commit the full RecursionCommitment"
     );
-    eprintln!("[{label}] guest committed vk_digest ‖ output: in-VM verify accepted ✓");
+    // The committed digests must satisfy the outer-verifier check against the
+    // trusted inner ELF and the same options.
+    let out = crate::verify_recursion_commitment(&commitment, inner_elf_bytes, &inner_proof_options)
+        .expect("outer verifier must accept the honest commitment");
+    assert_eq!(out, inner_proof.public_output);
+    eprintln!("[{label}] guest committed RecursionCommitment; outer verify accepted ✓");
 }
 
 /// `run_recursion_pipeline_with_options` with `blowup=8` (the `empty`/`fibonacci` default).

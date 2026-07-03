@@ -28,10 +28,24 @@
 //! - The prover stamps it into `VmProof::vk_digest` and binds it into the
 //!   Fiat-Shamir statement; the verifier recomputes it from its own vkey
 //!   and rejects on mismatch before any STARK work.
-//! - The recursion guest commits `vk_digest ‖ inner public output`, so the
-//!   *outer* verifier can check which vkey was used in-guest against a
-//!   digest derived from the trusted inner ELF. Without that outer check
-//!   the guest's result says nothing — every guest input is prover-supplied.
+//! - The recursion guest commits a [`crate::RecursionCommitment`]. The *outer*
+//!   verifier passes it to [`crate::verify_recursion_commitment`], which
+//!   re-derives the canonical vkey from the trusted inner ELF and rejects on a
+//!   `vk_digest` mismatch. Because the DECODE/REGISTER/PAGE commitments are
+//!   re-derived from that ELF, `vk_digest` is a faithful program identity:
+//!   a prover cannot substitute a vkey whose commitments describe a different
+//!   program. Without that outer check the guest's result says nothing — every
+//!   guest input is prover-supplied.
+//!
+//! Two independent guards back this up. First, `compute_digest` hashes every
+//! `pages` slot, but the verifier ignores the zero-init and private-input slots
+//! (it derives those locally); left unchecked, a prover could reclassify an ELF
+//! data page to zero-init under an unchanged digest, so
+//! `verify_with_options_with_vkey` asserts every ignored slot equals the value
+//! the verifier actually uses. Second, the outer check re-derives `vk_digest`
+//! from the trusted ELF, which requires the execution-dependent
+//! `runtime_page_ranges` and `num_private_input_pages` — carried in the
+//! `RecursionCommitment` because they are not derivable from the ELF alone.
 //!
 //! The digest covers the embedded [`ProofOptions`]: query count and
 //! grinding factor affect soundness but no commitment, so nothing else
@@ -57,7 +71,7 @@ pub const VKEY_VERSION: u32 = 4;
 /// private-input page slots, where there is no preprocessed commitment to
 /// cache. The verifier never reads these slots (private-input pages have no
 /// `with_preprocessed(...)` call in `VmAirs::new`).
-const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
+pub const PRIVATE_INPUT_PAGE_PLACEHOLDER: Commitment = [0u8; 32];
 
 /// Cached preprocessed-table commitments the verifier would otherwise
 /// recompute on every call.

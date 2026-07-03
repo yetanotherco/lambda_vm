@@ -3,10 +3,10 @@
 //! Private input layout (postcard-encoded):
 //!   `(VmProof, Vec<u8>, ProofOptions, VmVerifyingKey)`
 //! where the `Vec<u8>` holds the inner program's ELF bytes and `ProofOptions`
-//! specifies the parameters the inner prover used. Commits
-//! `vk_digest ‖ inner public output` on success: every input here is
-//! prover-supplied, so soundness comes from the outer verifier checking
-//! the committed digest against one derived from the trusted inner ELF.
+//! specifies the parameters the inner prover used. On success commits a
+//! postcard-encoded [`RecursionCommitment`]: every input here is
+//! prover-supplied, so soundness comes from an outer verifier passing it to
+//! `verify_recursion_commitment` with the trusted inner ELF.
 //!
 //! Not `no_std` (std/alloc are available — `build-std` provides them, and the
 //! prover links as a normal std crate; its prove-side code is dead-code
@@ -17,7 +17,7 @@
 
 #![no_main]
 
-use lambda_vm_prover::{ProofOptions, VmProof, VmVerifyingKey};
+use lambda_vm_prover::{ProofOptions, RecursionCommitment, VmProof, VmVerifyingKey};
 
 #[unsafe(export_name = "main")]
 pub fn main() -> ! {
@@ -49,9 +49,18 @@ pub fn main() -> ! {
     .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
-    let mut output = Vec::with_capacity(32 + vm_proof.public_output.len());
-    output.extend_from_slice(&vkey.compute_digest());
-    output.extend_from_slice(&vm_proof.public_output);
+    // `vm_proof.vk_digest` was just checked equal to `vkey.compute_digest()`
+    // inside verify, so reuse it instead of re-serializing and re-hashing.
+    let commitment = RecursionCommitment {
+        elf_digest: lambda_vm_prover::elf_digest(&inner_elf),
+        vk_digest: vm_proof.vk_digest,
+        options,
+        table_counts: vm_proof.table_counts,
+        num_private_input_pages: vm_proof.num_private_input_pages,
+        runtime_page_ranges: vm_proof.runtime_page_ranges,
+        public_output: vm_proof.public_output,
+    };
+    let output = postcard::to_allocvec(&commitment).expect("failed to serialize commitment");
     lambda_vm_syscalls::syscalls::commit(&output);
     lambda_vm_syscalls::syscalls::sys_halt();
 }

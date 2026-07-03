@@ -21,6 +21,7 @@ pub mod instruments;
 mod paged_mem;
 pub use stark::profile_markers;
 mod statement;
+pub use statement::elf_digest;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
@@ -71,7 +72,7 @@ use stark::proof::stark::MultiProof;
 ///
 /// Represents `count` contiguous pages starting at `base`, used for
 /// runtime-allocated memory (stack, heap) not covered by ELF segments.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RuntimePageRange {
     /// Base address of the first page (4KB-aligned).
     pub base: u64,
@@ -86,7 +87,7 @@ pub const FIXED_TABLE_COUNT: usize = 11;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
@@ -179,6 +180,62 @@ pub struct VmProof {
     /// into the Fiat-Shamir statement and checked by the verifier against
     /// its own vkey's digest before any STARK work.
     pub vk_digest: [u8; 32],
+}
+
+/// Public output the recursion guest commits after an in-VM verify. Its fields
+/// let [`verify_recursion_commitment`] bind the result to a trusted program and
+/// options; see that fn and `vkey.rs` for the soundness argument.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecursionCommitment {
+    /// Keccak256 of the raw inner ELF bytes the guest verified.
+    pub elf_digest: [u8; 32],
+    pub vk_digest: [u8; 32],
+    pub options: ProofOptions,
+    pub table_counts: TableCounts,
+    pub num_private_input_pages: usize,
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
+    pub public_output: Vec<u8>,
+}
+
+/// Outer-verifier check for a [`RecursionCommitment`]: re-derives the canonical
+/// vkey from `trusted_elf_bytes`, rejects on `elf_digest`/`options`/`vk_digest`
+/// mismatch, and returns the inner public output. See `vkey.rs`.
+///
+/// Two caller obligations, both trusted-input boundaries this fn does not check:
+/// - The `commitment` must come from an *already-verified* outer proof of the
+///   trusted recursion guest. This fn checks no STARK proof; on unverified bytes
+///   it proves nothing.
+/// - `mandated_options` must be a vetted secure parameter set, never options
+///   echoed from the prover.
+pub fn verify_recursion_commitment(
+    commitment: &RecursionCommitment,
+    trusted_elf_bytes: &[u8],
+    mandated_options: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    if commitment.elf_digest != elf_digest(trusted_elf_bytes) {
+        return Err(Error::InvalidVerifyingKey(
+            "recursion elf_digest does not match the trusted ELF".into(),
+        ));
+    }
+    if commitment.options != *mandated_options {
+        return Err(Error::InvalidVerifyingKey(
+            "recursion options do not match the mandated options".into(),
+        ));
+    }
+    let program = Elf::load(trusted_elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &commitment.runtime_page_ranges,
+        commitment.num_private_input_pages,
+    );
+    let canonical =
+        VmVerifyingKey::from_elf_and_options(&program, mandated_options, None, &page_configs);
+    if commitment.vk_digest != canonical.compute_digest() {
+        return Err(Error::InvalidVerifyingKey(
+            "recursion vk_digest does not match the vkey derived from the trusted ELF".into(),
+        ));
+    }
+    Ok(commitment.public_output.clone())
 }
 
 /// Error type for the prover crate.
@@ -1121,13 +1178,9 @@ pub fn verify_with_options(
 ///
 /// # Security
 ///
-/// The vkey is TRUSTED input. Passing one supplied by the prover (as the
-/// recursion guest does) proves nothing by itself: a coordinated prover can
-/// commit to a forged preprocessed table and ship a matching vkey, and the
-/// transcript stays self-consistent. Soundness requires the caller's output
-/// to bind `vkey.compute_digest()` (the recursion guest commits it) so an
-/// outer verifier can compare it against a digest derived from trusted
-/// inputs. See `vkey.rs`.
+/// The vkey is TRUSTED input; a prover-supplied one proves nothing unless the
+/// caller binds `vkey.compute_digest()` into an output an outer verifier checks
+/// against a trusted-input digest. See `vkey.rs` and [`RecursionCommitment`].
 pub fn verify_with_options_with_vkey(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
@@ -1198,6 +1251,25 @@ pub fn verify_with_options_with_vkey(
         return Err(Error::InvalidVerifyingKey(
             "proof vk_digest does not match the verifying key's digest".into(),
         ));
+    }
+
+    // Enforce the page slots `new_with_vkey` derives locally instead of reading
+    // from the vkey (zero-init, private-input). `compute_digest` hashes them, so
+    // without this check they contribute to the digest unenforced. See vkey.rs.
+    let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
+    for (i, config) in page_configs.iter().enumerate() {
+        let (expected, kind) = if config.is_private_input {
+            (crate::vkey::PRIVATE_INPUT_PAGE_PLACEHOLDER, "private-input")
+        } else if config.init_values.is_none() {
+            (zero_init_commitment, "zero-init")
+        } else {
+            continue;
+        };
+        if vkey.pages[i] != expected {
+            return Err(Error::InvalidVerifyingKey(format!(
+                "vkey.pages[{i}] does not match the expected {kind} page commitment",
+            )));
+        }
     }
 
     // Cross-check: table_counts must match the number of sub-proofs.

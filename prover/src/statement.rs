@@ -15,11 +15,12 @@ use sha3::{Digest, Keccak256};
 use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
-/// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
 /// Domain-separation tag. Bump the suffix (`_V3`, ...) on any encoding change.
 const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
-fn elf_digest(elf: &[u8]) -> [u8; 32] {
+/// Keccak256 of the raw ELF bytes — the program identity bound into the
+/// statement and committed by the recursion guest.
+pub fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(elf);
     h.finalize().into()
