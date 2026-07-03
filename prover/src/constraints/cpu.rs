@@ -78,7 +78,7 @@ pub fn emit_product_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensi
     col_b: usize,
 ) {
     let root = b.main(0, col_a) * b.main(0, col_b);
-    b.emit_base(idx, 2, root);
+    b.emit_base(idx, root);
 }
 
 /// `(1 − MEMORY − BRANCH) · read_register2 · imm[i] = 0`.
@@ -92,7 +92,7 @@ pub fn emit_arg2_exclusive<B: ConstraintBuilder<GoldilocksField, GoldilocksExten
     let branch = b.main(0, cols::BRANCH);
     let rr2 = b.main(0, cols::READ_REGISTER2);
     let imm = b.main(0, imm_col);
-    b.emit_base(idx, 3, (one - memory - branch) * rr2 * imm);
+    b.emit_base(idx, (one - memory - branch) * rr2 * imm);
 }
 
 /// `(1 − MEMORY) · mem_flags · (1 − mem_flags) = 0`.
@@ -105,7 +105,6 @@ pub fn emit_mem_flags_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtens
     let mem_flags = b.main(0, cols::MEM_FLAGS);
     b.emit_base(
         idx,
-        3,
         (one.clone() - memory) * mem_flags.clone() * (one - mem_flags),
     );
 }
@@ -120,7 +119,7 @@ pub fn emit_reg_not_read_is_zero<B: ConstraintBuilder<GoldilocksField, Goldilock
     let one = b.one();
     let flag = b.main(0, flag_col);
     let value = b.main(0, value_col);
-    b.emit_base(idx, 2, (one - flag) * value);
+    b.emit_base(idx, (one - flag) * value);
 }
 
 /// `arg2` multiplex for word index `word_idx ∈ {0, 1}`:
@@ -149,7 +148,7 @@ pub fn emit_arg2<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         + branch.clone() * rv2.clone()
         + (one - memory - branch) * (rv2 + imm);
     // Degree 2 relies on the live `MEMORY·BRANCH = 0` mutex.
-    b.emit_base(idx, 2, arg2 - expected);
+    b.emit_base(idx, arg2 - expected);
 }
 
 /// `cast(res, DWordWL)` word from the four `res` halves (DWordHL).
@@ -178,7 +177,7 @@ pub fn emit_rvd_eq_res<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension
     let branch = b.main(0, cols::BRANCH);
     let rvd = b.main(0, rvd_col);
     let res_w = res_word_expr(b, high);
-    b.emit_base(idx, 2, (one - memory - branch) * (rvd - res_w));
+    b.emit_base(idx, (one - memory - branch) * (rvd - res_w));
 }
 
 /// The `pc + instruction_length` carry pair against a destination dword
@@ -210,10 +209,10 @@ fn emit_pc_len_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensio
     // gate·carry·(1−carry): degree 3 (both instances).
     let one = b.one();
     let g = gate(b);
-    b.emit_base(idx, 3, g * carry_0.clone() * (one - carry_0));
+    b.emit_base(idx, g * carry_0.clone() * (one - carry_0));
     let one = b.one();
     let g = gate(b);
-    b.emit_base(idx + 1, 3, g * carry_1.clone() * (one - carry_1));
+    b.emit_base(idx + 1, g * carry_1.clone() * (one - carry_1));
 }
 
 /// `BRANCH · carry · (1 − carry) = 0` for `rvd = pc + instruction_length`
@@ -239,7 +238,7 @@ pub fn emit_branch_cond<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensio
     let branch_cond = b.main(0, cols::BRANCH_COND);
 
     let expected = branch.clone() * jalr.clone() + branch * (one - jalr) * res0;
-    b.emit_base(idx, 3, branch_cond - expected);
+    b.emit_base(idx, branch_cond - expected);
 }
 
 /// `(1 − branch_cond) · carry · (1 − carry) = 0` for
@@ -277,6 +276,12 @@ pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExt
 pub struct CpuConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
+    // The conditional ADD/SUB carry pairs, arg2 exclusivity, mem-flags bit and
+    // branch constraints are degree 3.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0..11: IS_BIT on each BIT_FLAG_COLUMNS entry (unconditional).
         for (i, &col) in BIT_FLAG_COLUMNS.iter().enumerate() {

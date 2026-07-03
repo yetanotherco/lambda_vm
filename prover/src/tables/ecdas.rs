@@ -405,24 +405,29 @@ impl EcdasConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
+    // The Lambda ConvCarry has the op·(λ·Δx) term, making it degree 3.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1,2: unconditional IS_BIT `x·(1−x)` on [MU, OP, NEXT_OP].
         for (i, col) in [cols::MU, cols::OP, cols::NEXT_OP].into_iter().enumerate() {
             let x = b.main(0, col);
             let one = b.one();
-            b.emit_base(i, 2, x.clone() * (one - x));
+            b.emit_base(i, x.clone() * (one - x));
         }
 
         // idx 3: OP · NEXT_OP = 0.
         let op = b.main(0, cols::OP);
         let next_op = b.main(0, cols::NEXT_OP);
-        b.emit_base(3, 2, op * next_op);
+        b.emit_base(3, op * next_op);
 
         // idx 4: NEXT_OP · (1 − MU) = 0.
         let next_op = b.main(0, cols::NEXT_OP);
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(4, 2, next_op * (one - mu));
+        b.emit_base(4, next_op * (one - mu));
 
         // Per relation: 64 ConvCarry (i=0..64) + 1 ColIsZero(c_63).
         let mut idx = 5;
@@ -431,19 +436,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcdasConstraints {
             (Relation::Xr, cols::C1),
             (Relation::Yr, cols::C2),
         ] {
-            // ConvCarry degree: Lambda has the op·(λ·Δx) term (degree 3);
-            // Xr/Yr are degree 2.
-            let conv_degree = match relation {
-                Relation::Lambda => 3,
-                Relation::Xr | Relation::Yr => 2,
-            };
             for i in 0..64 {
                 let root = Self::conv_carry(b, relation, i);
-                b.emit_base(idx, conv_degree, root);
+                b.emit_base(idx, root);
                 idx += 1;
             }
             let c_last = b.main(0, c_base + 63);
-            b.emit_base(idx, 1, c_last); // ColIsZero c_63
+            b.emit_base(idx, c_last); // ColIsZero c_63
             idx += 1;
         }
     }

@@ -438,9 +438,10 @@ fn test_constraints_count_and_indices() {
     use stark::constraints::builder::ConstraintSet;
     let meta = CommitConstraints.meta();
     assert_eq!(meta.len(), 8);
-    // Dense, idx-ordered, all degree 2 (unconditional).
+    // Dense, idx-ordered.
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
-        assert_eq!(m.degree, 2);
     }
+    // All constraints are degree 2 (unconditional).
+    assert_eq!(CommitConstraints.max_degree(), 2);
 }

@@ -119,33 +119,22 @@ pub trait ConstraintBuilder<F: IsField, E: IsField> {
     }
 
     // ---- sinks ----------------------------------------------------------
-    /// Record base-field constraint `constraint_idx`'s value, declaring its
-    /// polynomial `degree` and the number of trailing rows it is exempt from
-    /// (`end_exemptions`). Declaring these AT the emit site is what lets
+    /// Record base-field constraint `constraint_idx`'s value over the trace
+    /// `rows` it applies to (see [`RowDomain`]). Recording it here is what lets
     /// [`ConstraintSet::meta`] be *derived* from this single body (via
-    /// [`MetaBuilder`]) instead of hand-maintained as a parallel list.
-    fn emit_base_exempt(
-        &mut self,
-        constraint_idx: usize,
-        degree: usize,
-        end_exemptions: usize,
-        e: Self::Expr,
-    );
-    /// Extension-field (LogUp) counterpart of [`Self::emit_base_exempt`].
-    fn emit_ext_exempt(
-        &mut self,
-        constraint_idx: usize,
-        degree: usize,
-        end_exemptions: usize,
-        e: Self::ExprE,
-    );
-    /// Record a base-field constraint with no end-exemptions (the common case).
-    fn emit_base(&mut self, constraint_idx: usize, degree: usize, e: Self::Expr) {
-        self.emit_base_exempt(constraint_idx, degree, 0, e);
+    /// [`MetaBuilder`]) instead of hand-maintained as a parallel list. The
+    /// constraint's polynomial degree is NOT declared per-constraint — only the
+    /// per-table max matters, declared once via [`ConstraintSet::max_degree`].
+    fn emit_base_rows(&mut self, constraint_idx: usize, rows: RowDomain, e: Self::Expr);
+    /// Extension-field (LogUp) counterpart of [`Self::emit_base_rows`].
+    fn emit_ext_rows(&mut self, constraint_idx: usize, rows: RowDomain, e: Self::ExprE);
+    /// Record a base-field constraint that applies to every row (common case).
+    fn emit_base(&mut self, constraint_idx: usize, e: Self::Expr) {
+        self.emit_base_rows(constraint_idx, RowDomain::ALL, e);
     }
-    /// Record an extension-field (LogUp) constraint with no end-exemptions.
-    fn emit_ext(&mut self, constraint_idx: usize, degree: usize, e: Self::ExprE) {
-        self.emit_ext_exempt(constraint_idx, degree, 0, e);
+    /// Record an extension-field (LogUp) constraint that applies to every row.
+    fn emit_ext(&mut self, constraint_idx: usize, e: Self::ExprE) {
+        self.emit_ext_rows(constraint_idx, RowDomain::ALL, e);
     }
 
     // ---- folds ----------------------------------------------------------
@@ -183,41 +172,55 @@ pub enum RootKind {
     Ext,
 }
 
-/// Per-constraint metadata: plain data replacing the per-constraint trait
-/// objects. `Base` entries MUST form a prefix of an idx-ordered, dense list —
-/// see [`num_base_from_meta`].
-///
-/// Every constraint applies to every row (up to `end_exemptions` rows at the
-/// end of the trace); there is no per-constraint period/offset/periodic
-/// exemption machinery.
+/// Which trace rows a transition constraint applies to. `ALL` = every row;
+/// `except_last(n)` skips the final `n` rows — used by constraints that read
+/// `n` rows ahead (the last `n` rows have no valid "next" to check). Passed at
+/// the emit site; degree is NOT here (it's a per-table property, see
+/// [`ConstraintSet::max_degree`]) — the two are orthogonal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RowDomain {
+    /// Number of exempted rows at the end of the trace.
+    pub end_exemptions: usize,
+}
+
+impl RowDomain {
+    /// Every row (no exemptions).
+    pub const ALL: RowDomain = RowDomain { end_exemptions: 0 };
+    /// Every row except the last `n`.
+    pub const fn except_last(n: usize) -> RowDomain {
+        RowDomain { end_exemptions: n }
+    }
+}
+
+/// Per-constraint metadata, DERIVED from the body (via [`MetaBuilder`]). `Base`
+/// entries MUST form a prefix of an idx-ordered, dense list — see
+/// [`num_base_from_meta`]. Degree is intentionally absent: only the per-table
+/// max is consumed (by `composition_poly_degree_bound`), declared once via
+/// [`ConstraintSet::max_degree`].
 #[derive(Clone, Debug)]
 pub struct ConstraintMeta {
     pub constraint_idx: usize,
     /// Base | Ext; Base entries MUST be a prefix.
     pub kind: RootKind,
-    /// Declared degree; asserted == tree-measured degree (host-side test).
-    pub degree: usize,
     /// Number of exempted rows at the end of the trace (default 0).
     pub end_exemptions: usize,
 }
 
 impl ConstraintMeta {
-    /// A base-field constraint with default zerofier shape (every row, no
-    /// exemptions).
-    pub fn base(constraint_idx: usize, degree: usize) -> Self {
+    /// A base-field constraint applying to every row.
+    pub fn base(constraint_idx: usize) -> Self {
         Self {
             constraint_idx,
             kind: RootKind::Base,
-            degree,
             end_exemptions: 0,
         }
     }
 
-    /// An extension-field (LogUp) constraint with default zerofier shape.
-    pub fn ext(constraint_idx: usize, degree: usize) -> Self {
+    /// An extension-field (LogUp) constraint applying to every row.
+    pub fn ext(constraint_idx: usize) -> Self {
         Self {
             kind: RootKind::Ext,
-            ..Self::base(constraint_idx, degree)
+            ..Self::base(constraint_idx)
         }
     }
 
@@ -261,9 +264,20 @@ pub trait ConstraintSet<F: IsField, E: IsField>: Send + Sync {
     /// The single constraint body: emits every constraint exactly once.
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B);
 
+    /// The maximum multivariate degree over this set's base constraints — the
+    /// only degree info the proof consumes (via `composition_poly_degree_bound`,
+    /// which takes the per-table max). Declared once here instead of per
+    /// constraint; default 2 covers most tables, override to 3 for the few that
+    /// have a degree-3 constraint. Hand-declared, never auto-measured (that
+    /// would change the composition bound); the capture path asserts every
+    /// constraint's measured degree is `<=` this.
+    fn max_degree(&self) -> usize {
+        2
+    }
+
     /// Idx-ordered metadata, derived by running [`Self::eval`] through a
-    /// [`MetaBuilder`] (which records the `{kind, degree, end_exemptions}`
-    /// declared at each `emit_*`). Never overridden — the body is the source.
+    /// [`MetaBuilder`] (which records the `{kind, end_exemptions}` at each
+    /// `emit_*`). Never overridden — the body is the source.
     fn meta(&self) -> Vec<ConstraintMeta> {
         let mut mb = MetaBuilder::new();
         self.eval(&mut mb);
@@ -371,32 +385,18 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for MetaBuilder {
         Nil
     }
 
-    fn emit_base_exempt(
-        &mut self,
-        constraint_idx: usize,
-        degree: usize,
-        end_exemptions: usize,
-        _e: Nil,
-    ) {
+    fn emit_base_rows(&mut self, constraint_idx: usize, rows: RowDomain, _e: Nil) {
         self.metas.push(ConstraintMeta {
             constraint_idx,
             kind: RootKind::Base,
-            degree,
-            end_exemptions,
+            end_exemptions: rows.end_exemptions,
         });
     }
-    fn emit_ext_exempt(
-        &mut self,
-        constraint_idx: usize,
-        degree: usize,
-        end_exemptions: usize,
-        _e: Nil,
-    ) {
+    fn emit_ext_rows(&mut self, constraint_idx: usize, rows: RowDomain, _e: Nil) {
         self.metas.push(ConstraintMeta {
             constraint_idx,
             kind: RootKind::Ext,
-            degree,
-            end_exemptions,
+            end_exemptions: rows.end_exemptions,
         });
     }
 }
@@ -607,23 +607,11 @@ where
         FieldElement::<F>::from(v)
     }
 
-    fn emit_base_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: FieldElement<F>,
-    ) {
+    fn emit_base_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<F>) {
         self.tracker.mark(constraint_idx);
         self.base_out[constraint_idx] = e;
     }
-    fn emit_ext_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: FieldElement<E>,
-    ) {
+    fn emit_ext_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<E>) {
         debug_assert!(
             constraint_idx >= self.base_out.len(),
             "emit_ext with a base-prefix index {constraint_idx}"
@@ -752,23 +740,11 @@ where
         FieldElement::<F>::from(v).to_extension::<E>()
     }
 
-    fn emit_base_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: FieldElement<E>,
-    ) {
+    fn emit_base_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<E>) {
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
     }
-    fn emit_ext_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: FieldElement<E>,
-    ) {
+    fn emit_ext_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: FieldElement<E>) {
         self.tracker.mark(constraint_idx);
         self.ext_out[constraint_idx] = e;
     }
@@ -985,27 +961,15 @@ impl<F: IsField, E: IsField> ConstraintBuilder<F, E> for CaptureBuilder<F, E> {
         IrExpr::leaf(TreeKind::ConstSigned(v), Dim::Base, 0)
     }
 
-    fn emit_base_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: IrExpr,
-    ) {
+    fn emit_base_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: IrExpr) {
         debug_assert_eq!(e.0.dim, Dim::Base, "emit_base on an extension expression");
         let root = self.flatten(&e);
         self.ir.emit(constraint_idx, root);
-        // Record the TREE-MEASURED degree (not the declared one) so the
-        // host-side test can assert measured <= declared.
+        // Record the TREE-MEASURED degree so the host-side test can assert
+        // measured <= the table's declared max_degree().
         self.degrees.push((constraint_idx, e.degree()));
     }
-    fn emit_ext_exempt(
-        &mut self,
-        constraint_idx: usize,
-        _degree: usize,
-        _end_exemptions: usize,
-        e: IrExpr,
-    ) {
+    fn emit_ext_rows(&mut self, constraint_idx: usize, _rows: RowDomain, e: IrExpr) {
         let root = self.flatten(&e);
         self.ir.emit(constraint_idx, root);
         self.degrees.push((constraint_idx, e.degree()));

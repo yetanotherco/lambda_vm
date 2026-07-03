@@ -2,7 +2,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -37,7 +37,7 @@ where
         let a1 = b.main(1, 0);
         let a2 = b.main(2, 0);
         // idx 0: a_{i+2} = a_{i+1} + a_i; reads two next rows ⇒ 2 end exemptions.
-        b.emit_base_exempt(0, 1, 2, a2 - a1 - a0);
+        b.emit_base_rows(0, RowDomain::except_last(2), a2 - a1 - a0);
     }
 }
 

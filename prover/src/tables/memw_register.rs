@@ -375,6 +375,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwRegisterConstra
         // idx 2: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum), μ_sum = μ_read + μ_write
         let one = b.one();
         let mu_sum = b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE);
-        b.emit_base(2, 2, mu_sum.clone() * (one - mu_sum));
+        b.emit_base(2, mu_sum.clone() * (one - mu_sum));
     }
 }

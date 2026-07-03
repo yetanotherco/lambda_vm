@@ -271,9 +271,7 @@ pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         }
         None => x.clone() * (one - x),
     };
-    // Degree 3 gated, 2 ungated.
-    let degree = if cond_col.is_some() { 3 } else { 2 };
-    b.emit_base(idx, degree, root);
+    b.emit_base(idx, root);
 }
 
 /// One [`AddLinearTerm`]: `column · coefficient` or a constant.
@@ -367,12 +365,10 @@ pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>
         }
     };
 
-    // Both carries share the same degree: 3 gated, 2 ungated.
-    let degree = if cond_cols.is_empty() { 2 } else { 3 };
     let c0 = cond(b);
     let root_0 = bit(b, c0, carry_0);
-    b.emit_base(idx, degree, root_0);
+    b.emit_base(idx, root_0);
     let c1 = cond(b);
     let root_1 = bit(b, c1, carry_1);
-    b.emit_base(idx + 1, degree, root_1);
+    b.emit_base(idx + 1, root_1);
 }

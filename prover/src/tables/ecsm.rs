@@ -760,38 +760,43 @@ impl EcsmConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
+    // The k<N / xR<p carry-bit constraints (µ·c·(1−c)) are degree 3.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: IS_BIT(MU): mu·(1−mu). (deg 2)
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(0, 2, mu.clone() * (one - mu));
+        b.emit_base(0, mu.clone() * (one - mu));
 
         let mut idx = 1;
 
         // X2 convolution: 64 carries (deg 2) + closing c0(63) (deg 1).
         for i in 0..64 {
             let root = Self::conv_carry(b, Relation::X2, i);
-            b.emit_base(idx, 2, root);
+            b.emit_base(idx, root);
             idx += 1;
         }
         let c0_last = b.main(0, cols::c0(63));
-        b.emit_base(idx, 1, c0_last);
+        b.emit_base(idx, c0_last);
         idx += 1;
 
         // Yg convolution: 64 carries (deg 2) + closing c1(63) (deg 1).
         for i in 0..64 {
             let root = Self::conv_carry(b, Relation::Yg, i);
-            b.emit_base(idx, 2, root);
+            b.emit_base(idx, root);
             idx += 1;
         }
         let c1_last = b.main(0, cols::c1(63));
-        b.emit_base(idx, 1, c1_last);
+        b.emit_base(idx, c1_last);
         idx += 1;
 
         // idx 131: IS_BIT(q1[32]): x·(1−x). (deg 2)
         let q1_32 = b.main(0, cols::q1(32));
         let one = b.one();
-        b.emit_base(idx, 2, q1_32.clone() * (one - q1_32));
+        b.emit_base(idx, q1_32.clone() * (one - q1_32));
         idx += 1;
 
         // k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
@@ -801,13 +806,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
                 // µ · c_i · (1 − c_i)
                 let mu = b.main(0, cols::MU);
                 let one = b.one();
-                b.emit_base(idx, 3, mu * ci.clone() * (one - ci.clone()));
+                b.emit_base(idx, mu * ci.clone() * (one - ci.clone()));
                 idx += 1;
             }
             // µ · (1 − c_7)
             let mu = b.main(0, cols::MU);
             let one = b.one();
-            b.emit_base(idx, 2, mu * (one - c[7].clone()));
+            b.emit_base(idx, mu * (one - c[7].clone()));
             idx += 1;
         }
 

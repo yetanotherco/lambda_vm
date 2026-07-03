@@ -746,7 +746,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {
         let first = b.main(0, cols::FIRST);
         let end = b.main(0, cols::END);
         let mu = b.main(0, cols::MU);
-        b.emit_base(3, 2, (first + end) * (one - mu));
+        b.emit_base(3, (first + end) * (one - mu));
 
         // idx 4,5: ADD template for address + 1 = address_incr (unconditional)
         emit_add_pair(

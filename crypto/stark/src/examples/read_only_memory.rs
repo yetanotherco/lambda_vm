@@ -4,7 +4,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -41,14 +41,17 @@ where
 
         // All three read the next row ⇒ degree 2, 1 end exemption each.
         // idx 0 — continuity: (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-        b.emit_base_exempt(
+        b.emit_base_rows(
             0,
-            2,
-            1,
+            RowDomain::except_last(1),
             addr_diff.clone() * (addr_diff.clone() - one.clone()),
         );
         // idx 1 — single value: (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-        b.emit_base_exempt(1, 2, 1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
+        b.emit_base_rows(
+            1,
+            RowDomain::except_last(1),
+            (v_sorted_1 - v_sorted_0) * (addr_diff - one),
+        );
 
         // (z - (a'_{i+1} + α * v'_{i+1})) * p_{i+1} = (z - (a_{i+1} + α * v_{i+1})) * p_i
         let p0 = b.aux(0, 0);
@@ -62,7 +65,11 @@ where
         let sorted_fp = z.clone() - (a_sorted_1 + v_sorted_1 * alpha.clone());
         let unsorted_fp = z - (a1 + v1 * alpha);
         // idx 2 — permutation (degree 2, 1 end exemption).
-        b.emit_ext_exempt(2, 2, 1, sorted_fp * p1 - unsorted_fp * p0);
+        b.emit_ext_rows(
+            2,
+            RowDomain::except_last(1),
+            sorted_fp * p1 - unsorted_fp * p0,
+        );
     }
 }
 

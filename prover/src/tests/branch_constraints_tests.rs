@@ -22,10 +22,8 @@ fn test_branch_constraint_set_meta() {
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i);
     }
-    for m in &meta[..4] {
-        assert_eq!(m.degree, 3);
-    }
-    assert_eq!(meta[4].degree, 2);
+    // 4 conditional carry IS_BIT constraints are degree 3, so the table max is 3.
+    assert_eq!(BranchConstraints.max_degree(), 3);
 }
 
 // =========================================================================

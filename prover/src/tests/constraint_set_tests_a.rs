@@ -63,18 +63,15 @@ where
         assert_eq!(m.kind, RootKind::Base, "[{label}] meta kind {i}");
     }
 
-    // --- capture once; tree-measured degree <= declared ---
+    // --- capture once; tree-measured degree <= the table's declared max ---
     //
-    // The declared `meta.degree` is what the engine uses as the composition-poly
-    // degree bound. For most tables that bound is tight, so tree-measured ==
-    // declared. A few constraints (the ecsm/ecdas convolution TAILS — `ConvCarry`
-    // at large `i`) legitimately have a lower EXACT degree than their uniform
-    // declared bound: at limb `i` near the top, every remaining product has a
-    // zeroed (constant) factor, so the surviving expression is degree 1 while the
-    // meta declares 2 (resp. 3). The soundness-relevant invariant is therefore
-    // `measured <= declared` (the real degree must never EXCEED the bound the
-    // composition polynomial is sized for) — over-declaration is safe,
-    // under-declaration is not.
+    // `max_degree()` is what the engine uses as the composition-poly degree
+    // bound. Most constraints hit it; a few (the ecsm/ecdas convolution TAILS —
+    // `ConvCarry` at large `i`) legitimately have a lower EXACT degree (a zeroed
+    // factor drops the surviving product). The soundness-relevant invariant is
+    // therefore `measured <= max_degree()` — the real degree must never EXCEED
+    // the bound the composition polynomial is sized for; over-declaration is
+    // safe, under-declaration is not.
     let mut cb = CaptureBuilder::<Gl, Gl3>::new();
     set.eval(&mut cb);
     let (prog, degrees) = cb.finish(num_base);
@@ -89,11 +86,11 @@ where
         emitted.iter().enumerate().all(|(i, &idx)| i == idx),
         "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
     );
+    let max_degree = set.max_degree();
     for &(idx, measured) in &degrees {
         assert!(
-            measured <= meta[idx].degree,
-            "[{label}] constraint {idx}: tree degree {measured} EXCEEDS declared {}",
-            meta[idx].degree
+            measured <= max_degree,
+            "[{label}] constraint {idx}: tree degree {measured} EXCEEDS max_degree() {max_degree}"
         );
     }
     let no_ch: Vec<Fp3> = vec![];

@@ -829,12 +829,16 @@ impl ShiftConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: DirectionImpliesMu — direction * (1 - μ)
         let dir = b.main(0, cols::DIRECTION);
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(0, 2, dir * (one - mu));
+        b.emit_base(0, dir * (one - mu));
 
         // idx 1..5: ZbsOverrideX(i) — zbs * (X[i] - in[i] * (μ - direction))
         for i in 0..4 {
@@ -844,13 +848,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
             let mu = b.main(0, cols::MU);
             let dir = b.main(0, cols::DIRECTION);
             let left = mu - dir;
-            b.emit_base(1 + i, 3, zbs * (x_i - in_i * left));
+            b.emit_base(1 + i, zbs * (x_i - in_i * left));
         }
 
         // idx 5: ZbsOverrideX4 — zbs * X[4]
         let zbs = b.main(0, cols::ZBS);
         let x4 = b.main(0, cols::X_4);
-        b.emit_base(5, 2, zbs * x4);
+        b.emit_base(5, zbs * x4);
 
         // idx 6..10: ZbsOverrideY(i) — zbs * (Y[i] - in[i] * direction)
         for i in 0..4 {
@@ -858,14 +862,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
             let y_i = b.main(0, cols::Y[i]);
             let in_i = b.main(0, cols::IN[i]);
             let dir = b.main(0, cols::DIRECTION);
-            b.emit_base(6 + i, 3, zbs * (y_i - in_i * dir));
+            b.emit_base(6 + i, zbs * (y_i - in_i * dir));
         }
 
         // idx 10..14: LimbShiftIsBit(i) — limb_shift[i] * (1 - limb_shift[i])
         for i in 0..4 {
             let ls = Self::limb_shift(b, i);
             let one = b.one();
-            b.emit_base(10 + i, 2, ls.clone() * (one - ls));
+            b.emit_base(10 + i, ls.clone() * (one - ls));
         }
 
         // idx 14,15: OutputMatchesShifted(i) —
@@ -876,7 +880,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
             let half_lo = Self::shifted_half(b, 2 * i);
             let half_hi = Self::shifted_half(b, 2 * i + 1);
             let shift_16 = b.const_base(SHIFT_16);
-            b.emit_base(14 + i, 3, out - half_lo - half_hi * shift_16);
+            b.emit_base(14 + i, out - half_lo - half_hi * shift_16);
         }
 
         // idx 16..19: FlagIsBit — flag * (1 - flag) for direction, signed, word_instr
@@ -886,7 +890,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
         {
             let flag = b.main(0, flag_col);
             let one = b.one();
-            b.emit_base(16 + off, 2, flag.clone() * (one - flag));
+            b.emit_base(16 + off, flag.clone() * (one - flag));
         }
     }
 }

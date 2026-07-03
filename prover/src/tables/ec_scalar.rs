@@ -293,7 +293,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints
         for (i, col) in bit_cols.enumerate() {
             let x = b.main(0, col);
             let one = b.one();
-            b.emit_base(i, 2, x.clone() * (one - x));
+            b.emit_base(i, x.clone() * (one - x));
         }
 
         // idx 10..18: limb_bit(i) · (1 − mu) = 0.
@@ -301,18 +301,18 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints
             let a = b.main(0, cols::limb_bit(i));
             let mu = b.main(0, cols::MU);
             let one = b.one();
-            b.emit_base(10 + i, 2, a * (one - mu));
+            b.emit_base(10 + i, a * (one - mu));
         }
 
         // idx 18: last_limb · (1 − mu) = 0.
         let last_limb = b.main(0, cols::LAST_LIMB);
         let mu = b.main(0, cols::MU);
         let one = b.one();
-        b.emit_base(18, 2, last_limb * (one - mu));
+        b.emit_base(18, last_limb * (one - mu));
 
         // idx 19: last_limb · offset = 0.
         let last_limb = b.main(0, cols::LAST_LIMB);
         let offset = b.main(0, cols::OFFSET);
-        b.emit_base(19, 2, last_limb * offset);
+        b.emit_base(19, last_limb * offset);
     }
 }

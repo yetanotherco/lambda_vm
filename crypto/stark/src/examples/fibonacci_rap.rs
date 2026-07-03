@@ -4,7 +4,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -45,7 +45,7 @@ where
         let a0 = b.main(0, 0);
         let a1 = b.main(1, 0);
         let a2 = b.main(2, 0);
-        b.emit_base_exempt(0, 1, 3 + 32 - 16 - 1, a2 - a1 - a0);
+        b.emit_base_rows(0, RowDomain::except_last(3 + 32 - 16 - 1), a2 - a1 - a0);
 
         // idx 1: permutation; z_{i+1} * (b_i + gamma) = z_i * (a_i + gamma);
         // reads the next row ⇒ 1 end exemption.
@@ -54,10 +54,9 @@ where
         let gamma = b.challenge(0);
         let a_i = b.main(0, 0);
         let b_i = b.main(0, 1);
-        b.emit_ext_exempt(
+        b.emit_ext_rows(
             1,
-            2,
-            1,
+            RowDomain::except_last(1),
             z_i_plus_one * (b_i + gamma.clone()) - z_i * (a_i + gamma),
         );
     }

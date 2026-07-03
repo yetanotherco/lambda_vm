@@ -41,7 +41,7 @@ where
         let col1 = b.main(0, 1);
         let col2 = b.main(0, 2);
         // idx 0: col0 + col1 - col2 = 0, applied at every row (degree 1, no exemptions).
-        b.emit_base(0, 1, col0 + col1 - col2);
+        b.emit_base(0, col0 + col1 - col2);
     }
 }
 

@@ -790,26 +790,26 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
         let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);
-        b.emit_base(0, 2, is_bit_lhs);
+        b.emit_base(0, is_bit_lhs);
         let is_bit_rhs = Self::signed_is_bit(b, cols::RHS_SIGNED);
-        b.emit_base(1, 2, is_bit_rhs);
+        b.emit_base(1, is_bit_rhs);
 
         // idx 2: LhsSign: (1 - lhs_signed) * lhs_is_negative
         let lhs_signed = b.main(0, cols::LHS_SIGNED);
         let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
         let one = b.one();
-        b.emit_base(2, 2, (one - lhs_signed) * lhs_is_neg);
+        b.emit_base(2, (one - lhs_signed) * lhs_is_neg);
 
         // idx 3: RhsSign: (1 - rhs_signed) * rhs_is_negative
         let rhs_signed = b.main(0, cols::RHS_SIGNED);
         let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
         let one = b.one();
-        b.emit_base(3, 2, (one - rhs_signed) * rhs_is_neg);
+        b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
 
         // idx 4..8: raw_product convolution for i = 0..4.
         for i in 0..4 {
             let root = Self::raw_product(b, i);
-            b.emit_base(4 + i, 2, root);
+            b.emit_base(4 + i, root);
         }
     }
 }

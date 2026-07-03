@@ -274,11 +274,11 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for StoreConstraints {
 
         // width sum is bit: sum * (1 - sum)
         let one = b.one();
-        b.emit_base(4, 2, sum.clone() * (one - sum.clone()));
+        b.emit_base(4, sum.clone() * (one - sum.clone()));
 
         // width ⇒ μ: sum * (1 - μ)
         let one = b.one();
         let mu = b.main(0, cols::MU);
-        b.emit_base(5, 2, sum * (one - mu));
+        b.emit_base(5, sum * (one - mu));
     }
 }

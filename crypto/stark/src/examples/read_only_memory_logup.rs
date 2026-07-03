@@ -8,7 +8,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -49,14 +49,17 @@ where
 
         // All three read the next row ⇒ 1 end exemption each.
         // idx 0 — continuity (degree 2): (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-        b.emit_base_exempt(
+        b.emit_base_rows(
             0,
-            2,
-            1,
+            RowDomain::except_last(1),
             addr_diff.clone() * (addr_diff.clone() - one.clone()),
         );
         // idx 1 — single value (degree 2): (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-        b.emit_base_exempt(1, 2, 1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
+        b.emit_base_rows(
+            1,
+            RowDomain::except_last(1),
+            (v_sorted_1 - v_sorted_0) * (addr_diff - one),
+        );
 
         // We are using the following LogUp equation:
         // s1 = s0 + m / sorted_term - 1/unsorted_term.
@@ -74,10 +77,9 @@ where
         let unsorted_term = -(a1 + v1 * alpha.clone()) + z.clone();
         let sorted_term = -(a_sorted_1 + v_sorted_1 * alpha) + z;
         // idx 2 — LogUp permutation (degree 3, 1 end exemption).
-        b.emit_ext_exempt(
+        b.emit_ext_rows(
             2,
-            3,
-            1,
+            RowDomain::except_last(1),
             s0 * unsorted_term.clone() * sorted_term.clone() + m * unsorted_term.clone()
                 - sorted_term.clone()
                 - s1 * unsorted_term * sorted_term,

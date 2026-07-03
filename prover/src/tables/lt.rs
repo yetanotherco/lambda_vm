@@ -398,16 +398,21 @@ impl LtConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
+    // The LT formula (idx 2) is degree 3; the rest are degree 2.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: IS_BIT<carry[0]>: carry[0] * (1 - carry[0])
         let c0 = Self::carry_0(b);
         let one = b.one();
-        b.emit_base(0, 2, c0.clone() * (one - c0));
+        b.emit_base(0, c0.clone() * (one - c0));
 
         // idx 1: IS_BIT<carry[1]>: carry[1] * (1 - carry[1])
         let c1 = Self::carry_1(b);
         let one = b.one();
-        b.emit_base(1, 2, c1.clone() * (one - c1));
+        b.emit_base(1, c1.clone() * (one - c1));
 
         // idx 2: LT formula: lt - (signed*signed_lt + (1-signed)*unsigned_lt)
         // signed_lt = A*(1-B) + A*C + (1-B)*C; unsigned_lt = C = carry[1]
@@ -422,27 +427,23 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
         let signed_lt = a.clone() * one_minus_b.clone() + a * c.clone() + one_minus_b * c;
         let one = b.one();
         let expected_lt = signed.clone() * signed_lt + (one - signed) * unsigned_lt;
-        b.emit_base(2, 3, lt - expected_lt);
+        b.emit_base(2, lt - expected_lt);
 
         // idx 3: out = lt XOR invert = lt + invert - 2*lt*invert
         let out = b.main(0, cols::OUT);
         let lt = b.main(0, cols::LT);
         let invert = b.main(0, cols::INVERT);
         let two = b.const_base(2);
-        b.emit_base(
-            3,
-            2,
-            out - (lt.clone() + invert.clone() - two * lt * invert),
-        );
+        b.emit_base(3, out - (lt.clone() + invert.clone() - two * lt * invert));
 
         // idx 4: invert * (1 - invert)
         let invert = b.main(0, cols::INVERT);
         let one = b.one();
-        b.emit_base(4, 2, invert.clone() * (one - invert));
+        b.emit_base(4, invert.clone() * (one - invert));
 
         // idx 5: signed * (1 - signed)
         let signed = b.main(0, cols::SIGNED);
         let one = b.one();
-        b.emit_base(5, 2, signed.clone() * (one - signed));
+        b.emit_base(5, signed.clone() * (one - signed));
     }
 }

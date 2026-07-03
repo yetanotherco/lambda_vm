@@ -1063,7 +1063,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
         // idx 0: SignedIsBit — signed * (1 - signed)
         let signed = b.main(0, cols::SIGNED);
         let one = b.one();
-        b.emit_base(0, 2, signed.clone() * (one - signed));
+        b.emit_base(0, signed.clone() * (one - signed));
 
         // idx 1: RemainderSignMatchesNumerator —
         // (r[0]+r[1]+r[2]+r[3]) * (sign_r - sign_n)
@@ -1074,7 +1074,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
         let sign_r = b.main(0, cols::SIGN_R);
         let sign_n = b.main(0, cols::SIGN_N);
         let r_sum = r0 + r1 + r2 + r3;
-        b.emit_base(1, 2, r_sum * (sign_r - sign_n));
+        b.emit_base(1, r_sum * (sign_r - sign_n));
 
         // idx 2,3: AbsRFormula(0,1) — (1-sign_r) * (abs_r[i] - r::DWordWL[i])
         for (off, (abs_col, lo, hi)) in [
@@ -1088,7 +1088,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
             let one = b.one();
             let abs_r = b.main(0, abs_col);
             let r_wl = Self::dword_wl(b, lo, hi);
-            b.emit_base(2 + off, 2, (one - sign_r) * (abs_r - r_wl));
+            b.emit_base(2 + off, (one - sign_r) * (abs_r - r_wl));
         }
 
         // idx 4,5: AbsDFormula(0,1) — (1-sign_d) * (abs_d[i] - d::DWordWL[i])
@@ -1103,7 +1103,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
             let one = b.one();
             let abs_d = b.main(0, abs_col);
             let d_wl = Self::dword_wl(b, lo, hi);
-            b.emit_base(4 + off, 2, (one - sign_d) * (abs_d - d_wl));
+            b.emit_base(4 + off, (one - sign_d) * (abs_d - d_wl));
         }
 
         // idx 6: SignQFormula — signed * (1-overflow) - sign_q
@@ -1111,37 +1111,37 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
         let overflow = b.main(0, cols::OVERFLOW);
         let sign_q = b.main(0, cols::SIGN_Q);
         let one = b.one();
-        b.emit_base(6, 2, signed * (one - overflow) - sign_q);
+        b.emit_base(6, signed * (one - overflow) - sign_q);
 
         // idx 7..11: CarryIsBit(0..4) — carry[i] * (1 - carry[i])
         for i in 0..4 {
             let carry = Self::carry(b, i);
             let one = b.one();
-            b.emit_base(7 + i, 2, carry.clone() * (one - carry));
+            b.emit_base(7 + i, carry.clone() * (one - carry));
         }
 
         // idx 11: SignNSubRIsBit — sign_n_sub_r * (1 - sign_n_sub_r)
         let sign = b.main(0, cols::SIGN_N_SUB_R);
         let one = b.one();
-        b.emit_base(11, 2, sign.clone() * (one - sign));
+        b.emit_base(11, sign.clone() * (one - sign));
 
         // idx 12: UnsignedSignN — (1-signed) * sign_n
         let signed = b.main(0, cols::SIGNED);
         let sign_n = b.main(0, cols::SIGN_N);
         let one = b.one();
-        b.emit_base(12, 2, (one - signed) * sign_n);
+        b.emit_base(12, (one - signed) * sign_n);
 
         // idx 13: UnsignedSignR — (1-signed) * sign_r
         let signed = b.main(0, cols::SIGNED);
         let sign_r = b.main(0, cols::SIGN_R);
         let one = b.one();
-        b.emit_base(13, 2, (one - signed) * sign_r);
+        b.emit_base(13, (one - signed) * sign_r);
 
         // idx 14: UnsignedSignD — (1-signed) * sign_d
         let signed = b.main(0, cols::SIGNED);
         let sign_d = b.main(0, cols::SIGN_D);
         let one = b.one();
-        b.emit_base(14, 2, (one - signed) * sign_d);
+        b.emit_base(14, (one - signed) * sign_d);
 
         // idx 15..19: DivByZeroQ(0..4) — div_by_zero * (q[i] - 65535)
         let q_cols = [cols::Q_0, cols::Q_1, cols::Q_2, cols::Q_3];
@@ -1149,7 +1149,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
             let dbz = b.main(0, cols::DIV_BY_ZERO);
             let q = b.main(0, q_col);
             let fill = b.const_base(SIGN_FILL);
-            b.emit_base(15 + i, 2, dbz * (q - fill));
+            b.emit_base(15 + i, dbz * (q - fill));
         }
     }
 }

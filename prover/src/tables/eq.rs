@@ -270,10 +270,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EqConstraints {
         let eq = b.main(0, cols::EQ);
         let invert = b.main(0, cols::INVERT);
         let two = b.const_base(2);
-        b.emit_base(
-            3,
-            2,
-            res - (eq.clone() + invert.clone() - two * eq * invert),
-        );
+        b.emit_base(3, res - (eq.clone() + invert.clone() - two * eq * invert));
     }
 }

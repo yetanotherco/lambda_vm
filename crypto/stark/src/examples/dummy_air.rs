@@ -2,7 +2,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -28,12 +28,12 @@ impl ConstraintSet<StarkField, StarkField> for DummyConstraints {
         let a0 = b.main(0, 1);
         let a1 = b.main(1, 1);
         let a2 = b.main(2, 1);
-        b.emit_base_exempt(0, 1, 2, a2 - a1 - a0);
+        b.emit_base_rows(0, RowDomain::except_last(2), a2 - a1 - a0);
 
         // idx 1: IS_BIT on column 0, every row. bit * (bit - 1) = 0.
         let bit = b.main(0, 0);
         let one = b.one();
-        b.emit_base(1, 2, bit.clone() * (bit - one));
+        b.emit_base(1, bit.clone() * (bit - one));
     }
 }
 

@@ -413,37 +413,41 @@ fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 pub struct BranchConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: (1 - JALR) * carry_0(pc) * (1 - carry_0)
         let one = b.one();
         let cond = one - b.main(0, cols::JALR);
         let c = carry_0_expr(b, cols::PC_0);
         let one = b.one();
-        b.emit_base(0, 3, cond * c.clone() * (one - c));
+        b.emit_base(0, cond * c.clone() * (one - c));
 
         // idx 1: (1 - JALR) * carry_1(pc) * (1 - carry_1)
         let one = b.one();
         let cond = one - b.main(0, cols::JALR);
         let c = carry_1_expr(b, cols::PC_0, cols::PC_1);
         let one = b.one();
-        b.emit_base(1, 3, cond * c.clone() * (one - c));
+        b.emit_base(1, cond * c.clone() * (one - c));
 
         // idx 2: JALR * carry_0(register) * (1 - carry_0)
         let cond = b.main(0, cols::JALR);
         let c = carry_0_expr(b, cols::REGISTER_0);
         let one = b.one();
-        b.emit_base(2, 3, cond * c.clone() * (one - c));
+        b.emit_base(2, cond * c.clone() * (one - c));
 
         // idx 3: JALR * carry_1(register) * (1 - carry_1)
         let cond = b.main(0, cols::JALR);
         let c = carry_1_expr(b, cols::REGISTER_0, cols::REGISTER_1);
         let one = b.one();
-        b.emit_base(3, 3, cond * c.clone() * (one - c));
+        b.emit_base(3, cond * c.clone() * (one - c));
 
         // idx 4: JALR * (1 - JALR)
         let one = b.one();
         let jalr = b.main(0, cols::JALR);
-        b.emit_base(4, 2, jalr.clone() * (one - jalr));
+        b.emit_base(4, jalr.clone() * (one - jalr));
     }
 }
 

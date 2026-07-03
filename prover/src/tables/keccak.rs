@@ -464,6 +464,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct KeccakConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         use crate::constraints::templates::emit_add_pair;
 
@@ -501,6 +505,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakConstraints {
         let carry_0 = (addr_lo + c192 - ptr_lo) * inv_2_32.clone();
         let carry_1 = (addr_hi + carry_0 - ptr_hi) * inv_2_32;
         let mu = b.main(0, cols::MU);
-        b.emit_base(50, 2, mu * carry_1);
+        b.emit_base(50, mu * carry_1);
     }
 }
