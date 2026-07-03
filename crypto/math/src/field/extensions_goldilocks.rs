@@ -199,6 +199,11 @@ impl IsField for Degree2GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
+    // The base×ext ops run in the constraint-eval hot loop from downstream
+    // crates; these impls are concrete (non-generic), so without the
+    // attribute they compile as cross-crate calls under the default
+    // no-LTO release profile — unlike the #[inline(always)] IsField ops.
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -208,6 +213,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -224,6 +230,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree2GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -233,6 +240,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
+    #[inline(always)]
     fn embed(a: Self::BaseType) -> <Degree2GoldilocksExtensionField as IsField>::BaseType {
         [FpE::from_raw(a), FpE::zero()]
     }
@@ -410,6 +418,12 @@ impl IsField for Degree3GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
+    // The base×ext ops run in the constraint-eval hot loop from downstream
+    // crates (the evaluator's eval·β fold and every LogUp fingerprint term);
+    // these impls are concrete (non-generic), so without the attribute they
+    // compile as cross-crate calls under the default no-LTO release profile —
+    // unlike the #[inline(always)] IsField ops.
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -420,6 +434,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -436,6 +451,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree3GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -446,6 +462,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    #[inline(always)]
     fn embed(a: Self::BaseType) -> <Degree3GoldilocksExtensionField as IsField>::BaseType {
         [FpE::from_raw(a), FpE::zero(), FpE::zero()]
     }

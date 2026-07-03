@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
-test-rust test-executor test-flamegraph flamegraph-prover \
+test-rust test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
@@ -232,6 +232,14 @@ test-rust: compile-programs-rust
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
+
+test-profile-recursion: test-profile-recursion-single test-profile-recursion-multi
+
+test-profile-recursion-single: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_1query -- --ignored --nocapture
+
+test-profile-recursion-multi: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_multiquery -- --ignored --nocapture
 
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
 # Run after bumping the ethrex rev; README checksums are refreshed automatically.
