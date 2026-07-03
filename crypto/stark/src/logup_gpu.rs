@@ -13,7 +13,7 @@ use std::any::TypeId;
 
 use crate::lookup::{
     BusInteraction, BusValue, LOGUP_CHALLENGE_ALPHA, LinearTerm, Multiplicity, Packing,
-    compute_alpha_powers,
+    compute_alpha_powers, split_interactions,
 };
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
@@ -47,17 +47,6 @@ fn i64_to_canonical(c: i64) -> u64 {
 /// Canonical Goldilocks negation.
 fn neg_canonical(x: u64) -> u64 {
     if x == 0 { 0 } else { GOLDILOCKS_P - x }
-}
-
-/// Committed-pair / absorbed split, mirroring `lookup::split_interactions`.
-fn split_interactions(num: usize) -> (usize, usize) {
-    if num <= 2 {
-        (0, num)
-    } else if num % 2 == 1 {
-        ((num - 1) / 2, 1)
-    } else {
-        ((num - 2) / 2, 2)
-    }
 }
 
 /// Encode a multiplicity as a signed linear form `const + Σ coef·col` (sign
@@ -153,6 +142,21 @@ pub struct FingerprintDescriptor {
 }
 
 impl FingerprintDescriptor {
+    /// Panic if any fingerprint or multiplicity term references a main column
+    /// index `>= num_cols`. The kernels index `main[col*num_rows + row]`
+    /// unchecked (they are never told the column count), so a mis-authored
+    /// table would otherwise be a silent out-of-bounds device read; this makes
+    /// it fail loudly, like the CPU path's slice indexing. O(#terms), run once
+    /// per table build.
+    fn assert_columns_in_bounds(&self, num_cols: usize) {
+        for &col in self.term_col.iter().chain(self.mult_term_col.iter()) {
+            assert!(
+                (col as usize) < num_cols,
+                "logup descriptor references main column {col} but the table has {num_cols} columns"
+            );
+        }
+    }
+
     fn push_element(&mut self, alpha_idx: u32, const_val: u64, terms: &[(u64, u32)]) {
         self.elem_alpha_idx.push(alpha_idx);
         self.elem_const.push(const_val);
@@ -371,6 +375,7 @@ where
 
     // main trace -> column-major u64. SAFETY: F == Goldilocks (repr(u64)).
     let num_cols = main_cols.len();
+    desc.assert_columns_in_bounds(num_cols);
     let mut main_flat = vec![0u64; num_cols * trace_len];
     for (c, col) in main_cols.iter().enumerate() {
         for (r, e) in col.iter().enumerate() {
@@ -438,6 +443,7 @@ where
     }
 
     let num_cols = main_cols.len();
+    desc.assert_columns_in_bounds(num_cols);
     // Reuse the resident main trace from the R1 main LDE (column-major
     // `[col*trace_len + row]`, same column order as `main_cols`) when it matches
     // this table exactly; otherwise flatten + upload the host columns. The
@@ -555,6 +561,7 @@ mod tests {
     use crate::lookup::{PackingShifts, compute_alpha_powers};
     use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
     use math::field::goldilocks::GoldilocksField;
+    use math::field::traits::IsPrimeField;
 
     type F = GoldilocksField;
     type E = Degree3GoldilocksExtensionField;
@@ -663,6 +670,17 @@ mod tests {
         [*v[0].value(), *v[1].value(), *v[2].value()]
     }
 
+    // Reduce raw limbs to canonical form before comparing. The GPU pipeline
+    // computes the same field values as the CPU reference but through different
+    // op trees (tree-scan batch inverse, closed-form accumulate), and Goldilocks
+    // representatives in [p, 2^64) are legal, so raw limbs may rarely differ
+    // even when the values match. Same pattern as math-cuda's batch_inverse
+    // parity tests. The fingerprint test deliberately compares raw limbs: the
+    // kernel mirrors the CPU evaluator op for op, so bit-identity holds there.
+    fn canon(a: &[u64]) -> Vec<u64> {
+        a.iter().map(F::canonical).collect()
+    }
+
     // GPU fingerprint kernel vs the CPU evaluator, byte for byte (full ext3
     // alpha/z so mul_base is exercised). Runs on the GPU box.
     #[test]
@@ -712,6 +730,7 @@ mod tests {
 
         // CPU reference, layout [(k*num_rows + row)*3 + limb].
         let mut cpu = vec![0u64; interactions.len() * num_rows * 3];
+        #[allow(clippy::needless_range_loop)] // main is column-major: main[c][row]
         for k in 0..interactions.len() {
             for row in 0..num_rows {
                 let fp = eval_fingerprint::<F, E>(&desc, k, |c| &main[c][row], &alpha_powers, &z);
@@ -773,7 +792,7 @@ mod tests {
             for (k, it) in ints.iter().enumerate() {
                 let m = it.multiplicity.evaluate_at_row(main, row);
                 let t = &m * &fps[k * num_rows + row];
-                acc = acc + if it.is_sender { t } else { -t };
+                acc += if it.is_sender { t } else { -t };
             }
             *slot = acc;
         }
@@ -839,6 +858,7 @@ mod tests {
 
         // Reciprocals of every interaction's fingerprint, laid out [k*num_rows+row].
         let mut recips: Vec<FieldElement<E>> = Vec::with_capacity(interactions.len() * num_rows);
+        #[allow(clippy::needless_range_loop)] // main is column-major: main[c][row]
         for k in 0..interactions.len() {
             for row in 0..num_rows {
                 recips.push(eval_fingerprint::<F, E>(
@@ -895,31 +915,32 @@ mod tests {
 
         // CPU reference term columns: 2 committed pairs + virtual (last 1).
         let mut cpu = vec![0u64; desc.num_out_cols * num_rows * 3];
-        let mut ref_cols: Vec<Vec<FieldElement<E>>> = Vec::new();
-        ref_cols.push(reference_term_column(
-            &[&interactions[0], &interactions[1]],
-            &main,
-            num_rows,
-            &alpha_powers,
-            &z,
-            &shifts,
-        ));
-        ref_cols.push(reference_term_column(
-            &[&interactions[2], &interactions[3]],
-            &main,
-            num_rows,
-            &alpha_powers,
-            &z,
-            &shifts,
-        ));
-        ref_cols.push(reference_term_column(
-            &[&interactions[4]],
-            &main,
-            num_rows,
-            &alpha_powers,
-            &z,
-            &shifts,
-        ));
+        let ref_cols: Vec<Vec<FieldElement<E>>> = vec![
+            reference_term_column(
+                &[&interactions[0], &interactions[1]],
+                &main,
+                num_rows,
+                &alpha_powers,
+                &z,
+                &shifts,
+            ),
+            reference_term_column(
+                &[&interactions[2], &interactions[3]],
+                &main,
+                num_rows,
+                &alpha_powers,
+                &z,
+                &shifts,
+            ),
+            reference_term_column(
+                &[&interactions[4]],
+                &main,
+                num_rows,
+                &alpha_powers,
+                &z,
+                &shifts,
+            ),
+        ];
         for (col, rc) in ref_cols.iter().enumerate() {
             for (row, v) in rc.iter().enumerate() {
                 let o = (col * num_rows + row) * 3;
@@ -944,7 +965,11 @@ mod tests {
                 .unwrap();
 
         assert_eq!(desc.num_out_cols, 3);
-        assert_eq!(gpu, cpu, "GPU term columns mismatch CPU reference");
+        assert_eq!(
+            canon(&gpu),
+            canon(&cpu),
+            "GPU term columns mismatch CPU reference"
+        );
     }
 
     // Reference accumulated column, mirroring build_accumulated_column_from_terms.
@@ -968,7 +993,7 @@ mod tests {
                 rs = &rs + &c[row];
             }
             acc = &acc + &rs - &offset;
-            out.push(acc.clone());
+            out.push(acc);
         }
         (out, total)
     }
@@ -1068,11 +1093,15 @@ mod tests {
         stream.synchronize().unwrap();
 
         assert_eq!(
-            ra.table_contribution,
-            limbs(&total),
+            canon(&ra.table_contribution),
+            canon(&limbs(&total)),
             "table_contribution L mismatch"
         );
-        assert_eq!(gpu, expected, "resident aux buffer mismatch CPU reference");
+        assert_eq!(
+            canon(&gpu),
+            canon(&expected),
+            "resident aux buffer mismatch CPU reference"
+        );
 
         // Resident-main path: upload main col-major to device, then build via
         // ResidentMain::Dev (no host upload). Must be byte-identical to Host.
@@ -1095,7 +1124,8 @@ mod tests {
             "resident-main L mismatch vs host-upload path"
         );
         assert_eq!(
-            gpu_dev, expected,
+            canon(&gpu_dev),
+            canon(&expected),
             "resident-main aux buffer mismatch CPU reference"
         );
     }

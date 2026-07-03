@@ -17,6 +17,8 @@ use crate::Result;
 use crate::device::backend;
 use crate::inverse::batch_inverse_ext3_dev;
 
+// Must match LOGUP_BLK in kernels/logup.cu: the block scan kernel assumes
+// exactly this many threads per block for its shared-memory array.
 const BLOCK_SIZE: u32 = 256;
 
 /// Flat LogUp descriptor for one table (CSR arrays, canonical Goldilocks). Built
@@ -41,12 +43,22 @@ pub struct LogupDescriptor<'a> {
     pub mult_term_col: &'a [u32],
 }
 
-fn cfg(total: usize) -> LaunchConfig {
-    LaunchConfig {
+fn cfg(total: usize) -> Result<LaunchConfig> {
+    // See `batch_inverse_ext3_dev` for the rationale: a u32 grid_dim is
+    // truncated past u32::MAX / BLOCK_SIZE, which would silently launch too
+    // few blocks and leave a tail of the (uninitialized) output unwritten.
+    // Runtime Err, not debug_assert, so release builds also route to the
+    // caller's CPU fallback.
+    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
+    Ok(LaunchConfig {
         grid_dim: ((total as u32).div_ceil(BLOCK_SIZE), 1, 1),
         block_dim: (BLOCK_SIZE, 1, 1),
         shared_mem_bytes: 0,
-    }
+    })
 }
 
 /// Fingerprint kernel over a device-resident main trace. Returns the ext3 fp
@@ -94,7 +106,7 @@ fn fingerprints_into_dev(
             .arg(&z1)
             .arg(&z2)
             .arg(&mut out)
-            .launch(cfg(total))?;
+            .launch(cfg(total)?)?;
     }
     Ok(out)
 }
@@ -168,7 +180,7 @@ pub fn logup_term_columns(
             .arg(&mult_term_coef)
             .arg(&mult_term_col)
             .arg(&mut out)
-            .launch(cfg(total))?;
+            .launch(cfg(total)?)?;
     }
     if timing {
         stream.synchronize()?;
@@ -266,9 +278,6 @@ impl PartialEq for ResidentAux {
 }
 impl Eq for ResidentAux {}
 
-/// Full aux build on device: fingerprints → invert → term columns → accumulate
-/// scan → assemble the row-major aux trace buffer, all resident. `inv_n` is
-/// `1/num_rows` embedded in ext3. The stream is synchronised before return.
 /// Main trace input for the resident aux build: either a host column-major
 /// buffer to upload, or an already-resident device buffer (from the R1 main
 /// LDE) to read in place. The device form skips the ~3 GB main re-upload.
@@ -278,6 +287,10 @@ pub enum ResidentMain<'a> {
     Dev(&'a CudaSlice<u64>),
 }
 
+/// Full aux build on device: fingerprints → invert → term columns → accumulate
+/// scan → assemble the row-major aux trace buffer, all resident. `inv_n` is
+/// `1/num_rows` embedded in ext3. Requires `num_rows >= 1`. The stream is
+/// synchronised before return.
 #[allow(clippy::too_many_arguments)]
 pub fn logup_aux_resident(
     main: ResidentMain,
@@ -288,6 +301,7 @@ pub fn logup_aux_resident(
     inv_n: [u64; 3],
     stream: &Arc<CudaStream>,
 ) -> Result<ResidentAux> {
+    assert!(num_rows >= 1, "logup_aux_resident requires num_rows >= 1");
     let be = backend()?;
     // Per-phase timing (env LAMBDA_VM_LOGUP_TIMING): sync between phases so wall
     // time is attributed correctly. Off = no extra syncs, production path.
@@ -326,10 +340,13 @@ pub fn logup_aux_resident(
 
     // Term columns (committed + virtual), resident, layout [col][row].
     // num_out is always >= 1 (the accumulated column); num_committed = num_out - 1.
-    debug_assert!(
-        d.num_out_cols >= 1,
-        "logup descriptor has no output columns"
-    );
+    // Runtime Err, not debug_assert: in release a zero would wrap num_out - 1
+    // to usize::MAX and launch the assemble kernel with a bogus column count.
+    if d.num_out_cols == 0 {
+        return Err(cudarc::driver::DriverError(
+            cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
+        ));
+    }
     let num_out = d.num_out_cols;
     let mut terms = unsafe { stream.alloc::<u64>(num_out * num_rows * 3) }?;
     let out_col_offsets = stream.clone_htod(d.out_col_offsets)?;
@@ -356,7 +373,7 @@ pub fn logup_aux_resident(
             .arg(&mult_term_coef)
             .arg(&mult_term_col)
             .arg(&mut terms)
-            .launch(cfg(num_out * num_rows))?;
+            .launch(cfg(num_out * num_rows)?)?;
     }
     sync_if(timing)?;
     let t_term = std::time::Instant::now();
@@ -370,7 +387,7 @@ pub fn logup_aux_resident(
             .arg(&num_out_u32)
             .arg(&num_rows_u32)
             .arg(&mut row_sum)
-            .launch(cfg(num_rows))?;
+            .launch(cfg(num_rows)?)?;
     }
     scan_add_inplace(stream, be, &mut row_sum, num_rows)?; // row_sum now holds S
     let (i0, i1, i2) = (inv_n[0], inv_n[1], inv_n[2]);
@@ -385,7 +402,7 @@ pub fn logup_aux_resident(
             .arg(&i1)
             .arg(&i2)
             .arg(&mut accumulated)
-            .launch(cfg(num_rows))?;
+            .launch(cfg(num_rows)?)?;
     }
 
     // Assemble row-major aux buffer: committed (num_out-1) cols + accumulated.
@@ -401,7 +418,7 @@ pub fn logup_aux_resident(
             .arg(&accumulated)
             .arg(&num_rows_u32)
             .arg(&mut aux)
-            .launch(cfg(num_rows))?;
+            .launch(cfg(num_rows)?)?;
     }
     sync_if(timing)?;
     let t_accum_done = std::time::Instant::now();
