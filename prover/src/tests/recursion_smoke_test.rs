@@ -46,7 +46,7 @@ fn prove_inner_and_encode_blob(
     inner_elf: &[u8],
     inner_input: &[u8],
     opts: &stark::proof::options::ProofOptions,
-) -> (crate::VmProof, Vec<u8>) {
+) -> (crate::VmProof, rkyv::util::AlignedVec<16>) {
     eprintln!(
         "[{tag}] proving inner (blowup={}, fri_queries={}) ...",
         opts.blowup_factor, opts.fri_number_of_queries
@@ -197,7 +197,7 @@ fn setup_guest_run(
         "{guest_name} ELF has entry_point=0 — build artifact is malformed"
     );
     let executor =
-        executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
+        executor::vm::execution::Executor::new(&program, blob.to_vec()).expect("Executor::new failed");
     (guest_elf_bytes, program, executor)
 }
 
@@ -538,11 +538,11 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
         "vk digest must match the proof's"
     );
 
-    // Host buffers carry no alignment guarantee, so `verify_recursion_blob`
-    // must accept the blob at any base alignment (falling back to an aligned
-    // copy when needed). The plain call above already exercises the common
-    // misaligned case (`Vec` base + 12-byte prefix → 4-aligned archive);
-    // shifting the base by 4 covers another residue class.
+    // The encoder returns a 16-aligned buffer whose archive offset is a
+    // multiple of 16, so the plain call above exercises the zero-copy aligned
+    // host path. `verify_recursion_blob` must also accept arbitrary base
+    // alignment (falling back to one aligned copy): shift the base by 4 to
+    // exercise the misaligned fallback.
     let mut padded: Vec<u8> = Vec::with_capacity(blob.len() + 4);
     padded.extend_from_slice(&[0u8; 4]);
     padded.extend_from_slice(&blob);
@@ -726,7 +726,7 @@ fn test_dump_recursion_input() {
         prove_inner_and_encode_blob("dump-input", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
     let path = "/tmp/recursion_input.bin";
-    std::fs::write(path, &blob).expect("write blob");
+    std::fs::write(path, &blob[..]).expect("write blob");
     eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
 }
 

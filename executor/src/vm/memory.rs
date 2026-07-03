@@ -48,9 +48,24 @@ pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
 pub const MAX_PRIVATE_INPUT_SIZE: u64 = 64 * 1024 * 1024;
 /// Fixed high address where private input is mapped. Guest programs can read
 /// directly from this address (ZisK-style memory-mapped input).
-/// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.
+/// Layout: a 16-byte header — 4-byte LE length prefix at
+/// `PRIVATE_INPUT_START_INDEX`, then 12 reserved bytes — followed by the
+/// payload at `+PRIVATE_INPUT_PAYLOAD_OFFSET`. The payload base is 16-aligned
+/// so guests can read structured (e.g. rkyv-archived) input in place with
+/// naturally-aligned loads.
 /// Must match `PRIVATE_INPUT_START` in `syscalls/src/syscalls.rs`.
 pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
+
+/// Byte offset of the private-input payload from [`PRIVATE_INPUT_START_INDEX`]:
+/// the size of the `[len: u32 LE][reserved: 12 bytes]` header. A multiple of 16
+/// so the payload base stays 16-aligned.
+/// Must match `PRIVATE_INPUT_PAYLOAD_OFFSET` in `syscalls/src/syscalls.rs`.
+pub const PRIVATE_INPUT_PAYLOAD_OFFSET: u64 = 16;
+
+const _: () = assert!(
+    (PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_PAYLOAD_OFFSET).is_multiple_of(16),
+    "private-input payload base must be 16-aligned",
+);
 
 #[derive(Default, Debug, Clone)]
 pub struct Memory {
@@ -218,8 +233,9 @@ impl Memory {
         Ok(self.public_output.clone())
     }
 
-    /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX` as a
-    /// 4-byte LE length prefix followed by the raw data. The guest reads these
+    /// Pre-loads private input bytes at `PRIVATE_INPUT_START_INDEX`: a 4-byte
+    /// LE length prefix, 12 reserved (zero) bytes, then the raw data at
+    /// `+PRIVATE_INPUT_PAYLOAD_OFFSET` (16-aligned). The guest reads these
     /// bytes directly via normal RISC-V loads (ZisK-style memory-mapped input).
     pub fn store_private_inputs(&mut self, inputs: Vec<u8>) -> Result<(), MemoryError> {
         if inputs.is_empty() {
@@ -231,7 +247,10 @@ impl Memory {
         let len_u32 =
             u32::try_from(inputs.len()).map_err(|_| MemoryError::PrivateInputSizeExceeded)?;
         self.store_word(PRIVATE_INPUT_START_INDEX, len_u32)?;
-        self.set_bytes_aligned(PRIVATE_INPUT_START_INDEX + 4, &inputs)?;
+        self.set_bytes_aligned(
+            PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_PAYLOAD_OFFSET,
+            &inputs,
+        )?;
         Ok(())
     }
 

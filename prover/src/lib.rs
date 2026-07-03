@@ -196,16 +196,16 @@ pub struct RecursionInput {
 }
 
 // ============================================================================
-// Recursion-input wire format: aligning magic prefix + rkyv archive
+// Recursion-input wire format: magic/version prefix + rkyv archive
 // ============================================================================
 //
-// The guest reads the archive in place with naturally-aligned loads (archived
-// field elements are 8-aligned; we require 16 for headroom), and the executor
-// traps unaligned doubleword loads. The executor maps the private input as
-// `[u32 len][payload...]` with the payload at `PRIVATE_INPUT_START + 4`, which
-// is only 4-aligned. A fixed prefix pads the payload so the archive that
-// follows lands 16-aligned, and doubles as a magic + version tag the guest
-// validates before the unsafe access.
+// The guest reads the archive in place with naturally-aligned loads, so the
+// archive's first byte must sit 16-aligned in guest memory. The executor maps
+// the private-input payload at a 16-aligned base
+// (`PRIVATE_INPUT_START + PRIVATE_INPUT_PAYLOAD_OFFSET`), so the prefix is
+// pure framing — a magic + version tag the guest validates before the unsafe
+// access — sized to a multiple of the alignment so the archive after it stays
+// aligned. Asserted below against the executor ABI.
 
 /// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
 pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
@@ -216,38 +216,44 @@ pub const RECURSION_INPUT_VERSION: u32 = 1;
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
 
-/// Aligning prefix length: `magic(4) + version(4) + reserved(4) = 12` bytes,
-/// chosen so the archive starts 16-aligned given the executor's
-/// `PRIVATE_INPUT_START + 4` payload base. Asserted below.
-pub const RECURSION_INPUT_PREFIX_LEN: usize = 12;
+/// Prefix length: `magic(4) + version(4) + reserved(8) = 16` bytes — a
+/// multiple of [`RECURSION_INPUT_ALIGN`] so the archive after it stays
+/// aligned. Asserted below.
+pub const RECURSION_INPUT_PREFIX_LEN: usize = 16;
 
 const _: () = {
-    let payload_base = (executor::vm::memory::PRIVATE_INPUT_START_INDEX as usize) + 4;
-    let pad =
-        (RECURSION_INPUT_ALIGN - (payload_base % RECURSION_INPUT_ALIGN)) % RECURSION_INPUT_ALIGN;
-    assert!(
-        RECURSION_INPUT_PREFIX_LEN == pad,
-        "prefix length must align the archive to RECURSION_INPUT_ALIGN given the private-input payload base",
-    );
+    let payload_base = (executor::vm::memory::PRIVATE_INPUT_START_INDEX
+        + executor::vm::memory::PRIVATE_INPUT_PAYLOAD_OFFSET) as usize;
     assert!(
         (payload_base + RECURSION_INPUT_PREFIX_LEN).is_multiple_of(RECURSION_INPUT_ALIGN),
         "archive must start at a RECURSION_INPUT_ALIGN-aligned guest address",
     );
+    assert!(
+        RECURSION_INPUT_PREFIX_LEN >= 8,
+        "prefix must hold at least magic + version",
+    );
 };
 
-/// Encode a [`RecursionInput`] into the on-wire blob: a 12-byte
-/// `magic + version + reserved` prefix followed by the rkyv archive. The prefix
-/// both aligns the archive in guest memory (so in-place reads don't trap) and
-/// tags the format/version so the guest can validate before the unsafe access.
-pub fn encode_recursion_input(input: &RecursionInput) -> Result<Vec<u8>, Error> {
-    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(input)
-        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
-    let mut blob = Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
+/// Encode a [`RecursionInput`] into the on-wire blob: the 16-byte
+/// `magic + version + reserved` prefix followed by the rkyv archive,
+/// serialized directly after the prefix (no archive copy). The returned
+/// buffer is 16-aligned and the prefix length is a multiple of the alignment,
+/// so the archive is aligned both here and — because the guest payload base
+/// is 16-aligned — in guest memory.
+pub fn encode_recursion_input(
+    input: &RecursionInput,
+) -> Result<rkyv::util::AlignedVec<{ RECURSION_INPUT_ALIGN }>, Error> {
+    let mut blob = rkyv::util::AlignedVec::<{ RECURSION_INPUT_ALIGN }>::new();
     blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
     blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
-    blob.extend_from_slice(&[0u8; 4]); // reserved
+    blob.extend_from_slice(&[0u8; 8]); // reserved
     debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
-    blob.extend_from_slice(&archive);
+    // rkyv computes alignment padding against positions from the buffer
+    // start; the prefix is a multiple of RECURSION_INPUT_ALIGN, so archive
+    // offsets keep the same residues and `&blob[PREFIX_LEN..]` is a valid
+    // aligned archive.
+    let blob = rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(input, blob)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
     Ok(blob)
 }
 
@@ -1237,11 +1243,9 @@ pub struct RecursionVerification<'a> {
 pub fn verify_recursion_blob(blob: &[u8]) -> Result<RecursionVerification<'_>, Error> {
     use rkyv::rancor::Error as RkyvError;
 
-    // Validate + strip the aligning magic/version prefix. In the guest the
-    // returned slice starts at the 16-aligned archive base (the prefix exists
-    // precisely so the archive lands aligned at
-    // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
-    // loads do not trap.
+    // Validate + strip the magic/version prefix. In the guest the returned
+    // slice starts at the 16-aligned archive base (aligned payload base +
+    // 16-byte prefix), so the in-place doubleword loads do not trap.
     let archive_bytes = recursion_archive_bytes(blob).ok_or_else(|| {
         Error::Execution(String::from("recursion blob: bad magic or version"))
     })?;
@@ -1344,8 +1348,11 @@ fn verify_archived_parts(
     // MAX_PRIVATE_INPUT_SIZE fits in ~257 pages of DEFAULT_PAGE_SIZE.
     {
         use crate::tables::page::DEFAULT_PAGE_SIZE;
-        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
+        use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_PAYLOAD_OFFSET};
+        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize
+            + PRIVATE_INPUT_PAYLOAD_OFFSET as usize)
+            .div_ceil(DEFAULT_PAGE_SIZE)
+            + 1;
         if num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
                 "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",

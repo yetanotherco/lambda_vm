@@ -15,7 +15,7 @@ fn panic(_info: &PanicInfo) -> ! {
 
 fn read_n() -> u64 {
     // Layout matches `syscalls::get_private_input`: 4-byte LE length prefix at
-    // PRIVATE_INPUT_START, payload at +4. We only need the first 8 bytes (u64).
+    // PRIVATE_INPUT_START, payload at +16. We only need the first 8 bytes (u64).
     let mut n_bytes = [0u8; 8];
 
     debug_assert!(
@@ -23,7 +23,7 @@ fn read_n() -> u64 {
         "private input too short to contain a u64"
     );
 
-    let input_data = (PRIVATE_INPUT_START + 4) as *const u8;
+    let input_data = (PRIVATE_INPUT_START + 16) as *const u8;
     n_bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(input_data, 8) });
 
     u64::from_le_bytes(n_bytes)

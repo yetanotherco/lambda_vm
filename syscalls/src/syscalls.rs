@@ -8,6 +8,12 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
+/// Byte offset of the private-input payload from [`PRIVATE_INPUT_START`]: the
+/// `[len: u32 LE][reserved: 12 bytes]` header. The payload base is 16-aligned
+/// so structured (e.g. rkyv-archived) input can be read in place.
+/// Must match `executor::vm::memory::PRIVATE_INPUT_PAYLOAD_OFFSET`.
+pub const PRIVATE_INPUT_PAYLOAD_OFFSET: usize = 16;
+
 #[cfg(target_arch = "riscv64")]
 pub enum SyscallNumbers {
     Print = 1,
@@ -87,7 +93,7 @@ pub fn get_private_input() -> Vec<u8> {
     // executor). The data pointer and length are within the memory-mapped region.
     let len_ptr = PRIVATE_INPUT_START as *const u32;
     let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
-    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+    let data_ptr = (PRIVATE_INPUT_START + PRIVATE_INPUT_PAYLOAD_OFFSET) as *const u8;
     let slice = unsafe { core::slice::from_raw_parts(data_ptr, len) };
     slice.to_vec()
 }
@@ -99,8 +105,9 @@ pub fn get_private_input() -> Vec<u8> {
 
 /// Borrow the private input bytes in place from the memory-mapped region —
 /// no copy, no allocation. Same layout as [`get_private_input`]; the returned
-/// slice starts at `PRIVATE_INPUT_START + 4` (a 4-aligned address) and lives
-/// for the whole execution (the host never remaps the region).
+/// slice starts at `PRIVATE_INPUT_START + PRIVATE_INPUT_PAYLOAD_OFFSET` (a
+/// 16-aligned address) and lives for the whole execution (the host never
+/// remaps the region).
 #[cfg(target_arch = "riscv64")]
 pub fn get_private_input_slice() -> &'static [u8] {
     // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
@@ -109,7 +116,7 @@ pub fn get_private_input_slice() -> &'static [u8] {
     // region, which stays mapped and unmodified for the whole execution.
     let len_ptr = PRIVATE_INPUT_START as *const u32;
     let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
-    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+    let data_ptr = (PRIVATE_INPUT_START + PRIVATE_INPUT_PAYLOAD_OFFSET) as *const u8;
     unsafe { core::slice::from_raw_parts(data_ptr, len) }
 }
 

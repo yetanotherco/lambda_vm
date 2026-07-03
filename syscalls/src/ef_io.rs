@@ -18,7 +18,7 @@
 use core::arch::asm;
 
 #[cfg(target_arch = "riscv64")]
-use crate::syscalls::{PRIVATE_INPUT_START, SyscallNumbers};
+use crate::syscalls::{PRIVATE_INPUT_PAYLOAD_OFFSET, PRIVATE_INPUT_START, SyscallNumbers};
 
 /// EF IO: return a zero-copy pointer and size for the private input.
 ///
@@ -36,7 +36,7 @@ pub unsafe extern "C" fn read_input(buf_ptr: *mut *const u8, buf_size: *mut usiz
     unsafe {
         let len_ptr = PRIVATE_INPUT_START as *const u32;
         let len = core::ptr::read_volatile(len_ptr) as usize;
-        *buf_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+        *buf_ptr = (PRIVATE_INPUT_START + PRIVATE_INPUT_PAYLOAD_OFFSET) as *const u8;
         *buf_size = len;
     }
 }

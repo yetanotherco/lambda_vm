@@ -1842,12 +1842,15 @@ fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOpe
 /// Encode private input as `[len_u32_LE][data]` — the canonical wire format.
 /// Must match `executor::vm::memory::Memory::store_private_inputs`.
 fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
-    let len_bytes = (private_input.len() as u32).to_le_bytes();
-    len_bytes
-        .iter()
-        .chain(private_input.iter())
-        .copied()
-        .collect()
+    // Mirrors `Memory::store_private_inputs`: `[len: u32 LE][reserved: 12
+    // zero bytes][payload]` — the payload base is 16-aligned.
+    use executor::vm::memory::PRIVATE_INPUT_PAYLOAD_OFFSET;
+    let mut bytes =
+        Vec::with_capacity(PRIVATE_INPUT_PAYLOAD_OFFSET as usize + private_input.len());
+    bytes.extend_from_slice(&(private_input.len() as u32).to_le_bytes());
+    bytes.resize(PRIVATE_INPUT_PAYLOAD_OFFSET as usize, 0);
+    bytes.extend_from_slice(private_input);
+    bytes
 }
 
 /// Build the initial-memory image (byte address -> value) from the ELF segments

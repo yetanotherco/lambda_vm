@@ -1015,7 +1015,8 @@ fn test_l2g_design_y_orphan_mu_zero_rejects() {
 /// epoch boundaries) and the resulting multi-epoch L2G chain verifies end-to-end.
 ///
 /// The fixture reads 16 bytes of private input from 0xFF000000, then commits
-/// bytes 4..12 (8 bytes after the 4-byte length prefix). With `epoch_size_log2=2`
+/// payload bytes 0..8 (the payload starts at +16, after the input header).
+/// With `epoch_size_log2=2`
 /// (4 cycles) the 11-cycle program spans three epochs: epoch 0 reads the private-input
 /// page (touching 0xFF000000..), epoch 1 performs the commit syscall, epoch 2
 /// halts. The private-input page's L2G entry (epoch 0 fini → epoch 1+ init)
@@ -1028,15 +1029,12 @@ fn test_l2g_design_y_orphan_mu_zero_rejects() {
 fn test_continuation_private_input_spans_epochs() {
     let elf_bytes = crate::test_utils::asm_elf_bytes("test_private_input_xpage");
 
-    // 16-byte private input: 4-byte length prefix (=16) + 8 bytes of payload
-    // that will be committed + 4 padding bytes (the fixture commits bytes 4..12).
+    // 16-byte private input: the fixture commits payload bytes 0..8.
     let mut input: Vec<u8> = Vec::with_capacity(16);
-    // Length prefix: 16 as little-endian u32.
-    input.extend_from_slice(&16u32.to_le_bytes());
     // 8-byte payload that will be committed.
     input.extend_from_slice(&[0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]);
-    // 4 trailing padding bytes (not committed).
-    input.extend_from_slice(&[0x00u8, 0x00, 0x00, 0x00]);
+    // 8 trailing padding bytes (not committed).
+    input.extend_from_slice(&[0u8; 8]);
     assert_eq!(input.len(), 16);
 
     let result = crate::continuation::prove_and_verify_continuation(
@@ -1049,11 +1047,11 @@ fn test_continuation_private_input_spans_epochs() {
     // The continuation must prove and verify without error.
     let output = result.expect("prove_and_verify_continuation must not error");
 
-    // The fixture commits bytes 4..12 of private input (the 8-byte payload).
+    // The fixture commits payload bytes 0..8 of the private input.
     assert_eq!(
         output.as_deref(),
-        Some(&input[4..12]),
-        "committed output must equal private input bytes 4..12"
+        Some(&input[0..8]),
+        "committed output must equal private input bytes 0..8"
     );
 }
 

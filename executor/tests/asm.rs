@@ -33,8 +33,8 @@ fn test_private_input_memory_mapped() {
     let input: Vec<u8> = (0u8..16).collect();
     let executor = Executor::new(&program, input.clone()).unwrap();
     let result = executor.run().unwrap();
-    // Committed bytes are at 0xFF000008 = data bytes [4..12]
-    assert_eq!(result.return_values.memory_values, input[4..12].to_vec());
+    // Committed bytes are at 0xFF000010 = data bytes [0..8]
+    assert_eq!(result.return_values.memory_values, input[0..8].to_vec());
 }
 
 #[test]

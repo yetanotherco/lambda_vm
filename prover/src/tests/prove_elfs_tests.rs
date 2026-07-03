@@ -2666,7 +2666,7 @@ fn test_prove_private_input_xpage() {
     let input: Vec<u8> = (0u8..16).collect();
     let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
     assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
-    assert_eq!(proof.public_output, input[4..12].to_vec());
+    assert_eq!(proof.public_output, input[0..8].to_vec());
 }
 
 /// Same ASM, different input values — output depends on input.
@@ -2679,7 +2679,7 @@ fn test_prove_private_input_different_values() {
     ];
     let proof = prove_vm_minimal(&elf_bytes, &input, &Default::default());
     assert!(verify_vm_minimal(&proof, &elf_bytes), "proof should verify");
-    assert_eq!(proof.public_output, input[4..12].to_vec());
+    assert_eq!(proof.public_output, input[0..8].to_vec());
 }
 
 /// End-to-end: EF zkVM IO interface — demo guest reads its private input via
@@ -2868,8 +2868,8 @@ fn test_proof_does_not_contain_private_input_field() {
     // not the actual bytes. Verify the proof's public fields don't contain them.
     assert_eq!(vm_proof.num_private_input_pages, 1);
     // public_output is the committed output, NOT the private input.
-    // It should contain bytes [4..12] of the input (what the ASM program commits).
-    assert_eq!(vm_proof.public_output, input[4..12].to_vec());
+    // It should contain bytes [0..8] of the input (what the ASM program commits).
+    assert_eq!(vm_proof.public_output, input[0..8].to_vec());
     // No `private_input` field exists — this is enforced by the type system,
     // but explicitly document that the proof carries only the page count.
     assert!(

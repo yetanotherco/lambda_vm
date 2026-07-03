@@ -1,11 +1,11 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
-//! Private input layout: a 12-byte `"LVMR" + version + reserved` prefix
+//! Private input layout: a 16-byte `"LVMR" + version + reserved` prefix
 //! followed by an rkyv archive of `lambda_vm_prover::RecursionInput`
-//! `{ vm_proof, inner_elf, options, vkey }`. The prefix 16-aligns the archive
-//! in guest memory (the executor maps the payload at `PRIVATE_INPUT_START + 4`,
-//! which is only 4-aligned) and tags the format so the guest rejects a
-//! wrong-format blob before the unsafe access. The proof is verified **in
+//! `{ vm_proof, inner_elf, options, vkey }`. The prefix tags the format so the
+//! guest rejects a wrong-format blob before the unsafe access; sized to a
+//! multiple of 16, it keeps the archive 16-aligned at the executor's aligned
+//! payload base (`PRIVATE_INPUT_START + 16`). The proof is verified **in
 //! place** via `verify_recursion_blob` — no deserialization pass, no owned
 //! `VmProof`. Commits `vk_digest ‖ inner public output` on success: every
 //! input here is prover-supplied, so soundness comes from the outer verifier
@@ -34,8 +34,8 @@ pub fn main() -> ! {
     }));
 
     // Zero-copy: borrow the blob straight from the mapped private-input region.
-    // The 12-byte prefix puts the archive at a 16-aligned guest address, so the
-    // verifier's in-place doubleword loads don't trap.
+    // The payload base and prefix are both 16-aligned, so the archive sits at a
+    // 16-aligned guest address and the verifier's in-place loads don't trap.
     let blob = lambda_vm_syscalls::syscalls::get_private_input_slice();
     lambda_vm_prover::profile_markers::step_marker::<
         { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },

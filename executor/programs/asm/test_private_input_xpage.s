@@ -2,7 +2,7 @@
 	.globl	main
 main:
 	# Read private input directly from 0xFF000000 (memory-mapped).
-	# Layout: [len:u32 LE] [data...]
+	# Layout: [len:u32 LE] [12 reserved bytes] [data at +16]
 	# Commits 8 bytes of data.
 	#
 	# Note: lui in RV64 sign-extends to 64 bits. lui with 0xFF000 would give
@@ -16,11 +16,11 @@ main:
 	# Read length at 0xFF000000
 	lw	t3, 0(t0)		# 2: t3 = length
 
-	# Load 8 bytes of data at 0xFF000008 (aligned, 4 bytes into data region)
-	ld	t1, 8(t0)		# 3
+	# Load 8 bytes of data at 0xFF000010 (aligned, start of data region)
+	ld	t1, 16(t0)		# 3
 
-	# Commit 8 bytes from 0xFF000008
-	addi	a1, t0, 8		# 4: buf_addr = 0xFF000008
+	# Commit 8 bytes from 0xFF000010
+	addi	a1, t0, 16		# 4: buf_addr = 0xFF000010
 	li	a0, 1			# 5: fd = 1
 	li	a2, 8			# 6: count = 8
 	li	a7, 64			# 7: syscall = Commit
