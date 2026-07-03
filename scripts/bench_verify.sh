@@ -155,24 +155,38 @@ SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
 SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
 
 # Decide whether both sides can VERIFY one shared proof (baseline's) — tightest
-# timing precision — or must verify their own (when the PR changes the proof format).
+# timing precision — or must verify their own. In auto mode, distinguish a real
+# proof-format change (deserialize error → benign) from the PR *rejecting* a valid
+# baseline proof (a verify regression). Both fall back to per-side, but they mean
+# very different things, so carry the reason into the report — otherwise a real
+# backward-compat break gets silently reclassified as a format change and shown green.
 per_side=0
+per_side_note=""
 case "$PROVE_PER_SIDE" in
-  1) per_side=1 ;;
+  1) per_side=1; per_side_note="forced via PROVE_PER_SIDE=1" ;;
   0) per_side=0 ;;
-  *)  # auto: can the PR binary deserialize + verify the baseline's proof?
-      if [ -z "$(verify_time "$WORK/cli_A" "$PROOF_B")" ]; then
-        echo "==> PR binary cannot verify the baseline's proof (likely a proof-format change);"
-        echo "    verifying per-side (set PROVE_PER_SIDE=0 to force shared)."
+  *)  probe="$("$WORK/cli_A" verify "$PROOF_B" "$ELF" --time 2>&1 || true)"
+      if printf '%s\n' "$probe" | grep -q 'Verification time'; then
+        per_side=0                                     # PR verifies main's proof -> shared
+      elif printf '%s\n' "$probe" | grep -q 'Failed to deserialize'; then
         per_side=1
+        per_side_note="PR can't deserialize the baseline's proof — proof-format change"
+        echo "==> $per_side_note; verifying per-side."
+      else
+        per_side=1
+        per_side_note="⚠️ PR REJECTS the baseline's valid proof — likely a VERIFY REGRESSION, not a format change"
+        echo "==> $per_side_note"
+        echo "    verifying per-side, but the Verify-time numbers below are NOT a safe signal."
       fi ;;
 esac
 
 if [ "$per_side" = "1" ]; then
+  MODE="per-side"
   echo "==> Per-side verify: each binary verifies its OWN proof."
   PROOF_FOR_A="$PROOF_A"
   PROOF_FOR_B="$PROOF_B"
 else
+  MODE="shared"
   echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
   PROOF_FOR_A="$PROOF_B"
   PROOF_FOR_B="$PROOF_B"
@@ -193,7 +207,7 @@ done
 # Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" python3 - "$WORK/pairs.csv" <<'PY'
+SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" PER_SIDE_NOTE="$per_side_note" python3 - "$WORK/pairs.csv" <<'PY'
 import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
@@ -277,6 +291,9 @@ drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
 # Markdown table (rendered directly in the PR comment) + paired detail.
 sign = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
 icon = "🟢" if (lo > 0 and p < 0.05) else "🔴" if (hi < 0 and p < 0.05) else "⚪"
+mode = os.environ.get('MODE', 'shared')
+per_side_note = os.environ.get('PER_SIDE_NOTE', '')
+
 print("\n=== Verify ABBA result ===")
 print()
 
@@ -287,10 +304,19 @@ size_impr = (size_b - size_a) / size_b * 100.0 if size_b else 0.0
 size_icon = "🟢" if size_impr > 0.005 else "🔴" if size_impr < -0.005 else "⚪"
 to_mib = lambda b: b / (1024.0 * 1024.0)
 
+# In per-side mode A and B verify different proofs, so label the metric (M2).
+vt_label = "Verify time (per-side)" if mode == "per-side" else "Verify time"
 print("| Metric | main | PR | Δ |")
 print("|--------|------|----|---|")
-print(f"| **Verify time** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+print(f"| **{vt_label}** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
 print(f"| **Proof size** | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
+
+# Surface why per-side kicked in (format change vs possible regression) so a green
+# table can't silently hide a backward-compat verify break (M1/M2).
+if mode == "per-side":
+    print()
+    print(f"> **Per-side** ({per_side_note or 'each side verified its own proof'}): "
+          "A/B/B/A cancels machine drift but not proof-specific variance — read the Verify-time Δ as approximate.")
 print()
 print("```")
 print(f"  pairs: {n}   mean A (PR): {mA:.3f}s   mean B (main): {mB:.3f}s")
