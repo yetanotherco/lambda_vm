@@ -636,18 +636,6 @@ where
                 .map(|a| evals(&a.evaluations))
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
-            deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
-                proof,
-                &evaluation_point,
-                primitive_root,
-                challenges,
-                &lde_base,
-                lde_aux,
-                evals(&opening.composition_poly.evaluations),
-            )?);
-
-            // Mirror for the symmetric query point.
             let mut lde_base_sym: Vec<FieldElement<Field>> = Vec::new();
             if let Some(p) = opening.precomputed_trace_polys.as_ref() {
                 lde_base_sym.extend_from_slice(evals(&p.evaluations_sym));
@@ -660,29 +648,60 @@ where
                 .map(|a| evals(&a.evaluations_sym))
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, true, domain);
-            deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
-                proof,
-                &evaluation_point,
-                primitive_root,
-                challenges,
-                &lde_base_sym,
-                lde_aux_sym,
-                evals(&opening.composition_poly.evaluations_sym),
-            )?);
+            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
+            let evaluation_point_sym =
+                Self::query_challenge_to_evaluation_point(*iota, true, domain);
+            let (evaluation, evaluation_sym) =
+                Self::reconstruct_deep_composition_poly_evaluation_pair(
+                    proof,
+                    &evaluation_point,
+                    &evaluation_point_sym,
+                    primitive_root,
+                    challenges,
+                    &lde_base,
+                    lde_aux,
+                    evals(&opening.composition_poly.evaluations),
+                    &lde_base_sym,
+                    lde_aux_sym,
+                    evals(&opening.composition_poly.evaluations_sym),
+                )?;
+            deep_poly_evaluations.push(evaluation);
+            deep_poly_evaluations_sym.push(evaluation_sym);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
     }
 
-    fn reconstruct_deep_composition_poly_evaluation(
+    /// Reconstructs the deep composition polynomial evaluation at a query's
+    /// evaluation point and its symmetric counterpart in one traversal. The
+    /// OOD table walk and `trace_term_coeffs` walk are shared between the two
+    /// (they don't depend on the evaluation point), halving the loads and
+    /// letting the two `denoms_trace` vectors, and the two composition-tail
+    /// denominators, share a single batch-inverse call each.
+    ///
+    /// Algebraic rewrite of the per-element trace term: for column `col` and
+    /// row `row`,
+    ///   coeff(col,row) * (base(col) - ood(row,col)) * denom(row)
+    /// distributes to
+    ///   denom(row) * (coeff(col,row) * base(col) - coeff(col,row) * ood(row,col)).
+    /// Summing over `col` first isolates `coeff * ood`, which is identical for
+    /// both evaluation points, from `coeff * base`, which differs; and moves
+    /// the `denom(row)` multiplication (ext * ext) out of the column loop.
+    /// When `col` indexes a base-field column this also lets `coeff * base`
+    /// use the cheap `IsSubFieldOf` asymmetric multiplication instead of a
+    /// full extension-field product.
+    fn reconstruct_deep_composition_poly_evaluation_pair(
         proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
+        evaluation_point_sym: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         lde_trace_base_evaluations: &[FieldElement<Field>],
         lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
-    ) -> Option<FieldElement<FieldExtension>> {
+        lde_trace_base_evaluations_sym: &[FieldElement<Field>],
+        lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
+    ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
         let ood_evaluations_table_height = proof.trace_ood_evaluations.height();
         let ood_evaluations_table_width = proof.trace_ood_evaluations.width();
         // Hot loop below: resolve the archived OOD data to one flat slice once
@@ -690,12 +709,18 @@ where
         let ood_data = proof.trace_ood_evaluations.row_major_data();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
-        // Runtime guard: a malformed proof may supply opening evaluations whose
-        // column count does not match the OOD table width, or whose composition
-        // poly parts count does not match the proof's `composition_poly_parts_ood_evaluation`.
-        // Without these checks the indexing below would panic in release builds.
-        if lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len()
-            != ood_evaluations_table_width
+        let num_base = lde_trace_base_evaluations.len();
+        // Runtime guards: a malformed proof may supply opening evaluations
+        // whose column count does not match the OOD table width, whose
+        // regular/symmetric base-column split disagree, or whose composition
+        // poly parts count does not match the proof's
+        // `composition_poly_parts_ood_evaluation`. Without these checks the
+        // indexing below would panic in release builds.
+        if num_base != lde_trace_base_evaluations_sym.len() {
+            return None;
+        }
+        if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
+            || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
         {
             return None;
         }
@@ -706,54 +731,86 @@ where
             return None;
         }
 
-        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
+        // Build both denominator sets (regular, then symmetric) and invert
+        // them together in a single batch.
+        let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
         let mut current_z = challenges.z.clone();
         for _ in 0..ood_evaluations_table_height {
-            denoms_trace.push(evaluation_point - &current_z);
+            denoms.push(evaluation_point - &current_z);
+            current_z = primitive_root * &current_z;
+        }
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_evaluations_table_height {
+            denoms.push(evaluation_point_sym - &current_z);
             current_z = primitive_root * &current_z;
         }
         // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
-        FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
+        FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
+        let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
 
-        let num_base = lde_trace_base_evaluations.len();
-        let trace_term = (0..ood_evaluations_table_width)
-            .zip(&challenges.trace_term_coeffs)
-            .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
-                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
-                    FieldElement::zero(),
-                    |trace_t, (row_idx, coeff)| {
-                        let ood_val = &ood_data[row_idx * ood_evaluations_table_width + col_idx];
-                        // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
-                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            &lde_trace_base_evaluations[col_idx] - ood_val
-                        } else {
-                            &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
-                        };
-                        let poly_evaluation = diff * &denoms_trace[row_idx];
-                        trace_t + &poly_evaluation * coeff
-                    },
-                );
-                trace_terms + trace_i
-            });
+        let mut trace_term = FieldElement::<FieldExtension>::zero();
+        let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
+        for row_idx in 0..ood_evaluations_table_height {
+            let ood_row = &ood_data[row_idx * ood_evaluations_table_width
+                ..(row_idx + 1) * ood_evaluations_table_width];
+            let mut ood_row_sum = FieldElement::<FieldExtension>::zero();
+            let mut base_row_sum = FieldElement::<FieldExtension>::zero();
+            let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
+            for col_idx in 0..ood_evaluations_table_width {
+                let coeff = &trace_term_coeffs[col_idx][row_idx];
+                let ood_val = &ood_row[col_idx];
+                ood_row_sum = ood_row_sum + coeff * ood_val;
+                if col_idx < num_base {
+                    // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
+                    base_row_sum = base_row_sum + &lde_trace_base_evaluations[col_idx] * coeff;
+                    base_row_sum_sym =
+                        base_row_sum_sym + &lde_trace_base_evaluations_sym[col_idx] * coeff;
+                } else {
+                    let aux_idx = col_idx - num_base;
+                    base_row_sum = base_row_sum + coeff * &lde_trace_aux_evaluations[aux_idx];
+                    base_row_sum_sym =
+                        base_row_sum_sym + coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                }
+            }
+            trace_term = trace_term + &denoms_trace[row_idx] * &(&base_row_sum - &ood_row_sum);
+            trace_term_sym =
+                trace_term_sym + &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - &ood_row_sum);
+        }
 
         let composition_parts_ood = evals(&proof.composition_poly_parts_ood_evaluation);
         let number_of_parts = lde_composition_poly_parts_evaluation.len();
+        // A malformed proof can give the regular and symmetric openings a
+        // different composition-poly-parts count; reject rather than let the
+        // shared `z_pow`/bounds checks below silently apply the wrong count
+        // to one side.
+        if number_of_parts != lde_composition_poly_parts_evaluation_sym.len() {
+            return None;
+        }
         let z_pow = &challenges.z.pow(number_of_parts);
 
         // A malformed proof can make evaluation_point == z^N, reject.
-        let denom_composition = (evaluation_point - z_pow).inv().ok()?;
-        let mut h_terms = FieldElement::zero();
-        for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
+        let mut denom_composition_pair = [evaluation_point - z_pow, evaluation_point_sym - z_pow];
+        FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
+        let [denom_composition, denom_composition_sym] = denom_composition_pair;
+
+        let mut h_sum_zpow = FieldElement::<FieldExtension>::zero();
+        let mut h_sum = FieldElement::<FieldExtension>::zero();
+        let mut h_sum_sym = FieldElement::<FieldExtension>::zero();
+        for j in 0..number_of_parts {
+            let h_i_upsilon = &lde_composition_poly_parts_evaluation[j];
+            let h_i_upsilon_sym = &lde_composition_poly_parts_evaluation_sym[j];
             // Bounds-check via `.get(j)?`: a malformed opening may have more
             // parts than the proof header advertises.
             let h_i_zpower = composition_parts_ood.get(j)?;
             let gamma = challenges.gammas.get(j)?;
-            let h_i_term = (h_i_upsilon - h_i_zpower) * gamma;
-            h_terms += h_i_term;
+            h_sum_zpow = h_sum_zpow + h_i_zpower * gamma;
+            h_sum = h_sum + h_i_upsilon * gamma;
+            h_sum_sym = h_sum_sym + h_i_upsilon_sym * gamma;
         }
-        h_terms *= denom_composition;
+        let h_terms = (&h_sum - &h_sum_zpow) * denom_composition;
+        let h_terms_sym = (&h_sum_sym - &h_sum_zpow) * denom_composition_sym;
 
-        Some(trace_term + h_terms)
+        Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
     }
 
     /// Verifies one or more STARK proofs with their corresponding AIRs.
