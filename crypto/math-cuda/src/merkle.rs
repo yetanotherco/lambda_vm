@@ -17,6 +17,7 @@
 //! to match `FieldElement::<Ext3>::write_bytes_be`.
 
 use cudarc::driver::{CudaSlice, CudaStream, CudaViewMut, LaunchConfig, PushKernelArg};
+use std::sync::Arc;
 
 use crate::Result;
 use crate::device::{Backend, backend};
@@ -316,13 +317,75 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Row-pair Keccak leaf + Merkle tree build for R2 composition-polynomial
-/// commit. `parts_interleaved` is `num_parts` slices, each holding an ext3
-/// LDE column interleaved as `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`.
-///
-/// Returns `(2*(lde_size/2) - 1) * 32` bytes of tree nodes in the standard
-/// layout (root at byte offset 0, leaves in the tail).
-pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Result<Vec<u8>> {
+/// Gather Merkle authentication paths on device for `positions` (leaf indices)
+/// against the resident tree `nodes_dev` (standard layout, `2*leaves_len-1`
+/// nodes of 32 bytes). Returns `positions.len() * depth * 32` bytes, where
+/// `depth = log2(leaves_len)`. Query `q`'s path is `[q*depth*32 ..
+/// (q+1)*depth*32]`, each 32 byte node a sibling from leaf to root. These are
+/// the same nodes the CPU `MerkleTree::get_proof_by_pos` collects. Runs on the
+/// caller's `stream` (pass the table's session stream).
+pub fn gather_merkle_paths_dev(
+    nodes_dev: &CudaSlice<u8>,
+    leaves_len: usize,
+    positions: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u8>> {
+    let num_queries = positions.len();
+    if num_queries == 0 {
+        return Ok(Vec::new());
+    }
+    assert!(
+        leaves_len.is_power_of_two() && leaves_len >= 2,
+        "leaves_len must be a power of two >= 2"
+    );
+    let depth = leaves_len.trailing_zeros() as usize;
+    // Guard the kernel's device reads: a position past leaves_len would walk
+    // off the node buffer. Positions are valid by construction; this catches a
+    // caller bug before it becomes an out of bounds device read.
+    assert!(
+        positions.iter().all(|&p| (p as usize) < leaves_len),
+        "gather_merkle_paths_dev: leaf position >= leaves_len"
+    );
+    let be = backend()?;
+
+    let pos_dev = stream.clone_htod(positions)?;
+    // SAFETY: every byte of `out` is written by the kernel below (one 32-byte
+    // node per (query, level)) before the D2H reads it back.
+    let mut out = unsafe { stream.alloc::<u8>(num_queries * depth * 32) }?;
+
+    let grid = (num_queries as u32).div_ceil(KECCAK_BLOCK_DIM);
+    let cfg = LaunchConfig {
+        grid_dim: (grid, 1, 1),
+        block_dim: (KECCAK_BLOCK_DIM, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    let num_queries_u32 = num_queries as u32;
+    let leaves_len_u64 = leaves_len as u64;
+    let depth_u32 = depth as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.merkle_gather_paths)
+            .arg(nodes_dev)
+            .arg(&pos_dev)
+            .arg(&num_queries_u32)
+            .arg(&leaves_len_u64)
+            .arg(&depth_u32)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build the composition Merkle tree on device. `parts_interleaved` is
+/// `num_parts` slices, each an ext3 LDE column interleaved as
+/// `[a0,a1,a2, b0,b1,b2, ...]` of length `3*lde_size`. Leaves hash row pairs, so
+/// `num_leaves = lde_size / 2`. Returns the device node buffer, the leaf count,
+/// and the stream it was built on. Used by the device keep wrapper below.
+fn build_comp_poly_tree_nodes_dev(
+    parts_interleaved: &[&[u64]],
+) -> Result<(CudaSlice<u8>, usize, Arc<CudaStream>)> {
     assert!(!parts_interleaved.is_empty());
     let m = parts_interleaved.len();
     let ext3_elems = parts_interleaved[0].len() / 3;
@@ -351,9 +414,13 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
 
     pack_ext3_to_pinned_slabs(parts_interleaved, pinned, lde_size);
 
-    // H2D the de-interleaved parts.
+    // H2D the de-interleaved parts, then release the staging lock (the kernels
+    // below read the device `buf`, not `pinned`). Synchronize first so the
+    // async H2D has consumed `pinned` before it is freed/reused.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+    stream.synchronize()?;
+    drop(staging);
 
     // Leaves into tail of a tight node buffer.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
@@ -380,18 +447,33 @@ pub fn build_comp_poly_tree_from_evals_ext3(parts_interleaved: &[&[u64]]) -> Res
     }
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-
-    let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
-    drop(staging);
-    Ok(out)
+    Ok((nodes_dev, num_leaves, stream))
 }
 
-/// Build a FRI-layer Merkle tree on device from an interleaved ext3 eval
-/// vector. Each leaf hashes two consecutive ext3 values. `num_leaves =
-/// evals.len() / 6` (since each ext3 is 3 u64s).
-///
-/// Returns the `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
+/// Build the comp poly Merkle tree on device and keep the nodes resident
+/// (returned as a [`crate::lde::GpuMerkleTree`] with its root), so R4
+/// composition openings gather paths on device instead of copying the whole
+/// tree to host. `leaves_len = lde_size / 2` (row pair leaves).
+pub fn build_comp_poly_tree_from_evals_ext3_keep(
+    parts_interleaved: &[&[u64]],
+) -> Result<crate::lde::GpuMerkleTree> {
+    let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    stream.synchronize()?;
+    Ok(crate::lde::GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    })
+}
+
+/// Test-only parity harness: build a FRI layer Merkle tree on device from an
+/// interleaved ext3 eval vector and return the full host node buffer so tests
+/// can compare it byte for byte against the CPU. Production folds and commits
+/// via [`crate::fri::FriLayer::fold_and_commit_layer`]. Each leaf hashes two
+/// consecutive ext3 values; `num_leaves = evals.len() / 6`. Returns the
+/// `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
 pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     assert!(
         evals.len().is_multiple_of(6),

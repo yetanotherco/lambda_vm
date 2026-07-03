@@ -177,12 +177,14 @@ fn run_parity(
         buf: Arc::new(main_dev),
         m: num_main,
         lde_size,
+        tree: None,
     };
     let aux_handle = if num_aux > 0 {
         Some(GpuLdeExt3 {
             buf: Arc::new(aux_dev),
             m: num_aux,
             lde_size,
+            tree: None,
         })
     } else {
         drop(aux_dev);

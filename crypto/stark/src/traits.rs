@@ -1,23 +1,19 @@
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use math::{
-    field::{
-        element::FieldElement,
-        traits::{IsFFTField, IsField, IsSubFieldOf},
-    },
-    polynomial::Polynomial,
+use math::field::{
+    element::FieldElement,
+    traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 
 use crate::{
-    constraints::transition::TransitionConstraintEvaluator,
-    domain::Domain,
-    lookup::{BusPublicInputs, PackingShifts},
+    constraint_ir::ConstraintProgram, constraints::builder::ConstraintMeta, domain::Domain,
+    lookup::BusPublicInputs,
 };
 
 use super::{
     config::Commitment, constraints::boundary::BoundaryConstraints, context::AirContext,
-    frame::Frame, proof::options::ProofOptions, trace::TraceTable,
+    frame::Frame, frame::RowFrame, proof::options::ProofOptions, trace::TraceTable,
 };
 
 /// Deduplicated zerofier evaluations: unique zerofier vectors indexed by constraint.
@@ -53,13 +49,11 @@ impl<F: IsField> ZerofierEvaluations<F> {
 }
 
 /// Key identifying a unique zerofier shape — constraints with the same key share
-/// the same zerofier evaluations on the extended domain.
+/// the same zerofier evaluations on the extended domain. Every constraint
+/// applies to every row, so the shape is fully determined by its end
+/// exemptions.
 #[derive(Clone, Copy, Hash, Eq, PartialEq)]
 struct ZerofierGroupKey {
-    period: usize,
-    offset: usize,
-    exemptions_period: Option<usize>,
-    periodic_exemptions_offset: Option<usize>,
     end_exemptions: usize,
 }
 
@@ -75,20 +69,18 @@ where
     E: IsField,
 {
     Prover {
-        frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
+        /// Borrowed row view straight into the row-major trace storage —
+        /// the prover hot path never copies rows into an owned frame.
+        rows: RowFrame<'a, F, E>,
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<F>,
     },
     Verifier {
         frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<E>,
     },
 }
 
@@ -98,38 +90,30 @@ where
     E: IsField,
 {
     pub fn new_prover(
-        frame: &'a Frame<F, E>,
-        periodic_values: &'a [FieldElement<F>],
+        rows: RowFrame<'a, F, E>,
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<F>,
     ) -> Self {
         Self::Prover {
-            frame,
-            periodic_values,
+            rows,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
-            packing_shifts,
         }
     }
 
     pub fn new_verifier(
         frame: &'a Frame<E, E>,
-        periodic_values: &'a [FieldElement<E>],
         rap_challenges: &'a [FieldElement<E>],
         logup_alpha_powers: &'a [FieldElement<E>],
         logup_table_offset: &'a FieldElement<E>,
-        packing_shifts: &'a PackingShifts<E>,
     ) -> Self {
         Self::Verifier {
             frame,
-            periodic_values,
             rap_challenges,
             logup_alpha_powers,
             logup_table_offset,
-            packing_shifts,
         }
     }
 }
@@ -216,22 +200,20 @@ pub trait AIR: Send + Sync {
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
-    /// The method called by the prover to evaluate the transitions corresponding to an evaluation frame.
-    /// In the case of the prover, the main evaluation table of the frame takes values in
-    /// `Self::Field`, since they are the evaluations of the main trace at the LDE domain.
-    /// In the case of the verifier, the frame take elements of Self::FieldExtension.
+    /// Evaluates the transitions corresponding to an evaluation frame at the
+    /// out-of-domain point. The verifier and the debug trace validation call
+    /// this; the prover instead uses `compute_transition_prover`.
+    /// In the verifier's case, the frame takes elements of `Self::FieldExtension`;
+    /// the debug validation path evaluates over the base `Self::Field` trace.
+    ///
+    /// Required: implemented via the single-source constraint body (the
+    /// [`VerifierEvalFolder`](crate::constraints::builder::VerifierEvalFolder)
+    /// run — this exact monomorphization, compiled into the guest binary, is the
+    /// recursion-guest constraint-evaluation path; it never captures or hashes).
     fn compute_transition(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
-    ) -> Vec<FieldElement<Self::FieldExtension>> {
-        let mut evaluations =
-            vec![FieldElement::<Self::FieldExtension>::zero(); self.num_transition_constraints()];
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate_verifier(evaluation_context, &mut evaluations));
-
-        evaluations
-    }
+    ) -> Vec<FieldElement<Self::FieldExtension>>;
 
     /// Number of constraints that evaluate in the base field F.
     ///
@@ -251,22 +233,31 @@ pub trait AIR: Send + Sync {
     /// `base_evals` has length `num_base_transition_constraints()`.
     /// `ext_evals` has length `num_transition_constraints()`; only indices
     /// `[num_base..]` are written/read for extension constraints.
+    ///
+    /// Required: implemented via the single-source constraint body (the
+    /// [`ProverEvalFolder`](crate::constraints::builder::ProverEvalFolder) run —
+    /// the CPU prover hot path).
     fn compute_transition_prover(
         &self,
         evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
         base_evals: &mut [FieldElement<Self::Field>],
         ext_evals: &mut [FieldElement<Self::FieldExtension>],
-    ) {
-        for e in base_evals.iter_mut() {
-            *e = FieldElement::zero();
-        }
-        let num_base = base_evals.len();
-        for e in ext_evals[num_base..].iter_mut() {
-            *e = FieldElement::zero();
-        }
-        self.transition_constraints()
-            .iter()
-            .for_each(|c| c.evaluate_prover(evaluation_context, base_evals, ext_evals));
+    );
+
+    /// The idx-ordered metadata for every transition constraint (kind, declared
+    /// degree, zerofier shape), as plain data. `RootKind::Base` entries form a
+    /// prefix (its length is `num_base_transition_constraints()`).
+    fn constraints_meta(&self) -> &[ConstraintMeta];
+
+    /// The lazily captured flat IR ([`ConstraintProgram`]) of every transition
+    /// constraint, for the CPU interpreter and the GPU kernel.
+    ///
+    /// GUEST-SAFETY: capture hash-conses, so the verify/recursion path must
+    /// NEVER call this — only the prover, GPU lowering, and tests do. The
+    /// default panics precisely so any accidental verify-path use is caught;
+    /// AIRs that support capture override it with a cached (`OnceLock`) build.
+    fn constraint_program(&self) -> &ConstraintProgram<Self::Field, Self::FieldExtension> {
+        unimplemented!("constraint_program is not available for this AIR")
     }
 
     fn boundary_constraints(
@@ -287,34 +278,6 @@ pub trait AIR: Send + Sync {
         self.context().num_transition_constraints
     }
 
-    fn get_periodic_column_values(&self) -> Vec<Vec<FieldElement<Self::Field>>> {
-        vec![]
-    }
-
-    fn get_periodic_column_polynomials(
-        &self,
-        trace_length: usize,
-    ) -> Vec<Polynomial<FieldElement<Self::Field>>> {
-        let mut result = Vec::new();
-        for periodic_column in self.get_periodic_column_values() {
-            let values: Vec<_> = periodic_column
-                .iter()
-                .cycle()
-                .take(trace_length)
-                .cloned()
-                .collect();
-            let poly =
-                Polynomial::<FieldElement<Self::Field>>::interpolate_fft::<Self::Field>(&values)
-                    .unwrap();
-            result.push(poly);
-        }
-        result
-    }
-
-    fn transition_constraints(
-        &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>>;
-
     /// Compute zerofier evaluations as deduplicated groups with index mapping.
     ///
     /// Each unique zerofier (keyed by period/offset/exemption parameters) is
@@ -324,25 +287,26 @@ pub trait AIR: Send + Sync {
         &self,
         domain: &Domain<Self::Field>,
     ) -> ZerofierEvaluations<Self::Field> {
-        let num_constraints = self.num_transition_constraints();
+        let meta = self.constraints_meta();
+        let num_constraints = meta.len();
         let mut constraint_to_group = vec![0usize; num_constraints];
         let mut zerofier_groups_map: HashMap<ZerofierGroupKey, usize> = HashMap::new();
         let mut groups: Vec<Vec<FieldElement<Self::Field>>> = Vec::new();
 
-        self.transition_constraints().iter().for_each(|c| {
+        meta.iter().for_each(|m| {
             let key = ZerofierGroupKey {
-                period: c.period(),
-                offset: c.offset(),
-                exemptions_period: c.exemptions_period(),
-                periodic_exemptions_offset: c.periodic_exemptions_offset(),
-                end_exemptions: c.end_exemptions(),
+                end_exemptions: m.end_exemptions,
             };
             let group_idx = *zerofier_groups_map.entry(key).or_insert_with(|| {
                 let idx = groups.len();
-                groups.push(c.zerofier_evaluations_on_extended_domain(domain));
+                groups.push(
+                    crate::constraints::zerofier::zerofier_evaluations_on_extended_domain(
+                        m, domain,
+                    ),
+                );
                 idx
             });
-            constraint_to_group[c.constraint_idx()] = group_idx;
+            constraint_to_group[m.constraint_idx] = group_idx;
         });
 
         ZerofierEvaluations {

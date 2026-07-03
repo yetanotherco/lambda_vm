@@ -299,17 +299,15 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                 let fwd_tw =
                     TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
-                let (nodes, _handle, _lde) =
-                    math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
-                        &row_major,
-                        n,
-                        num_cols,
-                        blowup,
-                        &weights_u64,
-                    )
-                    .expect("new row-major GPU pipeline");
-                let mut gpu_root = [0u8; 32];
-                gpu_root.copy_from_slice(&nodes[0..32]);
+                let (handle, _lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+                    &row_major,
+                    n,
+                    num_cols,
+                    blowup,
+                    &weights_u64,
+                )
+                .expect("new row-major GPU pipeline");
+                let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;
 
                 let cpu_root = cpu_row_major_merkle_root(
                     &(0..num_cols)
@@ -363,7 +361,7 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
                 let fwd_tw =
                     TwoHalfTwiddles::<GoldilocksField>::new(log_lde, false).expect("fwd twiddles");
 
-                let (nodes, _handle, _lde) =
+                let (handle, _lde) =
                     math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
                         &row_major,
                         n,
@@ -372,8 +370,7 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
                         &weights_u64,
                     )
                     .expect("new ext3 row-major GPU pipeline");
-                let mut gpu_root = [0u8; 32];
-                gpu_root.copy_from_slice(&nodes[0..32]);
+                let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;
 
                 let cpu_root =
                     cpu_ext3_row_major_merkle_root(&columns, blowup, &weights_fp, &inv_tw, &fwd_tw);

@@ -2845,6 +2845,8 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p4_bitwise_collect");
     bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
     // the same chunk size used to split them into instances (see chunk_and_generate
@@ -2898,10 +2900,14 @@ fn build_traces<I: ImageSource + Sync>(
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p5_generate_tables");
 
     // A monolithic run or the final continuation epoch terminates on the program's
     // halt ECALL. Intermediate continuation epochs do not halt, so fall back to the
@@ -3268,6 +3274,8 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let local_to_global = local_to_global::generate_local_to_global_trace(&[]);
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     Ok(Traces {
         cpus,
         bitwise,
@@ -3984,16 +3992,26 @@ impl Traces {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p0_decode");
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 1: Logs → CPU operations
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p1_cpu_ops");
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
         let mut register_state = RegisterState::from_init(register_init);
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2a_collect_cpu");
         let (
             memw_ops,
             load_ops,
@@ -4007,7 +4025,11 @@ impl Traces {
             ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
             cpu_ops,
             memw_ops,
@@ -4024,9 +4046,13 @@ impl Traces {
             &mut register_state,
             is_final,
         );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phases 3-5
-        build_traces(
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p3to5_build_traces");
+        let result = build_traces(
             ops,
             Some(initial_image),
             &memory_state,
@@ -4040,7 +4066,10 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
-        )
+        );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        result
     }
 
     /// Generates all traces from execution logs (legacy API).

@@ -168,6 +168,19 @@ where
         })
     }
 
+    /// Create a root only Merkle tree placeholder: stores the commitment root
+    /// but no nodes. Used when paths are gathered from a device resident copy
+    /// (GPU) instead of this host tree, so the host nodes are never built.
+    /// [`get_proof_by_pos`](Self::get_proof_by_pos) must NOT be called on it.
+    pub fn from_root(root: B::Node) -> Self {
+        MerkleTree {
+            root,
+            nodes: Vec::new(),
+            #[cfg(feature = "disk-spill")]
+            mmap_backing: None,
+        }
+    }
+
     /// Create a Merkle tree from pre-hashed leaf nodes.
     ///
     /// This skips the `hash_leaves` step, useful when leaves have already been
