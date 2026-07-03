@@ -1440,7 +1440,7 @@ fn test_verify_rejects_tampered_public_output() {
 /// - Division: DIV, DIVU, REM, REMU
 /// - Control: LUI, AUIPC, JALR
 #[test]
-#[ignore] // Slow: run with `cargo test --ignored` or `make test-prover-all`
+#[ignore] // Slow: run with `cargo test -- --ignored` or `make test-prover-all`
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
