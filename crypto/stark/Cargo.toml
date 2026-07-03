@@ -49,6 +49,7 @@ rand_chacha = "0.3.1"
 test-utils = []
 test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
+profile-markers = []                                                 # Emits inlining-immune asm markers for guest step profiling
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
 cuda = ["dep:math-cuda"]

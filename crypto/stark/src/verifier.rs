@@ -103,6 +103,9 @@ pub trait IsStarkVerifier<
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool {
+        crate::profile_markers::step_marker::<
+            { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
+        >();
         let trace_length = proof.trace_length;
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
@@ -245,6 +248,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges, domain, proof,
@@ -399,6 +403,9 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
+        crate::profile_markers::step_marker::<
+            { crate::profile_markers::STEP_VERIFY_TRACE_AND_COMPOSITION_OPENINGS },
+        >();
         challenges
             .iotas
             .iter()
@@ -909,6 +916,9 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
+        crate::profile_markers::step_marker::<
+            { crate::profile_markers::STEP_REPLAY_ROUNDS_AFTER_ROUND_1 },
+        >();
         // ===================================
         // ==========|   Round 2   |==========
         // ===================================

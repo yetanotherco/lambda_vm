@@ -19,6 +19,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+pub use stark::profile_markers;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -1115,6 +1116,9 @@ pub fn verify_with_options(
         Some(balance) => balance,
         None => return Ok(false),
     };
+
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
 
     Ok(Verifier::multi_verify(
         &air_refs,

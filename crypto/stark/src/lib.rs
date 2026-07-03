@@ -22,6 +22,7 @@ pub mod grinding;
 pub mod instruments;
 pub mod lookup;
 pub(crate) mod par;
+pub mod profile_markers;
 pub mod proof;
 pub mod prover;
 pub mod r4_denoms;
