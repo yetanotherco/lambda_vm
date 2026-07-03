@@ -1453,6 +1453,79 @@ mod tests {
         );
     }
 
+    // `private_input_page_bases` must enumerate exactly the aligned bases that
+    // `is_private_input_page` classifies private, in ascending, page_size-spaced order.
+    #[test]
+    fn test_private_input_page_bases_enumeration() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let page_size = page::DEFAULT_PAGE_SIZE as u64;
+        let start = PRIVATE_INPUT_START_INDEX;
+
+        // Count 0 yields nothing.
+        assert_eq!(page::private_input_page_bases(0).count(), 0);
+
+        // Ascending, exact page_size spacing from the region start.
+        let bases: Vec<u64> = page::private_input_page_bases(3).collect();
+        assert_eq!(bases, vec![start, start + page_size, start + 2 * page_size]);
+
+        // The enumeration and the predicate agree: every yielded base classifies
+        // private for that count, and the first base past them does not.
+        for n in 0..4usize {
+            for base in page::private_input_page_bases(n) {
+                assert!(page::is_private_input_page(base, n));
+            }
+            assert!(!page::is_private_input_page(
+                start + n as u64 * page_size,
+                n
+            ));
+        }
+    }
+
+    // The deserialized-count bound is the tight honest max: exactly the pages a MAX-size
+    // input occupies, with no slack. Pin the value and the tightness (checked via the byte
+    // span so we don't allocate a 64 MiB test input).
+    #[test]
+    fn test_max_private_input_pages_is_tight() {
+        use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
+        let page_size = page::DEFAULT_PAGE_SIZE;
+        let max = page::max_private_input_pages();
+
+        // (64 MiB + 4-byte prefix) / 256 KiB page = 257 pages (256 full data pages plus
+        // the one page the length prefix spills into). Pinned so a size/page change is caught.
+        assert_eq!(max, 257);
+
+        // No slack: an honest MAX-size input needs the whole last page (the bound is not
+        // padded), and never overflows into an extra one.
+        let honest_bytes = MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES;
+        assert!((max - 1) * page_size < honest_bytes);
+        assert!(honest_bytes <= max * page_size);
+    }
+
+    // The verifier builds private-page configs with `include_private_genesis=false`, which
+    // must yield an explicitly empty genesis (never the looked-up bytes) so no verifier path
+    // can start depending on private data; the prover's `true` still loads the committed bytes.
+    #[test]
+    fn test_global_memory_configs_private_genesis_inclusion() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        let private_base = PRIVATE_INPUT_START_INDEX;
+        let genesis = vec![1u8, 2, 3, 4];
+        let mut init_page_data = HashMap::new();
+        init_page_data.insert(private_base, genesis.clone());
+
+        // Verifier side: empty genesis even though bytes are present in the map.
+        let verifier =
+            global_memory_configs_from_init_page_data(&[private_base], &init_page_data, 1, false);
+        assert_eq!(verifier.len(), 1);
+        assert!(verifier[0].is_private_input);
+        assert_eq!(verifier[0].init_values, Some(Vec::new()));
+
+        // Prover side: the same call loads the genesis bytes into the committed config.
+        let prover =
+            global_memory_configs_from_init_page_data(&[private_base], &init_page_data, 1, true);
+        assert!(prover[0].is_private_input);
+        assert_eq!(prover[0].init_values, Some(genesis));
+    }
+
     // Negative: `num_private_input_pages` is deserialized/untrusted, so reject a bundle
     // whose count exceeds the max before using it to size/build the global AIRs.
     #[test]

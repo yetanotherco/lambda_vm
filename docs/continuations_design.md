@@ -270,8 +270,8 @@ otherwise a prover could classify that page private and forge the ELF byte's gen
 **enforced by the loader**: `Elf::load` rejects any `PT_LOAD` segment reaching at or above
 `PRIVATE_INPUT_START_INDEX` (`ElfError::SegmentInPrivateInputRegion`) — covering every page
 the verifier can classify private, which slightly exceeds `[base, base+MAX_PRIVATE_INPUT_SIZE)`
-(the length prefix pushes an honest max-size input onto one more page, plus a page of
-count-bound slack).
+because the length prefix pushes an honest max-size input onto one more page (the count
+bound is that tight span, with no extra slack).
 Turning the reservation from convention into an enforced invariant closes this gap for
 **both** the continuation and monolithic paths (they share the loader and the same
 non-preprocessed-private-page design).

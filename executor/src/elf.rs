@@ -298,9 +298,10 @@ impl Elf {
             // stays private); ELF data placed there would have an unbound, prover-forgeable
             // genesis. The verifier can classify any page from the base up to the maximum
             // private-input page count as private — a span that slightly exceeds
-            // `MAX_PRIVATE_INPUT_SIZE` (the length prefix pushes an honest max-size input onto
-            // one more page, and the page-count bound adds a page of slack), so we reserve the
-            // whole high area rather than exactly `[base, base+MAX)`. Nothing legitimate loads
+            // `MAX_PRIVATE_INPUT_SIZE` because the length prefix pushes an honest max-size
+            // input onto one more page (the page-count bound is that tight span, with no
+            // extra slack), so we reserve the whole high area rather than exactly
+            // `[base, base+MAX)`. Nothing legitimate loads
             // here: ELF code/data live at low addresses, and the stack (`STACK_TOP`) and
             // private input are runtime regions written outside `load_program`, so this does
             // not affect them. Turns "the private-input area holds only private input" from a

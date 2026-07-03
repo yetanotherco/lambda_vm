@@ -294,3 +294,38 @@ pub enum MemoryError {
     #[error("Failed to allocate memory for load_bytes")]
     AllocationFailed,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The wire-format writer and every private-input page-span computation assume the
+    // length prefix is exactly a 4-byte LE `u32`; pin that so a change to the constant
+    // is caught rather than silently drifting from the page math.
+    #[test]
+    fn private_input_length_prefix_is_a_le_u32() {
+        assert_eq!(PRIVATE_INPUT_LENGTH_PREFIX_BYTES, 4);
+        assert_eq!(PRIVATE_INPUT_LENGTH_PREFIX_BYTES, size_of::<u32>());
+    }
+
+    // `store_private_inputs` must write a LE length prefix at the region base and the data
+    // immediately after it, at `+ PRIVATE_INPUT_LENGTH_PREFIX_BYTES`.
+    #[test]
+    fn store_private_inputs_writes_le_length_prefix_then_data() {
+        let mut memory = Memory::default();
+        let inputs = vec![0xAAu8, 0xBB, 0xCC];
+        memory.store_private_inputs(inputs.clone()).unwrap();
+
+        assert_eq!(
+            memory.load_word(PRIVATE_INPUT_START_INDEX).unwrap(),
+            inputs.len() as u32
+        );
+        let data = memory
+            .load_bytes(
+                PRIVATE_INPUT_START_INDEX + PRIVATE_INPUT_LENGTH_PREFIX_BYTES as u64,
+                inputs.len() as u64,
+            )
+            .unwrap();
+        assert_eq!(data, inputs);
+    }
+}

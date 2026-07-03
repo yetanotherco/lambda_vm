@@ -171,7 +171,7 @@ impl PageConfig {
 /// the other commits it, which is a soundness bug, so do not reimplement it.
 ///
 /// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
-pub fn private_input_page_count(private_inputs: &[u8]) -> usize {
+pub(crate) fn private_input_page_count(private_inputs: &[u8]) -> usize {
     use executor::vm::memory::PRIVATE_INPUT_LENGTH_PREFIX_BYTES;
     if private_inputs.is_empty() {
         return 0;
@@ -192,7 +192,7 @@ pub fn private_input_page_count(private_inputs: &[u8]) -> usize {
 /// (`ElfError::SegmentInPrivateInputRegion`) — covering every page this function
 /// can classify private — so no ELF-declared data can live there and have its
 /// genesis go unbound.
-pub fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
+pub(crate) fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = DEFAULT_PAGE_SIZE as u64;
     let end = PRIVATE_INPUT_START_INDEX + num_private_input_pages as u64 * page_size;
@@ -202,7 +202,9 @@ pub fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> 
 /// The page bases of the first `num_private_input_pages` private-input pages, in
 /// ascending order — the enumeration counterpart of [`is_private_input_page`]
 /// (`is_private_input_page(b, n)` holds exactly for the aligned bases this yields).
-pub fn private_input_page_bases(num_private_input_pages: usize) -> impl Iterator<Item = u64> {
+pub(crate) fn private_input_page_bases(
+    num_private_input_pages: usize,
+) -> impl Iterator<Item = u64> {
     use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
     let page_size = DEFAULT_PAGE_SIZE as u64;
     (0..num_private_input_pages as u64).map(move |i| PRIVATE_INPUT_START_INDEX + i * page_size)
@@ -212,7 +214,7 @@ pub fn private_input_page_bases(num_private_input_pages: usize) -> impl Iterator
 /// a MAX-size input including its length prefix — no slack (an honest max-size
 /// input occupies exactly this many pages). Both the monolithic and continuation
 /// verifiers bound the deserialized, untrusted count with this before sizing AIRs.
-pub fn max_private_input_pages() -> usize {
+pub(crate) fn max_private_input_pages() -> usize {
     use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
     (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES)
         .div_ceil(DEFAULT_PAGE_SIZE)
