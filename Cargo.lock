@@ -412,6 +412,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "digest",
+ "keccak",
  "libc",
  "math",
  "memmap2",
