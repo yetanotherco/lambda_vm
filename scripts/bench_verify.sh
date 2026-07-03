@@ -5,7 +5,7 @@
 #
 # Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
 #   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~4 min).
-#   Env: REBUILD=1 forces rebuild; BENCH_FEATURES=<list> (default: jemalloc-stats).
+#   Env: REBUILD=1 forces rebuild + re-prove; BENCH_FEATURES=<list> (default: jemalloc-stats).
 #        PROVE_PER_SIDE=auto|1|0 (default auto): 1 = each side proves+verifies its
 #        own proof (required when REF_A changes the proof format); 0 = force one
 #        shared proof (best precision); auto = share if the PR binary can verify the
@@ -27,8 +27,8 @@ ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 INPUT_REL="executor/tests/ethrex_bench_20.bin"
 WORK="/tmp/verify_run"
 WT="/tmp/verify_wt"
-PROOF_B="/tmp/verify_proof_b.bin"   # baseline's proof (shared mode: both verify this)
-PROOF_A="/tmp/verify_proof_a.bin"   # PR's own proof (per-side mode only)
+PROOF_B="$WORK/proof_b.bin"   # baseline's proof (cached in $WORK, keyed like the binaries)
+PROOF_A="$WORK/proof_a.bin"   # PR's proof (cached likewise)
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -130,14 +130,27 @@ run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits
   echo "$t"
 }
 
-# Both sides prove their own proof: needed for the proof-size row, and per-side
-# verify needs both. The verify MODE below only decides which proof each side verifies.
-echo "==> Proving with the baseline binary"
-prove_once "$WORK/cli_B" "$PROOF_B"
-echo "==> Proving with the PR binary"
-prove_once "$WORK/cli_A" "$PROOF_A"
+# Both sides prove their own proof (needed for the proof-size row; per-side verify
+# needs both). Proofs are cached in $WORK like the binaries, marker
+# "<sha> <features> <ELF+input hash>". Bytes are non-deterministic (parallel grinding)
+# but size + verify cost are structural, so reusing a cached proof is valid. The prove
+# call passes no proof-option flags; if it ever gains one (--blowup, ...), add it to the marker.
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+PROOF_KEY_INPUT="$(cat "$ELF" "$INPUT" | sha256_of | cut -c1-16)"
+prove_cached() {  # $1=binary $2=proof-path $3=sha
+  local marker="$3 $BENCH_FEATURES $PROOF_KEY_INPUT"
+  if [ "${REBUILD:-0}" != "1" ] && [ -f "$2" ] && [ "$(cat "$2.sha" 2>/dev/null)" = "$marker" ]; then
+    echo "==> Reusing cached proof for ${3:0:10} ($(basename "$2"))"
+  else
+    echo "==> Proving with $(basename "$1") (${3:0:10})"
+    prove_once "$1" "$2"
+    echo "$marker" > "$2.sha"
+  fi
+}
+prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B"
+prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A"
 
-# Proof sizes (bytes), captured before the proofs are removed below.
+# Proof sizes (bytes) for the Proof size row.
 SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
 SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
 
@@ -179,7 +192,7 @@ for i in $(seq 1 "$N_PAIRS"); do
   printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (+=faster)\n' \
     "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($b-$a)/$b*100}")"
 done
-rm -f "$PROOF_A" "$PROOF_B"
+# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
 SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" python3 - "$WORK/pairs.csv" <<'PY'
