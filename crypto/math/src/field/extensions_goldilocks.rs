@@ -199,6 +199,7 @@ impl IsField for Degree2GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -208,6 +209,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -224,6 +226,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree2GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -410,6 +413,7 @@ impl IsField for Degree3GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -420,6 +424,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -436,6 +441,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree3GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,

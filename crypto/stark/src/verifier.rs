@@ -728,22 +728,18 @@ where
             return None;
         }
 
-        // Build both denominator sets (regular, then symmetric) and invert
-        // them together in a single batch.
+        // Build both denominator sets in one walk of the shared z*g^k ladder,
+        // interleaved (regular, symmetric, regular, symmetric, ...), and
+        // invert them together in a single batch.
         let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
         let mut current_z = challenges.z.clone();
         for _ in 0..ood_evaluations_table_height {
             denoms.push(evaluation_point - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
             denoms.push(evaluation_point_sym - &current_z);
             current_z = primitive_root * &current_z;
         }
         // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
         FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
-        let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
 
         let mut trace_term = FieldElement::<FieldExtension>::zero();
         let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
@@ -769,9 +765,9 @@ where
                         base_row_sum_sym + coeff * &lde_trace_aux_evaluations_sym[aux_idx];
                 }
             }
-            trace_term = trace_term + &denoms_trace[row_idx] * &(&base_row_sum - &ood_row_sum);
-            trace_term_sym =
-                trace_term_sym + &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - &ood_row_sum);
+            trace_term = trace_term + &denoms[2 * row_idx] * &(&base_row_sum - &ood_row_sum);
+            trace_term_sym = trace_term_sym
+                + &denoms[2 * row_idx + 1] * &(&base_row_sum_sym - &ood_row_sum);
         }
 
         let composition_parts_ood = evals(&proof.composition_poly_parts_ood_evaluation);
@@ -785,10 +781,15 @@ where
         }
         let z_pow = &challenges.z.pow(number_of_parts);
 
-        // A malformed proof can make evaluation_point == z^N, reject.
-        let mut denom_composition_pair = [evaluation_point - z_pow, evaluation_point_sym - z_pow];
-        FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
-        let [denom_composition, denom_composition_sym] = denom_composition_pair;
+        // A malformed proof can make evaluation_point == z^N, reject. Hand-rolled
+        // 2-element batch inverse (one inversion, three muls, no allocation):
+        // for a, b with product p = a*b, inv(p) * b = inv(a) and inv(p) * a = inv(b).
+        let denom_composition_raw = evaluation_point - z_pow;
+        let denom_composition_sym_raw = evaluation_point_sym - z_pow;
+        let denom_composition_prod_inv =
+            (&denom_composition_raw * &denom_composition_sym_raw).inv().ok()?;
+        let denom_composition = &denom_composition_prod_inv * &denom_composition_sym_raw;
+        let denom_composition_sym = &denom_composition_prod_inv * &denom_composition_raw;
 
         let mut h_sum_zpow = FieldElement::<FieldExtension>::zero();
         let mut h_sum = FieldElement::<FieldExtension>::zero();
