@@ -83,7 +83,12 @@ pub const GENESIS_EPOCH: u64 = 0;
 pub const MAX_EPOCHS: u64 = 1 << 20;
 
 /// A cell's state when an epoch first touches it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+//
+// Deliberately NOT serde-derived: `value` is a private-input byte for a private
+// first-read, so these types must never be serialized into a proof bundle (the
+// bundle ships only the value-free `touched_page_bases`). Keeping the derives off
+// makes re-introducing that leak a compile error, not a silent regression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InitClaim {
     /// Value the cell held when this epoch first touched it.
     pub value: u64,
@@ -97,7 +102,8 @@ pub struct InitClaim {
 }
 
 /// A cell's state at the end of the epoch that touched it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// (Not serde-derived — see [`InitClaim`].)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FiniClaim {
     /// Value the cell holds at this epoch's end.
     pub value: u64,
@@ -107,8 +113,10 @@ pub struct FiniClaim {
     pub timestamp: u64,
 }
 
-/// The init/fini boundary claims for a single touched cell.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+/// The init/fini boundary claims for a single touched cell. Prover-local only:
+/// it holds cell values, so it is never serialized (not serde-derived — see
+/// [`InitClaim`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellBoundary {
     pub address: u64,
     pub init: InitClaim,

@@ -49,7 +49,6 @@ use std::collections::HashMap;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
-use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
@@ -268,7 +267,7 @@ fn canonical_page_bases(page_bases: &[u64]) -> Vec<u64> {
 /// Private-input pages are built NON-preprocessed, so the verifier never recomputes their
 /// genesis from the ELF and never needs the raw private bytes. They are identified EXACTLY
 /// as the monolithic verifier does — the first `num_private_input_pages` pages from
-/// `PRIVATE_INPUT_START_INDEX` (see [`is_private_input_page`]).
+/// `PRIVATE_INPUT_START_INDEX` (see [`page::is_private_input_page`]).
 fn global_memory_configs(
     page_bases: &[u64],
     elf: &Elf,
@@ -278,25 +277,40 @@ fn global_memory_configs(
     // non-preprocessed (their INIT is never recomputed).
     let image = build_initial_image_paged(elf, &[]);
     let init_page_data = build_init_page_data(&image);
-    global_memory_configs_from_init_page_data(page_bases, &init_page_data, num_private_input_pages)
+    global_memory_configs_from_init_page_data(
+        page_bases,
+        &init_page_data,
+        num_private_input_pages,
+        false,
+    )
 }
 
 /// Shared genesis-config builder for prover and verifier, one `PageConfig` per page base
 /// in `page_bases` (which must be canonical: sorted + deduped). `init_page_data` holds
 /// each page's genesis bytes (ELF + private input on the prover side; ELF only on the
-/// verifier side). Private-input pages are built NON-preprocessed: on the prover their
-/// committed INIT column carries the genesis bytes; on the verifier the AIR is
-/// non-preprocessed so those bytes are irrelevant.
+/// verifier side).
+///
+/// `include_private_genesis` — whether a private-input page's genesis bytes are loaded
+/// from `init_page_data` into its config. The PROVER passes `true`: those bytes become
+/// the committed INIT column. The VERIFIER passes `false`: its AIR for a private page is
+/// non-preprocessed and never consults `init_values` (and its `init_page_data` is built
+/// from the ELF alone, so there is nothing to load) — the config carries an explicitly
+/// empty vec so no code path can silently start depending on verifier-side private data.
 fn global_memory_configs_from_init_page_data(
     page_bases: &[u64],
     init_page_data: &HashMap<u64, Vec<u8>>,
     num_private_input_pages: usize,
+    include_private_genesis: bool,
 ) -> Vec<PageConfig> {
     page_bases
         .iter()
         .map(|&page_base| {
-            if is_private_input_page(page_base, num_private_input_pages) {
-                let data = init_page_data.get(&page_base).cloned().unwrap_or_default();
+            if page::is_private_input_page(page_base, num_private_input_pages) {
+                let data = if include_private_genesis {
+                    init_page_data.get(&page_base).cloned().unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
                 PageConfig::with_private_input(page_base, data)
             } else {
                 match init_page_data.get(&page_base) {
@@ -306,38 +320,6 @@ fn global_memory_configs_from_init_page_data(
             }
         })
         .collect()
-}
-
-/// Whether `page_base` is one of the first `num_private_input_pages` pages starting at
-/// `PRIVATE_INPUT_START_INDEX` — the page-aligned span private input actually occupies.
-/// This matches the monolithic verifier's `page_configs_from_elf_and_runtime` exactly, so
-/// the continuation classifies private pages identically to the monolithic path. Classifying
-/// by the count (not the raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) keeps prover
-/// and verifier in lockstep regardless of whether the region end is page-aligned.
-///
-/// NOTE (shared with the monolithic path): a page classified private is built
-/// non-preprocessed, so its genesis is NOT recomputed from the ELF. This is safe because
-/// the private-input area is reserved and the reservation is enforced: `Elf::load` rejects
-/// any loadable segment reaching at/above `PRIVATE_INPUT_START_INDEX`
-/// (`ElfError::SegmentInPrivateInputRegion`) — covering every page this function can
-/// classify private — so no ELF-declared data can live there and have its genesis go unbound.
-fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
-    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-    let page_size = page::DEFAULT_PAGE_SIZE as u64;
-    let end = PRIVATE_INPUT_START_INDEX + num_private_input_pages as u64 * page_size;
-    (PRIVATE_INPUT_START_INDEX..end).contains(&page_base)
-}
-
-/// Number of pages the private input occupies, starting at `PRIVATE_INPUT_START_INDEX`.
-/// Mirrors the monolithic prover (`from_elf_and_logs`): the wire format is a 4-byte
-/// length prefix plus the data, and `PRIVATE_INPUT_START_INDEX` is page-aligned, so the
-/// span is `ceil((4 + len) / page_size)` consecutive pages (0 when there is no input).
-fn private_input_page_count(private_inputs: &[u8]) -> usize {
-    if private_inputs.is_empty() {
-        return 0;
-    }
-    let total_bytes = 4 + private_inputs.len();
-    total_bytes.div_ceil(page::DEFAULT_PAGE_SIZE)
 }
 
 /// Per-epoch register state and label.
@@ -665,6 +647,7 @@ fn prove_global(
         page_bases,
         init_page_data,
         num_private_input_pages,
+        true,
     );
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
@@ -886,7 +869,7 @@ pub fn prove_continuation(
 
     // One global LogUp over all the (kept) local-to-global tables. `all_boundaries` was
     // accumulated locally in the loop (never round-tripped through the bundle).
-    let num_private_input_pages = private_input_page_count(private_inputs);
+    let num_private_input_pages = page::private_input_page_count(private_inputs);
     // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
     // tables and is shipped in the bundle, so the two can never diverge in set or order.
     let touched_page_bases = touched_page_bases(&all_boundaries);
@@ -909,8 +892,9 @@ pub fn prove_continuation(
 
 /// Verify a [`ContinuationProof`] using ONLY the bundle and the ELF — nothing from
 /// the prover's memory. Returns `Ok(Some(public_output))` (the run-wide committed
-/// bytes, reconstructed from the per-epoch bound slices) iff every check holds, else
-/// `Ok(None)`.
+/// bytes, reconstructed from the per-epoch bound slices) iff every check holds,
+/// `Ok(None)` if a well-formed proof fails verification, and `Err` if the bundle is
+/// structurally malformed (fails validation before any proof is checked).
 ///
 /// The verifier (1) enumerates epochs itself, assigning `epoch_label` and `is_final`
 /// by position (a trusted enumeration); (2) verifies each epoch, deriving its
@@ -934,10 +918,7 @@ pub fn verify_continuation(
     // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
     // diverges the verifier's challenges and `verify_global`'s `multi_verify` rejects —
     // on top of the committed-AIR-shape mismatch a wrong count causes on a touched page.
-    // The tight max is the honest span of a MAX-size input including its 4-byte length
-    // prefix: `ceil((MAX_PRIVATE_INPUT_SIZE + 4) / page_size)` pages (no slack).
-    let max_private_input_pages =
-        (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE);
+    let max_private_input_pages = page::max_private_input_pages();
     if bundle.num_private_input_pages > max_private_input_pages {
         return Err(Error::InvalidTableCounts(format!(
             "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
@@ -1002,17 +983,21 @@ pub fn verify_continuation(
     let page_bases = canonical_page_bases(&bundle.touched_page_bases);
     // Every honest base is produced by `page::page_base_for_address`, so it is page-aligned; a
     // non-aligned base is only reachable via a hand-crafted bundle. Left unchecked, such a base
-    // still falls in the private-input range (`is_private_input_page`), so it would be built
-    // NON-preprocessed with a prover-controlled genesis. The GlobalMemory bus already prevents
-    // forging any real cell (no MEMW access exists at a non-aligned fake address, so no L2G row
-    // consumes its genesis token), but a self-cancelling junk page could otherwise ride along in
-    // an accepted proof. Reject here so the verifier's page set is exactly the aligned set the
-    // prover could honestly derive.
+    // still falls in the private-input range (`page::is_private_input_page`), so it would be
+    // built NON-preprocessed with a prover-controlled genesis. The GlobalMemory bus already
+    // prevents forging any real cell (no MEMW access exists at a non-aligned fake address, so no
+    // L2G row consumes its genesis token), but a self-cancelling junk page could otherwise ride
+    // along in an accepted proof. Reject here so the verifier's page set is exactly the aligned
+    // set the prover could honestly derive. Like the count bound above, this is structural
+    // validation of an untrusted bundle field, so it is an `Err` (malformed bundle), not
+    // `Ok(None)` (well-formed proof that failed verification).
     if page_bases
         .iter()
         .any(|&b| b != page::page_base_for_address(b))
     {
-        return Ok(None);
+        return Err(Error::MalformedContinuationBundle(
+            "touched_page_bases contains a non-page-aligned entry".to_string(),
+        ));
     }
     if !verify_global(
         n,
@@ -1443,27 +1428,27 @@ mod tests {
         // first page, not the last. Classification is by count alone, not the region span.
         let region_pages = MAX_PRIVATE_INPUT_SIZE / page_size;
         let last_region_page = start + (region_pages - 1) * page_size;
-        assert!(!is_private_input_page(start, 0));
-        assert!(!is_private_input_page(last_region_page, 0));
+        assert!(!page::is_private_input_page(start, 0));
+        assert!(!page::is_private_input_page(last_region_page, 0));
 
         // Count n → exactly the first n pages from start.
-        assert!(is_private_input_page(start, 1));
-        assert!(!is_private_input_page(start + page_size, 1));
-        assert!(is_private_input_page(start + page_size, 2));
+        assert!(page::is_private_input_page(start, 1));
+        assert!(!page::is_private_input_page(start + page_size, 1));
+        assert!(page::is_private_input_page(start + page_size, 2));
         // Pages below the region are never private.
-        assert!(!is_private_input_page(start - page_size, 10));
+        assert!(!page::is_private_input_page(start - page_size, 10));
 
         // private_input_page_count: wire format is [len:4][data], region is page-aligned.
-        assert_eq!(private_input_page_count(&[]), 0);
-        assert_eq!(private_input_page_count(&[0u8; 16]), 1);
+        assert_eq!(page::private_input_page_count(&[]), 0);
+        assert_eq!(page::private_input_page_count(&[0u8; 16]), 1);
         // 4-byte prefix + (page_size - 4) data exactly fills one page.
         assert_eq!(
-            private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 4]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 4]),
             1
         );
         // One more byte spills into a second page.
         assert_eq!(
-            private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 3]),
+            page::private_input_page_count(&vec![0u8; page::DEFAULT_PAGE_SIZE - 3]),
             2
         );
     }
@@ -1476,8 +1461,7 @@ mod tests {
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
         let mut bundle =
             prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(page::DEFAULT_PAGE_SIZE);
-        bundle.num_private_input_pages = max_pages + 1;
+        bundle.num_private_input_pages = page::max_private_input_pages() + 1;
         assert!(matches!(
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
             Err(Error::InvalidTableCounts(_))
@@ -1651,10 +1635,11 @@ mod tests {
         );
         bundle.touched_page_bases[0] += 1;
         assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
-                .is_none(),
-            "a non-page-aligned touched page base must be rejected"
+            matches!(
+                verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
+                Err(Error::MalformedContinuationBundle(_))
+            ),
+            "a non-page-aligned touched page base is a malformed bundle → must be an Err"
         );
     }
 
