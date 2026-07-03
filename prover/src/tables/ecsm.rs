@@ -469,7 +469,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::X2, 32, &mut out);
     is_byte(cols::Q0, 32, &mut out);
     is_byte(cols::YG, 32, &mut out);
-    is_byte(cols::Q1, 33, &mut out); // q1[0..32] (all 33 bytes)
+    is_byte(cols::Q1, 33, &mut out); // q1[0..=32] (all 33 bytes)
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
     // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
@@ -887,7 +887,35 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequ
     }
 }
 
-/// Creates all ECSM transition constraints (412 total: 1 mu + 256 k bits + 1 q1[32] + 8 xG<p + 146 others).
+/// `(Σ_{i=0}^{255} k_bit[i]) · (1 − µ) = 0` — all scalar bits must be zero on padding rows.
+///
+/// Without this constraint a prover could set k_bit columns on a µ=0 row (IS_BIT allows 0
+/// or 1) and fire phantom BIT bus receives, breaking bus balance. Spec: ecsm.toml:730-733.
+pub struct KBitsZeroOnPadding {
+    pub constraint_idx: usize,
+}
+
+impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KBitsZeroOnPadding {
+    fn degree(&self) -> usize {
+        2
+    }
+    fn constraint_idx(&self) -> usize {
+        self.constraint_idx
+    }
+    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
+    where
+        F: IsSubFieldOf<E>,
+        E: IsField,
+    {
+        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
+        let sum = (0..256).fold(FieldElement::<F>::zero(), |acc, i| {
+            acc + step.get_main_evaluation_element(0, cols::k_bit(i)).clone()
+        });
+        sum * (FieldElement::<F>::one() - mu)
+    }
+}
+
+/// Creates all ECSM transition constraints (413 total: 1 mu + 256 k bits + 1 k-bits-zero-on-padding + 1 q1[32] + 8 xG<p + 146 others).
 pub fn create_constraints(
     constraint_idx_start: usize,
 ) -> (
@@ -910,6 +938,10 @@ pub fn create_constraints(
         constraints.push(c.boxed());
     }
     idx = next_idx;
+
+    // (Σ k_bit[i]) · (1 − µ) = 0: all scalar bits must be zero on padding rows.
+    constraints.push(KBitsZeroOnPadding { constraint_idx: idx }.boxed());
+    idx += 1;
 
     // x2 convolution: 64 carries + closing.
     for i in 0..64 {
@@ -954,8 +986,8 @@ pub fn create_constraints(
     idx += 1;
 
     // IS_BIT(q1[32]) — the high byte of the 33-byte yG quotient is a single-bit value.
-    // The spec mandates this unconditionally (ec:c:q1_257); IS_BYTE(0..32) is separate
-    // (μ-gated bus interaction) and does not replace this polynomial constraint.
+    // The spec mandates this unconditionally (ec:c:q1_257); IS_BYTE(0..=32) covers all 33
+    // bytes via a μ-gated bus interaction and does not replace this polynomial constraint.
     constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
     idx += 1;
 
