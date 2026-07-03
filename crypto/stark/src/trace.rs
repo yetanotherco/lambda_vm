@@ -560,6 +560,18 @@ where
         &self.aux_data[row * self.num_aux_cols + col]
     }
 
+    /// Borrow a full main-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn main_row(&self, row: usize) -> &[FieldElement<F>] {
+        &self.main_data[row * self.num_main_cols..(row + 1) * self.num_main_cols]
+    }
+
+    /// Borrow a full aux-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn aux_row(&self, row: usize) -> &[FieldElement<E>] {
+        &self.aux_data[row * self.num_aux_cols..(row + 1) * self.num_aux_cols]
+    }
+
     /// Gather a full main-trace row into an owned Vec.
     /// Used by `open_trace_polys` (called ~30 times per table, allocation is negligible).
     pub fn gather_main_row(&self, row_idx: usize) -> Vec<FieldElement<F>> {

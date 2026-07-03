@@ -1,17 +1,13 @@
-//! End-to-end naive recursion pipeline smoke tests.
+//! End-to-end naive recursion pipeline smoke tests: prove an inner program,
+//! hand `(VmProof, elf, opts)` to the in-VM verifier guest, then either prove
+//! the guest's execution (`OuterMode::Prove`) or just execute it
+//! (`OuterMode::ExecuteOnly`). Guest ELFs come from `make compile-recursion-elfs`.
 //!
-//! Each test:
-//! 1. Proves an inner program on the host.
-//! 2. Serializes `(VmProof, inner_elf, opts)` with postcard.
-//! 3. Hands that as private input to the recursion guest.
-//! 4. Either **proves** the recursion guest's execution (memory-bounded via
-//!    continuations) and verifies the outer proof (`OuterMode::Prove`), or
-//!    merely **executes** the guest in-VM and reads the committed marker
-//!    straight off the executor's memory (`OuterMode::ExecuteOnly`) — a cheaper
-//!    tier that skips the LDE/FRI that dominate the full pipeline.
-//!
-//! The guest ELFs are assumed built by `make compile-recursion-elfs`.
+//! Every pipeline host-verifies the inner proof, so building with
+//! `--features stark/instruments` makes any of these tests print the verifier's
+//! per-step `Time spent:` timings.
 
+use std::ops::ControlFlow;
 use std::path::PathBuf;
 
 fn workspace_root() -> PathBuf {
@@ -32,11 +28,8 @@ fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
     })
 }
 
-/// Minimum-security FRI parameters: blowup=2, a single FRI query. Security is
-/// intentionally terrible — used by the capacity-probing test, where the goal
-/// is the smallest possible inner proof, not a sound one.
-/// (`GoldilocksCubicProofOptions::with_blowup` derives a query count from a
-/// 128-bit target, far more than we want here.)
+/// Smallest possible inner proof (blowup=2, 1 query). Intentionally insecure —
+/// for the cheap diagnostics, not soundness.
 const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
     stark::proof::options::ProofOptions {
         blowup_factor: 2,
@@ -45,11 +38,8 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         grinding_factor: 1,
     };
 
-/// Prove `inner_elf` (fed `inner_input`) under `opts`, then package
-/// `(proof, elf, opts)` into the postcard blob the recursion guest consumes as
-/// its private input. `tag` prefixes the progress lines. Returns the inner
-/// proof — callers that re-verify it on the host need it — next to the encoded
-/// blob.
+/// Prove `inner_elf` under `opts` and postcard-encode `(proof, elf, opts)` into
+/// the guest's private-input blob. Returns the proof and the blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
@@ -74,29 +64,17 @@ fn prove_inner_and_encode_blob(
     (inner_proof, blob)
 }
 
-/// How far to take the recursion guest after it has been handed the inner
-/// proof. The guest under test is the verifier either way — this only chooses
-/// whether we also prove the guest's own execution.
+/// Whether to also prove the guest's own execution after handing it the proof.
 #[derive(Clone, Copy, Debug)]
 enum OuterMode {
-    /// Execute the guest in-VM and read the committed marker straight off the
-    /// executor's memory. Streams logs via `Executor::resume()` and never
-    /// builds a `Traces`, so footprint stays bounded to the VM's touched
-    /// memory + instruction cache. Skips the LDE/FRI of the full pipeline entirely.
+    /// Execute in-VM, read the committed marker off memory; no LDE/FRI.
     ExecuteOnly,
-    /// Prove the guest's execution via continuations, then verify the outer
-    /// proof on the host. `prove_and_verify_continuation` retains every epoch's
-    /// STARK proof in the bundle before verifying, so peak RAM grows with epoch
-    /// count. Heavy — excluded from CI, run manually. A future verify-one-and-
-    /// discard API extension would make this memory-friendlier.
+    /// Prove the execution (memory-bounded via continuations) and verify on host.
     Prove,
 }
 
-/// Execute the recursion guest in-VM on `blob` and return the bytes it
-/// committed (the success marker the in-VM verifier emits).
-///
-/// Streams execution via `Executor::resume()`. The committed marker is
-/// read directly off the executor's memory. This avoids OOMs.
+/// Execute the recursion guest in-VM on `blob` and return its committed bytes,
+/// read straight off the executor's memory after a streamed run.
 fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
     use executor::elf::Elf;
     use executor::vm::execution::Executor;
@@ -105,12 +83,11 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
     let program = Elf::load(recursion_elf_bytes).expect("load recursion elf");
     let mut executor = Executor::new(&program, blob.to_vec()).expect("executor new");
 
-    // Drain chunks to completion without retaining logs or building a trace.
-    while executor
-        .resume()
-        .expect("recursion guest execution failed (verify panicked in-VM?)")
-        .is_some()
-    {}
+    let (total_cycles, exec_time) = drive_executor(
+        &mut executor,
+        |_log| ControlFlow::Continue(()),
+        |_, _, _| {},
+    );
 
     let committed = executor
         .finish()
@@ -118,7 +95,7 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
         .memory_values;
 
     eprintln!(
-        "[{label}] committed {} bytes: {:?} (as str: {:?})",
+        "[{label}] {total_cycles} cycles in {exec_time:?}; committed {} bytes: {:?} (as str: {:?})",
         committed.len(),
         committed,
         String::from_utf8_lossy(&committed),
@@ -130,9 +107,8 @@ fn execute_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]
 /// trace+LDE stays under the ~16GiB CI runners.
 const OUTER_EPOCH_SIZE_LOG2: u32 = 16;
 
-/// Prove the recursion guest's execution on `blob` memory-bounded via
-/// continuations and verify the bundle on the host, returning the bytes the
-/// guest committed.
+/// Prove the guest's execution via continuations, verify on host, return the
+/// committed bytes.
 fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) -> Vec<u8> {
     let opts =
         crate::GoldilocksCubicProofOptions::with_blowup(2).expect("blowup=2 is always valid");
@@ -152,10 +128,312 @@ fn prove_outer_and_commit(label: &str, recursion_elf_bytes: &[u8], blob: &[u8]) 
     committed
 }
 
-/// Core pipeline: prove an inner program with the given options, hand the
-/// proof+ELF+options to the recursion guest, then take the guest to `mode`
-/// (execute-only or full prove) and assert it committed the `[1]` success
-/// marker — i.e. the in-VM verifier accepted the inner proof.
+/// Stream a guest's execution via `Executor::resume()` without buffering the log
+/// stream. `on_log` returns `Break` to stop early; `on_progress` fires per chunk.
+/// Returns `(total_cycles, wall_time)`, exact even on an early break.
+fn drive_executor(
+    executor: &mut executor::vm::execution::Executor,
+    mut on_log: impl FnMut(&executor::vm::logs::Log) -> ControlFlow<()>,
+    mut on_progress: impl FnMut(usize, u64, std::time::Duration),
+) -> (u64, std::time::Duration) {
+    let start = std::time::Instant::now();
+    let mut total_cycles: u64 = 0;
+    let mut chunks: usize = 0;
+    while let Some(logs) = executor
+        .resume()
+        .expect("executor resume failed (guest panicked in-VM?)")
+    {
+        let mut stop = false;
+        for log in logs {
+            total_cycles += 1;
+            if on_log(log).is_break() {
+                stop = true;
+                break;
+            }
+        }
+        chunks += 1;
+        on_progress(chunks, total_cycles, start.elapsed());
+        if stop {
+            break;
+        }
+    }
+    (total_cycles, start.elapsed())
+}
+
+/// Shared preamble: build the blob (an `empty` inner proof under `opts`), load
+/// `guest_name`, and stand up an executor. Returns `(elf_bytes, program, executor)`.
+fn setup_guest_run(
+    label: &str,
+    guest_name: &str,
+    opts: &stark::proof::options::ProofOptions,
+) -> (
+    Vec<u8>,
+    executor::elf::Elf,
+    executor::vm::execution::Executor,
+) {
+    let root = workspace_root();
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
+    let guest_elf_bytes = read_guest_elf(&root, guest_name);
+
+    let (_inner_proof, blob) = prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], opts);
+
+    let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
+    assert_ne!(
+        program.entry_point, 0,
+        "{guest_name} ELF has entry_point=0 — build artifact is malformed"
+    );
+    let executor =
+        executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
+    (guest_elf_bytes, program, executor)
+}
+
+/// Demangled enclosing-function name for a PC via the ELF symbol table;
+/// `<unknown>` if none covers it. No file:line (symtab has no DWARF).
+fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
+    symbols.lookup(pc).map_or_else(
+        || "<unknown>".to_string(),
+        |s| executor::flamegraph::demangle(&s.name),
+    )
+}
+
+/// Verifier sub-steps in execution order, keyed by `stark::profile_markers::STEP_*`
+/// value. `run_profile` buckets cycles by the latest marker observed so far
+/// (`decode_step_marker`, defaulting to bucket 0 until the first marker fires),
+/// so `multi_verify`'s per-table `3,4,5,6` repetition re-attributes cycles to
+/// the correct step on each table's `6->3` transition instead of latching at 6.
+const STEP_LABELS: [&str; 7] = [
+    "0. setup (alloc init + postcard decode)",
+    "1. airs_and_bus_balance (Elf::load/VmAirs::new preprocessed FFT+Merkle/bus balance)",
+    "2. multi_verify setup (transcript replay phase A/B, per-table fork)",
+    "3. step 1: replay_rounds_after_round_1",
+    "4. step 2: verify_claimed_composition_polynomial",
+    "5. step 3: verify_fri",
+    "6. step 4: verify_trace_and_composition_openings (+ wrap-up)",
+];
+
+/// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
+fn blowup8() -> stark::proof::options::ProofOptions {
+    crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
+}
+
+/// Short per-step tag for the function table, keyed by the same bucket index
+/// used in `STEP_LABELS`/`buckets`.
+fn step_tag(bucket: u8) -> &'static str {
+    match bucket {
+        0 => "setup",
+        1 => "airs_bus_balance",
+        2 => "multi_verify_setup",
+        3 => "step1:replay",
+        4 => "step2:claimed",
+        5 => "step3:fri",
+        6 => "step4:openings",
+        _ => "?",
+    }
+}
+
+/// Print one top-25 table: `rows` is `(name, cycles, distinct_pcs)`, already
+/// unsorted; `denom_cycles` is the denominator for percentages — the global
+/// total for the all-steps table, but *that step's own total* for a per-step
+/// table, so `%`/`cum %` show what dominates within that step (a `keccak`
+/// that's 90% of a cheap step should read as 90%, not as a fraction of a
+/// percent of the whole run).
+fn print_top25_table(rows: &mut [(String, u64, u64)], denom_cycles: u64) {
+    rows.sort_unstable_by_key(|(_name, cycles, _pcs)| std::cmp::Reverse(*cycles));
+    let pct = |n: u64| 100.0 * (n as f64) / (denom_cycles as f64);
+    eprintln!("  rank          cycles        %    cum %    PCs  function");
+    let mut cumulative: u64 = 0;
+    for (rank, (name, cycles, pcs)) in rows.iter().take(25).enumerate() {
+        cumulative += cycles;
+        eprintln!(
+            "  {:>4}  {:>14}  {:>6.2}%  {:>6.2}%  {:>5}  {}",
+            rank + 1,
+            cycles,
+            pct(*cycles),
+            pct(cumulative),
+            pcs,
+            name,
+        );
+    }
+}
+
+/// Print the global top-25 functions by cycle count, then one top-25 table
+/// per verifier step — so e.g. how much of `step4:openings` is spent in
+/// `keccak` is visible at a glance, instead of only the function's total
+/// across all steps.
+fn print_function_table(
+    symbols: &executor::elf::SymbolTable,
+    pc_hist: std::collections::HashMap<(u64, u8), u64>,
+    total_cycles: u64,
+) {
+    let mut by_function: std::collections::HashMap<String, (u64, u64)> =
+        std::collections::HashMap::new();
+    let mut by_function_per_step: std::collections::HashMap<
+        u8,
+        std::collections::HashMap<String, (u64, u64)>,
+    > = std::collections::HashMap::new();
+    let mut unique_pcs: std::collections::HashSet<u64> = std::collections::HashSet::new();
+    for ((pc, bucket), count) in &pc_hist {
+        unique_pcs.insert(*pc);
+        let name = resolve_pc(symbols, *pc);
+
+        let entry = by_function.entry(name.clone()).or_insert((0, 0));
+        entry.0 += *count; // cycles
+        entry.1 += 1; // distinct PCs folded into this function
+
+        let step_entry = by_function_per_step
+            .entry(*bucket)
+            .or_default()
+            .entry(name)
+            .or_insert((0, 0));
+        step_entry.0 += *count;
+        step_entry.1 += 1;
+    }
+
+    eprintln!("  Unique PCs   : {}", unique_pcs.len());
+    eprintln!();
+    eprintln!(
+        "  Top 25 functions by cycle count (aggregated over their PCs, all steps; % of total cycles):"
+    );
+    let mut rows: Vec<(String, u64, u64)> = by_function
+        .into_iter()
+        .map(|(name, (cycles, pcs))| (name, cycles, pcs))
+        .collect();
+    print_top25_table(&mut rows, total_cycles);
+
+    for bucket in 0u8..STEP_LABELS.len() as u8 {
+        let Some(by_step_function) = by_function_per_step.remove(&bucket) else {
+            continue;
+        };
+        let step_total: u64 = by_step_function.values().map(|(cycles, _pcs)| cycles).sum();
+        eprintln!();
+        eprintln!(
+            "  Top 25 functions by cycle count — step {} (% of this step's {} cycles):",
+            step_tag(bucket),
+            step_total,
+        );
+        let mut rows: Vec<(String, u64, u64)> = by_step_function
+            .into_iter()
+            .map(|(name, (cycles, pcs))| (name, cycles, pcs))
+            .collect();
+        print_top25_table(&mut rows, step_total);
+    }
+}
+
+/// Print the per-verifier-step cycle bucketing (`buckets[0]` = setup).
+fn print_step_breakdown(buckets: &[u64; 7], total_cycles: u64) {
+    eprintln!();
+    eprintln!("  Per-step cycle breakdown (latest-marker state machine):");
+    eprintln!("  {:<70}  {:>14}  {:>7}", "bucket", "cycles", "%");
+    for (label, cycles) in STEP_LABELS.iter().zip(buckets.iter()) {
+        let pct = if total_cycles > 0 {
+            100.0 * (*cycles as f64) / (total_cycles as f64)
+        } else {
+            0.0
+        };
+        eprintln!("  {:<60}  {:>14}  {:>6.2}%", label, cycles, pct);
+    }
+}
+
+/// Single-pass execute-only profiler. Always prints total cycles, the
+/// per-step cycle breakdown (marker decode is cheap — one `InstructionCache`
+/// lookup per cycle), and a rough trace/LDE estimate; with `detailed`, also
+/// the top-25 functions table (needs a `pc_hist` HashMap, so gated).
+fn run_profile(
+    guest_name: &str,
+    progress_stride: usize,
+    opts: stark::proof::options::ProofOptions,
+    detailed: bool,
+) {
+    use std::collections::HashMap;
+
+    let (guest_elf_bytes, program, mut executor) = setup_guest_run("profile", guest_name, &opts);
+    let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
+    let instructions = executor::vm::execution::InstructionCache::new(&program.data)
+        .expect("instruction cache build failed");
+
+    let mut pc_hist: HashMap<(u64, u8), u64> = HashMap::new();
+    let mut buckets = [0u64; 7];
+    let bucket = std::cell::Cell::new(0u8);
+    let unique = std::cell::Cell::new(0usize);
+
+    eprintln!(
+        "[profile] executing {guest_name} guest ({}) ...",
+        if detailed {
+            "histogram + steps"
+        } else {
+            "steps"
+        }
+    );
+    let (total_cycles, exec_time) = drive_executor(
+        &mut executor,
+        |log| {
+            let pc = log.current_pc;
+
+            if let Some(marker) = executor::vm::execution::decode_step_marker(&instructions, pc) {
+                bucket.set(marker as u8);
+            }
+            buckets[bucket.get() as usize] += 1;
+
+            if detailed {
+                *pc_hist.entry((pc, bucket.get())).or_insert(0) += 1;
+                unique.set(pc_hist.len());
+            }
+
+            ControlFlow::Continue(())
+        },
+        |chunks, cycles, elapsed| {
+            if chunks.is_multiple_of(progress_stride) {
+                if detailed {
+                    eprintln!(
+                        "[profile]   ... {chunks} chunks, {cycles} cycles, {} unique PCs, bucket={}, {elapsed:?}",
+                        unique.get(),
+                        bucket.get(),
+                    );
+                } else {
+                    eprintln!(
+                        "[profile]   ... {chunks} chunks, {cycles} cycles, bucket={}, {elapsed:?}",
+                        bucket.get(),
+                    );
+                }
+            }
+        },
+    );
+
+    eprintln!();
+    eprintln!("============================================================");
+    eprintln!(
+        "  {} GUEST PROFILE (blowup={}, {} queries)",
+        guest_name.to_uppercase(),
+        opts.blowup_factor,
+        opts.fri_number_of_queries,
+    );
+    eprintln!("============================================================");
+    eprintln!("  Total cycles : {total_cycles}");
+    eprintln!("  Exec time    : {exec_time:?}");
+    eprintln!();
+    eprintln!("  Rough trace/LDE size if this guest were proven:");
+    let approx_columns = 250u64;
+    let main_trace_bytes = total_cycles * approx_columns * 8;
+    eprintln!(
+        "    main trace          : ~{:.2} GB ({total_cycles} cycles × ~{approx_columns} cols × 8 B)",
+        main_trace_bytes as f64 / 1e9,
+    );
+    eprintln!(
+        "    main LDE (blowup=2) : ~{:.2} GB  (+aux ≈ 50% more → peak ≈ 2-3× LDE)",
+        (main_trace_bytes * 2) as f64 / 1e9,
+    );
+
+    eprintln!();
+    print_step_breakdown(&buckets, total_cycles);
+    if detailed {
+        eprintln!();
+        print_function_table(&symbols, pc_hist, total_cycles);
+    }
+    eprintln!("============================================================");
+}
+
+/// Core pipeline: prove the inner program, run the guest to `mode`, assert it
+/// committed `[1]` (the in-VM verifier accepted the proof).
 fn run_recursion_pipeline_with_options(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -202,8 +480,7 @@ fn run_recursion_pipeline_with_options(
     eprintln!("[{label}] guest committed [1]: in-VM verify accepted ✓");
 }
 
-/// Convenience wrapper using `blowup=8` for the inner proof — the default for
-/// the `empty` and `fibonacci` cases, chosen to keep outer-prove memory tractable.
+/// `run_recursion_pipeline_with_options` with `blowup=8` (the `empty`/`fibonacci` default).
 fn run_recursion_pipeline(
     label: &str,
     inner_elf_bytes: &[u8],
@@ -221,9 +498,8 @@ fn run_recursion_pipeline(
     );
 }
 
-/// Reproduce the recursion guest's EXACT path on the host — decode the postcard
-/// blob into `(VmProof, Vec<u8>, ProofOptions)` and call `verify_with_options`.
-/// Cheap regression guard.
+/// Decode the blob on the host and verify — a cheap guard on the encode/decode
+/// contract without running the VM.
 #[test]
 #[ignore = "needs prebuilt guest ELF (make compile-recursion-elfs)"]
 fn test_recursion_blob_decodes_and_verifies_on_host() {
@@ -256,8 +532,7 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 
 // === Execute-only tier ========================================================
 
-/// Execute-only mirror of `test_recursion_prove_empty`: verify a `blowup=8`
-/// proof of the empty program in-VM.
+/// Execute-only: verify a `blowup=8` proof of the empty program in-VM.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_empty() {
@@ -271,8 +546,7 @@ fn test_recursion_execute_empty() {
     );
 }
 
-/// Execute-only mirror of `test_recursion_prove_1query`: smallest possible
-/// inner proof (blowup=2, 1 query) → least guest work.
+/// Execute-only: smallest inner proof (blowup=2, 1 query) → least guest work.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute_1query() {
@@ -287,8 +561,69 @@ fn test_recursion_execute_1query() {
     );
 }
 
-/// Execute-only mirror of `test_recursion_prove`: verify a `blowup=8` proof of
-/// fibonacci(10) in-VM.
+/// Regression test for the marker mechanism itself: every `STEP_*` marker
+/// must be observed at least once during a full verifier run, and each
+/// transition between consecutive markers must be a valid step in the
+/// verifier's state machine.
+///
+/// `multi_verify` re-runs `replay_rounds_after_round_1 -> step_2 -> step_3 ->
+/// step_4` once per AIR table (see `crypto/stark/src/verifier.rs`), so the
+/// full marker sequence isn't monotonic overall — it's `STEP_DECODE_DONE ->
+/// STEP_AIRS_AND_BUS_BALANCE_DONE` once each, followed by N repetitions of
+/// the `3,4,5,6` cycle (one per table). A transition outside
+/// `{1->2, 2->3, 3->4, 4->5, 5->6, 6->3}` means the marker convention broke —
+/// wrong immediate decoded, or a stale/mismatched build.
+#[test]
+#[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
+fn test_recursion_step_markers_observed_in_order() {
+    let (_bytes, program, mut executor) =
+        setup_guest_run("step-markers", "recursion", &MIN_PROOF_OPTIONS);
+    let instructions = executor::vm::execution::InstructionCache::new(&program.data)
+        .expect("instruction cache build failed");
+
+    let decode_done = stark::profile_markers::STEP_DECODE_DONE;
+    let airs_ready = stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE;
+    let replay = stark::profile_markers::STEP_REPLAY_ROUNDS_AFTER_ROUND_1;
+    let claimed = stark::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL;
+    let fri = stark::profile_markers::STEP_VERIFY_FRI;
+    let openings = stark::profile_markers::STEP_VERIFY_TRACE_AND_COMPOSITION_OPENINGS;
+
+    let mut last_marker: Option<u32> = None;
+    let mut seen = std::collections::HashSet::new();
+    drive_executor(
+        &mut executor,
+        |log| {
+            if let Some(marker) =
+                executor::vm::execution::decode_step_marker(&instructions, log.current_pc)
+            {
+                let valid_transition = match last_marker {
+                    None => marker == decode_done,
+                    Some(last) if last == decode_done => marker == airs_ready,
+                    Some(last) if last == airs_ready => marker == replay,
+                    Some(last) if last == replay => marker == claimed,
+                    Some(last) if last == claimed => marker == fri,
+                    Some(last) if last == fri => marker == openings,
+                    Some(last) if last == openings => marker == replay,
+                    Some(_) => false,
+                };
+                assert!(
+                    valid_transition,
+                    "invalid step marker transition: {last_marker:?} -> {marker}"
+                );
+                last_marker = Some(marker);
+                seen.insert(marker);
+            }
+            ControlFlow::Continue(())
+        },
+        |_, _, _| {},
+    );
+
+    for step in [decode_done, airs_ready, replay, claimed, fri, openings] {
+        assert!(seen.contains(&step), "marker {step} was never observed");
+    }
+}
+
+/// Execute-only: verify a `blowup=8` proof of fibonacci(10) in-VM.
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_execute() {
@@ -308,8 +643,7 @@ fn test_recursion_execute() {
 
 // === Full-prove tier ==========================================================
 
-/// Inner program: empty (halt immediately). Useful for measuring the
-/// verifier's intrinsic recursion overhead.
+/// Inner program: empty — the verifier's intrinsic recursion overhead.
 #[test]
 #[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_empty() {
@@ -323,8 +657,7 @@ fn test_recursion_prove_empty() {
     );
 }
 
-/// Inner program: empty, but with the absolute-minimum FRI parameters
-/// (blowup=2, **fri_number_of_queries=1**). For quick profiling only.
+/// Inner program: empty, blowup=2/1-query. Quick profiling only.
 #[test]
 #[ignore = "slow: memory-bounded continuation prove of the verifier-in-VM"]
 fn test_recursion_prove_1query() {
@@ -338,6 +671,50 @@ fn test_recursion_prove_1query() {
         MIN_PROOF_OPTIONS,
         OuterMode::Prove,
     );
+}
+
+/// Dump the guest's private-input blob to `/tmp/recursion_input.bin` for the
+/// CLI's `execute --flamegraph`.
+#[test]
+#[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
+fn test_dump_recursion_input() {
+    let root = workspace_root();
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
+
+    let (_inner_proof, blob) =
+        prove_inner_and_encode_blob("dump-input", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+
+    let path = "/tmp/recursion_input.bin";
+    std::fs::write(path, &blob).expect("write blob");
+    eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
+}
+
+/// Cycle count only of the recursion guest verifying a 1-query inner proof.
+#[test]
+#[ignore = "diagnostic: fast; recursion guest cycle count (1 query)"]
+fn test_recursion_cycles_1query() {
+    run_profile("recursion", 500, MIN_PROOF_OPTIONS, false);
+}
+
+/// Cycle count only at 128-bit security: more FRI queries → more verifier cycles.
+#[test]
+#[ignore = "diagnostic: fast; recursion guest cycle count (multi-query)"]
+fn test_recursion_cycles_multiquery() {
+    run_profile("recursion", 500, blowup8(), false);
+}
+
+/// Full profile (top-25 + per-step) of the 1-query run.
+#[test]
+#[ignore = "diagnostic: ~8 min; recursion guest histogram + steps (1 query)"]
+fn test_recursion_profile_1query() {
+    run_profile("recursion", 500, MIN_PROOF_OPTIONS, true);
+}
+
+/// Full profile at 128-bit security: weight shifts toward per-query FRI/Merkle.
+#[test]
+#[ignore = "diagnostic: heavy; recursion guest histogram + steps (multi-query)"]
+fn test_recursion_profile_multiquery() {
+    run_profile("recursion", 500, blowup8(), true);
 }
 
 /// Inner program: fibonacci(10).
