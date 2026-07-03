@@ -940,7 +940,12 @@ pub fn create_constraints(
     idx = next_idx;
 
     // (Σ k_bit[i]) · (1 − µ) = 0: all scalar bits must be zero on padding rows.
-    constraints.push(KBitsZeroOnPadding { constraint_idx: idx }.boxed());
+    constraints.push(
+        KBitsZeroOnPadding {
+            constraint_idx: idx,
+        }
+        .boxed(),
+    );
     idx += 1;
 
     // x2 convolution: 64 carries + closing.

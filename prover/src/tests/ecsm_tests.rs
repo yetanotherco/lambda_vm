@@ -214,21 +214,36 @@ fn k_bits_zero_on_padding_rejects_forged_row() {
     // Single forged bit on padding row: sum=1, (1−µ)=1 → 1.
     let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
     main[cols::k_bit(0)] = FE::one();
-    let view: TableView<GoldilocksField, GoldilocksExtension> = TableView::new(vec![main.clone()], vec![]);
-    assert_eq!(c.evaluate(&view), FE::one(), "k_bit[0]=1 on µ=0 must fire (residual=1)");
+    let view: TableView<GoldilocksField, GoldilocksExtension> =
+        TableView::new(vec![main.clone()], vec![]);
+    assert_eq!(
+        c.evaluate(&view),
+        FE::one(),
+        "k_bit[0]=1 on µ=0 must fire (residual=1)"
+    );
 
     // Same bit on an active row (µ=1): constraint holds.
     main[cols::MU] = FE::one();
-    let view_active: TableView<GoldilocksField, GoldilocksExtension> = TableView::new(vec![main.clone()], vec![]);
-    assert_eq!(c.evaluate(&view_active), FE::zero(), "k_bit[0]=1 on µ=1 must not fire");
+    let view_active: TableView<GoldilocksField, GoldilocksExtension> =
+        TableView::new(vec![main.clone()], vec![]);
+    assert_eq!(
+        c.evaluate(&view_active),
+        FE::zero(),
+        "k_bit[0]=1 on µ=1 must not fire"
+    );
 
     // Multiple forged bits: sum=3, residual=3.
     let mut main_multi = vec![FE::zero(); cols::NUM_COLUMNS];
     main_multi[cols::k_bit(0)] = FE::one();
     main_multi[cols::k_bit(7)] = FE::one();
     main_multi[cols::k_bit(255)] = FE::one();
-    let view_multi: TableView<GoldilocksField, GoldilocksExtension> = TableView::new(vec![main_multi], vec![]);
-    assert_eq!(c.evaluate(&view_multi), FE::from(3u64), "3 forged k_bits → residual=3");
+    let view_multi: TableView<GoldilocksField, GoldilocksExtension> =
+        TableView::new(vec![main_multi], vec![]);
+    assert_eq!(
+        c.evaluate(&view_multi),
+        FE::from(3u64),
+        "3 forged k_bits → residual=3"
+    );
 }
 
 /// OverflowRequired for XgLtP evaluates non-zero when xG = p (no valid xg_sub_p exists).
@@ -247,13 +262,22 @@ fn xg_ge_p_overflow_required_fires() {
 
     for i in 0..7 {
         assert_eq!(
-            CarryBit { kind: OverflowKind::XgLtP, i, constraint_idx: 0 }.evaluate(&view),
+            CarryBit {
+                kind: OverflowKind::XgLtP,
+                i,
+                constraint_idx: 0
+            }
+            .evaluate(&view),
             FE::zero(),
             "carry bit {i}: c_i=0 is a valid bit"
         );
     }
     assert_ne!(
-        OverflowRequired { kind: OverflowKind::XgLtP, constraint_idx: 0 }.evaluate(&view),
+        OverflowRequired {
+            kind: OverflowKind::XgLtP,
+            constraint_idx: 0
+        }
+        .evaluate(&view),
         FE::zero(),
         "OverflowRequired must fire when xG = p"
     );
@@ -263,9 +287,9 @@ fn five_g_x_le() -> [u8; 32] {
     // x-coordinate of 5·G (secp256k1), little-endian.
     // 0x2f8bde4d1a07209355b4a7250a5c5128e88b84bddc619ab7cba8d569b240efe4
     [
-        0xe4, 0xef, 0x40, 0xb2, 0x69, 0xd5, 0xa8, 0xcb, 0xb7, 0x9a, 0x61, 0xdc, 0xbd, 0x84,
-        0x8b, 0xe8, 0x28, 0x51, 0x5c, 0x0a, 0x25, 0xa7, 0xb4, 0x55, 0x93, 0x20, 0x07, 0x1a,
-        0x4d, 0xde, 0x8b, 0x2f,
+        0xe4, 0xef, 0x40, 0xb2, 0x69, 0xd5, 0xa8, 0xcb, 0xb7, 0x9a, 0x61, 0xdc, 0xbd, 0x84, 0x8b,
+        0xe8, 0x28, 0x51, 0x5c, 0x0a, 0x25, 0xa7, 0xb4, 0x55, 0x93, 0x20, 0x07, 0x1a, 0x4d, 0xde,
+        0x8b, 0x2f,
     ]
 }
 
@@ -273,11 +297,20 @@ fn five_g_x_le() -> [u8; 32] {
 /// quotient whose high byte (index 32) equals 1. IS_BIT(q1[32]) must still hold.
 #[test]
 fn q1_bit32_equals_one_path() {
-    let witness = compute_witness(&k_le(1), &five_g_x_le())
-        .expect("k=1, xG=x(5·G) is a valid ECSM input");
-    assert_eq!(witness.q1[32], 1, "sanity: q1[32] should be 1 for x(5·G) as base point");
+    let witness =
+        compute_witness(&k_le(1), &five_g_x_le()).expect("k=1, xG=x(5·G) is a valid ECSM input");
+    assert_eq!(
+        witness.q1[32], 1,
+        "sanity: q1[32] should be 1 for x(5·G) as base point"
+    );
 
-    let op = EcsmOperation { timestamp: 100, addr_xg: 0x2000, addr_k: 0x3000, addr_xr: 0x1000, witness };
+    let op = EcsmOperation {
+        timestamp: 100,
+        addr_xg: 0x2000,
+        addr_k: 0x3000,
+        addr_xr: 0x1000,
+        witness,
+    };
     let trace = generate_ecsm_trace(&[op]);
 
     for row in 0..trace.num_rows() {
@@ -298,12 +331,22 @@ fn constraints_hold_for_k_eq_n_minus_one() {
     let witness = compute_witness(&k_bytes, &gx_le()).expect("N-1 is a valid scalar");
     assert_eq!(witness.len_k, 255, "N-1 has MSB at bit 255");
 
-    let op = EcsmOperation { timestamp: 999, addr_xg: 0x2000, addr_k: 0x3000, addr_xr: 0x1000, witness };
+    let op = EcsmOperation {
+        timestamp: 999,
+        addr_xg: 0x2000,
+        addr_k: 0x3000,
+        addr_xr: 0x1000,
+        witness,
+    };
     let trace = generate_ecsm_trace(&[op]);
 
     for row in 0..trace.num_rows() {
         let view = row_view(&trace, row);
-        assert_eq!(IsBitConstraint::unconditional(cols::MU, 0).evaluate(&view), FE::zero(), "is_bit(mu) row {row}");
+        assert_eq!(
+            IsBitConstraint::unconditional(cols::MU, 0).evaluate(&view),
+            FE::zero(),
+            "is_bit(mu) row {row}"
+        );
         for i in 0..256 {
             assert_eq!(
                 IsBitConstraint::unconditional(cols::k_bit(i), 0).evaluate(&view),
@@ -311,19 +354,63 @@ fn constraints_hold_for_k_eq_n_minus_one() {
                 "is_bit(k_bit[{i}]) row {row}"
             );
         }
-        assert_eq!(KBitsZeroOnPadding { constraint_idx: 0 }.evaluate(&view), FE::zero(), "k_bits_zero_on_padding row {row}");
+        assert_eq!(
+            KBitsZeroOnPadding { constraint_idx: 0 }.evaluate(&view),
+            FE::zero(),
+            "k_bits_zero_on_padding row {row}"
+        );
         for i in 0..64 {
             for relation in [Relation::X2, Relation::Yg] {
-                assert_eq!(ConvCarry { relation, i, constraint_idx: 0 }.evaluate(&view), FE::zero(), "conv carry i={i} row {row}");
+                assert_eq!(
+                    ConvCarry {
+                        relation,
+                        i,
+                        constraint_idx: 0
+                    }
+                    .evaluate(&view),
+                    FE::zero(),
+                    "conv carry i={i} row {row}"
+                );
             }
         }
-        assert_eq!(ColIsZero { col: cols::c0(63), constraint_idx: 0 }.evaluate(&view), FE::zero());
-        assert_eq!(ColIsZero { col: cols::c1(63), constraint_idx: 0 }.evaluate(&view), FE::zero());
+        assert_eq!(
+            ColIsZero {
+                col: cols::c0(63),
+                constraint_idx: 0
+            }
+            .evaluate(&view),
+            FE::zero()
+        );
+        assert_eq!(
+            ColIsZero {
+                col: cols::c1(63),
+                constraint_idx: 0
+            }
+            .evaluate(&view),
+            FE::zero()
+        );
         for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
             for i in 0..7 {
-                assert_eq!(CarryBit { kind, i, constraint_idx: 0 }.evaluate(&view), FE::zero(), "carry bit kind i={i} row {row}");
+                assert_eq!(
+                    CarryBit {
+                        kind,
+                        i,
+                        constraint_idx: 0
+                    }
+                    .evaluate(&view),
+                    FE::zero(),
+                    "carry bit kind i={i} row {row}"
+                );
             }
-            assert_eq!(OverflowRequired { kind, constraint_idx: 0 }.evaluate(&view), FE::zero(), "overflow required row {row}");
+            assert_eq!(
+                OverflowRequired {
+                    kind,
+                    constraint_idx: 0
+                }
+                .evaluate(&view),
+                FE::zero(),
+                "overflow required row {row}"
+            );
         }
     }
 }
