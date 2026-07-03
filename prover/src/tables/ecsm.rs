@@ -10,11 +10,9 @@
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!
 //! ## Padding
-//! Padding rows have `mu = 0`, all columns zero **except `q1`, which pads to `p`**. This makes
-//! both carry relations close on padding without gating the whole recurrence: the x² relation
-//! has no standalone constant (closes at all-zero), and the yG relation closes because the
-//! `p² − q1·p` offset cancels (`q1 = p`) and the curve constant `b` is multiplied by `µ` (so it
-//! drops when `µ = 0`). Only that single `µ·b` term is µ-gated. The range checks /
+//! Padding rows have `mu = 0`, all columns zero. The yG carry relation closes because both the
+//! `µ·p²` and `µ·b` terms vanish when `µ = 0`, leaving the trivial `0 = 0` recurrence. The x²
+//! relation has no standalone constant and also closes at all-zero. The range checks /
 //! virtual-carry checks remain µ-gated as before.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
@@ -196,13 +194,6 @@ pub fn generate_ecsm_trace(
         }
 
         table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    // Padding rows (`mu = 0`) must carry `q1 = p` so the yG carry relation closes: the
-    // `p² − q1·p` offset cancels and the µ-gated `b` term drops. Bytes 0..31 hold p; byte 32
-    // stays 0 (a valid IS_BIT value).
-    for row_idx in n..num_rows {
-        table.set_bytes(row_idx, cols::Q1, &P_BYTES);
     }
 
     trace
@@ -418,7 +409,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // read x10 -> addr_xR (register read at ts + 1).
+    // read x10 -> addr_xR (register read at ts + 2, grouped with xR writes).
     out.push(BusInteraction::sender(
         BusId::Memw,
         mu(),
@@ -427,7 +418,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 10),
             BusValue::constant(0),
-            ts_lo_plus(1),
+            ts_lo_plus(2),
             ts_hi(),
             1,
             0,
@@ -640,8 +631,8 @@ fn p_byte<F: IsField>(m: usize) -> FieldElement<F> {
 }
 
 /// Convolution carry constraint at limb `i`: `2^8·c_i − c_{i-1} − S_i = 0`, with `c_{-1} = 0`.
-/// Unconditional (degree 2); the only µ-gated term is the curve constant `µ·b` inside `S_i`
-/// for the yG relation at limb 0 (see [`ConvCarry::s_i`]).
+/// Unconditional (degree 2); for the yG relation, both the `µ·p²` offset and the curve
+/// constant `µ·b` are µ-gated so that all columns can pad to zero (see [`ConvCarry::s_i`]).
 pub struct ConvCarry {
     pub relation: Relation,
     pub i: usize,
@@ -674,19 +665,17 @@ impl ConvCarry {
                 s = s - byte(cols::X2, 32, i);
             }
             Relation::Yg => {
-                // Σ (yG_j·yG_{i-j} + P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − b_i
+                // Σ (yG_j·yG_{i-j} + µ·P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − µ·b_i
+                // Both the p² offset and the curve constant b are µ-gated: they vanish on
+                // padding rows (µ=0), so all columns can pad to zero.
+                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
                 for j in 0..=i {
                     s += byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
-                    s += p_byte::<F>(j) * p_byte::<F>(i - j);
+                    s += mu.clone() * (p_byte::<F>(j) * p_byte::<F>(i - j));
                     s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
                     s = s - byte(cols::Q1, 33, j) * p_byte::<F>(i - j);
                 }
                 if i == 0 {
-                    // Only the curve constant `b` is gated by `µ`: it vanishes on padding
-                    // (µ=0) and equals `b` on real rows (µ=1). `B` is the zero-extension of
-                    // `b`, so `B_i = 0` for i ≥ 1 — nothing to gate there. The rest of the
-                    // relation stays unconditional.
-                    let mu = step.get_main_evaluation_element(0, cols::MU).clone();
                     s = s - mu * FieldElement::<F>::from(B);
                 }
             }
@@ -697,7 +686,7 @@ impl ConvCarry {
 
 impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
     fn degree(&self) -> usize {
-        2 // degree-2 convolution; the only µ-gated term (µ·b) is degree 1
+        2 // degree-2 convolution; µ-gated terms (µ·p², µ·b) are degree 1 in columns
     }
 
     fn constraint_idx(&self) -> usize {

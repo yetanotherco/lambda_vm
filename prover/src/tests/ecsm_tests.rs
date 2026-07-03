@@ -139,15 +139,11 @@ fn create_constraints_count() {
     assert_eq!(next, 413);
 }
 
-/// The yG carry recurrence is unsatisfiable on a padding row unless two ingredients hold,
-/// and this test locks both:
-///   (a) `q1` pads to `p`, so the `p² − q1·p` offset cancels;
-///   (b) the curve constant `b` is multiplied by `µ`, so it drops when `µ = 0`.
-/// Removing either ingredient leaves a nonzero residual on the yG limb-0 relation.
-/// The x² relation has no standalone constant, so it closes on all-zero padding and is
-/// left fully unconditional.
+/// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
+/// curve constant `µ·b` are multiplied by `µ`, so they vanish when `µ = 0`.
+/// This test verifies the closing argument and its two ingredients.
 #[test]
-fn yg_padding_closes_via_q1_eq_p_and_mu_gated_b() {
+fn yg_padding_closes_via_mu_gated_p2_and_b() {
     // yG limb-0 ConvCarry residual on a one-off row with the given `µ` and `q1`.
     let yg_residual = |mu: u64, q1_is_p: bool| {
         let mut main = vec![FE::zero(); cols::NUM_COLUMNS];
@@ -167,26 +163,26 @@ fn yg_padding_closes_via_q1_eq_p_and_mu_gated_b() {
         .evaluate(&view)
     };
 
-    // The padding row this chip emits (µ = 0, q1 = p): both ingredients present → closes.
-    assert_eq!(
-        yg_residual(0, true),
-        FE::zero(),
-        "padding row (µ=0, q1=p) must close"
-    );
-
-    // Drop ingredient (a): q1 = 0 instead of p → the p² offset is uncancelled.
+    // Padding row (µ=0, q1=0): µ gates away both p² and b → closes trivially.
     assert_eq!(
         yg_residual(0, false),
-        FE::zero() - FE::from(2209u64),
-        "without q1=p the residual is −P_0² = −47²"
+        FE::zero(),
+        "padding row (µ=0, q1=0) must close"
     );
 
-    // Drop ingredient (b): force the row active (µ = 1) so the curve constant `b`
-    // survives even with q1 = p. Residual = b = 7.
+    // µ=0 but q1=p: µ·p² is gated away, so q1·p is unmatched → evaluate = +P_0² = +47².
+    // (evaluate = 256·c_i − c_prev − s_i = −s_i when carries are 0; s_i = −q1[0]·P[0] = −2209.)
     assert_eq!(
-        yg_residual(1, true),
-        FE::from(7u64),
-        "with µ=1 (b ungated) the leftover residual is the curve constant b=7"
+        yg_residual(0, true),
+        FE::from(2209u64),
+        "µ=0 with q1=p leaves +P_0² = +47² residual"
+    );
+
+    // µ=1, q1=0: s_i = µ·P_0² − µ·b = 2209 − 7 = 2202 → evaluate = −2202.
+    assert_eq!(
+        yg_residual(1, false),
+        FE::zero() - FE::from(2202u64),
+        "µ=1, q1=0: evaluate = −(P_0² − b) = −2202"
     );
 
     // x² has no standalone constant → closes on an all-zero padding row regardless.

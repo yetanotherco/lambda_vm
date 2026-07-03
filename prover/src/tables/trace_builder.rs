@@ -647,8 +647,8 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 /// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
 /// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
-/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read also
-/// at `T + 1`; `xR` memory writes at `T + 2`. Every read advances
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
+/// `xR` memory writes at `T + 2`. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
 /// accesses always observe a strictly smaller old timestamp.
 #[allow(clippy::needless_range_loop)]
@@ -730,15 +730,15 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 1);
     }
 
-    // x10 -> addr_xR (register read at T + 1).
+    // x10 -> addr_xR (register read at T + 2, grouped with xR writes per spec ecsm.toml:658).
     {
         let (val, old_ts) = register_state.read(10);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * 10, value, t + 1, 2, true)
+            MemwOperation::new(true, 2 * 10, value, t + 2, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(10, val, t + 1);
+        register_state.write(10, val, t + 2);
     }
 
     // xR writes at T + 2 (4 doublewords).
@@ -2118,7 +2118,7 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..32).
+        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..=32).
         // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
         // while the others are 32. Do NOT merge into a single loop — extending the
         // loop bound would push q1[32] twice and break AreBytes bus balance.
