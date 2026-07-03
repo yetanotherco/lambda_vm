@@ -686,9 +686,6 @@ where
     /// Summing over `col` first isolates `coeff * ood`, which is identical for
     /// both evaluation points, from `coeff * base`, which differs; and moves
     /// the `denom(row)` multiplication (ext * ext) out of the column loop.
-    /// When `col` indexes a base-field column this also lets `coeff * base`
-    /// use the cheap `IsSubFieldOf` asymmetric multiplication instead of a
-    /// full extension-field product.
     fn reconstruct_deep_composition_poly_evaluation_pair(
         proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
