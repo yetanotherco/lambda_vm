@@ -138,7 +138,13 @@ impl PageConfig {
     }
 
     /// Create a page with initial values from private input data.
-    /// These pages are NOT preprocessed — the verifier never sees the init values.
+    ///
+    /// These pages are built NON-preprocessed, so INIT is a committed main-trace column
+    /// enforced by the GlobalMemory bus rather than recomputed from the ELF. Privacy comes
+    /// from that (the raw input is neither bundled nor recomputed by the verifier), NOT from
+    /// this constructor: the verifier rebuilds the config from the ELF alone and never consults
+    /// the `data` argument for a private page (it passes an empty vec). Not a ZK/hiding claim —
+    /// the committed column is still opened at STARK query positions.
     pub fn with_private_input(page_base: u64, data: Vec<u8>) -> Self {
         assert!(data.len() <= DEFAULT_PAGE_SIZE, "Data exceeds page size");
         Self {

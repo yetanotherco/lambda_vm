@@ -89,7 +89,10 @@ pub struct InitClaim {
     pub value: u64,
     /// Epoch that last wrote the cell (or [`GENESIS_EPOCH`]).
     pub originating_epoch: u64,
-    /// Timestamp of that originating write.
+    /// Timestamp of that originating write. Provenance-tracked for symmetry with
+    /// [`FiniClaim`] and asserted by the telescoping tests, but intentionally NOT
+    /// constrained: the L2G init token is pinned to `ts=0` (timestamps are epoch-local;
+    /// cross-epoch links are ordered by epoch label, not timestamp).
     pub timestamp: u64,
 }
 

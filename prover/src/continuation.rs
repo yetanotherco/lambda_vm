@@ -1000,6 +1000,20 @@ pub fn verify_continuation(
     // Canonicalize the (untrusted) list so a shuffled-but-same-set list still verifies,
     // while a different set fails via GlobalMemory-bus imbalance / AIR-count mismatch.
     let page_bases = canonical_page_bases(&bundle.touched_page_bases);
+    // Every honest base is produced by `page::page_base_for_address`, so it is page-aligned; a
+    // non-aligned base is only reachable via a hand-crafted bundle. Left unchecked, such a base
+    // still falls in the private-input range (`is_private_input_page`), so it would be built
+    // NON-preprocessed with a prover-controlled genesis. The GlobalMemory bus already prevents
+    // forging any real cell (no MEMW access exists at a non-aligned fake address, so no L2G row
+    // consumes its genesis token), but a self-cancelling junk page could otherwise ride along in
+    // an accepted proof. Reject here so the verifier's page set is exactly the aligned set the
+    // prover could honestly derive.
+    if page_bases
+        .iter()
+        .any(|&b| b != page::page_base_for_address(b))
+    {
+        return Ok(None);
+    }
     if !verify_global(
         n,
         &page_bases,
@@ -1611,6 +1625,36 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "a missing touched page base must be rejected"
+        );
+    }
+
+    // Negative: a non-page-aligned base is only reachable via a hand-crafted bundle (honest
+    // bases come from `page_base_for_address`). The verifier rejects it up front so a base in
+    // the private-input range can't be built NON-preprocessed with a prover-controlled genesis
+    // and ride along as a self-cancelling junk page. Page-count-independent: perturbing any one
+    // base by +1 makes it non-aligned.
+    #[test]
+    fn test_split_verify_rejects_non_page_aligned_touched_page_base() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &ProofOptions::default_test_options()).unwrap();
+        assert!(
+            !bundle.touched_page_bases.is_empty(),
+            "baseline must have touched pages"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_some(),
+            "baseline must verify before tampering"
+        );
+        bundle.touched_page_bases[0] += 1;
+        assert!(
+            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
+                .unwrap()
+                .is_none(),
+            "a non-page-aligned touched page base must be rejected"
         );
     }
 
