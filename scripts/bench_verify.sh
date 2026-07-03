@@ -169,12 +169,10 @@ case "$PROVE_PER_SIDE" in
 esac
 
 if [ "$per_side" = "1" ]; then
-  MODE="per-side"
   echo "==> Per-side verify: each binary verifies its OWN proof."
   PROOF_FOR_A="$PROOF_A"
   PROOF_FOR_B="$PROOF_B"
 else
-  MODE="shared"
   echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
   PROOF_FOR_A="$PROOF_B"
   PROOF_FOR_B="$PROOF_B"
@@ -195,7 +193,7 @@ done
 # Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" python3 - "$WORK/pairs.csv" <<'PY'
+SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" python3 - "$WORK/pairs.csv" <<'PY'
 import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
