@@ -118,10 +118,14 @@ As rough ethrex 10-transfer distinct-account reference points from a local sweep
 about 26.8 GB. For a new workload, use the highest value the machine can run
 without swapping.
 
-Continuation proof bundles are self-contained for standalone verification. When
-`--private-input` is used, the serialized continuation proof includes the raw
-private input bytes so the verifier can rebuild the genesis memory commitment.
-Do not treat continuation proof files as confidential-input hiding artifacts.
+Continuation proof bundles are self-contained for standalone verification: the
+verifier needs only the proof file and the ELF. When `--private-input` is used,
+the serialized proof does **not** include the raw private input bytes — it
+carries only the private-input page count; the private genesis lives in
+committed, bus-enforced columns the verifier never recomputes (see
+`docs/continuations_design.md` §3.6). This is not a zero-knowledge guarantee,
+though: committed columns are still opened at STARK query positions, so do not
+treat proof files as cryptographically hiding the private input.
 
 ## Guest Program Flamegraphs
 
