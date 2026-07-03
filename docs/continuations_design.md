@@ -414,19 +414,39 @@ has no verifier-known final state) and preprocesses 2 columns, not 3.
 The COMMIT chip's running output index lives in a synthetic single-word register
 **x254** (word-address 508), so it rides the **same** register binding above —
 epoch *i*'s `FINI[x254]` becomes epoch *i+1*'s `INIT[x254]`, pinned by the two
-locks like any register. Each epoch therefore indexes its committed bytes from the
-*carried* value, not from `0`:
+locks like any register. The COMMIT trace seeds `current_commit_index` from x254
+(`register_state.read_index()` in `trace_builder.rs`), with a debug-assert pinning
+the two in sync every step, so each epoch's committed-byte indices continue the
+*carried* global count rather than restarting at `0`.
 
-- the COMMIT trace seeds `current_commit_index` from x254
-  (`register_state.read_index()` in `trace_builder.rs`), with a debug-assert
-  pinning the two in sync every step;
-- the verifier's commit-bus offset (`compute_commit_bus_offset`'s `start_index`)
-  starts at the same carried x254.
+COMMIT correctness is a **global** property, closed once over the whole run rather
+than per epoch:
 
-The driver concatenates each epoch's committed slice into the run-wide output.
-Because every slice is commit-bus-bound *and* the x254 indices are forced
-contiguous (`init(i+1) == fini(i)`), the concatenation equals the true output
-stream — no separate global "commit output" bus is needed.
+- The COMMIT chip emits each committed byte onto the **Memory** bus (not a
+  dedicated bus) as `[domain = 2, index, 0, 0, 0, value]`. `domain` is the
+  RAM/register domain separator (formerly named `is_register`) extended with a third
+  value (`commit = 2`). COMMIT emits it as the constant `2`; every other Memory-bus
+  participant fixes the tag to a `{0,1}` value — PAGE/REGISTER/CPU as a constant, and
+  MEMW/MEMW_ALIGNED pin it to `{0,1}` with an explicit `IS_BIT(domain)` constraint (so
+  the disjointness is local, not merely a consequence of every `Memw` dispatcher
+  hardcoding `{0,1}`). Hence a `domain = 2` token can only originate from COMMIT.
+- The emit fires **in the global proof, not the epoch proof**. Each epoch's COMMIT
+  air (`create_commit_air(opts, false)`) carries only the base interactions and
+  closes to zero; the epoch's COMMIT main-trace root is captured and, in the global
+  proof, the *same* trace is re-committed under a reduced air (`commit_global_air`,
+  emit only) — root-bound by `verify_commit_commitment_binding` exactly as
+  `verify_l2g_commitment_binding` binds the L2G tables. So the emitted tokens are the
+  epoch's pinned `(index, value)` bytes, inherited via the commitment binding.
+- The verifier closes the output bus **once**, in the global proof:
+  `compute_commit_bus_offset(full_output, z, alpha)` fingerprints the claimed output
+  at global indices `0..N` and requires the single folded LogUp balance to match. The
+  run-wide output is absorbed into the global statement before `z`/`alpha` are
+  sampled. This forces the multiset of emitted `(index, value)` tokens across all
+  epochs to equal `{(i, full_output[i])}` — pinning length, order, completeness, and
+  no-splice — so the returned output is **verifier-checked, not driver-trusted**.
+
+The per-epoch commit-bus close (with its per-epoch `start_index`) and the
+driver-trusted slice concatenation are therefore removed.
 
 ---
 

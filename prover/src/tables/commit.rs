@@ -19,7 +19,7 @@
 //! - `value`: Byte — the byte being committed
 //! - `mu`: Bit — multiplicity (1 for real rows, 0 for padding)
 //!
-//! ## Bus Interactions (18 total)
+//! ## Bus Interactions (17 base + 1 output emit)
 //! - **Receiver**: Ecall bus — receives `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` from CPU (mult = first)
 //! - **Sender**: CommitNextByte bus — sends to next row (mult = mu - end)
 //! - **Receiver**: CommitNextByte bus — receives from prev row (mult = mu - first)
@@ -31,7 +31,17 @@
 //! - **Sender**: Memw bus — read x12 register (count) at ts (mult = first)
 //! - **Sender**: Memw bus — read+write x254 commit index at ts (mult = first)
 //! - **Sender**: Memw bus — read memory byte at ts (mult = mu - end)
-//! - **Sender**: Commit bus — sends committed `(index, value)` pairs (mult = mu - end)
+//!
+//! The above 17 interactions are the "base" set ([`bus_interactions`]); they close
+//! within a single proof (Memw reads/writes, the CommitNextByte chain, range checks).
+//!
+//! The committed output itself is emitted separately by [`output_bus_interaction`]:
+//! - **Sender**: Memory bus — `[domain = 2 (commit domain), index, 0, 0, 0, value]`
+//!   (mult = mu - end). This is the token the verifier closes against the claimed public
+//!   output. It rides the shared Memory bus under the `domain` domain separator
+//!   (`RAM = 0`, `register = 1`, `commit = 2`) instead of a dedicated bus, so that the
+//!   continuation prover can carry it up to the global proof and close it once, globally,
+//!   over the whole output — the same root-binding move as the local-to-global table.
 //!
 //! ## Constraints (8 total)
 //! - `range_first`: first * (1 - first) = 0 (degree 2)
@@ -227,7 +237,11 @@ pub fn generate_commit_trace(
 // Bus interactions
 // =========================================================================
 
-/// Creates all bus interactions for the COMMIT table (18 total).
+/// Creates the base bus interactions for the COMMIT table (17 total).
+///
+/// These are the interactions that close within a single proof. The committed
+/// output token is NOT here — it is emitted separately by [`output_bus_interaction`]
+/// so a continuation prover can carry it up to the global proof (see that function).
 ///
 /// The COMMIT table:
 /// - **Receives** Ecall from CPU with `[timestamp_lo, timestamp_hi, constant(64), constant(0)]` (mult = first)
@@ -431,7 +445,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ),
         // 13. MEMW read+write x10 (fd=1 → count) at ts (mult = first)
-        // CO24 format: [old[8], is_register, base_addr[2], value[8], ts[2], w2, w4, w8]
+        // CO24 format: [old[8], domain, base_addr[2], value[8], ts[2], w2, w4, w8]
         // old = [1,0,...,0] (asserts x10=1=fd), value = [count_0, count_1, 0,...,0] (writes count)
         BusInteraction::sender(
             BusId::Memw,
@@ -446,7 +460,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                // is_register = 1
+                // domain = 1
                 BusValue::constant(1),
                 // base_address = [20, 0] (x10 → addr 2*10 = 20)
                 BusValue::constant(20),
@@ -501,7 +515,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                // is_register = 1
+                // domain = 1
                 BusValue::constant(1),
                 // base_address = [22, 0] (x11 → addr 2*11 = 22)
                 BusValue::constant(22),
@@ -556,7 +570,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                // is_register = 1
+                // domain = 1
                 BusValue::constant(1),
                 // base_address = [24, 0] (x12 → addr 2*12 = 24)
                 BusValue::constant(24),
@@ -609,7 +623,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                // is_register = 1
+                // domain = 1
                 BusValue::constant(1),
                 // base_address = [508, 0]
                 BusValue::constant(508),
@@ -669,7 +683,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 BusValue::constant(0),
                 BusValue::constant(0),
-                // is_register = 0
+                // domain = 0
                 BusValue::constant(0),
                 // base_address = [ADDRESS_0, ADDRESS_1]
                 BusValue::Packed {
@@ -707,22 +721,52 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
             ],
         ),
-        // 18. COMMIT[index, value] (mult = mu - end)
-        BusInteraction::sender(
-            BusId::Commit,
-            mu_minus_end,
-            vec![
-                BusValue::Packed {
-                    start_column: cols::INDEX,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::VALUE,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
     ]
+}
+
+/// The COMMIT output emit: one Memory-bus token per committed byte (mult = mu - end).
+///
+/// Token `[domain = 2, addr_lo = index, addr_hi = 0, ts_lo = 0, ts_hi = 0, value]`.
+/// The `domain` field is the Memory-bus domain separator, extended to a third value
+/// (`RAM = 0`, `register = 1`, `commit = 2`); `domain` carries no boolean/range
+/// constraint, so no new AIR constraint is needed — domain disjointness comes from the
+/// commit token only ever being closed by the verifier's output receiver, never aliasing a
+/// RAM/register cell (whose chains are closed by their own PAGE/REGISTER bookends).
+///
+/// `index` (the global commit index carried in x254) rides in the address_lo slot: since
+/// commit tokens are domain-disjoint and never matched against real addresses, it is a pure
+/// identifier and need not be a valid 32-bit word. There is no timestamp (commit output is
+/// append-only, ordered by `index`, not by memory timestamp).
+///
+/// This token is emitted:
+/// - in a **monolithic** proof, alongside the base interactions, closed in-proof by the
+///   verifier's `compute_commit_bus_offset` over the whole output;
+/// - in a **continuation**, only in the reduced global commit air (NOT the epoch air), so
+///   the run-wide output is closed once, globally.
+pub fn output_bus_interaction() -> BusInteraction {
+    BusInteraction::sender(
+        BusId::Memory,
+        Multiplicity::Diff(cols::MU, cols::END),
+        vec![
+            // domain = 2 (commit domain separator)
+            BusValue::constant(2),
+            // address_lo = index (global commit index)
+            BusValue::Packed {
+                start_column: cols::INDEX,
+                packing: Packing::Direct,
+            },
+            // address_hi = 0
+            BusValue::constant(0),
+            // timestamp_lo = 0, timestamp_hi = 0 (no timestamp: ordered by index)
+            BusValue::constant(0),
+            BusValue::constant(0),
+            // value = committed byte
+            BusValue::Packed {
+                start_column: cols::VALUE,
+                packing: Packing::Direct,
+            },
+        ],
+    )
 }
 
 // =========================================================================

@@ -185,7 +185,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // 2. MEMW read_addr: read register x10 to bind addr (per spec keccak:c:read_addr)
-    // Format: [old[8], is_register=1, base_addr=[20,0], value[8], ts, ts_hi, write2=1, write4=0, write8=0]
+    // Format: [old[8], domain=1, base_addr=[20,0], value[8], ts, ts_hi, write2=1, write4=0, write8=0]
     // For register read: old = value = addr as WL + 6 zeros
     {
         // addr as DWordWL from DWordBL bytes: lo32 = sum(addr[0..4] * 256^i), hi32 = sum(addr[4..8] * 256^i)
@@ -232,7 +232,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         for _ in 2..8 {
             values.push(BusValue::constant(0));
         }
-        // is_register = 1
+        // domain = 1
         values.push(BusValue::constant(1));
         // base_address = 2*10 = 20 (register x10)
         values.push(BusValue::constant(20));
@@ -381,7 +381,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 7. MEMW interactions: 25 combined read+write per lane (per spec)
-    // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
+    // Format: [old[8], domain, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
     // old = input_state (read), value = output_state (write)
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
@@ -417,7 +417,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             });
         }
-        // is_register = 0
+        // domain = 0
         values.push(BusValue::constant(0));
         // address as DWordWL
         values.push(addr_lo);

@@ -163,16 +163,36 @@ fn continuation_epoch_differs_from_monolithic_statement() {
     assert_ne!(monolithic, epoch_state(b"elf", 1));
 }
 
-fn global_state(elf: &[u8], num_epochs: usize) -> [u8; 32] {
+fn global_state(elf: &[u8], num_epochs: usize, full_output: &[u8]) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(&mut t, elf, num_epochs);
+    absorb_continuation_global_statement(&mut t, elf, num_epochs, full_output);
     t.state()
 }
 
 #[test]
-fn continuation_global_state_binds_program_and_epoch_count() {
-    let baseline = global_state(b"elf", 3);
-    assert_eq!(baseline, global_state(b"elf", 3)); // deterministic
-    assert_ne!(baseline, global_state(b"elf", 4), "must bind epoch count");
-    assert_ne!(baseline, global_state(b"other-elf", 3), "must bind the ELF");
+fn continuation_global_state_binds_program_epoch_count_and_output() {
+    let baseline = global_state(b"elf", 3, b"output");
+    assert_eq!(baseline, global_state(b"elf", 3, b"output")); // deterministic
+    assert_ne!(
+        baseline,
+        global_state(b"elf", 4, b"output"),
+        "must bind epoch count"
+    );
+    assert_ne!(
+        baseline,
+        global_state(b"other-elf", 3, b"output"),
+        "must bind the ELF"
+    );
+    assert_ne!(
+        baseline,
+        global_state(b"elf", 3, b"OUTPUT"),
+        "must bind the committed output"
+    );
+    // Length is bound, not just concatenated bytes: an output that would collide under a
+    // naive concat (e.g. a length-prefix boundary shift) still diverges.
+    assert_ne!(
+        global_state(b"elf", 3, b"ab"),
+        global_state(b"elf", 3, b"abc"),
+        "must bind the output length"
+    );
 }

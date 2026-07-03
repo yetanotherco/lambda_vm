@@ -9,7 +9,7 @@ fn test_memw_register_trace_generation() {
     // Create a simple register op (reg x1 = address 1, so base_address = 2)
     let ops = vec![
         MemwOperation::new(
-            true, // is_register
+            true, // domain
             2,    // base_address = 2 * register_index (reg x1)
             [42, 7, 0, 0, 0, 0, 0, 0],
             100,
@@ -51,7 +51,7 @@ fn test_memw_register_trace_generation_write_op() {
     // Write op: is_read = false => MU_WRITE=1, MU_READ=0
     let ops = vec![
         MemwOperation::new(
-            true, // is_register
+            true, // domain
             4,    // base_address = 2 * register_index (reg x2)
             [99, 55, 0, 0, 0, 0, 0, 0],
             200,

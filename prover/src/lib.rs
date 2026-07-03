@@ -80,6 +80,13 @@ pub struct RuntimePageRange {
 /// keccak_rc, register, ecsm, ec_scalar, ecdas.
 pub const FIXED_TABLE_COUNT: usize = 11;
 
+/// Fixed position of the COMMIT sub-proof within a proof's `proofs` vector. The
+/// always-present tables are committed in a fixed order (see `VmAirs::air_trace_pairs` /
+/// `air_refs`): bitwise (0), decode (1), commit (2), … So the COMMIT table's main-trace
+/// Merkle root is always `proof.proofs[COMMIT_TABLE_INDEX]`. Used by the continuation
+/// prover to capture each epoch's COMMIT root for the global commitment binding.
+pub(crate) const COMMIT_TABLE_INDEX: usize = 2;
+
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -495,7 +502,10 @@ impl VmAirs {
             .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
             .collect();
         let halt = create_halt_air(proof_options);
-        let commit = create_commit_air(proof_options);
+        // Emit the committed-output token in-proof by default (monolithic path). Continuation
+        // epochs override `commit` with an emit-free air (the output is carried to and closed
+        // in the global proof); see `continuation::build_epoch_airs`.
+        let commit = create_commit_air(proof_options, true);
         let keccak = create_keccak_air(proof_options);
         let keccak_rnd = create_keccak_rnd_air(proof_options);
         let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
@@ -627,19 +637,24 @@ pub(crate) fn replay_transcript_phase_a(
     (z, alpha)
 }
 
-/// Compute the bus balance offset for the COMMIT[index, value] bus.
+/// Compute the bus balance offset for the COMMIT output on the Memory bus.
 ///
-/// For each public output byte at index `i` with value `v`:
-///   `fingerprint = z - (BusId::Commit * α^0 + i * α^1 + v * α^2)`
+/// The COMMIT chip emits each committed byte as a Memory-bus token in the `commit`
+/// domain (`domain = 2`); see [`tables::commit::output_bus_interaction`]. For the
+/// public output byte at global index `i` with value `v`, that token is
+/// `[domain = 2, addr_lo = i, addr_hi = 0, ts_lo = 0, ts_hi = 0, value = v]`, whose
+/// fingerprint (bus_id at α⁰, then values at α¹, α², …) is:
+///   `fingerprint = z - (BusId::Memory + 2·α + i·α² + v·α⁶)`
 ///   `term = +1 / fingerprint`
 ///
-/// Returns `Some(Σ term)` — the positive receiver contribution that is no
-/// longer present as an in-trace table. For empty public output, returns
-/// `Some(zero)`. Returns `None` on a fingerprint collision (zero divisor),
-/// which the caller should treat as verification failure.
+/// Returns `Some(Σ term)` — the positive receiver contribution the verifier supplies for
+/// the emitted output tokens (there is no in-trace receiver). Indices are the run-global
+/// 0-based commit indices, matching the x254 counter: `0` for the first committed byte,
+/// so no `start_index` offset is needed (a monolithic proof and a whole continuation both
+/// index from 0). For empty output, returns `Some(zero)`. Returns `None` on a fingerprint
+/// collision (zero divisor), which the caller treats as verification failure.
 pub(crate) fn compute_commit_bus_offset(
     public_output: &[u8],
-    start_index: u64,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
 ) -> Option<FieldElement<E>> {
@@ -647,20 +662,22 @@ pub(crate) fn compute_commit_bus_offset(
         return Some(FieldElement::zero());
     }
 
-    let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
+    let bus_id = FieldElement::<E>::from(BusId::Memory as u64);
+    // α² (index/addr_lo coefficient) and α⁶ (value coefficient); the addr_hi/ts_lo/ts_hi
+    // slots (α³..α⁵) are constant 0 in the commit token, so they drop out.
     let alpha_sq = alpha * alpha;
+    let alpha_pow6 = &alpha_sq * &alpha_sq * &alpha_sq;
+    // Constant part of the linear combination: BusId::Memory + 2·α (domain = 2).
+    let domain_term = &bus_id + (FieldElement::<E>::from(2u64) * alpha);
 
-    // fingerprint_i = z - (BusId::Commit + (start_index + i)·α + value_i·α²).
-    // `start_index` is the carried x254: 0 for a monolithic proof or the first
-    // epoch, nonzero for a continuation epoch whose commits continue a prior one.
+    // fingerprint_i = z - (BusId::Memory + 2·α + i·α² + value_i·α⁶).
     let mut fingerprints: Vec<FieldElement<E>> = public_output
         .iter()
         .enumerate()
         .map(|(i, &value)| {
-            let global_index = start_index + i as u64;
-            let linear_combination = bus_id
-                + (FieldElement::<E>::from(global_index) * alpha)
-                + (FieldElement::<E>::from(value as u64) * alpha_sq);
+            let linear_combination = &domain_term
+                + (FieldElement::<E>::from(i as u64) * &alpha_sq)
+                + (FieldElement::<E>::from(value as u64) * &alpha_pow6);
             z - linear_combination
         })
         .collect();
@@ -678,18 +695,20 @@ pub(crate) fn compute_commit_bus_offset(
 
 /// Compute the expected COMMIT bus balance for a `MultiProof`.
 ///
-/// Replays Phase A of the transcript to recover (z, alpha), then computes
-/// the offset from the given public output bytes. Call this after `multi_prove`
-/// and before `multi_verify`.
+/// Replays Phase A of the transcript to recover (z, alpha), then computes the offset from
+/// the given public output bytes. Commit indices are run-global 0-based (the x254 counter),
+/// so no start offset is needed. Used by the monolithic verifier (the whole output is closed
+/// in-proof) and by the continuation global verifier (the whole run's output is closed once,
+/// over the re-committed COMMIT tables). Call this after `multi_prove` and before
+/// `multi_verify`.
 pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
     public_output_bytes: &[u8],
-    start_index: u64,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
     let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
-    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
 }
 
 /// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
@@ -711,6 +730,30 @@ pub(crate) fn verify_l2g_commitment_binding(
             .iter()
             .enumerate()
             .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
+}
+
+/// Bind the global proof's re-committed COMMIT sub-tables to the per-epoch proofs.
+///
+/// The global proof re-commits each epoch's COMMIT trace (under the reduced
+/// `commit_global_air`, which carries only the output emit) at positions
+/// `[offset, offset + N)` — after the `offset` local-to-global sub-tables. So
+/// `final_proof.proofs[offset + i].lde_trace_main_merkle_root` must equal epoch `i`'s own
+/// COMMIT root (`epoch_commit_roots[i]`). Equal roots prove the global output bus ran over
+/// the very same COMMIT tables the epochs committed — so the pinned `MU`/`END`/`FIRST`
+/// multiplicities (enforced in the epoch proof) carry over, exactly as
+/// [`verify_l2g_commitment_binding`] inherits the L2G column pinning.
+///
+/// Called by `continuation::verify_continuation`.
+pub(crate) fn verify_commit_commitment_binding(
+    epoch_commit_roots: &[Commitment],
+    final_proof: &MultiProof<F, E, ()>,
+    offset: usize,
+) -> bool {
+    final_proof.proofs.len() >= offset + epoch_commit_roots.len()
+        && epoch_commit_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| final_proof.proofs[offset + i].lde_trace_main_merkle_root == *root)
 }
 
 // =============================================================================
@@ -1063,8 +1106,6 @@ pub fn verify_with_options(
         &air_refs,
         &vm_proof.proof,
         &vm_proof.public_output,
-        // Monolithic proof: commits are indexed from 0.
-        0,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,

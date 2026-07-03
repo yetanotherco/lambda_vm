@@ -408,7 +408,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::One,
             vec![
-                // is_register = 0
+                // domain = 0
                 BusValue::constant(0),
                 // address_lo = page_base_lo + offset
                 address_lo.clone(),
@@ -430,7 +430,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
             BusId::Memory,
             Multiplicity::One,
             vec![
-                // is_register = 0
+                // domain = 0
                 BusValue::constant(0),
                 // address_lo = page_base_lo + offset
                 address_lo,

@@ -46,7 +46,7 @@ use crate::tables::bytewise::{
 };
 use crate::tables::commit::{
     bus_interactions as commit_bus_interactions, cols as commit_cols,
-    create_constraints as commit_constraints,
+    create_constraints as commit_constraints, output_bus_interaction as commit_output_interaction,
 };
 use crate::tables::cpu::{
     CpuOperation, bus_interactions as cpu_bus_interactions, cols as cpu_cols,
@@ -925,12 +925,20 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> VmAir {
 }
 
 /// Create COMMIT AIR with constraints and bus interactions.
-pub fn create_commit_air(proof_options: &ProofOptions) -> VmAir {
+///
+/// `emit_output` controls whether the committed-output token
+/// ([`commit_output_interaction`]) is included:
+/// - `true` for a monolithic proof (the output bus is closed in-proof by the verifier);
+/// - `false` for a continuation epoch (the output emit is carried up to the global proof
+///   and closed there — see `commit_global_air` in `continuation.rs`).
+pub fn create_commit_air(proof_options: &ProofOptions, emit_output: bool) -> VmAir {
     let (transition_constraints, _) = commit_constraints(0);
 
-    let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
-        interactions: commit_bus_interactions(),
-    };
+    let mut interactions = commit_bus_interactions();
+    if emit_output {
+        interactions.push(commit_output_interaction());
+    }
+    let auxiliary_trace_build_data = AuxiliaryTraceBuildData { interactions };
 
     AirWithBuses::new(
         commit_cols::NUM_COLUMNS,
@@ -972,7 +980,7 @@ pub fn create_page_air(proof_options: &ProofOptions, page_base: u64) -> VmAir {
 /// Create REGISTER AIR with bus interactions.
 ///
 /// The REGISTER table provides initial and final tokens for register accesses
-/// on the Memory bus (is_register=1).
+/// on the Memory bus (domain=1).
 pub fn create_register_air(proof_options: &ProofOptions) -> VmAir {
     let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
 

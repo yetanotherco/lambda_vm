@@ -427,9 +427,18 @@ fn test_address_incr_halfword_carry() {
 
 #[test]
 fn test_bus_interactions_count() {
-    use crate::tables::commit::bus_interactions;
+    use crate::tables::commit::{bus_interactions, output_bus_interaction};
+    use crate::tables::types::BusId;
+
+    // 17 base interactions (Ecall, CommitNextByte send/receive, IsHalfword ×8, Zero,
+    // Memw ×5); the committed-output emit is a separate interaction.
     let interactions = bus_interactions();
-    assert_eq!(interactions.len(), 18);
+    assert_eq!(interactions.len(), 17);
+
+    // The output emit is a single Memory-bus sender in the commit domain.
+    let output = output_bus_interaction();
+    assert!(output.is_sender);
+    assert_eq!(output.bus_id, u64::from(BusId::Memory));
 }
 
 #[test]

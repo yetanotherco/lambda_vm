@@ -250,7 +250,7 @@ pub enum BusId {
     Memw = 14,
     // ID 15 (Load) is reserved: the load lookup is now dispatched through
     // [`MemoryOp`](BusId::MemoryOp).
-    /// Internal memory consistency bus: memory[is_register, address, timestamp, value]
+    /// Internal memory consistency bus: memory[domain, address, timestamp, value]
     /// Used for read/write pairing in MEMW table (M1-M8 in spec)
     Memory = 16,
     /// Branch target computation
@@ -265,9 +265,10 @@ pub enum BusId {
     Ecall = 19,
     /// COMMIT self-referencing recursive bus (row N → row N+1)
     CommitNextByte = 20,
-    /// COMMIT output bus: verifier computes the receiver contribution externally
-    /// from `VmProof.public_output` using the shared LogUp challenges
-    Commit = 21,
+    // ID 21 (Commit) is reserved: the COMMIT output no longer has a dedicated bus. It now
+    // rides the [`Memory`](BusId::Memory) bus under the `domain` domain separator
+    // (`commit = 2`); the verifier still computes the receiver contribution externally from
+    // the claimed output (see `compute_commit_bus_offset`), now over the whole run's output.
     /// Keccak core ↔ round chip: (timestamp, round, state[200 bytes])
     Keccak = 22,
     /// Keccak round ↔ RC lookup: (round, rc[8 bytes])
@@ -333,7 +334,6 @@ impl BusId {
             BusId::Decode => "Decode",
             BusId::Ecall => "Ecall",
             BusId::CommitNextByte => "CommitNextByte",
-            BusId::Commit => "Commit",
             BusId::Keccak => "Keccak",
             BusId::KeccakRc => "KeccakRc",
             BusId::ByteAlu => "ByteAlu",
@@ -366,7 +366,7 @@ impl TryFrom<u64> for BusId {
             18 => Ok(BusId::Decode),
             19 => Ok(BusId::Ecall),
             20 => Ok(BusId::CommitNextByte),
-            21 => Ok(BusId::Commit),
+            // 21 (Commit) retired — see the enum definition.
             22 => Ok(BusId::Keccak),
             23 => Ok(BusId::KeccakRc),
             24 => Ok(BusId::ByteAlu),
