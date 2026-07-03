@@ -46,11 +46,9 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use crate::constraints::templates::{
-    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -737,18 +735,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct CommitConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CommitConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = vec![
-            is_bit_meta(0, false),      // first
-            is_bit_meta(1, false),      // end
-            is_bit_meta(2, false),      // μ
-            ConstraintMeta::base(3, 2), // (first + end)·(1 − μ)
-        ];
-        m.extend(add_pair_meta(4, false)); // idx 4,5: address + 1 = address_incr
-        m.extend(add_pair_meta(6, false)); // idx 6,7: count_decr + 1 = count
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0-2: IS_BIT for first, end, mu
         emit_is_bit(b, 0, cols::FIRST, None);

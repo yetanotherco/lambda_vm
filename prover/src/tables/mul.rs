@@ -689,7 +689,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 //   2: LhsSign                  3: RhsSign
 //   4..8: RawProduct(0..4)
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// MUL table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the MUL layout is fixed via `cols`).
@@ -787,19 +787,6 @@ impl MulConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 2), // SignedIsBit(LHS_SIGNED)
-            ConstraintMeta::base(1, 2), // SignedIsBit(RHS_SIGNED)
-            ConstraintMeta::base(2, 2), // LhsSign
-            ConstraintMeta::base(3, 2), // RhsSign
-            ConstraintMeta::base(4, 2), // RawProduct(0)
-            ConstraintMeta::base(5, 2), // RawProduct(1)
-            ConstraintMeta::base(6, 2), // RawProduct(2)
-            ConstraintMeta::base(7, 2), // RawProduct(3)
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
         let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);

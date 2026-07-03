@@ -24,12 +24,10 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::{
-    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
 // =========================================================================
 // Column indices for EQ table
@@ -255,13 +253,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct EqConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EqConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = add_pair_meta(0, false).to_vec(); // idx 0,1: b + diff = a
-        m.push(is_bit_meta(2, false)); // idx 2: IS_BIT(invert)
-        m.push(ConstraintMeta::base(3, 2)); // idx 3: res = eq XOR invert
-        m
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // diff = a - b, encoded as b + diff = a (unconditional).
         emit_add_pair(

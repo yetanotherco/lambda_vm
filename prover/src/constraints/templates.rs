@@ -252,7 +252,7 @@ impl AddOperand {
 // zerofier shape — none of these templates override period/offset/
 // exemptions).
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta};
+use stark::constraints::builder::ConstraintBuilder;
 
 /// IS_BIT: `x·(1−x)`, optionally gated by a condition column:
 /// `cond·x·(1−x)`.
@@ -272,11 +272,6 @@ pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         None => x.clone() * (one - x),
     };
     b.emit_base(idx, root);
-}
-
-/// Metadata for [`emit_is_bit`]: degree 3 gated, 2 ungated.
-pub fn is_bit_meta(idx: usize, conditional: bool) -> ConstraintMeta {
-    ConstraintMeta::base(idx, if conditional { 3 } else { 2 })
 }
 
 /// One [`AddLinearTerm`]: `column · coefficient` or a constant.
@@ -376,14 +371,4 @@ pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>
     let c1 = cond(b);
     let root_1 = bit(b, c1, carry_1);
     b.emit_base(idx + 1, root_1);
-}
-
-/// Metadata for [`emit_add_pair`]: two constraints at `idx`, `idx + 1`;
-/// degree 3 gated, 2 ungated.
-pub fn add_pair_meta(idx: usize, conditional: bool) -> [ConstraintMeta; 2] {
-    let degree = if conditional { 3 } else { 2 };
-    [
-        ConstraintMeta::base(idx, degree),
-        ConstraintMeta::base(idx + 1, degree),
-    ]
 }

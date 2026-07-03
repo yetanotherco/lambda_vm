@@ -641,7 +641,7 @@ impl OverflowKind {
 //   140..147 : CarryBit(XrLtP, 0..7)
 //   147      : OverflowRequired(XrLtP)
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// ECSM transition constraints as a single-source [`ConstraintSet`] (148
 /// total). No column configuration needed (the layout is fixed via `cols`).
@@ -760,54 +760,20 @@ impl EcsmConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(148);
-        m.push(ConstraintMeta::base(0, 2)); // IS_BIT(MU)
-        let mut idx = 1;
-        // X2 convolution: 64 carries (deg 2) + closing (deg 1).
-        for _ in 0..64 {
-            m.push(ConstraintMeta::base(idx, 2));
-            idx += 1;
-        }
-        m.push(ConstraintMeta::base(idx, 1));
-        idx += 1;
-        // Yg convolution: 64 carries (deg 2) + closing (deg 1).
-        for _ in 0..64 {
-            m.push(ConstraintMeta::base(idx, 2));
-            idx += 1;
-        }
-        m.push(ConstraintMeta::base(idx, 1));
-        idx += 1;
-        // IS_BIT(q1[32]) (deg 2).
-        m.push(ConstraintMeta::base(idx, 2));
-        idx += 1;
-        // k < N: 7 carry bits (deg 3) + overflow-required (deg 2).
-        for _ in 0..7 {
-            m.push(ConstraintMeta::base(idx, 3));
-            idx += 1;
-        }
-        m.push(ConstraintMeta::base(idx, 2));
-        idx += 1;
-        // xR < p: 7 carry bits (deg 3) + overflow-required (deg 2).
-        for _ in 0..7 {
-            m.push(ConstraintMeta::base(idx, 3));
-            idx += 1;
-        }
-        m.push(ConstraintMeta::base(idx, 2));
-        idx += 1;
-        debug_assert_eq!(idx, 148);
-        m
+    // The k<N / xR<p carry-bit constraints (µ·c·(1−c)) are degree 3.
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        // idx 0: IS_BIT(MU): mu·(1−mu).
+        // idx 0: IS_BIT(MU): mu·(1−mu). (deg 2)
         let mu = b.main(0, cols::MU);
         let one = b.one();
         b.emit_base(0, mu.clone() * (one - mu));
 
         let mut idx = 1;
 
-        // X2 convolution: 64 carries + closing c0(63).
+        // X2 convolution: 64 carries (deg 2) + closing c0(63) (deg 1).
         for i in 0..64 {
             let root = Self::conv_carry(b, Relation::X2, i);
             b.emit_base(idx, root);
@@ -817,7 +783,7 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(idx, c0_last);
         idx += 1;
 
-        // Yg convolution: 64 carries + closing c1(63).
+        // Yg convolution: 64 carries (deg 2) + closing c1(63) (deg 1).
         for i in 0..64 {
             let root = Self::conv_carry(b, Relation::Yg, i);
             b.emit_base(idx, root);
@@ -827,13 +793,13 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(idx, c1_last);
         idx += 1;
 
-        // idx 131: IS_BIT(q1[32]): x·(1−x).
+        // idx 131: IS_BIT(q1[32]): x·(1−x). (deg 2)
         let q1_32 = b.main(0, cols::q1(32));
         let one = b.one();
         b.emit_base(idx, q1_32.clone() * (one - q1_32));
         idx += 1;
 
-        // k < N and xR < p: 7 carry bits + overflow-required each.
+        // k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
         for kind in [OverflowKind::KLtN, OverflowKind::XrLtP] {
             let c = Self::carry_chain(b, kind);
             for ci in c.iter().take(7) {

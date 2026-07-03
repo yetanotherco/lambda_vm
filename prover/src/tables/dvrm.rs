@@ -976,7 +976,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // One body against the generic `ConstraintBuilder` serves the compiled prover
 // folder, the verifier folder and IR capture. Constraint indices 0..19.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// DVRM table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the DVRM layout is fixed via `cols`).
@@ -1059,11 +1059,6 @@ impl DvrmConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for DvrmConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // All DVRM constraints are declared degree 2.
-        (0..19).map(|i| ConstraintMeta::base(i, 2)).collect()
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: SignedIsBit — signed * (1 - signed)
         let signed = b.main(0, cols::SIGNED);

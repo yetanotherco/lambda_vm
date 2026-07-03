@@ -352,7 +352,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // One body against the generic `ConstraintBuilder` serves the compiled prover
 // folder, the verifier folder and IR capture. Constraint indices 0..6.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// LT table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the LT layout is fixed via `cols`).
@@ -398,15 +398,9 @@ impl LtConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 2), // Carry0IsBit
-            ConstraintMeta::base(1, 2), // Carry1IsBit
-            ConstraintMeta::base(2, 3), // LtFormula
-            ConstraintMeta::base(3, 2), // OutXorInvert
-            ConstraintMeta::base(4, 2), // InvertIsBit
-            ConstraintMeta::base(5, 2), // SignedIsBit
-        ]
+    // The LT formula (idx 2) is degree 3; the rest are degree 2.
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

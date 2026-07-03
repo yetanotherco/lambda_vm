@@ -4,7 +4,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -39,31 +39,24 @@ impl<F> ConstraintSet<F, F> for FibonacciRAPConstraints
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            // idx 0: fibonacci; end exemptions hard-coded for the steps = 16
-            // integration tests.
-            ConstraintMeta::base(0, 1).with_end_exemptions(3 + 32 - 16 - 1),
-            // idx 1: permutation; reads the next row ⇒ 1 end exemption.
-            ConstraintMeta::ext(1, 2).with_end_exemptions(1),
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
-        // a_{i+2} = a_{i+1} + a_i on column 0.
+        // idx 0: a_{i+2} = a_{i+1} + a_i on column 0. End exemptions hard-coded
+        // for the steps = 16 integration tests.
         let a0 = b.main(0, 0);
         let a1 = b.main(1, 0);
         let a2 = b.main(2, 0);
-        b.emit_base(0, a2 - a1 - a0);
+        b.emit_base_rows(0, RowDomain::except_last(3 + 32 - 16 - 1), a2 - a1 - a0);
 
-        // z_{i+1} * (b_i + gamma) = z_i * (a_i + gamma)
+        // idx 1: permutation; z_{i+1} * (b_i + gamma) = z_i * (a_i + gamma);
+        // reads the next row ⇒ 1 end exemption.
         let z_i = b.aux(0, 0);
         let z_i_plus_one = b.aux(1, 0);
         let gamma = b.challenge(0);
         let a_i = b.main(0, 0);
         let b_i = b.main(0, 1);
-        b.emit_ext(
+        b.emit_ext_rows(
             1,
+            RowDomain::except_last(1),
             z_i_plus_one * (b_i + gamma.clone()) - z_i * (a_i + gamma),
         );
     }

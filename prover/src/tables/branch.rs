@@ -26,7 +26,7 @@
 //! - Sender: IS_HALFWORD (×3 for next_pc_high[0..3])
 //! - Receiver: BRANCH (provides branch targets to CPU)
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -413,14 +413,8 @@ fn carry_1_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
 pub struct BranchConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for BranchConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 3), // PcCarry0IsBit
-            ConstraintMeta::base(1, 3), // PcCarry1IsBit
-            ConstraintMeta::base(2, 3), // RegCarry0IsBit
-            ConstraintMeta::base(3, 3), // RegCarry1IsBit
-            ConstraintMeta::base(4, 2), // JalrIsBit
-        ]
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

@@ -66,9 +66,9 @@ pub const NUM_CPU_CONSTRAINTS: usize = 12 + 6 + 2 + 2 + 2 + 4 + 2 + 2 + 1 + 2 + 
 // compiled prover folder, the verifier folder and IR capture. All constraints
 // here use the default zerofier shape (every row, no exemptions).
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use super::templates::{INV_SHIFT_32, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta};
+use super::templates::{INV_SHIFT_32, emit_add_pair, emit_is_bit};
 
 /// `col_a · col_b = 0`.
 pub fn emit_product_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
@@ -79,11 +79,6 @@ pub fn emit_product_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensi
 ) {
     let root = b.main(0, col_a) * b.main(0, col_b);
     b.emit_base(idx, root);
-}
-
-/// Metadata for [`emit_product_zero`].
-pub fn product_zero_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 2)
 }
 
 /// `(1 − MEMORY − BRANCH) · read_register2 · imm[i] = 0`.
@@ -100,11 +95,6 @@ pub fn emit_arg2_exclusive<B: ConstraintBuilder<GoldilocksField, GoldilocksExten
     b.emit_base(idx, (one - memory - branch) * rr2 * imm);
 }
 
-/// Metadata for [`emit_arg2_exclusive`].
-pub fn arg2_exclusive_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 3)
-}
-
 /// `(1 − MEMORY) · mem_flags · (1 − mem_flags) = 0`.
 pub fn emit_mem_flags_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
@@ -119,11 +109,6 @@ pub fn emit_mem_flags_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtens
     );
 }
 
-/// Metadata for [`emit_mem_flags_bit`].
-pub fn mem_flags_bit_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 3)
-}
-
 /// `(1 − flag) · value = 0`.
 pub fn emit_reg_not_read_is_zero<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
@@ -135,11 +120,6 @@ pub fn emit_reg_not_read_is_zero<B: ConstraintBuilder<GoldilocksField, Goldilock
     let flag = b.main(0, flag_col);
     let value = b.main(0, value_col);
     b.emit_base(idx, (one - flag) * value);
-}
-
-/// Metadata for [`emit_reg_not_read_is_zero`].
-pub fn reg_not_read_is_zero_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 2)
 }
 
 /// `arg2` multiplex for word index `word_idx ∈ {0, 1}`:
@@ -167,13 +147,8 @@ pub fn emit_arg2<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     let expected = memory.clone() * imm.clone()
         + branch.clone() * rv2.clone()
         + (one - memory - branch) * (rv2 + imm);
+    // Degree 2 relies on the live `MEMORY·BRANCH = 0` mutex.
     b.emit_base(idx, arg2 - expected);
-}
-
-/// Metadata for [`emit_arg2`] (degree 2 relies on the live `MEMORY·BRANCH = 0`
-/// mutex).
-pub fn arg2_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 2)
 }
 
 /// `cast(res, DWordWL)` word from the four `res` halves (DWordHL).
@@ -205,11 +180,6 @@ pub fn emit_rvd_eq_res<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension
     b.emit_base(idx, (one - memory - branch) * (rvd - res_w));
 }
 
-/// Metadata for [`emit_rvd_eq_res`].
-pub fn rvd_eq_res_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 2)
-}
-
 /// The `pc + instruction_length` carry pair against a destination dword
 /// (`rvd` or `next_pc`), gated by `gate`; shared body of
 /// [`emit_branch_rvd_pair`] and [`emit_next_pc_add_pair`]:
@@ -236,6 +206,7 @@ fn emit_pc_len_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensio
     let carry_0 = (pc_lo + instr_len - dst_lo) * inv_2_32.clone();
     let carry_1 = (pc_hi + carry_0.clone() - dst_hi) * inv_2_32;
 
+    // gate·carry·(1−carry): degree 3 (both instances).
     let one = b.one();
     let g = gate(b);
     b.emit_base(idx, g * carry_0.clone() * (one - carry_0));
@@ -255,14 +226,6 @@ pub fn emit_branch_rvd_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExte
     });
 }
 
-/// Metadata for [`emit_branch_rvd_pair`].
-pub fn branch_rvd_meta(idx: usize) -> [ConstraintMeta; 2] {
-    [
-        ConstraintMeta::base(idx, 3),
-        ConstraintMeta::base(idx + 1, 3),
-    ]
-}
-
 /// `branch_cond − (BRANCH·JALR + BRANCH·(1−JALR)·res[0])`.
 pub fn emit_branch_cond<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
     b: &mut B,
@@ -278,11 +241,6 @@ pub fn emit_branch_cond<B: ConstraintBuilder<GoldilocksField, GoldilocksExtensio
     b.emit_base(idx, branch_cond - expected);
 }
 
-/// Metadata for [`emit_branch_cond`].
-pub fn branch_cond_meta(idx: usize) -> ConstraintMeta {
-    ConstraintMeta::base(idx, 3)
-}
-
 /// `(1 − branch_cond) · carry · (1 − carry) = 0` for
 /// `next_pc = pc + instruction_length` (two instances at `idx`, `idx + 1`).
 pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
@@ -293,14 +251,6 @@ pub fn emit_next_pc_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExt
         let one = b.one();
         one - b.main(0, cols::BRANCH_COND)
     });
-}
-
-/// Metadata for [`emit_next_pc_add_pair`].
-pub fn next_pc_add_meta(idx: usize) -> [ConstraintMeta; 2] {
-    [
-        ConstraintMeta::base(idx, 3),
-        ConstraintMeta::base(idx + 1, 3),
-    ]
 }
 
 // =========================================================================
@@ -326,62 +276,10 @@ pub fn next_pc_add_meta(idx: usize) -> [ConstraintMeta; 2] {
 pub struct CpuConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for CpuConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(NUM_CPU_CONSTRAINTS);
-        // idx 0..11: IS_BIT on each BIT_FLAG_COLUMNS entry (unconditional).
-        for i in 0..BIT_FLAG_COLUMNS.len() {
-            m.push(is_bit_meta(i, false));
-        }
-        let mut idx = BIT_FLAG_COLUMNS.len();
-        // idx 12,13: ADD pair (conditional on ADD).
-        m.extend(add_pair_meta(idx, true));
-        idx += 2;
-        // idx 14,15: SUB pair (conditional on SUB).
-        m.extend(add_pair_meta(idx, true));
-        idx += 2;
-        // idx 16..21: word_instr mutexes + register-read gates.
-        for _ in 0..6 {
-            m.push(product_zero_meta(idx));
-            idx += 1;
-        }
-        // idx 22,23: arg2 multiplex.
-        m.push(arg2_meta(idx));
-        idx += 1;
-        m.push(arg2_meta(idx));
-        idx += 1;
-        // idx 24..27: register zero-forcing.
-        for _ in 0..4 {
-            m.push(reg_not_read_is_zero_meta(idx));
-            idx += 1;
-        }
-        // idx 28,29: rvd = cast(res, WL).
-        m.push(rvd_eq_res_meta(idx));
-        idx += 1;
-        m.push(rvd_eq_res_meta(idx));
-        idx += 1;
-        // idx 30,31: branch rvd = pc + len.
-        m.extend(branch_rvd_meta(idx));
-        idx += 2;
-        // idx 32: branch_cond.
-        m.push(branch_cond_meta(idx));
-        idx += 1;
-        // idx 33,34: next_pc = pc + len.
-        m.extend(next_pc_add_meta(idx));
-        idx += 2;
-        // idx 35: MEMORY · BRANCH = 0.
-        m.push(product_zero_meta(idx));
-        idx += 1;
-        // idx 36,37: arg2 exclusivity.
-        m.push(arg2_exclusive_meta(idx));
-        idx += 1;
-        m.push(arg2_exclusive_meta(idx));
-        idx += 1;
-        // idx 38: IS_BIT(mem_flags) on non-MEMORY rows.
-        m.push(mem_flags_bit_meta(idx));
-        idx += 1;
-        debug_assert_eq!(idx, NUM_CPU_CONSTRAINTS);
-        debug_assert_eq!(m.len(), NUM_CPU_CONSTRAINTS);
-        m
+    // The conditional ADD/SUB carry pairs, arg2 exclusivity, mem-flags bit and
+    // branch constraints are degree 3.
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

@@ -8,7 +8,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -39,15 +39,6 @@ where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // All three read the next row ⇒ 1 end exemption each.
-        vec![
-            ConstraintMeta::base(0, 2).with_end_exemptions(1), // continuity
-            ConstraintMeta::base(1, 2).with_end_exemptions(1), // single value
-            ConstraintMeta::ext(2, 3).with_end_exemptions(1),  // LogUp permutation
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         let a_sorted_0 = b.main(0, 2);
         let a_sorted_1 = b.main(1, 2);
@@ -56,10 +47,19 @@ where
         let one = b.one();
         let addr_diff = a_sorted_1 - a_sorted_0;
 
-        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-        b.emit_base(0, addr_diff.clone() * (addr_diff.clone() - one.clone()));
-        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-        b.emit_base(1, (v_sorted_1 - v_sorted_0) * (addr_diff - one));
+        // All three read the next row ⇒ 1 end exemption each.
+        // idx 0 — continuity (degree 2): (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        b.emit_base_rows(
+            0,
+            RowDomain::except_last(1),
+            addr_diff.clone() * (addr_diff.clone() - one.clone()),
+        );
+        // idx 1 — single value (degree 2): (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        b.emit_base_rows(
+            1,
+            RowDomain::except_last(1),
+            (v_sorted_1 - v_sorted_0) * (addr_diff - one),
+        );
 
         // We are using the following LogUp equation:
         // s1 = s0 + m / sorted_term - 1/unsorted_term.
@@ -76,8 +76,10 @@ where
         let m = b.main(1, 4);
         let unsorted_term = -(a1 + v1 * alpha.clone()) + z.clone();
         let sorted_term = -(a_sorted_1 + v_sorted_1 * alpha) + z;
-        b.emit_ext(
+        // idx 2 — LogUp permutation (degree 3, 1 end exemption).
+        b.emit_ext_rows(
             2,
+            RowDomain::except_last(1),
             s0 * unsorted_term.clone() * sorted_term.clone() + m * unsorted_term.clone()
                 - sorted_term.clone()
                 - s1 * unsorted_term * sorted_term,

@@ -4,7 +4,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -39,21 +39,14 @@ where
     F: IsSubFieldOf<E> + IsFFTField + Send + Sync,
     E: IsField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // idx i: column i's a_{j+2} = a_{j+1} + a_j; reads two next rows ⇒ 2
-        // end exemptions.
-        (0..self.num_columns)
-            .map(|i| ConstraintMeta::base(i, 1).with_end_exemptions(2))
-            .collect()
-    }
-
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         for col in 0..self.num_columns {
             let a0 = b.main(0, col);
             let a1 = b.main(1, col);
             let a2 = b.main(2, col);
-            // Constraint: a2 = a1 + a0  =>  a2 - a1 - a0 = 0
-            b.emit_base(col, a2 - a1 - a0);
+            // idx col: column col's a_{j+2} = a_{j+1} + a_j; reads two next rows
+            // ⇒ 2 end exemptions.
+            b.emit_base_rows(col, RowDomain::except_last(2), a2 - a1 - a0);
         }
     }
 }

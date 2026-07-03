@@ -735,7 +735,7 @@ pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
 // One body against the generic `ConstraintBuilder` serves the compiled prover
 // folder, the verifier folder and IR capture. Constraint indices 0..19.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// SHIFT table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the SHIFT layout is fixed via `cols`).
@@ -829,27 +829,8 @@ impl ShiftConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(NUM_SHIFT_CONSTRAINTS);
-        m.push(ConstraintMeta::base(0, 2)); // DirectionImpliesMu
-        for i in 0..4 {
-            m.push(ConstraintMeta::base(1 + i, 3)); // ZbsOverrideX
-        }
-        m.push(ConstraintMeta::base(5, 2)); // ZbsOverrideX4
-        for i in 0..4 {
-            m.push(ConstraintMeta::base(6 + i, 3)); // ZbsOverrideY
-        }
-        for i in 0..4 {
-            m.push(ConstraintMeta::base(10 + i, 2)); // LimbShiftIsBit
-        }
-        for i in 0..2 {
-            m.push(ConstraintMeta::base(14 + i, 3)); // OutputMatchesShifted
-        }
-        for i in 0..3 {
-            m.push(ConstraintMeta::base(16 + i, 2)); // FlagIsBit
-        }
-        debug_assert_eq!(m.len(), NUM_SHIFT_CONSTRAINTS);
-        m
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

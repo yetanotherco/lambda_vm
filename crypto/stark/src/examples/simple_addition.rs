@@ -36,16 +36,11 @@ impl<F> ConstraintSet<F, F> for SimpleAdditionConstraints<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // idx 0: col0 + col1 = col2, applied at every row (no exemptions).
-        vec![ConstraintMeta::base(0, 1)]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let col0 = b.main(0, 0);
         let col1 = b.main(0, 1);
         let col2 = b.main(0, 2);
-        // Constraint: col0 + col1 - col2 = 0
+        // idx 0: col0 + col1 - col2 = 0, applied at every row (degree 1, no exemptions).
         b.emit_base(0, col0 + col1 - col2);
     }
 }

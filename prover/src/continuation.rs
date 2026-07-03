@@ -42,9 +42,7 @@ use executor::vm::execution::Executor;
 use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
-use stark::constraints::builder::{
-    ConstraintBuilder, ConstraintMeta, ConstraintSet, EmptyConstraints,
-};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
@@ -115,10 +113,6 @@ fn global_transcript(elf_bytes: &[u8], num_epochs: usize) -> DefaultTranscript<E
 struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // IS_BIT(MU), unconditional → degree 2.
-        vec![ConstraintMeta::base(0, 2)]
-    }
     fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
         crate::constraints::templates::emit_is_bit(b, 0, local_to_global::cols::MU, None);
     }

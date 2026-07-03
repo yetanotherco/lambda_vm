@@ -825,8 +825,9 @@ pub struct AirWithBuses<
     /// The LogUp layout: the framework generates the LogUp (extension)
     /// constraints from this and appends them after the `constraint_set` ones.
     logup: LogUpLayout,
-    /// Idx-ordered metadata for all transition constraints:
-    /// `constraint_set.meta()` (base prefix) followed by `logup_meta` (ext).
+    /// Idx-ordered metadata for all transition constraints, DERIVED at
+    /// construction: `constraint_set.meta()` (base prefix) followed by the
+    /// LogUp emission's derived metadata (ext).
     meta: Vec<ConstraintMeta>,
     /// Number of base-field constraints (the `RootKind::Base` prefix length of
     /// `meta`) — these use the cheaper F×E accumulation path.
@@ -879,12 +880,16 @@ impl<
         let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
         let num_term_columns = logup.num_term_columns;
 
-        // meta = constraint_set base-prefix meta + appended LogUp ext meta.
+        // meta = constraint_set base-prefix meta + appended LogUp ext meta,
+        // both DERIVED by running the respective bodies through a MetaBuilder
+        // (the `{degree, end_exemptions}` declared at each emit).
         let mut meta = constraint_set.meta();
         let num_base = num_base_from_meta(&meta);
         // The set is entirely base-field (its meta is a Base prefix).
         debug_assert_eq!(num_base, meta.len(), "constraint set meta must be all-base");
-        meta.extend(logup_meta(&logup, meta.len()));
+        let mut logup_mb = crate::constraints::builder::MetaBuilder::new();
+        emit_logup_constraints::<F, E, _>(&mut logup_mb, &logup, num_base);
+        meta.extend(logup_mb.into_meta());
 
         // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
@@ -1007,7 +1012,14 @@ where
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
-        let max_degree = self.meta.iter().map(|m| m.degree).max().unwrap_or(1);
+        // Only the per-table MAX degree is consumed. Base constraints declare it
+        // once via `ConstraintSet::max_degree()`; the framework's LogUp
+        // constraints contribute their own known max (batched terms degree 3,
+        // accumulator `1 + absorbed`).
+        let max_degree = self
+            .constraint_set
+            .max_degree()
+            .max(logup_max_degree(&self.logup));
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1729,7 +1741,8 @@ where
 // accumulated); there are no per-constraint objects.
 //
 // All LogUp constraints use the default zerofier shape (every row, no
-// exemptions), so [`logup_meta`] emits plain [`RootKind::Ext`] entries.
+// exemptions) and are [`RootKind::Ext`]; their metadata is derived from this
+// same emission (via `MetaBuilder`), not hand-listed.
 //
 // The data-dependent "skip the multiply when the row value is zero"
 // optimization IS reproduced, through the [`ConstraintBuilder::fold_fingerprint_term`]
@@ -1744,7 +1757,7 @@ use crate::constraints::builder::ConstraintBuilder;
 /// computed by [`AirWithBuses::new`] from the interaction list (via
 /// `split_interactions`). This is the plain-data source for the LogUp
 /// constraints: [`emit_logup_constraints`] reads it to generate every LogUp
-/// constraint, and [`logup_meta`] reads it for the metadata.
+/// constraint (its metadata is derived from that same emission).
 #[derive(Clone)]
 pub struct LogUpLayout {
     /// All interactions, in the order they were registered. The first
@@ -2042,7 +2055,8 @@ where
         -term_b
     };
 
-    // c · fp_a · fp_b: c is aux (ext), so this is ext throughout.
+    // c · fp_a · fp_b: c is aux (ext), so this is ext throughout (degree 3;
+    // see `logup_max_degree`).
     let main = c * fp_a * fp_b;
     b.emit_ext(idx, main - term_a - term_b);
 }
@@ -2097,7 +2111,26 @@ where
         _ => unreachable!("absorbed must contain 1 or 2 interactions"),
     };
 
+    // Degree 1 + absorbed count (2 for one absorbed, 3 for two); folded into
+    // the composition bound via `logup_max_degree`.
     b.emit_ext(idx, root);
+}
+
+/// The maximum degree among a layout's framework-generated LogUp constraints:
+/// batched committed terms are degree 3, the accumulator is `1 + absorbed`.
+/// Zero when there are no interactions. Folded into
+/// `composition_poly_degree_bound` alongside the base constraints' max_degree.
+pub fn logup_max_degree(layout: &LogUpLayout) -> usize {
+    if layout.interactions.is_empty() {
+        return 0;
+    }
+    // Accumulated constraint: 1 + number of absorbed interactions.
+    let mut m = 1 + layout.absorbed().len();
+    // Batched committed terms (if any) are degree 3.
+    if layout.num_committed_pairs > 0 {
+        m = m.max(3);
+    }
+    m
 }
 
 /// Emit every LogUp transition constraint for `layout` through the builder,
@@ -2119,26 +2152,6 @@ where
         idx += 1;
     }
     emit_logup_accumulated::<F, E, B>(b, layout, idx);
-}
-
-/// The idx-ordered [`ConstraintMeta`] for `layout`'s LogUp constraints, starting
-/// at `idx_start`: batched terms are degree 3; the accumulated constraint is
-/// degree `1 + absorbed.len()` (2 for one absorbed, 3 for two). All are
-/// [`RootKind::Ext`] with the default zerofier shape (period 1, offset 0, no
-/// exemptions).
-pub fn logup_meta(layout: &LogUpLayout, idx_start: usize) -> Vec<ConstraintMeta> {
-    let mut meta = Vec::with_capacity(layout.num_constraints());
-    if layout.interactions.is_empty() {
-        return meta;
-    }
-    let mut idx = idx_start;
-    for _ in 0..layout.num_committed_pairs {
-        meta.push(ConstraintMeta::ext(idx, 3)); // c · fp_a · fp_b
-        idx += 1;
-    }
-    let absorbed_len = layout.absorbed().len();
-    meta.push(ConstraintMeta::ext(idx, 1 + absorbed_len));
-    meta
 }
 
 /// Run an [`AirWithBuses`] table's transition constraints through the
@@ -2277,24 +2290,25 @@ mod logup_single_source_tests {
         let n_base = 0usize; // LogUp constraints are all extension-rooted.
         let n = layout.num_constraints();
 
-        // Metadata self-consistency: all-ext, dense, and the batched/accumulated
-        // degree formula (3 per batched term; 1 + absorbed for the accumulator).
-        let meta = logup_meta(layout, n_base);
+        // Metadata self-consistency: derived from the LogUp emission itself
+        // (MetaBuilder), it must be all-ext, dense, and match the
+        // batched/accumulated degree formula (3 per batched term; 1 + absorbed
+        // for the accumulator).
+        let meta = {
+            let mut mb = crate::constraints::builder::MetaBuilder::new();
+            emit_logup_constraints::<Gl, Ext3, _>(&mut mb, layout, n_base);
+            mb.into_meta()
+        };
         assert_eq!(meta.len(), n, "[{label}] meta count");
         let num_base = num_base_from_meta(&meta);
         assert_eq!(num_base, 0, "[{label}] LogUp meta is all-ext");
         for (i, m) in meta.iter().enumerate() {
             assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
             assert_eq!(m.kind, RootKind::Ext, "[{label}] meta kind {i}");
-            let expected_degree = if i < layout.num_committed_pairs {
-                3
-            } else {
-                1 + layout.absorbed().len()
-            };
-            assert_eq!(m.degree, expected_degree, "[{label}] degree {i}");
         }
 
-        // Capture once; tree-measured degree <= declared.
+        // Capture once; the tree-measured degree must match the batched/
+        // accumulated formula, and `logup_max_degree` must equal their max.
         let mut cb = CaptureBuilder::<Gl, Ext3>::new();
         emit_logup_constraints(&mut cb, layout, n_base);
         let (prog, degrees) = cb.finish(num_base);
@@ -2309,12 +2323,18 @@ mod logup_single_source_tests {
             "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
         );
         for &(idx, measured) in &degrees {
-            assert!(
-                measured <= meta[idx].degree,
-                "[{label}] constraint {idx}: tree degree {measured} exceeds declared {}",
-                meta[idx].degree
-            );
+            let expected_degree = if idx < layout.num_committed_pairs {
+                3
+            } else {
+                1 + layout.absorbed().len()
+            };
+            assert_eq!(measured, expected_degree, "[{label}] degree {idx}");
         }
+        assert_eq!(
+            logup_max_degree(layout),
+            degrees.iter().map(|&(_, d)| d).max().unwrap_or(0),
+            "[{label}] logup_max_degree matches max measured degree"
+        );
 
         let n_aux = num_aux_cols(layout);
 

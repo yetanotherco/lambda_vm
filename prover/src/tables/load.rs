@@ -481,7 +481,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 //   5: ReadImpliesMu                                6..10: ExtensionHigh(4..8)
 //   10..12: ExtensionMid(2..4)                      12: ExtensionLow
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// LOAD table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the LOAD layout is fixed via `cols`).
@@ -513,22 +513,8 @@ impl LoadConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LoadConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            ConstraintMeta::base(0, 2),  // FlagIsBit(SIGNED)
-            ConstraintMeta::base(1, 2),  // FlagIsBit(READ2)
-            ConstraintMeta::base(2, 2),  // FlagIsBit(READ4)
-            ConstraintMeta::base(3, 2),  // FlagIsBit(READ8)
-            ConstraintMeta::base(4, 2),  // WidthSumIsBit
-            ConstraintMeta::base(5, 2),  // ReadImpliesMu
-            ConstraintMeta::base(6, 3),  // ExtensionHigh(4)
-            ConstraintMeta::base(7, 3),  // ExtensionHigh(5)
-            ConstraintMeta::base(8, 3),  // ExtensionHigh(6)
-            ConstraintMeta::base(9, 3),  // ExtensionHigh(7)
-            ConstraintMeta::base(10, 3), // ExtensionMid(2)
-            ConstraintMeta::base(11, 3), // ExtensionMid(3)
-            ConstraintMeta::base(12, 3), // ExtensionLow (res[1])
-        ]
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

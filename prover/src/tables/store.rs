@@ -22,10 +22,10 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::{emit_is_bit, is_bit_meta};
+use crate::constraints::templates::emit_is_bit;
 
 // =========================================================================
 // Column indices for STORE table
@@ -261,17 +261,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct StoreConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for StoreConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            is_bit_meta(0, false),      // write2
-            is_bit_meta(1, false),      // write4
-            is_bit_meta(2, false),      // write8
-            is_bit_meta(3, false),      // μ
-            ConstraintMeta::base(4, 2), // width sum is bit
-            ConstraintMeta::base(5, 2), // width ⇒ μ
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         emit_is_bit(b, 0, cols::WRITE2, None);
         emit_is_bit(b, 1, cols::WRITE4, None);

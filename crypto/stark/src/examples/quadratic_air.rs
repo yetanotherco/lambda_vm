@@ -4,7 +4,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -33,15 +33,11 @@ impl<F> ConstraintSet<F, F> for QuadraticConstraints<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // idx 0: x_{i+1} = x_i²; reads the next row ⇒ 1 end exemption.
-        vec![ConstraintMeta::base(0, 2).with_end_exemptions(1)]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let x = b.main(0, 0);
         let x_squared = b.main(1, 0);
-        b.emit_base(0, x_squared - x.clone() * x);
+        // idx 0: x_{i+1} = x_i²; reads the next row ⇒ 1 end exemption.
+        b.emit_base_rows(0, RowDomain::except_last(1), x_squared - x.clone() * x);
     }
 }
 

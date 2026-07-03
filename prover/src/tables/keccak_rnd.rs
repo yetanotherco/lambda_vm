@@ -29,7 +29,7 @@
 //! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -906,11 +906,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // 20 conditional IS_BIT constraints → degree 3.
-        (0..20)
-            .map(|i| crate::constraints::templates::is_bit_meta(i, true))
-            .collect()
+    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3.
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

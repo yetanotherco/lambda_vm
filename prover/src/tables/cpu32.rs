@@ -24,11 +24,9 @@ use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
 };
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use crate::constraints::templates::{
-    AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
 // =========================================================================
 // Column indices for CPU32 table
@@ -602,29 +600,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 pub struct Cpu32Constraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        let mut m = Vec::with_capacity(32);
-        // idx 0-6: IS_BIT (unconditional, degree 2).
-        for i in 0..7 {
-            m.push(is_bit_meta(i, false));
-        }
-        // idx 7,8: ADD pair gated on ADD (conditional, degree 3).
-        m.extend(add_pair_meta(7, true));
-        // idx 9,10: SUB pair gated on SUB (conditional, degree 3).
-        m.extend(add_pair_meta(9, true));
-        // idx 11-16: RegZero (degree 2).
-        for i in 11..17 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        // idx 17-22: sign-extension arithmetic (linear, degree 1).
-        for i in 17..23 {
-            m.push(ConstraintMeta::base(i, 1));
-        }
-        // idx 23-31: sign-zero, arg2-exclusive, flag ⇒ μ (all degree 2).
-        for i in 23..32 {
-            m.push(ConstraintMeta::base(i, 2));
-        }
-        m
+    fn max_degree(&self) -> usize {
+        3
     }
 
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {

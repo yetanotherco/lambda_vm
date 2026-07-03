@@ -5,7 +5,7 @@ use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
         builder::{
-            ConstraintBuilder, ConstraintMeta, ConstraintSet, num_base_from_meta,
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
             run_transition_prover, run_transition_verifier,
         },
     },
@@ -34,25 +34,20 @@ impl<F> ConstraintSet<F, F> for Fibonacci2ColsConstraints<F>
 where
     F: IsFFTField + Send + Sync,
 {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        vec![
-            // idx 0: s_{0, i+1} = s_{0, i} + s_{1, i}; reads the next row ⇒ 1 end exemption.
-            ConstraintMeta::base(0, 1).with_end_exemptions(1),
-            // idx 1: s_{1, i+1} = s_{1, i} + s_{0, i+1}; reads the next row ⇒ 1 end exemption.
-            ConstraintMeta::base(1, 1).with_end_exemptions(1),
-        ]
-    }
-
     fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
         let s0_0 = b.main(0, 0);
         let s0_1 = b.main(0, 1);
         let s1_0 = b.main(1, 0);
         let s1_1 = b.main(1, 1);
 
-        // s_{0, i+1} = s_{0, i} + s_{1, i}
-        b.emit_base(0, s1_0.clone() - s0_0 - s0_1.clone());
-        // s_{1, i+1} = s_{1, i} + s_{0, i+1}
-        b.emit_base(1, s1_1 - s0_1 - s1_0);
+        // idx 0: s_{0, i+1} = s_{0, i} + s_{1, i}; reads the next row ⇒ 1 end exemption.
+        b.emit_base_rows(
+            0,
+            RowDomain::except_last(1),
+            s1_0.clone() - s0_0 - s0_1.clone(),
+        );
+        // idx 1: s_{1, i+1} = s_{1, i} + s_{0, i+1}; reads the next row ⇒ 1 end exemption.
+        b.emit_base_rows(1, RowDomain::except_last(1), s1_1 - s0_1 - s1_0);
     }
 }
 

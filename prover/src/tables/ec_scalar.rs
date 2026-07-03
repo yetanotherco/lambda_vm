@@ -276,18 +276,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // One body against the generic `ConstraintBuilder` serves the compiled prover
 // folder, the verifier folder and IR capture. Constraint indices 0..20.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// EC_SCALAR transition constraints as a single-source [`ConstraintSet`] (20
 /// total). No column configuration needed (the layout is fixed via `cols`).
 pub struct EcScalarConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        // 10 unconditional IS_BIT (degree 2) + 10 MulZero (degree 2).
-        (0..20).map(|i| ConstraintMeta::base(i, 2)).collect()
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0..10: unconditional IS_BIT `x·(1−x)` for
         // [mu, limb_bit(0..8), last_limb], in that column order. Iterator

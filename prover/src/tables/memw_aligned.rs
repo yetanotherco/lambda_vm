@@ -39,7 +39,7 @@
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintMeta, ConstraintSet};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
@@ -670,10 +670,6 @@ fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) ->
 pub struct MemwAlignedConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwAlignedConstraints {
-    fn meta(&self) -> Vec<ConstraintMeta> {
-        (0..8).map(|i| ConstraintMeta::base(i, 2)).collect()
-    }
-
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // idx 0: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum)
         let one = b.one();

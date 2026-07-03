@@ -12,24 +12,18 @@
 use math::field::element::FieldElement;
 use stark::constraint_ir::eval_program_base;
 use stark::constraints::builder::{
-    CaptureBuilder, ConstraintBuilder, ConstraintMeta, ProverEvalFolder, RootKind,
-    VerifierEvalFolder, num_base_from_meta,
+    CaptureBuilder, ConstraintBuilder, MetaBuilder, ProverEvalFolder, RootKind, VerifierEvalFolder,
+    num_base_from_meta,
 };
 use stark::frame::Frame;
 use stark::table::TableView;
 use stark::traits::TransitionEvaluationContext;
 
 use crate::constraints::cpu::{
-    arg2_exclusive_meta, arg2_meta, branch_cond_meta, branch_rvd_meta, mem_flags_bit_meta,
-    next_pc_add_meta, product_zero_meta, reg_not_read_is_zero_meta, rvd_eq_res_meta,
-};
-use crate::constraints::cpu::{
     emit_arg2, emit_arg2_exclusive, emit_branch_cond, emit_branch_rvd_pair, emit_mem_flags_bit,
     emit_next_pc_add_pair, emit_product_zero, emit_reg_not_read_is_zero, emit_rvd_eq_res,
 };
-use crate::constraints::templates::{
-    AddLinearTerm, AddOperand, add_pair_meta, emit_add_pair, emit_is_bit, is_bit_meta,
-};
+use crate::constraints::templates::{AddLinearTerm, AddOperand, emit_add_pair, emit_is_bit};
 use crate::tables::cpu::cols;
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 
@@ -78,18 +72,23 @@ macro_rules! emit_body {
 /// this pins that capture/interpretation stays faithful to the compiled folder.
 /// `meta` must be dense, idx-ordered, all-base, with each declared degree equal
 /// to the tree-measured degree.
-fn check_emit<T: EmitBody>(label: &str, body: &T, meta: &[ConstraintMeta]) {
+fn check_emit<T: EmitBody>(label: &str, body: &T, max_degree: usize) {
     let n = body.n();
-    assert_eq!(meta.len(), n, "[{label}] meta length");
 
-    // --- meta invariants ---
-    assert_eq!(num_base_from_meta(meta), n, "[{label}] all-base num_base");
+    // --- meta invariants (DERIVED from the body): dense, idx-ordered, all-base ---
+    let meta = {
+        let mut mb = MetaBuilder::new();
+        body.eval(&mut mb);
+        mb.into_meta()
+    };
+    assert_eq!(meta.len(), n, "[{label}] meta length");
+    assert_eq!(num_base_from_meta(&meta), n, "[{label}] all-base num_base");
     for (i, m) in meta.iter().enumerate() {
         assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
         assert_eq!(m.kind, RootKind::Base, "[{label}] meta kind {i}");
     }
 
-    // --- capture once; tree-measured degree == declared ---
+    // --- capture once; tree-measured degree matches the declared max ---
     let mut cb = CaptureBuilder::<Gl, Gl3>::new();
     body.eval(&mut cb);
     let (prog, degrees) = cb.finish(n);
@@ -104,13 +103,18 @@ fn check_emit<T: EmitBody>(label: &str, body: &T, meta: &[ConstraintMeta]) {
         emitted.iter().enumerate().all(|(i, &idx)| i == idx),
         "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
     );
-    for &(idx, measured) in &degrees {
-        assert_eq!(
-            measured, meta[idx].degree,
-            "[{label}] constraint {idx}: tree degree {measured} != declared {}",
-            meta[idx].degree
+    let mut max_measured = 0;
+    for &(_, measured) in &degrees {
+        assert!(
+            measured <= max_degree,
+            "[{label}] tree degree {measured} EXCEEDS declared max {max_degree}"
         );
+        max_measured = max_measured.max(measured);
     }
+    assert_eq!(
+        max_measured, max_degree,
+        "[{label}] max tree-measured degree {max_measured} != declared {max_degree}"
+    );
     let no_ch: Vec<Fp3> = vec![];
     let offset_e = Fp3::zero();
 
@@ -167,10 +171,10 @@ fn check_emit<T: EmitBody>(label: &str, body: &T, meta: &[ConstraintMeta]) {
 #[test]
 fn emit_is_bit_folder_capture_agree() {
     emit_body!(Uncond, 1, |b| { emit_is_bit(b, 0, 7, None) });
-    check_emit("is_bit_unconditional", &Uncond, &[is_bit_meta(0, false)]);
+    check_emit("is_bit_unconditional", &Uncond, 2);
 
     emit_body!(Cond, 1, |b| { emit_is_bit(b, 0, 5, Some(3)) });
-    check_emit("is_bit_conditional", &Cond, &[is_bit_meta(0, true)]);
+    check_emit("is_bit_conditional", &Cond, 3);
 }
 
 // =============================================================================
@@ -179,7 +183,8 @@ fn emit_is_bit_folder_capture_agree() {
 
 /// Run the pair check for one `conditional` flag.
 fn check_add_pair_case<T: EmitBody>(label: &str, body: &T, conditional: bool) {
-    check_emit(label, body, &add_pair_meta(0, conditional));
+    let max_degree = if conditional { 3 } else { 2 };
+    check_emit(label, body, max_degree);
 }
 
 #[test]
@@ -250,22 +255,22 @@ fn emit_add_pair_multi_cond_bytes() {
 #[test]
 fn emit_product_zero_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_product_zero(b, 0, 12, 17) });
-    check_emit("product_zero", &Body, &[product_zero_meta(0)]);
+    check_emit("product_zero", &Body, 2);
 }
 
 #[test]
 fn emit_arg2_exclusive_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_arg2_exclusive(b, 0, cols::IMM_0) });
-    check_emit("arg2_exclusive_imm0", &Body0, &[arg2_exclusive_meta(0)]);
+    check_emit("arg2_exclusive_imm0", &Body0, 3);
 
     emit_body!(Body1, 1, |b| { emit_arg2_exclusive(b, 0, cols::IMM_1) });
-    check_emit("arg2_exclusive_imm1", &Body1, &[arg2_exclusive_meta(0)]);
+    check_emit("arg2_exclusive_imm1", &Body1, 3);
 }
 
 #[test]
 fn emit_mem_flags_bit_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_mem_flags_bit(b, 0) });
-    check_emit("mem_flags_bit", &Body, &[mem_flags_bit_meta(0)]);
+    check_emit("mem_flags_bit", &Body, 3);
 }
 
 #[test]
@@ -273,20 +278,12 @@ fn emit_reg_not_read_is_zero_folder_capture_agree() {
     emit_body!(Body, 1, |b| {
         emit_reg_not_read_is_zero(b, 0, cols::READ_REGISTER1, cols::RV1_0)
     });
-    check_emit(
-        "reg_not_read_is_zero_rv1",
-        &Body,
-        &[reg_not_read_is_zero_meta(0)],
-    );
+    check_emit("reg_not_read_is_zero_rv1", &Body, 2);
 
     emit_body!(Body2, 1, |b| {
         emit_reg_not_read_is_zero(b, 0, cols::READ_REGISTER2, cols::RV2_1)
     });
-    check_emit(
-        "reg_not_read_is_zero_rv2",
-        &Body2,
-        &[reg_not_read_is_zero_meta(0)],
-    );
+    check_emit("reg_not_read_is_zero_rv2", &Body2, 2);
 }
 
 // =============================================================================
@@ -296,33 +293,33 @@ fn emit_reg_not_read_is_zero_folder_capture_agree() {
 #[test]
 fn emit_arg2_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_arg2(b, 0, 0) });
-    check_emit("arg2_word0", &Body0, &[arg2_meta(0)]);
+    check_emit("arg2_word0", &Body0, 2);
     emit_body!(Body1, 1, |b| { emit_arg2(b, 0, 1) });
-    check_emit("arg2_word1", &Body1, &[arg2_meta(0)]);
+    check_emit("arg2_word1", &Body1, 2);
 }
 
 #[test]
 fn emit_rvd_eq_res_folder_capture_agree() {
     emit_body!(Body0, 1, |b| { emit_rvd_eq_res(b, 0, 0) });
-    check_emit("rvd_eq_res_word0", &Body0, &[rvd_eq_res_meta(0)]);
+    check_emit("rvd_eq_res_word0", &Body0, 2);
     emit_body!(Body1, 1, |b| { emit_rvd_eq_res(b, 0, 1) });
-    check_emit("rvd_eq_res_word1", &Body1, &[rvd_eq_res_meta(0)]);
+    check_emit("rvd_eq_res_word1", &Body1, 2);
 }
 
 #[test]
 fn emit_branch_rvd_pair_folder_capture_agree() {
     emit_body!(Body, 2, |b| { emit_branch_rvd_pair(b, 0) });
-    check_emit("branch_rvd_pair", &Body, &branch_rvd_meta(0));
+    check_emit("branch_rvd_pair", &Body, 3);
 }
 
 #[test]
 fn emit_branch_cond_folder_capture_agree() {
     emit_body!(Body, 1, |b| { emit_branch_cond(b, 0) });
-    check_emit("branch_cond", &Body, &[branch_cond_meta(0)]);
+    check_emit("branch_cond", &Body, 3);
 }
 
 #[test]
 fn emit_next_pc_add_pair_folder_capture_agree() {
     emit_body!(Body, 2, |b| { emit_next_pc_add_pair(b, 0) });
-    check_emit("next_pc_add_pair", &Body, &next_pc_add_meta(0));
+    check_emit("next_pc_add_pair", &Body, 3);
 }
