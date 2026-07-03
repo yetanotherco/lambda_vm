@@ -11,4 +11,4 @@ lambda-vm-syscalls = { path = "../../../syscalls" }
 postcard = { version = "1.0", features = ["alloc"] }
 
 [profile.release]
-debug = true
+debug = 2
