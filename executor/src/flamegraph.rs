@@ -175,7 +175,10 @@ impl FlamegraphGenerator {
             self.symbols.lookup(log.next_pc),
         ) {
             (Some(a), Some(b)) => a.address == b.address,
-            _ => false,
+            // Either address unresolved: treat as an ordinary jump (no stack
+            // mutation) rather than a tail call, matching the doc comment and
+            // this PR's stance against spurious pop+push in unsymbolized code.
+            _ => true,
         };
         if same_function {
             return;

@@ -747,6 +747,38 @@ fn test_flamegraph_dst0_jump_onto_zero_size_symbol_boundary() {
     assert_eq!(lines, vec!["main 1", "main;asm_stub 1"]);
 }
 
+#[test]
+fn test_flamegraph_dst0_jump_with_unresolved_address_is_not_a_tail_call() {
+    // A dst=0 jump where the current or next PC resolves to no symbol (asm
+    // stubs, code in linker gaps) must be treated as an ordinary jump — no
+    // pop+push — matching `maybe_tail_call`'s doc comment. Regression guard
+    // against the `_ => false` bug that spuriously mutated the stack in
+    // unsymbolized regions.
+    let symbols = make_symbol_table(vec![("main", 0x1000, 100)]);
+    let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
+
+    // The jump lands at 0x9000, which no symbol covers (unresolved next_pc).
+    let instructions = make_instructions(vec![
+        (0x1004, Instruction::JumpAndLink { dst: 0, offset: 0 }),
+        (0x9000, nop_instruction()),
+    ]);
+
+    let logs = vec![mk_log(0x1004, 0x9000), mk_log(0x9000, 0x9004)];
+
+    generator.process_logs(&logs, &instructions).unwrap();
+
+    let mut output = Vec::new();
+    generator.write_folded(&mut output).unwrap();
+    let output_str = String::from_utf8(output).unwrap();
+
+    // No stack mutation: both instructions stay charged to the pre-jump state
+    // ("main"). A spurious tail call would have produced a second "main;<...>"
+    // frame for the unresolved landing.
+    let mut lines: Vec<&str> = output_str.lines().collect();
+    lines.sort();
+    assert_eq!(lines, vec!["main 2"]);
+}
+
 // ============================================================================
 // Trie-fold correctness
 // ============================================================================
