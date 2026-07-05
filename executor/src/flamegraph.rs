@@ -10,6 +10,7 @@ use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::{Elf, SymbolTable};
 use crate::vm::execution::{Executor, ExecutorError, InstructionCache, CHUNK_SIZE};
+use crate::vm::memory::U64HashMap;
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
 
@@ -37,7 +38,9 @@ struct TrieNode {
     parent: u32,
     addr: u64,
     count: u64,
-    children: HashMap<u64, u32>,
+    // u64-keyed by function-entry address; the crate's identity-ish u64 hasher
+    // avoids SipHash on every `push` lookup/insert (a hot-path operation).
+    children: U64HashMap<u32>,
 }
 
 /// Root node index. Its own `parent` field is a self-loop sentinel and is
@@ -71,7 +74,7 @@ impl FlamegraphGenerator {
                 parent: ROOT,
                 addr: entry_point,
                 count: 0,
-                children: HashMap::new(),
+                children: U64HashMap::default(),
             }],
             current: ROOT,
             total_counted: 0,
@@ -118,7 +121,7 @@ impl FlamegraphGenerator {
             parent: self.current,
             addr,
             count: 0,
-            children: HashMap::new(),
+            children: U64HashMap::default(),
         });
         self.nodes[current].children.insert(addr, new_idx);
         self.current = new_idx;
