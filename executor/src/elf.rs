@@ -548,6 +548,30 @@ impl SymbolTable {
         }
     }
 
+    /// Like [`Self::lookup`], but also returns the exclusive upper bound of the
+    /// addresses that resolve to the returned function — its size-end, capped
+    /// at the next symbol's start so overlapping/nested symbols are respected.
+    /// Every address in `[func.address, end)` resolves to `func` via `lookup`,
+    /// so callers can cache the range and skip re-running `lookup` inside it.
+    pub fn lookup_range(&self, address: u64) -> Option<(&FunctionSymbol, u64)> {
+        let idx = match self.functions.binary_search_by_key(&address, |f| f.address) {
+            Ok(i) => i,
+            Err(0) => return None,
+            Err(i) => i - 1,
+        };
+        let func = &self.functions[idx];
+        let size_end = if func.size == 0 {
+            u64::MAX
+        } else {
+            func.address + func.size
+        };
+        if address >= size_end {
+            return None;
+        }
+        let next_start = self.functions.get(idx + 1).map_or(u64::MAX, |f| f.address);
+        Some((func, size_end.min(next_start)))
+    }
+
     /// Check if the symbol table is empty
     pub fn is_empty(&self) -> bool {
         self.functions.is_empty()

@@ -63,6 +63,11 @@ pub struct FlamegraphGenerator {
     current: u32,
     /// Sum of `count` across all nodes, tracked incrementally.
     total_counted: u64,
+    /// `[start, end)` address range of the function most recently resolved in
+    /// `maybe_tail_call`. A `dst=0` jump whose endpoints both fall inside it is
+    /// an intra-function jump — the overwhelmingly common case — and short-
+    /// circuits without the two `SymbolTable` binary searches.
+    cached_fn_range: Option<(u64, u64)>,
 }
 
 impl FlamegraphGenerator {
@@ -78,6 +83,7 @@ impl FlamegraphGenerator {
             }],
             current: ROOT,
             total_counted: 0,
+            cached_fn_range: None,
         }
     }
 
@@ -173,21 +179,32 @@ impl FlamegraphGenerator {
     /// boundary can misattribute — not fixed here, see flamegraph_plan.md
     /// bug #1.
     fn maybe_tail_call(&mut self, log: &Log) {
-        let same_function = match (
-            self.symbols.lookup(log.current_pc),
-            self.symbols.lookup(log.next_pc),
-        ) {
-            (Some(a), Some(b)) => a.address == b.address,
-            // Either address unresolved: treat as an ordinary jump (no stack
-            // mutation) rather than a tail call, matching the doc comment and
-            // this PR's stance against spurious pop+push in unsymbolized code.
-            _ => true,
-        };
-        if same_function {
-            return;
+        // Fast path: both endpoints inside the last-resolved function's range
+        // ⇒ an intra-function jump. `lookup_range` guarantees the range holds
+        // exactly the addresses that `lookup` resolves to that function, so
+        // this is equivalent to two same-function lookups — without running
+        // them. Covers loop back-edges, switch arms, self-tail-recursion, etc.
+        if let Some((start, end)) = self.cached_fn_range {
+            if (start..end).contains(&log.current_pc) && (start..end).contains(&log.next_pc) {
+                return;
+            }
         }
-        self.pop();
-        self.push(log.next_pc);
+
+        let from = self.symbols.lookup_range(log.current_pc);
+        if let Some((f, end)) = from {
+            self.cached_fn_range = Some((f.address, end));
+        }
+
+        // Only a resolved cross-function jump is a real tail call; if either
+        // endpoint is unresolved, treat it as an ordinary jump (no mutation),
+        // matching the doc comment and this PR's stance against spurious
+        // pop+push in unsymbolized code.
+        if let (Some((f, _)), Some(t)) = (from, self.symbols.lookup(log.next_pc)) {
+            if f.address != t.address {
+                self.pop();
+                self.push(log.next_pc);
+            }
+        }
     }
 
     /// Write the folded stack output to a writer.

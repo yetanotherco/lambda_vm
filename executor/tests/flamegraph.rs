@@ -779,6 +779,44 @@ fn test_flamegraph_dst0_jump_with_unresolved_address_is_not_a_tail_call() {
     assert_eq!(lines, vec!["main 2"]);
 }
 
+#[test]
+fn test_flamegraph_cached_range_respects_nested_symbol_boundary() {
+    // `inner` (0x1050, size 50) is nested inside `outer` (0x1000, size 200).
+    // The tail-call fast-path caches outer's range, but that range must be
+    // capped at inner's start (0x1050), not outer.address+outer.size — else a
+    // dst=0 jump from outer into inner would be swallowed as "intra-outer" and
+    // the genuine cross-function tail call would be lost. Regression guard for
+    // the `lookup_range` effective-end cap.
+    let symbols = make_symbol_table(vec![("outer", 0x1000, 200), ("inner", 0x1050, 50)]);
+    let mut generator = FlamegraphGenerator::new(symbols, 0x1000);
+
+    let instructions = make_instructions(vec![
+        (0x1004, Instruction::JumpAndLink { dst: 0, offset: 0 }),
+        (0x1010, Instruction::JumpAndLink { dst: 0, offset: 0 }),
+        (0x1050, nop_instruction()),
+    ]);
+
+    // First jump stays inside outer (populates the cache); second jump crosses
+    // into nested inner and must register as a tail call.
+    let logs = vec![
+        mk_log(0x1004, 0x1010),
+        mk_log(0x1010, 0x1050),
+        mk_log(0x1050, 0x1054),
+    ];
+
+    generator.process_logs(&logs, &instructions).unwrap();
+
+    let mut output = Vec::new();
+    generator.write_folded(&mut output).unwrap();
+    let output_str = String::from_utf8(output).unwrap();
+
+    let mut lines: Vec<&str> = output_str.lines().collect();
+    lines.sort();
+    // Two intra-outer instructions under "outer"; the instruction after the
+    // tail call charged to "outer;inner" — proving the boundary jump mutated.
+    assert_eq!(lines, vec!["outer 2", "outer;inner 1"]);
+}
+
 // ============================================================================
 // Trie-fold correctness
 // ============================================================================
