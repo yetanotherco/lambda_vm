@@ -345,37 +345,26 @@ pub fn drive_with_flamegraph(
     Ok(total_cycles)
 }
 
-/// Options for [`run_with_flamegraph`].
-#[derive(Debug, Clone, Copy, Default)]
-pub struct FlamegraphRunOptions {
-    /// Stop once at least this many cycles have been processed. `None` runs
-    /// to completion.
-    pub cycle_budget: Option<u64>,
-}
-
 /// Reusable execute+flamegraph path: build the `SymbolTable`, construct the
 /// `Executor`, and drive it via [`drive_with_flamegraph`]. This is what the
 /// CLI's `execute --flamegraph` path and any test/caller should use instead
 /// of hand-rolling the same `SymbolTable`/`Executor`/drive-loop wiring.
 ///
-/// `on_chunk` is forwarded to `drive_with_flamegraph` for periodic partial
-/// persistence; pass `|_, _| {}` if not needed.
+/// `cycle_budget` is forwarded to [`drive_with_flamegraph`]; `on_chunk` is
+/// forwarded for periodic partial persistence (pass `|_, _| {}` if not
+/// needed).
 pub fn run_with_flamegraph(
     elf_bytes: &[u8],
     program: &Elf,
     private_inputs: Vec<u8>,
-    options: FlamegraphRunOptions,
+    cycle_budget: Option<u64>,
     on_chunk: impl FnMut(u64, &FlamegraphGenerator),
 ) -> Result<(FlamegraphGenerator, u64), FlamegraphDriveError> {
     let symbols = SymbolTable::parse(elf_bytes);
     let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
     let mut executor = Executor::new(program, private_inputs)?;
-    let total_cycles = drive_with_flamegraph(
-        &mut executor,
-        &mut generator,
-        options.cycle_budget,
-        on_chunk,
-    )?;
+    let total_cycles =
+        drive_with_flamegraph(&mut executor, &mut generator, cycle_budget, on_chunk)?;
     Ok((generator, total_cycles))
 }
 

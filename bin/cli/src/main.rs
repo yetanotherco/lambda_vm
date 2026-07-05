@@ -363,7 +363,7 @@ fn cmd_execute(
             &elf_data,
             &program,
             private_inputs,
-            executor::flamegraph::FlamegraphRunOptions { cycle_budget },
+            cycle_budget,
             |total_cycles, generator| {
                 let Some(threshold) = next_checkpoint else {
                     return;
