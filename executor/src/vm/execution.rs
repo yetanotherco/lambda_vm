@@ -28,7 +28,7 @@ pub struct ExecutionResult {
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
-const CHUNK_SIZE: usize = 100_000;
+pub const CHUNK_SIZE: usize = 100_000;
 
 /// Result of executing one continuation epoch: the logs produced during the
 /// epoch and the VM state at the epoch boundary. The boundary state is the

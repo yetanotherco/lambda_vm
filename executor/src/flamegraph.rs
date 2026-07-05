@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::{Elf, SymbolTable};
-use crate::vm::execution::{Executor, ExecutorError, InstructionCache};
+use crate::vm::execution::{Executor, ExecutorError, InstructionCache, CHUNK_SIZE};
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
 
@@ -305,9 +305,10 @@ impl FlamegraphGenerator {
 /// cycles) without reimplementing the drive loop. Returns the total number
 /// of cycles processed.
 ///
-/// `cycle_budget` of `None` runs to completion; `Some(n)` stops once at
-/// least `n` cycles have been processed (the last chunk may overshoot
-/// slightly, since chunks aren't split mid-way).
+/// `cycle_budget` of `None` runs to completion; `Some(n)` stops at exactly
+/// `n` cycles: the final chunk's cycle limit is capped to the cycles still
+/// owed, so the loop neither overshoots nor runs (and discards) a whole extra
+/// chunk past the budget.
 pub fn drive_with_flamegraph(
     executor: &mut Executor,
     generator: &mut FlamegraphGenerator,
@@ -322,7 +323,17 @@ pub fn drive_with_flamegraph(
     let instructions = executor.instructions.clone();
 
     let mut total_cycles: u64 = 0;
-    while let Some(logs) = executor.resume()? {
+    loop {
+        // Cap the final chunk to the cycles still owed against the budget so we
+        // stop at exactly `cycle_budget`; a full `CHUNK_SIZE` otherwise. (The
+        // cap only shrinks the limit, so normal chunks are unaffected and we
+        // never buffer more than one chunk of logs.)
+        let limit = cycle_budget
+            .map(|budget| ((budget - total_cycles) as usize).min(CHUNK_SIZE))
+            .unwrap_or(CHUNK_SIZE);
+        let Some(logs) = executor.resume_with_limit(limit)? else {
+            break;
+        };
         total_cycles += logs.len() as u64;
         generator.process_logs(logs, &instructions)?;
         on_chunk(total_cycles, generator);
