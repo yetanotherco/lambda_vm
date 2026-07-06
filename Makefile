@@ -2,7 +2,8 @@
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -287,10 +288,31 @@ test-math-cuda:
 	cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
-# Asserts every R1/R2/R3 GPU counter fired on a real prove.
+# Asserts the R1-R4 GPU dispatch counters fired on a real prove.
 test-cuda-integration:
 	cargo test -p lambda-vm-prover --release --features cuda \
 	    --test cuda_path_integration -- --ignored --nocapture
+
+# GPU error-path coverage (requires NVIDIA GPU + nvcc).
+# Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
+test-cuda-fallback:
+	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+
+# The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
+# GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
+# GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
+# to stark; crypto/ecsm build without it (they have no GPU path).
+test-prover-cuda:
+	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	    --features lambda-vm-prover/cuda -- --test-threads=1
+
+# The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
+# NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
+# comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
+test-prover-comprehensive-cuda:
+	cargo test --release -p lambda-vm-prover --features cuda \
+	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:

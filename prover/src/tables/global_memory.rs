@@ -8,10 +8,17 @@
 //! touched it). Untouched bytes send and receive the identical token, so they
 //! cancel — exactly as PAGE's init/fini bookend does on the epoch-local bus.
 //!
-//! Because the genesis value lives in a PREPROCESSED column (OFFSET + INIT,
-//! byte-for-byte identical to PAGE's), the verifier recomputes the same
-//! commitment from the ELF via [`page::compute_precomputed_commitment`]. This
-//! binds the program's initial memory to the ELF binary.
+//! For ELF/runtime pages the genesis value lives in a PREPROCESSED column (OFFSET +
+//! INIT, byte-for-byte identical to PAGE's), so the verifier recomputes the same
+//! commitment from the ELF via [`page::compute_precomputed_commitment`]. This binds
+//! the program's initial memory to the ELF binary.
+//!
+//! Private-input pages are the exception: the AIR is built NON-preprocessed (see
+//! `continuation::global_memory_air`), so INIT is a committed main-trace column the
+//! verifier never recomputes from the ELF — the raw private input is neither bundled nor
+//! reconstructed by the verifier, and correctness is enforced by the GlobalMemory bus,
+//! exactly as the monolithic PAGE does. (This is not zero-knowledge: the committed column
+//! is still opened at STARK query positions; it is not a cryptographic hiding guarantee.)
 //!
 //! ## Columns
 //!
