@@ -8,9 +8,13 @@ name: GPU Tests (merge queue)
 # runner; all GPU work happens on the rented box (provisioned by the template onstart). The box
 # is ALWAYS destroyed at the end.
 #
-# Triggered on `merge_group` (one rental per merge, not per push) + `workflow_dispatch` for
-# manual runs. To gate merges, add the job name `gpu-tests` to the branch-protection required
-# status checks for `main` (GitHub UI).
+# The GPU suite runs on `merge_group` (one rental per merge, not per push) + `workflow_dispatch`
+# for manual runs. The `pull_request` trigger exists ONLY so the job reports on PRs: it is
+# skipped there (no rental, no cost), and GitHub counts a skipped job as satisfying a required
+# status check. Without it, `gpu-tests` never reports on the PR head and the PR is stuck at
+# "Expected — Waiting for status to be reported", unable to enter the merge queue. To gate
+# merges, add the job name `gpu-tests` to the branch-protection required status checks for
+# `main` (GitHub UI).
 #
 # Requires repo secrets:
 #   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
@@ -18,6 +22,9 @@ name: GPU Tests (merge queue)
 
 on:
   merge_group:
+  # Reports the check as Skipped on PRs (see the job-level `if`) so the required check is
+  # satisfied and the PR can enter the merge queue.
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -45,6 +52,9 @@ env:
 jobs:
   gpu-tests:
     runs-on: ubuntu-latest
+    # Skip on PRs (reports as Skipped = required check satisfied, no GPU rental); run for
+    # real on merge_group and manual dispatch.
+    if: github.event_name != 'pull_request'
     # Provisioning + cuda builds + 5 test groups; the prover suite (single-threaded, real
     # ELF proves) dominates. Generous ceiling; teardown still always destroys the box.
     timeout-minutes: 240
