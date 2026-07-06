@@ -104,7 +104,7 @@ def main():
         frame_names = []
         for addr in stack:
             frames = resolved.get(addr)
-            if frames:
+            if frames and frames[0][0] != "??":
                 for function, location in reversed(frames):
                     frame_names.append(f"{function} ({location})")
             else:
