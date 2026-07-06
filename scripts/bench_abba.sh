@@ -19,7 +19,8 @@
 #   4. Reports BOTH a paired-t 95% CI (sensitive to outliers) AND a robust
 #      median + Wilcoxon signed-rank result (shrugs off transient slow runs).
 #
-# CONVENTION: every reported number is an IMPROVEMENT, positive = PR FASTER.
+# CONVENTION: reported % = (PR - baseline)/baseline, matching the classic /bench.
+# NEGATIVE = PR FASTER (improvement); positive = regression.
 #
 # USAGE:
 #   scripts/bench_abba.sh REF_A [REF_B] [N_PAIRS]
@@ -153,7 +154,7 @@ run_prove() {  # $1=binary -> echoes proving time (s)
   echo "$t"
 }
 
-echo "==> Running $N_PAIRS interleaved pairs  (improvement: + = PR faster)"
+echo "==> Running $N_PAIRS interleaved pairs  (improvement: - = PR faster)"
 printf 'pair,a_time,b_time\n' > "$WORK/pairs.csv"
 for i in $(seq 1 "$N_PAIRS"); do
   if [ $((i % 2)) -eq 1 ]; then          # odd pair: A then B
@@ -162,8 +163,8 @@ for i in $(seq 1 "$N_PAIRS"); do
     b="$(run_prove "$WORK/cli_B")"; a="$(run_prove "$WORK/cli_A")"
   fi
   printf '%d,%s,%s\n' "$i" "$a" "$b" >> "$WORK/pairs.csv"
-  printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (+=faster)\n' \
-    "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($b-$a)/$b*100}")"
+  printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
+    "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
 done
 
 # --- 4. Paired t-test + robust median/Wilcoxon ---
@@ -174,8 +175,8 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 A = [float(r['a_time']) for r in rows]   # PR
 B = [float(r['b_time']) for r in rows]   # baseline
 n = len(A)
-# per-pair improvement: positive => PR (A) faster than baseline (B)
-d = [(b - a) / b * 100.0 for a, b in zip(A, B)]
+# per-pair delta = (PR - baseline)/baseline: negative => PR (A) faster than baseline (B)
+d = [(a - b) / b * 100.0 for a, b in zip(A, B)]
 
 # ---- parametric: paired t ----
 mean = sum(d) / n
@@ -253,7 +254,7 @@ slope = (sum((i - mi) * (nrm[i] - mn) for i in range(N)) / denom) if denom else 
 half = N // 2
 drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
 
-print("\n=== ABBA paired result  (improvement: + = PR faster) ===")
+print("\n=== ABBA paired result  (improvement: - = PR faster) ===")
 print(f"  pairs: {n}   mean A (PR): {sum(A)/n:.3f}s   mean B (base): {sum(B)/n:.3f}s")
 print()
 print(f"  [parametric] paired-t   mean {mean:+.2f}%   sd {sd:.2f}%   se {se:.2f}%")
@@ -266,11 +267,11 @@ print(f"  run-to-run jitter:    A CV {cvA:.2f}%   B CV {cvB:.2f}%        (lower 
 print(f"  within-session drift: {slope * N:+.2f}% over the run, 1st->2nd half {drift_shift:+.2f}%")
 print(f"    (jitter -> Tier-1 cached gate floor; drift -> whether the cached baseline can be trusted)")
 print()
-if lo > 0 and p < 0.05:
-    print(f"  VERDICT: REAL IMPROVEMENT - PR faster by ~{mean:.2f}% (t-CI and Wilcoxon agree)")
-elif hi < 0 and p < 0.05:
-    print(f"  VERDICT: REAL REGRESSION - PR slower by ~{-mean:.2f}% (t-CI and Wilcoxon agree)")
-elif (lo > 0) != (p < 0.05):
+if hi < 0 and p < 0.05:
+    print(f"  VERDICT: REAL IMPROVEMENT - PR faster by ~{-mean:.2f}% (t-CI and Wilcoxon agree)")
+elif lo > 0 and p < 0.05:
+    print(f"  VERDICT: REAL REGRESSION - PR slower by ~{mean:.2f}% (t-CI and Wilcoxon agree)")
+elif (hi < 0) != (p < 0.05):
     print(f"  VERDICT: BORDERLINE - parametric and robust disagree; suspect outlier pair(s).")
     print(f"           Trust the median ({med:+.2f}%); add pairs or inspect the per-pair list.")
 else:

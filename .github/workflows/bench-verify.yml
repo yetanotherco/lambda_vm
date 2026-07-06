@@ -97,7 +97,7 @@ jobs:
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/verify_result.txt') || read('/tmp/verify_out.txt');
               body += res + '\n';
-              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. + = PR faster. ';
+              body += '\n<sub>Drift-free interleaved A/B/B/A measurement. - = PR faster. ';
               body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
             } else {
               const tail = read('/tmp/verify_out.txt').split('\n').slice(-30).join('\n');

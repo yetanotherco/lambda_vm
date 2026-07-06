@@ -426,7 +426,7 @@ jobs:
             if (process.env.OUTCOME === 'success') {
               const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
               body += '```\n' + res + '\n```\n';
-              body += '\n<sub>+ = PR faster. Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+              body += '\n<sub>- = PR faster. Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
             } else {
               const tail = read(`${tmp}/abba_out.txt`).split('\n').slice(-30).join('\n');
               body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
