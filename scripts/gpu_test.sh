@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+#
+# gpu_test.sh — run the CUDA-only test groups on a GPU box.
+#
+# Exercises the CUDA path, which CPU CI can't (GitHub runners have no GPU):
+#   1. math-cuda kernel parity         (make test-math-cuda)
+#   2. end-to-end GPU dispatch + proof  (make test-cuda-integration)
+#   3. GPU error-path / CPU fallback    (make test-cuda-fallback)
+#   4. prover/stark/crypto/ecsm suite   (make test-prover-cuda) — CPU CI's prover tests on GPU
+#   5. comprehensive all-instructions   (make test-prover-comprehensive-cuda)
+#
+# Runs on the rented Vast box from the gpu-tests.yml merge-queue workflow. All groups
+# run even if one fails (so the log shows every failure); the script exits non-zero if ANY
+# group failed, which fails the workflow job and blocks the merge.
+#
+# Env:
+#   CUDARC_PIN   cudarc CUDA-version feature to pin (default cuda-12080). See the sed below.
+#   SYSROOT_DIR  rv64 sysroot (default /opt/lambda-vm-sysroot, provisioned by the template).
+
+set -euo pipefail
+
+CUDARC_PIN="${CUDARC_PIN:-cuda-12080}"
+export SYSROOT_DIR="${SYSROOT_DIR:-/opt/lambda-vm-sysroot}"
+
+log() { printf '\n=== %s ===\n' "$*"; }
+
+# --- GPU toolchain sanity (fail loudly rather than silently falling back to CPU) ---
+log "GPU toolchain"
+if ! command -v nvcc >/dev/null 2>&1; then
+    for d in /usr/local/cuda/bin /usr/local/cuda-*/bin; do
+        [ -x "$d/nvcc" ] && export PATH="$d:$PATH" && break
+    done
+fi
+command -v nvcc >/dev/null 2>&1 || { echo "ERROR: nvcc not found — CUDA toolkit missing" >&2; exit 1; }
+nvcc --version | tail -n 2
+# Full nvidia-smi up front: GPU model, driver + CUDA runtime version, memory — for the log.
+nvidia-smi
+nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
+
+# --- Pin cudarc so it binds a fixed driver-symbol set --------------------------
+# crypto/math-cuda/Cargo.toml uses `cuda-version-from-build-system` + `fallback-latest`;
+# when detection falls back to "latest", cudarc requests symbols some boxes' driver doesn't
+# export (e.g. cuDevSmResourceSplit / cuCtxGetDevice_v2) -> runtime panic. Pinning to a fixed,
+# conservative CUDA version binds a known driver-symbol set instead. (This is cudarc's
+# host-side driver-API floor — independent of the PTX/driver version the offer filter targets.)
+log "pinning cudarc to $CUDARC_PIN"
+# Guard the sed anchors: if math-cuda's cudarc features are ever renamed/reformatted, a silent
+# no-op here would bring the fallback-latest driver-symbol panic back with a confusing signature.
+for anchor in '"cuda-version-from-build-system"' '"fallback-latest"'; do
+    grep -qF "$anchor" crypto/math-cuda/Cargo.toml \
+        || { echo "ERROR: sed anchor $anchor not found in crypto/math-cuda/Cargo.toml — update this script's cudarc pin" >&2; exit 1; }
+done
+# Restore the tracked file on exit so a manual run on a dev box doesn't leave the tree dirty
+# (CI doesn't need this — the workflow re-checks-out before every run — but it's harmless there).
+CUDARC_TOML_BACKUP="$(mktemp)"
+cp crypto/math-cuda/Cargo.toml "$CUDARC_TOML_BACKUP"
+trap 'cp "$CUDARC_TOML_BACKUP" crypto/math-cuda/Cargo.toml; rm -f "$CUDARC_TOML_BACKUP"' EXIT
+sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
+    crypto/math-cuda/Cargo.toml
+
+# --- Build the guest ELFs the tests prove ---------------------------------------
+# math-cuda parity needs none; cuda_path_integration / cuda_fallback prove an asm ELF; the
+# prover suite (Groups 4 & 5) proves asm AND rust guests. Build both up front.
+log "compiling guest programs (asm + rust)"
+make compile-programs-asm
+make compile-programs-rust
+
+# --- Run the CUDA test groups via the Makefile targets --------------------------
+fail=0
+run() {  # $1 = make target
+    log "make $1"
+    if ! make "$1"; then
+        echo "::error::GPU test group failed: $1"
+        fail=1
+    fi
+}
+run test-math-cuda                  # Group 1: kernel parity
+run test-cuda-integration           # Group 2: end-to-end GPU dispatch + proof verifies
+run test-cuda-fallback              # Group 3: GPU error -> CPU fallback still verifies
+run test-prover-cuda                # Group 4: prover/stark/crypto/ecsm suite on the GPU path
+run test-prover-comprehensive-cuda  # Group 5: comprehensive all-instructions prove on GPU
+
+if [ "$fail" -ne 0 ]; then
+    log "FAILED — one or more GPU test groups failed"
+    exit 1
+fi
+log "all GPU test groups passed"

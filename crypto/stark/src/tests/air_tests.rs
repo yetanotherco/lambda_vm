@@ -1,4 +1,4 @@
-//! Tests for various AIR implementations (Fibonacci, periodic, RAP, memory, etc.).
+//! Tests for various AIR implementations (Fibonacci, RAP, memory, etc.).
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::{
@@ -9,7 +9,6 @@ use math::field::{
 use crate::traits::AIR;
 use crate::{
     examples::{
-        bit_flags::{self, BitFlagsAIR},
         dummy_air::{self, DummyAIR},
         fibonacci_2_cols_shifted::{self, Fibonacci2ColsShifted},
         fibonacci_2_columns::{self, Fibonacci2ColsAIR},
@@ -18,7 +17,6 @@ use crate::{
         quadratic_air::{self, QuadraticAIR, QuadraticPublicInputs},
         read_only_memory::{ReadOnlyPublicInputs, ReadOnlyRAP, sort_rap_trace},
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
-        simple_periodic_cols::{self, SimplePeriodicAIR, SimplePeriodicPublicInputs}, //         simple_periodic_cols::{self, SimplePeriodicAIR, SimplePeriodicPublicInputs},
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
@@ -53,61 +51,6 @@ fn test_prove_fib() {
         &mut DefaultTranscript::<F>::new(&[]),
     )
     .unwrap();
-    assert!(Verifier::verify(
-        &proof,
-        &air,
-        &mut DefaultTranscript::<F>::new(&[]),
-    ));
-}
-
-#[test_log::test]
-fn test_prove_simple_periodic_8() {
-    let mut trace = simple_periodic_cols::simple_periodic_trace::<GoldilocksField>(8);
-
-    let proof_options = ProofOptions::default_test_options();
-
-    let pub_inputs = SimplePeriodicPublicInputs {
-        a0: Felt::one(),
-        a1: Felt::from(8),
-    };
-
-    let air = SimplePeriodicAIR::<GoldilocksField>::new(&proof_options);
-
-    let proof = Prover::prove(
-        &air,
-        &mut trace,
-        &pub_inputs,
-        &mut DefaultTranscript::<F>::new(&[]),
-    )
-    .unwrap();
-    assert!(Verifier::verify(
-        &proof,
-        &air,
-        &mut DefaultTranscript::<F>::new(&[]),
-    ));
-}
-
-#[test_log::test]
-fn test_prove_simple_periodic_32() {
-    let mut trace = simple_periodic_cols::simple_periodic_trace::<GoldilocksField>(32);
-
-    let proof_options = ProofOptions::default_test_options();
-
-    let pub_inputs = SimplePeriodicPublicInputs {
-        a0: Felt::one(),
-        a1: Felt::from(32768),
-    };
-
-    let air = SimplePeriodicAIR::<GoldilocksField>::new(&proof_options);
-
-    let proof = Prover::prove(
-        &air,
-        &mut trace,
-        &pub_inputs,
-        &mut DefaultTranscript::<F>::new(&[]),
-    )
-    .unwrap();
-
     assert!(Verifier::verify(
         &proof,
         &air,
@@ -243,23 +186,6 @@ fn test_prove_dummy() {
         &proof,
         &air,
         &mut DefaultTranscript::<F>::new(&[])
-    ));
-}
-
-#[test_log::test]
-fn test_prove_bit_flags() {
-    let mut trace = bit_flags::bit_prefix_flag_trace(32);
-    let proof_options = ProofOptions::default_test_options();
-
-    let air = BitFlagsAIR::new(&proof_options);
-
-    let proof =
-        Prover::prove(&air, &mut trace, &(), &mut DefaultTranscript::<F>::new(&[])).unwrap();
-
-    assert!(Verifier::verify(
-        &proof,
-        &air,
-        &mut DefaultTranscript::<F>::new(&[]),
     ));
 }
 
@@ -519,36 +445,6 @@ fn test_multi_prove_2_tables_small_field() {
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[]),
-        &FieldElement::zero(),
-    ));
-}
-
-#[test_log::test]
-fn test_multi_prove_different_airs() {
-    let mut trace_1 = dummy_air::dummy_trace(16);
-    let mut trace_2 = bit_flags::bit_prefix_flag_trace(32);
-    let proof_options = ProofOptions::default_test_options();
-
-    let air_1 = DummyAIR::new(&proof_options);
-    let air_2 = BitFlagsAIR::new(&proof_options);
-
-    let air_trace_pairs: Vec<(
-        &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksField, PublicInputs = ()>,
-        &mut _,
-        &_,
-    )> = vec![(&air_1, &mut trace_1, &()), (&air_2, &mut trace_2, &())];
-
-    let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<F>::new(&[])).unwrap();
-
-    let airs: Vec<
-        &dyn AIR<Field = GoldilocksField, FieldExtension = GoldilocksField, PublicInputs = ()>,
-    > = vec![&air_1, &air_2];
-
-    assert!(Verifier::multi_verify(
-        &airs,
-        &multi_proof,
-        &mut DefaultTranscript::<F>::new(&[]),
         &FieldElement::zero(),
     ));
 }

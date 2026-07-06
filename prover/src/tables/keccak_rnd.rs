@@ -29,7 +29,7 @@
 //! produces a single-bit carry, range-checked via IS_BIT polynomial constraints.
 
 use executor::vm::instruction::execution::{KECCAK_RC, KECCAK_RHO};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
@@ -634,7 +634,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
     // byte pairs (z=2i, z=2i+1) into ARE_BYTES interactions per the
     // implementation guidance in spec/is_byte.typ.
-    // Cxz_right uses IS_BIT polynomial constraints (see create_constraints).
+    // Cxz_right uses IS_BIT polynomial constraints (see `KeccakRndConstraints`).
     for x in 0..5 {
         for i in 0..4 {
             interactions.push(BusInteraction::sender(
@@ -897,38 +897,29 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// KECCAK_RND polynomial constraints: 20 IS_BIT(μ; Cxz_right) constraints.
-///
-/// Per spec d75944ee, `Cxz_right` is typed `[Bit, 4], 5` and range-checked via
-/// IS_BIT polynomial constraints (kind="template", cond="μ"), not lookups:
-///   μ * Cxz_right[x][hw] * (1 - Cxz_right[x][hw]) = 0
-///
-/// - pi is a spec [[variables.virtual]] inlined in chi bus interactions.
-/// - rnc/rbc are spec [[variables.constant]] inlined as compile-time constants.
-///
-/// All other checks (XOR, AND, HWSL, ARE_BYTES, IS_HALF, KECCAK, KECCAK_RC) are
-/// enforced via bus interactions against the BITWISE/KECCAK_RC chips.
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    use crate::constraints::templates::IsBitConstraint;
+/// The KECCAK round table's 20 transition constraints as a single
+/// [`ConstraintSet`]: for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
+/// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
+pub struct KeccakRndConstraints;
 
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(20);
-    let mut idx = constraint_idx_start;
-    for x in 0..5 {
-        for hw in 0..4 {
-            constraints
-                .push(IsBitConstraint::new(cols::MU, cols::cxz_right_bit(x, hw), idx).boxed());
-            idx += 1;
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
+    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3.
+    fn max_degree(&self) -> usize {
+        3
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        use crate::constraints::templates::emit_is_bit;
+
+        let mut idx = 0;
+        for x in 0..5 {
+            for hw in 0..4 {
+                emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), Some(cols::MU));
+                idx += 1;
+            }
         }
     }
-    (constraints, idx)
 }
