@@ -20,6 +20,8 @@ pub mod gpu_lde;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+#[cfg(feature = "cuda")]
+pub mod logup_gpu;
 pub mod lookup;
 pub(crate) mod par;
 pub mod profile_markers;
