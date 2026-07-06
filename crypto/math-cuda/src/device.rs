@@ -265,9 +265,11 @@ impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
-        // per alloc and serialises under the context lock. We never share
-        // slices across streams (every call scopes its own buffers and syncs
-        // before returning), so the tracking is pure overhead. Disable it.
+        // per alloc and serialises under the context lock. Slices are only
+        // shared across streams after the producing stream has been host-
+        // synchronised (e.g. the retained trace snapshot and the resident
+        // LogUp aux buffer; every producer syncs before its handle escapes),
+        // so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
 
         // Retain freed device memory in the stream ordered pool for reuse.

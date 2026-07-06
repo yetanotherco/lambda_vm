@@ -84,7 +84,9 @@ pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
 }
 
-/// LogUp aux-build term-column GPU path attempts (one per table that took it).
+/// Successful LogUp aux-build GPU dispatches (one per table that took either
+/// the resident or the term-column path; failed attempts fall back to CPU and
+/// are not counted).
 pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_logup_calls() -> u64 {
     GPU_LOGUP_CALLS.load(Ordering::Relaxed)
@@ -1108,12 +1110,10 @@ unsafe fn ext3_slice_to_u64<E: IsField>(col: &[FieldElement<E>]) -> &[u64] {
     unsafe { from_raw_parts(ptr, len) }
 }
 
-/// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated
-/// `Vec<FieldElement<E>>` of length `n`. Caller must have established
-/// `E == Ext3`.
 /// Like [`try_expand_leaf_and_tree_ext3_row_major_keep`] but the aux columns are
 /// already resident on device (from the GPU LogUp aux build) — no host upload.
-/// Consumes the resident buffer via the device-input LDE.
+/// The resident buffer is only borrowed: the device-input LDE copies it
+/// device-to-device into its own scratch, so `ra` stays valid afterwards.
 pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
     ra: &math_cuda::logup::ResidentAux,
     blowup_factor: usize,
@@ -1150,6 +1150,10 @@ where
 
     let lde_out: Vec<FieldElement<E>> = unsafe {
         let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
         Vec::from_raw_parts(
             v.as_mut_ptr() as *mut FieldElement<E>,
             v.len() / 3,
@@ -1161,6 +1165,9 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated
+/// `Vec<FieldElement<E>>` of length `n`. Caller must have established
+/// `E == Ext3`.
 pub(crate) fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
 where
     E: IsField + 'static,

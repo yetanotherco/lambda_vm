@@ -115,7 +115,7 @@ extern "C" __global__ void logup_term_ext3(
 // Accumulated column (K4): running sum of the term columns, on device.
 //   row_sum[i] = sum over all term columns of term[col][i]
 //   S = inclusive prefix scan of row_sum ;  L = S[n-1] ;  offset = L / N
-//   acc[i] = S[i] - (i+1) * offset          (matches build_accumulated_column)
+//   acc[i] = S[i] - (i+1) * offset          (matches build_accumulated_column_from_terms)
 // Additive 3-phase Hillis-Steele scan (mirrors inverse.cu, add not mul).
 // ===========================================================================
 

@@ -379,17 +379,6 @@ fn launch_row_to_col_major(
     Ok(dst)
 }
 
-/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
-///
-/// `total_cols` is the number of base-field columns in the row-major layout:
-/// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
-/// components are just three adjacent base-field columns, so the same row-major
-/// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
-///
-/// Single H2D, row-major NTT, single D2H — no CPU-side extract or transpose.
-/// Returns (merkle_nodes, column-major device buffer, row-major LDE Vec). The
-/// buffer is transposed to column-major (as required by the downstream GPU
-/// kernels DEEP/barycentric); callers wrap it in the appropriate LDE handle.
 /// Row-major LDE input: either a host slice (uploaded) or an already-resident
 /// device buffer (copied device-to-device, no PCIe upload).
 enum InnerInput<'a> {
@@ -397,6 +386,19 @@ enum InnerInput<'a> {
     Dev(&'a CudaSlice<u64>),
 }
 
+/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
+///
+/// `total_cols` is the number of base-field columns in the row-major layout:
+/// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
+/// components are just three adjacent base-field columns, so the same row-major
+/// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
+///
+/// Single H2D (or D2D), row-major NTT, single D2H — no CPU-side extract or
+/// transpose. Returns (merkle_nodes, column-major device buffer, row-major LDE
+/// Vec, optional trace-domain column-major snapshot — `Some` iff
+/// `retain_trace_col_major`). The buffer is transposed to column-major (as
+/// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
+/// the appropriate LDE handle.
 #[allow(clippy::type_complexity)]
 fn coset_lde_row_major_inner(
     input: InnerInput,

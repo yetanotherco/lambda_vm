@@ -114,7 +114,7 @@ const LOGUP_CHUNK_SIZE: usize = 1024;
 /// Returns `(num_committed_pairs, absorbed_count)` where:
 /// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
 /// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
-fn split_interactions(num_interactions: usize) -> (usize, usize) {
+pub(crate) fn split_interactions(num_interactions: usize) -> (usize, usize) {
     if num_interactions <= 2 {
         (0, num_interactions)
     } else if num_interactions % 2 == 1 {

@@ -205,6 +205,14 @@ where
             .map(|r| (r.buf.as_ref(), r.rows))
     }
 
+    /// Drop the retained device-resident main trace. Its only consumer is the
+    /// aux build, so the prover clears it right after that pass to reclaim the
+    /// snapshot's VRAM before the aux-commit + DEEP/FRI peak.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_trace_dev(&mut self) {
+        self.main_trace_dev = None;
+    }
+
     pub fn num_steps(&self) -> usize {
         debug_assert!(self.main_table.height.is_multiple_of(self.step_size));
         self.main_table.height / self.step_size
