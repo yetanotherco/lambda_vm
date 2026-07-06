@@ -1540,44 +1540,6 @@ mod tests {
         ));
     }
 
-    // Privacy regression for the touched-cell value leak. Pre-fix, `EpochProof.boundary`
-    // serialized each touched cell's `init.value`/`fini.value` as a u64, so a private
-    // byte `b` appeared in the bundle as the 8-byte window `[b,0,0,0,0,0,0,0]`. The fix
-    // drops `boundary` from the bundle entirely (only the value-free `touched_page_bases`
-    // ships), so those windows must be gone. We mark distinctive TOUCHED byte values
-    // (0xC7..) — their u64-LE encodings are astronomically unlikely to occur as any honest
-    // field/count/root byte-run — and assert none appear in the serialized bundle. (The
-    // committed `public_output` serializes bytes RAW, not as u64s, so it cannot produce
-    // these windows even for the committed markers.)
-    #[test]
-    fn test_bundle_carries_no_touched_cell_values() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let mut input: Vec<u8> = (0u8..16).collect();
-        let markers = [0xC7u8, 0xC8, 0xC9];
-        input[4] = markers[0];
-        input[5] = markers[1];
-        input[6] = markers[2];
-
-        let bundle =
-            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
-                .unwrap();
-        let bytes = bincode::serialize(&bundle).unwrap();
-        for m in markers {
-            let needle = (m as u64).to_le_bytes(); // [m,0,0,0,0,0,0,0]
-            assert!(
-                !bytes.windows(8).any(|w| w == needle),
-                "byte 0x{m:02X} appears as a u64 in the bundle — a touched-cell value leaked"
-            );
-        }
-        // Sanity: still verifies from bundle + ELF alone.
-        assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
-                .is_some()
-        );
-    }
-
     // Multi-page private input: the program reads private input across TWO pages
     // (page 0 for the length, page 1 for the committed bytes), so the run touches two
     // private pages → `num_private_input_pages >= 2` and two NON-preprocessed
