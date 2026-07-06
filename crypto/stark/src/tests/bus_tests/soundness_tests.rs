@@ -3,6 +3,7 @@
 //! These tests verify that the verifier correctly rejects proofs that violate
 //! the bus balance invariant.
 
+use crate::constraints::builder::EmptyConstraints;
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 use math::field::{
@@ -1310,7 +1311,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
 
     fn sender_air_direct(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Sender uses Direct: 2 separate elements
@@ -1321,12 +1322,18 @@ fn test_packing_mismatch_direct_vs_word2l() {
                 ),
             ],
         };
-        AirWithBuses::new(3, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            3,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     fn receiver_air_word2l(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver uses Word2L: combines 2 columns into 1 element
@@ -1343,7 +1350,7 @@ fn test_packing_mismatch_direct_vs_word2l() {
             auxiliary_trace_build_data,
             proof_options,
             1,
-            vec![],
+            EmptyConstraints,
         )
     }
 
@@ -1415,7 +1422,7 @@ fn test_packing_mismatch_element_count() {
 
     fn sender_air_3_direct(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Sender uses 3 Direct elements: produces [col1, col2, col3]
@@ -1427,12 +1434,18 @@ fn test_packing_mismatch_element_count() {
                 ),
             ],
         };
-        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            4,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     fn receiver_air_word2l_direct(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Receiver uses Word2L (combines cols 1,2 into 1 element) + Direct (col 3)
@@ -1448,7 +1461,13 @@ fn test_packing_mismatch_element_count() {
                 ),
             ],
         };
-        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            4,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     let mut sender_trace = TraceTable::from_columns_main(
@@ -1517,7 +1536,7 @@ fn test_packing_mismatch_shift_constant() {
 
     fn sender_air_word4l(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Word4L: b0 + 2^8*b1 + 2^16*b2 + 2^24*b3
@@ -1528,12 +1547,18 @@ fn test_packing_mismatch_shift_constant() {
                 ),
             ],
         };
-        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            5,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     fn receiver_air_dwordhl(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHL: [h0 + 2^16*h1, h2 + 2^16*h3] - different shift pattern!
@@ -1544,7 +1569,13 @@ fn test_packing_mismatch_shift_constant() {
                 ),
             ],
         };
-        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            5,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     // Use small values so the different shift formulas give clearly different results
@@ -1618,7 +1649,7 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
 
     fn sender_air_dwordhhw(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHHW: [Word, Half, Half] at columns 1, 2, 3
@@ -1629,12 +1660,18 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
                 ),
             ],
         };
-        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            4,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     fn receiver_air_dwordwhh(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordWHH: [Half, Half, Word] at columns 1, 2, 3
@@ -1645,7 +1682,13 @@ fn test_compound_mismatch_dwordhhw_vs_dwordwhh() {
                 ),
             ],
         };
-        AirWithBuses::new(4, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            4,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     // Trace with values that expose the layout difference
@@ -1717,7 +1760,7 @@ fn test_compound_equals_primitive_expansion() {
 
     fn sender_air_compound(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // DWordHL (compound): 4 halves at columns 1-4
@@ -1728,12 +1771,18 @@ fn test_compound_equals_primitive_expansion() {
                 ),
             ],
         };
-        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            5,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     fn receiver_air_primitives(
         proof_options: &ProofOptions,
-    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
+    ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
         let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
             interactions: vec![
                 // Equivalent: 2× Word2L at columns 1-2 and 3-4
@@ -1744,7 +1793,13 @@ fn test_compound_equals_primitive_expansion() {
                 ),
             ],
         };
-        AirWithBuses::new(5, auxiliary_trace_build_data, proof_options, 1, vec![])
+        AirWithBuses::new(
+            5,
+            auxiliary_trace_build_data,
+            proof_options,
+            1,
+            EmptyConstraints,
+        )
     }
 
     let mut sender_trace = TraceTable::from_columns_main(

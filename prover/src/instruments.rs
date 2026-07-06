@@ -87,6 +87,26 @@ pub fn print_report(
             total,
         );
         row_sub("  Aux trace build (parallel)", mp.aux_build, total);
+        row_sub(
+            "    LogUp fingerprint (CPU)",
+            mp.round1_sub.aux_fingerprint,
+            total,
+        );
+        row_sub(
+            "    LogUp batch invert (CPU)",
+            mp.round1_sub.aux_invert,
+            total,
+        );
+        row_sub(
+            "    LogUp term combine (CPU)",
+            mp.round1_sub.aux_term,
+            total,
+        );
+        row_sub(
+            "    LogUp accumulate scan (CPU)",
+            mp.round1_sub.aux_accumulate,
+            total,
+        );
         row_sub("  Aux trace commit", mp.aux_commit, total);
         row_sub(
             "    Aux LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)",

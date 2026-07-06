@@ -26,8 +26,7 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
-    IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -2037,6 +2036,28 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
 
+        // Disk-spill needs the aux columns in the host trace to spill them, so
+        // disable the GPU-resident aux build (it would keep them device-only).
+        #[cfg(all(feature = "cuda", feature = "disk-spill"))]
+        if storage_mode == StorageMode::Disk {
+            for (_, trace, _) in air_trace_pairs.iter_mut() {
+                trace.set_resident_aux_ok(false);
+            }
+        }
+
+        // Thread each table's device-resident trace-domain main columns (kept by
+        // the R1 main LDE) onto its trace so the LogUp aux fingerprint kernel
+        // reads them in place instead of re-uploading ~3 GB. Tables without a GPU
+        // main handle (CPU LDE, preprocessed) fall back to the host upload path.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        for ((_, trace, _), gpu_main) in air_trace_pairs.iter_mut().zip(main_gpu_handles.iter()) {
+            if let Some(handle) = gpu_main
+                && let Some(td) = &handle.trace_dev
+            {
+                trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+            }
+        }
+
         #[cfg(feature = "parallel")]
         let aux_iter = air_trace_pairs.par_iter_mut();
         #[cfg(not(feature = "parallel"))]
@@ -2050,6 +2071,22 @@ pub trait IsStarkProver<
                 }
             })
             .collect();
+
+        // The trace-domain snapshots retained by the R1 main LDE (both Arcs:
+        // trace.main_trace_dev and GpuLdeBase.trace_dev) have exactly one
+        // consumer — the aux build above. Drop them now so the main-trace-sized
+        // device buffers are reclaimed before the aux-commit + DEEP/FRI VRAM
+        // peak instead of living to the end of the proof.
+        #[cfg(feature = "cuda")]
+        {
+            for (_, trace, _) in air_trace_pairs.iter_mut() {
+                trace.clear_main_trace_dev();
+            }
+            for handle in main_gpu_handles.iter_mut().flatten() {
+                handle.trace_dev = None;
+                handle.trace_rows = 0;
+            }
+        }
 
         // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
         #[cfg(feature = "disk-spill")]
@@ -2105,6 +2142,41 @@ pub trait IsStarkProver<
 
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+
+                        // Resident GPU path: aux columns already on device (from
+                        // the resident LogUp aux build) — LDE straight from device
+                        // memory, no upload, no host column extraction. When the
+                        // resident build fired the host aux trace is empty, so a
+                        // device LDE failure is a hard abort, not a fall through to
+                        // the host path below (which would commit a zero aux trace).
+                        #[cfg(feature = "cuda")]
+                        if let Some(ra) = trace.aux_resident() {
+                            #[cfg(feature = "instruments")]
+                            let t_sub = Instant::now();
+                            let (tree, handle, aux_data) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep_dev::<
+                                    Field,
+                                    FieldExtension,
+                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                >(
+                                    ra, domain.blowup_factor, &twiddles.coset_weights
+                                )
+                                .ok_or_else(|| {
+                                    ProvingError::Fft(
+                                        "resident aux LDE failed; host aux trace is empty"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let num_cols = ra.num_aux_cols;
+                            #[cfg(feature = "instruments")]
+                            crate::instruments::accum_r1_aux(t_sub.elapsed(), Duration::ZERO);
+                            let root = tree.root;
+                            return Ok((
+                                Some(TableCommit::plain(tree, root)),
+                                (aux_data, num_cols),
+                                Some(handle),
+                            ));
+                        }
 
                         // Fused GPU path (cuda only): row-major ext3 NTT — single
                         // H2D, no column extraction, no CPU transpose.

@@ -5,7 +5,9 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraintEvaluator,
+        builder::{
+            ConstraintMeta, ConstraintSet, ProverEvalFolder, VerifierEvalFolder, num_base_from_meta,
+        },
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -112,7 +114,7 @@ const LOGUP_CHUNK_SIZE: usize = 1024;
 /// Returns `(num_committed_pairs, absorbed_count)` where:
 /// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
 /// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
-fn split_interactions(num_interactions: usize) -> (usize, usize) {
+pub(crate) fn split_interactions(num_interactions: usize) -> (usize, usize) {
     if num_interactions <= 2 {
         (0, num_interactions)
     } else if num_interactions % 2 == 1 {
@@ -540,8 +542,9 @@ pub enum LinearTerm {
 
 /// A value that contributes to the bus fingerprint.
 ///
-/// Each `BusValue` produces exactly **1 bus element** for the fingerprint.
-/// The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
+/// A `BusValue` produces 1, 2, or 4 bus elements for the fingerprint depending
+/// on its packing (see [`BusValue::num_bus_elements`]); `Linear` always
+/// produces 1. The fingerprint is computed as: `z - (v₀ + α·v₁ + α²·v₂ + ...)`
 /// where each `vᵢ` is a bus element from a `BusValue`.
 #[derive(Debug, Clone)]
 pub enum BusValue {
@@ -589,7 +592,8 @@ impl BusValue {
         BusValue::Linear(terms)
     }
 
-    /// Returns the number of bus elements this value produces (always 1).
+    /// Returns the number of bus elements this value produces: 1, 2, or 4 for
+    /// `Packed` depending on the packing, always 1 for `Linear`.
     pub fn num_bus_elements(&self) -> usize {
         match self {
             BusValue::Packed { packing, .. } => packing.num_bus_elements(),
@@ -801,19 +805,36 @@ impl BusValue {
 // =============================================================================
 
 /// Struct representing an AIR with Lookup. Contains own implementation of boundary constraints and auxiliary trace building
+///
+/// `CS` is the table's [`ConstraintSet`]: its single `eval` body emits the
+/// table's base-field transition constraints, and the framework appends the
+/// LogUp constraints (generated from [`Self::logup`]) after them. One body
+/// serves the compiled prover folder, the verifier folder, and IR capture.
 pub struct AirWithBuses<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
     E: IsField + Send + Sync,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
+    CS: ConstraintSet<F, E>,
 > {
     context: AirContext,
     step_size: usize,
     trace_layout: (usize, usize),
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
-    /// Number of domain (base-field) constraints. These come before LogUp constraints
-    /// in the transition_constraints vec and use the cheaper F×E accumulation path.
-    num_base_constraints: usize,
+    /// The table's single-source constraint set (base-field constraints).
+    constraint_set: CS,
+    /// The LogUp layout: the framework generates the LogUp (extension)
+    /// constraints from this and appends them after the `constraint_set` ones.
+    logup: LogUpLayout,
+    /// Idx-ordered metadata for all transition constraints, DERIVED at
+    /// construction: `constraint_set.meta()` (base prefix) followed by the
+    /// LogUp emission's derived metadata (ext).
+    meta: Vec<ConstraintMeta>,
+    /// Number of base-field constraints (the `RootKind::Base` prefix length of
+    /// `meta`) — these use the cheaper F×E accumulation path.
+    num_base: usize,
+    /// Lazily captured flat IR of every transition constraint, built once on
+    /// first request (prover/GPU/tests only — the verify path never forces it).
+    constraint_program: std::sync::OnceLock<crate::constraint_ir::ConstraintProgram<F, E>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -832,7 +853,8 @@ impl<
     E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI,
-> AirWithBuses<F, E, B, PI>
+    CS: ConstraintSet<F, E>,
+> AirWithBuses<F, E, B, PI, CS>
 {
     /// Creates an AirWithBuses with LogUp-specific transition constraints.
     /// If no boundary constraints are needed, use `NullBoundaryConstraintBuilder` as B and () as PI.
@@ -850,41 +872,24 @@ impl<
         auxiliary_trace_build_data: AuxiliaryTraceBuildData,
         proof_options: &ProofOptions,
         step_size: usize,
-        mut transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>>,
+        constraint_set: CS,
     ) -> Self {
-        // Domain constraints are passed in first; LogUp constraints are appended below.
-        // The domain constraints use the F×E accumulation path (3 muls vs 9).
-        let num_base_constraints = transition_constraints.len();
-
+        // Base-field (table) constraints come from the constraint set; LogUp
+        // (extension) constraints are appended by the framework from the layout.
         let num_interactions = auxiliary_trace_build_data.interactions.len();
+        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
+        let num_term_columns = logup.num_term_columns;
 
-        // Split interactions: committed pairs get term columns, last 1-2 are absorbed
-        let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
-        let absorbed =
-            auxiliary_trace_build_data.interactions[num_interactions - absorbed_count..].to_vec();
-
-        // Create batched term constraints for committed pairs only
-        for pair_idx in 0..num_committed_pairs {
-            let constraint = LookupBatchedTermConstraint::new(
-                auxiliary_trace_build_data.interactions[pair_idx * 2].clone(),
-                auxiliary_trace_build_data.interactions[pair_idx * 2 + 1].clone(),
-                pair_idx,
-                transition_constraints.len(),
-            );
-            transition_constraints.push(Box::new(constraint));
-        }
-
-        let num_term_columns = num_committed_pairs;
-
-        // Add the accumulated constraint with absorbed interactions
-        if num_interactions > 0 {
-            let accumulated_constraint = LookupAccumulatedConstraint::new(
-                transition_constraints.len(),
-                num_term_columns,
-                absorbed,
-            );
-            transition_constraints.push(Box::new(accumulated_constraint));
-        }
+        // meta = constraint_set base-prefix meta + appended LogUp ext meta,
+        // both DERIVED by running the respective bodies through a MetaBuilder
+        // (the `{degree, end_exemptions}` declared at each emit).
+        let mut meta = constraint_set.meta();
+        let num_base = num_base_from_meta(&meta);
+        // The set is entirely base-field (its meta is a Base prefix).
+        debug_assert_eq!(num_base, meta.len(), "constraint set meta must be all-base");
+        let mut logup_mb = crate::constraints::builder::MetaBuilder::new();
+        emit_logup_constraints::<F, E, _>(&mut logup_mb, &logup, num_base);
+        meta.extend(logup_mb.into_meta());
 
         // Layout: num_committed_pairs term columns + 1 accumulated = ⌈N/2⌉
         let num_aux_columns = if num_interactions > 0 {
@@ -895,7 +900,7 @@ impl<
         let trace_layout = (num_main_columns, num_aux_columns);
 
         // Compute max bus elements across all interactions for alpha power count
-        let max_bus_elements = auxiliary_trace_build_data
+        let max_bus_elements = logup
             .interactions
             .iter()
             .map(|i| i.num_bus_elements())
@@ -907,15 +912,18 @@ impl<
             proof_options: proof_options.clone(),
             trace_columns: trace_layout.0 + trace_layout.1,
             transition_offsets: vec![0, 1],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
             step_size,
             trace_layout,
-            transition_constraints,
-            num_base_constraints,
+            constraint_set,
+            logup,
+            meta,
+            num_base,
+            constraint_program: std::sync::OnceLock::new(),
             auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
@@ -961,12 +969,13 @@ impl<
     }
 }
 
-impl<F, E, B, PI> crate::traits::AIR for AirWithBuses<F, E, B, PI>
+impl<F, E, B, PI, CS> crate::traits::AIR for AirWithBuses<F, E, B, PI, CS>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
+    CS: ConstraintSet<F, E>,
 {
     type Field = F;
 
@@ -1003,12 +1012,14 @@ where
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize {
+        // Only the per-table MAX degree is consumed. Base constraints declare it
+        // once via `ConstraintSet::max_degree()`; the framework's LogUp
+        // constraints contribute their own known max (batched terms degree 3,
+        // accumulator `1 + absorbed`).
         let max_degree = self
-            .transition_constraints
-            .iter()
-            .map(|c| c.degree())
-            .max()
-            .unwrap_or(1);
+            .constraint_set
+            .max_degree()
+            .max(logup_max_degree(&self.logup));
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1023,13 +1034,57 @@ where
     }
 
     fn num_base_transition_constraints(&self) -> usize {
-        self.num_base_constraints
+        self.num_base
     }
 
-    fn transition_constraints(
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
+    }
+
+    fn compute_transition_prover(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+        ctx: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        // One folder pass runs BOTH the table constraint set and the LogUp
+        // emission; LogUp constraints are appended after the set's (idx offset
+        // by the base-constraint count).
+        run_air_transition_prover(
+            &self.constraint_set,
+            &self.logup,
+            ctx,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        ctx: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_air_transition_verifier(
+            &self.constraint_set,
+            &self.logup,
+            self.num_base,
+            self.meta.len(),
+            ctx,
+        )
+    }
+
+    fn constraint_program(
+        &self,
+    ) -> &crate::constraint_ir::ConstraintProgram<Self::Field, Self::FieldExtension> {
+        // Lazily captured once (prover/GPU/tests only — the verify path never
+        // calls this). Runs the table set AND the LogUp emission through one
+        // CaptureBuilder, matching the folder emission order/indexing exactly.
+        self.constraint_program.get_or_init(|| {
+            let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
+            self.constraint_set.eval(&mut cb);
+            emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+            let (prog, _degrees) = cb.finish(self.num_base);
+            prog
+        })
     }
 
     fn build_auxiliary_trace(
@@ -1054,6 +1109,13 @@ where
         let trace_len = trace.num_rows();
         let _table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
+        // Device-resident trace-domain main columns from the R1 main LDE, cloned
+        // (Arc, cheap) into a local so no borrow of `trace` is held across the
+        // `set_aux_resident` mutable borrow below. When present, the resident aux
+        // build reads them in place and skips the ~3 GB main re-upload.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        let resident_main = trace.main_trace_dev.clone();
+
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
@@ -1066,49 +1128,91 @@ where
         // tables with many interactions.
         // Without `parallel`: sequential over pairs, sequential over rows.
         let interactions = &self.auxiliary_trace_build_data.interactions;
-        let build_pair = |i: usize| {
-            compute_logup_term_column(
-                &[&interactions[i * 2], &interactions[i * 2 + 1]],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
-        };
 
-        #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE {
-            (0..num_committed_pairs)
-                .into_par_iter()
-                .map(build_pair)
-                .collect()
-        } else {
-            (0..num_committed_pairs).map(build_pair).collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let committed_columns: Vec<Vec<FieldElement<E>>> =
-            (0..num_committed_pairs).map(build_pair).collect();
+        // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
+        // debug-checks): build the aux columns on device and keep them resident
+        // for the aux LDE (no term-column download). Returns the table
+        // contribution; the host set_aux + CPU accumulate below are skipped.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        if trace.resident_aux_ok()
+            && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
+                interactions,
+                &main_segment_cols,
+                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
+                trace_len,
+                challenges,
+            )
+        {
+            let table_contribution = crate::gpu_lde::u64_to_ext3_vec::<E>(&ra.table_contribution)
+                .pop()
+                .expect("one ext3 element");
+            trace.set_aux_resident(ra);
+            return Some(BusPublicInputs { table_contribution });
+        }
 
-        // Virtual column for absorbed interactions (NOT written to trace).
-        let virtual_column = if absorbed_count == 2 {
-            compute_logup_term_column(
-                &[
-                    &interactions[num_interactions - 2],
-                    &interactions[num_interactions - 1],
-                ],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
-        } else {
-            compute_logup_term_column(
-                &[&interactions[num_interactions - 1]],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
+        // GPU aux build (Goldilocks + ext3 + above threshold) computes all term
+        // columns on device, byte identical, and falls back to the CPU build.
+        #[cfg(feature = "cuda")]
+        let gpu_term_cols = crate::logup_gpu::try_build_term_columns_gpu::<F, E>(
+            interactions,
+            &main_segment_cols,
+            trace_len,
+            challenges,
+        );
+        #[cfg(not(feature = "cuda"))]
+        #[allow(clippy::type_complexity)]
+        let gpu_term_cols: Option<(Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>)> = None;
+
+        let (committed_columns, virtual_column) = match gpu_term_cols {
+            Some(cols) => cols,
+            None => {
+                let build_pair = |i: usize| {
+                    compute_logup_term_column(
+                        &[&interactions[i * 2], &interactions[i * 2 + 1]],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                };
+
+                #[cfg(feature = "parallel")]
+                let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE
+                {
+                    (0..num_committed_pairs)
+                        .into_par_iter()
+                        .map(build_pair)
+                        .collect()
+                } else {
+                    (0..num_committed_pairs).map(build_pair).collect()
+                };
+                #[cfg(not(feature = "parallel"))]
+                let committed_columns: Vec<Vec<FieldElement<E>>> =
+                    (0..num_committed_pairs).map(build_pair).collect();
+
+                // Virtual column for absorbed interactions (NOT written to trace).
+                let virtual_column = if absorbed_count == 2 {
+                    compute_logup_term_column(
+                        &[
+                            &interactions[num_interactions - 2],
+                            &interactions[num_interactions - 1],
+                        ],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                } else {
+                    compute_logup_term_column(
+                        &[&interactions[num_interactions - 1]],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                };
+                (committed_columns, virtual_column)
+            }
         };
 
         // Write only committed columns to trace
@@ -1283,7 +1387,7 @@ impl Multiplicity {
 
     /// Evaluate the multiplicity for a single row of column-major main data.
     #[inline]
-    fn evaluate_at_row<F: IsField>(
+    pub(crate) fn evaluate_at_row<F: IsField>(
         &self,
         main_segment_cols: &[Vec<FieldElement<F>>],
         row: usize,
@@ -1489,6 +1593,8 @@ where
 
     let process_chunk = |chunk_start: usize, result_chunk: &mut [FieldElement<E>]| {
         let chunk_len = result_chunk.len();
+        #[cfg(feature = "instruments")]
+        let _t0 = std::time::Instant::now();
 
         // Phase 1 — fingerprints, laid out as [int_0 rows…, int_1 rows…].
         // fp[k*chunk_len + i] = interaction k at row chunk_start+i.
@@ -1540,10 +1646,14 @@ where
             }
         }
 
+        #[cfg(feature = "instruments")]
+        let _t1 = std::time::Instant::now();
         // Phase 2: batch invert
         FieldElement::inplace_batch_inverse(&mut fingerprints)
             .expect("fingerprint is zero - probability of sampling zero is negligible");
 
+        #[cfg(feature = "instruments")]
+        let _t2 = std::time::Instant::now();
         // Phase 3: Compute terms
         for (i, result_elem) in result_chunk.iter_mut().enumerate() {
             let row = chunk_start + i;
@@ -1557,6 +1667,8 @@ where
             }
             *result_elem = acc;
         }
+        #[cfg(feature = "instruments")]
+        crate::instruments::accum_aux_term(_t1 - _t0, _t2 - _t1, std::time::Instant::now() - _t2);
     };
 
     #[cfg(feature = "parallel")]
@@ -1591,6 +1703,8 @@ where
         return FieldElement::zero();
     }
     let trace_len = term_columns[0].len();
+    #[cfg(feature = "instruments")]
+    let _t_acc = std::time::Instant::now();
 
     // Compute L = sum of all terms across all rows
     let mut table_contribution = FieldElement::<E>::zero();
@@ -1615,6 +1729,8 @@ where
         trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
 
+    #[cfg(feature = "instruments")]
+    crate::instruments::accum_aux_accumulate(std::time::Instant::now() - _t_acc);
     table_contribution
 }
 
@@ -1675,332 +1791,864 @@ where
     (bus_sums, sender_sums, receiver_sums)
 }
 
-/// Computes multiplicity for an interaction from a `TableView`.
-fn compute_multiplicity_from_step<A: IsSubFieldOf<B>, B: IsField>(
-    step: &TableView<A, B>,
-    multiplicity: &Multiplicity,
-) -> FieldElement<A> {
-    multiplicity.evaluate_with(|col| step.get_main_evaluation_element(0, col).clone())
+// =============================================================================
+// LogUp single-source constraints (ConstraintBuilder front-end)
+// =============================================================================
+//
+// The LogUp transition constraints are generated from the interaction config
+// (a [`LogUpLayout`]) through the generic [`ConstraintBuilder`], so ONE body
+// serves the compiled prover folder, the verifier folder and IR capture. This
+// is the single source for the two LogUp constraint shapes (batched term and
+// accumulated); there are no per-constraint objects.
+//
+// All LogUp constraints use the default zerofier shape (every row, no
+// exemptions) and are [`RootKind::Ext`]; their metadata is derived from this
+// same emission (via `MetaBuilder`), not hand-listed.
+//
+// The data-dependent "skip the multiply when the row value is zero"
+// optimization IS reproduced, through the [`ConstraintBuilder::fold_fingerprint_term`]
+// hook rather than in this row-agnostic body: capture and the verifier fold the
+// term unconditionally (value-identical, since `0·α = 0`), while
+// `ProverEvalFolder` overrides the hook to skip the base×ext multiply for a
+// zero bus element on the hot per-row path.
+
+use crate::constraints::builder::ConstraintBuilder;
+
+/// Config describing an [`AirWithBuses`] table's LogUp layout, exactly as
+/// computed by [`AirWithBuses::new`] from the interaction list (via
+/// `split_interactions`). This is the plain-data source for the LogUp
+/// constraints: [`emit_logup_constraints`] reads it to generate every LogUp
+/// constraint (its metadata is derived from that same emission).
+#[derive(Clone)]
+pub struct LogUpLayout {
+    /// All interactions, in the order they were registered. The first
+    /// `2 * num_committed_pairs` are the committed (batched) pairs; the last
+    /// 1–2 are absorbed into the accumulated constraint.
+    pub interactions: Vec<BusInteraction>,
+    /// Number of committed batched pairs (each gets one aux term column).
+    pub num_committed_pairs: usize,
+    /// Number of committed term columns (`= num_committed_pairs`).
+    pub num_term_columns: usize,
+    /// Index of the accumulated column (`= num_term_columns`).
+    pub acc_column_idx: usize,
 }
 
-/// Computes the fingerprint for an interaction from a `TableView`.
-///
-/// Returns `z - (bus_id + α·v[0] + α²·v[1] + ...)`
-fn compute_fingerprint_from_step<A: IsSubFieldOf<B>, B: IsField>(
-    step: &TableView<A, B>,
-    interaction: &BusInteraction,
-    z: &FieldElement<B>,
-    alpha_powers: &[FieldElement<B>],
-    shifts: &PackingShifts<A>,
-) -> FieldElement<B> {
-    // α⁰ = 1: the bus-id term needs no multiply — embed it into B directly.
-    let mut linear_combination = FieldElement::<B>::from(interaction.bus_id);
-    let mut alpha_idx = 1;
-    for bv in &interaction.values {
-        alpha_idx += bv.accumulate_fingerprint_from_step(
-            step,
-            alpha_powers,
-            alpha_idx,
-            &mut linear_combination,
-            shifts,
-        );
-    }
-    z - &linear_combination
-}
-
-/// Constraint for a batched pair of interactions sharing one aux column.
-///
-/// Verifies: `c = m_a/fp_a + m_b/fp_b` where signs are baked into m_a, m_b.
-///
-/// Clearing denominators: `c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0`
-///
-/// Degree 3: c (aux) × fp_a (linear in main) × fp_b (linear in main).
-struct LookupBatchedTermConstraint {
-    interaction_a: BusInteraction,
-    interaction_b: BusInteraction,
-    term_column_idx: usize,
-    constraint_idx: usize,
-}
-
-impl LookupBatchedTermConstraint {
-    pub fn new(
-        interaction_a: BusInteraction,
-        interaction_b: BusInteraction,
-        term_column_idx: usize,
-        constraint_idx: usize,
-    ) -> Self {
+impl LogUpLayout {
+    /// Derive the LogUp layout from an interaction list, mirroring the split
+    /// [`AirWithBuses::new`] performs.
+    pub fn from_interactions(interactions: Vec<BusInteraction>) -> Self {
+        let num_interactions = interactions.len();
+        let (num_committed_pairs, _absorbed_count) = split_interactions(num_interactions);
+        let num_term_columns = num_committed_pairs;
         Self {
-            interaction_a,
-            interaction_b,
-            term_column_idx,
-            constraint_idx,
-        }
-    }
-}
-
-impl<F, E> TransitionConstraintEvaluator<F, E> for LookupBatchedTermConstraint
-where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        3 // c * fp_a * fp_b
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        fn evaluate_batched_term_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            step: &TableView<A, B>,
-            term_column_idx: usize,
-            interaction_a: &BusInteraction,
-            interaction_b: &BusInteraction,
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-            shifts: &PackingShifts<A>,
-        ) -> FieldElement<B> {
-            let c = step.get_aux_evaluation_element(0, term_column_idx);
-            let z = &rap_challenges[0];
-
-            let m_a = compute_multiplicity_from_step(step, &interaction_a.multiplicity);
-            let m_b = compute_multiplicity_from_step(step, &interaction_b.multiplicity);
-
-            let fp_a = compute_fingerprint_from_step(step, interaction_a, z, alpha_powers, shifts);
-            let fp_b = compute_fingerprint_from_step(step, interaction_b, z, alpha_powers, shifts);
-
-            // c * fp_a * fp_b - sign_a * m_a * fp_b - sign_b * m_b * fp_a = 0
-            // Use conditional negation instead of E×E sign multiplication
-            let term_a = m_a * &fp_b;
-            let term_a = if interaction_a.is_sender {
-                term_a
-            } else {
-                -term_a
-            };
-            let term_b = m_b * &fp_a;
-            let term_b = if interaction_b.is_sender {
-                term_b
-            } else {
-                -term_b
-            };
-            c * &fp_a * &fp_b - term_a - term_b
-        }
-
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-                ..
-            } => evaluate_batched_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction_a,
-                &self.interaction_b,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-                ..
-            } => evaluate_batched_term_constraint(
-                frame.get_evaluation_step(0),
-                self.term_column_idx,
-                &self.interaction_a,
-                &self.interaction_b,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-            ),
-        };
-
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-            *eval = res;
-        }
-    }
-}
-
-/// Constraint for the accumulated column with absorbed interactions.
-///
-/// The accumulated column tracks the running sum of all committed term columns
-/// plus 1-2 "absorbed" interactions whose terms are verified inline (not committed).
-///
-/// For 1 absorbed interaction:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f - sign · m = 0` (degree 2)
-///
-/// For 2 absorbed interactions:
-///   `(acc_next - acc_curr - Σ terms + L/N) · f₁·f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0` (degree 3)
-struct LookupAccumulatedConstraint {
-    constraint_idx: usize,
-    /// Number of committed term columns (excludes absorbed interactions)
-    num_term_columns: usize,
-    /// Index of the accumulated column (= num_term_columns)
-    acc_column_idx: usize,
-    /// 1 or 2 interactions absorbed into this constraint (not committed as columns)
-    absorbed: Vec<BusInteraction>,
-}
-
-impl LookupAccumulatedConstraint {
-    pub fn new(
-        constraint_idx: usize,
-        num_term_columns: usize,
-        absorbed: Vec<BusInteraction>,
-    ) -> Self {
-        Self {
-            constraint_idx,
+            interactions,
+            num_committed_pairs,
             num_term_columns,
             acc_column_idx: num_term_columns,
-            absorbed,
+        }
+    }
+
+    /// The absorbed interactions (last 1–2), folded into the accumulated
+    /// constraint. Empty when there are no interactions.
+    fn absorbed(&self) -> &[BusInteraction] {
+        let n = self.interactions.len();
+        if n == 0 {
+            return &[];
+        }
+        let (_, absorbed_count) = split_interactions(n);
+        &self.interactions[n - absorbed_count..]
+    }
+
+    /// Number of LogUp transition constraints this layout produces:
+    /// one per committed pair (batched term) plus one accumulated constraint
+    /// when there is at least one interaction.
+    pub fn num_constraints(&self) -> usize {
+        if self.interactions.is_empty() {
+            0
+        } else {
+            self.num_committed_pairs + 1
         }
     }
 }
 
-impl<F, E> TransitionConstraintEvaluator<F, E> for LookupAccumulatedConstraint
+/// Capture a [`Multiplicity`] as a base-field expression, mirroring
+/// [`Multiplicity::evaluate_with`].
+fn emit_multiplicity<F, E, B>(b: &B, multiplicity: &Multiplicity, offset: usize) -> B::Expr
 where
-    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
 {
-    fn degree(&self) -> usize {
-        1 + self.absorbed.len() // 2 for 1 absorbed, 3 for 2 absorbed
+    match multiplicity {
+        Multiplicity::One => b.one(),
+        Multiplicity::Column(col) => b.main(offset, *col),
+        Multiplicity::Sum(a, c) => b.main(offset, *a) + b.main(offset, *c),
+        Multiplicity::Negated(col) => b.one() - b.main(offset, *col),
+        Multiplicity::Diff(a, c) => b.main(offset, *a) - b.main(offset, *c),
+        Multiplicity::Sum3(a, c, d) => b.main(offset, *a) + b.main(offset, *c) + b.main(offset, *d),
+        Multiplicity::Linear(terms) => emit_linear_terms(b, terms, offset),
     }
+}
 
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, E>,
-        transition_evaluations: &mut [FieldElement<E>],
-    ) {
-        #[allow(clippy::too_many_arguments)]
-        fn evaluate_accumulated_constraint<A: IsSubFieldOf<B>, B: IsField>(
-            first_step: &TableView<A, B>,
-            second_step: &TableView<A, B>,
-            acc_column_idx: usize,
-            num_term_columns: usize,
-            logup_table_offset: &FieldElement<B>,
-            absorbed: &[BusInteraction],
-            rap_challenges: &&[FieldElement<B>],
-            alpha_powers: &[FieldElement<B>],
-            shifts: &PackingShifts<A>,
-        ) -> FieldElement<B> {
-            // Accumulated column values
-            let acc_curr = first_step.get_aux_evaluation_element(0, acc_column_idx);
-            let acc_next = second_step.get_aux_evaluation_element(0, acc_column_idx);
-
-            // Sum of all committed term columns at the next step
-            let terms_sum: FieldElement<B> = (0..num_term_columns)
-                .map(|i| second_step.get_aux_evaluation_element(0, i).clone())
-                .sum();
-
-            // delta = acc_next - acc_curr - terms_sum + L/N
-            let delta = acc_next - acc_curr - terms_sum + logup_table_offset;
-
-            let z = &rap_challenges[0];
-
-            // Clear denominators of absorbed interactions
-            debug_assert!(matches!(absorbed.len(), 1 | 2));
-            // Use conditional negation instead of E×E sign multiplication where possible
-            match absorbed.len() {
-                1 => {
-                    // (delta) · f - sign · m = 0
-                    // sign multiply also promotes m from base field A to extension B
-                    let m = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let f = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[0],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
-                    let sign: FieldElement<B> = if absorbed[0].is_sender {
-                        FieldElement::one()
-                    } else {
-                        -FieldElement::one()
-                    };
-                    delta * &f - m * sign
-                }
-                2 => {
-                    // (delta) · f₁ · f₂ - sign₁·m₁·f₂ - sign₂·m₂·f₁ = 0
-                    // m_i * f_j naturally promotes A→B, then conditionally negate
-                    let m1 = compute_multiplicity_from_step(second_step, &absorbed[0].multiplicity);
-                    let m2 = compute_multiplicity_from_step(second_step, &absorbed[1].multiplicity);
-                    let f1 = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[0],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
-                    let f2 = compute_fingerprint_from_step(
-                        second_step,
-                        &absorbed[1],
-                        z,
-                        alpha_powers,
-                        shifts,
-                    );
-                    let term1 = m1 * &f2;
-                    let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
-                    let term2 = m2 * &f1;
-                    let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
-                    delta * &f1 * &f2 - term1 - term2
-                }
-                _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+/// Capture a slice of [`LinearTerm`]s as a base-field sum, mirroring the
+/// `Multiplicity::Linear` arm of [`Multiplicity::evaluate_with`] (`Σ terms`,
+/// starting from zero).
+fn emit_linear_terms<F, E, B>(b: &B, terms: &[LinearTerm], offset: usize) -> B::Expr
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let mut result = b.const_base(0);
+    for term in terms {
+        match *term {
+            LinearTerm::Column {
+                coefficient,
+                column,
+            } => {
+                result = result + b.main(offset, column) * b.const_signed(coefficient);
+            }
+            LinearTerm::ColumnUnsigned {
+                coefficient,
+                column,
+            } => {
+                result = result + b.main(offset, column) * b.const_base(coefficient);
+            }
+            LinearTerm::Constant(value) => {
+                result = result + b.const_signed(value);
             }
         }
+    }
+    result
+}
 
-        let res = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                logup_table_offset,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-                ..
-            } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-                logup_table_offset,
-                &self.absorbed,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-            ),
-            TransitionEvaluationContext::Verifier {
-                frame,
-                logup_table_offset,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-                ..
-            } => evaluate_accumulated_constraint(
-                frame.get_evaluation_step(0),
-                frame.get_evaluation_step(1),
-                self.acc_column_idx,
-                self.num_term_columns,
-                logup_table_offset,
-                &self.absorbed,
-                rap_challenges,
-                logup_alpha_powers,
-                packing_shifts,
-            ),
-        };
+/// Fold a [`Packing`]'s fingerprint contribution into the running fingerprint
+/// `fp`, mirroring [`Packing::accumulate_fingerprint_with`]. Each bus element
+/// subtracts one `col_expr * alpha_power` term (base operand LEFT) from `fp` —
+/// see [`emit_fingerprint`] for why terms are subtracted rather than summed.
+/// Returns the updated fingerprint and the number of alpha powers consumed
+/// (`= packing.num_bus_elements()`). Field addition is associative and
+/// commutative, so this row-agnostic accumulation is value-identical to the
+/// runtime body regardless of grouping.
+fn emit_packing_fingerprint<F, E, B>(
+    b: &B,
+    packing: Packing,
+    start_col: usize,
+    offset: usize,
+    alpha_offset: usize,
+    mut fp: B::ExprE,
+) -> (B::ExprE, usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let col = |c: usize| b.main(offset, c);
+    let alpha = |i: usize| b.alpha_pow(alpha_offset + i);
+    let shift_8 = || b.const_base(SHIFT_8);
+    let shift_16 = || b.const_base(SHIFT_16);
+    let shift_24 = || b.const_base(SHIFT_8 * SHIFT_16);
 
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx) {
-            *eval = res;
+    match packing {
+        Packing::Direct => (fp - col(start_col) * alpha(0), 1),
+        Packing::Word2L => {
+            let combined = col(start_col) + col(start_col + 1) * shift_16();
+            (fp - combined * alpha(0), 1)
         }
+        Packing::Word4L => {
+            let combined = col(start_col)
+                + col(start_col + 1) * shift_8()
+                + col(start_col + 2) * shift_16()
+                + col(start_col + 3) * shift_24();
+            (fp - combined * alpha(0), 1)
+        }
+        Packing::DWordWL => {
+            fp = fp - col(start_col) * alpha(0);
+            (fp - col(start_col + 1) * alpha(1), 2)
+        }
+        Packing::DWordHHW => {
+            fp = fp - col(start_col) * alpha(0);
+            let w = col(start_col + 1) + col(start_col + 2) * shift_16();
+            (fp - w * alpha(1), 2)
+        }
+        Packing::DWordWHH => {
+            let w = col(start_col) + col(start_col + 1) * shift_16();
+            fp = fp - w * alpha(0);
+            (fp - col(start_col + 2) * alpha(1), 2)
+        }
+        Packing::DWordHL => {
+            let w0 = col(start_col) + col(start_col + 1) * shift_16();
+            fp = fp - w0 * alpha(0);
+            let w1 = col(start_col + 2) + col(start_col + 3) * shift_16();
+            (fp - w1 * alpha(1), 2)
+        }
+        Packing::DWordBL => {
+            let w0 = col(start_col)
+                + col(start_col + 1) * shift_8()
+                + col(start_col + 2) * shift_16()
+                + col(start_col + 3) * shift_24();
+            fp = fp - w0 * alpha(0);
+            let w1 = col(start_col + 4)
+                + col(start_col + 5) * shift_8()
+                + col(start_col + 6) * shift_16()
+                + col(start_col + 7) * shift_24();
+            (fp - w1 * alpha(1), 2)
+        }
+        Packing::QuadHL => {
+            for i in 0..4 {
+                let c = start_col + i * 2;
+                let w = col(c) + col(c + 1) * shift_16();
+                fp = fp - w * alpha(i);
+            }
+            (fp, 4)
+        }
+        Packing::QuadWL => {
+            for i in 0..4 {
+                fp = fp - col(start_col + i) * alpha(i);
+            }
+            (fp, 4)
+        }
+    }
+}
+
+/// Fold a [`BusValue`]'s fingerprint contribution into the running fingerprint
+/// `fp`, mirroring [`BusValue::accumulate_fingerprint_from_step`]. Returns the
+/// updated fingerprint and the number of alpha powers consumed.
+fn emit_busvalue_fingerprint<F, E, B>(
+    b: &B,
+    bv: &BusValue,
+    offset: usize,
+    alpha_offset: usize,
+    fp: B::ExprE,
+) -> (B::ExprE, usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    match bv {
+        BusValue::Packed {
+            start_column,
+            packing,
+        } => emit_packing_fingerprint::<F, E, B>(
+            b,
+            *packing,
+            *start_column,
+            offset,
+            alpha_offset,
+            fp,
+        ),
+        BusValue::Linear(terms) => {
+            // Routed through the builder so the prover folder can zero-skip
+            // the multiply (Linear is where the constant-0 bus-width padding
+            // lives; the packed contributions above fold unconditionally —
+            // their elements are real trace columns with no zero-heavy
+            // padding). Value-identical either way.
+            let result = emit_linear_terms(b, terms, offset);
+            (b.fold_fingerprint_term(fp, result, alpha_offset), 1)
+        }
+    }
+}
+
+/// Capture an interaction's fingerprint as an extension expression, mirroring
+/// `z - (bus_id + α·v[0] + α²·v[1] + ...)`.
+///
+/// `α⁰ = 1`: the bus-id term needs no multiply and is added as a base constant.
+///
+/// The subtraction is distributed: the fingerprint starts at `z − bus_id` and
+/// each α·value term is subtracted as it is emitted. Field addition is
+/// associative and commutative, so this is value-identical to
+/// `z − (bus + Σ terms)` — and it keeps the running value in ONE extension
+/// accumulator. The prover folder runs this body once per LDE row, where
+/// collecting the terms in a `Vec` costs a heap allocation per fingerprint
+/// per row.
+fn emit_fingerprint<F, E, B>(b: &B, interaction: &BusInteraction, offset: usize) -> B::ExprE
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let z = b.challenge(0);
+    let bus = b.const_base(interaction.bus_id);
+    // `bus` is base and `z` ext; the tower only implements base − ext (base
+    // operand LEFT), so z − bus is written −(bus − z).
+    let mut fp = -(bus - z);
+    let mut alpha_idx = 1;
+    for bv in &interaction.values {
+        let (next, consumed) = emit_busvalue_fingerprint::<F, E, B>(b, bv, offset, alpha_idx, fp);
+        fp = next;
+        alpha_idx += consumed;
+    }
+    fp
+}
+
+/// Emit the batched-term constraint for committed pair `pair_idx`:
+/// `c · fp_a · fp_b − sign_a·m_a·fp_b − sign_b·m_b·fp_a` (degree 3).
+fn emit_logup_batched_term<F, E, B>(b: &mut B, layout: &LogUpLayout, pair_idx: usize, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let interaction_a = &layout.interactions[pair_idx * 2];
+    let interaction_b = &layout.interactions[pair_idx * 2 + 1];
+    let term_column_idx = pair_idx;
+
+    let c = b.aux(0, term_column_idx);
+    let m_a = emit_multiplicity::<F, E, B>(b, &interaction_a.multiplicity, 0);
+    let m_b = emit_multiplicity::<F, E, B>(b, &interaction_b.multiplicity, 0);
+    let fp_a = emit_fingerprint::<F, E, B>(b, interaction_a, 0);
+    let fp_b = emit_fingerprint::<F, E, B>(b, interaction_b, 0);
+
+    // is_sender is a compile-time bool, resolved as add vs neg instead of an
+    // ext×ext sign multiply (same optimization as the runtime body). m·fp is
+    // base×ext = ext (base operand LEFT).
+    let term_a = m_a * fp_b.clone();
+    let term_a = if interaction_a.is_sender {
+        term_a
+    } else {
+        -term_a
+    };
+    let term_b = m_b * fp_a.clone();
+    let term_b = if interaction_b.is_sender {
+        term_b
+    } else {
+        -term_b
+    };
+
+    // c · fp_a · fp_b: c is aux (ext), so this is ext throughout (degree 3;
+    // see `logup_max_degree`).
+    let main = c * fp_a * fp_b;
+    b.emit_ext(idx, main - term_a - term_b);
+}
+
+/// Emit the accumulated constraint (with 1–2 absorbed interactions).
+/// `acc_curr` reads row 0; `acc_next`,
+/// the committed-term sum and the absorbed fingerprints/multiplicities all read
+/// the NEXT row (offset 1).
+///
+/// - 1 absorbed: `(acc_next − acc_curr − Σterms + L/N)·f − sign·m` (degree 2)
+/// - 2 absorbed: `(…)·f₁·f₂ − sign₁·m₁·f₂ − sign₂·m₂·f₁` (degree 3)
+fn emit_logup_accumulated<F, E, B>(b: &mut B, layout: &LogUpLayout, idx: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    let acc_curr = b.aux(0, layout.acc_column_idx);
+    let acc_next = b.aux(1, layout.acc_column_idx);
+
+    // delta = acc_next − acc_curr − Σ committed_terms(next) + L/N
+    let mut delta = acc_next - acc_curr;
+    for i in 0..layout.num_term_columns {
+        delta = delta - b.aux(1, i);
+    }
+    delta = delta + b.table_offset();
+
+    let absorbed = layout.absorbed();
+    let root = match absorbed.len() {
+        1 => {
+            // delta · f − sign · m
+            let m = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
+            let f = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
+            let mt = if absorbed[0].is_sender { m } else { -m };
+            // delta · f is ext; `mt` is base. The tower only implements base −
+            // ext (base operand LEFT), so write `delta·f − mt` as `−(mt − delta·f)`.
+            -(mt - delta * f)
+        }
+        2 => {
+            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1
+            let m1 = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
+            let m2 = emit_multiplicity::<F, E, B>(b, &absorbed[1].multiplicity, 1);
+            let f1 = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
+            let f2 = emit_fingerprint::<F, E, B>(b, &absorbed[1], 1);
+
+            let term1 = m1 * f2.clone();
+            let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
+            let term2 = m2 * f1.clone();
+            let term2 = if absorbed[1].is_sender { term2 } else { -term2 };
+            delta * f1 * f2 - term1 - term2
+        }
+        _ => unreachable!("absorbed must contain 1 or 2 interactions"),
+    };
+
+    // Degree 1 + absorbed count (2 for one absorbed, 3 for two); folded into
+    // the composition bound via `logup_max_degree`.
+    b.emit_ext(idx, root);
+}
+
+/// The maximum degree among a layout's framework-generated LogUp constraints:
+/// batched committed terms are degree 3, the accumulator is `1 + absorbed`.
+/// Zero when there are no interactions. Folded into
+/// `composition_poly_degree_bound` alongside the base constraints' max_degree.
+pub fn logup_max_degree(layout: &LogUpLayout) -> usize {
+    if layout.interactions.is_empty() {
+        return 0;
+    }
+    // Accumulated constraint: 1 + number of absorbed interactions.
+    let mut m = 1 + layout.absorbed().len();
+    // Batched committed terms (if any) are degree 3.
+    if layout.num_committed_pairs > 0 {
+        m = m.max(3);
+    }
+    m
+}
+
+/// Emit every LogUp transition constraint for `layout` through the builder,
+/// starting at absolute constraint index `idx_base` (the table's base-constraint
+/// count). Committed batched terms come first (one per committed pair), then the
+/// single accumulated constraint. Emits nothing when there are no interactions.
+pub fn emit_logup_constraints<F, E, B>(b: &mut B, layout: &LogUpLayout, idx_base: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    if layout.interactions.is_empty() {
+        return;
+    }
+    let mut idx = idx_base;
+    for pair_idx in 0..layout.num_committed_pairs {
+        emit_logup_batched_term::<F, E, B>(b, layout, pair_idx, idx);
+        idx += 1;
+    }
+    emit_logup_accumulated::<F, E, B>(b, layout, idx);
+}
+
+/// Run an [`AirWithBuses`] table's transition constraints through the
+/// [`ProverEvalFolder`] in ONE pass: the constraint set's base-field body
+/// followed by the appended LogUp constraints (idx offset by `num_base`, the
+/// base-prefix length). `base_evals` is sized `num_base`; `ext_evals` the total
+/// constraint count.
+fn run_air_transition_prover<F, E, CS>(
+    constraint_set: &CS,
+    logup: &LogUpLayout,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+    base_evals: &mut [FieldElement<F>],
+    ext_evals: &mut [FieldElement<E>],
+) where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let num_base = base_evals.len();
+    let mut folder = ProverEvalFolder::new(ctx, base_evals, ext_evals);
+    constraint_set.eval(&mut folder);
+    emit_logup_constraints(&mut folder, logup, num_base);
+    folder.assert_all_emitted();
+}
+
+/// Run an [`AirWithBuses`] table's transition constraints at a single point,
+/// returning every constraint value in the extension field: the constraint
+/// set's base-field body (promoted) followed by the appended LogUp constraints.
+///
+/// A Verifier context runs the [`VerifierEvalFolder`] (the OOD/recursion path).
+/// A Prover context is also accepted — debug trace validation calls this with a
+/// prover frame — by running the [`ProverEvalFolder`] and promoting the
+/// base-prefix results.
+fn run_air_transition_verifier<F, E, CS>(
+    constraint_set: &CS,
+    logup: &LogUpLayout,
+    num_base: usize,
+    num_constraints: usize,
+    ctx: &TransitionEvaluationContext<'_, F, E>,
+) -> Vec<FieldElement<E>>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+    CS: ConstraintSet<F, E>,
+{
+    let mut ext_evals = vec![FieldElement::<E>::zero(); num_constraints];
+    match ctx {
+        TransitionEvaluationContext::Verifier { .. } => {
+            let mut folder = VerifierEvalFolder::new(ctx, &mut ext_evals);
+            constraint_set.eval(&mut folder);
+            emit_logup_constraints(&mut folder, logup, num_base);
+            folder.assert_all_emitted();
+        }
+        TransitionEvaluationContext::Prover { .. } => {
+            let mut base_evals = vec![FieldElement::<F>::zero(); num_base];
+            let mut folder = ProverEvalFolder::new(ctx, &mut base_evals, &mut ext_evals);
+            constraint_set.eval(&mut folder);
+            emit_logup_constraints(&mut folder, logup, num_base);
+            folder.assert_all_emitted();
+            // Promote the base-prefix results into the extension slots.
+            for (slot, base) in ext_evals.iter_mut().zip(base_evals) {
+                *slot = base.to_extension();
+            }
+        }
+    }
+    ext_evals
+}
+
+#[cfg(test)]
+mod logup_single_source_tests {
+    //! Regression tests for the single-source LogUp constraint bodies
+    //! ([`emit_logup_constraints`]) run three ways from ONE definition. For
+    //! every layout we assert, on 1000
+    //! random two-step frames: [`ProverEvalFolder`] == capture→`eval_program`
+    //! (prover) and [`VerifierEvalFolder`] == capture→`eval_program_verifier`
+    //! (verifier) — all bit-for-bit.
+    //!
+    //! Coverage: the accumulated constraint's 1-absorbed AND 2-absorbed branches
+    //! (the latter reads `aux(1, ·)` next-row cells), the batched-term
+    //! constraint, and every [`Packing`] variant's fingerprint contribution.
+    use super::*;
+    use crate::constraint_ir::{eval_program, eval_program_verifier};
+    use crate::constraints::builder::{
+        CaptureBuilder, ProverEvalFolder, RootKind, VerifierEvalFolder, num_base_from_meta,
+    };
+    use crate::frame::Frame;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+    use math::field::goldilocks::GoldilocksField as Gl;
+
+    type Fp = FieldElement<Gl>;
+    type Fp3 = FieldElement<Ext3>;
+
+    const TRIALS: usize = 1000;
+
+    /// A tiny deterministic SplitMix64 PRNG (no `rand` dependency).
+    struct SplitMix64 {
+        state: u64,
+    }
+    impl SplitMix64 {
+        fn new(seed: u64) -> Self {
+            Self { state: seed }
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Number of aux columns the layout uses: committed term columns + the
+    /// accumulated column.
+    fn num_aux_cols(layout: &LogUpLayout) -> usize {
+        if layout.interactions.is_empty() {
+            0
+        } else {
+            layout.num_term_columns + 1
+        }
+    }
+
+    fn rand_fp3(rng: &mut SplitMix64) -> Fp3 {
+        FieldElement::<Ext3>::new([
+            Fp::from(rng.next_u64()),
+            Fp::from(rng.next_u64()),
+            Fp::from(rng.next_u64()),
+        ])
+    }
+
+    /// The permanent regression check for one layout, on `TRIALS` random
+    /// two-step frames: the LogUp body run three ways from ONE definition must
+    /// agree bit-for-bit — [`ProverEvalFolder`] == capture→[`eval_program`]
+    /// (prover) and [`VerifierEvalFolder`] == capture→[`eval_program_verifier`]
+    /// (verifier).
+    fn check_layout(label: &str, layout: &LogUpLayout, num_main_cols: usize) {
+        let n_base = 0usize; // LogUp constraints are all extension-rooted.
+        let n = layout.num_constraints();
+
+        // Metadata self-consistency: derived from the LogUp emission itself
+        // (MetaBuilder), it must be all-ext, dense, and match the
+        // batched/accumulated degree formula (3 per batched term; 1 + absorbed
+        // for the accumulator).
+        let meta = {
+            let mut mb = crate::constraints::builder::MetaBuilder::new();
+            emit_logup_constraints::<Gl, Ext3, _>(&mut mb, layout, n_base);
+            mb.into_meta()
+        };
+        assert_eq!(meta.len(), n, "[{label}] meta count");
+        let num_base = num_base_from_meta(&meta);
+        assert_eq!(num_base, 0, "[{label}] LogUp meta is all-ext");
+        for (i, m) in meta.iter().enumerate() {
+            assert_eq!(m.constraint_idx, i, "[{label}] meta idx {i}");
+            assert_eq!(m.kind, RootKind::Ext, "[{label}] meta kind {i}");
+        }
+
+        // Capture once; the tree-measured degree must match the batched/
+        // accumulated formula, and `logup_max_degree` must equal their max.
+        let mut cb = CaptureBuilder::<Gl, Ext3>::new();
+        emit_logup_constraints(&mut cb, layout, n_base);
+        let (prog, degrees) = cb.finish(num_base);
+        assert_eq!(degrees.len(), n, "[{label}] one emit per constraint");
+        // Release-safe exact-once check: the emitted indices must be exactly
+        // 0..n (the per-emit EmitTracker only exists under debug_assertions,
+        // which a --release test build compiles out).
+        let mut emitted: Vec<usize> = degrees.iter().map(|&(idx, _)| idx).collect();
+        emitted.sort_unstable();
+        assert!(
+            emitted.iter().enumerate().all(|(i, &idx)| i == idx),
+            "[{label}] emitted constraint indices are not exactly 0..{n}: {emitted:?}"
+        );
+        for &(idx, measured) in &degrees {
+            let expected_degree = if idx < layout.num_committed_pairs {
+                3
+            } else {
+                1 + layout.absorbed().len()
+            };
+            assert_eq!(measured, expected_degree, "[{label}] degree {idx}");
+        }
+        assert_eq!(
+            logup_max_degree(layout),
+            degrees.iter().map(|&(_, d)| d).max().unwrap_or(0),
+            "[{label}] logup_max_degree matches max measured degree"
+        );
+
+        let n_aux = num_aux_cols(layout);
+
+        for trial in 0..TRIALS {
+            let mut rng = SplitMix64::new(0xC0FF_EE00_u64 ^ (label.len() as u64) ^ trial as u64);
+
+            // Random two-step prover frame.
+            let mk_step = |rng: &mut SplitMix64| {
+                let main: Vec<Fp> = (0..num_main_cols)
+                    .map(|_| Fp::from(rng.next_u64()))
+                    .collect();
+                let aux: Vec<Fp3> = (0..n_aux).map(|_| rand_fp3(rng)).collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let frame = Frame::<Gl, Ext3>::new(vec![mk_step(&mut rng), mk_step(&mut rng)]);
+            let rap_challenges = vec![rand_fp3(&mut rng), rand_fp3(&mut rng)]; // [z, alpha]
+            let alpha_powers: Vec<Fp3> = (0..12).map(|_| rand_fp3(&mut rng)).collect();
+            let table_offset = rand_fp3(&mut rng);
+
+            let prover_ctx = TransitionEvaluationContext::new_prover(
+                frame.as_row_frame(),
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+            );
+
+            // --- ProverEvalFolder == capture → interpret (prover) ---
+            let mut base_out = vec![Fp::zero(); n_base];
+            let mut ext_out = vec![Fp3::zero(); n];
+            let mut folder = ProverEvalFolder::new(&prover_ctx, &mut base_out, &mut ext_out);
+            emit_logup_constraints(&mut folder, layout, n_base);
+            folder.assert_all_emitted();
+
+            let mut ir_base = vec![Fp::zero(); n_base];
+            let mut ir_ext = vec![Fp3::zero(); n];
+            eval_program(&prog, &prover_ctx, &mut ir_base, &mut ir_ext);
+            for i in 0..n {
+                assert_eq!(
+                    ext_out[i], ir_ext[i],
+                    "[{label}] prover folder vs interpreter mismatch, constraint {i}, trial {trial}"
+                );
+            }
+
+            // --- verifier-side: embed the same frame into the extension ---
+            let embed_step = |step: &TableView<Gl, Ext3>| -> TableView<Ext3, Ext3> {
+                let main: Vec<Fp3> = (0..num_main_cols)
+                    .map(|c| step.get_main_evaluation_element(0, c).to_extension())
+                    .collect();
+                let aux: Vec<Fp3> = (0..n_aux)
+                    .map(|c| *step.get_aux_evaluation_element(0, c))
+                    .collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let vframe: Frame<Ext3, Ext3> = Frame::new(vec![
+                embed_step(frame.get_evaluation_step(0)),
+                embed_step(frame.get_evaluation_step(1)),
+            ]);
+            let vctx = TransitionEvaluationContext::<Gl, Ext3>::new_verifier(
+                &vframe,
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+            );
+
+            // --- VerifierEvalFolder == capture → interpret (verifier) ---
+            let mut vext_out = vec![Fp3::zero(); n];
+            let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
+            emit_logup_constraints(&mut vfolder, layout, n_base);
+            vfolder.assert_all_emitted();
+
+            let mut ir_vext = vec![Fp3::zero(); n];
+            eval_program_verifier(&prog, &vctx, &mut ir_vext);
+            for i in 0..n {
+                assert_eq!(
+                    vext_out[i], ir_vext[i],
+                    "[{label}] verifier folder vs interpreter mismatch, constraint {i}, trial {trial}"
+                );
+            }
+
+            // Prover base-promotion and verifier evaluations must agree
+            // (the prover frame embedded == the verifier frame).
+            for i in 0..n {
+                assert_eq!(
+                    ext_out[i], vext_out[i],
+                    "[{label}] prover vs verifier folder mismatch, constraint {i}, trial {trial}"
+                );
+            }
+        }
+    }
+
+    /// A sender interaction with a `Direct`-packed value at column 1.
+    fn direct_sender(bus_id: u64) -> BusInteraction {
+        BusInteraction::sender(
+            bus_id,
+            Multiplicity::Column(0),
+            vec![BusValue::Packed {
+                start_column: 1,
+                packing: Packing::Direct,
+            }],
+        )
+    }
+
+    /// A receiver interaction with a single `column(3)` value.
+    fn column_receiver(bus_id: u64) -> BusInteraction {
+        BusInteraction::receiver(bus_id, Multiplicity::Column(2), vec![BusValue::column(3)])
+    }
+
+    #[test]
+    fn logup_one_absorbed() {
+        // 3 interactions → split(3) = (1 committed pair, 1 absorbed):
+        //   idx 0: batched term (interactions 0,1)
+        //   idx 1: accumulated, 1 absorbed (interaction 2), degree 2.
+        let interactions = vec![direct_sender(7), column_receiver(11), direct_sender(13)];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 1, "must exercise 1-absorbed");
+        check_layout("one_absorbed", &layout, 8);
+    }
+
+    #[test]
+    fn logup_two_absorbed() {
+        // 4 interactions → split(4) = (1 committed pair, 2 absorbed):
+        //   idx 0: batched term (interactions 0,1)
+        //   idx 1: accumulated, 2 absorbed (interactions 2,3), degree 3.
+        let interactions = vec![
+            direct_sender(7),
+            column_receiver(11),
+            direct_sender(13),
+            column_receiver(17),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 2, "must exercise 2-absorbed");
+        check_layout("two_absorbed", &layout, 8);
+    }
+
+    #[test]
+    fn logup_two_interactions_absorbed_only() {
+        // 2 interactions → split(2) = (0 committed pairs, 2 absorbed): the
+        // accumulated constraint alone, degree 3, no batched term.
+        let interactions = vec![direct_sender(7), column_receiver(11)];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 0);
+        assert_eq!(layout.num_constraints(), 1);
+        check_layout("two_absorbed_only", &layout, 8);
+    }
+
+    #[test]
+    fn logup_all_packing_variants() {
+        // Drive every Packing arm through the fingerprint of a committed pair
+        // and an absorbed interaction. DWordBL/QuadHL are the widest (8 cols);
+        // give a generous column budget.
+        const ALL_PACKINGS: [Packing; 10] = [
+            Packing::Direct,
+            Packing::Word2L,
+            Packing::Word4L,
+            Packing::DWordWL,
+            Packing::DWordHHW,
+            Packing::DWordWHH,
+            Packing::DWordHL,
+            Packing::DWordBL,
+            Packing::QuadHL,
+            Packing::QuadWL,
+        ];
+        for packing in ALL_PACKINGS {
+            // 3 interactions: two committed (pair) + one absorbed, all using the
+            // packing at column 0.
+            let mk = |bus: u64, sender: bool| {
+                let values = vec![BusValue::Packed {
+                    start_column: 0,
+                    packing,
+                }];
+                if sender {
+                    BusInteraction::sender(bus, Multiplicity::One, values)
+                } else {
+                    BusInteraction::receiver(bus, Multiplicity::One, values)
+                }
+            };
+            let interactions = vec![mk(3, true), mk(5, false), mk(7, true)];
+            let layout = LogUpLayout::from_interactions(interactions);
+            check_layout(
+                &format!("packing_{packing:?}"),
+                &layout,
+                packing.num_columns(),
+            );
+        }
+    }
+
+    #[test]
+    fn logup_two_committed_pairs() {
+        // >= 2 committed pairs: split(6) = (2 pairs, 2 absorbed). Exercises
+        // the batched-term loop past its first iteration (pair_idx*2
+        // interaction indexing, per-pair term columns) and the accumulated
+        // constraint's committed-term sum over more than one aux column —
+        // the layout shape every production table has, which the fixtures
+        // above (<= 4 interactions, <= 1 pair) never reach.
+        let interactions = vec![
+            direct_sender(3),
+            column_receiver(5),
+            direct_sender(7),
+            column_receiver(11),
+            direct_sender(13),
+            column_receiver(17),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 2, "must exercise >= 2 pairs");
+        assert_eq!(layout.absorbed().len(), 2);
+        assert_eq!(layout.num_constraints(), 3); // 2 batched terms + accumulated
+        check_layout("two_committed_pairs", &layout, 8);
+    }
+
+    #[test]
+    fn logup_linear_zero_skip() {
+        // The prover folder zero-skips the F×E multiply for Linear bus
+        // elements ([`ConstraintBuilder::fold_fingerprint_term`]); the random
+        // frames above never produce a zero element, so drive both always-zero
+        // shapes explicitly — the constant-0 bus-width padding and a
+        // column-minus-itself combination — next to a nonzero element, and
+        // assert the folder still matches the (skip-free) captured program
+        // bit-for-bit.
+        let zero_padded = |bus: u64, sender: bool| {
+            let values = vec![
+                BusValue::column(1),
+                BusValue::linear(vec![LinearTerm::Constant(0)]),
+                BusValue::linear(vec![
+                    LinearTerm::Column {
+                        coefficient: 1,
+                        column: 2,
+                    },
+                    LinearTerm::Column {
+                        coefficient: -1,
+                        column: 2,
+                    },
+                ]),
+                BusValue::linear(vec![LinearTerm::Column {
+                    coefficient: 3,
+                    column: 3,
+                }]),
+            ];
+            if sender {
+                BusInteraction::sender(bus, Multiplicity::Column(0), values)
+            } else {
+                BusInteraction::receiver(bus, Multiplicity::Column(0), values)
+            }
+        };
+        let interactions = vec![
+            zero_padded(3, true),
+            zero_padded(5, false),
+            zero_padded(7, true),
+        ];
+        let layout = LogUpLayout::from_interactions(interactions);
+        assert_eq!(layout.num_committed_pairs, 1);
+        assert_eq!(layout.absorbed().len(), 1);
+        check_layout("linear_zero_skip", &layout, 8);
     }
 }

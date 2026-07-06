@@ -9,7 +9,7 @@ use super::{
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, PackingShifts, compute_alpha_powers},
+    lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{
         BatchedMultiProof, BatchedTableData, DeepPolynomialOpening, MultiProof,
         PolynomialOpenings,
@@ -170,12 +170,6 @@ pub trait IsStarkVerifier<
                 .map(|((num, den), beta)| num * den * beta)
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
-        let periodic_values = air
-            .get_periodic_column_polynomials(trace_length)
-            .iter()
-            .map(|poly| poly.evaluate(&challenges.z))
-            .collect::<Vec<FieldElement<FieldExtension>>>();
-
         let num_main_trace_columns =
             proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
 
@@ -202,23 +196,24 @@ pub trait IsStarkVerifier<
 
         let ood_frame =
             (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
-        let packing_shifts = PackingShifts::<FieldExtension>::new();
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
-            &periodic_values,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
-            &packing_shifts,
         );
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
 
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        air.transition_constraints().iter().for_each(|c| {
-            denominators[c.constraint_idx()] =
-                c.evaluate_zerofier(&challenges.z, &domain.trace_primitive_root, trace_length);
+        air.constraints_meta().iter().for_each(|m| {
+            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
+                m,
+                &challenges.z,
+                &domain.trace_primitive_root,
+                trace_length,
+            );
         });
 
         let transition_c_i_evaluations_sum = itertools::izip!(

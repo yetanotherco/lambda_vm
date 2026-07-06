@@ -7,13 +7,9 @@
 //! - **IS_BIT**: Enforces that a value is binary (0 or 1)
 //!   - Constraint: `cond * X * (1-X) = 0`
 //!
-//! - **ADD**: 64-bit addition with embedded virtual carry columns
+//! - **ADD**: 64-bit addition with carries as inline expressions
 //!   - lhs, rhs, sum: DWordWL (2 × 32-bit words)
 //!   - Embeds carry constraints inline
-
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::{constraints::transition::TransitionConstraint, table::TableView};
 
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 
@@ -29,84 +25,6 @@ pub const SHIFT_32: u64 = 1u64 << 32;
 /// Verify: INV_SHIFT_32 * SHIFT_32 ≡ 1 (mod p)
 pub const INV_SHIFT_32: u64 = 18446744065119617026;
 
-/// 2^(-32) in the field, used for carry extraction.
-#[inline]
-fn inv_2_32<F: IsField>() -> FieldElement<F> {
-    FieldElement::from(INV_SHIFT_32)
-}
-
-// =========================================================================
-// IS_BIT Template
-// =========================================================================
-
-/// Enforces that a value is binary (0 or 1).
-///
-/// Two modes:
-/// - Conditional: `cond * X * (1-X) = 0` (degree 3)
-/// - Unconditional: `X * (1-X) = 0` (degree 2)
-pub struct IsBitConstraint {
-    /// Column index for the condition (None = unconditional)
-    cond_col: Option<usize>,
-    /// Column index for the value to check (X)
-    value_col: usize,
-    /// Unique constraint identifier
-    constraint_idx: usize,
-}
-
-impl IsBitConstraint {
-    /// Creates a conditional IS_BIT constraint.
-    ///
-    /// Constraint: `cond * X * (1-X) = 0`
-    pub fn new(cond_col: usize, value_col: usize, constraint_idx: usize) -> Self {
-        Self {
-            cond_col: Some(cond_col),
-            value_col,
-            constraint_idx,
-        }
-    }
-
-    /// Creates an unconditional IS_BIT constraint.
-    ///
-    /// Constraint: `X * (1-X) = 0`
-    pub fn unconditional(value_col: usize, constraint_idx: usize) -> Self {
-        Self {
-            cond_col: None,
-            value_col,
-            constraint_idx,
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstraint {
-    fn degree(&self) -> usize {
-        match self.cond_col {
-            Some(_) => 3, // cubic: cond * X * (1-X)
-            None => 2,    // quadratic: X * (1-X)
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let x = step.get_main_evaluation_element(0, self.value_col).clone();
-        let one = FieldElement::<F>::one();
-
-        match self.cond_col {
-            Some(cond_col) => {
-                let cond = step.get_main_evaluation_element(0, cond_col).clone();
-                &cond * &x * (one - x)
-            }
-            None => &x * (one - &x),
-        }
-    }
-}
-
 // =========================================================================
 // ADD Template (Embedded Carry Approach)
 // =========================================================================
@@ -119,7 +37,7 @@ impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for IsBitConstra
 ///
 /// Uses i64 for coefficients to support negative values (e.g., `4 - 2*c`).
 /// Converted to FieldElement in eval().
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AddLinearTerm {
     /// coefficient * column_value
     Column {
@@ -130,6 +48,55 @@ pub enum AddLinearTerm {
     },
     /// A constant value
     Constant(i64),
+}
+
+/// Inline term storage for one limb of an [`AddOperand::Linear`]: at most
+/// 4 terms (the byte-packed [`AddOperand::from_dword_bl`] limb is the widest).
+///
+/// Operands are constructed INSIDE the per-row constraint bodies (the CPU
+/// table builds two per row; KECCAK builds three per lane × 25 lanes), so
+/// this must not heap-allocate — a `Vec` here costs allocations per operand
+/// per LDE row.
+#[derive(Debug, Clone, Copy)]
+pub struct AddTerms {
+    terms: [AddLinearTerm; Self::CAP],
+    len: u8,
+}
+
+impl AddTerms {
+    const CAP: usize = 4;
+    const FILL: AddLinearTerm = AddLinearTerm::Constant(0);
+
+    /// The empty term list (a zero limb).
+    pub const fn empty() -> Self {
+        Self {
+            terms: [Self::FILL; Self::CAP],
+            len: 0,
+        }
+    }
+
+    /// Term list from a slice. Panics if given more than 4 terms.
+    pub fn of(source: &[AddLinearTerm]) -> Self {
+        assert!(
+            source.len() <= Self::CAP,
+            "AddTerms holds at most {} terms, got {}",
+            Self::CAP,
+            source.len()
+        );
+        let mut terms = [Self::FILL; Self::CAP];
+        terms[..source.len()].copy_from_slice(source);
+        Self {
+            terms,
+            len: source.len() as u8,
+        }
+    }
+}
+
+impl core::ops::Deref for AddTerms {
+    type Target = [AddLinearTerm];
+    fn deref(&self) -> &[AddLinearTerm] {
+        &self.terms[..self.len as usize]
+    }
 }
 
 /// An ADD operand representing a 64-bit value as [lo, hi] words.
@@ -144,86 +111,22 @@ pub enum AddLinearTerm {
 /// - DWordHL → DWordWL: `AddOperand::from_dword_hl(col)` → repack 4 halves
 /// - DWordBL → DWordWL: `AddOperand::from_dword_bl(col)` → repack 8 bytes
 /// - Expressions: `AddOperand::linear(...)` → arbitrary linear combinations
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum AddOperand {
     /// Two consecutive columns (DWordWL): evaluates to [col, col+1]
     DWordWL { start_column: usize },
 
     /// Linear combination for lo and hi limbs.
-    /// Handles: constants, single columns, expressions, and virtual columns.
+    /// Handles: constants, single columns, and expressions.
     Linear {
         /// Terms for the low 32-bit word
-        lo: Vec<AddLinearTerm>,
+        lo: AddTerms,
         /// Terms for the high 32-bit word (empty = zero)
-        hi: Vec<AddLinearTerm>,
+        hi: AddTerms,
     },
 }
 
-impl AddLinearTerm {
-    /// Evaluate this term using values from the trace.
-    fn eval<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddLinearTerm::Column {
-                coefficient,
-                column,
-            } => {
-                let col_val = step.get_main_evaluation_element(0, *column);
-                col_val * FieldElement::<F>::from(*coefficient)
-            }
-            AddLinearTerm::Constant(value) => FieldElement::<F>::from(*value),
-        }
-    }
-}
-
-/// Evaluate a slice of terms as a sum.
-fn eval_terms<F, E>(terms: &[AddLinearTerm], step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    if terms.is_empty() {
-        FieldElement::zero()
-    } else {
-        terms
-            .iter()
-            .map(|t| t.eval(step))
-            .fold(FieldElement::zero(), |acc, x| acc + x)
-    }
-}
-
 impl AddOperand {
-    /// Get the low word value from the trace.
-    pub fn eval_lo<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddOperand::DWordWL { start_column } => {
-                step.get_main_evaluation_element(0, *start_column).clone()
-            }
-            AddOperand::Linear { lo, .. } => eval_terms(lo, step),
-        }
-    }
-
-    /// Get the high word value from the trace.
-    pub fn eval_hi<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self {
-            AddOperand::DWordWL { start_column } => step
-                .get_main_evaluation_element(0, *start_column + 1)
-                .clone(),
-            AddOperand::Linear { hi, .. } => eval_terms(hi, step),
-        }
-    }
-
     // -------------------------------------------------------------------------
     // Convenience constructors for common cast types
     // -------------------------------------------------------------------------
@@ -237,8 +140,8 @@ impl AddOperand {
     /// hi = 0 (since constants fit in 32 bits for VM use cases).
     pub fn constant(value: i64) -> Self {
         AddOperand::Linear {
-            lo: vec![AddLinearTerm::Constant(value)],
-            hi: vec![],
+            lo: AddTerms::of(&[AddLinearTerm::Constant(value)]),
+            hi: AddTerms::empty(),
         }
     }
 
@@ -246,11 +149,11 @@ impl AddOperand {
     /// hi = 0.
     pub fn from_word(col: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![AddLinearTerm::Column {
+            lo: AddTerms::of(&[AddLinearTerm::Column {
                 coefficient: 1,
                 column: col,
-            }],
-            hi: vec![],
+            }]),
+            hi: AddTerms::empty(),
         }
     }
 
@@ -259,7 +162,7 @@ impl AddOperand {
     /// hi = h[2] + 2^16 * h[3]
     pub fn from_dword_hl(start_column: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![
+            lo: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column,
@@ -268,8 +171,8 @@ impl AddOperand {
                     coefficient: 1 << 16,
                     column: start_column + 1,
                 },
-            ],
-            hi: vec![
+            ]),
+            hi: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column + 2,
@@ -278,7 +181,7 @@ impl AddOperand {
                     coefficient: 1 << 16,
                     column: start_column + 3,
                 },
-            ],
+            ]),
         }
     }
 
@@ -287,7 +190,7 @@ impl AddOperand {
     /// hi = b[4] + 2^8*b[5] + 2^16*b[6] + 2^24*b[7]
     pub fn from_dword_bl(start_column: usize) -> Self {
         AddOperand::Linear {
-            lo: vec![
+            lo: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column,
@@ -304,8 +207,8 @@ impl AddOperand {
                     coefficient: 1 << 24,
                     column: start_column + 3,
                 },
-            ],
-            hi: vec![
+            ]),
+            hi: AddTerms::of(&[
                 AddLinearTerm::Column {
                     coefficient: 1,
                     column: start_column + 4,
@@ -322,190 +225,150 @@ impl AddOperand {
                     coefficient: 1 << 24,
                     column: start_column + 7,
                 },
-            ],
+            ]),
         }
     }
 
-    /// Creates a Linear operand from explicit lo/hi term lists.
-    /// Use this for complex expressions like `4 - 2*c` or virtual columns.
-    pub fn linear(lo: Vec<AddLinearTerm>, hi: Vec<AddLinearTerm>) -> Self {
-        AddOperand::Linear { lo, hi }
+    /// Creates a Linear operand from explicit lo/hi term lists (at most 4
+    /// terms per limb). Use this for complex expressions like `4 - 2*c`.
+    pub fn linear(lo: &[AddLinearTerm], hi: &[AddLinearTerm]) -> Self {
+        AddOperand::Linear {
+            lo: AddTerms::of(lo),
+            hi: AddTerms::of(hi),
+        }
     }
 }
 
-// -------------------------------------------------------------------------
-// AddConstraint
-// -------------------------------------------------------------------------
+// =========================================================================
+// Single-body emit functions (ConstraintBuilder front-end)
+// =========================================================================
+//
+// The single-body emit functions: one body written against the generic
+// `ConstraintBuilder` serves the compiled prover folder, the verifier folder
+// and IR capture.
+//
+// Each `emit_*` takes the constraint index it emits at; the matching
+// `*_meta` returns the idx-ordered metadata (declared degree; default
+// zerofier shape — none of these templates override period/offset/
+// exemptions).
 
-/// 64-bit addition constraint with embedded carry.
-///
-/// Enforces: `lhs + rhs = sum (mod 2^64)`
-///
-/// Uses DWordWL representation (2 × 32-bit words):
-/// - lhs = [lhs_lo, lhs_hi]
-/// - rhs = [rhs_lo, rhs_hi]
-/// - sum = [sum_lo, sum_hi]
-///
-/// Embeds virtual carry columns inline:
-/// - carry_0 = (lhs_lo + rhs_lo - sum_lo) / 2^32
-/// - carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) / 2^32
-///
-/// Constraints:
-/// - carry_0 is a bit: cond * carry_0 * (1 - carry_0) = 0
-/// - carry_1 is a bit: cond * carry_1 * (1 - carry_1) = 0
-///
-/// Assumptions (must be verified via bus lookups):
-/// - lhs_lo, lhs_hi, rhs_lo, rhs_hi, sum_lo, sum_hi are all valid 32-bit words
-pub struct AddConstraint {
-    /// Column indices for condition flags (constraint active when sum > 0)
-    cond_cols: Vec<usize>,
-    /// Left-hand side operand (flexible representation)
-    lhs: AddOperand,
-    /// Right-hand side operand (flexible representation)
-    rhs: AddOperand,
-    /// Sum/output operand (flexible representation)
-    sum: AddOperand,
-    /// Which carry constraint this is (0 or 1)
-    carry_idx: usize,
-    /// Unique constraint identifier
-    constraint_idx: usize,
+use stark::constraints::builder::ConstraintBuilder;
+
+/// IS_BIT: `x·(1−x)`, optionally gated by a condition column:
+/// `cond·x·(1−x)`.
+pub fn emit_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    value_col: usize,
+    cond_col: Option<usize>,
+) {
+    let x = b.main(0, value_col);
+    let one = b.one();
+    let root = match cond_col {
+        Some(c) => {
+            let cond = b.main(0, c);
+            cond * x.clone() * (one - x)
+        }
+        None => x.clone() * (one - x),
+    };
+    b.emit_base(idx, root);
 }
 
-impl AddConstraint {
-    /// Creates ADD constraints for both carries.
-    ///
-    /// Returns two constraints: one for carry_0 and one for carry_1.
-    ///
-    /// # Arguments
-    /// * `cond_cols` - Column indices for condition flags (constraint active when sum > 0)
-    /// * `lhs` - Left-hand side operand (flexible representation)
-    /// * `rhs` - Right-hand side operand (flexible representation)
-    /// * `sum` - Sum/output operand (flexible representation)
-    /// * `constraint_idx_start` - Starting constraint index (uses 2 consecutive indices)
-    pub fn new_pair(
-        cond_cols: Vec<usize>,
-        lhs: AddOperand,
-        rhs: AddOperand,
-        sum: AddOperand,
-        constraint_idx_start: usize,
-    ) -> (Self, Self) {
-        let carry_0 = Self {
-            cond_cols: cond_cols.clone(),
-            lhs: lhs.clone(),
-            rhs: rhs.clone(),
-            sum: sum.clone(),
-            carry_idx: 0,
-            constraint_idx: constraint_idx_start,
-        };
-
-        let carry_1 = Self {
-            cond_cols,
-            lhs,
-            rhs,
-            sum,
-            carry_idx: 1,
-            constraint_idx: constraint_idx_start + 1,
-        };
-
-        (carry_0, carry_1)
+/// One [`AddLinearTerm`]: `column · coefficient` or a constant.
+fn add_term_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    t: &AddLinearTerm,
+) -> B::Expr {
+    match t {
+        AddLinearTerm::Column {
+            coefficient,
+            column,
+        } => b.main(0, *column) * b.const_signed(*coefficient),
+        AddLinearTerm::Constant(v) => b.const_signed(*v),
     }
+}
 
-    /// Compute carry_0 inline from trace values.
-    fn compute_carry_0<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_lo = self.lhs.eval_lo(step);
-        let rhs_lo = self.rhs.eval_lo(step);
-        let sum_lo = self.sum.eval_lo(step);
-
-        // carry_0 = (lhs_lo + rhs_lo - sum_lo) * 2^(-32)
-        (lhs_lo + rhs_lo - sum_lo) * inv_2_32::<F>()
+/// Sum of terms, from zero.
+fn add_terms_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    terms: &[AddLinearTerm],
+) -> B::Expr {
+    let mut acc = b.zero();
+    for t in terms {
+        acc = acc + add_term_expr(b, t);
     }
+    acc
+}
 
-    /// Compute carry_1 inline from trace values.
-    fn compute_carry_1<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_hi = self.lhs.eval_hi(step);
-        let rhs_hi = self.rhs.eval_hi(step);
-        let sum_hi = self.sum.eval_hi(step);
-        let carry_0 = self.compute_carry_0(step);
-
-        // carry_1 = (lhs_hi + rhs_hi + carry_0 - sum_hi) * 2^(-32)
-        (lhs_hi + rhs_hi + carry_0 - sum_hi) * inv_2_32::<F>()
+/// An operand's low word.
+fn add_operand_lo<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    op: &AddOperand,
+) -> B::Expr {
+    match op {
+        AddOperand::DWordWL { start_column } => b.main(0, *start_column),
+        AddOperand::Linear { lo, .. } => add_terms_expr(b, lo),
     }
+}
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
+/// An operand's high word.
+fn add_operand_hi<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    op: &AddOperand,
+) -> B::Expr {
+    match op {
+        AddOperand::DWordWL { start_column } => b.main(0, *start_column + 1),
+        AddOperand::Linear { hi, .. } => add_terms_expr(b, hi),
+    }
+}
 
-        let carry = match self.carry_idx {
-            0 => self.compute_carry_0(step),
-            1 => self.compute_carry_1(step),
-            _ => unreachable!("carry_idx validated <= 1 at construction"),
-        };
+/// The ADD carry pair, emitted from ONE body at `idx` and `idx + 1`:
+///
+/// ```text
+/// carry_0 = (lhs.lo + rhs.lo − sum.lo)·2⁻³²
+/// carry_1 = (lhs.hi + rhs.hi + carry_0 − sum.hi)·2⁻³²
+/// emit:     [cond·] carry_i·(1 − carry_i)      at idx, idx+1
+/// ```
+///
+/// `cond` is the sum of the `cond_cols` flags (empty = unconditional).
+pub fn emit_add_pair<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &mut B,
+    idx: usize,
+    cond_cols: &[usize],
+    lhs: &AddOperand,
+    rhs: &AddOperand,
+    sum: &AddOperand,
+) {
+    let inv_2_32 = b.const_base(INV_SHIFT_32);
+    let carry_0 = (add_operand_lo(b, lhs) + add_operand_lo(b, rhs) - add_operand_lo(b, sum))
+        * inv_2_32.clone();
+    let carry_1 = (add_operand_hi(b, lhs) + add_operand_hi(b, rhs) + carry_0.clone()
+        - add_operand_hi(b, sum))
+        * inv_2_32;
 
-        if self.cond_cols.is_empty() {
-            // Unconditional: carry * (1 - carry)
-            &carry * (one - &carry)
+    let cond = |b: &B| -> Option<B::Expr> {
+        if cond_cols.is_empty() {
+            None
         } else {
-            // Conditional: cond * carry * (1 - carry)
-            let cond = self
-                .cond_cols
-                .iter()
-                .map(|&col| step.get_main_evaluation_element(0, col).clone())
-                .fold(FieldElement::<F>::zero(), |acc, x| acc + x);
-            cond * &carry * (one - carry)
+            let mut acc = b.zero();
+            for &c in cond_cols {
+                acc = acc + b.main(0, c);
+            }
+            Some(acc)
         }
-    }
-}
+    };
+    let bit = |b: &B, cond: Option<B::Expr>, carry: B::Expr| -> B::Expr {
+        let one = b.one();
+        match cond {
+            Some(c) => c * carry.clone() * (one - carry),
+            None => carry.clone() * (one - carry),
+        }
+    };
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for AddConstraint {
-    fn degree(&self) -> usize {
-        if self.cond_cols.is_empty() { 2 } else { 3 }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-// =========================================================================
-// Helper Functions
-// =========================================================================
-
-/// Creates multiple unconditional IS_BIT constraints for the given columns.
-///
-/// # Arguments
-/// * `value_cols` - Slice of column indices to constrain
-/// * `constraint_idx_start` - Starting index for constraint numbering
-///
-/// # Returns
-/// Vector of IS_BIT constraints and the next available constraint index.
-pub fn new_is_bit_constraints(
-    value_cols: &[usize],
-    constraint_idx_start: usize,
-) -> (Vec<IsBitConstraint>, usize) {
-    let constraints = value_cols
-        .iter()
-        .enumerate()
-        .map(|(i, &col)| IsBitConstraint::unconditional(col, constraint_idx_start + i))
-        .collect();
-
-    (constraints, constraint_idx_start + value_cols.len())
+    let c0 = cond(b);
+    let root_0 = bit(b, c0, carry_0);
+    b.emit_base(idx, root_0);
+    let c1 = cond(b);
+    let root_1 = bit(b, c1, carry_1);
+    b.emit_base(idx + 1, root_1);
 }

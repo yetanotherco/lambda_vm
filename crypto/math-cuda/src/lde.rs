@@ -379,6 +379,13 @@ fn launch_row_to_col_major(
     Ok(dst)
 }
 
+/// Row-major LDE input: either a host slice (uploaded) or an already-resident
+/// device buffer (copied device-to-device, no PCIe upload).
+enum InnerInput<'a> {
+    Host(&'a [u64]),
+    Dev(&'a CudaSlice<u64>),
+}
+
 /// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
 ///
 /// `total_cols` is the number of base-field columns in the row-major layout:
@@ -386,19 +393,32 @@ fn launch_row_to_col_major(
 /// components are just three adjacent base-field columns, so the same row-major
 /// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
 ///
-/// Single H2D, row-major NTT, single D2H — no CPU-side extract or transpose.
-/// Returns (merkle_nodes, column-major device buffer, row-major LDE Vec). The
-/// buffer is transposed to column-major (as required by the downstream GPU
-/// kernels DEEP/barycentric); callers wrap it in the appropriate LDE handle.
+/// Single H2D (or D2D), row-major NTT, single D2H — no CPU-side extract or
+/// transpose. Returns (merkle_nodes, column-major device buffer, row-major LDE
+/// Vec, optional trace-domain column-major snapshot — `Some` iff
+/// `retain_trace_col_major`). The buffer is transposed to column-major (as
+/// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
+/// the appropriate LDE handle.
+#[allow(clippy::type_complexity)]
 fn coset_lde_row_major_inner(
-    row_major: &[u64],
+    input: InnerInput,
     n: usize,
     total_cols: usize,
     blowup_factor: usize,
     weights: &[u64],
     what: &str,
-) -> Result<(GpuMerkleTree, CudaSlice<u64>, Vec<u64>)> {
-    assert_eq!(row_major.len(), n * total_cols);
+    retain_trace_col_major: bool,
+) -> Result<(
+    GpuMerkleTree,
+    CudaSlice<u64>,
+    Vec<u64>,
+    Option<CudaSlice<u64>>,
+)> {
+    let input_len = match &input {
+        InnerInput::Host(h) => h.len(),
+        InnerInput::Dev(d) => d.len(),
+    };
+    assert_eq!(input_len, n * total_cols);
     assert!(n.is_power_of_two());
     assert_eq!(weights.len(), n);
     assert!(blowup_factor.is_power_of_two());
@@ -420,10 +440,27 @@ fn coset_lde_row_major_inner(
     let be = backend()?;
     let stream = be.next_stream();
 
-    // H2D into a zeroed lde_size*total_cols buffer; only the first n*total_cols
-    // rows carry data, the remainder are already zero (zero-padding for LDE).
+    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
+    // carry data, the remainder are already zero (zero-padding for LDE). Host
+    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
-    stream.memcpy_htod(row_major, &mut buf.slice_mut(0..n * total_cols))?;
+    match input {
+        InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+    }
+
+    // Snapshot the trace-domain input (column-major) before the iNTT overwrites
+    // it in place. The LogUp aux fingerprint kernel reads the main trace in
+    // place from this buffer, so R1 aux build skips the ~3 GB main re-upload.
+    // Transpose is a plain row->col transpose on the first n rows (not yet
+    // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
+    let trace_col_major = if retain_trace_col_major {
+        Some(launch_row_to_col_major(
+            &stream, be, &buf, n, total_cols, n as u64,
+        )?)
+    } else {
+        None
+    };
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -508,7 +545,7 @@ fn coset_lde_row_major_inner(
         leaves_len: num_leaves,
         root,
     };
-    Ok((tree, col_major_dev, lde_out))
+    Ok((tree, col_major_dev, lde_out, trace_col_major))
 }
 
 /// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
@@ -526,19 +563,22 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     blowup_factor: usize,
     weights: &[u64],
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
-        row_major,
+    let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
+        InnerInput::Host(row_major),
         n,
         m,
         blowup_factor,
         weights,
         "coset_lde_row_major lde_size",
+        true,
     )?;
     let handle = GpuLdeBase {
         buf: Arc::new(col_major_dev),
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
     };
     Ok((handle, lde_out))
 }
@@ -560,13 +600,43 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     blowup_factor: usize,
     weights: &[u64],
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let (tree, col_major_dev, lde_out) = coset_lde_row_major_inner(
-        row_major,
+    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+        InnerInput::Host(row_major),
         n,
         m * 3,
         blowup_factor,
         weights,
         "coset_lde_ext3_row_major lde_size",
+        false,
+    )?;
+    let handle = GpuLdeExt3 {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+    };
+    Ok((handle, lde_out))
+}
+
+/// Like [`coset_lde_ext3_row_major_with_merkle_tree_keep`] but the input is an
+/// already-resident device buffer (`n * m` ext3 elements, row-major, `n*m*3`
+/// u64s). No PCIe upload: the buffer is copied device-to-device into the LDE
+/// scratch. Used by the resident LogUp aux path.
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+    input_dev: &CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+        InnerInput::Dev(input_dev),
+        n,
+        m * 3,
+        blowup_factor,
+        weights,
+        "coset_lde_ext3_row_major_dev lde_size",
+        false,
     )?;
     let handle = GpuLdeExt3 {
         buf: Arc::new(col_major_dev),
@@ -590,6 +660,12 @@ pub struct GpuLdeBase {
     pub m: usize,
     pub lde_size: usize,
     pub tree: Option<GpuMerkleTree>,
+    /// Trace-domain main columns, column-major `[col*trace_rows + row]`, kept
+    /// resident from the R1 main LDE so the LogUp aux fingerprint kernel reads
+    /// them in place (no re-upload). None unless the base keep path retained it.
+    pub trace_dev: Option<Arc<CudaSlice<u64>>>,
+    /// Row count (n) of `trace_dev`; 0 when `trace_dev` is None.
+    pub trace_rows: usize,
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -1177,6 +1253,8 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
             m,
             lde_size,
             tree: None,
+            trace_dev: None,
+            trace_rows: 0,
         }))
     } else {
         drop(buf);
