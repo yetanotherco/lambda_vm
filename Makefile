@@ -289,9 +289,11 @@ test-math-cuda:
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
 # Asserts the R1-R4 GPU dispatch counters fired on a real prove.
+# --test-threads=1: these tests reset and assert on process-global GPU call
+# counters, so they must run serially or one test's reset races another's read.
 test-cuda-integration:
 	cargo test -p lambda-vm-prover --release --features cuda \
-	    --test cuda_path_integration -- --ignored --nocapture
+	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
 
 # GPU error-path coverage (requires NVIDIA GPU + nvcc).
 # Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.

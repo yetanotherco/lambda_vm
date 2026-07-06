@@ -116,6 +116,34 @@ fn test_verify_rejects_truncated_composition_poly_parts_ood() {
     );
 }
 
+/// A malformed proof whose `deep_poly_openings` Vec is shorter than the FRI
+/// query count. `reconstruct_deep_composition_poly_evaluations_for_all_queries`
+/// indexes `deep_poly_openings[i]` for every query index, and this Vec's length
+/// is not otherwise bound (the `query_list.len()` guard checks a different
+/// field), so a truncated `deep_poly_openings` must make the verifier return
+/// `false` instead of panicking with an out-of-bounds index in release builds.
+#[test_log::test]
+fn test_verify_rejects_truncated_deep_poly_openings() {
+    let (air, mut proof) = make_valid_simple_proof();
+
+    assert!(
+        proof.deep_poly_openings.len() >= 2,
+        "test precondition: a valid proof has one deep-poly opening per FRI query",
+    );
+    // Drop the last opening so the Vec is shorter than `fri_number_of_queries`;
+    // the query loop would then index past the end.
+    proof.deep_poly_openings.pop();
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<GoldilocksField>::new(&[])
+        ),
+        "Verifier must reject when deep_poly_openings is shorter than the query count"
+    );
+}
+
 /// A malformed proof whose deep-poly opening `evaluations` slice has the
 /// wrong number of columns. The runtime width-mismatch guard added in this
 /// PR must cause the verifier to return `false` instead of indexing past
