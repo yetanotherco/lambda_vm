@@ -20,7 +20,7 @@ mod debug_report;
 pub mod instruments;
 mod paged_mem;
 pub use stark::profile_markers;
-mod statement;
+pub mod statement;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
@@ -33,7 +33,6 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -61,6 +60,7 @@ use crate::test_utils::{
 
 // Re-exported so downstream verifier guests (e.g. the in-VM recursion guest) can
 // name the proof-options type carried in their private input alongside `VmProof`.
+pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 

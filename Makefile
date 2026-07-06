@@ -52,8 +52,15 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 # rather than executor/programs/. The recursion guest is the in-VM STARK verifier.
 RECURSION_GUESTS_DIR=./bench_vs/lambda
 RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
-RECURSION_GUESTS := empty fibonacci recursion
+RECURSION_GUESTS := empty fibonacci
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
+
+# The recursion verifier itself (bench_vs/lambda/recursion) requires picking
+# exactly one of its `min`/`blowup8` Cargo features at build time (fixes the
+# inner ProofOptions — see main.rs) — so it's built as two named artifacts
+# from the same crate dir, not via the generic %.elf pattern rule.
+RECURSION_VERIFIER_PRESETS := min blowup8
+RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -148,7 +155,7 @@ compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 # compiling until the tests are fast enough to run in CI.
 compile-programs: compile-programs-asm compile-programs-rust compile-bench compile-recursion-elfs
 
-compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS)
+compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS) $(RECURSION_VERIFIER_ARTIFACTS)
 
 $(RECURSION_ARTIFACTS_DIR):
 	mkdir -p $@
@@ -167,21 +174,23 @@ $(BENCH_ARTIFACTS_DIR):
 FORCE:
 
 # The guest .elf rules all share one canned recipe: the cargo build invocation is
-# identical across the rust, bench, and recursion guests. They differ only in the
-# source directory ($(1)) and the built-binary name suffix ($(2): empty when the
-# binary == crate name, `-bench` for the recursion suite, whose crates are named
-# <name>-bench). cargo owns the dep graph (see FORCE above), so the recipe always
-# runs and lets cargo decide what to actually rebuild.
+# identical across the rust, bench, and recursion guests. They differ in the
+# crate directory ($(1), the full path — callers interpolate $* themselves, so
+# a target's stem needn't match its crate dir name, e.g. the recursion-verifier
+# presets below), the built binary's filename ($(2)), and optional extra cargo
+# args ($(3), e.g. `--features min`). cargo owns the dep graph (see FORCE
+# above), so the recipe always runs and lets cargo decide what to rebuild.
 define build_guest_elf
-cd $(1)/$* && \
+cd $(1) && \
 	CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 	CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 	rustup run nightly-2026-02-01 cargo build --release \
 		--target $(RV64_TARGET_SPEC) \
 		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 		-Z build-std-features=compiler-builtins-mem \
-		-Z json-target-spec
-cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$*$(2) $@
+		-Z json-target-spec \
+		$(3)
+cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$(2) $@
 endef
 
 # Compile rust (64-bit)
@@ -191,18 +200,28 @@ endef
 # and fail to compile guest C dependencies). Order-only because prepare-sysroot is
 # .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
 $(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(RUST_PROGRAMS_DIR),)
+	$(call build_guest_elf,$(RUST_PROGRAMS_DIR)/$*,$*)
 
 # Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR),)
+	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR)/$*,$*)
 
 # Recursion-suite guests (bench_vs/lambda/): the crate's binary is <name>-bench, so
 # copy <name>-bench -> <name>.elf. std-inclusive build-std covers both the no_std
 # inner guests and the std recursion verifier. Prover tests read these prebuilt
 # artifacts like every other program (see prover/src/tests/recursion_smoke_test.rs).
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(RECURSION_GUESTS_DIR),-bench)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
+
+# The recursion verifier's `min`/`blowup8` presets: same crate dir, same
+# built-binary filename, different Cargo feature -> different artifact name.
+# Not a pattern rule (the stem "recursion-min" wouldn't match the crate dir
+# "recursion") — see the comment on RECURSION_VERIFIER_PRESETS above.
+$(RECURSION_ARTIFACTS_DIR)/recursion-min.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-bench,--features min)
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-blowup8.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-bench,--features blowup8)
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

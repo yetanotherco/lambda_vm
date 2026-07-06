@@ -5,6 +5,14 @@ name = "recursion-bench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Exactly one selects the fixed ProofOptions the inner proof was generated
+# with (see main.rs) — hardcoded, not private input: otherwise a malicious
+# private input could supply cheap/insecure options and the guest would
+# accept + commit as if it had checked something at real security.
+min = []
+blowup8 = []
+
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [
     "profile-markers",

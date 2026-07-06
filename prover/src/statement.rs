@@ -18,7 +18,13 @@ use crate::{RuntimePageRange, TableCounts};
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
 const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
-fn elf_digest(elf: &[u8]) -> [u8; 32] {
+/// Canonical full-ELF identity digest: exactly what [`absorb_statement`] binds
+/// into the Fiat-Shamir transcript, so it's the complete, unambiguous "which
+/// program" commitment (unlike `decode`/`page` table commitments, which only
+/// cover segment *content* and say nothing about e.g. `entry_point`). Public so
+/// the recursion guest can commit to it directly instead of inventing another
+/// identity scheme.
+pub fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(elf);
     h.finalize().into()
