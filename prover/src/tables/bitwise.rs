@@ -412,22 +412,171 @@ pub fn update_multiplicities(
 ) {
     for op in ops {
         let row = row_index(op.x, op.y, op.z);
-        let mu_col = match op.lookup_type {
-            BitwiseOperationType::Msb8 => cols::MU_MSB8,
-            BitwiseOperationType::Msb16 => cols::MU_MSB16,
-            BitwiseOperationType::Zero => cols::MU_ZERO,
-            BitwiseOperationType::AreBytes => cols::MU_ARE_BYTES,
-            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
-            BitwiseOperationType::IsB20 => cols::MU_IS_B20,
-            BitwiseOperationType::Hwsl => cols::MU_HWSL,
-            BitwiseOperationType::ByteAluAnd => cols::MU_BYTE_ALU_AND,
-            BitwiseOperationType::ByteAluOr => cols::MU_BYTE_ALU_OR,
-            BitwiseOperationType::ByteAluXor => cols::MU_BYTE_ALU_XOR,
-        };
+        let mu_col = mu_column(op.lookup_type);
 
         // Increment multiplicity
         let current = trace.main_table.get_row(row)[mu_col];
         trace.main_table.set_fe(row, mu_col, current + FE::one());
+    }
+}
+
+/// Number of distinct BITWISE lookup types (one multiplicity column each).
+pub const NUM_LOOKUP_TYPES: usize = 10;
+
+/// Dense index in `[0, NUM_LOOKUP_TYPES)` for a lookup type. Ordering is an
+/// internal detail of the histogram; only [`type_mu_column`] (its inverse for
+/// the fill) needs to agree with it.
+#[inline]
+pub const fn lookup_type_index(t: BitwiseOperationType) -> usize {
+    match t {
+        BitwiseOperationType::Msb8 => 0,
+        BitwiseOperationType::Msb16 => 1,
+        BitwiseOperationType::Zero => 2,
+        BitwiseOperationType::AreBytes => 3,
+        BitwiseOperationType::IsHalf => 4,
+        BitwiseOperationType::IsB20 => 5,
+        BitwiseOperationType::Hwsl => 6,
+        BitwiseOperationType::ByteAluAnd => 7,
+        BitwiseOperationType::ByteAluOr => 8,
+        BitwiseOperationType::ByteAluXor => 9,
+    }
+}
+
+/// Multiplicity column for a lookup type (used by the legacy per-op path).
+#[inline]
+pub const fn mu_column(t: BitwiseOperationType) -> usize {
+    match t {
+        BitwiseOperationType::Msb8 => cols::MU_MSB8,
+        BitwiseOperationType::Msb16 => cols::MU_MSB16,
+        BitwiseOperationType::Zero => cols::MU_ZERO,
+        BitwiseOperationType::AreBytes => cols::MU_ARE_BYTES,
+        BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
+        BitwiseOperationType::IsB20 => cols::MU_IS_B20,
+        BitwiseOperationType::Hwsl => cols::MU_HWSL,
+        BitwiseOperationType::ByteAluAnd => cols::MU_BYTE_ALU_AND,
+        BitwiseOperationType::ByteAluOr => cols::MU_BYTE_ALU_OR,
+        BitwiseOperationType::ByteAluXor => cols::MU_BYTE_ALU_XOR,
+    }
+}
+
+/// Multiplicity column for the histogram lane at dense index `type_idx`
+/// (inverse of [`lookup_type_index`]). Used by [`BitwiseHistogram::fill_multiplicities`].
+#[inline]
+const fn type_mu_column(type_idx: usize) -> usize {
+    // Columns 11..=20, one per lookup type, in `lookup_type_index` order.
+    cols::MU_MSB8 + type_idx
+}
+
+/// Guards the fragile assumption that the histogram's arithmetic column map
+/// (`type_mu_column ∘ lookup_type_index`) agrees with the authoritative per-type
+/// `mu_column` match. If anyone reorders `lookup_type_index` or renumbers the `MU_*`
+/// columns so they are no longer contiguous 11..=20 in that order, this fails loudly in a
+/// plain `cargo test` (not just the #[ignore]d parity gate) — a wrong MU column would
+/// silently unbalance the BITWISE bus and produce an unsound proof.
+#[cfg(test)]
+mod histogram_column_map_guard {
+    use super::*;
+
+    #[test]
+    fn type_mu_column_matches_mu_column_for_all_types() {
+        use BitwiseOperationType::*;
+        const ALL: [BitwiseOperationType; NUM_LOOKUP_TYPES] = [
+            Msb8, Msb16, Zero, AreBytes, IsHalf, IsB20, Hwsl, ByteAluAnd, ByteAluOr, ByteAluXor,
+        ];
+        for t in ALL {
+            assert_eq!(
+                type_mu_column(lookup_type_index(t)),
+                mu_column(t),
+                "histogram column map disagrees with mu_column for {t:?}"
+            );
+        }
+        // Also confirm the dense indices are a bijection over 0..NUM_LOOKUP_TYPES.
+        let mut seen = [false; NUM_LOOKUP_TYPES];
+        for t in ALL {
+            seen[lookup_type_index(t)] = true;
+        }
+        assert!(seen.iter().all(|&s| s), "lookup_type_index is not a bijection");
+    }
+}
+
+/// "Histogram-on-the-fly" accumulator for BITWISE lookup multiplicities.
+///
+/// Replaces materializing the giant `Vec<BitwiseOperation>` (whose only consumer
+/// is the multiplicity count) with a dense counter array. Each lookup increments
+/// `counters[type_idx * NUM_ROWS + row_index(x, y, z)]`.
+///
+/// The histogram is a commutative monoid: increments and [`merge`](Self::merge)
+/// are order-independent, so per-thread histograms can be tree-reduced and the
+/// resulting multiplicities are byte-identical to the serial per-op count that
+/// [`update_multiplicities`] produces (both just sum the same lookups per cell).
+///
+/// Memory: `NUM_ROWS * NUM_LOOKUP_TYPES * 8` bytes = 2^20 * 10 * 8 = 80 MiB.
+pub struct BitwiseHistogram {
+    counters: Box<[u64]>,
+}
+
+impl BitwiseHistogram {
+    /// Allocate a zeroed histogram (80 MiB).
+    pub fn new() -> Self {
+        Self {
+            counters: vec![0u64; NUM_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
+        }
+    }
+
+    /// Increment the counter for one lookup.
+    #[inline]
+    pub fn bump(&mut self, op: BitwiseOperation) {
+        let idx = lookup_type_index(op.lookup_type) * NUM_ROWS + row_index(op.x, op.y, op.z);
+        // `debug_assert` guards the invariant; row_index already bounds-checks z<16
+        // in debug and (x,y) are u8 so idx is always in range.
+        self.counters[idx] += 1;
+    }
+
+    /// Fold a slice of lookups into the histogram.
+    #[inline]
+    pub fn add_ops(&mut self, ops: &[BitwiseOperation]) {
+        for &op in ops {
+            self.bump(op);
+        }
+    }
+
+    /// Merge another histogram into this one (commutative, order-independent).
+    pub fn merge(&mut self, other: &BitwiseHistogram) {
+        for (a, b) in self.counters.iter_mut().zip(other.counters.iter()) {
+            *a += *b;
+        }
+    }
+
+    /// Total number of lookups counted (for instrumentation only).
+    pub fn total(&self) -> u64 {
+        self.counters.iter().sum()
+    }
+
+    /// Write the accumulated multiplicities into the BITWISE trace's MU columns.
+    ///
+    /// Produces exactly the same MU columns as calling [`update_multiplicities`]
+    /// with the full op vector, because both sum one increment per lookup into
+    /// the `(row, mu_col)` cell.
+    pub fn fill_multiplicities(
+        &self,
+        trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) {
+        for type_idx in 0..NUM_LOOKUP_TYPES {
+            let mu_col = type_mu_column(type_idx);
+            let base = type_idx * NUM_ROWS;
+            for row in 0..NUM_ROWS {
+                let count = self.counters[base + row];
+                if count != 0 {
+                    trace.main_table.set_fe(row, mu_col, FE::from(count));
+                }
+            }
+        }
+    }
+}
+
+impl Default for BitwiseHistogram {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

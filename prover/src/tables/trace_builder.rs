@@ -365,12 +365,307 @@ fn collect_cpu_ops(
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
 /// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
+/// Whether to use the legacy MEMW_R trace-gen path (materialize `Vec<MemwOperation>`
+/// for register accesses + fill columns from it), selected via the
+/// `LAMBDA_VM_LEGACY_TRACEGEN` environment variable (set to any non-empty value).
+///
+/// The default (unset) is the new direct-to-column register fill. The legacy path
+/// exists for A/B measurement and the byte-parity gate test.
+fn legacy_tracegen() -> bool {
+    std::env::var("LAMBDA_VM_LEGACY_TRACEGEN")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
+/// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
+///
+/// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
+/// column fill (`generate_memw_register_trace_direct`) and its IS_HALFWORD bitwise
+/// collector (`collect_bitwise_from_memw_register_direct`) need, and nothing else.
+/// It replaces the full `MemwOperation` (216→~152 B via the E6 shrink, but still 8
+/// `[u32;8]`/`[u64;8]` arrays) for register accesses — the largest table by rows —
+/// so the walk never materializes a `MemwOperation` for the register fast path.
+///
+/// Field domains mirror `MemwOperation`'s so the produced table is byte-identical:
+/// - `address`   = `base_address / 2` (the register index 0..=255; ADDRESS column,
+///   and `2*ADDRESS` on the memory/MEMW buses)
+/// - `val0/val1` = `value[0]`/`value[1]` (the 32-bit register halves)
+/// - `old0/old1` = `old[0]`/`old[1]`
+/// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
+///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
+#[derive(Debug, Clone, Copy)]
+struct RegRow {
+    address: u64,
+    timestamp: u64,
+    val0: u32,
+    val1: u32,
+    old0: u32,
+    old1: u32,
+    old_ts_lo: u32,
+    is_read: bool,
+}
+
+impl RegRow {
+    /// Build a `RegRow` from a fully-formed register `MemwOperation`. Used on the
+    /// precompile / commit / keccak / halt paths, which construct a `MemwOperation`
+    /// first (their computation is unchanged) and only convert to the compact row
+    /// once the op is known to route to MEMW_R.
+    ///
+    /// Only valid for ops for which `is_register_op` is true (width==2, atomic
+    /// old_timestamp). The debug asserts mirror `generate_memw_register_trace`.
+    #[inline]
+    fn from_memw(op: &MemwOperation) -> Self {
+        debug_assert_eq!(op.base_address % 2, 0);
+        debug_assert_eq!(op.old_timestamp[0], op.old_timestamp[1]);
+        RegRow {
+            address: op.base_address / 2,
+            timestamp: op.timestamp,
+            val0: op.value[0],
+            val1: op.value[1],
+            old0: op.old[0],
+            old1: op.old[1],
+            old_ts_lo: (op.old_timestamp[0] & 0xFFFF_FFFF) as u32,
+            is_read: op.is_read,
+        }
+    }
+}
+
+/// Direct-to-column MEMW_R trace fill from compact [`RegRow`]s.
+///
+/// This is the fused replacement for `generate_memw_register_trace` (which fills from
+/// `&[MemwOperation]`): it produces a BYTE-IDENTICAL table. Every column write below
+/// mirrors `memw_register::generate_memw_register_trace` cell-for-cell — the only
+/// difference is the source carrier (`RegRow` vs `MemwOperation`). Keep the two in sync.
+fn generate_memw_register_trace_direct(
+    rows: &[RegRow],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    use super::types::{FE, VmTable};
+
+    let num_rows = rows.len().next_power_of_two().max(4);
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * memw_register::cols::NUM_COLUMNS],
+        memw_register::cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
+
+    use memw_register::cols;
+    for (row_idx, r) in rows.iter().enumerate() {
+        // ADDRESS = base_address / 2 (already divided in RegRow).
+        table.set_u64(row_idx, cols::ADDRESS, r.address);
+        // Timestamp split into lo/hi 32-bit words.
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
+        // Value: registers are DWordWL = 2 words.
+        table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
+        table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
+        // Old value.
+        table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
+        table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
+        // Old timestamp low (upper limb shared with TIMESTAMP_1).
+        table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
+        // Multiplicity.
+        table.set_bool(row_idx, cols::MU_READ, r.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
+    }
+
+    trace
+}
+
+/// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta
+/// `ts_lo - old_ts_lo` is in [1, 2^16] by decomposing `ts_lo - old_ts_lo - 1` into two bytes.
+/// Shared by BOTH the direct (`RegRow`) and `MemwOperation` collectors so they can never drift
+/// (a divergence would be a silent soundness bug — see the E7 review).
+#[inline]
+fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation {
+    debug_assert!(
+        ts_lo > old_ts_lo,
+        "ts_lo must exceed old_ts_lo (enforced by reg_ts_delta_in_range)"
+    );
+    let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
+    BitwiseOperation::halfword(
+        BitwiseOperationType::IsHalf,
+        (diff_minus_1 & 0xFF) as u8,
+        (diff_minus_1 >> 8) as u8,
+    )
+}
+
+/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s.
+/// Byte-identical to `collect_bitwise_from_memw_register` (both call the shared helper).
+fn collect_bitwise_from_memw_register_direct(rows: &[RegRow]) -> Vec<BitwiseOperation> {
+    rows.iter()
+        .map(|r| memw_register_is_half_lookup((r.timestamp & 0xFFFF_FFFF) as u32, r.old_ts_lo))
+        .collect()
+}
+
+/// Routes each `MemwOperation` into its destination table bucket at CREATION time
+/// (register fast-path / aligned / general), so the walk fills the three buckets directly
+/// and no separate partition pass is needed downstream. Classification order matches the old
+/// two-stage partition (register first, then aligned), and push order within each bucket is
+/// preserved, so the buckets are byte-identical to `partition`-ing one combined vec.
+///
+/// ## Direct-to-column register fill
+///
+/// For the register fast path we do NOT materialize a `Vec<MemwOperation>`. Ops that route
+/// to MEMW_R are stored as compact [`RegRow`]s (`register_rows`) and later filled directly
+/// into the MEMW_R columns. Under the `LAMBDA_VM_LEGACY_TRACEGEN` flag we instead keep the
+/// old `Vec<MemwOperation>` (`register_ops`) and the old column fill, for A/B + byte-parity
+/// testing. The `aligned` / `general` buckets are unchanged in both modes — an op that FAILS
+/// `is_register_op` is always routed as a `MemwOperation` exactly as before.
+#[derive(Default)]
+struct MemwBuckets {
+    /// New path: compact register rows (empty in legacy mode).
+    register_rows: Vec<RegRow>,
+    /// Legacy path: full register `MemwOperation`s (empty in new mode).
+    register_ops: Vec<MemwOperation>,
+    aligned: Vec<MemwOperation>,
+    general: Vec<MemwOperation>,
+    /// When true, keep the old `Vec<MemwOperation>` register materialization + fill.
+    legacy: bool,
+}
+
+impl MemwBuckets {
+    fn with_register_capacity(n: usize, legacy: bool) -> Self {
+        Self {
+            register_rows: if legacy { Vec::new() } else { Vec::with_capacity(n) },
+            register_ops: if legacy { Vec::with_capacity(n) } else { Vec::new() },
+            aligned: Vec::new(),
+            general: Vec::new(),
+            legacy,
+        }
+    }
+
+    /// Store an op already known to route to MEMW_R.
+    #[inline]
+    fn push_register(&mut self, op: MemwOperation) {
+        if self.legacy {
+            self.register_ops.push(op);
+        } else {
+            self.register_rows.push(RegRow::from_memw(&op));
+        }
+    }
+
+    /// Store a compact register row directly (new path only). In legacy mode this
+    /// reconstructs the equivalent `MemwOperation` so the two modes are comparable.
+    #[inline]
+    fn push_register_row(&mut self, row: RegRow, op_if_legacy: impl FnOnce() -> MemwOperation) {
+        if self.legacy {
+            self.register_ops.push(op_if_legacy());
+        } else {
+            self.register_rows.push(row);
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, op: MemwOperation) {
+        if is_register_op(&op) {
+            self.push_register(op);
+        } else if is_aligned_op(&op) {
+            self.aligned.push(op);
+        } else {
+            self.general.push(op);
+        }
+    }
+    fn extend_ops(&mut self, ops: impl IntoIterator<Item = MemwOperation>) {
+        for op in ops {
+            self.push(op);
+        }
+    }
+}
+
+/// Sink for `MemwOperation`s so `collect_register_ops_from_cpu` can feed either a plain
+/// `Vec` (tests/scratch paths) or the classifying [`MemwBuckets`] (the walk).
+trait MemwSink {
+    fn push_op(&mut self, op: MemwOperation);
+
+    /// Fast path for a 2-word register access (M1/M3/M5 and precompile register I/O).
+    ///
+    /// The caller passes the compact, pre-decomposed fields. The sink decides routing
+    /// (via the same predicate as `is_register_op`): if the timestamp delta admits the
+    /// op into MEMW_R it fills a compact [`RegRow`] DIRECTLY — no `MemwOperation` is
+    /// built. Only on the (rare) fallback (delta out of IS_HALF range, or upper-limb
+    /// mismatch) does it call `build_fallback` to materialize the `MemwOperation` and
+    /// route it to the aligned/general bucket exactly as before.
+    ///
+    /// `reg_addr` is `2 * reg_index`; `[val0,val1]`/`[old0,old1]` are the 32-bit halves;
+    /// `old_ts` is the (shared) old_timestamp of both words.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn push_reg_access(
+        &mut self,
+        reg_addr: u64,
+        val0: u32,
+        val1: u32,
+        old0: u32,
+        old1: u32,
+        timestamp: u64,
+        old_ts: u64,
+        is_read: bool,
+        build_fallback: impl FnOnce() -> MemwOperation,
+    ) {
+        // Default impl (plain Vec): register accesses are still ordinary MemwOperations.
+        let _ = (reg_addr, val0, val1, old0, old1, timestamp, old_ts, is_read);
+        self.push_op(build_fallback());
+    }
+}
+impl MemwSink for Vec<MemwOperation> {
+    #[inline]
+    fn push_op(&mut self, op: MemwOperation) {
+        self.push(op);
+    }
+}
+impl MemwSink for MemwBuckets {
+    #[inline]
+    fn push_op(&mut self, op: MemwOperation) {
+        self.push(op);
+    }
+
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    fn push_reg_access(
+        &mut self,
+        reg_addr: u64,
+        val0: u32,
+        val1: u32,
+        old0: u32,
+        old1: u32,
+        timestamp: u64,
+        old_ts: u64,
+        is_read: bool,
+        build_fallback: impl FnOnce() -> MemwOperation,
+    ) {
+        // Mirror `is_register_op` for a width-2 register access whose two words share
+        // `old_ts` (always true here by construction). If it passes, fill a RegRow
+        // directly; otherwise fall back to the general/aligned MemwOperation path.
+        if reg_ts_delta_in_range(timestamp, old_ts) {
+            let row = RegRow {
+                address: reg_addr / 2,
+                timestamp,
+                val0,
+                val1,
+                old0,
+                old1,
+                old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
+                is_read,
+            };
+            self.push_register_row(row, build_fallback);
+        } else {
+            let op = build_fallback();
+            debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
+            if is_aligned_op(&op) {
+                self.aligned.push(op);
+            } else {
+                self.general.push(op);
+            }
+        }
+    }
+}
+
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
-    Vec<MemwOperation>,
+    MemwBuckets,
     Vec<LoadOperation>,
     Vec<LtOperation>,
     Vec<ShiftOperation>,
@@ -382,7 +677,7 @@ fn collect_ops_from_cpu(
     Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
-    let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
+    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3, legacy_tracegen());
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -414,16 +709,16 @@ fn collect_ops_from_cpu(
         // Collect memory operations for Load/Store instructions
         if op.decode.fields.is_load() {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
-            memw_ops.push(memw_op);
+            memw.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
         } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
-            memw_ops.push(memw_op);
+            memw.push(memw_op);
         }
 
         // Collect register operations (M1, M3, M5)
-        collect_register_ops_from_cpu(op, register_state, &mut memw_ops);
+        collect_register_ops_from_cpu(op, register_state, &mut memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -433,7 +728,7 @@ fn collect_ops_from_cpu(
                 current_commit_index as u64,
             ));
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw_ops.extend(reg_commit_ops);
+            memw.extend_ops(reg_commit_ops);
             let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
@@ -469,7 +764,7 @@ fn collect_ops_from_cpu(
             // collect_keccak_memw_ops handles memory_state + register_state updates
             let keccak_memw_ops =
                 collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
-            memw_ops.extend(keccak_memw_ops);
+            memw.extend_ops(keccak_memw_ops);
             keccak_ops.push(KeccakOperation {
                 timestamp: op.timestamp,
                 state_addr,
@@ -482,7 +777,7 @@ fn collect_ops_from_cpu(
         if op.ecall_ecsm {
             let (ecsm_memw, ecsm_op, ec_scalar_rows, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
-            memw_ops.extend(ecsm_memw);
+            memw.extend_ops(ecsm_memw);
             ecsm_ops.push(ecsm_op);
             ec_scalar_ops.extend(ec_scalar_rows);
             ecdas_ops.extend(ecdas_rows);
@@ -518,7 +813,9 @@ fn collect_ops_from_cpu(
             }
         }
 
-        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
+        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
+        // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
+        // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
@@ -531,7 +828,7 @@ fn collect_ops_from_cpu(
     );
 
     (
-        memw_ops,
+        memw,
         load_ops,
         lt_ops,
         shift_ops,
@@ -773,10 +1070,10 @@ fn collect_ecsm_ops(
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
 /// pushing them into `memw_ops`.
-fn collect_register_ops_from_cpu(
+fn collect_register_ops_from_cpu<S: MemwSink>(
     op: &CpuOperation,
     register_state: &mut RegisterState,
-    memw_ops: &mut Vec<MemwOperation>,
+    memw_ops: &mut S,
 ) {
     let d = &op.decode.fields;
     // These register accesses happen for every real instruction. For non-word
@@ -795,12 +1092,24 @@ fn collect_register_ops_from_cpu(
         } else {
             register_state.read(d.rs1)
         };
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp;
+        // Direct fast path: fill a RegRow when routing to MEMW_R; the closure rebuilds
+        // the identical MemwOperation only on the (rare) general/aligned fallback.
+        memw_ops.push_reg_access(
+            reg_addr,
+            reg_value[0] as u32,
+            reg_value[1] as u32,
+            reg_value[0] as u32,
+            reg_value[1] as u32,
+            ts,
+            old_ts,
+            true,
+            || {
+                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+                MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+                    .with_old(reg_value, old_timestamps)
+            },
+        );
         if d.rs1 == 255 {
             register_state.write_pc(op.rv1, op.timestamp);
         } else {
@@ -813,12 +1122,22 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp + 1;
+        memw_ops.push_reg_access(
+            reg_addr,
+            reg_value[0] as u32,
+            reg_value[1] as u32,
+            reg_value[0] as u32,
+            reg_value[1] as u32,
+            ts,
+            old_ts,
+            true,
+            || {
+                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+                MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
+                    .with_old(reg_value, old_timestamps)
+            },
+        );
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
 
@@ -828,12 +1147,22 @@ fn collect_register_ops_from_cpu(
         let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
         let old_value = pack_register_value(old_val);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 2, false)
-            .with_old(old_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp + 2;
+        memw_ops.push_reg_access(
+            reg_addr,
+            reg_value[0] as u32,
+            reg_value[1] as u32,
+            old_value[0] as u32,
+            old_value[1] as u32,
+            ts,
+            old_ts,
+            false,
+            || {
+                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+                MemwOperation::new(true, reg_addr, reg_value, ts, 2, false)
+                    .with_old(old_value, old_timestamps)
+            },
+        );
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
@@ -1377,11 +1706,23 @@ pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
     if op.old_timestamp[0] != op.old_timestamp[1] {
         return false;
     }
-    let ts = op.timestamp;
-    let old_ts = op.old_timestamp[0];
-    let ts_lo = ts & 0xFFFF_FFFF;
+    reg_ts_delta_in_range(op.timestamp, op.old_timestamp[0])
+}
+
+/// The timestamp-delta admission test for MEMW_R (conditions 3-5 of `is_register_op`),
+/// factored out so the direct fast path (`push_reg_access`) and the `MemwOperation`
+/// classifier (`is_register_op`) share EXACTLY the same routing logic:
+/// - `ts_hi == old_ts_hi` (upper limbs match)
+/// - `ts_lo > old_ts_lo` (lower-limb ordering)
+/// - `ts_lo - old_ts_lo <= 2^16` (delta fits the IS_HALF range [1, 2^16])
+///
+/// The fast path only calls this for width-2 register accesses whose two words share
+/// `old_ts` by construction, so conditions 1-2 of `is_register_op` always hold there.
+#[inline]
+fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
+    let ts_lo = timestamp & 0xFFFF_FFFF;
     let old_ts_lo = old_ts & 0xFFFF_FFFF;
-    let ts_hi = ts >> 32;
+    let ts_hi = timestamp >> 32;
     let old_ts_hi = old_ts >> 32;
     ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
 }
@@ -1393,17 +1734,9 @@ pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
 fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     ops.iter()
         .map(|op| {
-            let ts_lo = op.timestamp & 0xFFFF_FFFF;
-            let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
-            debug_assert!(
-                ts_lo > old_ts_lo,
-                "ts_lo must exceed old_ts_lo (enforced by is_register_op)"
-            );
-            let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
-            BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (diff_minus_1 & 0xFF) as u8,
-                (diff_minus_1 >> 8) as u8,
+            memw_register_is_half_lookup(
+                (op.timestamp & 0xFFFF_FFFF) as u32,
+                (op.old_timestamp[0] & 0xFFFF_FFFF) as u32,
             )
         })
         .collect()
@@ -2584,7 +2917,10 @@ struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
     memw_aligned_ops: Vec<MemwOperation>,
+    /// Legacy MEMW_R ops (non-empty only under `LAMBDA_VM_LEGACY_TRACEGEN`).
     memw_register_ops: Vec<MemwOperation>,
+    /// New direct-fill MEMW_R rows (non-empty in the default path).
+    memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
     lt_ops: Vec<LtOperation>,
     shift_ops: Vec<ShiftOperation>,
@@ -2647,7 +2983,7 @@ fn chunk_and_generate<T: Sync>(
 #[allow(clippy::too_many_arguments)]
 fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
-    mut memw_ops: Vec<MemwOperation>,
+    mut memw: MemwBuckets,
     load_ops: Vec<LoadOperation>,
     mut lt_ops: Vec<LtOperation>,
     mut shift_ops: Vec<ShiftOperation>,
@@ -2666,16 +3002,22 @@ fn collect_all_ops(
     // Only the final epoch terminates; intermediate epochs keep their boundary
     // register state (no zeroizing) so it can seed the next epoch.
     if is_final {
-        let halt_memw_ops = collect_halt_ops(register_state);
-        memw_ops.extend(halt_memw_ops);
+        // Route halt ops through the same classifier; they append to the end of their
+        // buckets, matching the old "append then partition" order.
+        memw.extend_ops(collect_halt_ops(register_state));
     }
 
-    // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-    // Order matters: register ops would also pass is_aligned_op, so check first.
-    let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-        memw_ops.into_iter().partition(is_register_op);
-    let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
-        memw_ops.into_iter().partition(is_aligned_op);
+    // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
+    // creation via `MemwBuckets`, so there is no separate partition pass here — the old
+    // two-`partition` sweep (which moved millions of structs a second time, a bandwidth-bound
+    // cost) is gone. Order within each bucket matches the old stable partitions → byte-identical.
+    let MemwBuckets {
+        register_rows: memw_register_rows,
+        register_ops: memw_register_ops,
+        aligned: memw_aligned_ops,
+        general: memw_ops,
+        legacy: _,
+    } = memw;
 
     // Collect BRANCH operations from CPU ops where branch_cond = true
     let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -2781,6 +3123,7 @@ fn collect_all_ops(
         memw_ops,
         memw_aligned_ops,
         memw_register_ops,
+        memw_register_rows,
         load_ops,
         lt_ops,
         shift_ops,
@@ -2825,6 +3168,7 @@ fn build_traces<I: ImageSource + Sync>(
         memw_ops,
         memw_aligned_ops,
         memw_register_ops,
+        memw_register_rows,
         load_ops,
         mut lt_ops,
         shift_ops,
@@ -2854,51 +3198,12 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("p4_bitwise_collect");
-    bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
-    // the same chunk size used to split them into instances (see chunk_and_generate
-    // below) so the BITWISE multiplicity matches the per-instance sends.
-    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops, max_rows.mul));
-    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops, max_rows.dvrm));
-    bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-    bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-    // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
-    for op in &bytewise_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &eq_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &store_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-    bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2).
-    // Continuation epochs (l2g_memory_bookend) skip PAGE entirely (see the
-    // generate_page_tables call below), so they skip its AreBytes lookups too.
-    if let Some(image) = initial_image
-        && !l2g_memory_bookend
-    {
-        bitwise_ops.extend(collect_bitwise_from_page(
-            image,
-            memory_state,
-            l2g_memory_bookend,
-        ));
-    }
 
     let public_output_bytes: Vec<u8> = commit_ops
         .iter()
         .filter(|op| !op.end)
         .map(|op| op.value)
         .collect();
-    // COMMIT table sends AreBytes and IsHalfword lookups
-    bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
-    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecsm(&ecsm_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecdas(&ecdas_ops));
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
@@ -2906,7 +3211,124 @@ fn build_traces<I: ImageSource + Sync>(
         .chunks(max_rows.cpu)
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
-    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
+    // The per-source bitwise collectors are all pure functions of their inputs and the
+    // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
+    // so we collect every source in parallel and concatenate. The result is byte-identical
+    // to the previous serial `.extend()` chain regardless of order.
+    //
+    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
+    // chunk size used to split them into instances so multiplicities match the per-instance
+    // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
+    // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
+    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
+    // Every source's bitwise lookups are collected by a pure `collect_*` function.
+    // In the DEFAULT ("histogram-on-the-fly") path we never concatenate them into one
+    // giant `Vec<BitwiseOperation>` (~140 M ops / ~560 MB at 10-tx whose only consumer
+    // is the multiplicity count). Instead each collector's transient per-source Vec is
+    // folded into a `BitwiseHistogram` and dropped, and the histograms are tree-reduced.
+    // The histogram is a commutative monoid, so the summed multiplicities are
+    // byte-identical to the serial per-op `update_multiplicities` count regardless of
+    // accumulation order (they ride a permutation-invariant bus).
+    //
+    // Under `LAMBDA_VM_LEGACY_TRACEGEN` we keep the original materialize-then-count
+    // path (build one `bitwise_ops` Vec, then `update_multiplicities`) for A/B and the
+    // byte-parity gate.
+    let use_histogram = !legacy_tracegen();
+    // Holds the accumulated multiplicities in the default path; `None` under the legacy flag.
+    let mut bitwise_histogram: Option<bitwise::BitwiseHistogram> = None;
+
+    // Shared collector list: each is a pure `Fn() -> Vec<BitwiseOperation>` of its source.
+    // The order of the list does not affect the histogram (commutative) nor the legacy
+    // concatenation's multiplicities (order-independent bus), matching the prior design.
+    type Collector<'a> = Box<dyn Fn() -> Vec<BitwiseOperation> + Sync + 'a>;
+    let mul_chunk = max_rows.mul;
+    let dvrm_chunk = max_rows.dvrm;
+    let mut collectors: Vec<Collector> = vec![
+        Box::new(|| collect_bitwise_from_lt(&lt_ops)),
+        Box::new(|| collect_bitwise_from_mul(&mul_ops, mul_chunk)),
+        Box::new(|| collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk)),
+        Box::new(|| collect_bitwise_from_branch(&branch_ops)),
+        Box::new(|| shift::collect_bitwise_from_shift(&shift_ops)),
+        Box::new(|| bytewise_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
+        Box::new(|| eq_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
+        Box::new(|| store_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
+        Box::new(|| collect_bitwise_from_memw_aligned(&memw_aligned_ops)),
+        Box::new(|| {
+            // MEMW_R IS_HALFWORD lookups from whichever carrier is populated
+            // (direct RegRows by default; legacy MemwOperations under the flag).
+            // The two produce byte-identical lookups; exactly one is non-empty.
+            let mut v = collect_bitwise_from_memw_register(&memw_register_ops);
+            v.extend(collect_bitwise_from_memw_register_direct(&memw_register_rows));
+            v
+        }),
+        Box::new(|| collect_bitwise_from_commit(&commit_ops)),
+        Box::new(|| collect_bitwise_from_keccak(&keccak_ops)),
+        Box::new(|| collect_bitwise_from_ecsm(&ecsm_ops)),
+        Box::new(|| collect_bitwise_from_ecdas(&ecdas_ops)),
+        Box::new(|| collect_byte_check_ops_for_padding(num_padding_rows)),
+    ];
+    if let Some(image) = initial_image
+        && !l2g_memory_bookend
+    {
+        collectors.push(Box::new(move || {
+            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend)
+        }));
+    }
+
+    if use_histogram {
+        // --- Histogram-on-the-fly (default) ---
+        // Fold the in-walk lookups (from the serial p2a walk + CPU32) into the base
+        // histogram, then free that Vec: it is no longer needed once counted.
+        let mut base = bitwise::BitwiseHistogram::new();
+        base.add_ops(&bitwise_ops);
+        bitwise_ops = Vec::new();
+
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            // Each collector produces its transient Vec, which is folded into a per-WORKER
+            // histogram and dropped. Using `fold` (not `map`) means one 80 MiB histogram per
+            // worker thread reused across all collectors it handles — not one allocated+zeroed
+            // per collector. Tree-reduce the per-worker histograms (commutative monoid) so we
+            // never hold the concatenated op stream.
+            let reduced = collectors
+                .par_iter()
+                .fold(bitwise::BitwiseHistogram::new, |mut h, f| {
+                    h.add_ops(&f());
+                    h
+                })
+                .reduce(bitwise::BitwiseHistogram::new, |mut a, b| {
+                    a.merge(&b);
+                    a
+                });
+            base.merge(&reduced);
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for f in &collectors {
+                base.add_ops(&f());
+            }
+        }
+        bitwise_histogram = Some(base);
+    } else {
+        // --- Legacy materialize-then-count (LAMBDA_VM_LEGACY_TRACEGEN) ---
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let parts: Vec<Vec<BitwiseOperation>> = collectors.par_iter().map(|f| f()).collect();
+            for part in parts {
+                bitwise_ops.extend(part);
+            }
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for f in &collectors {
+                bitwise_ops.extend(f());
+            }
+        }
+    }
+    drop(collectors);
     #[cfg(feature = "instruments")]
     drop(__sp);
 
@@ -2973,13 +3395,29 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_registers = || {
-        chunk_and_generate(
-            &memw_register_ops,
-            max_rows.memw_register,
-            memw_register::generate_memw_register_trace,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )
+        // Default: direct-to-column fill from compact RegRows (no MemwOperation
+        // materialization). Legacy (`LAMBDA_VM_LEGACY_TRACEGEN`): fill from the
+        // MemwOperation carrier. Dispatch on the SAME flag that chose the carrier at
+        // walk time — not on carrier-emptiness, which would silently pick the direct
+        // path for zero-register-op workloads even under the legacy flag (masking the
+        // A/B parity gate). Both paths chunk identically and produce byte-identical tables.
+        if !legacy_tracegen() {
+            chunk_and_generate(
+                &memw_register_rows,
+                max_rows.memw_register,
+                generate_memw_register_trace_direct,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        } else {
+            chunk_and_generate(
+                &memw_register_ops,
+                max_rows.memw_register,
+                memw_register::generate_memw_register_trace,
+                #[cfg(feature = "disk-spill")]
+                storage_mode,
+            )
+        }
     };
     let gen_loads = || {
         chunk_and_generate(
@@ -3076,7 +3514,13 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_bitwise = || {
         let mut bitwise = bitwise::generate_bitwise_trace();
-        bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
+        // Default: fill MU columns from the accumulated histogram (no giant op Vec).
+        // Legacy (`LAMBDA_VM_LEGACY_TRACEGEN`): scatter-add over the materialized Vec.
+        // Both write the same summed multiplicities into columns 11..=20.
+        match &bitwise_histogram {
+            Some(h) => h.fill_multiplicities(&mut bitwise),
+            None => bitwise::update_multiplicities(&mut bitwise, &bitwise_ops),
+        }
         bitwise
     };
     // Each CPU operation looks up the DECODE table once; padding rows look up

@@ -107,7 +107,7 @@ pub fn generate_memw_aligned_trace(
         table.set_dword_whh(row_idx, cols::BASE_ADDRESS[0], op.base_address);
 
         for i in 0..8 {
-            table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
         }
 
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
@@ -118,7 +118,7 @@ pub fn generate_memw_aligned_trace(
         table.set_bool(row_idx, cols::WRITE8, w8);
 
         for i in 0..8 {
-            table.set_u64(row_idx, cols::OLD[i], op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
         }
 
         // Single old_timestamp (from old_timestamp[0], verified equal for all bytes)

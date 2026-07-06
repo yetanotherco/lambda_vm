@@ -125,12 +125,12 @@ pub fn generate_memw_register_trace(
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
 
         // Value: registers are DWordWL = 2 words
-        table.set_u64(row_idx, cols::VAL_0, op.value[0]);
-        table.set_u64(row_idx, cols::VAL_1, op.value[1]);
+        table.set_u64(row_idx, cols::VAL_0, op.value[0] as u64);
+        table.set_u64(row_idx, cols::VAL_1, op.value[1] as u64);
 
         // Old value
-        table.set_u64(row_idx, cols::OLD_0, op.old[0]);
-        table.set_u64(row_idx, cols::OLD_1, op.old[1]);
+        table.set_u64(row_idx, cols::OLD_0, op.old[0] as u64);
+        table.set_u64(row_idx, cols::OLD_1, op.old[1] as u64);
 
         // Old timestamp low (upper limb shared with TIMESTAMP_1)
         table.set_u64(

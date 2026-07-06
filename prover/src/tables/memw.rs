@@ -108,17 +108,22 @@ pub struct MemwOperation {
     pub is_register: bool,
     /// Base address (64-bit)
     pub base_address: u64,
-    /// Values to write (8 bytes)
-    pub value: [u64; 8],
+    /// Values to write. Each element is one memory byte (0-255) or, for register
+    /// accesses, a 32-bit half of the register word — both fit in u32, so this is
+    /// `[u32; 8]` rather than `[u64; 8]` to halve the struct's footprint (the walk
+    /// materializes tens of millions of these; it is memory-bandwidth-bound).
+    pub value: [u32; 8],
     /// Timestamp of this access
     pub timestamp: u64,
     /// Access width: 1, 2, 4, or 8 bytes
     pub width: u8,
     /// Whether this is a read (true) or write (false)
     pub is_read: bool,
-    /// Previous values at the addresses (filled by memory model)
-    pub old: [u64; 8],
-    /// Previous timestamps at the addresses (filled by memory model)
+    /// Previous values at the addresses (filled by memory model). Same element
+    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
+    pub old: [u32; 8],
+    /// Previous timestamps at the addresses (filled by memory model). Timestamps
+    /// can reach u64::MAX (HALT), so these stay `[u64; 8]`.
     pub old_timestamp: [u64; 8],
 }
 
@@ -135,7 +140,16 @@ impl MemwOperation {
         Self {
             is_register,
             base_address,
-            value,
+            // Callers build a [u64; 8] transiently on the stack; we store the u32
+            // domain (byte / 32-bit register half) so the persisted struct is half
+            // the size. Values never exceed u32 (every element is a byte or a
+            // pack_register_value 32-bit limb). The debug_assert fails loudly if a
+            // future caller ever passes an out-of-domain value instead of silently
+            // truncating it (which would be a soundness bug).
+            value: value.map(|v| {
+                debug_assert!(v <= u32::MAX as u64, "MemwOperation value element exceeds u32: {v}");
+                v as u32
+            }),
             timestamp,
             width,
             is_read,
@@ -146,7 +160,10 @@ impl MemwOperation {
 
     /// Set the old values (from memory model).
     pub fn with_old(mut self, old: [u64; 8], old_timestamp: [u64; 8]) -> Self {
-        self.old = old;
+        self.old = old.map(|v| {
+            debug_assert!(v <= u32::MAX as u64, "MemwOperation old element exceeds u32: {v}");
+            v as u32
+        });
         self.old_timestamp = old_timestamp;
         self
     }
@@ -192,7 +209,7 @@ pub fn generate_memw_trace(
 
         // value[8]
         for i in 0..8 {
-            table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
         }
 
         // timestamp as DWordWL (2 words)
@@ -206,7 +223,7 @@ pub fn generate_memw_trace(
 
         // Output: old[8]
         for i in 0..8 {
-            table.set_u64(row_idx, cols::OLD[i], op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
         }
 
         // Auxiliary: carry[7]
