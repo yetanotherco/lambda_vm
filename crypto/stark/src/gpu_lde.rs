@@ -1641,9 +1641,12 @@ where
         1usize << terminal_shift
     };
     let total_folds = (n0 / terminal_len).trailing_zeros() as usize;
-    // The GPU path only runs above gpu_lde_threshold(); tiny clamped traces
-    // (total_folds == 0) are handled by the CPU fallback.
-    if total_folds == 0 {
+    // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
+    // the CPU path (which handles both correctly): tiny clamped traces
+    // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
+    // final fold would reach n_out == 1 and trip `fold_and_commit_layer`'s
+    // `n_out >= 2` assert. The final fold below is therefore always n_out >= 2.
+    if total_folds == 0 || terminal_len < 2 {
         return None;
     }
     let num_committed = total_folds - 1;
