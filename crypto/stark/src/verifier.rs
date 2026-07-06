@@ -238,10 +238,30 @@ pub trait IsStarkVerifier<
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
     }
 
+    /// The FRI fold layout for this proof, derived from options + domain.
+    ///
+    /// Delegates to the shared [`crate::fri::terminal::FriFoldLayout`] so the
+    /// verifier's Fiat-Shamir replay and structural checks use exactly the same
+    /// arithmetic as the CPU and GPU provers; drift between them would break all
+    /// proofs. `VerifierDomain.lde_length` is the codeword size and
+    /// `lde_length / trace_length` the blowup factor.
+    // `FriFoldLayout` is a crate-internal helper type returned from a default method
+    // of this public trait; the exposure is intentional (internal helper).
+    #[allow(private_interfaces)]
+    fn fri_termination_params(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &VerifierDomain<Field>,
+    ) -> crate::fri::terminal::FriFoldLayout {
+        let k = air.options().fri_final_poly_log_degree as u32;
+        let blowup_log = (domain.lde_length / domain.trace_length).trailing_zeros();
+        crate::fri::terminal::FriFoldLayout::new(domain.lde_length.trailing_zeros(), blowup_log, k)
+    }
+
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
     /// openings of the trace polynomials and the composition polynomial parts. It then uses these to verify that the
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
     fn step_3_verify_fri(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: &StarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -258,6 +278,46 @@ pub trait IsStarkVerifier<
                 Some(pair) => pair,
                 None => return false,
             };
+
+        // ---- Reconstruct the FRI terminal codeword from the final-poly coeffs ----
+        // The prover folds the deep composition codeword down to a terminal
+        // codeword of length `terminal_len = 2^(blowup_log + effective_k)` and sends
+        // the `2^effective_k` coefficients of the low-degree polynomial it encodes.
+        let layout = Self::fri_termination_params(air, domain);
+        let num_committed = layout.num_committed;
+
+        // Structural check: number of committed FRI layers must equal
+        // `num_committed` (zero when no fold or a single final fold happened).
+        if proof.fri_layers_merkle_roots.len() != num_committed {
+            return false;
+        }
+        // Structural check: the final polynomial must have exactly `2^effective_k`
+        // coefficients; otherwise the reconstruction below is ill-defined.
+        if proof.fri_final_poly_coeffs.len() != (1usize << layout.effective_k) {
+            return false;
+        }
+        // Structural check: every per-query FRI decommitment must carry exactly
+        // `num_committed` layers. The fold loop in `verify_query_and_sym_openings`
+        // zips these untrusted, variable-length vecs against the committed layer
+        // roots, and they are NOT bound into the Fiat-Shamir transcript. Without
+        // this check a prover could send them empty (making the fold run zero
+        // iterations and accept the query vacuously) or padded (making the loop
+        // skip the terminal low-degree check), bypassing FRI entirely. This length
+        // check is the only thing that pins them, so it must run before the loop.
+        if proof.query_list.iter().any(|decommitment| {
+            decommitment.layers_auth_paths.len() != num_committed
+                || decommitment.layers_evaluations_sym.len() != num_committed
+        }) {
+            return false;
+        }
+
+        let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
+        let terminal_codeword =
+            crate::fri::terminal::terminal_codeword_from_coeffs::<Field, FieldExtension>(
+                &proof.fri_final_poly_coeffs,
+                &terminal_offset,
+                layout.terminal_len,
+            );
 
         // verify FRI
         let mut evaluation_point_inverse = challenges
@@ -285,6 +345,7 @@ pub trait IsStarkVerifier<
                     eval,
                     &deep_poly_evaluations[i],
                     &deep_poly_evaluations_sym[i],
+                    &terminal_codeword,
                 )
             })
     }
@@ -454,6 +515,7 @@ pub trait IsStarkVerifier<
     /// `evaluation_point_inv`: precomputed value of 𝜐⁻¹.
     /// `deep_composition_evaluation`: precomputed value of p₀(𝜐), where p₀ is the deep composition polynomial.
     /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
+    #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
         proof: &StarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
@@ -462,12 +524,30 @@ pub trait IsStarkVerifier<
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
+        terminal_codeword: &[FieldElement<FieldExtension>],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let fri_layers_merkle_roots = &proof.fri_layers_merkle_roots;
+
+        let p0_eval = deep_composition_evaluation;
+        let p0_eval_sym = deep_composition_evaluation_sym;
+
+        // No-fold (clamp) case: the codeword never folds (`total_folds == 0`), so
+        // no folding challenges were drawn and the terminal codeword *is* the deep
+        // composition codeword p₀ itself. The query's two points 𝜐 and -𝜐 sit at
+        // FRI-order positions `iota*2` and `iota*2 + 1` of the terminal codeword.
+        if zetas.is_empty() {
+            return terminal_codeword
+                .get(iota * 2)
+                .is_some_and(|t| p0_eval == t)
+                && terminal_codeword
+                    .get(iota * 2 + 1)
+                    .is_some_and(|t| p0_eval_sym == t);
+        }
+
         let evaluation_point_vec: Vec<FieldElement<Field>> =
             core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
                 Some(evaluation_point.square())
@@ -475,64 +555,61 @@ pub trait IsStarkVerifier<
             .take(fri_layers_merkle_roots.len())
             .collect();
 
-        let p0_eval = deep_composition_evaluation;
-        let p0_eval_sym = deep_composition_evaluation_sym;
-
         // Reconstruct p₁(𝜐²)
         let mut v =
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
-        // Handle case with 0 FRI layers (trace_length <= 2)
-        // In this case, the fold loop below doesn't iterate, so we need to verify
-        // the final value directly here.
-        if fri_layers_merkle_roots.is_empty() {
-            return v == proof.fri_last_value;
-        }
+        // Fold through every committed layer: use the proof to verify the openings
+        // of pᵢ(−𝜐^(2ⁱ)) (given by the prover) and pᵢ(𝜐^(2ⁱ)) (computed on the
+        // previous iteration), then obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)). When there are no
+        // committed layers (`total_folds == 1`, a single final fold) this fold is
+        // empty and `v`/`index` already hold the terminal-layer value/position.
+        let openings_ok =
+            fri_layers_merkle_roots
+                .iter()
+                .enumerate()
+                .zip(&fri_decommitment.layers_auth_paths)
+                .zip(&fri_decommitment.layers_evaluations_sym)
+                .zip(evaluation_point_vec)
+                .fold(
+                    true,
+                    |result,
+                     (
+                        (((i, merkle_root), auth_path_sym), evaluation_sym),
+                        evaluation_point_inv,
+                    )| {
+                        // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
+                        // `v` is pᵢ(𝜐^(2ⁱ)).
+                        // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
+                        let openings_ok = Self::verify_fri_layer_openings(
+                            merkle_root,
+                            auth_path_sym,
+                            &v,
+                            evaluation_sym,
+                            index,
+                        );
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+                        // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
+                        v = (&v + evaluation_sym)
+                            + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+                        // Update index for next iteration. The index of the squares in the next layer
+                        // is obtained by halving the current index. This is due to the bit-reverse
+                        // ordering of the elements in the Merkle tree.
+                        index >>= 1;
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
-
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
                         result & openings_ok
-                    } else {
-                        // Check that final value is the given by the prover
-                        result & (v == proof.fri_last_value) & openings_ok
-                    }
-                },
-            )
+                    },
+                );
+
+        // After folding through all committed layers, `v` is the query's value at
+        // the terminal layer and `index` its FRI-order position there. Check it
+        // against the reconstructed terminal codeword. This single check covers
+        // both the single-fold (`total_folds == 1`, empty fold above) and
+        // multi-fold regimes; `.get()` fails closed on an out-of-range index.
+        let terminal_ok = terminal_codeword.get(index).is_some_and(|t| &v == t);
+        openings_ok & terminal_ok
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
@@ -541,6 +618,18 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
+
+        // `deep_poly_openings` comes straight from the untrusted proof and its
+        // length is not otherwise pinned (the `query_list.len()` guard checks a
+        // different field). The loop below indexes `deep_poly_openings[i]` for
+        // every `i` in `0..num_queries`, so a truncated Vec would panic the
+        // verifier with an out-of-bounds index on a malicious proof. Reject
+        // instead. (Extra entries are harmless — they are never indexed —
+        // matching the `<` convention of the `query_list` guard.)
+        if proof.deep_poly_openings.len() < num_queries {
+            return None;
+        }
+
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
 
@@ -1010,11 +1099,22 @@ pub trait IsStarkVerifier<
             })
             .collect::<Vec<FieldElement<FieldExtension>>>();
 
-        // >>>> Send challenge 𝜁ₙ₋₁
-        zetas.push(transcript.sample_field_element());
+        // The prover only samples the final-fold challenge when the codeword
+        // actually folds past the committed layers. For tiny traces (the clamp
+        // case) no fold happens, so no challenge is drawn. This must mirror the
+        // prover's `commit_phase_from_evaluations` exactly.
+        let total_folds = Self::fri_termination_params(air, domain).total_folds;
 
-        // <<<< Receive value: pₙ
-        transcript.append_field_element(&proof.fri_last_value);
+        // >>>> Send final-fold challenge 𝜁_final (only when folding occurs)
+        if total_folds > 0 {
+            zetas.push(transcript.sample_field_element());
+        }
+
+        // <<<< Receive the FRI final-polynomial coefficients (same Vec, same
+        // order the prover appended them in `commit_phase_from_evaluations`).
+        for c in &proof.fri_final_poly_coeffs {
+            transcript.append_field_element(c);
+        }
 
         // Receive grinding value
         let security_bits = air.context().proof_options.grinding_factor;
@@ -1109,7 +1209,7 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer3 = Instant::now();
 
-        if !Self::step_3_verify_fri(proof, &domain, &challenges) {
+        if !Self::step_3_verify_fri(air, proof, &domain, &challenges) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;
@@ -1175,7 +1275,7 @@ pub trait IsStarkVerifier<
                 .composition_poly_parts_ood_evaluation
                 .clone(),
             fri_layers_merkle_roots: Vec::new(),
-            fri_last_value: FieldElement::zero(),
+            fri_final_poly_coeffs: Vec::new(),
             query_list: Vec::new(),
             deep_poly_openings: Vec::new(),
             nonce: None,

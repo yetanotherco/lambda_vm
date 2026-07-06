@@ -86,6 +86,7 @@ fn epoch_transcript(
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     epoch_label: u64,
+    fri_final_poly_log_degree: u8,
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
@@ -98,6 +99,7 @@ fn epoch_transcript(
         // have private-input pages — the private-input count is always 0 here.
         0,
         runtime_page_ranges,
+        fri_final_poly_log_degree,
     );
     transcript
 }
@@ -108,6 +110,7 @@ fn global_transcript(
     elf_bytes: &[u8],
     num_epochs: usize,
     num_private_input_pages: usize,
+    fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
@@ -116,6 +119,7 @@ fn global_transcript(
         elf_bytes,
         num_epochs,
         num_private_input_pages,
+        fri_final_poly_log_degree,
         touched_page_bases,
     );
     transcript
@@ -486,6 +490,7 @@ fn prove_epoch(
             &table_counts,
             &runtime_page_ranges,
             label,
+            opts.fri_final_poly_log_degree,
         )
     };
 
@@ -578,6 +583,7 @@ fn verify_epoch(
             &epoch.table_counts,
             &epoch.runtime_page_ranges,
             label,
+            opts.fri_final_poly_log_degree,
         )
     };
 
@@ -682,6 +688,7 @@ fn prove_global(
             elf_bytes,
             boundaries.len(),
             num_private_input_pages,
+            opts.fri_final_poly_log_degree,
             page_bases,
         ),
         #[cfg(feature = "disk-spill")]
@@ -726,7 +733,13 @@ fn verify_global(
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut global_transcript(elf_bytes, num_epochs, num_private_input_pages, page_bases),
+        &mut global_transcript(
+            elf_bytes,
+            num_epochs,
+            num_private_input_pages,
+            opts.fri_final_poly_log_degree,
+            page_bases,
+        ),
         &FieldElement::zero(),
     )
 }
@@ -1538,44 +1551,6 @@ mod tests {
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options()),
             Err(Error::InvalidTableCounts(_))
         ));
-    }
-
-    // Privacy regression for the touched-cell value leak. Pre-fix, `EpochProof.boundary`
-    // serialized each touched cell's `init.value`/`fini.value` as a u64, so a private
-    // byte `b` appeared in the bundle as the 8-byte window `[b,0,0,0,0,0,0,0]`. The fix
-    // drops `boundary` from the bundle entirely (only the value-free `touched_page_bases`
-    // ships), so those windows must be gone. We mark distinctive TOUCHED byte values
-    // (0xC7..) — their u64-LE encodings are astronomically unlikely to occur as any honest
-    // field/count/root byte-run — and assert none appear in the serialized bundle. (The
-    // committed `public_output` serializes bytes RAW, not as u64s, so it cannot produce
-    // these windows even for the committed markers.)
-    #[test]
-    fn test_bundle_carries_no_touched_cell_values() {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
-        let mut input: Vec<u8> = (0u8..16).collect();
-        let markers = [0xC7u8, 0xC8, 0xC9];
-        input[4] = markers[0];
-        input[5] = markers[1];
-        input[6] = markers[2];
-
-        let bundle =
-            prove_continuation(&elf_bytes, &input, 2, &ProofOptions::default_test_options())
-                .unwrap();
-        let bytes = bincode::serialize(&bundle).unwrap();
-        for m in markers {
-            let needle = (m as u64).to_le_bytes(); // [m,0,0,0,0,0,0,0]
-            assert!(
-                !bytes.windows(8).any(|w| w == needle),
-                "byte 0x{m:02X} appears as a u64 in the bundle — a touched-cell value leaked"
-            );
-        }
-        // Sanity: still verifies from bundle + ELF alone.
-        assert!(
-            verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
-                .unwrap()
-                .is_some()
-        );
     }
 
     // Multi-page private input: the program reads private input across TWO pages

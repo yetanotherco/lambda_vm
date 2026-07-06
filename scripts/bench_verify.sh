@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # bench_verify.sh — interleaved A/B/B/A paired verifier benchmark (PR vs main).
-# Positive numbers are improvements (PR faster).
+# Reported % = (PR - baseline)/baseline, matching the classic /bench:
+# NEGATIVE numbers are improvements (PR faster/smaller); positive = regression.
 #
 # Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
 #   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~4 min).
@@ -192,7 +193,7 @@ else
   PROOF_FOR_B="$PROOF_B"
 fi
 
-echo "==> Running $N_PAIRS interleaved pairs  (improvement: + = PR faster)"
+echo "==> Running $N_PAIRS interleaved pairs  (improvement: - = PR faster)"
 printf 'pair,a_time,b_time\n' > "$WORK/pairs.csv"
 for i in $(seq 1 "$N_PAIRS"); do
   if [ $((i % 2)) -eq 1 ]; then          # odd pair: A then B
@@ -201,8 +202,8 @@ for i in $(seq 1 "$N_PAIRS"); do
     b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B")"; a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A")"
   fi
   printf '%d,%s,%s\n' "$i" "$a" "$b" >> "$WORK/pairs.csv"
-  printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (+=faster)\n' \
-    "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($b-$a)/$b*100}")"
+  printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (-=faster)\n' \
+    "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
 done
 # Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
@@ -214,8 +215,8 @@ rows = list(csv.DictReader(open(sys.argv[1])))
 A = [float(r['a_time']) for r in rows]   # PR
 B = [float(r['b_time']) for r in rows]   # baseline
 n = len(A)
-# per-pair improvement: positive => PR (A) faster than baseline (B)
-d = [(b - a) / b * 100.0 for a, b in zip(A, B)]
+# per-pair delta = (PR - baseline)/baseline: negative => PR (A) faster than baseline (B)
+d = [(a - b) / b * 100.0 for a, b in zip(A, B)]
 
 # ---- parametric: paired t ----
 mean = sum(d) / n
@@ -290,18 +291,18 @@ drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
 
 # Markdown table (rendered directly in the PR comment) + paired detail.
 sign = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
-icon = "🟢" if (lo > 0 and p < 0.05) else "🔴" if (hi < 0 and p < 0.05) else "⚪"
+icon = "🟢" if (hi < 0 and p < 0.05) else "🔴" if (lo > 0 and p < 0.05) else "⚪"
 mode = os.environ.get('MODE', 'shared')
 per_side_note = os.environ.get('PER_SIDE_NOTE', '')
 
 print("\n=== Verify ABBA result ===")
 print()
 
-# Proof size row: exact (the .bin byte size), no ABBA. + = PR smaller = better.
+# Proof size row: exact (the .bin byte size), no ABBA. - = PR smaller = better.
 size_b = float(os.environ.get('SIZE_B', 0))   # main
 size_a = float(os.environ.get('SIZE_A', 0))   # PR
-size_impr = (size_b - size_a) / size_b * 100.0 if size_b else 0.0
-size_icon = "🟢" if size_impr > 0.005 else "🔴" if size_impr < -0.005 else "⚪"
+size_impr = (size_a - size_b) / size_b * 100.0 if size_b else 0.0
+size_icon = "🟢" if size_impr < -0.005 else "🔴" if size_impr > 0.005 else "⚪"
 to_mib = lambda b: b / (1024.0 * 1024.0)
 
 # In per-side mode A and B verify different proofs, so label the metric (M2).
@@ -328,11 +329,11 @@ print()
 print(f"  run-to-run jitter:    A CV {cvA:.2f}%   B CV {cvB:.2f}%        (lower = steadier)")
 print(f"  within-session drift: {slope * N:+.2f}% over the run, 1st->2nd half {drift_shift:+.2f}%")
 print("```")
-if lo > 0 and p < 0.05:
-    print(f"\n> 🟢 **REAL IMPROVEMENT** — PR verifies ~{mean:.2f}% faster (paired-t and Wilcoxon agree).")
-elif hi < 0 and p < 0.05:
-    print(f"\n> 🔴 **REAL REGRESSION** — PR verifies ~{-mean:.2f}% slower (paired-t and Wilcoxon agree).")
-elif (lo > 0) != (p < 0.05):
+if hi < 0 and p < 0.05:
+    print(f"\n> 🟢 **REAL IMPROVEMENT** — PR verifies ~{-mean:.2f}% faster (paired-t and Wilcoxon agree).")
+elif lo > 0 and p < 0.05:
+    print(f"\n> 🔴 **REAL REGRESSION** — PR verifies ~{mean:.2f}% slower (paired-t and Wilcoxon agree).")
+elif (hi < 0) != (p < 0.05):
     print(f"\n> ⚪ **BORDERLINE** — parametric and robust disagree; suspect outlier pair(s). Trust the median ({med:+.2f}%); add pairs.")
 else:
     print(f"\n> ⚪ **INCONCLUSIVE** — effect not separable from 0 at n={n} (point estimate ~{med:+.2f}%). Add pairs to resolve.")
