@@ -110,6 +110,7 @@ fn global_transcript(
     elf_bytes: &[u8],
     num_epochs: usize,
     num_private_input_pages: usize,
+    fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
@@ -118,6 +119,7 @@ fn global_transcript(
         elf_bytes,
         num_epochs,
         num_private_input_pages,
+        fri_final_poly_log_degree,
         touched_page_bases,
     );
     transcript
@@ -686,6 +688,7 @@ fn prove_global(
             elf_bytes,
             boundaries.len(),
             num_private_input_pages,
+            opts.fri_final_poly_log_degree,
             page_bases,
         ),
         #[cfg(feature = "disk-spill")]
@@ -730,7 +733,13 @@ fn verify_global(
     Verifier::multi_verify(
         &refs,
         proof,
-        &mut global_transcript(elf_bytes, num_epochs, num_private_input_pages, page_bases),
+        &mut global_transcript(
+            elf_bytes,
+            num_epochs,
+            num_private_input_pages,
+            opts.fri_final_poly_log_degree,
+            page_bases,
+        ),
         &FieldElement::zero(),
     )
 }
