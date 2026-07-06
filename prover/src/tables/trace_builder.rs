@@ -352,19 +352,6 @@ fn collect_cpu_ops(
 // Phase 2: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
 
-/// Collects all derived operations from CPU operations in a single pass.
-///
-/// This includes:
-/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7)
-/// - LOAD ops (memory loads with sign/zero extension)
-/// - LT ops (from SLT/BLT instructions)
-/// - Bitwise lookups (from CPU operations)
-///
-/// MEMW and LOAD collection requires sequential processing with state tracking.
-///
-/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
-/// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
-#[allow(clippy::type_complexity)]
 /// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
 ///
 /// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
@@ -477,8 +464,9 @@ fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation 
     )
 }
 
-/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s.
-/// Byte-identical to `collect_bitwise_from_memw_register` (both call the shared helper).
+/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s via
+/// the shared [`memw_register_is_half_lookup`] helper (the same lookup the MEMW_R
+/// trace fill uses), so the multiplicities stay consistent with that table.
 fn collect_bitwise_from_memw_register_direct(rows: &[RegRow]) -> Vec<BitwiseOperation> {
     rows.iter()
         .map(|r| memw_register_is_half_lookup((r.timestamp & 0xFFFF_FFFF) as u32, r.old_ts_lo))
@@ -631,6 +619,18 @@ impl MemwSink for MemwBuckets {
     }
 }
 
+/// Collects all derived operations from CPU operations in a single pass.
+///
+/// This includes:
+/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7)
+/// - LOAD ops (memory loads with sign/zero extension)
+/// - LT ops (from SLT/BLT instructions)
+/// - Bitwise lookups (from CPU operations)
+///
+/// MEMW and LOAD collection requires sequential processing with state tracking.
+///
+/// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
+/// keccak_ops, cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],

@@ -142,11 +142,12 @@ impl MemwOperation {
             // Callers build a [u64; 8] transiently on the stack; we store the u32
             // domain (byte / 32-bit register half) so the persisted struct is half
             // the size. Values never exceed u32 (every element is a byte or a
-            // pack_register_value 32-bit limb). The debug_assert fails loudly if a
-            // future caller ever passes an out-of-domain value instead of silently
-            // truncating it (which would be a soundness bug).
+            // pack_register_value 32-bit limb). This is an always-on `assert!` (not
+            // `debug_assert!`): a caller passing an out-of-domain value would
+            // otherwise silently truncate here and produce an unsound witness in
+            // release builds, so the invariant is enforced in every build profile.
             value: value.map(|v| {
-                debug_assert!(
+                assert!(
                     v <= u32::MAX as u64,
                     "MemwOperation value element exceeds u32: {v}"
                 );
@@ -163,7 +164,7 @@ impl MemwOperation {
     /// Set the old values (from memory model).
     pub fn with_old(mut self, old: [u64; 8], old_timestamp: [u64; 8]) -> Self {
         self.old = old.map(|v| {
-            debug_assert!(
+            assert!(
                 v <= u32::MAX as u64,
                 "MemwOperation old element exceeds u32: {v}"
             );

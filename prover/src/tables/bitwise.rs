@@ -520,6 +520,9 @@ pub struct BitwiseHistogram {
 
 impl BitwiseHistogram {
     /// Allocate a zeroed histogram (80 MiB).
+    // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray
+    // `..Default::default()` / `#[derive(Default)]` must not silently do that.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             counters: vec![0u64; NUM_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
@@ -574,12 +577,6 @@ impl BitwiseHistogram {
                 }
             }
         }
-    }
-}
-
-impl Default for BitwiseHistogram {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
