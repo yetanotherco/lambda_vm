@@ -178,6 +178,7 @@ fn global_state(
     elf: &[u8],
     num_epochs: usize,
     num_private_input_pages: usize,
+    fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) -> [u8; 32] {
     let mut t = DefaultTranscript::<E>::new(&[]);
@@ -186,6 +187,7 @@ fn global_state(
         elf,
         num_epochs,
         num_private_input_pages,
+        fri_final_poly_log_degree,
         touched_page_bases,
     );
     t.state()
@@ -193,31 +195,36 @@ fn global_state(
 
 #[test]
 fn continuation_global_state_binds_program_epoch_count_pages_and_touched_set() {
-    let baseline = global_state(b"elf", 3, 1, &[0x1000, 0x2000]);
-    assert_eq!(baseline, global_state(b"elf", 3, 1, &[0x1000, 0x2000])); // deterministic
+    let baseline = global_state(b"elf", 3, 1, 7, &[0x1000, 0x2000]);
+    assert_eq!(baseline, global_state(b"elf", 3, 1, 7, &[0x1000, 0x2000])); // deterministic
     assert_ne!(
         baseline,
-        global_state(b"elf", 4, 1, &[0x1000, 0x2000]),
+        global_state(b"elf", 4, 1, 7, &[0x1000, 0x2000]),
         "must bind epoch count"
     );
     assert_ne!(
         baseline,
-        global_state(b"other-elf", 3, 1, &[0x1000, 0x2000]),
+        global_state(b"other-elf", 3, 1, 7, &[0x1000, 0x2000]),
         "must bind the ELF"
     );
     assert_ne!(
         baseline,
-        global_state(b"elf", 3, 2, &[0x1000, 0x2000]),
+        global_state(b"elf", 3, 2, 7, &[0x1000, 0x2000]),
         "must bind the private-input page count"
     );
     assert_ne!(
         baseline,
-        global_state(b"elf", 3, 1, &[0x1000, 0x3000]),
+        global_state(b"elf", 3, 1, 8, &[0x1000, 0x2000]),
+        "must bind fri_final_poly_log_degree"
+    );
+    assert_ne!(
+        baseline,
+        global_state(b"elf", 3, 1, 7, &[0x1000, 0x3000]),
         "must bind the touched page-base set"
     );
     assert_ne!(
         baseline,
-        global_state(b"elf", 3, 1, &[0x1000]),
+        global_state(b"elf", 3, 1, 7, &[0x1000]),
         "must bind the touched page-base count"
     );
 }
