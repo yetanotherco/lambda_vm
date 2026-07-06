@@ -176,8 +176,8 @@ impl FlamegraphGenerator {
     /// either address unresolved) is treated as an ordinary jump — no stack
     /// mutation. Symbols with `size == 0` (stripped/ASM) accept any address
     /// at or past their start, so a `dst=0` jump landing exactly on such a
-    /// boundary can misattribute — not fixed here, see flamegraph_plan.md
-    /// bug #1.
+    /// boundary can misattribute the jump as a tail call into that symbol
+    /// instead of an ordinary intra-function jump — not fixed here.
     fn maybe_tail_call(&mut self, log: &Log) {
         // Fast path: both endpoints inside the last-resolved function's range
         // ⇒ an intra-function jump. `lookup_range` guarantees the range holds
@@ -223,7 +223,7 @@ impl FlamegraphGenerator {
         // function) can resolve to the same name path and must be summed
         // into one line, matching the pre-trie String-keyed behavior.
         let mut counts: HashMap<String, u64> = HashMap::new();
-        self.collect(ROOT, &mut path, &mut name_cache, &mut counts);
+        self.collect(&mut path, &mut name_cache, &mut counts);
 
         // Sort by stack path for deterministic output.
         let mut entries: Vec<_> = counts.into_iter().collect();
@@ -236,17 +236,34 @@ impl FlamegraphGenerator {
         Ok(())
     }
 
+    /// Fill `path` with `node_idx`'s root-to-node address chain by walking
+    /// `parent` pointers — avoids one host stack frame per trie level, since
+    /// trie depth mirrors guest call-stack depth and a deeply recursive guest
+    /// would otherwise risk overflowing the host stack here.
+    fn path_to(&self, node_idx: u32, path: &mut Vec<u64>) {
+        path.clear();
+        let mut cur = node_idx;
+        loop {
+            path.push(self.nodes[cur as usize].addr);
+            if cur == ROOT {
+                break;
+            }
+            cur = self.nodes[cur as usize].parent;
+        }
+        path.reverse();
+    }
+
     fn collect(
         &self,
-        node_idx: u32,
         path: &mut Vec<u64>,
         name_cache: &mut HashMap<u64, String>,
         counts: &mut HashMap<String, u64>,
     ) {
-        let node = &self.nodes[node_idx as usize];
-        path.push(node.addr);
-
-        if node.count > 0 {
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.count == 0 {
+                continue;
+            }
+            self.path_to(idx as u32, path);
             let stack = path
                 .iter()
                 .map(|addr| {
@@ -259,12 +276,6 @@ impl FlamegraphGenerator {
                 .join(";");
             *counts.entry(stack).or_insert(0) += node.count;
         }
-
-        for &child in node.children.values() {
-            self.collect(child, path, name_cache, counts);
-        }
-
-        path.pop();
     }
 
     /// Get the total number of instructions counted so far.
@@ -277,7 +288,7 @@ impl FlamegraphGenerator {
     pub fn raw_stacks(&self) -> Vec<(Vec<u64>, u64)> {
         let mut path = Vec::new();
         let mut out = Vec::new();
-        self.collect_raw(ROOT, &mut path, &mut out);
+        self.collect_raw(&mut path, &mut out);
         out
     }
 
@@ -304,18 +315,14 @@ impl FlamegraphGenerator {
         Ok(())
     }
 
-    fn collect_raw(&self, node_idx: u32, path: &mut Vec<u64>, out: &mut Vec<(Vec<u64>, u64)>) {
-        let node = &self.nodes[node_idx as usize];
-        path.push(node.addr);
-
-        if node.count > 0 {
+    fn collect_raw(&self, path: &mut Vec<u64>, out: &mut Vec<(Vec<u64>, u64)>) {
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if node.count == 0 {
+                continue;
+            }
+            self.path_to(idx as u32, path);
             out.push((path.clone(), node.count));
         }
-        for &child in node.children.values() {
-            self.collect_raw(child, path, out);
-        }
-
-        path.pop();
     }
 }
 

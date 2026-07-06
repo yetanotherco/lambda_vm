@@ -10,7 +10,11 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
+use executor::{
+    elf::Elf,
+    flamegraph::FlamegraphGenerator,
+    vm::execution::{CHUNK_SIZE, Executor},
+};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
@@ -409,7 +413,10 @@ fn cmd_execute(
 
         let mut cycle_count: u64 = 0;
         loop {
-            let logs = match executor.resume() {
+            let limit = cycle_budget
+                .map(|budget| ((budget - cycle_count) as usize).min(CHUNK_SIZE))
+                .unwrap_or(CHUNK_SIZE);
+            let logs = match executor.resume_with_limit(limit) {
                 Ok(logs) => logs,
                 Err(e) => {
                     eprintln!("Execution failed: {:?}", e);

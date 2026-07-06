@@ -511,7 +511,7 @@ fn test_flamegraph_instruction_not_found_error() {
 }
 
 // ============================================================================
-// Tail-call misdetection regression tests (flamegraph_plan.md bug #1)
+// Tail-call misdetection regression tests
 // ============================================================================
 
 #[test]
@@ -712,8 +712,8 @@ fn test_flamegraph_regular_recursion_dst1_still_pushes() {
 
 #[test]
 fn test_flamegraph_dst0_jump_onto_zero_size_symbol_boundary() {
-    // Known misattribution risk (flamegraph_plan.md bug #1 caveat): a dst=0
-    // jump landing exactly on a zero-size (stripped/ASM) symbol's start
+    // Known misattribution risk: a dst=0 jump landing exactly on a
+    // zero-size (stripped/ASM) symbol's start
     // address is accepted by `SymbolTable::lookup` regardless of where the
     // jump came from, since zero-size symbols have no upper bound. Pin
     // current behavior (treated as a tail call, since it resolves to a
