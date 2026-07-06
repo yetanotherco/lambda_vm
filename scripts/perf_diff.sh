@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+#
+# perf_diff.sh — symbol-level profile diff of two prover builds on the ethrex
+# fixture. Companion to bench_abba.sh: once ABBA says a regression is REAL,
+# this localizes it — `perf diff` reports per-symbol self-time deltas between
+# the two binaries, which is the ground truth the source-level audits can't
+# see (inlining, register pressure, allocator time).
+#
+# Builds mirror bench_abba.sh exactly (release, jemalloc-stats) plus debug
+# symbols (CARGO_PROFILE_RELEASE_DEBUG=1 — see the note in the workspace
+# Cargo.toml); debug=1 does not change optimization, so the profiled binary
+# is the benched binary.
+#
+# USAGE (on the bench server):
+#   scripts/perf_diff.sh REF_A [REF_B=origin/main]
+# Produces:
+#   - two perf-diff tables (recorded twice per side, interleaved B A B A —
+#     symbols whose delta repeats across both tables are real, one-off
+#     deltas are sampling noise)
+#   - top self-time report per side
+# Requires: perf. If kernel.perf_event_paranoid > 2, run:
+#   sudo sysctl kernel.perf_event_paranoid=1
+
+set -euo pipefail
+
+if [ $# -lt 1 ]; then
+  echo "usage: perf_diff.sh REF_A [REF_B=origin/main]" >&2
+  exit 2
+fi
+REF_A="$1"
+REF_B="${2:-origin/main}"
+
+ELF_REL="executor/program_artifacts/rust/ethrex.elf"
+INPUT_REL="executor/tests/ethrex_bench_20.bin"
+WORK="/tmp/perf_diff"
+WT="/tmp/perf_diff_wt"
+PROOF="/tmp/perf_diff_proof.bin"
+
+ROOT="$(git rev-parse --show-toplevel)"
+cd "$ROOT"
+
+command -v perf >/dev/null 2>&1 || { echo "ERROR: perf not installed (linux-tools)." >&2; exit 1; }
+[ -f "$ELF_REL" ] || { echo "ERROR: missing $ELF_REL — run bench_abba.sh once (it builds the guest)." >&2; exit 1; }
+[ -f "$INPUT_REL" ] || { echo "ERROR: missing $INPUT_REL — run bench_abba.sh once (it builds the fixture)." >&2; exit 1; }
+
+echo "==> Refs"
+git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed -- resolving against possibly-stale local refs." >&2
+SHA_A="$(git rev-parse "$REF_A")"
+SHA_B="$(git rev-parse "$REF_B")"
+echo "   A (PR)       $REF_A  -> ${SHA_A:0:10}"
+echo "   B (baseline) $REF_B  -> ${SHA_B:0:10}"
+
+mkdir -p "$WORK"
+
+# --- Build both binaries with debug symbols (cached per SHA) ---
+need_build=0
+if [ ! -x "$WORK/cli_A" ] || [ ! -x "$WORK/cli_B" ]; then
+  need_build=1
+elif [ "$(cat "$WORK/cli_A.sha" 2>/dev/null)" != "$SHA_A" ] || [ "$(cat "$WORK/cli_B.sha" 2>/dev/null)" != "$SHA_B" ]; then
+  need_build=1
+fi
+if [ "$need_build" = "1" ]; then
+  cleanup() { git worktree remove --force "$WT" 2>/dev/null || true; }
+  trap cleanup EXIT
+  git worktree remove --force "$WT" 2>/dev/null || true
+  echo "==> Building both binaries (release + debug symbols) in $WT"
+  git worktree add --detach "$WT" "$SHA_B" >/dev/null
+  build_cli() { # $1=sha $2=out
+    echo "==> Building cli @ ${1:0:10} -> $2"
+    git -C "$WT" checkout --quiet "$1"
+    if ! ( cd "$WT" && CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p cli --features jemalloc-stats >"$WORK/build_$2.log" 2>&1 ); then
+      echo "ERROR: build failed for $2. Tail of $WORK/build_$2.log:" >&2
+      tail -40 "$WORK/build_$2.log" >&2
+      exit 1
+    fi
+    cp "$WT/target/release/cli" "$WORK/$2"
+    echo "$1" > "$WORK/$2.sha"
+  }
+  build_cli "$SHA_B" cli_B
+  build_cli "$SHA_A" cli_A
+  cleanup
+  trap - EXIT
+else
+  echo "==> Reusing cached binaries (cli_A=${SHA_A:0:10} cli_B=${SHA_B:0:10})"
+fi
+
+# --- Record: warmup, then B A B A (interleaved so drift hits both sides) ---
+record() { # $1=binary $2=out.data
+  perf record -F 599 -o "$WORK/$2" -- \
+    "$WORK/$1" prove "$ELF_REL" --private-input "$INPUT_REL" -o "$PROOF" --time \
+    >"$WORK/$2.log" 2>&1
+  rm -f "$PROOF"
+  grep -o 'Proving time: [0-9.]*' "$WORK/$2.log" || true
+}
+echo "==> Warmup (B, not recorded)"
+"$WORK/cli_B" prove "$ELF_REL" --private-input "$INPUT_REL" -o "$PROOF" --time >/dev/null 2>&1
+rm -f "$PROOF"
+echo "==> Recording B (main), run 1";  record cli_B B1.data
+echo "==> Recording A (PR),   run 1";  record cli_A A1.data
+echo "==> Recording B (main), run 2";  record cli_B B2.data
+echo "==> Recording A (PR),   run 2";  record cli_A A2.data
+
+# --- Reports ---
+echo
+echo "=== perf diff, run 1  (Delta column: + = PR spends MORE self-time there) ==="
+perf diff "$WORK/B1.data" "$WORK/A1.data" 2>/dev/null | head -60
+echo
+echo "=== perf diff, run 2  (a symbol is REAL only if it repeats here) ==="
+perf diff "$WORK/B2.data" "$WORK/A2.data" 2>/dev/null | head -60
+echo
+echo "=== top self-time, B (main) run 1 ==="
+perf report -i "$WORK/B1.data" --stdio --no-children --percent-limit 0.5 2>/dev/null | head -45
+echo
+echo "=== top self-time, A (PR) run 1 ==="
+perf report -i "$WORK/A1.data" --stdio --no-children --percent-limit 0.5 2>/dev/null | head -45
+echo
+echo "Raw data in $WORK (perf report -i $WORK/A1.data for interactive drill-down)."

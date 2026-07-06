@@ -16,15 +16,10 @@
 //!
 //! `limb = Σ 2^i · limb_bits[i]` is virtual (a linear combination, never stored).
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::new_is_bit_constraints;
 
 // =========================================================================
 // Column indices
@@ -275,102 +270,49 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..20.
 
-/// `a · b = 0` or `a · (1 - b) = 0` (degree 2), used for the spec's implication
-/// constraints (`limb_bits_i = 1 ⇒ μ = 1`, `last_limb ⇒ μ`, `last_limb ⇒ offset = 0`).
-pub struct MulZeroConstraint {
-    pub a: usize,
-    pub b: usize,
-    /// when true, the second factor is `(1 - b)` instead of `b`
-    pub b_complement: bool,
-    pub constraint_idx: usize,
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulZeroConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
+/// EC_SCALAR transition constraints as a single-source [`ConstraintSet`] (20
+/// total). No column configuration needed (the layout is fixed via `cols`).
+pub struct EcScalarConstraints;
 
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let a = step.get_main_evaluation_element(0, self.a).clone();
-        let b = step.get_main_evaluation_element(0, self.b).clone();
-        if self.b_complement {
-            a * (FieldElement::<F>::one() - b)
-        } else {
-            a * b
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcScalarConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0..10: unconditional IS_BIT `x·(1−x)` for
+        // [mu, limb_bit(0..8), last_limb], in that column order. Iterator
+        // chain, not a Vec: eval runs once per LDE row.
+        let bit_cols = core::iter::once(cols::MU)
+            .chain((0..8).map(cols::limb_bit))
+            .chain(core::iter::once(cols::LAST_LIMB));
+        for (i, col) in bit_cols.enumerate() {
+            let x = b.main(0, col);
+            let one = b.one();
+            b.emit_base(i, x.clone() * (one - x));
         }
-    }
-}
 
-/// Creates all EC_SCALAR transition constraints (20 total).
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::with_capacity(20);
-    let mut idx = constraint_idx_start;
-
-    // IS_BIT for mu, limb_bits[0..8], last_limb.
-    let mut bit_cols = vec![cols::MU];
-    bit_cols.extend((0..8).map(cols::limb_bit));
-    bit_cols.push(cols::LAST_LIMB);
-    let (bit_constraints, next) = new_is_bit_constraints(&bit_cols, idx);
-    for c in bit_constraints {
-        constraints.push(c.boxed());
-    }
-    idx = next;
-
-    // limb_bits[i] = 1 ⇒ mu = 1  :  limb_bits[i] · (1 - mu) = 0
-    for i in 0..8 {
-        constraints.push(
-            MulZeroConstraint {
-                a: cols::limb_bit(i),
-                b: cols::MU,
-                b_complement: true,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
-        idx += 1;
-    }
-
-    // last_limb = 1 ⇒ mu = 1  :  last_limb · (1 - mu) = 0
-    constraints.push(
-        MulZeroConstraint {
-            a: cols::LAST_LIMB,
-            b: cols::MU,
-            b_complement: true,
-            constraint_idx: idx,
+        // idx 10..18: limb_bit(i) · (1 − mu) = 0.
+        for i in 0..8 {
+            let a = b.main(0, cols::limb_bit(i));
+            let mu = b.main(0, cols::MU);
+            let one = b.one();
+            b.emit_base(10 + i, a * (one - mu));
         }
-        .boxed(),
-    );
-    idx += 1;
 
-    // last_limb = 1 ⇒ offset = 0  :  last_limb · offset = 0
-    constraints.push(
-        MulZeroConstraint {
-            a: cols::LAST_LIMB,
-            b: cols::OFFSET,
-            b_complement: false,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
+        // idx 18: last_limb · (1 − mu) = 0.
+        let last_limb = b.main(0, cols::LAST_LIMB);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(18, last_limb * (one - mu));
 
-    (constraints, idx)
+        // idx 19: last_limb · offset = 0.
+        let last_limb = b.main(0, cols::LAST_LIMB);
+        let offset = b.main(0, cols::OFFSET);
+        b.emit_base(19, last_limb * offset);
+    }
 }

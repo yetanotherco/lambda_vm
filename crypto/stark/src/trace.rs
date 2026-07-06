@@ -9,6 +9,8 @@ use math::spill_safe::SpillSafe;
 use rayon::prelude::{
     IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
 };
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, OnceLock};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -28,7 +30,52 @@ where
     pub num_main_columns: usize,
     pub num_aux_columns: usize,
     pub step_size: usize,
+    /// LogUp aux columns built resident on device (pre-LDE), threaded from the
+    /// R1 aux build to the R1 aux commit so they feed the aux LDE without a host
+    /// round-trip. None on the CPU / download path.
+    #[cfg(feature = "cuda")]
+    pub(crate) aux_resident: Option<math_cuda::logup::ResidentAux>,
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill,
+    /// which needs the aux columns in the host trace to spill them).
+    #[cfg(feature = "cuda")]
+    pub(crate) resident_aux_ok: bool,
+    /// Trace-domain main columns kept resident on device from the R1 main LDE
+    /// (column-major `[col*rows + row]`), so the R1 LogUp aux fingerprint kernel
+    /// reads them in place instead of re-uploading ~3 GB. None when the GPU main
+    /// LDE did not run for this table.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_trace_dev: Option<ResidentMainTrace>,
 }
+
+/// Device-resident trace-domain main columns (column-major `[col*rows + row]`),
+/// retained from the R1 main LDE for the aux fingerprint kernel. GPU-only and
+/// transient; the device buffer is excluded from logical trace equality (only
+/// `rows` participates) and opaque in `Debug`, matching `ResidentAux`.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct ResidentMainTrace {
+    pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+    pub(crate) rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for ResidentMainTrace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResidentMainTrace")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PartialEq for ResidentMainTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for ResidentMainTrace {}
 
 impl<F, E> TraceTable<F, E>
 where
@@ -52,6 +99,12 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -74,6 +127,12 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -89,11 +148,69 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
     pub fn num_rows(&self) -> usize {
         self.main_table.height
+    }
+
+    /// Store the resident (pre-LDE) LogUp aux columns, threaded to the aux commit.
+    #[cfg(feature = "cuda")]
+    pub fn set_aux_resident(&mut self, ra: math_cuda::logup::ResidentAux) {
+        self.aux_resident = Some(ra);
+    }
+
+    /// Borrow the resident aux columns (read by the aux commit for the LDE).
+    #[cfg(feature = "cuda")]
+    pub fn aux_resident(&self) -> Option<&math_cuda::logup::ResidentAux> {
+        self.aux_resident.as_ref()
+    }
+
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn resident_aux_ok(&self) -> bool {
+        self.resident_aux_ok
+    }
+
+    /// Disable the GPU-resident aux build (host trace needed, e.g. disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn set_resident_aux_ok(&mut self, ok: bool) {
+        self.resident_aux_ok = ok;
+    }
+
+    /// Stash the device-resident trace-domain main columns from the R1 main LDE
+    /// (column-major `[col*rows + row]`) so the aux fingerprint kernel reads them
+    /// in place.
+    #[cfg(feature = "cuda")]
+    pub fn set_main_trace_dev(
+        &mut self,
+        buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+        rows: usize,
+    ) {
+        self.main_trace_dev = Some(ResidentMainTrace { buf, rows });
+    }
+
+    /// The device-resident main trace `(buffer, rows)`, if retained by R1.
+    #[cfg(feature = "cuda")]
+    pub fn main_trace_dev(&self) -> Option<(&math_cuda::CudaSlice<u64>, usize)> {
+        self.main_trace_dev
+            .as_ref()
+            .map(|r| (r.buf.as_ref(), r.rows))
+    }
+
+    /// Drop the retained device-resident main trace. Its only consumer is the
+    /// aux build, so the prover clears it right after that pass to reclaim the
+    /// snapshot's VRAM before the aux-commit + DEEP/FRI peak.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_trace_dev(&mut self) {
+        self.main_trace_dev = None;
     }
 
     pub fn num_steps(&self) -> usize {
@@ -210,13 +327,44 @@ where
     pub(crate) num_rows: usize,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// If the main trace was LDE'd on the GPU via the fused pipeline, the
-    /// device buffer is retained here so downstream GPU rounds can read the
-    /// LDE without a re-H2D. `None` on any CPU path.
+    /// Per table GPU residency session: owns this table's device LDE buffers
+    /// and bound stream. Threaded R1 to R4. Empty on the CPU path.
     #[cfg(feature = "cuda")]
-    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
-    #[cfg(feature = "cuda")]
-    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+    pub(crate) gpu_session: GpuTableSession,
+}
+
+/// Per table GPU residency session.
+///
+/// Owns the device buffers for one trace table: the main and aux trace LDE
+/// (resident R1 to R4), the composition parts LDE (R2 to R4), and a bound
+/// stream. The R4 local inv_denoms and FRI state stay local to R4.
+#[cfg(feature = "cuda")]
+pub(crate) struct GpuTableSession {
+    /// Main trace LDE, resident from the R1 fused pipeline through R4. None
+    /// when the GPU LDE did not run (below threshold, preprocessed main, not
+    /// Goldilocks, or a GPU error).
+    main_lde: Option<math_cuda::lde::GpuLdeBase>,
+    /// Aux trace LDE (ext3, deinterleaved on device), resident R1 to R4.
+    aux_lde: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Composition parts LDE (ext3, deinterleaved on device), produced in R2
+    /// and resident R2 to R4 so R4 DEEP reads them on device. None when the R2
+    /// GPU path did not run.
+    composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Stream bound to this table's GPU work, acquired lazily from the backend
+    /// pool and cached. None is cached when the backend is unavailable.
+    stream: OnceLock<Option<Arc<math_cuda::CudaStream>>>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuTableSession {
+    fn new() -> Self {
+        Self {
+            main_lde: None,
+            aux_lde: None,
+            composition_parts: None,
+            stream: OnceLock::new(),
+        }
+    }
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -311,9 +459,7 @@ where
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
-            gpu_main: None,
-            #[cfg(feature = "cuda")]
-            gpu_aux: None,
+            gpu_session: GpuTableSession::new(),
         }
     }
 
@@ -348,34 +494,54 @@ where
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
-            gpu_main: None,
-            #[cfg(feature = "cuda")]
-            gpu_aux: None,
+            gpu_session: GpuTableSession::new(),
         }
     }
 
-    /// Attach an already-populated device LDE handle for the main columns.
-    /// Only set when the GPU fused pipeline produced the LDE. Callers that
-    /// ran the CPU path should leave this alone.
+    /// Attach the device LDE handle for the main columns, produced by the GPU
+    /// fused pipeline. Leave unset on the CPU path.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
-        self.gpu_main = Some(h);
+        self.gpu_session.main_lde = Some(h);
     }
 
     /// Attach an already-populated device LDE handle for the aux columns.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
-        self.gpu_aux = Some(h);
+        self.gpu_session.aux_lde = Some(h);
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
-        self.gpu_main.as_ref()
+        self.gpu_session.main_lde.as_ref()
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
-        self.gpu_aux.as_ref()
+        self.gpu_session.aux_lde.as_ref()
+    }
+
+    /// Attach the composition parts LDE produced in R2. Read by R4 DEEP so the
+    /// parts are not re-uploaded.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_composition_parts(&mut self, h: math_cuda::lde::GpuLdeExt3) {
+        self.gpu_session.composition_parts = Some(h);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_composition_parts(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
+        self.gpu_session.composition_parts.as_ref()
+    }
+
+    /// The stream bound to this table's GPU work. Acquired lazily from the
+    /// backend pool on first call and cached, so all of a table's stream ops
+    /// share one queue. Returns None (cached) when the backend is unavailable.
+    #[cfg(feature = "cuda")]
+    pub fn bound_stream(&self) -> Option<Arc<math_cuda::CudaStream>> {
+        self.gpu_session
+            .stream
+            .get_or_init(|| math_cuda::device::backend().ok().map(|b| b.next_stream()))
+            .clone()
     }
 
     pub fn num_main_cols(&self) -> usize {
@@ -400,6 +566,18 @@ where
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
         &self.aux_data[row * self.num_aux_cols + col]
+    }
+
+    /// Borrow a full main-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn main_row(&self, row: usize) -> &[FieldElement<F>] {
+        &self.main_data[row * self.num_main_cols..(row + 1) * self.num_main_cols]
+    }
+
+    /// Borrow a full aux-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn aux_row(&self, row: usize) -> &[FieldElement<E>] {
+        &self.aux_data[row * self.num_aux_cols..(row + 1) * self.num_aux_cols]
     }
 
     /// Gather a full main-trace row into an owned Vec.
@@ -495,7 +673,11 @@ where
     // both via offset, with no per-eval-point or per-{main,aux} H2D.
     #[cfg(feature = "cuda")]
     let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
-        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(&dc.points, &evaluation_points);
+        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(
+            &dc.points,
+            &evaluation_points,
+            lde_trace.bound_stream(),
+        );
     #[allow(unused_variables)]
     #[cfg(not(feature = "cuda"))]
     let r3_ctx: Option<()> = None;

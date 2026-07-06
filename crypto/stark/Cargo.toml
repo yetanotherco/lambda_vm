@@ -37,6 +37,7 @@ web-sys = { version = "0.3.64", features = ['console'], optional = true }
 serde_cbor = { version = "0.11.1" }
 
 [dev-dependencies]
+math = { path = "../math", features = ["test-utils"] }
 criterion = { version = "0.4", default-features = false }
 env_logger = "*"
 test-log = { version = "0.2.11", features = ["log"] }
@@ -48,6 +49,7 @@ rand_chacha = "0.3.1"
 test-utils = []
 test_fiat_shamir = []
 instruments = []                                                     # This enables timing prints in prover and verifier
+profile-markers = []                                                 # Emits inlining-immune asm markers for guest step profiling
 debug-checks = []                                                    # Enables validate_trace + bus balance report in prover
 parallel = ["dep:rayon", "crypto/parallel"]
 cuda = ["dep:math-cuda"]
@@ -76,6 +78,10 @@ demangle-name-section = true
 dwarf-debug-info = false
 # Should we omit the default import path
 omit-default-module-path = false
+
+[[example]]
+name = "examples_cli"
+required-features = ["test-utils"]
 
 [[bench]]
 name = "prover_benchmark"

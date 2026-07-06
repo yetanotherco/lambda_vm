@@ -10,7 +10,7 @@
 # than an unpaired two-sample test.
 #
 # WHAT IT DOES:
-#   1. Builds the ethrex guest ELF + 20-transfer fixture once (identical for both
+#   1. Builds the ethrex guest ELF + 5-transfer fixture once (identical for both
 #      sides — a prover-only change doesn't touch the guest).
 #   2. Builds the `cli` prover at REF_A and REF_B (skips the build and reuses the
 #      cached binaries if they already exist; set REBUILD=1 to force).
@@ -52,7 +52,7 @@ N_PAIRS="${3:-20}"
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_bench_20.bin"
+INPUT_REL="executor/tests/ethrex_5_transfers.bin"
 WORK="/tmp/abba_run"
 WT="/tmp/abba_wt"
 PROOF="/tmp/abba_proof.bin"
@@ -83,9 +83,9 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 20-transfer fixture (missing)"
+  echo "==> Generating ethrex 5-transfer fixture (missing)"
   ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures 20 "$INPUT_REL" distinct
+  tooling/ethrex-fixtures/target/release/ethrex-fixtures 5 "$INPUT_REL" distinct
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"

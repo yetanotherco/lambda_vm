@@ -399,7 +399,7 @@ pub fn run_with_flamegraph(
 /// Demangle a Rust symbol name using the official rustc-demangle crate.
 ///
 /// Uses the alternate format (`{:#}`) to omit the hash suffix for cleaner output.
-pub(crate) fn demangle(name: &str) -> String {
+pub fn demangle(name: &str) -> String {
     // Use rustc-demangle with alternate format to omit hash
     format!("{:#}", rustc_demangle(name))
 }
