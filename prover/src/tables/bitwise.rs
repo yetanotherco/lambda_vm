@@ -495,7 +495,10 @@ mod histogram_column_map_guard {
         for t in ALL {
             seen[lookup_type_index(t)] = true;
         }
-        assert!(seen.iter().all(|&s| s), "lookup_type_index is not a bijection");
+        assert!(
+            seen.iter().all(|&s| s),
+            "lookup_type_index is not a bijection"
+        );
     }
 }
 

@@ -147,7 +147,10 @@ impl MemwOperation {
             // future caller ever passes an out-of-domain value instead of silently
             // truncating it (which would be a soundness bug).
             value: value.map(|v| {
-                debug_assert!(v <= u32::MAX as u64, "MemwOperation value element exceeds u32: {v}");
+                debug_assert!(
+                    v <= u32::MAX as u64,
+                    "MemwOperation value element exceeds u32: {v}"
+                );
                 v as u32
             }),
             timestamp,
@@ -161,7 +164,10 @@ impl MemwOperation {
     /// Set the old values (from memory model).
     pub fn with_old(mut self, old: [u64; 8], old_timestamp: [u64; 8]) -> Self {
         self.old = old.map(|v| {
-            debug_assert!(v <= u32::MAX as u64, "MemwOperation old element exceeds u32: {v}");
+            debug_assert!(
+                v <= u32::MAX as u64,
+                "MemwOperation old element exceeds u32: {v}"
+            );
             v as u32
         });
         self.old_timestamp = old_timestamp;

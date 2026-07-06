@@ -94,7 +94,10 @@ fn assert_parity(name: &str, elf: &Elf, logs: &[executor::vm::logs::Log], privat
         .row_major_data()
         .iter()
         .any(|fe: &FieldElement<crate::tables::types::GoldilocksField>| *fe.value() != 0);
-    assert!(any_mult, "[{name}] BITWISE table all-zero — test is vacuous");
+    assert!(
+        any_mult,
+        "[{name}] BITWISE table all-zero — test is vacuous"
+    );
 
     eprintln!(
         "[{name}] BITWISE byte-parity OK ({} rows x {} cols)",

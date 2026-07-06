@@ -9,6 +9,8 @@ pub mod auto_storage_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
 #[cfg(test)]
+pub mod bitwise_histogram_parity_tests;
+#[cfg(test)]
 pub mod bitwise_tests;
 #[cfg(test)]
 pub mod branch_bus_tests;
@@ -56,8 +58,6 @@ pub mod lt_bus_tests;
 pub mod lt_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
-#[cfg(test)]
-pub mod bitwise_histogram_parity_tests;
 #[cfg(test)]
 pub mod memw_register_direct_parity_tests;
 #[cfg(test)]

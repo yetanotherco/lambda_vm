@@ -526,8 +526,16 @@ struct MemwBuckets {
 impl MemwBuckets {
     fn with_register_capacity(n: usize, legacy: bool) -> Self {
         Self {
-            register_rows: if legacy { Vec::new() } else { Vec::with_capacity(n) },
-            register_ops: if legacy { Vec::with_capacity(n) } else { Vec::new() },
+            register_rows: if legacy {
+                Vec::new()
+            } else {
+                Vec::with_capacity(n)
+            },
+            register_ops: if legacy {
+                Vec::with_capacity(n)
+            } else {
+                Vec::new()
+            },
             aligned: Vec::new(),
             general: Vec::new(),
             legacy,
@@ -3250,16 +3258,33 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|| collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk)),
         Box::new(|| collect_bitwise_from_branch(&branch_ops)),
         Box::new(|| shift::collect_bitwise_from_shift(&shift_ops)),
-        Box::new(|| bytewise_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
-        Box::new(|| eq_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
-        Box::new(|| store_ops.iter().flat_map(|op| op.collect_bitwise_ops()).collect()),
+        Box::new(|| {
+            bytewise_ops
+                .iter()
+                .flat_map(|op| op.collect_bitwise_ops())
+                .collect()
+        }),
+        Box::new(|| {
+            eq_ops
+                .iter()
+                .flat_map(|op| op.collect_bitwise_ops())
+                .collect()
+        }),
+        Box::new(|| {
+            store_ops
+                .iter()
+                .flat_map(|op| op.collect_bitwise_ops())
+                .collect()
+        }),
         Box::new(|| collect_bitwise_from_memw_aligned(&memw_aligned_ops)),
         Box::new(|| {
             // MEMW_R IS_HALFWORD lookups from whichever carrier is populated
             // (direct RegRows by default; legacy MemwOperations under the flag).
             // The two produce byte-identical lookups; exactly one is non-empty.
             let mut v = collect_bitwise_from_memw_register(&memw_register_ops);
-            v.extend(collect_bitwise_from_memw_register_direct(&memw_register_rows));
+            v.extend(collect_bitwise_from_memw_register_direct(
+                &memw_register_rows,
+            ));
             v
         }),
         Box::new(|| collect_bitwise_from_commit(&commit_ops)),

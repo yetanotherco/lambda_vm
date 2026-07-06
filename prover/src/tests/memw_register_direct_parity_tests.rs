@@ -48,7 +48,11 @@ fn build_traces(elf: &Elf, logs: &[executor::vm::logs::Log], private_input: &[u8
 
 /// Build traces once with legacy MEMW_R fill and once with the direct fill, holding the
 /// env lock so the flag is stable across each build.
-fn build_both(elf: &Elf, logs: &[executor::vm::logs::Log], private_input: &[u8]) -> (Traces, Traces) {
+fn build_both(
+    elf: &Elf,
+    logs: &[executor::vm::logs::Log],
+    private_input: &[u8],
+) -> (Traces, Traces) {
     let _guard = ENV_LOCK.lock().unwrap();
 
     // SAFETY: single-threaded within the lock; no other test reads the var concurrently.
@@ -118,7 +122,10 @@ fn assert_parity(name: &str, elf: &Elf, logs: &[executor::vm::logs::Log], privat
         );
         total_rows += l.num_rows();
     }
-    assert!(total_rows > 0, "[{name}] MEMW_R has no rows — test is vacuous");
+    assert!(
+        total_rows > 0,
+        "[{name}] MEMW_R has no rows — test is vacuous"
+    );
 
     // ---- General + aligned MEMW buckets: unchanged as a multiset ----
     assert_eq!(
