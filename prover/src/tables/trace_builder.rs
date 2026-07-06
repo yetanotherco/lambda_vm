@@ -3228,14 +3228,23 @@ fn build_traces<I: ImageSource + Sync>(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        // Each collector produces its transient Vec, which is folded into a per-worker
-        // histogram and dropped. `fold` (not `map`) reuses one histogram per work-split
-        // instead of allocating one per collector. Tree-reduce them (commutative monoid) so
-        // we never hold the concatenated op stream.
+        // Each collector produces a transient Vec of lookups that is folded into a
+        // dense 80 MiB histogram and dropped. To keep peak memory from scaling with
+        // core count, cap the number of concurrent histograms: split the collectors
+        // into at most `max_par` chunks (one histogram each), run the chunks in
+        // parallel, and process the collectors within a chunk sequentially (so at most
+        // one transient Vec is live per chunk). Tree-reduce the chunk histograms —
+        // add_ops/merge form a commutative monoid, so the result is order-independent
+        // and byte-identical to the sequential path.
+        let max_par = rayon::current_num_threads().clamp(1, 8);
+        let chunk_size = collectors.len().div_ceil(max_par).max(1);
         let reduced = collectors
-            .par_iter()
-            .fold(bitwise::BitwiseHistogram::new, |mut h, f| {
-                h.add_ops(&f());
+            .par_chunks(chunk_size)
+            .map(|chunk| {
+                let mut h = bitwise::BitwiseHistogram::new();
+                for f in chunk {
+                    h.add_ops(&f());
+                }
                 h
             })
             .reduce(bitwise::BitwiseHistogram::new, |mut a, b| {
