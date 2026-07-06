@@ -26,7 +26,8 @@ use math::{
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{
-    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefMutIterator, ParallelIterator,
+    IndexedParallelIterator, IntoParallelIterator, IntoParallelRefIterator,
+    IntoParallelRefMutIterator, ParallelIterator,
 };
 
 #[cfg(feature = "debug-checks")]
@@ -523,7 +524,6 @@ where
     pub(crate) round3s: Vec<Round3<FieldExtension>>,
     pub(crate) z: FieldElement<FieldExtension>,
     pub(crate) domains: Vec<Arc<Domain<Field>>>,
-    pub(crate) twiddle_caches: Vec<Arc<LdeTwiddles<Field>>>,
     pub(crate) main_mmcs: MixedMmcs<Field>,
     pub(crate) aux_mmcs: Option<MixedMmcs<FieldExtension>>,
     pub(crate) comp_mmcs: MixedMmcs<FieldExtension>,
@@ -2565,7 +2565,6 @@ pub trait IsStarkProver<
             round3s,
             z,
             domains,
-            twiddle_caches,
             main_mmcs,
             aux_mmcs,
             comp_mmcs,
@@ -2575,7 +2574,25 @@ pub trait IsStarkProver<
 
     /// Reference (per-table) proof path: rounds 1-3 shared with the batched path
     /// via `prove_rounds_1_to_3`, then a per-table FRI + `StarkProof` per table.
-    /// Retained as an A/B oracle; superseded by `multi_prove_batched`.
+    /// Generates STARK proofs for one or more AIRs with a shared transcript.
+    ///
+    /// # Multi-Table Proving with LogUp
+    ///
+    /// When proving multiple tables that communicate via LogUp (lookup arguments),
+    /// all tables must use the **same** random challenges (z, α) for the LogUp bus
+    /// to balance correctly. This function ensures challenge sharing by:
+    ///
+    /// 1. **Commit all main traces**: All main trace commitments go into the
+    ///    transcript before any challenges are sampled.
+    /// 2. **Sample shared LogUp challenges**: The challenges (z, α) are sampled
+    ///    once from the transcript and shared by all AIRs.
+    /// 3. **Build auxiliary traces**: Each AIR builds its LogUp running-sum
+    ///    columns using the shared challenges.
+    /// 4. **Rounds 2-4**: Standard STARK protocol rounds for each AIR.
+    ///
+    /// # Warning
+    ///
+    /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
         mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
@@ -2590,62 +2607,835 @@ pub trait IsStarkProver<
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
-        let RoundsOneToThree {
-            round1s,
-            round2s,
-            round3s,
-            z,
-            domains,
-            twiddle_caches: _twiddle_caches,
-            ..
-        } = Self::prove_rounds_1_to_3(
-            &mut air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )?;
+        info!("Started proof generation...");
 
-        let mut proofs = Vec::with_capacity(round1s.len());
-        for idx in 0..round1s.len() {
-            let air = air_trace_pairs[idx].0;
-            let pub_inputs = air_trace_pairs[idx].2;
-            let domain = &domains[idx];
-            let round_1_result = &round1s[idx];
-            let round_2_result = &round2s[idx];
-            let round_3_result = &round3s[idx];
+        #[cfg(feature = "instruments")]
+        crate::instruments::reset_all();
+        #[cfg(feature = "instruments")]
+        let mut heap_snaps: Vec<crate::instruments::HeapSnapshot> = Vec::new();
 
-            let round_4_result =
-                Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
-                    air,
-                    domain,
-                    round_1_result,
-                    round_2_result,
-                    round_3_result,
-                    &z,
-                    transcript,
-                );
+        let num_airs = air_trace_pairs.len();
 
-            proofs.push(StarkProof {
-                lde_trace_main_merkle_root: round_1_result.main.root,
-                lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
-                lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
-                trace_ood_evaluations: round_3_result.trace_ood_evaluations.clone(),
-                composition_poly_root: round_2_result.composition_poly_root,
-                composition_poly_parts_ood_evaluation: round_3_result
-                    .composition_poly_parts_ood_evaluation
-                    .clone(),
-                fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
-                fri_last_value: round_4_result.fri_last_value,
-                query_list: round_4_result.query_list,
-                deep_poly_openings: round_4_result.deep_poly_openings,
-                nonce: round_4_result.nonce,
-                bus_public_inputs: round_1_result.bus_public_inputs.clone(),
-                public_inputs: pub_inputs.clone(),
-                trace_length: domain.interpolation_domain_size,
+        // Check if any AIR has an auxiliary trace
+        let needs_lookup_challenges = air_trace_pairs
+            .iter()
+            .any(|(air, _, _)| air.has_aux_trace());
+
+        // =====================================================================
+        // Pre-pass: compute domains and twiddles
+        // =====================================================================
+
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_prepass");
+
+        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
+        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
+        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
+        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
+            std::collections::HashMap::new();
+
+        let mut domains = Vec::with_capacity(num_airs);
+        let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
+
+        for (air, trace, _pub_inputs) in &*air_trace_pairs {
+            let trace_length = trace.num_rows();
+            let blowup = air.options().blowup_factor as usize;
+            let coset_offset = air.options().coset_offset;
+            let key = (trace_length, blowup, coset_offset);
+
+            #[cfg(test)]
+            let was_hit = domain_cache.contains_key(&key);
+
+            let (domain, twiddles) = domain_cache
+                .entry(key)
+                .or_insert_with(|| {
+                    let d = Domain::new(*air, trace_length);
+                    let t = LdeTwiddles::new(&d);
+                    (Arc::new(d), Arc::new(t))
+                })
+                .clone();
+
+            #[cfg(test)]
+            crate::tests::domain_cache_stats::record(was_hit);
+
+            domains.push(domain);
+            twiddle_caches.push(twiddles);
+        }
+        // Free the HashMap (which holds extra strong Arc references) before the
+        // long proving rounds begin. `domains` and `twiddle_caches` already hold
+        // the only surviving Arcs we care about.
+        drop(domain_cache);
+
+        let k = table_parallelism().min(num_airs).max(1);
+
+        // VRAM budgeted admission. The budget caps the summed device working set
+        // of the tables proved concurrently so large blocks don't exhaust VRAM.
+        // It is an extra ceiling on top of `k` (it never raises concurrency). On
+        // non-cuda builds, or when the budget can't be queried, it is `u64::MAX`
+        // and chunking falls back to fixed size `k`.
+        #[cfg(feature = "cuda")]
+        let vram_budget = math_cuda::device::backend()
+            .map(|b| b.vram_budget_bytes())
+            .unwrap_or(u64::MAX);
+        #[cfg(not(feature = "cuda"))]
+        let vram_budget = u64::MAX;
+
+        // R1 main commit: only the main LDE and its Merkle scratch are resident,
+        // so the aux columns add nothing to this phase's working set.
+        let main_chunks = {
+            let estimates: Vec<u64> = air_trace_pairs
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, trace, _))| {
+                    let lde_size =
+                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
+                    estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+                })
+                .collect();
+            plan_table_chunks(&estimates, k, vram_budget)
+        };
+
+        // Spill main traces to mmap before Round 1 LDE.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(_, trace, _)| {
+                trace
+                    .main_table
+                    .spill_to_disk()
+                    .map_err(|e| ProvingError::DiskSpill(format!("early main: {e}")))
+            })?;
+        }
+
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
+        let prepass_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After pool alloc") {
+            heap_snaps.push(s);
+        }
+
+        // =====================================================================
+        // Round 1, Phase A: Commit all main traces (parallel in chunks of K)
+        // =====================================================================
+        // All main trace commitments must be in the transcript before sampling
+        // LogUp challenges.
+
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_main_commit");
+
+        let mut main_commits: Vec<TableCommit<Field>> = Vec::with_capacity(num_airs);
+        let mut main_ldes: Vec<(Vec<FieldElement<Field>>, usize)> = Vec::with_capacity(num_airs);
+        // Optional device-side LDE handle per table, populated only when the
+        // R1 fused GPU pipeline produced one. Threaded through Phase D's zip
+        // chain so each handle stays paired with its table by construction.
+        #[cfg(feature = "cuda")]
+        let mut main_gpu_handles: Vec<Option<math_cuda::lde::GpuLdeBase>> =
+            Vec::with_capacity(num_airs);
+
+        for &(chunk_start, chunk_end) in &main_chunks {
+            let chunk_range = chunk_start..chunk_end;
+
+            let chunk_results: Vec<Result<_, ProvingError>> =
+                crate::par::par_map_collect(chunk_range, |idx| {
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+                    let twiddles = &twiddle_caches[idx];
+
+                    let precomputed = air
+                        .is_preprocessed()
+                        .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+                    Self::commit_main_trace(
+                        *trace,
+                        domain,
+                        twiddles,
+                        precomputed,
+                        #[cfg(feature = "disk-spill")]
+                        storage_mode,
+                    )
+                });
+
+            // Sequential: append roots to shared transcript (Fiat-Shamir ordering)
+            for result in chunk_results {
+                #[cfg(feature = "cuda")]
+                let (commit, cached_main, gpu_main) = result?;
+                #[cfg(not(feature = "cuda"))]
+                let (commit, cached_main) = result?;
+                if let Some(ref pre_root) = commit.precomputed_root {
+                    transcript.append_bytes(pre_root);
+                }
+                transcript.append_bytes(&commit.root);
+                main_commits.push(commit);
+                main_ldes.push(cached_main);
+                #[cfg(feature = "cuda")]
+                main_gpu_handles.push(gpu_main);
+            }
+        }
+
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
+        let main_commits_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After main commits") {
+            heap_snaps.push(s);
+        }
+
+        // =====================================================================
+        // Round 1, Phase B: Sample shared LogUp challenges
+        // =====================================================================
+
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // =====================================================================
+        // Phase C + Rounds 2-4: Forked per table
+        // =====================================================================
+        // Each table gets an independent transcript fork (cloned from the shared
+        // state after Phase B, domain-separated by table index). This matches
+        // the verifier's forking and makes per-table proving independent.
+        //
+        // Split into two passes for parallelism:
+        //   Pass 1 (parallel): Build all auxiliary traces (fingerprint + batch inversion)
+        //   Pass 2 (parallel): Fork transcript → extract → LDE → commit
+
+        // Pass 1: Build aux traces in parallel.
+        // Each build_auxiliary_trace has internal parallelism (batch_inverse, par_chunks),
+        // but outer parallelism over 12 tables also helps on high-core-count machines.
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_aux_build");
+
+        // Disk-spill needs the aux columns in the host trace to spill them, so
+        // disable the GPU-resident aux build (it would keep them device-only).
+        #[cfg(all(feature = "cuda", feature = "disk-spill"))]
+        if storage_mode == StorageMode::Disk {
+            for (_, trace, _) in air_trace_pairs.iter_mut() {
+                trace.set_resident_aux_ok(false);
+            }
+        }
+
+        // Thread each table's device-resident trace-domain main columns (kept by
+        // the R1 main LDE) onto its trace so the LogUp aux fingerprint kernel
+        // reads them in place instead of re-uploading ~3 GB. Tables without a GPU
+        // main handle (CPU LDE, preprocessed) fall back to the host upload path.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        for ((_, trace, _), gpu_main) in air_trace_pairs.iter_mut().zip(main_gpu_handles.iter()) {
+            if let Some(handle) = gpu_main
+                && let Some(td) = &handle.trace_dev
+            {
+                trace.set_main_trace_dev(std::sync::Arc::clone(td), handle.trace_rows);
+            }
+        }
+
+        #[cfg(feature = "parallel")]
+        let aux_iter = air_trace_pairs.par_iter_mut();
+        #[cfg(not(feature = "parallel"))]
+        let aux_iter = air_trace_pairs.iter_mut();
+        let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
+            .map(|(air, trace, _)| {
+                if air.has_aux_trace() {
+                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // The trace-domain snapshots retained by the R1 main LDE (both Arcs:
+        // trace.main_trace_dev and GpuLdeBase.trace_dev) have exactly one
+        // consumer — the aux build above. Drop them now so the main-trace-sized
+        // device buffers are reclaimed before the aux-commit + DEEP/FRI VRAM
+        // peak instead of living to the end of the proof.
+        #[cfg(feature = "cuda")]
+        {
+            for (_, trace, _) in air_trace_pairs.iter_mut() {
+                trace.clear_main_trace_dev();
+            }
+            for handle in main_gpu_handles.iter_mut().flatten() {
+                handle.trace_dev = None;
+                handle.trace_rows = 0;
+            }
+        }
+
+        // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
+        #[cfg(feature = "disk-spill")]
+        if storage_mode == StorageMode::Disk {
+            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(air, trace, _)| {
+                if air.has_aux_trace() {
+                    trace
+                        .spill_aux_to_disk()
+                        .map_err(|e| ProvingError::DiskSpill(format!("aux trace: {e}")))?;
+                }
+                Ok::<(), ProvingError>(())
+            })?;
+        }
+
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
+        let aux_build_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux build") {
+            heap_snaps.push(s);
+        }
+
+        // Pass 2: Parallel fork transcript → extract → LDE → commit in chunks of K.
+        // Each table gets its own transcript fork.
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("r1_aux_commit");
+
+        // Pre-fork all transcripts (cheap, sequential — must match verifier ordering)
+        let mut table_transcripts: Vec<_> = (0..num_airs)
+            .map(|idx| {
+                let mut t = transcript.clone();
+                if num_airs > 1 {
+                    t.append_bytes(&(idx as u64).to_le_bytes());
+                }
+                t
+            })
+            .collect();
+
+        // Parallel aux commit in chunks of K. The closure returns a cfg-gated
+        // AuxResult. Under cuda it carries the optional ext3 GPU LDE handle as
+        // a third element, so Phase D's zip chain keeps it paired with its
+        // table without a separate handle vector.
+        #[cfg(feature = "cuda")]
+        type AuxResult<FE> = (
+            Option<TableCommit<FE>>,
+            (Vec<FieldElement<FE>>, usize),
+            Option<math_cuda::lde::GpuLdeExt3>,
+        );
+        #[cfg(not(feature = "cuda"))]
+        type AuxResult<FE> = (Option<TableCommit<FE>>, (Vec<FieldElement<FE>>, usize));
+        #[allow(clippy::type_complexity)]
+        let mut aux_results: Vec<AuxResult<FieldExtension>> = Vec::with_capacity(num_airs);
+
+        // R1 aux commit and rounds 2 to 4 share the peak working set: the main
+        // and aux LDEs are co-resident, plus the composition and Merkle
+        // transients (in the scratch factor). `num_aux_columns` is populated by
+        // the aux build above, so this estimate is accurate for both phases.
+        let peak_chunks = {
+            let estimates: Vec<u64> = air_trace_pairs
+                .iter()
+                .enumerate()
+                .map(|(idx, (_, trace, _))| {
+                    let lde_size =
+                        domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
+                    estimate_table_vram_bytes(
+                        trace.num_main_columns,
+                        trace.num_aux_columns,
+                        lde_size,
+                    )
+                })
+                .collect();
+            plan_table_chunks(&estimates, k, vram_budget)
+        };
+
+        for &(chunk_start, chunk_end) in &peak_chunks {
+            let chunk_range = chunk_start..chunk_end;
+
+            #[allow(clippy::type_complexity)]
+            let chunk_aux: Vec<Result<AuxResult<FieldExtension>, ProvingError>> =
+                crate::par::par_map_collect(chunk_range, |idx| {
+                    let (air, trace, _) = &air_trace_pairs[idx];
+                    let domain = &domains[idx];
+                    let twiddles = &twiddle_caches[idx];
+
+                    if air.has_aux_trace() {
+                        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+
+                        // Resident GPU path: aux columns already on device (from
+                        // the resident LogUp aux build) — LDE straight from device
+                        // memory, no upload, no host column extraction. When the
+                        // resident build fired the host aux trace is empty, so a
+                        // device LDE failure is a hard abort, not a fall through to
+                        // the host path below (which would commit a zero aux trace).
+                        #[cfg(feature = "cuda")]
+                        if let Some(ra) = trace.aux_resident() {
+                            #[cfg(feature = "instruments")]
+                            let t_sub = Instant::now();
+                            let (tree, handle, aux_data) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep_dev::<
+                                    Field,
+                                    FieldExtension,
+                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                >(
+                                    ra, domain.blowup_factor, &twiddles.coset_weights
+                                )
+                                .ok_or_else(|| {
+                                    ProvingError::Fft(
+                                        "resident aux LDE failed; host aux trace is empty"
+                                            .to_string(),
+                                    )
+                                })?;
+                            let num_cols = ra.num_aux_cols;
+                            #[cfg(feature = "instruments")]
+                            crate::instruments::accum_r1_aux(t_sub.elapsed(), Duration::ZERO);
+                            let root = tree.root;
+                            return Ok((
+                                Some(TableCommit::plain(tree, root)),
+                                (aux_data, num_cols),
+                                Some(handle),
+                            ));
+                        }
+
+                        // Fused GPU path (cuda only): row-major ext3 NTT — single
+                        // H2D, no column extraction, no CPU transpose.
+                        #[cfg(feature = "cuda")]
+                        {
+                            let (trace_slice, num_cols) = trace.aux_data_row_major();
+                            let n = if num_cols > 0 {
+                                trace_slice.len() / num_cols
+                            } else {
+                                0
+                            };
+                            #[cfg(feature = "instruments")]
+                            let t_sub = Instant::now();
+                            if let Some((tree, handle, aux_data)) =
+                                crate::gpu_lde::try_expand_leaf_and_tree_ext3_row_major_keep::<
+                                    Field,
+                                    FieldExtension,
+                                    BatchedMerkleTreeBackend<FieldExtension>,
+                                >(
+                                    trace_slice,
+                                    n,
+                                    num_cols,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
+                                )
+                            {
+                                #[cfg(feature = "instruments")]
+                                let aux_lde_dur = t_sub.elapsed();
+                                let root = tree.root;
+                                #[cfg(feature = "instruments")]
+                                crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
+                                return Ok((
+                                    Some(TableCommit::plain(tree, root)),
+                                    (aux_data, num_cols),
+                                    Some(handle),
+                                ));
+                            }
+                        }
+
+                        // CPU path: copy the already-row-major aux trace directly
+                        // (one memcpy — no transpose) and expand with the
+                        // cache-blocked batched two-half FFT.
+                        let (trace_data, total_cols) = trace.aux_data_row_major();
+
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
+
+                        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+                            Vec::with_capacity(lde_size * total_cols);
+                        aux_data.extend_from_slice(trace_data);
+
+                        #[cfg(feature = "disk-spill")]
+                        if storage_mode == StorageMode::Disk {
+                            trace.aux_table.advise_drop_cache();
+                        }
+
+                        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+                            &mut aux_data,
+                            total_cols,
+                            domain.blowup_factor,
+                            &twiddles.coset_weights,
+                            &twiddles.two_half_inv,
+                            &twiddles.two_half_fwd,
+                        )
+                        .expect("row-major aux coset LDE expansion");
+
+                        #[cfg(feature = "instruments")]
+                        let aux_lde_dur = t_sub.elapsed();
+                        #[cfg(feature = "instruments")]
+                        let t_sub = Instant::now();
+                        #[allow(unused_mut)]
+                        let (mut tree, root) =
+                            Self::commit_rows_bit_reversed(&aux_data, total_cols)
+                                .ok_or(ProvingError::EmptyCommitment)?;
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
+                        let commit = TableCommit::plain(tree, root);
+                        #[cfg(feature = "instruments")]
+                        crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+
+                        #[cfg(feature = "cuda")]
+                        return Ok((Some(commit), (aux_data, total_cols), None));
+                        #[cfg(not(feature = "cuda"))]
+                        Ok((Some(commit), (aux_data, total_cols)))
+                    } else {
+                        #[cfg(feature = "cuda")]
+                        return Ok((None, (Vec::new(), 0), None));
+                        #[cfg(not(feature = "cuda"))]
+                        Ok((None, (Vec::new(), 0)))
+                    }
+                });
+
+            // Sequential: append aux roots to forked transcripts.
+            for (j, result) in chunk_aux.into_iter().enumerate() {
+                let aux_full = result?;
+                // Tuple shape is cfg-gated; `.0` is the optional TableCommit
+                // in both variants.
+                if let Some(ref c) = aux_full.0 {
+                    table_transcripts[chunk_start + j].append_bytes(&c.root);
+                }
+                aux_results.push(aux_full);
+            }
+        }
+
+        // Build commitments and cached LDEs as separate vecs:
+        // commitments are borrowed in Phase D, LDEs are consumed by value.
+        let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
+            Vec::with_capacity(num_airs);
+        let mut cached_ldes: Vec<Lde<Field, FieldExtension>> = Vec::with_capacity(num_airs);
+        // Under cuda, fold main_gpu_handles into the zip chain so each handle
+        // stays paired with its table by construction.
+        #[cfg(feature = "cuda")]
+        let main_iter = main_commits
+            .into_iter()
+            .zip(main_ldes)
+            .zip(main_gpu_handles);
+        #[cfg(not(feature = "cuda"))]
+        let main_iter = main_commits.into_iter().zip(main_ldes);
+
+        for ((main_pack, aux_full), bus_public_inputs) in
+            main_iter.zip(aux_results).zip(bus_inputs_vec)
+        {
+            #[cfg(feature = "cuda")]
+            let ((main_commit, main_lde), gpu_main) = main_pack;
+            #[cfg(not(feature = "cuda"))]
+            let (main_commit, main_lde) = main_pack;
+            #[cfg(feature = "cuda")]
+            let (aux_commit, cached_aux, gpu_aux) = aux_full;
+            #[cfg(not(feature = "cuda"))]
+            let (aux_commit, cached_aux) = aux_full;
+            commitments.push(Round1Commitments {
+                main: main_commit,
+                aux: aux_commit,
+                rap_challenges: lookup_challenges.clone(),
+                bus_public_inputs,
+            });
+            #[cfg(feature = "cuda")]
+            cached_ldes.push(Lde {
+                main: main_lde,
+                aux: cached_aux,
+                gpu_main,
+                gpu_aux,
+            });
+            #[cfg(not(feature = "cuda"))]
+            cached_ldes.push(Lde {
+                main: main_lde,
+                aux: cached_aux,
+            });
+        }
+
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
+        let aux_commit_elapsed = phase_start.elapsed();
+        #[cfg(feature = "instruments")]
+        if let Some(s) = crate::instruments::snap("After aux commit") {
+            heap_snaps.push(s);
+        }
+
+        #[cfg(feature = "debug-checks")]
+        Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
+
+        // =====================================================================
+        // Rounds 2-4: Parallel per-table proving in chunks of K
+        // =====================================================================
+        // Each chunk of K tables is processed in parallel. Cached LDE columns
+        // from Phase A/C are consumed here (zero-copy move), eliminating the
+        // expensive reconstruct_round1 recomputation.
+
+        #[cfg(feature = "instruments")]
+        let phase_start = Instant::now();
+        #[cfg(feature = "instruments")]
+        let __sp = crate::instruments::span("rounds_2to4");
+        #[cfg(feature = "instruments")]
+        let mut table_timings: Vec<(
+            String,
+            usize,
+            Duration,
+            crate::instruments::TableSubOps,
+        )> = Vec::with_capacity(num_airs);
+
+        let mut proofs = Vec::with_capacity(num_airs);
+        let mut lde_drain = cached_ldes.into_iter();
+        for &(chunk_start, chunk_end) in &peak_chunks {
+            let chunk_size = chunk_end - chunk_start;
+
+            let chunk_ldes: Vec<Lde<Field, FieldExtension>> =
+                lde_drain.by_ref().take(chunk_size).collect();
+            let chunk_commitments = &commitments[chunk_start..chunk_end];
+            let chunk_transcripts = &mut table_transcripts[chunk_start..chunk_end];
+
+            #[cfg(feature = "parallel")]
+            let iter = chunk_ldes
+                .into_par_iter()
+                .zip(chunk_commitments.par_iter())
+                .zip(chunk_transcripts.par_iter_mut())
+                .enumerate();
+            #[cfg(not(feature = "parallel"))]
+            let iter = chunk_ldes
+                .into_iter()
+                .zip(chunk_commitments.iter())
+                .zip(chunk_transcripts.iter_mut())
+                .enumerate();
+
+            let chunk_results: Vec<Result<_, ProvingError>> = iter
+                .map(|(j, ((lde, commitment), table_transcript))| {
+                    let idx = chunk_start + j;
+                    let (air, trace, pub_inputs) = &air_trace_pairs[idx];
+                    let _ = trace; // used by instruments
+                    let domain = &domains[idx];
+
+                    #[cfg(feature = "instruments")]
+                    let table_start = Instant::now();
+
+                    // Build Round1 from cached LDE (consumed by value, no recomputation).
+                    let mut round_1_result =
+                        commitment.build_round1(lde, air.step_size(), domain.blowup_factor);
+
+                    if let Some(ref bpi) = round_1_result.bus_public_inputs {
+                        table_transcript.append_field_element(&bpi.table_contribution);
+                    }
+
+                    let proof = Self::prove_rounds_2_to_4(
+                        *air,
+                        *pub_inputs,
+                        &mut round_1_result,
+                        table_transcript,
+                        domain,
+                        &twiddle_caches[idx],
+                    )?;
+
+                    #[cfg(feature = "instruments")]
+                    let table_timing = {
+                        let sub_ops = crate::instruments::take_round_sub_ops().unwrap_or_default();
+                        (
+                            air.name().to_string(),
+                            trace.num_rows(),
+                            table_start.elapsed(),
+                            sub_ops,
+                        )
+                    };
+
+                    #[cfg(feature = "instruments")]
+                    return Ok((proof, table_timing));
+                    #[cfg(not(feature = "instruments"))]
+                    Ok(proof)
+                })
+                .collect();
+
+            for result in chunk_results {
+                #[cfg(feature = "instruments")]
+                {
+                    let (proof, timing) = result?;
+                    proofs.push(proof);
+                    table_timings.push(timing);
+                }
+                #[cfg(not(feature = "instruments"))]
+                proofs.push(result?);
+            }
+        }
+
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        #[cfg(feature = "instruments")]
+        {
+            // Store timing data for the top-level report in prove_with_options.
+            // Uses a thread-local to avoid changing multi_prove's return type.
+            crate::instruments::store(crate::instruments::MultiProveTiming {
+                prepass: prepass_elapsed,
+                main_commits: main_commits_elapsed,
+                aux_build: aux_build_elapsed,
+                aux_commit: aux_commit_elapsed,
+                rounds_2_4: phase_start.elapsed(),
+                round1_sub: crate::instruments::take_r1_sub(),
+                table_timings,
+                heap_snapshots: heap_snaps,
             });
         }
 
         Ok(MultiProof { proofs })
+    }
+
+    /// Executes rounds 2-4 and generates a STARK proof for the trace `main_trace` with public inputs `pub_inputs`.
+    /// Warning: the transcript must be safely initialized before passing it to this method.
+    fn prove_rounds_2_to_4(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        pub_inputs: &PI,
+        round_1_result: &mut Round1<Field, FieldExtension>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+    ) -> Result<StarkProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+    {
+        log::debug!("Started proof generation...");
+
+        // ===================================
+        // ==========|   Round 2   |==========
+        // ===================================
+
+        // <<<< Receive challenge: 𝛽
+        let beta = transcript.sample_field_element();
+        let trace_length = domain.interpolation_domain_size;
+        let num_boundary_constraints = air
+            .boundary_constraints(
+                pub_inputs,
+                &round_1_result.rap_challenges,
+                round_1_result.bus_public_inputs.as_ref(),
+                trace_length,
+            )
+            .constraints
+            .len();
+
+        let num_transition_constraints = air.context().num_transition_constraints;
+
+        let mut coefficients: Vec<_> =
+            core::iter::successors(Some(FieldElement::one()), |x| Some(x * &beta))
+                .take(num_boundary_constraints + num_transition_constraints)
+                .collect();
+
+        let transition_coefficients: Vec<_> =
+            coefficients.drain(..num_transition_constraints).collect();
+        let boundary_coefficients = coefficients;
+
+        let round_2_result = Self::round_2_compute_composition_polynomial(
+            air,
+            pub_inputs,
+            domain,
+            twiddles,
+            round_1_result,
+            &transition_coefficients,
+            &boundary_coefficients,
+        )?;
+
+        // >>>> Send commitments: [H₁], [H₂]
+        transcript.append_bytes(&round_2_result.composition_poly_root);
+
+        // ===================================
+        // ==========|   Round 3   |==========
+        // ===================================
+
+        // <<<< Receive challenge: z
+        let z = transcript.sample_z_ood(
+            &domain.lde_roots_of_unity_coset,
+            &domain.trace_roots_of_unity,
+        );
+
+        #[cfg(feature = "instruments")]
+        let t_r3 = Instant::now();
+        let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+            air,
+            domain,
+            round_1_result,
+            &round_2_result,
+            &z,
+        );
+        #[cfg(feature = "instruments")]
+        let round_3_dur = t_r3.elapsed();
+
+        // >>>> Send values: tⱼ(zgᵏ)
+        let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
+        for col in trace_ood_evaluations_columns.iter() {
+            for elem in col.iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+
+        // >>>> Send values: Hᵢ(z^N)
+        for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+            transcript.append_field_element(element);
+        }
+
+        // ===================================
+        // ==========|   Round 4   |==========
+        // ===================================
+
+        // Part of this round is running FRI, which is an interactive
+        // protocol on its own. Therefore we pass it the transcript
+        // to simulate the interactions with the verifier.
+        let round_4_result = Self::round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
+            air,
+            domain,
+            round_1_result,
+            &round_2_result,
+            &round_3_result,
+            &z,
+            transcript,
+        );
+
+        #[cfg(feature = "instruments")]
+        {
+            let zero = Duration::ZERO;
+            let (r2_constraints, r2_fft, r2_merkle) =
+                crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
+            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
+                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
+            crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
+                constraints: r2_constraints,
+                comp_decompose: r2_fft,
+                comp_commit: r2_merkle,
+                ood: round_3_dur,
+                deep_comp: r4_deep_comp,
+                deep_extend: r4_fft,
+                fri_commit: r4_merkle,
+                queries: r4_queries,
+            });
+        }
+
+        log::debug!("End proof generation");
+
+        Ok(StarkProof {
+            // [t]
+            lde_trace_main_merkle_root: round_1_result.main.root,
+            // [t]
+            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
+            // For preprocessed tables: commitment to precomputed columns only
+            lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
+            // tⱼ(zgᵏ)
+            trace_ood_evaluations: round_3_result.trace_ood_evaluations,
+            // [H₁] and [H₂]
+            composition_poly_root: round_2_result.composition_poly_root,
+            // Hᵢ(z^N)
+            composition_poly_parts_ood_evaluation: round_3_result
+                .composition_poly_parts_ood_evaluation,
+            // [pₖ]
+            fri_layers_merkle_roots: round_4_result.fri_layers_merkle_roots,
+            // pₙ
+            fri_last_value: round_4_result.fri_last_value,
+            // Open(p₀(D₀), 𝜐ₛ), Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
+            query_list: round_4_result.query_list,
+            // Open(H₁(D_LDE, 𝜐₀), Open(H₂(D_LDE, 𝜐₀), Open(tⱼ(D_LDE), 𝜐₀)
+            // Open(H₁(D_LDE, -𝜐ᵢ), Open(H₂(D_LDE, -𝜐ᵢ), Open(tⱼ(D_LDE), -𝜐ᵢ)
+            deep_poly_openings: round_4_result.deep_poly_openings,
+            // nonce obtained from grinding
+            nonce: round_4_result.nonce,
+            // Bus interaction public inputs (for boundary constraints and bus balance check)
+            bus_public_inputs: round_1_result.bus_public_inputs.clone(),
+            // Public inputs for boundary constraints
+            public_inputs: pub_inputs.clone(),
+            trace_length: domain.interpolation_domain_size,
+        })
     }
 
     /// One table's DEEP composition codeword (bit-reversed, ready for the batched
@@ -2873,6 +3663,53 @@ pub trait IsStarkProver<
         )
         .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
+}
+
+/// Heuristic peak device bytes for one table: co-resident LDE columns plus the
+/// resident Merkle trees, with a scratch factor for NTT and leaf transients. A
+/// deliberate over estimate for a safety ceiling, not a precise allocator. Pass
+/// aux_cols == 0 when the aux LDE is not yet resident (R1 main commit).
+fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+    const BYTES_PER_BASE: u64 = 8;
+    const EXT3_BYTES: u64 = 24;
+    const SCRATCH_FACTOR: u64 = 2;
+    const RESIDENT_TREE_BYTES_PER_LDE: u64 = 256;
+    let lde = lde_size as u64;
+    let per_row = (main_cols as u64).saturating_mul(BYTES_PER_BASE)
+        + (aux_cols as u64).saturating_mul(EXT3_BYTES);
+    let lde_term = lde.saturating_mul(per_row).saturating_mul(SCRATCH_FACTOR);
+    let tree_term = lde.saturating_mul(RESIDENT_TREE_BYTES_PER_LDE);
+    lde_term.saturating_add(tree_term)
+}
+
+/// Plan contiguous table chunks for parallel proving. A chunk grows until it
+/// hits `k` tables or its summed VRAM estimate would exceed `budget`; a single
+/// table larger than `budget` runs solo. With `budget == u64::MAX` (non-cuda,
+/// or VRAM not binding) chunks fall back to fixed size `k`, identical to the
+/// old `step_by(k)`, so scheduling and the proof are unchanged. Returns
+/// `(start, end)` half open ranges covering `0..estimates.len()` in order.
+fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, usize)> {
+    let n = estimates.len();
+    let k = k.max(1);
+    let budget = budget as u128;
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < n {
+        let mut end = start;
+        let mut acc: u128 = 0;
+        while end < n {
+            let next = estimates[end] as u128;
+            // Always admit at least one table per chunk (oversized → solo).
+            if end > start && (end - start >= k || acc + next > budget) {
+                break;
+            }
+            acc += next;
+            end += 1;
+        }
+        chunks.push((start, end));
+        start = end;
+    }
+    chunks
 }
 
 /// Print a global bus balance report aggregating per-bus sums across all tables.
