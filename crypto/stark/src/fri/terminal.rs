@@ -1,13 +1,58 @@
-//! Conversion helpers between a FRI terminal codeword and the coefficients of
-//! the low-degree polynomial it encodes.
-//!
-//! These are pure, self-contained helpers — no transcript, no FRI logic.
-//! They are used by the prover (`commit_phase_from_evaluations`) and verifier FRI step.
+//! Shared, pure FRI early-termination helpers used by both the prover
+//! (`commit_phase_from_evaluations`, `try_fri_commit_gpu`) and the verifier
+//! (`step_3_verify_fri`): the fold layout (`FriFoldLayout`) and the conversion
+//! between a terminal codeword and the coefficients of the low-degree
+//! polynomial it encodes. No transcript, no FRI protocol state.
 
 use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
+
+/// The FRI early-termination fold layout.
+///
+/// Derived identically by the CPU prover (`commit_phase_from_evaluations`), the
+/// GPU prover (`try_fri_commit_gpu`), and the verifier (`fri_termination_params`).
+/// Keeping the arithmetic in one place is load-bearing: the three callers must
+/// agree exactly or proofs fail to verify, and a CPU/GPU disagreement would
+/// surface only on GPU machines.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FriFoldLayout {
+    /// Folds from the LDE codeword down to the terminal codeword.
+    pub(crate) total_folds: u32,
+    /// Committed (Merkle-rooted) FRI layers = `total_folds - 1`, or 0 when there
+    /// is no fold or only a single final fold.
+    pub(crate) num_committed: usize,
+    /// Terminal codeword length = `2^(blowup_log + effective_k)`.
+    pub(crate) terminal_len: usize,
+    /// Terminal polynomial log-degree bound actually used, `min(k, trace_bits)`.
+    /// This is the verifier's `expected_k` and the prover's `effective_log_degree`.
+    pub(crate) effective_k: u32,
+}
+
+impl FriFoldLayout {
+    /// Derive the layout from the LDE codeword size.
+    ///
+    /// * `lde_log`    — log2 of the LDE (deep-composition) codeword length.
+    /// * `blowup_log` — log2 of the LDE blowup factor.
+    /// * `k`          — requested `fri_final_poly_log_degree`.
+    ///
+    /// Folding stops once the codeword encodes a polynomial of degree `< 2^k`,
+    /// i.e. at codeword length `2^(blowup_log + k)`, clamped to the full LDE
+    /// size for traces too small to fold that far (the `.min(lde_log)`).
+    /// Computing `blowup_log + k` in `u32` (both small) sidesteps the
+    /// `1 << (blowup_log + k)` overflow an out-of-range `k` would otherwise cause.
+    pub(crate) fn new(lde_log: u32, blowup_log: u32, k: u32) -> Self {
+        let terminal_log = (blowup_log + k).min(lde_log);
+        let total_folds = lde_log - terminal_log;
+        Self {
+            total_folds,
+            num_committed: total_folds.saturating_sub(1) as usize,
+            terminal_len: 1usize << terminal_log,
+            effective_k: terminal_log - blowup_log,
+        }
+    }
+}
 
 /// Prover side: given a FRI terminal codeword in **bit-reversed** order,
 /// recover the `2^final_poly_log_degree` coefficients of the underlying

@@ -72,30 +72,17 @@ where
         }
     }
 
-    // Determine how many total folds are needed to reach the terminal codeword.
-    // terminal_len = 2^(blowup_log + k), clamped to initial_len for tiny inputs.
-    let initial_len = evals.len();
-    let k = final_poly_log_degree as usize;
-    // Compute `min(2^(blowup_log + k), initial_len)` without materializing the
-    // shift: an out-of-range `k` (prover self-misconfiguration) would make
-    // `2^(blowup_log + k)` overflow to 0, and the `initial_len / terminal_len`
-    // below would then divide by zero. Clamping to `initial_len` first degrades
-    // gracefully to no early termination, mirroring the verifier's own
-    // `expected_k = min(k, root_order)` clamp.
-    let terminal_shift = blowup_log as usize + k;
-    let terminal_len = if terminal_shift >= initial_len.trailing_zeros() as usize {
-        initial_len
-    } else {
-        1usize << terminal_shift
-    };
-    let total_folds = (initial_len / terminal_len).trailing_zeros() as usize;
-    let num_committed = total_folds.saturating_sub(1);
+    // Fold layout, shared with the GPU prover and the verifier — see `FriFoldLayout`.
+    let layout = crate::fri::terminal::FriFoldLayout::new(
+        evals.len().trailing_zeros(),
+        blowup_log,
+        final_poly_log_degree,
+    );
+    let num_committed = layout.num_committed;
 
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
     let mut fri_layer_list = Vec::with_capacity(num_committed);
-    // Track the coset offset as it squares with each fold (needed for iFFT in terminal).
-    let mut terminal_offset = coset_offset.clone();
 
     // Commit `num_committed` folded layers to the transcript.
     for _ in 0..num_committed {
@@ -118,36 +105,38 @@ where
         // >>>> Send commitment: [pₖ]
         transcript.append_bytes(&root);
 
-        // Update twiddles and offset for the next level.
+        // Update twiddles for the next level.
         update_twiddles_in_place(&mut inv_twiddles);
-        terminal_offset = terminal_offset.square();
     }
 
     // One final fold to reach the terminal codeword (size terminal_len), unless
     // already there (total_folds == 0 means initial_len == terminal_len).
-    if total_folds > 0 {
+    if layout.total_folds > 0 {
         // <<<< Receive challenge: 𝜁_final
         let zeta = transcript.sample_field_element();
         fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
-        terminal_offset = terminal_offset.square();
     }
-    debug_assert_eq!(evals.len(), terminal_len, "terminal codeword size mismatch");
+    debug_assert_eq!(
+        evals.len(),
+        layout.terminal_len,
+        "terminal codeword size mismatch"
+    );
 
     // Recover the low-degree polynomial coefficients from the terminal codeword
     // and send them to the verifier.
     //
-    // The number of coefficients is determined by the *actual* terminal codeword,
-    // not the requested `final_poly_log_degree`: for tiny inputs `terminal_len`
-    // is clamped to `initial_len`, so the terminal polynomial has degree
-    // < terminal_len / 2^blowup_log = 2^(log2(terminal_len) - blowup_log). Using
-    // this clamped exponent keeps the coefficient count in lockstep with what the
-    // verifier reconstructs (`expected_k = min(k, trace_bits)`); passing the raw
-    // `final_poly_log_degree` would over-pad with zeros and break the round-trip.
-    let effective_log_degree = terminal_len.trailing_zeros() - blowup_log;
+    // The coefficient count follows the *actual* terminal codeword via
+    // `layout.effective_k` (`min(k, trace_bits)`), not the requested
+    // `final_poly_log_degree`: for tiny inputs the codeword is clamped to the
+    // full LDE, so passing the raw `k` would over-pad with zeros and break the
+    // round-trip against the verifier's own `expected_k` reconstruction.
+    // The terminal coset offset is `coset_offset^(2^total_folds)` — the offset
+    // after `total_folds` squarings (matches the GPU prover and the verifier).
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
     let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
         &evals,
         &terminal_offset,
-        effective_log_degree,
+        layout.effective_k,
     );
     for c in &final_poly_coeffs {
         transcript.append_field_element(c);

@@ -236,24 +236,23 @@ pub trait IsStarkVerifier<
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
     }
 
-    /// FRI termination params derived from options + domain: `(blowup_log, expected_k, total_folds)`.
+    /// The FRI fold layout for this proof, derived from options + domain.
     ///
-    /// * `blowup_log`  - log2 of the LDE blowup factor.
-    /// * `expected_k`  - clamped final-poly log-degree: `min(k, trace_bits)`.
-    /// * `total_folds` - number of FRI folds performed: `trace_bits - expected_k`.
-    ///
-    /// Both the commit phase (prover) and the Fiat-Shamir replay (verifier) must use
-    /// the same computation; having it in one place prevents silent drift between the two
-    /// callers that would break all proofs.
+    /// Delegates to the shared [`crate::fri::terminal::FriFoldLayout`] so the
+    /// verifier's Fiat-Shamir replay and structural checks use exactly the same
+    /// arithmetic as the CPU and GPU provers; drift between them would break all
+    /// proofs. `VerifierDomain.lde_length` is the codeword size and
+    /// `lde_length / trace_length` the blowup factor.
+    // `FriFoldLayout` is a crate-internal helper type returned from a default method
+    // of this public trait; the exposure is intentional (internal helper).
+    #[allow(private_interfaces)]
     fn fri_termination_params(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &VerifierDomain<Field>,
-    ) -> (u32, u32, u32) {
+    ) -> crate::fri::terminal::FriFoldLayout {
         let k = air.options().fri_final_poly_log_degree as u32;
         let blowup_log = (domain.lde_length / domain.trace_length).trailing_zeros();
-        let expected_k = k.min(domain.root_order);
-        let total_folds = domain.root_order - expected_k;
-        (blowup_log, expected_k, total_folds)
+        crate::fri::terminal::FriFoldLayout::new(domain.lde_length.trailing_zeros(), blowup_log, k)
     }
 
     /// Reconstructs the Deep composition polynomial evaluations at the challenge indices values using the provided
@@ -280,21 +279,19 @@ pub trait IsStarkVerifier<
 
         // ---- Reconstruct the FRI terminal codeword from the final-poly coeffs ----
         // The prover folds the deep composition codeword down to a terminal
-        // codeword of length `terminal_len = 2^(blowup_log + expected_k)` and sends the
-        // `2^expected_k` coefficients of the low-degree polynomial it encodes.
-        // `VerifierDomain.root_order` is `log2(trace_length)` (trace bits), and the
-        // LDE blowup adds `blowup_log` bits.
-        let (blowup_log, expected_k, total_folds) = Self::fri_termination_params(air, domain);
-        let num_committed = total_folds.saturating_sub(1) as usize;
+        // codeword of length `terminal_len = 2^(blowup_log + effective_k)` and sends
+        // the `2^effective_k` coefficients of the low-degree polynomial it encodes.
+        let layout = Self::fri_termination_params(air, domain);
+        let num_committed = layout.num_committed;
 
         // Structural check: number of committed FRI layers must equal
         // `num_committed` (zero when no fold or a single final fold happened).
         if proof.fri_layers_merkle_roots.len() != num_committed {
             return false;
         }
-        // Structural check: the final polynomial must have exactly `2^expected_k`
+        // Structural check: the final polynomial must have exactly `2^effective_k`
         // coefficients; otherwise the reconstruction below is ill-defined.
-        if proof.fri_final_poly_coeffs.len() != (1usize << expected_k) {
+        if proof.fri_final_poly_coeffs.len() != (1usize << layout.effective_k) {
             return false;
         }
         // Structural check: every per-query FRI decommitment must carry exactly
@@ -312,14 +309,13 @@ pub trait IsStarkVerifier<
             return false;
         }
 
-        let terminal_len = (1usize << blowup_log) << expected_k;
-        let terminal_offset = domain.coset_offset.pow(1u64 << total_folds);
-        let terminal_codeword = crate::fri::terminal::terminal_codeword_from_coeffs::<
-            Field,
-            FieldExtension,
-        >(
-            &proof.fri_final_poly_coeffs, &terminal_offset, terminal_len
-        );
+        let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
+        let terminal_codeword =
+            crate::fri::terminal::terminal_codeword_from_coeffs::<Field, FieldExtension>(
+                &proof.fri_final_poly_coeffs,
+                &terminal_offset,
+                layout.terminal_len,
+            );
 
         // verify FRI
         let mut evaluation_point_inverse = challenges
@@ -1098,10 +1094,7 @@ pub trait IsStarkVerifier<
         // actually folds past the committed layers. For tiny traces (the clamp
         // case) no fold happens, so no challenge is drawn. This must mirror the
         // prover's `commit_phase_from_evaluations` exactly.
-        //
-        // `VerifierDomain.root_order` is `log2(trace_length)` (trace bits). The
-        // number of total folds equals `trace_bits - min(k, trace_bits)`.
-        let (_, _, total_folds) = Self::fri_termination_params(air, domain);
+        let total_folds = Self::fri_termination_params(air, domain).total_folds;
 
         // >>>> Send final-fold challenge 𝜁_final (only when folding occurs)
         if total_folds > 0 {
