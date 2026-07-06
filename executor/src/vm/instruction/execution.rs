@@ -412,9 +412,12 @@ impl Instruction {
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
-                        // xG and k must occupy disjoint 32-byte regions: overlapping
-                        // addresses would cause the same memory byte to serve as both
-                        // an xG limb and a k bit, corrupting the scalar multiplication.
+                        // xG and k must occupy disjoint 32-byte regions. The trace builder
+                        // reads each operand as unaligned doubleword MEMW accesses (xG at T,
+                        // k at T+1); if the regions overlap, the same address is touched at
+                        // both timestamps and the MEMW consistency argument can't prove the
+                        // access chain. The loaded values would still be well-defined — this
+                        // guard is about trace provability, not correctness of the multiply.
                         // xR may alias either: its accesses are at a later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
