@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -10,11 +10,7 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use executor::{
-    elf::Elf,
-    flamegraph::FlamegraphGenerator,
-    vm::execution::{CHUNK_SIZE, Executor},
-};
+use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
@@ -302,22 +298,37 @@ fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
 }
 
 /// Write the flamegraph's current (possibly partial) folded output to
-/// `output_path`, overwriting any previous contents. Used both for the final
+/// `output_path`, replacing any previous contents. Used both for the final
 /// write and for periodic checkpoints during a long run.
+///
+/// Writes to a `tempfile` in the same directory, flushes it, then persists
+/// (renames) it over `output_path` — the whole file is replaced atomically,
+/// so a kill mid-write can never leave `output_path` empty or torn (the
+/// previous good checkpoint stays put until the new one is fully on disk).
 fn write_flamegraph_checkpoint(
     output_path: &PathBuf,
     generator: &FlamegraphGenerator,
     raw: bool,
 ) -> Result<(), String> {
-    let file =
-        File::create(output_path).map_err(|e| format!("Failed to create output file: {e}"))?;
-    let mut writer = BufWriter::new(file);
+    let dir = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Failed to create temp output file: {e}"))?;
+
+    let mut writer = BufWriter::new(tmp.as_file());
     let result = if raw {
         generator.write_folded_raw(&mut writer)
     } else {
         generator.write_folded(&mut writer)
     };
-    result.map_err(|e| format!("Failed to write flamegraph output: {e:?}"))
+    result.map_err(|e| format!("Failed to write flamegraph output: {e:?}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush flamegraph output: {e}"))?;
+    drop(writer);
+
+    tmp.persist(output_path)
+        .map_err(|e| format!("Failed to replace {output_path:?} with temp output: {e}"))?;
+    Ok(())
 }
 
 /// Flamegraph-related flags grouped so `cmd_execute` doesn't need a flat
@@ -383,10 +394,21 @@ fn cmd_execute(
             },
         );
 
-        let (generator, total_cycles) = match result {
-            Ok(r) => r,
+        let (generator, result) = result;
+        let total_cycles = match result {
+            Ok(total_cycles) => total_cycles,
             Err(e) => {
                 eprintln!("Execution failed: {:?}", e);
+                // Best-effort: persist whatever the generator accumulated
+                // before the fault instead of discarding it outright.
+                match write_flamegraph_checkpoint(output_path, &generator, flamegraph.raw) {
+                    Ok(()) => eprintln!(
+                        "Partial flamegraph written to {:?} ({} instructions)",
+                        output_path,
+                        generator.total_instructions()
+                    ),
+                    Err(e) => eprintln!("Warning: failed to write partial flamegraph: {e}"),
+                }
                 return ExitCode::FAILURE;
             }
         };
@@ -413,10 +435,7 @@ fn cmd_execute(
 
         let mut cycle_count: u64 = 0;
         loop {
-            let limit = cycle_budget
-                .map(|budget| ((budget - cycle_count) as usize).min(CHUNK_SIZE))
-                .unwrap_or(CHUNK_SIZE);
-            let logs = match executor.resume_with_limit(limit) {
+            let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
                 Ok(logs) => logs,
                 Err(e) => {
                     eprintln!("Execution failed: {:?}", e);

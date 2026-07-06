@@ -33,14 +33,21 @@ def parse_args():
 
 
 def read_raw_stacks(path):
-    """Yields (list_of_addr_strings, count) per line of a raw folded file."""
+    """Yields (list_of_addr_strings, count) per line of a raw folded file.
+    Skips a malformed line (e.g. one torn by a kill mid-write) with a
+    warning instead of raising, so a killed run's output can still be
+    enriched.
+    """
     with open(path) as f:
-        for line in f:
+        for lineno, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            stack, count = line.rsplit(" ", 1)
-            yield stack.split(";"), int(count)
+            try:
+                stack, count = line.rsplit(" ", 1)
+                yield stack.split(";"), int(count)
+            except ValueError:
+                print(f"warning: {path}:{lineno}: skipping malformed line: {line!r}", file=sys.stderr)
 
 
 def query_addr2line(elf_path, addresses, addr2line_bin):

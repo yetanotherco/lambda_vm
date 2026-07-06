@@ -877,3 +877,58 @@ fn test_flamegraph_trie_fold_matches_hand_computed_counts() {
     lines.sort();
     assert_eq!(lines, vec!["main 3", "main;f 6"]);
 }
+
+// ============================================================================
+// run_with_flamegraph: generator survives an execution error
+// ============================================================================
+
+#[test]
+fn test_run_with_flamegraph_returns_generator_on_executor_new_failure() {
+    // Private input past MAX_PRIVATE_INPUT_SIZE fails inside `Executor::new`,
+    // before any cycle runs. `run_with_flamegraph` must still hand back a
+    // (valid, empty) generator rather than discarding it — the whole point
+    // of returning `(generator, Result<..>)` instead of `Result<(generator, ..), _>`
+    // is that a caller can always inspect/persist whatever was accumulated,
+    // even on failure.
+    let elf_bytes = std::fs::read("./program_artifacts/rust/add.elf").unwrap();
+    let program = executor::elf::Elf::load(&elf_bytes).unwrap();
+    let oversized_input = vec![0u8; 64 * 1024 * 1024 + 1];
+
+    let (generator, result) = executor::flamegraph::run_with_flamegraph(
+        &elf_bytes,
+        &program,
+        oversized_input,
+        None,
+        |_, _| {},
+    );
+
+    assert!(result.is_err());
+    assert_eq!(generator.total_instructions(), 0);
+}
+
+#[test]
+fn test_run_with_flamegraph_returns_generator_on_drive_loop_fault() {
+    // `misaligned_pc.elf` jumps to an unaligned PC on its very first
+    // instruction, so `Executor::resume_with_limit` errors out from inside
+    // `drive_with_flamegraph`'s loop — a different failure site than
+    // `Executor::new` above (this one fires after the executor was already
+    // constructed and handed to `drive_with_flamegraph`). `run_with_flamegraph`
+    // must still hand back a valid generator from this branch too.
+    //
+    // `total_instructions()` is 0 here specifically because the fault lands
+    // within the *same* chunk as the one instruction that ran before it (a
+    // chunk's logs are discarded entirely if `resume_with_limit` errors
+    // before reaching the chunk boundary) — not because the fix only
+    // handles the zero-cycles case. The contract doesn't depend on how many
+    // complete chunks preceded the fault: `generator` is mutated in place
+    // by `&mut` across loop iterations, and both of `run_with_flamegraph`'s
+    // return sites hand back that same value regardless of `Ok`/`Err`.
+    let elf_bytes = std::fs::read("./program_artifacts/asm/misaligned_pc.elf").unwrap();
+    let program = executor::elf::Elf::load(&elf_bytes).unwrap();
+
+    let (generator, result) =
+        executor::flamegraph::run_with_flamegraph(&elf_bytes, &program, vec![], None, |_, _| {});
+
+    assert!(result.is_err());
+    assert_eq!(generator.total_instructions(), 0);
+}

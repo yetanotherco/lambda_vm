@@ -9,7 +9,7 @@ use std::io::{self, Write};
 use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::{Elf, SymbolTable};
-use crate::vm::execution::{CHUNK_SIZE, Executor, ExecutorError, InstructionCache};
+use crate::vm::execution::{Executor, ExecutorError, InstructionCache};
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
 use crate::vm::memory::U64HashMap;
@@ -217,22 +217,28 @@ impl FlamegraphGenerator {
     /// (memoized), rather than per instruction.
     pub fn write_folded<W: Write>(&self, writer: &mut W) -> io::Result<()> {
         let mut name_cache: HashMap<u64, String> = HashMap::new();
-        let mut path = Vec::new();
-        // Keyed by the *resolved* stack string, not by trie node: distinct
-        // nodes (e.g. two different call-site addresses inside the same
-        // function) can resolve to the same name path and must be summed
-        // into one line, matching the pre-trie String-keyed behavior.
-        let mut counts: HashMap<String, u64> = HashMap::new();
-        self.collect(&mut path, &mut name_cache, &mut counts);
-
-        // Sort by stack path for deterministic output.
-        let mut entries: Vec<_> = counts.into_iter().collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let entries = self.fold(|addr| {
+            name_cache
+                .entry(addr)
+                .or_insert_with(|| self.resolve_address(addr))
+                .clone()
+        });
 
         for (stack, count) in entries {
             writeln!(writer, "{} {}", stack, count)?;
         }
 
+        Ok(())
+    }
+
+    /// Write folded stack output keyed by raw hex addresses instead of
+    /// resolved names (pairs with scripts/enrich_flamegraph.py).
+    pub fn write_folded_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
+        let entries = self.fold(|addr| format!("0x{addr:x}"));
+
+        for (stack, count) in entries {
+            writeln!(writer, "{stack} {count}")?;
+        }
         Ok(())
     }
 
@@ -253,76 +259,36 @@ impl FlamegraphGenerator {
         path.reverse();
     }
 
-    fn collect(
-        &self,
-        path: &mut Vec<u64>,
-        name_cache: &mut HashMap<u64, String>,
-        counts: &mut HashMap<String, u64>,
-    ) {
+    /// Walk every counted trie node, render its root-to-node address chain
+    /// through `render_addr` (memoized name resolution for `write_folded`,
+    /// raw hex for `write_folded_raw`), and fold same-rendered-path nodes
+    /// (e.g. two different call-site addresses inside the same function)
+    /// into summed counts. Returns entries sorted by stack path for
+    /// deterministic output.
+    fn fold(&self, mut render_addr: impl FnMut(u64) -> String) -> Vec<(String, u64)> {
+        let mut path = Vec::new();
+        let mut counts: HashMap<String, u64> = HashMap::new();
         for (idx, node) in self.nodes.iter().enumerate() {
             if node.count == 0 {
                 continue;
             }
-            self.path_to(idx as u32, path);
+            self.path_to(idx as u32, &mut path);
             let stack = path
                 .iter()
-                .map(|addr| {
-                    name_cache
-                        .entry(*addr)
-                        .or_insert_with(|| self.resolve_address(*addr))
-                        .clone()
-                })
+                .map(|&addr| render_addr(addr))
                 .collect::<Vec<_>>()
                 .join(";");
             *counts.entry(stack).or_insert(0) += node.count;
         }
+
+        let mut entries: Vec<_> = counts.into_iter().collect();
+        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+        entries
     }
 
     /// Get the total number of instructions counted so far.
     pub fn total_instructions(&self) -> u64 {
         self.total_counted
-    }
-
-    /// Raw (unresolved) call-stack address paths and their counts — one
-    /// entry per counted trie node, root-to-leaf.
-    pub fn raw_stacks(&self) -> Vec<(Vec<u64>, u64)> {
-        let mut path = Vec::new();
-        let mut out = Vec::new();
-        self.collect_raw(&mut path, &mut out);
-        out
-    }
-
-    /// Write folded stack output keyed by raw hex addresses instead of
-    /// resolved names (pairs with scripts/enrich_flamegraph.py).
-    pub fn write_folded_raw<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        let mut entries: Vec<(String, u64)> = self
-            .raw_stacks()
-            .into_iter()
-            .map(|(addrs, count)| {
-                let stack = addrs
-                    .iter()
-                    .map(|addr| format!("0x{addr:x}"))
-                    .collect::<Vec<_>>()
-                    .join(";");
-                (stack, count)
-            })
-            .collect();
-        entries.sort_by(|(a, _), (b, _)| a.cmp(b));
-
-        for (stack, count) in entries {
-            writeln!(writer, "{stack} {count}")?;
-        }
-        Ok(())
-    }
-
-    fn collect_raw(&self, path: &mut Vec<u64>, out: &mut Vec<(Vec<u64>, u64)>) {
-        for (idx, node) in self.nodes.iter().enumerate() {
-            if node.count == 0 {
-                continue;
-            }
-            self.path_to(idx as u32, path);
-            out.push((path.clone(), node.count));
-        }
     }
 }
 
@@ -352,14 +318,7 @@ pub fn drive_with_flamegraph(
 
     let mut total_cycles: u64 = 0;
     loop {
-        // Cap the final chunk to the cycles still owed against the budget so we
-        // stop at exactly `cycle_budget`; a full `CHUNK_SIZE` otherwise. (The
-        // cap only shrinks the limit, so normal chunks are unaffected and we
-        // never buffer more than one chunk of logs.)
-        let limit = cycle_budget
-            .map(|budget| ((budget - total_cycles) as usize).min(CHUNK_SIZE))
-            .unwrap_or(CHUNK_SIZE);
-        let Some(logs) = executor.resume_with_limit(limit)? else {
+        let Some(logs) = executor.resume_budgeted(total_cycles, cycle_budget)? else {
             break;
         };
         total_cycles += logs.len() as u64;
@@ -381,19 +340,25 @@ pub fn drive_with_flamegraph(
 /// `cycle_budget` is forwarded to [`drive_with_flamegraph`]; `on_chunk` is
 /// forwarded for periodic partial persistence (pass `|_, _| {}` if not
 /// needed).
+///
+/// The generator is always returned, even on error: a fault partway through
+/// a long, uncheckpointed run would otherwise silently discard everything
+/// accumulated so far, since this function is the one that owns it.
 pub fn run_with_flamegraph(
     elf_bytes: &[u8],
     program: &Elf,
     private_inputs: Vec<u8>,
     cycle_budget: Option<u64>,
     on_chunk: impl FnMut(u64, &FlamegraphGenerator),
-) -> Result<(FlamegraphGenerator, u64), FlamegraphDriveError> {
+) -> (FlamegraphGenerator, Result<u64, FlamegraphDriveError>) {
     let symbols = SymbolTable::parse(elf_bytes);
     let mut generator = FlamegraphGenerator::new(symbols, program.entry_point);
-    let mut executor = Executor::new(program, private_inputs)?;
-    let total_cycles =
-        drive_with_flamegraph(&mut executor, &mut generator, cycle_budget, on_chunk)?;
-    Ok((generator, total_cycles))
+    let mut executor = match Executor::new(program, private_inputs) {
+        Ok(executor) => executor,
+        Err(e) => return (generator, Err(e.into())),
+    };
+    let result = drive_with_flamegraph(&mut executor, &mut generator, cycle_budget, on_chunk);
+    (generator, result)
 }
 
 /// Demangle a Rust symbol name using the official rustc-demangle crate.
