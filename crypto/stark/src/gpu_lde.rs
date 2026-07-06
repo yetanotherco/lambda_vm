@@ -1631,22 +1631,27 @@ where
 /// concrete transcript type to support snapshot semantics via `Clone`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E, T>(
-    number_layers: usize,
     evals: &[FieldElement<E>],
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
 ) -> Option<(
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
+    E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
 {
+    // GPU drives the early-termination FRI commit phase, mirroring
+    // `commit_phase_from_evaluations`: for each committed layer (sample zeta,
+    // fold, append root); then one final fold to the terminal codeword whose
+    // coefficients are emitted (not a single value).
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1688,11 +1693,25 @@ where
     // produced had this dispatch never been called.
     let transcript_snapshot = transcript.clone();
 
-    let num_committed_layers = number_layers.saturating_sub(1);
+    // Fold layout, shared with the CPU prover and the verifier — see `FriFoldLayout`.
+    let layout = crate::fri::terminal::FriFoldLayout::new(
+        n0.trailing_zeros(),
+        blowup_log,
+        final_poly_log_degree,
+    );
+    // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
+    // the CPU path (which handles both correctly): tiny clamped traces
+    // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
+    // final fold would reach n_out == 1 and trip `fold_and_commit_layer`'s
+    // `n_out >= 2` assert. The final fold below is therefore always n_out >= 2.
+    if layout.total_folds == 0 || layout.terminal_len < 2 {
+        return None;
+    }
+    let num_committed = layout.num_committed;
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
-        Vec::with_capacity(num_committed_layers);
+        Vec::with_capacity(num_committed);
 
-    for _ in 0..num_committed_layers {
+    for _ in 0..num_committed {
         // <<<< Receive challenge zeta_k
         let zeta: FieldElement<E> = transcript.sample_field_element();
         // SAFETY: E == Ext3.
@@ -1721,29 +1740,38 @@ where
         transcript.append_bytes(&root);
     }
 
-    // <<<< Receive challenge zeta_{n-1}
-    let zeta_last: FieldElement<E> = transcript.sample_field_element();
-    let zeta_ptr = &zeta_last as *const FieldElement<E> as *const u64;
+    // Final (uncommitted) fold to the terminal codeword. n_out == terminal_len
+    // >= 2, so reuse fold_and_commit_layer and keep only its evaluations; the
+    // Merkle root/nodes are discarded (the terminal layer is sent as coeffs).
+    let zeta_final: FieldElement<E> = transcript.sample_field_element();
+    let zeta_ptr = &zeta_final as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let last_raw = match state.fold_final(zeta_raw) {
+    let (terminal_evals_u64, _tree) = match state.fold_and_commit_layer(zeta_raw) {
         Ok(v) => v,
         Err(_) => {
             *transcript = transcript_snapshot;
             return None;
         }
     };
-    let last_vec = u64_to_ext3_vec::<E>(&last_raw);
-    let last_value = last_vec
-        .into_iter()
-        .next()
-        .expect("fold_final returns 1 elt");
+    debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
+    let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
 
-    // >>>> Send value: p_n
-    transcript.append_field_element(&last_value);
+    // CPU-side coefficient extraction, identical to commit_phase_from_evaluations.
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &terminal_codeword,
+        &terminal_offset,
+        layout.effective_k,
+    );
+
+    // >>>> Send the final polynomial coefficients.
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some((last_value, fri_layer_list))
+    Some((final_poly_coeffs, fri_layer_list))
 }
 
 /// GPU FRI query phase: gather each layer's paths on device instead of walking

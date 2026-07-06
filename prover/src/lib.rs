@@ -938,6 +938,7 @@ pub fn prove_with_options_and_inputs(
         &table_counts,
         num_private_input_pages,
         &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
     );
 
     // Phase 4: Prove (multi_prove)
@@ -1103,6 +1104,7 @@ pub fn verify_with_options(
         &vm_proof.table_counts,
         vm_proof.num_private_input_pages,
         &vm_proof.runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
     );
 
     // Fork the post-absorb state: the replay helper advances through Phase A

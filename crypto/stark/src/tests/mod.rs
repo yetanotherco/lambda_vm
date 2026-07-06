@@ -13,4 +13,5 @@ pub mod row_pair_opening_tests;
 pub mod small_trace_tests;
 #[cfg(feature = "disk-spill")]
 pub mod table_disk_spill_tests;
+pub mod terminal_tests;
 pub mod trace_test_helpers;
