@@ -31,6 +31,9 @@ pub fn main() -> ! {
     let blob = lambda_vm_syscalls::syscalls::get_private_input();
     let (vm_proof, inner_elf, options): (VmProof, Vec<u8>, ProofOptions) =
         postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
+    lambda_vm_prover::profile_markers::step_marker::<
+        { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
+    >();
 
     let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options, None, None)
         .expect("verify errored");

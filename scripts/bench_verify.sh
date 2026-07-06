@@ -5,7 +5,11 @@
 #
 # Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
 #   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~4 min).
-#   Env: REBUILD=1 forces rebuild; BENCH_FEATURES=<list> (default: jemalloc-stats).
+#   Env: REBUILD=1 forces rebuild + re-prove; BENCH_FEATURES=<list> (default: jemalloc-stats).
+#        PROVE_PER_SIDE=auto|1|0 (default auto): 1 = each side proves+verifies its
+#        own proof (required when REF_A changes the proof format); 0 = force one
+#        shared proof (best precision); auto = share if the PR binary can verify the
+#        baseline's proof, else fall back to per-side.
 
 set -euo pipefail
 
@@ -23,7 +27,8 @@ ELF_REL="executor/program_artifacts/rust/ethrex.elf"
 INPUT_REL="executor/tests/ethrex_bench_20.bin"
 WORK="/tmp/verify_run"
 WT="/tmp/verify_wt"
-PROOF="/tmp/verify_proof.bin"
+PROOF_B="$WORK/proof_b.bin"   # baseline's proof (cached in $WORK, keyed like the binaries)
+PROOF_A="$WORK/proof_a.bin"   # PR's proof (cached likewise)
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
@@ -93,7 +98,14 @@ else
   echo "     cli_A=${SHA_A:0:10}  cli_B=${SHA_B:0:10}  features=$BENCH_FEATURES"
 fi
 
-# --- 3. Prove once (shared), then interleaved A/B/B/A verify measurement ---
+# --- 3. Prove, then interleaved A/B/B/A verify measurement ---
+# Default: both sides verify ONE shared proof (proved by the baseline), which gives
+# ABBA the tightest precision (no proof-specific variance). That only works when both
+# binaries share the same proof (de)serialization format. A PR that changes the proof
+# format cannot deserialize the baseline's proof, so we detect that and fall back to
+# per-side proofs (each binary proves and verifies its own). PROVE_PER_SIDE overrides.
+PROVE_PER_SIDE="${PROVE_PER_SIDE:-auto}"
+
 prove_once() {  # $1=binary $2=proof-path
   if ! "$1" prove "$ELF" --private-input "$INPUT" -o "$2" --time >"$WORK/prove_$(basename "$2").log" 2>&1; then
     echo "ERROR: prove failed for $1. Tail of log:" >&2
@@ -101,39 +113,102 @@ prove_once() {  # $1=binary $2=proof-path
     exit 1
   fi
 }
-run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s)
-  local out t
-  out="$("$1" verify "$2" "$ELF" --time 2>&1)"
-  t="$(printf '%s\n' "$out" | grep -o 'Verification time: [0-9.]*' | awk '{print $3}')"
+verify_time() {  # $1=binary $2=proof-path -> echoes time on success, empty on failure (never exits)
+  local out
+  out="$("$1" verify "$2" "$ELF" --time 2>&1)" || true
+  printf '%s\n' "$out" | grep -o 'Verification time: [0-9.]*' | awk '{print $3}' || true
+}
+run_verify() {  # $1=binary $2=proof-path -> echoes verification time (s), exits on failure
+  local t
+  t="$(verify_time "$1" "$2")"
   if [ -z "$t" ]; then
-    echo "ERROR: could not parse 'Verification time' from cli output:" >&2
-    printf '%s\n' "$out" >&2
+    echo "ERROR: could not parse 'Verification time' from '$1 verify $2':" >&2
+    "$1" verify "$2" "$ELF" --time >&2 2>&1 || true
+    echo "HINT: if REF_A changes the proof format, run with PROVE_PER_SIDE=1." >&2
     exit 1
   fi
   echo "$t"
 }
 
-# One shared proof for both sides: per-side proofs leak a proof-specific bias ABBA can't cancel.
-echo "==> Proving once with the baseline binary (both sides verify this same proof)"
-prove_once "$WORK/cli_B" "$PROOF"
+# Both sides prove their own proof (needed for the proof-size row; per-side verify
+# needs both). Proofs are cached in $WORK like the binaries, marker
+# "<sha> <features> <ELF+input hash>". Bytes are non-deterministic (parallel grinding)
+# but size + verify cost are structural, so reusing a cached proof is valid. The prove
+# call passes no proof-option flags; if it ever gains one (--blowup, ...), add it to the marker.
+sha256_of() { if command -v sha256sum >/dev/null 2>&1; then sha256sum; else shasum -a 256; fi; }
+PROOF_KEY_INPUT="$(cat "$ELF" "$INPUT" | sha256_of | cut -c1-16)"
+prove_cached() {  # $1=binary $2=proof-path $3=sha
+  local marker="$3 $BENCH_FEATURES $PROOF_KEY_INPUT"
+  if [ "${REBUILD:-0}" != "1" ] && [ -f "$2" ] && [ "$(cat "$2.sha" 2>/dev/null)" = "$marker" ]; then
+    echo "==> Reusing cached proof for ${3:0:10} ($(basename "$2"))"
+  else
+    echo "==> Proving with $(basename "$1") (${3:0:10})"
+    prove_once "$1" "$2"
+    echo "$marker" > "$2.sha"
+  fi
+}
+prove_cached "$WORK/cli_B" "$PROOF_B" "$SHA_B"
+prove_cached "$WORK/cli_A" "$PROOF_A" "$SHA_A"
+
+# Proof sizes (bytes) for the Proof size row.
+SIZE_B="$(wc -c < "$PROOF_B" | tr -d '[:space:]')"
+SIZE_A="$(wc -c < "$PROOF_A" | tr -d '[:space:]')"
+
+# Decide whether both sides can VERIFY one shared proof (baseline's) — tightest
+# timing precision — or must verify their own. In auto mode, distinguish a real
+# proof-format change (deserialize error → benign) from the PR *rejecting* a valid
+# baseline proof (a verify regression). Both fall back to per-side, but they mean
+# very different things, so carry the reason into the report — otherwise a real
+# backward-compat break gets silently reclassified as a format change and shown green.
+per_side=0
+per_side_note=""
+case "$PROVE_PER_SIDE" in
+  1) per_side=1; per_side_note="forced via PROVE_PER_SIDE=1" ;;
+  0) per_side=0 ;;
+  *)  probe="$("$WORK/cli_A" verify "$PROOF_B" "$ELF" --time 2>&1 || true)"
+      if printf '%s\n' "$probe" | grep -q 'Verification time'; then
+        per_side=0                                     # PR verifies main's proof -> shared
+      elif printf '%s\n' "$probe" | grep -q 'Failed to deserialize'; then
+        per_side=1
+        per_side_note="PR can't deserialize the baseline's proof — proof-format change"
+        echo "==> $per_side_note; verifying per-side."
+      else
+        per_side=1
+        per_side_note="⚠️ PR REJECTS the baseline's valid proof — likely a VERIFY REGRESSION, not a format change"
+        echo "==> $per_side_note"
+        echo "    verifying per-side, but the Verify-time numbers below are NOT a safe signal."
+      fi ;;
+esac
+
+if [ "$per_side" = "1" ]; then
+  MODE="per-side"
+  echo "==> Per-side verify: each binary verifies its OWN proof."
+  PROOF_FOR_A="$PROOF_A"
+  PROOF_FOR_B="$PROOF_B"
+else
+  MODE="shared"
+  echo "==> Shared verify: both sides verify the baseline's proof (best precision)."
+  PROOF_FOR_A="$PROOF_B"
+  PROOF_FOR_B="$PROOF_B"
+fi
 
 echo "==> Running $N_PAIRS interleaved pairs  (improvement: + = PR faster)"
 printf 'pair,a_time,b_time\n' > "$WORK/pairs.csv"
 for i in $(seq 1 "$N_PAIRS"); do
   if [ $((i % 2)) -eq 1 ]; then          # odd pair: A then B
-    a="$(run_verify "$WORK/cli_A" "$PROOF")"; b="$(run_verify "$WORK/cli_B" "$PROOF")"
+    a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A")"; b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B")"
   else                                   # even pair: B then A (ABBA pattern)
-    b="$(run_verify "$WORK/cli_B" "$PROOF")"; a="$(run_verify "$WORK/cli_A" "$PROOF")"
+    b="$(run_verify "$WORK/cli_B" "$PROOF_FOR_B")"; a="$(run_verify "$WORK/cli_A" "$PROOF_FOR_A")"
   fi
   printf '%d,%s,%s\n' "$i" "$a" "$b" >> "$WORK/pairs.csv"
   printf '   pair %2d/%d   A=%ss  B=%ss   PR %+.2f%% (+=faster)\n' \
     "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($b-$a)/$b*100}")"
 done
-rm -f "$PROOF"
+# Proofs are kept in $WORK as a cache (invalidated by their .sha markers), not deleted.
 
 # --- 4. Paired t-test + robust median/Wilcoxon (same stats as bench_abba.sh) ---
-python3 - "$WORK/pairs.csv" <<'PY'
-import sys, csv, math
+SIZE_A="$SIZE_A" SIZE_B="$SIZE_B" MODE="$MODE" PER_SIDE_NOTE="$per_side_note" python3 - "$WORK/pairs.csv" <<'PY'
+import sys, csv, math, os
 
 rows = list(csv.DictReader(open(sys.argv[1])))
 A = [float(r['a_time']) for r in rows]   # PR
@@ -216,11 +291,32 @@ drift_shift = sum(nrm[half:]) / (N - half) - sum(nrm[:half]) / half
 # Markdown table (rendered directly in the PR comment) + paired detail.
 sign = lambda v: f"+{v:.2f}" if v >= 0 else f"{v:.2f}"
 icon = "🟢" if (lo > 0 and p < 0.05) else "🔴" if (hi < 0 and p < 0.05) else "⚪"
-print("\n=== Verify ABBA result  (improvement: + = PR faster) ===")
+mode = os.environ.get('MODE', 'shared')
+per_side_note = os.environ.get('PER_SIDE_NOTE', '')
+
+print("\n=== Verify ABBA result ===")
 print()
-print("| Metric | main | PR | Δ (paired) |")
-print("|--------|------|----|------------|")
-print(f"| **Verify time** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+
+# Proof size row: exact (the .bin byte size), no ABBA. + = PR smaller = better.
+size_b = float(os.environ.get('SIZE_B', 0))   # main
+size_a = float(os.environ.get('SIZE_A', 0))   # PR
+size_impr = (size_b - size_a) / size_b * 100.0 if size_b else 0.0
+size_icon = "🟢" if size_impr > 0.005 else "🔴" if size_impr < -0.005 else "⚪"
+to_mib = lambda b: b / (1024.0 * 1024.0)
+
+# In per-side mode A and B verify different proofs, so label the metric (M2).
+vt_label = "Verify time (per-side)" if mode == "per-side" else "Verify time"
+print("| Metric | main | PR | Δ |")
+print("|--------|------|----|---|")
+print(f"| **{vt_label}** | {mB:.3f}s | {mA:.3f}s | {sign(mean)}% {icon} |")
+print(f"| **Proof size** | {to_mib(size_b):.2f} MiB | {to_mib(size_a):.2f} MiB | {sign(size_impr)}% {size_icon} |")
+
+# Surface why per-side kicked in (format change vs possible regression) so a green
+# table can't silently hide a backward-compat verify break (M1/M2).
+if mode == "per-side":
+    print()
+    print(f"> **Per-side** ({per_side_note or 'each side verified its own proof'}): "
+          "A/B/B/A cancels machine drift but not proof-specific variance — read the Verify-time Δ as approximate.")
 print()
 print("```")
 print(f"  pairs: {n}   mean A (PR): {mA:.3f}s   mean B (main): {mB:.3f}s")
