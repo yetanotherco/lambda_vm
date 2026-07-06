@@ -488,7 +488,7 @@ input = ["prev_pc_timestamp_borrow"]
 [[constraints.mem]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", ["-", "timestamp", ["*", 3, ["not", "pc_double_read"]]]], ["idx", "pc", "i"]]
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["-", "timestamp", ["*", 3, ["not", "pc_double_read"]]], ["idx", "pc", "i"]]
 iter = ["i", 0, 1]
 multiplicity = 1
 

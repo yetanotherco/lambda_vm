@@ -46,7 +46,7 @@ Since we choose to represent the epoch-local timestamps as 32-bit `Word` values,
 an epoch _should not_ consist of more than $2^30$ cycles
 (refer to the scaling factor in @memory:aside:granularity).
 
-As such, each epoch proceeds by commiting to all its tables,#footnote[
+As such, each epoch proceeds by committing to all its tables,#footnote[
   The local-to-global will require a separate Merkle tree to allow the separation of epoch-local and cross-epoch proving.
 ] obtaining epoch-local LogUp challenges,
 proving the epoch-local (that is, without cross-epoch memory interaction) LogUp sum is zero, and performing a full batch FRI, including the queries.
