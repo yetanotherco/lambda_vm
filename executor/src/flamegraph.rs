@@ -184,10 +184,11 @@ impl FlamegraphGenerator {
         // exactly the addresses that `lookup` resolves to that function, so
         // this is equivalent to two same-function lookups — without running
         // them. Covers loop back-edges, switch arms, self-tail-recursion, etc.
-        if let Some((start, end)) = self.cached_fn_range {
-            if (start..end).contains(&log.current_pc) && (start..end).contains(&log.next_pc) {
-                return;
-            }
+        if let Some((start, end)) = self.cached_fn_range
+            && (start..end).contains(&log.current_pc)
+            && (start..end).contains(&log.next_pc)
+        {
+            return;
         }
 
         let from = self.symbols.lookup_range(log.current_pc);
@@ -199,11 +200,11 @@ impl FlamegraphGenerator {
         // endpoint is unresolved, treat it as an ordinary jump (no mutation),
         // matching the doc comment and this PR's stance against spurious
         // pop+push in unsymbolized code.
-        if let (Some((f, _)), Some(t)) = (from, self.symbols.lookup(log.next_pc)) {
-            if f.address != t.address {
-                self.pop();
-                self.push(log.next_pc);
-            }
+        if let (Some((f, _)), Some(t)) = (from, self.symbols.lookup(log.next_pc))
+            && f.address != t.address
+        {
+            self.pop();
+            self.push(log.next_pc);
         }
     }
 
