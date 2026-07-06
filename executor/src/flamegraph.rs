@@ -9,10 +9,10 @@ use std::io::{self, Write};
 use rustc_demangle::demangle as rustc_demangle;
 
 use crate::elf::{Elf, SymbolTable};
-use crate::vm::execution::{Executor, ExecutorError, InstructionCache, CHUNK_SIZE};
-use crate::vm::memory::U64HashMap;
+use crate::vm::execution::{CHUNK_SIZE, Executor, ExecutorError, InstructionCache};
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::logs::Log;
+use crate::vm::memory::U64HashMap;
 
 /// Errors that can occur during flamegraph generation.
 #[derive(Debug, thiserror::Error)]
