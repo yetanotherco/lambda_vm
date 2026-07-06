@@ -524,9 +524,22 @@ binding holds there too — not just on the integrated path.
 The continuation can be proved and verified by separate parties. `prove_continuation`
 emits a self-contained `ContinuationProof` bundle; `verify_continuation(elf, &bundle)`
 checks it using **only the bundle and the ELF** — nothing from the prover's memory.
-The integrated `prove_and_verify_continuation` is now a thin wrapper
-(`prove_continuation` then `verify_continuation`), and `prove_verify_epoch` is
-likewise split into `prove_epoch` + `verify_epoch`.
+The integrated `prove_and_verify_continuation` proves and verifies in one
+**streaming** pass: it proves each epoch, verifies it inline with `verify_epoch`,
+and drops that epoch's `MultiProof` — retaining only the
+`boundary`/`l2g_root`/`public_output` (small next to a `MultiProof` for typical
+epochs, though the accumulated per-epoch `boundary` lists still grow with the run's
+total touched memory — the O(1) bound below is on retained *proof* data) — before
+building and verifying the one global proof. This bounds its retained-proof memory
+to O(1) epochs (at most two are
+live across the one-epoch `is_final` lookahead) instead of holding all *N*. It is a faithful in-process mirror of
+`verify_continuation` (it derives `is_final`/`label` **positionally** — a one-epoch
+lookahead for `is_final` — and chains `register_init` from each verified epoch's
+`reg_fini`, never trusting the prover), but it is **not** a substitute for verifying
+an untrusted serialized bundle — `verify_continuation` remains that. The epoch loop
+it shares with `prove_continuation` lives in an internal `EpochDriver`, so the
+bundle producer and the streaming path cannot diverge in how epochs are produced.
+`prove_verify_epoch` is likewise split into `prove_epoch` + `verify_epoch`.
 
 The bundle is prover-supplied and therefore **untrusted**. Per epoch it carries the
 `MultiProof`, the `public_output` slice, `table_counts`, `runtime_page_ranges`, the bound
@@ -637,8 +650,9 @@ recursion/aggregation layer (deferred).
   `prove_epoch` / `verify_epoch` with the shared `build_epoch_airs` helper; the
   global proof (`prove_global` / `verify_global`); the per-epoch AIRs
   (`l2g_memory_air` / `l2g_global_air`); the power-of-two epoch sizing from
-  `epoch_size_log2`; the register-FINI preprocessing; the transcript seeding; and
-  `prove_and_verify_continuation` (the thin integrated wrapper).
+  `epoch_size_log2`; the register-FINI preprocessing; the transcript seeding; the
+  shared `EpochDriver` epoch loop; and `prove_and_verify_continuation` (the
+  streaming integrated prove→verify→drop path).
 - `prover/src/lib.rs` — `verify_l2g_commitment_binding` (epoch L2G root ↔ global
   sub-table root) and the commit-bus offset/balance helpers
   (`compute_commit_bus_offset`, `compute_expected_commit_bus_balance`) that take the
