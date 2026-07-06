@@ -539,6 +539,18 @@ pub trait IsStarkVerifier<
         proof: &StarkProof<Field, FieldExtension, PI>,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
+
+        // `deep_poly_openings` comes straight from the untrusted proof and its
+        // length is not otherwise pinned (the `query_list.len()` guard checks a
+        // different field). The loop below indexes `deep_poly_openings[i]` for
+        // every `i` in `0..num_queries`, so a truncated Vec would panic the
+        // verifier with an out-of-bounds index on a malicious proof. Reject
+        // instead. (Extra entries are harmless — they are never indexed —
+        // matching the `<` convention of the `query_list` guard.)
+        if proof.deep_poly_openings.len() < num_queries {
+            return None;
+        }
+
         let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
 
