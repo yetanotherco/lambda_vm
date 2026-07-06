@@ -11,6 +11,7 @@ cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
+profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
 
 [dependencies]

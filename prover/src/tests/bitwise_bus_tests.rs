@@ -4,12 +4,12 @@
 //! - Completeness: Valid lookups to BITWISE are accepted
 //! - Soundness: Invalid lookups to BITWISE are rejected
 
+use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 
-use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
@@ -54,9 +54,7 @@ mod receiver_cols {
 
 fn new_sender_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
             BusId::ByteAlu,
@@ -84,15 +82,13 @@ fn new_sender_air(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 fn new_receiver_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
             BusId::ByteAlu,
@@ -120,7 +116,7 @@ fn new_receiver_air(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 

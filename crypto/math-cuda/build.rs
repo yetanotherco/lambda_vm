@@ -72,6 +72,11 @@ fn compile_ptx(src: &str, out_name: &str, have_nvcc: bool) {
     // compute capability. If unset, try `nvidia-smi` to match the host GPU
     // (avoids JIT failures like nvcc-13.0 PTX rejected on Blackwell drivers);
     // fall back to compute_89 (Ada) when detection fails.
+    //
+    // NOTE: this `-arch` only sets the *virtual arch*, not the PTX ISA version, which is
+    // fixed by this nvcc's CUDA toolkit. The runtime driver must support that toolkit's CUDA
+    // version or it rejects the PTX with CUDA_ERROR_UNSUPPORTED_PTX_VERSION — i.e. the box's
+    // driver CUDA must be >= the build toolkit's CUDA. See README "GPU Tests".
     let arch = env::var("CUDARC_NVCC_ARCH").unwrap_or_else(|_| detect_arch());
 
     let status = Command::new(nvcc_path())
@@ -115,4 +120,5 @@ fn main() {
     compile_ptx("deep.cu", "deep.ptx", have_nvcc);
     compile_ptx("fri.cu", "fri.ptx", have_nvcc);
     compile_ptx("inverse.cu", "inverse.ptx", have_nvcc);
+    compile_ptx("logup.cu", "logup.ptx", have_nvcc);
 }

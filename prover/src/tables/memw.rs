@@ -27,17 +27,16 @@
 //! - 16 Memory bus tokens (read old + write new, per byte)
 //! - 2 MEMW output interactions (read + write, from CPU)
 //!
-//! ## Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
+//! ## Constraints (15 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT
+//! for carry + 3 IS_BIT for width flags (write2/4/8) + 1 IS_BIT for the width sum)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
-use crate::constraints::templates::IsBitConstraint;
+use crate::constraints::templates::emit_is_bit;
 
 /// Maximum number of rows per MEMW table chunk.
 /// If operations exceed this, the trace is split into multiple tables.
@@ -861,153 +860,61 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Virtual column computations
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// Compute virtual w2 = write2 + write4 + write8
-fn compute_w2<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let write2 = step.get_main_evaluation_element(0, cols::WRITE2).clone();
-    let write4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-    let write8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-    write2 + write4 + write8
+/// `μ_sum = μ_read + μ_write` as a builder expression.
+fn mu_sum_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE)
 }
 
-/// Compute virtual μ_sum = μ_read + μ_write
-fn compute_mu_sum<F, E>(step: &TableView<F, E>) -> FieldElement<F>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let mu_read = step.get_main_evaluation_element(0, cols::MU_READ).clone();
-    let mu_write = step.get_main_evaluation_element(0, cols::MU_WRITE).clone();
-    mu_read + mu_write
+/// `w2 = write2 + write4 + write8` as a builder expression.
+fn w2_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+    b.main(0, cols::WRITE2) + b.main(0, cols::WRITE4) + b.main(0, cols::WRITE8)
 }
 
-// =========================================================================
-// Constraints (11 total: 2 custom + 2 IS_BIT for multiplicities + 7 IS_BIT for carry)
-// =========================================================================
+/// The MEMW table's 15 transition constraints as a single [`ConstraintSet`]:
+/// - idx 0:     `IS_BIT<μ_sum>`;
+/// - idx 1:     `w2 ⇒ μ_sum` (`w2·(1 − μ_sum)`);
+/// - idx 2,3:   `IS_BIT` on `μ_read`, `μ_write`;
+/// - idx 4-10:  `IS_BIT` on `carry[0..6]`;
+/// - idx 11-13: `IS_BIT` on `write2`, `write4`, `write8`;
+/// - idx 14:    `IS_BIT<w2>` (width sum is a bit).
+pub struct MemwConstraints;
 
-/// MEMW table constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum MemwConstraintKind {
-    /// IS_BIT<μ_sum>: multiplicity sum is 0 or 1
-    MuSumIsBit,
-    /// w2 => μ_sum: if accessing 2+ bytes, must be active row
-    W2ImpliesMuSum,
-    /// IS_BIT<write2 + write4 + write8>: the width-sum is 0 or 1 (spec assumption).
-    WidthSumIsBit,
-}
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum)
+        let one = b.one();
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(0, mu_sum.clone() * (one - mu_sum));
 
-/// MEMW table constraint.
-pub struct MemwConstraint {
-    constraint_idx: usize,
-    kind: MemwConstraintKind,
-}
+        // idx 1: w2 ⇒ μ_sum = w2 * (1 - μ_sum)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        let mu_sum = mu_sum_expr(b);
+        b.emit_base(1, w2 * (one - mu_sum));
 
-impl MemwConstraint {
-    pub fn new(kind: MemwConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
+        // idx 2,3: IS_BIT<μ_read>, IS_BIT<μ_write>
+        emit_is_bit(b, 2, cols::MU_READ, None);
+        emit_is_bit(b, 3, cols::MU_WRITE, None);
+
+        // idx 4-10: IS_BIT for carry[0..6]
+        let mut idx = 4;
+        for &col in &cols::CARRY {
+            emit_is_bit(b, idx, col, None);
+            idx += 1;
         }
-    }
 
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-
-        match self.kind {
-            MemwConstraintKind::MuSumIsBit => {
-                let mu_sum = compute_mu_sum(step);
-                &mu_sum * (&one - &mu_sum)
-            }
-            MemwConstraintKind::W2ImpliesMuSum => {
-                let w2 = compute_w2(step);
-                let mu_sum = compute_mu_sum(step);
-                &w2 * (&one - &mu_sum)
-            }
-            MemwConstraintKind::WidthSumIsBit => {
-                let w2 = compute_w2(step);
-                &w2 * (&one - &w2)
-            }
+        // idx 11-13: IS_BIT on the width flags
+        for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
+            emit_is_bit(b, idx, col, None);
+            idx += 1;
         }
+
+        // idx 14: IS_BIT<w2> = w2 * (1 - w2)
+        let one = b.one();
+        let w2 = w2_expr(b);
+        b.emit_base(idx, w2.clone() * (one - w2));
     }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            MemwConstraintKind::MuSumIsBit => 2,
-            MemwConstraintKind::W2ImpliesMuSum => 2,
-            MemwConstraintKind::WidthSumIsBit => 2,
-        }
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the MEMW table.
-///
-/// 15 constraints total:
-/// - IS_BIT<μ_sum> (1)
-/// - w2 => μ_sum (1)
-/// - IS_BIT<μ_read> (1)
-/// - IS_BIT<μ_write> (1)
-/// - IS_BIT for carry[0..6] (7)
-/// - IS_BIT<write2/write4/write8> (3) + IS_BIT<write2+write4+write8> (1) [spec assumption]
-pub fn constraints()
--> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-
-    let mut idx = 0;
-
-    // IS_BIT<μ_sum>
-    constraints.push(MemwConstraint::new(MemwConstraintKind::MuSumIsBit, idx).boxed());
-    idx += 1;
-
-    // w2 => μ_sum
-    constraints.push(MemwConstraint::new(MemwConstraintKind::W2ImpliesMuSum, idx).boxed());
-    idx += 1;
-
-    // IS_BIT<μ_read>
-    constraints.push(IsBitConstraint::unconditional(cols::MU_READ, idx).boxed());
-    idx += 1;
-
-    // IS_BIT<μ_write>
-    constraints.push(IsBitConstraint::unconditional(cols::MU_WRITE, idx).boxed());
-    idx += 1;
-
-    // IS_BIT for carry[0..6]
-    for &col in &cols::CARRY {
-        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
-        idx += 1;
-    }
-
-    // IS_BIT on the width flags + their sum (spec defense-in-depth assumption).
-    for &col in &[cols::WRITE2, cols::WRITE4, cols::WRITE8] {
-        constraints.push(IsBitConstraint::unconditional(col, idx).boxed());
-        idx += 1;
-    }
-    constraints.push(MemwConstraint::new(MemwConstraintKind::WidthSumIsBit, idx).boxed());
-
-    constraints
 }

@@ -204,6 +204,14 @@ pub struct Round1SubOps {
     pub aux_lde: Duration,
     /// Aux trace: commit_bit_reversed (Merkle)
     pub aux_merkle: Duration,
+    /// Aux build: LogUp fingerprint computation (CPU).
+    pub aux_fingerprint: Duration,
+    /// Aux build: fingerprint batch inverse (CPU).
+    pub aux_invert: Duration,
+    /// Aux build: term combine (CPU).
+    pub aux_term: Duration,
+    /// Aux build: accumulated-column running sum (CPU).
+    pub aux_accumulate: Duration,
 }
 
 /// Timing data collected inside `multi_prove`.
@@ -225,6 +233,11 @@ static R1_MAIN_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_MAIN_MERKLE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_LDE_US: AtomicU64 = AtomicU64::new(0);
 static R1_AUX_MERKLE_US: AtomicU64 = AtomicU64::new(0);
+// Aux build (LogUp) sub-phases, CPU time accumulated across tables/chunks.
+static AUX_FINGERPRINT_US: AtomicU64 = AtomicU64::new(0);
+static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
+static AUX_TERM_US: AtomicU64 = AtomicU64::new(0);
+static AUX_ACCUM_US: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
@@ -256,12 +269,28 @@ pub fn accum_r1_aux(lde: Duration, merkle: Duration) {
     R1_AUX_MERKLE_US.fetch_add(merkle.as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Aux build (LogUp term column) sub-phase CPU times, summed across chunks.
+pub fn accum_aux_term(fingerprint: Duration, invert: Duration, term: Duration) {
+    AUX_FINGERPRINT_US.fetch_add(fingerprint.as_micros() as u64, Ordering::Relaxed);
+    AUX_INVERT_US.fetch_add(invert.as_micros() as u64, Ordering::Relaxed);
+    AUX_TERM_US.fetch_add(term.as_micros() as u64, Ordering::Relaxed);
+}
+
+/// Aux build accumulated-column (running sum) CPU time.
+pub fn accum_aux_accumulate(d: Duration) {
+    AUX_ACCUM_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+}
+
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
         main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
         main_merkle: Duration::from_micros(R1_MAIN_MERKLE_US.swap(0, Ordering::Relaxed)),
         aux_lde: Duration::from_micros(R1_AUX_LDE_US.swap(0, Ordering::Relaxed)),
         aux_merkle: Duration::from_micros(R1_AUX_MERKLE_US.swap(0, Ordering::Relaxed)),
+        aux_fingerprint: Duration::from_micros(AUX_FINGERPRINT_US.swap(0, Ordering::Relaxed)),
+        aux_invert: Duration::from_micros(AUX_INVERT_US.swap(0, Ordering::Relaxed)),
+        aux_term: Duration::from_micros(AUX_TERM_US.swap(0, Ordering::Relaxed)),
+        aux_accumulate: Duration::from_micros(AUX_ACCUM_US.swap(0, Ordering::Relaxed)),
     }
 }
 
@@ -278,6 +307,10 @@ pub fn reset_all() {
     R1_MAIN_MERKLE_US.store(0, Ordering::Relaxed);
     R1_AUX_LDE_US.store(0, Ordering::Relaxed);
     R1_AUX_MERKLE_US.store(0, Ordering::Relaxed);
+    AUX_FINGERPRINT_US.store(0, Ordering::Relaxed);
+    AUX_INVERT_US.store(0, Ordering::Relaxed);
+    AUX_TERM_US.store(0, Ordering::Relaxed);
+    AUX_ACCUM_US.store(0, Ordering::Relaxed);
     TIMING_DATA.with(|cell| {
         cell.borrow_mut().take();
     });

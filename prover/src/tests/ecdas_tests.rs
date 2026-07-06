@@ -1,16 +1,16 @@
-//! Tests for the ECDAS double/add table — the `R_BYTES` offset constant, constraint
-//! satisfaction on generated traces across many scalars, and the constraint count.
+//! Tests for the ECDAS double/add table — the `R_BYTES` offset constant,
+//! constraint satisfaction on generated traces across many scalars, and the
+//! single-source constraint count.
 
-use crate::constraints::templates::IsBitConstraint;
-use crate::tables::ecdas::{
-    ColIsZero, ConvCarry, EcdasOperation, MulZero, R_BYTES, Relation, cols, create_constraints,
-    generate_ecdas_trace,
-};
+use crate::tables::ecdas::{EcdasConstraints, EcdasOperation, R_BYTES, cols, generate_ecdas_trace};
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField};
 use ecsm::compute_witness;
-use stark::constraints::transition::TransitionConstraint;
+use math::field::element::FieldElement;
+use stark::constraints::builder::{ConstraintSet, ProverEvalFolder};
+use stark::frame::Frame;
 use stark::table::TableView;
 use stark::trace::TraceTable;
+use stark::traits::TransitionEvaluationContext;
 
 fn gx_le() -> [u8; 32] {
     let mut be = [
@@ -43,14 +43,38 @@ fn ops_for(k: u64) -> Vec<EcdasOperation> {
     ops_for_bytes(&k_le(k))
 }
 
-fn row_view(
-    trace: &TraceTable<GoldilocksField, GoldilocksExtension>,
-    row: usize,
-) -> TableView<GoldilocksField, GoldilocksExtension> {
+/// Evaluate the ECDAS [`ConstraintSet`] on one trace row (the compiled prover
+/// folder path), returning every base-field constraint value.
+fn eval_row(trace: &TraceTable<GoldilocksField, GoldilocksExtension>, row: usize) -> Vec<FE> {
     let main: Vec<FE> = (0..cols::NUM_COLUMNS)
         .map(|c| *trace.main_table.get(row, c))
         .collect();
-    TableView::new(vec![main], vec![])
+    let n = EcdasConstraints.meta().len();
+    let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![TableView::new(
+        vec![main],
+        vec![vec![]],
+    )]);
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+    let mut base = vec![FE::zero(); n];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+    EcdasConstraints.eval(&mut folder);
+    base
+}
+
+fn assert_trace_holds(trace: &TraceTable<GoldilocksField, GoldilocksExtension>, label: &str) {
+    for row in 0..trace.num_rows() {
+        for (i, v) in eval_row(trace, row).iter().enumerate() {
+            assert_eq!(
+                *v,
+                FE::zero(),
+                "{label}: constraint {i} must hold at row {row}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -63,73 +87,15 @@ fn r_bytes_is_three_p() {
     assert_eq!(&bytes[..], &R_BYTES[..]);
 }
 
-/// Every ECDAS constraint evaluates to zero on a generated trace across many scalars
-/// (which exercise both double and add steps), including padding rows.
+/// Every ECDAS constraint evaluates to zero on a generated trace across many
+/// scalars (exercising both double and add steps), including padding rows.
 #[test]
 fn constraints_hold_on_generated_trace() {
     for k in [2u64, 3, 5, 7, 0xFF, 0xABCD, 1_000_003] {
         let ops = ops_for(k);
         assert!(!ops.is_empty(), "k={k} should have steps");
         let trace = generate_ecdas_trace(&ops);
-
-        for row in 0..trace.num_rows() {
-            let view = row_view(&trace, row);
-            assert_eq!(
-                IsBitConstraint::unconditional(cols::MU, 0).evaluate(&view),
-                FE::zero(),
-                "is_bit(mu) k={k} row {row}"
-            );
-            assert_eq!(
-                IsBitConstraint::unconditional(cols::NEXT_OP, 0).evaluate(&view),
-                FE::zero()
-            );
-            assert_eq!(
-                IsBitConstraint::unconditional(cols::OP, 0).evaluate(&view),
-                FE::zero()
-            );
-            assert_eq!(
-                MulZero {
-                    a: cols::OP,
-                    b: cols::NEXT_OP,
-                    b_complement: false,
-                    constraint_idx: 0
-                }
-                .evaluate(&view),
-                FE::zero(),
-                "op·next_op k={k} row {row}"
-            );
-            assert_eq!(
-                MulZero {
-                    a: cols::NEXT_OP,
-                    b: cols::MU,
-                    b_complement: true,
-                    constraint_idx: 0
-                }
-                .evaluate(&view),
-                FE::zero()
-            );
-            for relation in [Relation::Lambda, Relation::Xr, Relation::Yr] {
-                for i in 0..64 {
-                    let v = ConvCarry {
-                        relation,
-                        i,
-                        constraint_idx: 0,
-                    }
-                    .evaluate(&view);
-                    assert_eq!(v, FE::zero(), "conv k={k} i={i} row {row}");
-                }
-            }
-            for c_base in [cols::C0, cols::C1, cols::C2] {
-                assert_eq!(
-                    ColIsZero {
-                        col: c_base + 63,
-                        constraint_idx: 0
-                    }
-                    .evaluate(&view),
-                    FE::zero()
-                );
-            }
-        }
+        assert_trace_holds(&trace, &format!("k={k}"));
     }
 }
 
@@ -141,28 +107,10 @@ fn constraints_hold_for_near_order_scalar() {
     let ops = ops_for_bytes(&k);
     assert!(!ops.is_empty());
     let trace = generate_ecdas_trace(&ops);
-    for row in 0..trace.num_rows() {
-        let view = row_view(&trace, row);
-        for relation in [Relation::Lambda, Relation::Xr, Relation::Yr] {
-            for i in 0..64 {
-                assert_eq!(
-                    ConvCarry {
-                        relation,
-                        i,
-                        constraint_idx: 0
-                    }
-                    .evaluate(&view),
-                    FE::zero(),
-                    "conv N-1 i={i} row {row}"
-                );
-            }
-        }
-    }
+    assert_trace_holds(&trace, "N-1");
 }
 
 #[test]
-fn create_constraints_count() {
-    let (constraints, next) = create_constraints(0);
-    assert_eq!(constraints.len(), 200);
-    assert_eq!(next, 200);
+fn constraint_set_count() {
+    assert_eq!(EcdasConstraints.meta().len(), 200);
 }

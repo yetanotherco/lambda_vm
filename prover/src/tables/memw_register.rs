@@ -38,15 +38,14 @@
 //! - 4 Memory bus tokens (read-old + write-new, per word)
 //! - 2 MEMW output interactions (read + write, from CPU)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
+use crate::constraints::templates::emit_is_bit;
 
 // =========================================================================
 // Column indices (10 columns)
@@ -359,62 +358,23 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints (3 algebraic)
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// MEMW_R constraint: IS_BIT(mu_sum) = (mu_read + mu_write) * (1 - mu_read - mu_write) = 0
-pub struct MemwRegisterMuSumIsBit {
-    constraint_idx: usize,
-}
+/// The MEMW_R table's 3 transition constraints as a single [`ConstraintSet`]:
+/// - idx 0,1: `IS_BIT` on `μ_read`, `μ_write`;
+/// - idx 2:   `IS_BIT<μ_sum>` with `μ_sum = μ_read + μ_write`.
+pub struct MemwRegisterConstraints;
 
-impl MemwRegisterMuSumIsBit {
-    pub fn new(constraint_idx: usize) -> Self {
-        Self { constraint_idx }
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MemwRegisterConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0,1: IS_BIT<μ_read>, IS_BIT<μ_write>
+        emit_is_bit(b, 0, cols::MU_READ, None);
+        emit_is_bit(b, 1, cols::MU_WRITE, None);
+
+        // idx 2: IS_BIT<μ_sum> = μ_sum * (1 - μ_sum), μ_sum = μ_read + μ_write
+        let one = b.one();
+        let mu_sum = b.main(0, cols::MU_READ) + b.main(0, cols::MU_WRITE);
+        b.emit_base(2, mu_sum.clone() * (one - mu_sum));
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let mu_read = step.get_main_evaluation_element(0, cols::MU_READ).clone();
-        let mu_write = step.get_main_evaluation_element(0, cols::MU_WRITE).clone();
-        let mu_sum = &mu_read + &mu_write;
-        &mu_sum * (&one - &mu_sum)
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MemwRegisterMuSumIsBit {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the MEMW_R table (3 total).
-///
-/// - IS_BIT(MU_READ) -- unconditional
-/// - IS_BIT(MU_WRITE) -- unconditional
-/// - IS_BIT(mu_sum) = (mu_read + mu_write) * (1 - mu_read - mu_write) = 0
-pub fn constraints()
--> Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>> {
-    use crate::constraints::templates::IsBitConstraint;
-
-    vec![
-        IsBitConstraint::unconditional(cols::MU_READ, 0).boxed(),
-        IsBitConstraint::unconditional(cols::MU_WRITE, 1).boxed(),
-        MemwRegisterMuSumIsBit::new(2).boxed(),
-    ]
 }

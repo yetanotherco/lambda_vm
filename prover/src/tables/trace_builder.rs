@@ -2746,19 +2746,12 @@ fn generate_page_tables<I: ImageSource>(
     let mut pages = Vec::new();
     let mut page_configs = Vec::new();
 
-    // Determine which page bases hold private input data.
-    let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
-        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-        let total_bytes = 4 + private_input.len(); // length prefix + data
-        (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    // Determine which page bases hold private input data — count-based, via the
+    // shared helpers (single source of truth with the continuation path).
+    let num_private_input_pages = page::private_input_page_count(private_input);
 
     for &page_base in &page_bases {
-        let config = if private_input_page_bases.contains(&page_base) {
+        let config = if page::is_private_input_page(page_base, num_private_input_pages) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
             PageConfig::with_private_input(page_base, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
@@ -4233,16 +4226,12 @@ impl Traces {
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
-        if num_private_input_pages > 0 {
-            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
-            for i in 0..num_private_input_pages {
-                configs.push(PageConfig {
-                    page_base: first_page_base + i as u64 * page_size as u64,
-                    init_values: None, // Verifier doesn't know these
-                    is_private_input: true,
-                });
-            }
+        for page_base in page::private_input_page_bases(num_private_input_pages) {
+            configs.push(PageConfig {
+                page_base,
+                init_values: None, // Verifier doesn't know these
+                is_private_input: true,
+            });
         }
 
         configs.sort_by_key(|c| c.page_base);
