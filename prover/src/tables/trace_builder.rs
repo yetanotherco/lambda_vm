@@ -631,6 +631,7 @@ impl MemwSink for MemwBuckets {
     }
 }
 
+#[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
