@@ -1629,27 +1629,21 @@ where
     // produced had this dispatch never been called.
     let transcript_snapshot = transcript.clone();
 
-    // Early-termination schedule (mirrors commit_phase_from_evaluations):
-    // terminal_len = 2^(blowup_log + final_poly_log_degree), clamped to n0.
-    // Clamp without materializing the shift so an out-of-range `k` cannot
-    // overflow `terminal_len` to 0 (see `commit_phase_from_evaluations`).
-    let k = final_poly_log_degree as usize;
-    let terminal_shift = blowup_log as usize + k;
-    let terminal_len = if terminal_shift >= n0.trailing_zeros() as usize {
-        n0
-    } else {
-        1usize << terminal_shift
-    };
-    let total_folds = (n0 / terminal_len).trailing_zeros() as usize;
+    // Fold layout, shared with the CPU prover and the verifier — see `FriFoldLayout`.
+    let layout = crate::fri::terminal::FriFoldLayout::new(
+        n0.trailing_zeros(),
+        blowup_log,
+        final_poly_log_degree,
+    );
     // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
     // the CPU path (which handles both correctly): tiny clamped traces
     // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
     // final fold would reach n_out == 1 and trip `fold_and_commit_layer`'s
     // `n_out >= 2` assert. The final fold below is therefore always n_out >= 2.
-    if total_folds == 0 || terminal_len < 2 {
+    if layout.total_folds == 0 || layout.terminal_len < 2 {
         return None;
     }
-    let num_committed = total_folds - 1;
+    let num_committed = layout.num_committed;
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
         Vec::with_capacity(num_committed);
 
@@ -1696,16 +1690,15 @@ where
             return None;
         }
     };
-    debug_assert_eq!(terminal_evals_u64.len(), terminal_len * 3);
+    debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
     let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
 
     // CPU-side coefficient extraction, identical to commit_phase_from_evaluations.
-    let terminal_offset = coset_offset.pow(1u64 << total_folds);
-    let effective_log_degree = terminal_len.trailing_zeros() - blowup_log;
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
     let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
         &terminal_codeword,
         &terminal_offset,
-        effective_log_degree,
+        layout.effective_k,
     );
 
     // >>>> Send the final polynomial coefficients.
