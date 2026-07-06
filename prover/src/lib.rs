@@ -19,6 +19,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+pub use stark::profile_markers;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -192,6 +193,9 @@ pub enum Error {
     InvalidContinuationEpochSize(String),
     /// Continuation proof construction hit an internal invariant failure.
     ContinuationInvariant(String),
+    /// Continuation bundle is structurally malformed (fails validation before
+    /// any proof is checked).
+    MalformedContinuationBundle(String),
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
@@ -213,6 +217,9 @@ impl fmt::Display for Error {
             }
             Error::ContinuationInvariant(msg) => {
                 write!(f, "continuation invariant failed: {msg}")
+            }
+            Error::MalformedContinuationBundle(msg) => {
+                write!(f, "malformed continuation bundle: {msg}")
             }
             Error::HaltInNonFinalEpoch => {
                 write!(
@@ -270,72 +277,72 @@ impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
-            (&self.bitwise, &mut traces.bitwise, &()),
-            (&self.decode, &mut traces.decode, &()),
-            (&self.commit, &mut traces.commit, &()),
-            (&self.keccak, &mut traces.keccak, &()),
-            (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
-            (&self.keccak_rc, &mut traces.keccak_rc, &()),
-            (&self.ecsm, &mut traces.ecsm, &()),
-            (&self.ecdas, &mut traces.ecdas, &()),
-            (&self.register, &mut traces.register, &()),
+            (self.bitwise.as_ref(), &mut traces.bitwise, &()),
+            (self.decode.as_ref(), &mut traces.decode, &()),
+            (self.commit.as_ref(), &mut traces.commit, &()),
+            (self.keccak.as_ref(), &mut traces.keccak, &()),
+            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
+            (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
+            (self.ecsm.as_ref(), &mut traces.ecsm, &()),
+            (self.ecdas.as_ref(), &mut traces.ecdas, &()),
+            (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
-            pairs.push((&self.halt, &mut traces.halt, &()));
+            pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
         }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.shifts.iter().zip(traces.shifts.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self
             .memw_aligneds
             .iter()
             .zip(traces.memw_aligneds.iter_mut())
         {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.muls.iter().zip(traces.muls.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.dvrms.iter().zip(traces.dvrms.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.branches.iter().zip(traces.branches.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self
             .memw_registers
             .iter()
             .zip(traces.memw_registers.iter_mut())
         {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.eqs.iter().zip(traces.eqs.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.bytewises.iter().zip(traces.bytewises.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.stores.iter().zip(traces.stores.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
 
         pairs
@@ -344,64 +351,64 @@ impl VmAirs {
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-            &self.bitwise,
-            &self.decode,
-            &self.commit,
-            &self.keccak,
-            &self.keccak_rnd,
-            &self.keccak_rc,
-            &self.ecsm,
-            &self.ecdas,
-            &self.register,
+            self.bitwise.as_ref(),
+            self.decode.as_ref(),
+            self.commit.as_ref(),
+            self.keccak.as_ref(),
+            self.keccak_rnd.as_ref(),
+            self.keccak_rc.as_ref(),
+            self.ecsm.as_ref(),
+            self.ecdas.as_ref(),
+            self.register.as_ref(),
         ];
         if self.include_halt {
-            refs.push(&self.halt);
+            refs.push(self.halt.as_ref());
         }
 
         for air in &self.cpus {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.lts {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.shifts {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memws {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memw_aligneds {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.loads {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.muls {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.dvrms {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.branches {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.pages {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memw_registers {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.eqs {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.bytewises {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.stores {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.cpu32s {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
 
         refs
@@ -451,67 +458,95 @@ impl VmAirs {
         register_preprocessed: Option<(Commitment, usize)>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
-            .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
+            .map(|i| {
+                Box::new(create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i))) as VmAir
+            })
             .collect();
-        let bitwise = if minimal_bitwise {
-            create_bitwise_air(proof_options)
+        let bitwise: VmAir = if minimal_bitwise {
+            Box::new(create_bitwise_air(proof_options))
         } else {
-            create_bitwise_air(proof_options).with_preprocessed(
+            Box::new(create_bitwise_air(proof_options).with_preprocessed(
                 bitwise::preprocessed_commitment(proof_options),
                 bitwise::NUM_PRECOMPUTED_COLS,
-            )
+            ))
         };
         let lts: Vec<_> = (0..table_counts.lt)
-            .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
+            .map(|i| {
+                Box::new(create_lt_air(proof_options).with_name(&format!("LT[{}]", i))) as VmAir
+            })
             .collect();
         let shifts: Vec<_> = (0..table_counts.shift)
-            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+            .map(|i| {
+                Box::new(create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let memws: Vec<_> = (0..table_counts.memw)
-            .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
+            .map(|i| {
+                Box::new(create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i))) as VmAir
+            })
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
-            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
+            .map(|i| {
+                Box::new(
+                    create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)),
+                ) as VmAir
+            })
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
-            .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
+            .map(|i| {
+                Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
+            })
             .collect();
         let decode_root = decode_commitment.unwrap_or_else(|| {
             decode::commitment_from_elf(elf, proof_options)
                 .expect("Failed to compute decode commitment")
         });
-        let decode = create_decode_air(proof_options)
-            .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS);
+        let decode: VmAir = Box::new(
+            create_decode_air(proof_options)
+                .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS),
+        );
         let muls: Vec<_> = (0..table_counts.mul)
-            .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
+            .map(|i| {
+                Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
+            })
             .collect();
         let dvrms: Vec<_> = (0..table_counts.dvrm)
-            .map(|i| create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i)))
+            .map(|i| {
+                Box::new(create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i))) as VmAir
+            })
             .collect();
         let branches: Vec<_> = (0..table_counts.branch)
-            .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+            .map(|i| {
+                Box::new(create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+                    as VmAir
+            })
             .collect();
-        let halt = create_halt_air(proof_options);
-        let commit = create_commit_air(proof_options);
-        let keccak = create_keccak_air(proof_options);
-        let keccak_rnd = create_keccak_rnd_air(proof_options);
-        let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
+        let halt: VmAir = Box::new(create_halt_air(proof_options));
+        let commit: VmAir = Box::new(create_commit_air(proof_options));
+        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
+        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
-        );
-        let ecsm = create_ecsm_air(proof_options);
-        let ecdas = create_ecdas_air(proof_options);
-        let register = if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
-            create_register_air(proof_options).with_preprocessed(commitment, num_preprocessed_cols)
-        } else {
-            let register_init = register_init
-                .map(<[u32]>::to_vec)
-                .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-            create_register_air(proof_options).with_preprocessed(
-                register::preprocessed_commitment(proof_options, &register_init),
-                register::NUM_PREPROCESSED_COLS,
-            )
-        };
+        ));
+        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
+        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
+        let register: VmAir =
+            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
+                Box::new(
+                    create_register_air(proof_options)
+                        .with_preprocessed(commitment, num_preprocessed_cols),
+                )
+            } else {
+                let register_init = register_init
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+                Box::new(create_register_air(proof_options).with_preprocessed(
+                    register::preprocessed_commitment(proof_options, &register_init),
+                    register::NUM_PREPROCESSED_COLS,
+                ))
+            };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -520,18 +555,20 @@ impl VmAirs {
         // initialized), so this commitment is always used.
         let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
 
-        let pages: Vec<_> = page_configs
+        let pages: Vec<VmAir> = page_configs
             .iter()
-            .map(|config| {
+            .map(|config| -> VmAir {
                 let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
-                    air
+                    Box::new(air)
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
-                    air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
+                    Box::new(
+                        air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS),
+                    )
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
@@ -544,24 +581,39 @@ impl VmAirs {
                         .unwrap_or_else(|| {
                             page::compute_precomputed_commitment(config, proof_options)
                         });
-                    air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
+                    Box::new(air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS))
                 }
             })
             .collect();
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
-            .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
+            .map(|i| {
+                Box::new(
+                    create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)),
+                ) as VmAir
+            })
             .collect();
         let eqs: Vec<_> = (0..table_counts.eq)
-            .map(|i| create_eq_air(proof_options).with_name(&format!("EQ[{}]", i)))
+            .map(|i| {
+                Box::new(create_eq_air(proof_options).with_name(&format!("EQ[{}]", i))) as VmAir
+            })
             .collect();
         let bytewises: Vec<_> = (0..table_counts.bytewise)
-            .map(|i| create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+            .map(|i| {
+                Box::new(create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let stores: Vec<_> = (0..table_counts.store)
-            .map(|i| create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+            .map(|i| {
+                Box::new(create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let cpu32s: Vec<_> = (0..table_counts.cpu32)
-            .map(|i| create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+            .map(|i| {
+                Box::new(create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+                    as VmAir
+            })
             .collect();
 
         #[cfg(feature = "debug-checks")]
@@ -776,11 +828,17 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_total");
+    #[cfg(feature = "instruments")]
     let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
@@ -790,6 +848,8 @@ pub fn prove_with_options_and_inputs(
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_execute = stark::instruments::heap_bytes();
@@ -797,6 +857,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("trace_build");
 
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
@@ -819,6 +881,8 @@ pub fn prove_with_options_and_inputs(
     drop(result);
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_trace = stark::instruments::heap_bytes();
@@ -826,6 +890,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -841,6 +907,8 @@ pub fn prove_with_options_and_inputs(
         None,
     );
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
@@ -868,6 +936,8 @@ pub fn prove_with_options_and_inputs(
     );
 
     // Phase 4: Prove (multi_prove)
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("proving");
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
@@ -875,6 +945,8 @@ pub fn prove_with_options_and_inputs(
         storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     #[cfg(feature = "instruments")]
     {
@@ -890,6 +962,14 @@ pub fn prove_with_options_and_inputs(
                 after_air: heap_after_air,
             },
         );
+        // Accurate wall-clock span tree (the trustworthy per-step breakdown).
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
     }
 
     Ok(VmProof {
@@ -955,12 +1035,10 @@ pub fn verify_with_options(
     // A malicious prover could set counts to 0, removing entire constraint sets.
     vm_proof.table_counts.validate()?;
 
-    // Bound num_private_input_pages before allocating PageConfigs.
-    // MAX_PRIVATE_INPUT_SIZE fits in ~257 pages of DEFAULT_PAGE_SIZE.
+    // Bound num_private_input_pages before allocating PageConfigs — the tight honest
+    // max, shared with the continuation verifier (see `page::max_private_input_pages`).
     {
-        use crate::tables::page::DEFAULT_PAGE_SIZE;
-        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
+        let max_pages = crate::tables::page::max_private_input_pages();
         if vm_proof.num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
                 "num_private_input_pages ({}) exceeds max ({max_pages})",
@@ -1037,6 +1115,9 @@ pub fn verify_with_options(
         Some(balance) => balance,
         None => return Ok(false),
     };
+
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
 
     Ok(Verifier::multi_verify(
         &air_refs,

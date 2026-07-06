@@ -190,7 +190,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         slot_number: None,
         version: 3,
         elasticity_multiplier: ELASTICITY_MULTIPLIER,
-        gas_ceil: 30_000_000,
+        gas_ceil: 60_000_000,
     };
     let skeleton = create_payload(&payload_args, &store, Bytes::new())?;
     let result = blockchain.build_payload(skeleton)?;

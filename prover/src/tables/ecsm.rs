@@ -16,15 +16,11 @@
 //! virtual-carry checks remain µ-gated as before.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::{INV_SHIFT_32, IsBitConstraint, new_is_bit_constraints};
+use crate::constraints::templates::INV_SHIFT_32;
 use ecsm::{B, EcsmWitness, N_BYTES, P_BYTES};
 
 // Bias signed convolution carries into IsHalfword [0, 2^16); see spec ecsm.typ "Carry offset" (@ecsm-limb_carry).
@@ -618,128 +614,15 @@ pub fn ecdas_tuple(
 pub enum Relation {
     /// `xG² − x2 − q0·p = 0`
     X2,
-    /// `yG² + p² − xG·x2 − b − q1·p = 0`
+    /// `yG² + µ·p² − xG·x2 − µ·b − q1·p = 0`
     Yg,
 }
 
-fn p_byte<F: IsField>(m: usize) -> FieldElement<F> {
-    if m < 32 {
-        FieldElement::from(P_BYTES[m] as u64)
-    } else {
-        FieldElement::zero()
-    }
-}
-
-/// Convolution carry constraint at limb `i`: `2^8·c_i − c_{i-1} − S_i = 0`, with `c_{-1} = 0`.
-/// Unconditional (degree 2); for the yG relation, both the `µ·p²` offset and the curve
-/// constant `µ·b` are µ-gated so that all columns can pad to zero (see [`ConvCarry::s_i`]).
-pub struct ConvCarry {
-    pub relation: Relation,
-    pub i: usize,
-    pub constraint_idx: usize,
-}
-
-impl ConvCarry {
-    fn s_i<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let i = self.i;
-        let col = |c: usize| -> FieldElement<F> { step.get_main_evaluation_element(0, c).clone() };
-        let byte = |base: usize, len: usize, j: usize| -> FieldElement<F> {
-            if j < len {
-                col(base + j)
-            } else {
-                FieldElement::zero()
-            }
-        };
-        let mut s = FieldElement::<F>::zero();
-        match self.relation {
-            Relation::X2 => {
-                // Σ xG_j·xG_{i-j} − x2_i − Σ q0_j·P_{i-j}
-                for j in 0..=i {
-                    s += byte(cols::XG, 32, j) * byte(cols::XG, 32, i - j);
-                    s = s - byte(cols::Q0, 32, j) * p_byte::<F>(i - j);
-                }
-                s = s - byte(cols::X2, 32, i);
-            }
-            Relation::Yg => {
-                // Σ (yG_j·yG_{i-j} + µ·P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − µ·b_i
-                // Both the p² offset and the curve constant b are µ-gated: they vanish on
-                // padding rows (µ=0), so all columns can pad to zero.
-                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                for j in 0..=i {
-                    s += byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
-                    s += mu.clone() * (p_byte::<F>(j) * p_byte::<F>(i - j));
-                    s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
-                    s = s - byte(cols::Q1, 33, j) * p_byte::<F>(i - j);
-                }
-                if i == 0 {
-                    s = s - mu * FieldElement::<F>::from(B);
-                }
-            }
-        }
-        s
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ConvCarry {
-    fn degree(&self) -> usize {
-        2 // degree-2 convolution; µ-gated terms (µ·p², µ·b) are degree 1 in columns
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c_base = match self.relation {
-            Relation::X2 => cols::C0,
-            Relation::Yg => cols::C1,
-        };
-        let c_i = step.get_main_evaluation_element(0, c_base + self.i).clone();
-        let c_prev = if self.i == 0 {
-            FieldElement::<F>::zero()
-        } else {
-            step.get_main_evaluation_element(0, c_base + self.i - 1)
-                .clone()
-        };
-        FieldElement::<F>::from(256u64) * c_i - c_prev - self.s_i(step)
-    }
-}
-
-/// `col = 0` (unconditional, degree 1). Used for the closing `c_63 = 0`.
-pub struct ColIsZero {
-    pub col: usize,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ColIsZero {
-    fn degree(&self) -> usize {
-        1
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        step.get_main_evaluation_element(0, self.col).clone()
-    }
-}
-
-/// The two 256-bit addition-overflow checks (`k < N` and `xR < p`), whose 8 word-carries
+/// The addition-overflow range checks (`xG < p`, `k < N`, `xR < p`), whose 8 word-carries
 /// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition
 /// must overflow `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
-/// `k < N` is `N + k_sub_N = k + 2^256` (with `k_sub_N = k − N mod 2^256`); `xR < p` is
-/// `p + xR_sub_p = xR + 2^256` (with `xR_sub_p = xR − p mod 2^256`).
+/// `xG < p` is `p + xg_sub_p = xG + 2^256`; `k < N` is `N + k_sub_N = k + 2^256`;
+/// `xR < p` is `p + xR_sub_p = xR + 2^256`.
 #[derive(Clone, Copy)]
 pub enum OverflowKind {
     XgLtP,
@@ -748,7 +631,7 @@ pub enum OverflowKind {
 }
 
 impl OverflowKind {
-    /// The constant addend's 32-bit word `i` (`N` for `k<N`, `p` for `xR<p`).
+    /// The constant addend's 32-bit word `i` (`p` for `xG<p`/`xR<p`, `N` for `k<N`).
     fn const_word(self, i: usize) -> u64 {
         let bytes = match self {
             OverflowKind::XgLtP => &P_BYTES,
@@ -761,7 +644,7 @@ impl OverflowKind {
         }
         w
     }
-    /// Column base of the witnessed halfword addend (`k_sub_N` / `xR_sub_p`).
+    /// Column base of the witnessed halfword addend (`xg_sub_p` / `k_sub_N` / `xR_sub_p`).
     fn addend_hl_base(self) -> usize {
         match self {
             OverflowKind::XgLtP => cols::XG_SUB_P,
@@ -777,276 +660,238 @@ impl OverflowKind {
             OverflowKind::XrLtP => cols::XR,
         }
     }
-    /// Whether the sum is stored as individual bits (k) rather than bytes (xR/xG).
+    /// Whether the sum is stored as individual bits (k) rather than bytes (xG/xR).
     fn sum_is_bits(self) -> bool {
         matches!(self, OverflowKind::KLtN)
     }
 }
 
-/// Computes the 8 word-carries of the addition for `kind`.
-fn carry_chain<F, E>(kind: OverflowKind, step: &TableView<F, E>) -> [FieldElement<F>; 8]
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let inv = FieldElement::<F>::from(INV_SHIFT_32);
-    let hl = kind.addend_hl_base();
-    let base = kind.sum_col_base();
-    let mut c: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-    let mut prev = FieldElement::<F>::zero();
-    for (i, slot) in c.iter_mut().enumerate() {
-        // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
-        let addend1 = step.get_main_evaluation_element(0, hl + 2 * i).clone()
-            + step.get_main_evaluation_element(0, hl + 2 * i + 1).clone()
-                * FieldElement::<F>::from(1u64 << 16);
-        // sum word i: computed from individual bits (k) or bytes (xR).
-        let mut sum = FieldElement::<F>::zero();
-        if kind.sum_is_bits() {
-            // k is stored as 256 individual bits; word i = bits 32i..32i+31.
-            for bit in 0..32 {
-                sum += step
-                    .get_main_evaluation_element(0, base + 32 * i + bit)
-                    .clone()
-                    * FieldElement::<F>::from(1u64 << bit);
-            }
+// =========================================================================
+// Single-body constraint set (ConstraintSet front-end)
+// =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..413:
+//   0        : IS_BIT(MU)
+//   1..257   : IS_BIT(k[i]) for the 256 scalar bits
+//   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
+//   258..322 : ConvCarry(X2, 0..64)
+//   322      : ColIsZero(c0(63))
+//   323..387 : ConvCarry(Yg, 0..64)
+//   387      : ColIsZero(c1(63))
+//   388      : IS_BIT(q1(32))
+//   389..396 : CarryBit(XgLtP, 0..7)
+//   396      : OverflowRequired(XgLtP)
+//   397..404 : CarryBit(KLtN, 0..7)
+//   404      : OverflowRequired(KLtN)
+//   405..412 : CarryBit(XrLtP, 0..7)
+//   412      : OverflowRequired(XrLtP)
+
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (413
+/// total). No column configuration needed (the layout is fixed via `cols`).
+pub struct EcsmConstraints;
+
+impl EcsmConstraints {
+    /// Byte `m` of the field prime `P` (zero beyond 32 bytes).
+    fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        m: usize,
+    ) -> B::Expr {
+        if m < 32 {
+            b.const_base(P_BYTES[m] as u64)
         } else {
-            // xR is stored as 32 bytes; word i = bytes 4i..4i+3.
-            for b in 0..4 {
-                sum += step
-                    .get_main_evaluation_element(0, base + 4 * i + b)
-                    .clone()
-                    * FieldElement::<F>::from(1u64 << (8 * b));
+            b.zero()
+        }
+    }
+
+    /// `bytes[base + j]` for `j < len`, else zero (the `byte` closure in `s_i`).
+    fn byte_at<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        base: usize,
+        len: usize,
+        j: usize,
+    ) -> B::Expr {
+        if j < len {
+            b.main(0, base + j)
+        } else {
+            b.zero()
+        }
+    }
+
+    /// `S_i` for `relation` at limb `i`.
+    fn s_i<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let byte = |base: usize, len: usize, j: usize| Self::byte_at(b, base, len, j);
+        let mut s = b.zero();
+        match relation {
+            Relation::X2 => {
+                // Σ xG_j·xG_{i-j} − x2_i − Σ q0_j·P_{i-j}
+                for j in 0..=i {
+                    s = s + byte(cols::XG, 32, j) * byte(cols::XG, 32, i - j);
+                    s = s - byte(cols::Q0, 32, j) * Self::p_byte_expr(b, i - j);
+                }
+                s = s - byte(cols::X2, 32, i);
+            }
+            Relation::Yg => {
+                // Σ (yG_j·yG_{i-j} + µ·P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − µ·b_i
+                // Both the p² offset and the curve constant b are µ-gated: they vanish on
+                // padding rows (µ=0), so all columns (including q1) can pad to zero.
+                let mu = b.main(0, cols::MU);
+                for j in 0..=i {
+                    s = s + byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
+                    s = s + mu.clone() * (Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j));
+                    s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
+                    s = s - byte(cols::Q1, 33, j) * Self::p_byte_expr(b, i - j);
+                }
+                if i == 0 {
+                    let curve_b = b.const_base(B);
+                    s = s - mu * curve_b;
+                }
             }
         }
-        let addend0 = FieldElement::<F>::from(kind.const_word(i));
-        let ci = (addend0 + addend1 + prev.clone() - sum) * inv.clone();
-        *slot = ci.clone();
-        prev = ci;
+        s
     }
-    c
+
+    /// `256·c_i − c_{i-1} − S_i`.
+    fn conv_carry<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        relation: Relation,
+        i: usize,
+    ) -> B::Expr {
+        let c_base = match relation {
+            Relation::X2 => cols::C0,
+            Relation::Yg => cols::C1,
+        };
+        let c_i = b.main(0, c_base + i);
+        let c_prev = if i == 0 {
+            b.zero()
+        } else {
+            b.main(0, c_base + i - 1)
+        };
+        let two_pow_8 = b.const_base(256);
+        two_pow_8 * c_i - c_prev - Self::s_i(b, relation, i)
+    }
+
+    /// The 8 word-carries of the `kind` addition. `k` is summed from its 256 individual
+    /// bit columns; `xG`/`xR` from their 32 byte columns.
+    fn carry_chain<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        kind: OverflowKind,
+    ) -> [B::Expr; 8] {
+        let hl = kind.addend_hl_base();
+        let base = kind.sum_col_base();
+        let mut c: [B::Expr; 8] = std::array::from_fn(|_| b.zero());
+        let mut prev = b.zero();
+        for (i, slot) in c.iter_mut().enumerate() {
+            // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
+            let shift_16 = b.const_base(1u64 << 16);
+            let addend1 = b.main(0, hl + 2 * i) + b.main(0, hl + 2 * i + 1) * shift_16;
+            // sum word i: from individual bits (k) or bytes (xG/xR).
+            let mut sum = b.zero();
+            if kind.sum_is_bits() {
+                // k is stored as 256 individual bits; word i = bits 32i..32i+31.
+                for bit in 0..32 {
+                    let shift = b.const_base(1u64 << bit);
+                    sum = sum + b.main(0, base + 32 * i + bit) * shift;
+                }
+            } else {
+                // xG/xR stored as 32 bytes; word i = bytes 4i..4i+3.
+                for byte in 0..4 {
+                    let shift = b.const_base(1u64 << (8 * byte));
+                    sum = sum + b.main(0, base + 4 * i + byte) * shift;
+                }
+            }
+            let addend0 = b.const_base(kind.const_word(i));
+            let inv = b.const_base(INV_SHIFT_32);
+            let ci = (addend0 + addend1 + prev.clone() - sum) * inv;
+            *slot = ci.clone();
+            prev = ci;
+        }
+        c
+    }
 }
 
-/// `µ · c_i · (1 - c_i) = 0` for a virtual carry bit (degree 3, since `c_i` is linear).
-pub struct CarryBit {
-    pub kind: OverflowKind,
-    pub i: usize,
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for CarryBit {
-    fn degree(&self) -> usize {
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
+    // The xG<p / k<N / xR<p carry-bit constraints (µ·c·(1−c)) are degree 3.
+    fn max_degree(&self) -> usize {
         3
     }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c = carry_chain(self.kind, step);
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let one = FieldElement::<F>::one();
-        mu * c[self.i].clone() * (one - c[self.i].clone())
-    }
-}
 
-/// `µ · (1 - c_7) = 0`: the top carry must be 1 (the addition overflows).
-pub struct OverflowRequired {
-    pub kind: OverflowKind,
-    pub constraint_idx: usize,
-}
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT(MU): mu·(1−mu). (deg 2)
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(0, mu.clone() * (one - mu));
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for OverflowRequired {
-    fn degree(&self) -> usize {
-        2
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let c = carry_chain(self.kind, step);
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        mu * (FieldElement::<F>::one() - c[7].clone())
-    }
-}
+        let mut idx = 1;
 
-/// `(Σ_{i=0}^{255} k_bit[i]) · (1 − µ) = 0` — all scalar bits must be zero on padding rows.
-///
-/// Without this constraint a prover could set k_bit columns on a µ=0 row (IS_BIT allows 0
-/// or 1) and fire phantom BIT bus receives, breaking bus balance. Spec: ecsm.toml:730-733.
-pub struct KBitsZeroOnPadding {
-    pub constraint_idx: usize,
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for KBitsZeroOnPadding {
-    fn degree(&self) -> usize {
-        2
-    }
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let sum = (0..256).fold(FieldElement::<F>::zero(), |acc, i| {
-            acc + step.get_main_evaluation_element(0, cols::k_bit(i)).clone()
-        });
-        sum * (FieldElement::<F>::one() - mu)
-    }
-}
-
-/// Creates all ECSM transition constraints (413 total: 1 mu + 256 k bits + 1 k-bits-zero-on-padding + 1 q1[32] + 8 xG<p + 146 others).
-pub fn create_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-    let mut idx = constraint_idx_start;
-
-    // IS_BIT(mu)
-    constraints.push(IsBitConstraint::unconditional(cols::MU, idx).boxed());
-    idx += 1;
-
-    // IS_BIT(k[i]) for all 256 scalar bits.
-    let k_bit_cols: Vec<usize> = (0..256).map(cols::k_bit).collect();
-    let (k_bit_constraints, next_idx) = new_is_bit_constraints(&k_bit_cols, idx);
-    for c in k_bit_constraints {
-        constraints.push(c.boxed());
-    }
-    idx = next_idx;
-
-    // (Σ k_bit[i]) · (1 − µ) = 0: all scalar bits must be zero on padding rows.
-    constraints.push(
-        KBitsZeroOnPadding {
-            constraint_idx: idx,
+        // idx 1..257: IS_BIT(k[i]) for the 256 scalar bits: k·(1−k). (deg 2)
+        for i in 0..256 {
+            let k = b.main(0, cols::k_bit(i));
+            let one = b.one();
+            b.emit_base(idx, k.clone() * (one - k));
+            idx += 1;
         }
-        .boxed(),
-    );
-    idx += 1;
 
-    // x2 convolution: 64 carries + closing.
-    for i in 0..64 {
-        constraints.push(
-            ConvCarry {
-                relation: Relation::X2,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
+        // idx 257: KBitsZeroOnPadding: (Σ k_bit[i])·(1−µ). All scalar bits must be zero on
+        // padding rows (µ=0), else a prover could fire phantom `Bit` bus receives. (deg 2)
+        let mut k_sum = b.zero();
+        for i in 0..256 {
+            k_sum = k_sum + b.main(0, cols::k_bit(i));
+        }
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(idx, k_sum * (one - mu));
         idx += 1;
-    }
-    constraints.push(
-        ColIsZero {
-            col: cols::c0(63),
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
 
-    // yG convolution: 64 carries + closing.
-    for i in 0..64 {
-        constraints.push(
-            ConvCarry {
-                relation: Relation::Yg,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
+        // X2 convolution: 64 carries (deg 2) + closing c0(63) (deg 1).
+        for i in 0..64 {
+            let root = Self::conv_carry(b, Relation::X2, i);
+            b.emit_base(idx, root);
+            idx += 1;
+        }
+        let c0_last = b.main(0, cols::c0(63));
+        b.emit_base(idx, c0_last);
         idx += 1;
-    }
-    constraints.push(
-        ColIsZero {
-            col: cols::c1(63),
-            constraint_idx: idx,
+
+        // Yg convolution: 64 carries (deg 2) + closing c1(63) (deg 1).
+        for i in 0..64 {
+            let root = Self::conv_carry(b, Relation::Yg, i);
+            b.emit_base(idx, root);
+            idx += 1;
         }
-        .boxed(),
-    );
-    idx += 1;
-
-    // IS_BIT(q1[32]) — the high byte of the 33-byte yG quotient is a single-bit value.
-    // The spec mandates this unconditionally (ec:c:q1_257); IS_BYTE(0..=32) covers all 33
-    // bytes via a μ-gated bus interaction and does not replace this polynomial constraint.
-    constraints.push(IsBitConstraint::unconditional(cols::q1(32), idx).boxed());
-    idx += 1;
-
-    // xG < p: 7 carry bits + overflow-required.
-    for i in 0..7 {
-        constraints.push(
-            CarryBit {
-                kind: OverflowKind::XgLtP,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
+        let c1_last = b.main(0, cols::c1(63));
+        b.emit_base(idx, c1_last);
         idx += 1;
-    }
-    constraints.push(
-        OverflowRequired {
-            kind: OverflowKind::XgLtP,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
 
-    // k < N: 7 carry bits + overflow-required.
-    for i in 0..7 {
-        constraints.push(
-            CarryBit {
-                kind: OverflowKind::KLtN,
-                i,
-                constraint_idx: idx,
-            }
-            .boxed(),
-        );
+        // idx 388: IS_BIT(q1[32]): x·(1−x). (deg 2)
+        let q1_32 = b.main(0, cols::q1(32));
+        let one = b.one();
+        b.emit_base(idx, q1_32.clone() * (one - q1_32));
         idx += 1;
-    }
-    constraints.push(
-        OverflowRequired {
-            kind: OverflowKind::KLtN,
-            constraint_idx: idx,
-        }
-        .boxed(),
-    );
-    idx += 1;
 
-    // xR < p: 7 carry bits + overflow-required.
-    for i in 0..7 {
-        constraints.push(
-            CarryBit {
-                kind: OverflowKind::XrLtP,
-                i,
-                constraint_idx: idx,
+        // xG < p, k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
+        for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
+            let c = Self::carry_chain(b, kind);
+            for ci in c.iter().take(7) {
+                // µ · c_i · (1 − c_i)
+                let mu = b.main(0, cols::MU);
+                let one = b.one();
+                b.emit_base(idx, mu * ci.clone() * (one - ci.clone()));
+                idx += 1;
             }
-            .boxed(),
-        );
-        idx += 1;
-    }
-    constraints.push(
-        OverflowRequired {
-            kind: OverflowKind::XrLtP,
-            constraint_idx: idx,
+            // µ · (1 − c_7)
+            let mu = b.main(0, cols::MU);
+            let one = b.one();
+            b.emit_base(idx, mu * (one - c[7].clone()));
+            idx += 1;
         }
-        .boxed(),
-    );
-    idx += 1;
 
-    (constraints, idx)
+        debug_assert_eq!(idx, 413);
+    }
 }

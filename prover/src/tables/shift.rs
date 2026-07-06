@@ -6,22 +6,19 @@
 //! 1. Intra-limb shift by `bit_shift = shift mod 16` using paired HWSL lookups (returning [SLL, SLLC]).
 //! 2. Full-limb shift by `limb_shift` (unary encoding of `shift >> 4`).
 //!
-//! ## Columns (26 total)
+//! ## Columns (29 total)
 //! - Input: `in[0..3]` (DWordHL), `shift` (Byte), `direction` (Bit), `signed` (Bit), `word_instr` (Bit)
 //! - Output: `out[0..1]` (DWordWL)
 //! - Auxiliary: `is_negative`, `bit_shift`, `zbs`, `X[0..4]`, `Y[0..3]`, `limb_shift_raw[0..2]`
 //! - Virtual: `limb_shift[3] = 1 - limb_shift_raw[0] - limb_shift_raw[1] - limb_shift_raw[2]`
+//! - Shift decomposition (ALU-bus shift amount): `shift_b1` (idx 26, Byte = shift[1]), `shift_h1` (idx 27, Half = shift[2]), `shift_high` (idx 28, Word = shift[3])
 //! - Multiplicity: `μ`
 //!
-//! ## Bus Interactions (15 total)
-//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), IS_HALFWORD (×4)
-//! - Receiver: SHIFT (from CPU)
+//! ## Bus Interactions (18 total)
+//! - Senders: MSB16, BYTE_ALU[AND] (×3), ZERO, HWSL (×5), ARE_BYTES (×2), IS_HALFWORD (×5)
+//! - Receiver: ALU (from CPU)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op};
@@ -222,7 +219,7 @@ impl ShiftOperation {
         // AIR constrains IS_NEGATIVE via the MSB16 bus (SHIFT-C14) only when
         // `signed = 1` — for `signed = 0` IS_NEGATIVE is free, so we set it
         // to zero. This makes `extension = 65535 * is_negative = 0` for SRL,
-        // so the extension contribution in `compute_shifted_half` naturally
+        // so the extension contribution in `shifted_half` naturally
         // vanishes (zero fill) — matching RISC-V SRL semantics regardless of
         // the top-bit value of the input.
         let is_negative = self.signed && (self.in_halves[3] >> 15) & 1 == 1;
@@ -541,7 +538,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // second output = extension - X[4] (the carry, expressed as a linear combination)
     interactions.push(BusInteraction::sender(
         BusId::Hwsl,
-        one_minus_zbs.clone(),
+        one_minus_zbs,
         vec![
             BusValue::linear(vec![LinearTerm::Column {
                 coefficient: 65535,
@@ -728,264 +725,174 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 
+/// Total number of SHIFT transition constraints.
+pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
+
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..19.
 
-/// Polynomial constraint kinds for the SHIFT table.
-#[derive(Debug, Clone, Copy)]
-pub enum ShiftConstraintKind {
-    /// SHIFT-C13: direction * (1 - μ) = 0
-    DirectionImpliesMu,
-    /// SHIFT-C5.i: zbs * (X[i] - in[i] * left) = 0
-    ZbsOverrideX(usize),
-    /// SHIFT-C7: zbs * X[4] = 0
-    ZbsOverrideX4,
-    /// SHIFT-C9.i: zbs * (Y[i] - in[i] * right) = 0
-    ZbsOverrideY(usize),
-    /// SHIFT-C10.i: IS_BIT<limb_shift[i]>
-    LimbShiftIsBit(usize),
-    /// SHIFT-C12.i: out[i] - (shifted::DWordWL)[i] = 0
-    OutputMatchesShifted(usize),
-    /// `IS_BIT<flag>`: `flag * (1 - flag) = 0` for a boolean flag used as a bus
-    /// multiplicity / shift selector (`shift:c:direction|signed|word_instr`).
-    /// `usize` is the flag column.
-    FlagIsBit(usize),
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-pub struct ShiftConstraint {
-    constraint_idx: usize,
-    kind: ShiftConstraintKind,
-}
+/// SHIFT table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the SHIFT layout is fixed via `cols`).
+pub struct ShiftConstraints;
 
-impl ShiftConstraint {
-    pub fn new(kind: ShiftConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
+impl ShiftConstraints {
+    /// `limb_shift[i]` (i = 0..2 raw, i = 3 virtual
+    /// `1 - ls_raw[0] - ls_raw[1] - ls_raw[2]`).
+    fn limb_shift<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i < 3 {
+            b.main(0, cols::LIMB_SHIFT_RAW[i])
+        } else {
+            let one = b.one();
+            let a = b.main(0, cols::LIMB_SHIFT_RAW[0]);
+            let c = b.main(0, cols::LIMB_SHIFT_RAW[1]);
+            let d = b.main(0, cols::LIMB_SHIFT_RAW[2]);
+            one - a - c - d
         }
     }
 
-    /// Compute the `shifted` virtual column at index `half_idx` (0..4).
-    fn compute_shifted_half<F, E>(half_idx: usize, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let dir: FieldElement<F> = step.get_main_evaluation_element(0, cols::DIRECTION).clone();
-        let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-        let left = &mu - &dir; // μ - direction
-        let right = dir;
+    /// intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0.
+    fn intra_left<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        if i == 0 {
+            b.main(0, cols::X[0])
+        } else {
+            let x = b.main(0, cols::X[i]);
+            let y = b.main(0, cols::Y[i - 1]);
+            x + y
+        }
+    }
+
+    /// intra_limb_right[i]: Y[i]+X[i+1].
+    fn intra_right<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        let y = b.main(0, cols::Y[i]);
+        let x = b.main(0, cols::X[i + 1]);
+        y + x
+    }
+
+    /// The `shifted` virtual column at index `half_idx` (0..4).
+    fn shifted_half<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        i: usize,
+    ) -> B::Expr {
+        // left = μ - direction, right = direction
+        let mu = b.main(0, cols::MU);
+        let dir = b.main(0, cols::DIRECTION);
+        let left = mu - dir;
+        let right = b.main(0, cols::DIRECTION);
 
         // extension = 65535 * is_negative
-        let is_neg = step.get_main_evaluation_element(0, cols::IS_NEGATIVE);
-        let extension = is_neg * FieldElement::<F>::from(65535u64);
+        let is_neg = b.main(0, cols::IS_NEGATIVE);
+        let c65535 = b.const_base(65535);
+        let extension = is_neg * c65535;
 
-        // Get X, Y, limb_shift, in columns
-        let get_x = |i: usize| step.get_main_evaluation_element(0, cols::X[i]).clone();
-        let get_y = |i: usize| step.get_main_evaluation_element(0, cols::Y[i]).clone();
-        let get_ls = |i: usize| -> FieldElement<F> {
-            if i < 3 {
-                step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
-                    .clone()
-            } else {
-                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
-                FieldElement::<F>::one()
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
-                    - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
-            }
-        };
-
-        // intra_limb_left[i]: X[0] for i=0, X[i]+Y[i-1] for i>0
-        let intra_left = |i: usize| -> FieldElement<F> {
-            if i == 0 {
-                get_x(0)
-            } else {
-                get_x(i) + get_y(i - 1)
-            }
-        };
-
-        // intra_limb_right[i]: Y[i]+X[i+1]
-        let intra_right = |i: usize| -> FieldElement<F> { get_y(i) + get_x(i + 1) };
-
-        let i = half_idx;
-        let zero = FieldElement::<F>::zero();
-
-        // left_part = left * Σ_j=0^i limb_shift[j] * intra_limb_left[i-j]
-        let mut left_part = zero.clone();
+        // left_part = left * Σ_{j=0}^{i} limb_shift[j] * intra_limb_left[i-j]
+        let mut left_part = b.zero();
         for j in 0..=i {
-            left_part += &get_ls(j) * intra_left(i - j);
+            left_part = left_part + Self::limb_shift(b, j) * Self::intra_left(b, i - j);
         }
-        left_part = &left * left_part;
+        let left_part = left * left_part;
 
-        // right_shift_part = right * Σ_j=0^(3-i) limb_shift[j] * intra_limb_right[i+j]
-        let mut right_shift_part = zero.clone();
+        // right_shift_part = Σ_{j=0}^{3-i} limb_shift[j] * intra_limb_right[i+j]
+        let mut right_shift_part = b.zero();
         for j in 0..=(3 - i) {
-            right_shift_part += &get_ls(j) * intra_right(i + j);
+            right_shift_part =
+                right_shift_part + Self::limb_shift(b, j) * Self::intra_right(b, i + j);
         }
 
-        // right_ext_part = right * extension * Σ_j=(4-i)^3 limb_shift[j]
-        let mut ext_sum = zero.clone();
+        // right_ext_part = extension * Σ_{j=4-i}^{3} limb_shift[j]
+        let mut ext_sum = b.zero();
         if i < 4 {
             for j in (4 - i)..4 {
-                ext_sum += get_ls(j);
+                ext_sum = ext_sum + Self::limb_shift(b, j);
             }
         }
-        let right_ext_part = &extension * ext_sum;
+        let right_ext_part = extension * ext_sum;
 
-        let right_part = &right * (right_shift_part + right_ext_part);
+        let right_part = right * (right_shift_part + right_ext_part);
 
         left_part + right_part
     }
-
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
-        match self.kind {
-            ShiftConstraintKind::DirectionImpliesMu => {
-                // direction * (1 - μ) = 0
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                let mu = step.get_main_evaluation_element(0, cols::MU);
-                dir * (&one - mu)
-            }
-            ShiftConstraintKind::ZbsOverrideX(i) => {
-                // zbs * (X[i] - in[i] * left) = 0, where left = μ - direction
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let x_i = step.get_main_evaluation_element(0, cols::X[i]);
-                let in_i = step.get_main_evaluation_element(0, cols::IN[i]);
-                let mu = step.get_main_evaluation_element(0, cols::MU);
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                let left = mu - dir;
-                zbs * (x_i - in_i * &left)
-            }
-            ShiftConstraintKind::ZbsOverrideX4 => {
-                // zbs * X[4] = 0
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let x4 = step.get_main_evaluation_element(0, cols::X_4);
-                zbs * x4
-            }
-            ShiftConstraintKind::ZbsOverrideY(i) => {
-                // zbs * (Y[i] - in[i] * right) = 0
-                let zbs = step.get_main_evaluation_element(0, cols::ZBS);
-                let y_i = step.get_main_evaluation_element(0, cols::Y[i]);
-                let in_i = step.get_main_evaluation_element(0, cols::IN[i]);
-                let dir = step.get_main_evaluation_element(0, cols::DIRECTION);
-                zbs * (y_i - in_i * dir)
-            }
-            ShiftConstraintKind::LimbShiftIsBit(i) => {
-                // limb_shift[i] * (1 - limb_shift[i]) = 0
-                // limb_shift[3] is virtual: 1 - ls_raw[0] - ls_raw[1] - ls_raw[2]
-                let ls = if i < 3 {
-                    step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[i])
-                        .clone()
-                } else {
-                    one.clone()
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[0])
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[1])
-                        - step.get_main_evaluation_element(0, cols::LIMB_SHIFT_RAW[2])
-                };
-                &ls * (&one - &ls)
-            }
-            ShiftConstraintKind::OutputMatchesShifted(i) => {
-                // C12.i: out[i] - (shifted::DWordWL)[i] = 0
-                // (shifted::DWordWL)[i] = shifted[2*i] + shifted[2*i+1] * 2^16
-                let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
-                let out = step.get_main_evaluation_element(0, out_col).clone();
-                let half_lo = Self::compute_shifted_half(2 * i, step);
-                let half_hi = Self::compute_shifted_half(2 * i + 1, step);
-                out - half_lo - half_hi * shift_16
-            }
-            ShiftConstraintKind::FlagIsBit(col) => {
-                // flag * (1 - flag) = 0
-                let flag = step.get_main_evaluation_element(0, col).clone();
-                let one = FieldElement::<F>::one();
-                &flag * (one - &flag)
-            }
-        }
-    }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for ShiftConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            ShiftConstraintKind::DirectionImpliesMu => 2,
-            ShiftConstraintKind::ZbsOverrideX(_) => 3, // zbs * (X - in * left), left = 1 - dir
-            ShiftConstraintKind::ZbsOverrideX4 => 2,
-            ShiftConstraintKind::ZbsOverrideY(_) => 3, // zbs * (Y - in * dir)
-            ShiftConstraintKind::LimbShiftIsBit(_) => 2,
-            ShiftConstraintKind::OutputMatchesShifted(_) => 3, // out - left*ls*intra (degree 3)
-            ShiftConstraintKind::FlagIsBit(_) => 2,
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for ShiftConstraints {
+    fn max_degree(&self) -> usize {
+        3
+    }
+
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: DirectionImpliesMu — direction * (1 - μ)
+        let dir = b.main(0, cols::DIRECTION);
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(0, dir * (one - mu));
+
+        // idx 1..5: ZbsOverrideX(i) — zbs * (X[i] - in[i] * (μ - direction))
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let x_i = b.main(0, cols::X[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let mu = b.main(0, cols::MU);
+            let dir = b.main(0, cols::DIRECTION);
+            let left = mu - dir;
+            b.emit_base(1 + i, zbs * (x_i - in_i * left));
+        }
+
+        // idx 5: ZbsOverrideX4 — zbs * X[4]
+        let zbs = b.main(0, cols::ZBS);
+        let x4 = b.main(0, cols::X_4);
+        b.emit_base(5, zbs * x4);
+
+        // idx 6..10: ZbsOverrideY(i) — zbs * (Y[i] - in[i] * direction)
+        for i in 0..4 {
+            let zbs = b.main(0, cols::ZBS);
+            let y_i = b.main(0, cols::Y[i]);
+            let in_i = b.main(0, cols::IN[i]);
+            let dir = b.main(0, cols::DIRECTION);
+            b.emit_base(6 + i, zbs * (y_i - in_i * dir));
+        }
+
+        // idx 10..14: LimbShiftIsBit(i) — limb_shift[i] * (1 - limb_shift[i])
+        for i in 0..4 {
+            let ls = Self::limb_shift(b, i);
+            let one = b.one();
+            b.emit_base(10 + i, ls.clone() * (one - ls));
+        }
+
+        // idx 14,15: OutputMatchesShifted(i) —
+        // out[i] - shifted_half[2i] - shifted_half[2i+1] * 2^16
+        for i in 0..2 {
+            let out_col = if i == 0 { cols::OUT_0 } else { cols::OUT_1 };
+            let out = b.main(0, out_col);
+            let half_lo = Self::shifted_half(b, 2 * i);
+            let half_hi = Self::shifted_half(b, 2 * i + 1);
+            let shift_16 = b.const_base(SHIFT_16);
+            b.emit_base(14 + i, out - half_lo - half_hi * shift_16);
+        }
+
+        // idx 16..19: FlagIsBit — flag * (1 - flag) for direction, signed, word_instr
+        for (off, flag_col) in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR]
+            .into_iter()
+            .enumerate()
+        {
+            let flag = b.main(0, flag_col);
+            let one = b.one();
+            b.emit_base(16 + off, flag.clone() * (one - flag));
         }
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Number of polynomial constraints in the SHIFT table.
-// 1 (DirectionImpliesMu) + 4 (ZbsOverrideX) + 1 (ZbsOverrideX4) + 4 (ZbsOverrideY)
-// + 4 (LimbShiftIsBit) + 2 (OutputMatchesShifted) + 3 (FlagIsBit) = 19
-pub const NUM_SHIFT_CONSTRAINTS: usize = 19;
-
-/// Creates all polynomial constraints for the SHIFT table.
-pub fn shift_constraints(constraint_idx_start: usize) -> (Vec<ShiftConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut constraints = Vec::with_capacity(NUM_SHIFT_CONSTRAINTS);
-
-    let mut push = |kind| {
-        constraints.push(ShiftConstraint::new(kind, idx));
-        idx += 1;
-    };
-
-    // C13: direction * (1 - μ) = 0
-    push(ShiftConstraintKind::DirectionImpliesMu);
-
-    // C5.i: zbs * (X[i] - in[i] * left) = 0
-    for i in 0..4 {
-        push(ShiftConstraintKind::ZbsOverrideX(i));
-    }
-
-    // C7: zbs * X[4] = 0
-    push(ShiftConstraintKind::ZbsOverrideX4);
-
-    // C9.i: zbs * (Y[i] - in[i] * right) = 0
-    for i in 0..4 {
-        push(ShiftConstraintKind::ZbsOverrideY(i));
-    }
-
-    // C10.i: IS_BIT<limb_shift[i]>
-    for i in 0..4 {
-        push(ShiftConstraintKind::LimbShiftIsBit(i));
-    }
-
-    // C12.i: out[i] - (shifted::DWordWL)[i] = 0
-    for i in 0..2 {
-        push(ShiftConstraintKind::OutputMatchesShifted(i));
-    }
-
-    // IS_BIT[direction|signed|word_instr] (shift.toml `range` group): these flags
-    // drive bus multiplicities / shift selectors, so they must be boolean.
-    for flag_col in [cols::DIRECTION, cols::SIGNED, cols::WORD_INSTR] {
-        push(ShiftConstraintKind::FlagIsBit(flag_col));
-    }
-
-    debug_assert_eq!(constraints.len(), NUM_SHIFT_CONSTRAINTS);
-    (constraints, idx)
 }
 
 // =========================================================================

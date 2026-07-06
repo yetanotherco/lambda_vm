@@ -3,7 +3,10 @@ use std::marker::PhantomData;
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraintEvaluator,
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -17,210 +20,56 @@ use math::{
     traits::ByteConversion,
 };
 
-/// This condition ensures the continuity in a read-only memory structure, preserving strict ordering.
-/// Equation based on Cairo Whitepaper section 9.7.2
-#[derive(Clone)]
-struct ContinuityConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
+/// Single-body [`ConstraintSet`] for [`ReadOnlyRAP`]: the continuity,
+/// single-value and permutation constraints, written once against the
+/// [`ConstraintBuilder`]. The permutation constraint reads the auxiliary
+/// (RAP) column and the interaction challenges, so it is an `Ext` constraint
+/// after the `Base` prefix.
+pub struct ReadOnlyRAPConstraints;
 
-impl<F: IsFFTField> ContinuityConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for ContinuityConstraint<F>
+impl<F> ConstraintSet<F, F> for ReadOnlyRAPConstraints
 where
     F: IsFFTField + Send + Sync,
 {
-    fn degree(&self) -> usize {
-        2
-    }
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        let a_sorted_0 = b.main(0, 2);
+        let a_sorted_1 = b.main(1, 2);
+        let v_sorted_0 = b.main(0, 3);
+        let v_sorted_1 = b.main(1, 3);
+        let one = b.one();
+        let addr_diff = a_sorted_1 - a_sorted_0;
 
-    fn constraint_idx(&self) -> usize {
-        0
-    }
+        // All three read the next row ⇒ degree 2, 1 end exemption each.
+        // idx 0 — continuity: (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
+        b.emit_base_rows(
+            0,
+            RowDomain::except_last(1),
+            addr_diff.clone() * (addr_diff.clone() - one.clone()),
+        );
+        // idx 1 — single value: (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
+        b.emit_base_rows(
+            1,
+            RowDomain::except_last(1),
+            (v_sorted_1 - v_sorted_0) * (addr_diff - one),
+        );
 
-    fn end_exemptions(&self) -> usize {
-        // NOTE: We are assuming that the trace has as length a power of 2.
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        let a_sorted_0 = first_step.get_main_evaluation_element(0, 2);
-        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-        // (a'_{i+1} - a'_i)(a'_{i+1} - a'_i - 1) = 0 where a' is the sorted address
-        let res = (a_sorted_1 - a_sorted_0) * (a_sorted_1 - a_sorted_0 - FieldElement::<F>::one());
-
-        // The eval always exists, except if the constraint idx were incorrectly defined.
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-            *eval = res;
-        }
-    }
-}
-/// Transition constraint that ensures that same addresses have same values, making the memory read-only.
-/// Equation based on Cairo Whitepaper section 9.7.2
-#[derive(Clone)]
-struct SingleValueConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> SingleValueConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for SingleValueConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        // NOTE: We are assuming that the trace has as length a power of 2.
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        let a_sorted0 = first_step.get_main_evaluation_element(0, 2);
-        let a_sorted1 = second_step.get_main_evaluation_element(0, 2);
-        let v_sorted0 = first_step.get_main_evaluation_element(0, 3);
-        let v_sorted1 = second_step.get_main_evaluation_element(0, 3);
-        // (v'_{i+1} - v'_i) * (a'_{i+1} - a'_i - 1) = 0
-        let res = (v_sorted1 - v_sorted0) * (a_sorted1 - a_sorted0 - FieldElement::<F>::one());
-
-        // The eval always exists, except if the constraint idx were incorrectly defined.
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-            *eval = res;
-        }
-    }
-}
-/// Permutation constraint ensures that the values are permuted in the memory.
-/// Equation based on Cairo Whitepaper section 9.7.2
-#[derive(Clone)]
-struct PermutationConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> PermutationConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for PermutationConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        2
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        // Auxiliary constraints
-        let p0 = first_step.get_aux_evaluation_element(0, 0);
-        let p1 = second_step.get_aux_evaluation_element(0, 0);
-        let z = &rap_challenges[0];
-        let alpha = &rap_challenges[1];
-        let a1 = second_step.get_main_evaluation_element(0, 0);
-        let v1 = second_step.get_main_evaluation_element(0, 1);
-        let a_sorted_1 = second_step.get_main_evaluation_element(0, 2);
-        let v_sorted_1 = second_step.get_main_evaluation_element(0, 3);
         // (z - (a'_{i+1} + α * v'_{i+1})) * p_{i+1} = (z - (a_{i+1} + α * v_{i+1})) * p_i
-        let res = (z - (a_sorted_1 + alpha * v_sorted_1)) * p1 - (z - (a1 + alpha * v1)) * p0;
-
-        // The eval always exists, except if the constraint idx were incorrectly defined.
-        if let Some(eval) = transition_evaluations.get_mut(self.constraint_idx()) {
-            *eval = res;
-        }
+        let p0 = b.aux(0, 0);
+        let p1 = b.aux(1, 0);
+        let z = b.challenge(0);
+        let alpha = b.challenge(1);
+        let a1 = b.main(1, 0);
+        let v1 = b.main(1, 1);
+        let a_sorted_1 = b.main(1, 2);
+        let v_sorted_1 = b.main(1, 3);
+        let sorted_fp = z.clone() - (a_sorted_1 + v_sorted_1 * alpha.clone());
+        let unsorted_fp = z - (a1 + v1 * alpha);
+        // idx 2 — permutation (degree 2, 1 end exemption).
+        b.emit_ext_rows(
+            2,
+            RowDomain::except_last(1),
+            sorted_fp * p1 - unsorted_fp * p0,
+        );
     }
 }
 
@@ -229,10 +78,12 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct ReadOnlyPublicInputs<F>
 where
     F: IsFFTField,
@@ -257,24 +108,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let transition_constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(ContinuityConstraint::new()),
-            Box::new(SingleValueConstraint::new()),
-            Box::new(PermutationConstraint::new()),
-        ];
+        let meta = ConstraintSet::<F, F>::meta(&ReadOnlyRAPConstraints);
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 5,
             transition_offsets: vec![0, 1],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
-            transition_constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -362,10 +208,38 @@ where
         BoundaryConstraints::from_constraints(vec![c1, c2, c3, c4, c_aux1, c_aux2])
     }
 
-    fn transition_constraints(
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
+    }
+
+    fn compute_transition_prover(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &ReadOnlyRAPConstraints,
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &ReadOnlyRAPConstraints,
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&ConstraintSet::<F, F>::meta(&ReadOnlyRAPConstraints))
     }
 
     fn context(&self) -> &AirContext {

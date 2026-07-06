@@ -3,7 +3,10 @@ use std::{marker::PhantomData, ops::Div};
 use crate::{
     constraints::{
         boundary::{BoundaryConstraint, BoundaryConstraints},
-        transition::TransitionConstraintEvaluator,
+        builder::{
+            ConstraintBuilder, ConstraintMeta, ConstraintSet, RowDomain, num_base_from_meta,
+            run_transition_prover, run_transition_verifier,
+        },
     },
     context::AirContext,
     proof::options::ProofOptions,
@@ -25,134 +28,37 @@ fn resize_to_next_power_of_two<F: IsFFTField>(trace_columns: &mut [Vec<FieldElem
     }
 }
 
-#[derive(Clone)]
-struct FibConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
+/// Single-body [`ConstraintSet`] for [`FibonacciRAP`]: the Fibonacci
+/// recurrence plus the RAP permutation constraint, written once against the
+/// [`ConstraintBuilder`]. The permutation constraint reads the auxiliary
+/// (RAP) column and the interaction challenge, so it is an `Ext` constraint
+/// after the `Base` prefix.
+pub struct FibonacciRAPConstraints;
 
-impl<F: IsFFTField> FibConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for FibConstraint<F>
+impl<F> ConstraintSet<F, F> for FibonacciRAPConstraints
 where
     F: IsFFTField + Send + Sync,
 {
-    fn degree(&self) -> usize {
-        1
-    }
+    fn eval<B: ConstraintBuilder<F, F>>(&self, b: &mut B) {
+        // idx 0: a_{i+2} = a_{i+1} + a_i on column 0. End exemptions hard-coded
+        // for the steps = 16 integration tests.
+        let a0 = b.main(0, 0);
+        let a1 = b.main(1, 0);
+        let a2 = b.main(2, 0);
+        b.emit_base_rows(0, RowDomain::except_last(3 + 32 - 16 - 1), a2 - a1 - a0);
 
-    fn constraint_idx(&self) -> usize {
-        0
-    }
-
-    fn end_exemptions(&self) -> usize {
-        // NOTE: This is hard-coded for the example of steps = 16 in the integration tests.
-        // If that number changes in the test, this should be changed too or the test will fail.
-        3 + 32 - 16 - 1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, _rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-        let third_step = frame.get_evaluation_step(2);
-
-        let a0 = first_step.get_main_evaluation_element(0, 0);
-        let a1 = second_step.get_main_evaluation_element(0, 0);
-        let a2 = third_step.get_main_evaluation_element(0, 0);
-
-        let res = a2 - a1 - a0;
-
-        transition_evaluations[self.constraint_idx()] = res;
-    }
-}
-
-#[derive(Clone)]
-struct PermutationConstraint<F: IsFFTField> {
-    phantom: PhantomData<F>,
-}
-
-impl<F: IsFFTField> PermutationConstraint<F> {
-    pub fn new() -> Self {
-        Self {
-            phantom: PhantomData,
-        }
-    }
-}
-
-impl<F> TransitionConstraintEvaluator<F, F> for PermutationConstraint<F>
-where
-    F: IsFFTField + Send + Sync,
-{
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        1
-    }
-
-    fn end_exemptions(&self) -> usize {
-        1
-    }
-
-    fn evaluate_verifier(
-        &self,
-        evaluation_context: &TransitionEvaluationContext<F, F>,
-        transition_evaluations: &mut [FieldElement<F>],
-    ) {
-        let (frame, _periodic_values, rap_challenges) = match evaluation_context {
-            TransitionEvaluationContext::Prover {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            }
-            | TransitionEvaluationContext::Verifier {
-                frame,
-                periodic_values,
-                rap_challenges,
-                ..
-            } => (frame, periodic_values, rap_challenges),
-        };
-
-        let first_step = frame.get_evaluation_step(0);
-        let second_step = frame.get_evaluation_step(1);
-
-        // Auxiliary constraints
-        let z_i = first_step.get_aux_evaluation_element(0, 0);
-        let z_i_plus_one = second_step.get_aux_evaluation_element(0, 0);
-        let gamma = &rap_challenges[0];
-
-        let a_i = first_step.get_main_evaluation_element(0, 0);
-        let b_i = first_step.get_main_evaluation_element(0, 1);
-
-        let res = z_i_plus_one * (b_i + gamma) - z_i * (a_i + gamma);
-
-        transition_evaluations[self.constraint_idx()] = res;
+        // idx 1: permutation; z_{i+1} * (b_i + gamma) = z_i * (a_i + gamma);
+        // reads the next row ⇒ 1 end exemption.
+        let z_i = b.aux(0, 0);
+        let z_i_plus_one = b.aux(1, 0);
+        let gamma = b.challenge(0);
+        let a_i = b.main(0, 0);
+        let b_i = b.main(0, 1);
+        b.emit_ext_rows(
+            1,
+            RowDomain::except_last(1),
+            z_i_plus_one * (b_i + gamma.clone()) - z_i * (a_i + gamma),
+        );
     }
 }
 
@@ -161,10 +67,12 @@ where
     F: IsFFTField,
 {
     context: AirContext,
-    transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, F>>>,
+    meta: Vec<ConstraintMeta>,
+    phantom: PhantomData<F>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct FibonacciRAPPublicInputs<F>
 where
     F: IsFFTField,
@@ -188,23 +96,19 @@ where
     }
 
     fn new(proof_options: &ProofOptions) -> Self {
-        let transition_constraints: Vec<
-            Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>,
-        > = vec![
-            Box::new(FibConstraint::new()),
-            Box::new(PermutationConstraint::new()),
-        ];
+        let meta = ConstraintSet::<F, F>::meta(&FibonacciRAPConstraints);
 
         let context = AirContext {
             proof_options: proof_options.clone(),
             trace_columns: 3,
             transition_offsets: vec![0, 1, 2],
-            num_transition_constraints: transition_constraints.len(),
+            num_transition_constraints: meta.len(),
         };
 
         Self {
             context,
-            transition_constraints,
+            meta,
+            phantom: PhantomData,
         }
     }
 
@@ -271,10 +175,38 @@ where
         BoundaryConstraints::from_constraints(vec![a0, a1, a0_aux])
     }
 
-    fn transition_constraints(
+    fn constraints_meta(&self) -> &[ConstraintMeta] {
+        &self.meta
+    }
+
+    fn compute_transition_prover(
         &self,
-    ) -> &Vec<Box<dyn TransitionConstraintEvaluator<Self::Field, Self::FieldExtension>>> {
-        &self.transition_constraints
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+        base_evals: &mut [FieldElement<Self::Field>],
+        ext_evals: &mut [FieldElement<Self::FieldExtension>],
+    ) {
+        run_transition_prover(
+            &FibonacciRAPConstraints,
+            evaluation_context,
+            base_evals,
+            ext_evals,
+        );
+    }
+
+    fn compute_transition(
+        &self,
+        evaluation_context: &TransitionEvaluationContext<Self::Field, Self::FieldExtension>,
+    ) -> Vec<FieldElement<Self::FieldExtension>> {
+        run_transition_verifier(
+            &FibonacciRAPConstraints,
+            evaluation_context,
+            self.num_base_transition_constraints(),
+            self.num_transition_constraints(),
+        )
+    }
+
+    fn num_base_transition_constraints(&self) -> usize {
+        num_base_from_meta(&ConstraintSet::<F, F>::meta(&FibonacciRAPConstraints))
     }
 
     fn context(&self) -> &AirContext {
