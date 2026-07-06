@@ -558,61 +558,56 @@ pub trait IsStarkVerifier<
             (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
         let mut index = iota;
 
-        // Handle case with 0 committed FRI layers but a single final fold
-        // (`total_folds == 1`). The fold loop below doesn't iterate, so we compare
-        // the folded value `v` against the reconstructed terminal codeword at the
-        // query's terminal-layer position (`index == iota`) directly.
-        if fri_layers_merkle_roots.is_empty() {
-            return terminal_codeword.get(index).is_some_and(|t| &v == t);
-        }
+        // Fold through every committed layer: use the proof to verify the openings
+        // of pᵢ(−𝜐^(2ⁱ)) (given by the prover) and pᵢ(𝜐^(2ⁱ)) (computed on the
+        // previous iteration), then obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)). When there are no
+        // committed layers (`total_folds == 1`, a single final fold) this fold is
+        // empty and `v`/`index` already hold the terminal-layer value/position.
+        let openings_ok =
+            fri_layers_merkle_roots
+                .iter()
+                .enumerate()
+                .zip(&fri_decommitment.layers_auth_paths)
+                .zip(&fri_decommitment.layers_evaluations_sym)
+                .zip(evaluation_point_vec)
+                .fold(
+                    true,
+                    |result,
+                     (
+                        (((i, merkle_root), auth_path_sym), evaluation_sym),
+                        evaluation_point_inv,
+                    )| {
+                        // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
+                        // `v` is pᵢ(𝜐^(2ⁱ)).
+                        // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
+                        let openings_ok = Self::verify_fri_layer_openings(
+                            merkle_root,
+                            auth_path_sym,
+                            &v,
+                            evaluation_sym,
+                            index,
+                        );
 
-        // For each FRI layer, starting from the layer 1: use the proof to verify the validity of values pᵢ(−𝜐^(2ⁱ)) (given by the prover) and
-        // pᵢ(𝜐^(2ⁱ)) (computed on the previous iteration by the verifier). Then use them to obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-        // Finally, check that the final value coincides with the given by the prover.
-        fri_layers_merkle_roots
-            .iter()
-            .enumerate()
-            .zip(&fri_decommitment.layers_auth_paths)
-            .zip(&fri_decommitment.layers_evaluations_sym)
-            .zip(evaluation_point_vec)
-            .fold(
-                true,
-                |result,
-                 (
-                    (((i, merkle_root), auth_path_sym), evaluation_sym),
-                    evaluation_point_inv,
-                )| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
-                        auth_path_sym,
-                        &v,
-                        evaluation_sym,
-                        index,
-                    );
+                        // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
+                        v = (&v + evaluation_sym)
+                            + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
 
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym) + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
+                        // Update index for next iteration. The index of the squares in the next layer
+                        // is obtained by halving the current index. This is due to the bit-reverse
+                        // ordering of the elements in the Merkle tree.
+                        index >>= 1;
 
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
-                    index >>= 1;
-
-                    if i < fri_decommitment.layers_evaluations_sym.len() - 1 {
                         result & openings_ok
-                    } else {
-                        // Last committed layer: `v` is now the folded value at the
-                        // terminal layer and `index` (after the final `index >>= 1`)
-                        // is its FRI-order position there. Check it against the
-                        // reconstructed terminal codeword.
-                        let terminal_ok = terminal_codeword.get(index).is_some_and(|t| &v == t);
-                        result & terminal_ok & openings_ok
-                    }
-                },
-            )
+                    },
+                );
+
+        // After folding through all committed layers, `v` is the query's value at
+        // the terminal layer and `index` its FRI-order position there. Check it
+        // against the reconstructed terminal codeword. This single check covers
+        // both the single-fold (`total_folds == 1`, empty fold above) and
+        // multi-fold regimes; `.get()` fails closed on an out-of-range index.
+        let terminal_ok = terminal_codeword.get(index).is_some_and(|t| &v == t);
+        openings_ok & terminal_ok
     }
 
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
