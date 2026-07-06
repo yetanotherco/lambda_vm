@@ -70,10 +70,39 @@
     ).join()
 )
 
+#let highlights = (
+  "aside": ("Aside", rgb("55aaff")),
+  "attention": ("Attention", rgb("ff2600")),
+)
+
+#let highlight(title, body, ref: none, kind: "aside") = [
+  #figure(
+    caption: title,
+    supplement: highlights.at(kind).at(0),
+    kind: kind,
+    body
+  )#ref
+]
+
+#let aside = highlight.with(kind: "aside")
+#let attention = highlight.with(kind: "attention")
+
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
   show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
+  show selector.or(..highlights.keys().map(k => figure.where(kind: k))): it => {
+    set figure.caption(position: top)
+    show figure.caption: cap => block(
+      inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
+      outset: (left: 1em),
+      width: 100% + 1em,
+      fill: highlights.at(it.kind).at(1),
+      stroke: luma(50%),
+      align(center, strong(text(fill: black, cap)))
+    )
+    block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false, align(left, it))
+  }
   body
 }
 
@@ -85,20 +114,6 @@
 #let rj = todo.with(background: teal, name: "Robin")
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
 #let cdsg = todo.with(background: olive, name: "Cyprien")
-
-#let highlight(title, body, color) = context figure(
-  block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false)[
-    #block(inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
-           width: 100% + 2em,
-           fill: color,
-           stroke: luma(50%),
-           align(center, strong(text(fill: black, title))))
-    #align(left, body)
-])
-
-#let aside(title, body) = highlight(title, body, rgb("55aaff"))
-
-#let attention(title, body) = highlight("Attention: " + title, body, rgb("#ff2600"))
 
 
 #let is-shiroa = "x-target" in sys.inputs

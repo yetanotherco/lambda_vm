@@ -64,7 +64,7 @@ The $i$th possible memory access in cycle $c$ will obtain as timestamp the value
 For simplicity, we will always reserve a timestamp for every possible memory access, and leave the timestamp unused if an instruction does not use it.
 
 
-#aside[Note on "simultaneous" memory accesses][
+#aside(ref: <memory:aside:granularity>)[Note on "simultaneous" memory accesses][
   For reasons of completeness (since temporal integrity as discussed below is a security necessity),
   we cannot deal with multiple accesses to the same address at identical timestamps.
   However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp
