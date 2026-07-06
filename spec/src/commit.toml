@@ -4,7 +4,7 @@ name = "COMMIT"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which to commit"
 pad = 0
 

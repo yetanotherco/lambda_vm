@@ -111,7 +111,7 @@ to have a strictly greater timestamp than the consumed token.
 This raises the question of how to represent timestamps and cleanly perform this check,
 as over a finite field the “less than” relation is ill-defined
 (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers).
-We choose to represent timestamps as machine words, using the existing `LT` chip (@lt) functionality for comparisons.
+We choose to represent timestamps as 32-bit words, using the existing `LT` chip (@lt) functionality for comparisons.
 The full implementation of the timestamp system can be seen in the `timestamp` column of the `CPU` (@cpu) and `MEMW` chips (@memw).
 The `CPU` merely passes in the current timestamp, while `MEMW` can recall the previously written timestamp and constrain the correct sequencing.
 

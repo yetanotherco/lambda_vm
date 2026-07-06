@@ -2,7 +2,7 @@ name = "HALT"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which to halt the program"
 
 [[variables.auxiliary]]
@@ -11,8 +11,7 @@ type = "DWordWL"
 desc = "The `next_pc` value the CPU wrote during the instruction HALT was invoked"
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 
 
 [[constraint_groups]]
@@ -21,7 +20,7 @@ name = "all"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
+input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
 iter = ["i", 1, 9]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_lo"
@@ -29,7 +28,7 @@ ref = "halt:c:zeroize_registers_lo"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
+input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
 output = ["cast", 0, ["BaseField", 8]]
 multiplicity = 1
 ref = "halt:c:read_zero_exit_code"
@@ -37,7 +36,7 @@ ref = "halt:c:read_zero_exit_code"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["cast", ["-", ["^", 2, 64], 1], "DWordWL"], 1, 0, 0]
+input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
 iter = ["i", 11, 31]
 multiplicity = 1
 ref = "halt:c:zeroize_registers_hi"
@@ -45,7 +44,7 @@ ref = "halt:c:zeroize_registers_hi"
 [[constraints.all]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["arr", ["+", ["idx", "timestamp", 0], 1], ["idx", "timestamp", 1]], ["idx", "pc", "i"]]
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", 1], ["idx", "pc", "i"]]
 multiplicity = 1
 iter = ["i", 0, 1]
 ref = "halt:c:consume_pc"
@@ -53,7 +52,7 @@ ref = "halt:c:consume_pc"
 [[constraints.all]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["arr", ["+", ["idx", "timestamp", 0], 1], ["idx", "timestamp", 1]], ["idx", ["arr", 1, 0], "i"]]
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", 1], ["idx", ["arr", 1, 0], "i"]]
 multiplicity = -1
 iter = ["i", 0, 1]
 ref = "halt:c:emit_pc"

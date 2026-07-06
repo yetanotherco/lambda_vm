@@ -53,7 +53,7 @@ input = ["DWordWL", "DWordWL", "BaseField"]
 [[signatures]]
 tag = "CPU32"
 kind = "interaction"
-input = ["DWordWL", "DWordWL"]
+input = ["Word", "DWordWL"]
 output = "Byte"
 
 # ALU[out; in1, in2, flags]
@@ -67,7 +67,7 @@ output = "DWordWL"
 [[signatures]]
 tag = "MEMOP"
 kind = "interaction"
-input = ["DWordWL", "DWordWL", "DWordWL", "Byte"]
+input = ["Word", "DWordWL", "DWordWL", "Byte"]
 output = "DWordWL"
 
 # BRANCH[next_pc; pc, offset, register, JALR]
@@ -81,39 +81,33 @@ output = "DWordWL"
 [[signatures]]
 tag = "MEMW"
 kind = "interaction"
-input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
+input = ["Bit", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
 output = ["BaseField", 8]
 
 # MEMW[is_register, base_address, value, timestamp, write2, write4, write8]
 [[signatures]]
 tag = "MEMW"
 kind = "interaction"
-input = ["Bit", "DWordWL", ["BaseField", 8], "DWordWL", "Bit", "Bit", "Bit"]
+input = ["Bit", "DWordWL", ["BaseField", 8], "Word", "Bit", "Bit", "Bit"]
 
 # LOAD[res; base_address, timestamp, flags]
 [[signatures]]
 tag = "LOAD"
 kind = "interaction"
-input = ["DWordWL", "DWordWL", "Byte"]
+input = ["DWordWL", "Word", "Byte"]
 output = "DWordWL"
 
 # ECALL[timestamp, syscallnr]
 [[signatures]]
 tag = "ECALL"
 kind = "interaction"
-input = ["DWordWL", "DWordWL"]
+input = ["Word", "DWordWL"]
 
 # CNB[timestamp, index, address, count]
 [[signatures]]
 tag = "CNB"
 kind = "interaction"
-input = ["DWordWL", "BaseField", "DWordWL", "DWordWL"]
-
-# COMMIT[index, value]
-[[signatures]]
-tag = "COMMIT"
-kind = "interaction"
-input = ["BaseField", "Byte"]
+input = ["Word", "BaseField", "DWordWL", "DWordWL"]
 
 # BYTE_ALU[res; selector, X, Y]
 [[signatures]]
@@ -168,13 +162,13 @@ kind = "interaction"
 input = ["Half", "B4"]
 output = ["Half", 2]
 
-# The actual memory tokens, see MEMW and PAGE
+# The actual memory tokens, see MEMW, L2G and PAGE
 [[signatures]]
 tag = "memory"
 kind = "interaction"
-input = ["BaseField", "DWordWL", "DWordWL", "BaseField"]
+input = ["BaseField", "DWordWL", "Word", "BaseField"]
 
-# Global memory: is_register, address, epoch, value
+# Global memory: domain, address, epoch, value
 [[signatures]]
 tag = "GLOBAL_MEM"
 kind = "interaction"
@@ -190,13 +184,13 @@ output = "Word"
 [[signatures]]
 tag = "SHA256_M"
 kind = "interaction"
-input = ["DWordWL", "BaseField"]
+input = ["Word", "BaseField"]
 output = "Word"
 
 [[signatures]]
 tag = "SHA256ROUND"
 kind = "interaction"
-input = ["DWordWL", ["Word", 8], "BaseField"]
+input = ["Word", ["Word", 8], "BaseField"]
 
 [[signatures]]
 tag = "ROTXOR"
@@ -208,7 +202,7 @@ output = "Word"
 [[signatures]]
 tag = "KECCAK"
 kind = "interaction"
-input = ["DWordWL", "BaseField", [[["Byte", 8], 5], 5]]
+input = ["Word", "BaseField", [[["Byte", 8], 5], 5]]
 
 # Keccak round constants
 [[signatures]]

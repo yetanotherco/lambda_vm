@@ -2,7 +2,7 @@ name = "KECCAK"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which the permutation is performed"
 pad = 0
 

@@ -124,9 +124,8 @@ This fast-path leverages that registers
 to achieve a footprint that is significantly smaller than both #memw and #aligned.
 
 Note: as a result of hard optimization, this chip can only be used for register accesses for which 
-+ $#`timestamp` - #`old_timestamp` in [1, 2^16]$, and
-+ $#`timestamp[0]` > #`old_timestamp[0]`$
-If either of these rules does not apply to your access, you should fall back to using `MEMW_A`.
+$#`timestamp` - #`old_timestamp` in [1, 2^16]$.
+If this does not apply to your access, you should fall back to using `MEMW_A`.
 
 Note moreover that this chip does not guard against misaligned register access faults: to access register with a given `address`, one must provide $2 dot #`address`$ in the lookup. 
 
@@ -144,10 +143,8 @@ The following range checks are assumed to be performed/enforced outside of this 
 
 == Constraints
 Since most registers are frequently accessed, the difference between `timestamp` and `old_timestamp` is small most of the times.
-Rather than storing their (nearly) identical upper limbs twice, it is instead assumed that
-$#`old_timestamp[1]` = #`timestamp[1]`$; #aligned can be used for accesses where this is not the case.
 
-Verifying that $#`timestamp` > #`old_timestamp`$ now simplifies to verifying that $#`timestamp[0]` - #`old_timestamp[0]` > 0$.
+Verifying that $#`timestamp` > #`old_timestamp`$ now simplifies to verifying that $#`timestamp` - #`old_timestamp` > 0$.
 For most accesses, this value will be small enough to fit in a `Half`.
 This chip thus enforces this by means of the following constraint:
 #render_constraint_table(register_chip, config, groups: "diff")
