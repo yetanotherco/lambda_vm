@@ -65,6 +65,17 @@ However, since it is practically impossible to commit more than $2^64-2^32$ byte
 
 Next, we read the `value` located at buffer address `address` and commit to it under the given `index`.
 This is only performed when we have not yet reached the `end` of the commit sequence.
+Values are committed by letting the verifier initialize and finalize the global memory argument (see @memory and @streaming),
+with the claimed commitments in its own domain separated part of memory, with domain separator value 3.
+This chip then checks that the same value as the one being committed is then found at the corresponding address.
+In doing this, we enforce that all values being committed match the claimed commitment,
+and the verifier can additionally check that register 254 contains the correct value to ensure
+the correct amount of bytes have been committed.#footnote[
+  We additionally note here that for very large commitments (with index $>= 2^32$),
+  the address can potentially become denormalized, but since no other chips or systems interact with
+  this memory domain, there is no issue.
+  The usual consistency guarantee from the LogUp argument and correct initialization as for general addresses applies.
+]
 #render_constraint_table(chip, config, groups: "commit")
 
 In parallel, we compute $#`address_incr` = #`address` + 1$ (@commit:c:address_incr) as address of the next byte to commit, and $#`count_decr` = #`count` - 1$ (@commit:c:count_decr) as the number of bytes that still has to be committed after committing this byte.

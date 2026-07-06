@@ -160,10 +160,17 @@ ref = "commit:c:read_value"
 
 [[constraints.commit]]
 kind = "interaction"
-tag = "COMMIT"
-input = ["index", "value"]
+tag = "memory"
+input = [3, ["arr", "index", 0], ["cast", 0, "Word"], "value"]
 multiplicity = ["-", "μ", "end"]
-ref = "commit:c:commit_value"
+ref = "commit:c:commit_value_out"
+
+[[constraints.commit]]
+kind = "interaction"
+tag = "memory"
+input = [3, ["arr", "index", 0], ["cast", 0, "Word"], "value"]
+multiplicity = ["-", ["-", "μ", "end"]]
+ref = "commit:c:commit_value_in"
 
 [[constraint_groups]]
 name = "end"

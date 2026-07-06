@@ -24,6 +24,12 @@ and are therefore handled simultaneously.
 #footnote[
   While RAM is byte addressed, we do choose to store registers as a `DWordWL` over two word addresses.
 ]
+In particular, our memory addressing scheme will consist of two parts: a domain separator, and an address within the domain.
+For specific domains and domain separators, we use the following assignment.
+
+/ RAM memory: $0$
+/ Registers: $1$
+/ Committed values: $2$
 
 On a high level, we ensure memory consistency by an interacting system of
 reads and writes to a lookup argument, combined with an initialization and finalization scheme.

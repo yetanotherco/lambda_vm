@@ -172,13 +172,13 @@ output = ["Half", 2]
 [[signatures]]
 tag = "memory"
 kind = "interaction"
-input = ["Bit", "DWordWL", "DWordWL", "BaseField"]
+input = ["BaseField", "DWordWL", "DWordWL", "BaseField"]
 
 # Global memory: is_register, address, epoch, value
 [[signatures]]
 tag = "GLOBAL_MEM"
 kind = "interaction"
-input = ["Bit", "DWordWL", "B20", "BaseField"]
+input = ["BaseField", "DWordWL", "B20", "BaseField"]
 
 # SHA256 things
 [[signatures]]
