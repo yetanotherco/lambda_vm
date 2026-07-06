@@ -4,7 +4,7 @@
 //! These are pure, self-contained helpers — no transcript, no FRI logic.
 //! They are used by the prover (`commit_phase_from_evaluations`) and verifier FRI step.
 
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
+use math::fft::bit_reversing::{in_place_bit_reverse_permute, reverse_index};
 use math::field::element::FieldElement;
 use math::field::traits::{IsFFTField, IsField, IsSubFieldOf};
 use math::polynomial::Polynomial;
@@ -33,16 +33,18 @@ where
     F: IsFFTField + IsSubFieldOf<E>,
     E: IsField + Send + Sync,
 {
-    // Bit-reversed -> natural order.
-    let mut natural = codeword_bitrev.to_vec();
-    in_place_bit_reverse_permute(&mut natural);
-
-    // A degree-<2^k poly is determined by 2^k points: take the size-2^k sub-coset
-    // terminal_offset*<w^blowup> = every `blowup`-th natural-order evaluation.
+    // A degree-<2^k poly is determined by 2^k points: the size-2^k sub-coset
+    // terminal_offset*<w^blowup> = every `blowup`-th natural-order evaluation,
+    // i.e. natural-order index m*blowup for m in 0..2^k. The codeword is in
+    // bit-reversed order, so gather those points straight from it via
+    // reverse_index — no full-codeword clone or O(n) permute (only 2^k of the
+    // blowup*2^k evaluations are ever read).
+    let len = codeword_bitrev.len();
     let keep = 1usize << final_poly_log_degree;
-    let blowup = natural.len() / keep;
-    let sub_coset: Vec<FieldElement<E>> = natural.into_iter().step_by(blowup).collect();
-    debug_assert_eq!(sub_coset.len(), keep);
+    let blowup = len / keep;
+    let sub_coset: Vec<FieldElement<E>> = (0..keep)
+        .map(|m| codeword_bitrev[reverse_index(m * blowup, len as u64)].clone())
+        .collect();
 
     // Coset iFFT on the small domain -> the 2^k coefficients directly (no oversized trim).
     let poly = Polynomial::interpolate_offset_fft::<F>(&sub_coset, terminal_offset)
