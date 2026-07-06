@@ -153,25 +153,8 @@ This table then feeds into the LogUp system in the normal way,
 emitting the initial tokens for all addresses in a page, without consuming any tokens.
 Since the `offset` column is always the same, it can be reused across all paged initialization and finalization tables.
 
-Concretely, each page gets an associated `PAGE` table, consisting of #total_nr_variables(chip) variables
-over #total_nr_instantiated_columns(chip, config) columns.
-For each such table, the `page` variable is instantiated as the constant base address of the page.
-The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size,
-but the verifier should still check that no pages overlap and all `page` values are page-aligned.
-
-== Page initialization
-
-#rj[check whether we need `fini` to be range-checked]
-We present here a set of constraints on the `PAGE` table that
-
-+ enforces the initial and final values of each address are bytes
-+ adds the initial and final interaction to the LogUp argument
-
-For zero-initialized pages, `init` can be a constant `0`,
-and hence doesn't need a column, nor a range check.
-
-#render_chip_variable_table(chip, config)
-#render_constraint_table(chip, config)
+Due to its interaction with the epoch-based proving system from @streaming,
+we defer a concrete instantiation and description of this scheme as an AIR table until then.
 
 
 #aside[Note on alternatives and trade-offs][
