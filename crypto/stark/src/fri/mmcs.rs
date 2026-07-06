@@ -214,10 +214,8 @@ where
         let n0 = 1usize << (h_max - 1);
 
         // Base digest layer: batch all tallest matrices' row pairs (input order).
-        let base_group: Vec<&MatrixEntry<E>> = entries
-            .iter()
-            .filter(|m| m.log_height == h_max)
-            .collect();
+        let base_group: Vec<&MatrixEntry<E>> =
+            entries.iter().filter(|m| m.log_height == h_max).collect();
 
         let mut layers: Vec<Vec<Commitment>> = Vec::with_capacity(h_max);
         let base: Vec<Commitment> = (0..n0).map(|k| hash_group_leaf(&base_group, k)).collect();
@@ -247,9 +245,7 @@ where
             i += 1;
         }
 
-        let root = layers
-            .last()
-            .expect("at least the base layer exists")[0];
+        let root = layers.last().expect("at least the base layer exists")[0];
 
         MixedMmcs {
             root,
@@ -409,7 +405,9 @@ mod tests {
         (0..width)
             .map(|c| {
                 (0..num_rows)
-                    .map(|r| FE::from(seed.wrapping_mul(31) + (c as u64) * 1009 + (r as u64) * 7 + 1))
+                    .map(|r| {
+                        FE::from(seed.wrapping_mul(31) + (c as u64) * 1009 + (r as u64) * 7 + 1)
+                    })
                     .collect()
             })
             .collect()
@@ -500,13 +498,19 @@ mod tests {
 
             // Tall matrices open at k = iota >> 0 = iota.
             assert_eq!(opening.per_matrix[0].evaluations, row(&a, wa, 2 * iota));
-            assert_eq!(opening.per_matrix[0].evaluations_sym, row(&a, wa, 2 * iota + 1));
+            assert_eq!(
+                opening.per_matrix[0].evaluations_sym,
+                row(&a, wa, 2 * iota + 1)
+            );
             assert_eq!(opening.per_matrix[1].evaluations, row(&b, wb, 2 * iota));
 
             // Height-3 matrix opens at k = iota >> (5 - 3) = iota >> 2.
             let kc = iota >> (h_max - hc);
             assert_eq!(opening.per_matrix[2].evaluations, row(&c, wc, 2 * kc));
-            assert_eq!(opening.per_matrix[2].evaluations_sym, row(&c, wc, 2 * kc + 1));
+            assert_eq!(
+                opening.per_matrix[2].evaluations_sym,
+                row(&c, wc, 2 * kc + 1)
+            );
 
             assert!(
                 MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights, &widths),
@@ -706,8 +710,7 @@ mod tests {
         }
 
         let mut opening = mmcs.open_batch(0);
-        opening.per_matrix[0].evaluations[0] =
-            &opening.per_matrix[0].evaluations[0] + &F3::one();
+        opening.per_matrix[0].evaluations[0] = &opening.per_matrix[0].evaluations[0] + &F3::one();
         assert!(!MixedMmcs::verify_batch(
             &mmcs.root(),
             0,

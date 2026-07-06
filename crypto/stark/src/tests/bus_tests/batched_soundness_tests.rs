@@ -56,7 +56,10 @@ fn valid_padding_proof() -> BatchedMultiProof<F, E, ()> {
 
 /// Verify a batched proof with a fresh verifier (AIRs reconstructed, as a real
 /// verifier would) against `expected_bus_balance`.
-fn batched_verify(proof: &BatchedMultiProof<F, E, ()>, expected_bus_balance: FieldElement<E>) -> bool {
+fn batched_verify(
+    proof: &BatchedMultiProof<F, E, ()>,
+    expected_bus_balance: FieldElement<E>,
+) -> bool {
     let proof_options = ProofOptions::default_test_options();
     let cpu_air = new_cpu_air_with_lookup(&proof_options);
     let add_air = new_add_air_with_lookup(&proof_options);
@@ -118,7 +121,9 @@ fn batched_rejects_tampered_aux_opening() {
 fn batched_rejects_main_opening_width_mismatch() {
     let mut proof = valid_padding_proof();
     // Drop one column from the opened main row → evaluations.len() != committed width.
-    proof.deep_poly_openings[0].main.per_matrix[0].evaluations.pop();
+    proof.deep_poly_openings[0].main.per_matrix[0]
+        .evaluations
+        .pop();
     assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
 }
 
@@ -135,7 +140,10 @@ fn batched_rejects_tampered_fri_last_value() {
 #[test_log::test]
 fn batched_rejects_tampered_fri_layer_root() {
     let mut proof = valid_padding_proof();
-    assert!(!proof.fri_layers_merkle_roots.is_empty(), "expect >= 1 FRI layer");
+    assert!(
+        !proof.fri_layers_merkle_roots.is_empty(),
+        "expect >= 1 FRI layer"
+    );
     proof.fri_layers_merkle_roots[0][0] ^= 1;
     assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
 }

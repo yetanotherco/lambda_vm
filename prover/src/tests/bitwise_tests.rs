@@ -626,7 +626,8 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+                .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];

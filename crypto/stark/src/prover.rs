@@ -47,8 +47,8 @@ use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
 use super::proof::stark::{
-    BatchedMultiProof, BatchedQueryOpening, BatchedTableData, DeepPolynomialOpening,
-    MultiProof, StarkProof,
+    BatchedMultiProof, BatchedQueryOpening, BatchedTableData, DeepPolynomialOpening, MultiProof,
+    StarkProof,
 };
 use super::trace::TraceTable;
 use super::traits::AIR;
@@ -1272,11 +1272,16 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
         // leaves + device-side inner tree, both wrapping the host eval Vecs.
+        // `try_build_comp_poly_tree_gpu` returns `(host_tree, dev_tree)`; this batched
+        // comp-poly path only needs the host tree (the device tree is an unused GPU
+        // optimization here), so drop it to keep `gpu_tree` the same `Option<BatchedMerkleTree>`
+        // as the non-cuda binding and share the commit `match` below.
         #[cfg(feature = "cuda")]
         let gpu_tree = crate::gpu_lde::try_build_comp_poly_tree_gpu::<
             FieldExtension,
             BatchedMerkleTreeBackend<FieldExtension>,
-        >(&lde_composition_poly_parts_evaluations);
+        >(&lde_composition_poly_parts_evaluations)
+        .map(|(host_tree, _dev_tree)| host_tree);
         #[cfg(not(feature = "cuda"))]
         let gpu_tree: Option<BatchedMerkleTree<FieldExtension>> = None;
 
@@ -1562,6 +1567,7 @@ pub trait IsStarkProver<
                     &domain.lde_roots_of_unity_coset,
                     &z_scalars,
                     math_cuda::inverse::DenomSign::XMinusZ,
+                    lde_trace.bound_stream(),
                 )
                 && let Some(deep_evals) =
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
@@ -1912,7 +1918,7 @@ pub trait IsStarkProver<
         // Spill main traces to mmap before Round 1 LDE.
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(_, trace, _)| {
+            crate::par::par_try_for_each_mut(air_trace_pairs, |(_, trace, _)| {
                 trace
                     .main_table
                     .spill_to_disk()
@@ -2091,7 +2097,7 @@ pub trait IsStarkProver<
         // Spill all aux trace tables to mmap before any Round 1 aux LDE work.
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
-            crate::par::par_try_for_each_mut(&mut air_trace_pairs, |(air, trace, _)| {
+            crate::par::par_try_for_each_mut(air_trace_pairs, |(air, trace, _)| {
                 if air.has_aux_trace() {
                     trace
                         .spill_aux_to_disk()
@@ -2316,7 +2322,6 @@ pub trait IsStarkProver<
             }
         };
 
-
         // Build commitments and cached LDEs as separate vecs:
         // commitments are borrowed in Phase D, LDEs are consumed by value.
         let mut commitments: Vec<Round1Commitments<Field, FieldExtension>> =
@@ -2385,12 +2390,8 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let phase_start = Instant::now();
         #[cfg(feature = "instruments")]
-        let table_timings: Vec<(
-            String,
-            usize,
-            Duration,
-            crate::instruments::TableSubOps,
-        )> = Vec::with_capacity(num_airs);
+        let table_timings: Vec<(String, usize, Duration, crate::instruments::TableSubOps)> =
+            Vec::with_capacity(num_airs);
 
         // Bus contributions bind first (read from the commitments — the same
         // value build_round1 copies into Round1), before any round-2 challenge.
@@ -2759,12 +2760,11 @@ pub trait IsStarkProver<
         let combined = crate::fri::batched::combine_by_height(&deep_inputs, &alpha);
         let coset_offset =
             FieldElement::<Field>::from(air_trace_pairs[0].0.context().proof_options.coset_offset);
-        let (fri_last_value, fri_layers) =
-            crate::fri::batched::batched_commit_phase::<Field, FieldExtension, _>(
-                combined,
-                transcript,
-                &coset_offset,
-            );
+        let (fri_last_value, fri_layers) = crate::fri::batched::batched_commit_phase::<
+            Field,
+            FieldExtension,
+            _,
+        >(combined, transcript, &coset_offset);
 
         // Grinding: mirror the per-table round 4 (shared proof options).
         let security_bits = air_trace_pairs[0].0.context().proof_options.grinding_factor;
@@ -2785,8 +2785,10 @@ pub trait IsStarkProver<
         let iotas = Self::sample_query_indexes(number_of_queries, &domains[tallest], transcript);
 
         let query_list = fri::query_phase(&fri_layers, &iotas);
-        let fri_layers_merkle_roots: Vec<_> =
-            fri_layers.iter().map(|layer| layer.merkle_tree.root).collect();
+        let fri_layers_merkle_roots: Vec<_> = fri_layers
+            .iter()
+            .map(|layer| layer.merkle_tree.root)
+            .collect();
 
         // Per-query openings: one MixedOpening per phase (main/aux/composition)
         // covering all tables at once, plus per-preprocessed-table precomputed
@@ -2871,7 +2873,6 @@ pub trait IsStarkProver<
         )
         .map(|mut multi_proof| multi_proof.proofs.remove(0))
     }
-
 }
 
 /// Print a global bus balance report aggregating per-bus sums across all tables.

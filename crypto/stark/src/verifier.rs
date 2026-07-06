@@ -11,8 +11,7 @@ use crate::{
     domain::new_verifier_domain,
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{
-        BatchedMultiProof, BatchedTableData, DeepPolynomialOpening, MultiProof,
-        PolynomialOpenings,
+        BatchedMultiProof, BatchedTableData, DeepPolynomialOpening, MultiProof, PolynomialOpenings,
     },
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
@@ -1436,14 +1435,17 @@ pub trait IsStarkVerifier<
             .iter()
             .map(|t| t.composition_poly_parts_ood_evaluation.len())
             .collect();
-        let aux_indices: Vec<usize> = (0..num_tables).filter(|&i| airs[i].has_aux_trace()).collect();
+        let aux_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].has_aux_trace())
+            .collect();
         let aux_heights: Vec<usize> = aux_indices.iter().map(|&i| heights[i]).collect();
         let aux_widths: Vec<usize> = aux_indices
             .iter()
             .map(|&i| airs[i].num_auxiliary_rap_columns())
             .collect();
-        let precomputed_indices: Vec<usize> =
-            (0..num_tables).filter(|&i| airs[i].is_preprocessed()).collect();
+        let precomputed_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].is_preprocessed())
+            .collect();
 
         // alpha^i powers for the cross-table combination.
         let mut alpha_pows: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_tables);
@@ -1577,7 +1579,11 @@ pub trait IsStarkVerifier<
                 let mut acc = FieldElement::<FieldExtension>::zero();
                 for i in 0..num_tables {
                     if heights[i] == h {
-                        let d = if bit == 0 { &deep_primary[i] } else { &deep_sym[i] };
+                        let d = if bit == 0 {
+                            &deep_primary[i]
+                        } else {
+                            &deep_sym[i]
+                        };
                         acc += &alpha_pows[i] * d;
                     }
                 }
@@ -1596,8 +1602,8 @@ pub trait IsStarkVerifier<
             };
 
             // Initial fold of the (uncommitted) tallest layer with betas_fri[0].
-            let mut v = (&c_hmax + &c_hmax_sym)
-                + ep0_inv.clone() * &betas_fri[0] * (&c_hmax - &c_hmax_sym);
+            let mut v =
+                (&c_hmax + &c_hmax_sym) + ep0_inv.clone() * &betas_fri[0] * (&c_hmax - &c_hmax_sym);
             let mut index = iota;
             let mut point_inv = ep0_inv.square();
 
@@ -1650,5 +1656,4 @@ pub trait IsStarkVerifier<
 
         true
     }
-
 }
