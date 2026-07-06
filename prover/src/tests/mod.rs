@@ -1,15 +1,7 @@
-/// Serializes tests that toggle the process-global `LAMBDA_VM_LEGACY_TRACEGEN` env var.
-/// MUST be shared by every such test (across files) — a per-file mutex would not serialize
-/// them, letting one file's `remove_var` race a concurrent file's legacy build.
-#[cfg(test)]
-pub static TRACEGEN_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 #[cfg(all(test, feature = "disk-spill"))]
 pub mod auto_storage_tests;
 #[cfg(test)]
 pub mod bitwise_bus_tests;
-#[cfg(test)]
-pub mod bitwise_histogram_parity_tests;
 #[cfg(test)]
 pub mod bitwise_tests;
 #[cfg(test)]
@@ -58,8 +50,6 @@ pub mod lt_bus_tests;
 pub mod lt_tests;
 #[cfg(test)]
 pub mod memw_aligned_tests;
-#[cfg(test)]
-pub mod memw_register_direct_parity_tests;
 #[cfg(test)]
 pub mod memw_register_tests;
 #[cfg(test)]

@@ -365,18 +365,6 @@ fn collect_cpu_ops(
 /// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
 /// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
-/// Whether to use the legacy MEMW_R trace-gen path (materialize `Vec<MemwOperation>`
-/// for register accesses + fill columns from it), selected via the
-/// `LAMBDA_VM_LEGACY_TRACEGEN` environment variable (set to any non-empty value).
-///
-/// The default (unset) is the new direct-to-column register fill. The legacy path
-/// exists for A/B measurement and the byte-parity gate test.
-fn legacy_tracegen() -> bool {
-    std::env::var("LAMBDA_VM_LEGACY_TRACEGEN")
-        .map(|v| !v.is_empty())
-        .unwrap_or(false)
-}
-
 /// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
 ///
 /// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
@@ -507,60 +495,35 @@ fn collect_bitwise_from_memw_register_direct(rows: &[RegRow]) -> Vec<BitwiseOper
 ///
 /// For the register fast path we do NOT materialize a `Vec<MemwOperation>`. Ops that route
 /// to MEMW_R are stored as compact [`RegRow`]s (`register_rows`) and later filled directly
-/// into the MEMW_R columns. Under the `LAMBDA_VM_LEGACY_TRACEGEN` flag we instead keep the
-/// old `Vec<MemwOperation>` (`register_ops`) and the old column fill, for A/B + byte-parity
-/// testing. The `aligned` / `general` buckets are unchanged in both modes — an op that FAILS
-/// `is_register_op` is always routed as a `MemwOperation` exactly as before.
+/// into the MEMW_R columns. The `aligned` / `general` buckets hold `MemwOperation`s — an op
+/// that FAILS `is_register_op` is routed there exactly as the old two-stage partition did.
 #[derive(Default)]
 struct MemwBuckets {
-    /// New path: compact register rows (empty in legacy mode).
+    /// Compact register rows (filled directly into the MEMW_R columns).
     register_rows: Vec<RegRow>,
-    /// Legacy path: full register `MemwOperation`s (empty in new mode).
-    register_ops: Vec<MemwOperation>,
     aligned: Vec<MemwOperation>,
     general: Vec<MemwOperation>,
-    /// When true, keep the old `Vec<MemwOperation>` register materialization + fill.
-    legacy: bool,
 }
 
 impl MemwBuckets {
-    fn with_register_capacity(n: usize, legacy: bool) -> Self {
+    fn with_register_capacity(n: usize) -> Self {
         Self {
-            register_rows: if legacy {
-                Vec::new()
-            } else {
-                Vec::with_capacity(n)
-            },
-            register_ops: if legacy {
-                Vec::with_capacity(n)
-            } else {
-                Vec::new()
-            },
+            register_rows: Vec::with_capacity(n),
             aligned: Vec::new(),
             general: Vec::new(),
-            legacy,
         }
     }
 
     /// Store an op already known to route to MEMW_R.
     #[inline]
     fn push_register(&mut self, op: MemwOperation) {
-        if self.legacy {
-            self.register_ops.push(op);
-        } else {
-            self.register_rows.push(RegRow::from_memw(&op));
-        }
+        self.register_rows.push(RegRow::from_memw(&op));
     }
 
-    /// Store a compact register row directly (new path only). In legacy mode this
-    /// reconstructs the equivalent `MemwOperation` so the two modes are comparable.
+    /// Store a compact register row directly.
     #[inline]
-    fn push_register_row(&mut self, row: RegRow, op_if_legacy: impl FnOnce() -> MemwOperation) {
-        if self.legacy {
-            self.register_ops.push(op_if_legacy());
-        } else {
-            self.register_rows.push(row);
-        }
+    fn push_register_row(&mut self, row: RegRow) {
+        self.register_rows.push(row);
     }
 
     #[inline]
@@ -655,7 +618,7 @@ impl MemwSink for MemwBuckets {
                 old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
                 is_read,
             };
-            self.push_register_row(row, build_fallback);
+            self.push_register_row(row);
         } else {
             let op = build_fallback();
             debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
@@ -685,7 +648,7 @@ fn collect_ops_from_cpu(
     Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
-    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3, legacy_tracegen());
+    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -1733,21 +1696,6 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
     let ts_hi = timestamp >> 32;
     let old_ts_hi = old_ts >> 32;
     ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
-}
-
-/// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
-///
-/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
-/// in a halfword (proving the timestamp delta is in range [1, 2^16]).
-fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    ops.iter()
-        .map(|op| {
-            memw_register_is_half_lookup(
-                (op.timestamp & 0xFFFF_FFFF) as u32,
-                (op.old_timestamp[0] & 0xFFFF_FFFF) as u32,
-            )
-        })
-        .collect()
 }
 
 // =============================================================================
@@ -2925,9 +2873,7 @@ struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
     memw_aligned_ops: Vec<MemwOperation>,
-    /// Legacy MEMW_R ops (non-empty only under `LAMBDA_VM_LEGACY_TRACEGEN`).
-    memw_register_ops: Vec<MemwOperation>,
-    /// New direct-fill MEMW_R rows (non-empty in the default path).
+    /// Direct-fill MEMW_R rows (register fast path).
     memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
     lt_ops: Vec<LtOperation>,
@@ -3021,10 +2967,8 @@ fn collect_all_ops(
     // cost) is gone. Order within each bucket matches the old stable partitions → byte-identical.
     let MemwBuckets {
         register_rows: memw_register_rows,
-        register_ops: memw_register_ops,
         aligned: memw_aligned_ops,
         general: memw_ops,
-        legacy: _,
     } = memw;
 
     // Collect BRANCH operations from CPU ops where branch_cond = true
@@ -3130,7 +3074,6 @@ fn collect_all_ops(
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
-        memw_register_ops,
         memw_register_rows,
         load_ops,
         lt_ops,
@@ -3175,12 +3118,11 @@ fn build_traces<I: ImageSource + Sync>(
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
-        memw_register_ops,
         memw_register_rows,
         load_ops,
         mut lt_ops,
         shift_ops,
-        mut bitwise_ops,
+        bitwise_ops,
         branch_ops,
         mul_ops,
         dvrm_ops,
@@ -3230,25 +3172,16 @@ fn build_traces<I: ImageSource + Sync>(
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
     // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
-    // Every source's bitwise lookups are collected by a pure `collect_*` function.
-    // In the DEFAULT ("histogram-on-the-fly") path we never concatenate them into one
-    // giant `Vec<BitwiseOperation>` (~140 M ops / ~560 MB at 10-tx whose only consumer
-    // is the multiplicity count). Instead each collector's transient per-source Vec is
-    // folded into a `BitwiseHistogram` and dropped, and the histograms are tree-reduced.
-    // The histogram is a commutative monoid, so the summed multiplicities are
-    // byte-identical to the serial per-op `update_multiplicities` count regardless of
-    // accumulation order (they ride a permutation-invariant bus).
-    //
-    // Under `LAMBDA_VM_LEGACY_TRACEGEN` we keep the original materialize-then-count
-    // path (build one `bitwise_ops` Vec, then `update_multiplicities`) for A/B and the
-    // byte-parity gate.
-    let use_histogram = !legacy_tracegen();
-    // Holds the accumulated multiplicities in the default path; `None` under the legacy flag.
-    let mut bitwise_histogram: Option<bitwise::BitwiseHistogram> = None;
+    // Every source's bitwise lookups are collected by a pure `collect_*` function. We never
+    // concatenate them into one giant `Vec<BitwiseOperation>` (~140 M ops / ~560 MB at 10-tx
+    // whose only consumer is the multiplicity count). Instead each collector's transient
+    // per-source Vec is folded into a `BitwiseHistogram` and dropped, and the per-worker
+    // histograms are tree-reduced. The histogram is a commutative monoid, so the summed
+    // multiplicities are independent of accumulation order (the lookups ride a
+    // permutation-invariant bus).
 
     // Shared collector list: each is a pure `Fn() -> Vec<BitwiseOperation>` of its source.
-    // The order of the list does not affect the histogram (commutative) nor the legacy
-    // concatenation's multiplicities (order-independent bus), matching the prior design.
+    // Order does not affect the histogram (commutative).
     type Collector<'a> = Box<dyn Fn() -> Vec<BitwiseOperation> + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
@@ -3277,16 +3210,7 @@ fn build_traces<I: ImageSource + Sync>(
                 .collect()
         }),
         Box::new(|| collect_bitwise_from_memw_aligned(&memw_aligned_ops)),
-        Box::new(|| {
-            // MEMW_R IS_HALFWORD lookups from whichever carrier is populated
-            // (direct RegRows by default; legacy MemwOperations under the flag).
-            // The two produce byte-identical lookups; exactly one is non-empty.
-            let mut v = collect_bitwise_from_memw_register(&memw_register_ops);
-            v.extend(collect_bitwise_from_memw_register_direct(
-                &memw_register_rows,
-            ));
-            v
-        }),
+        Box::new(|| collect_bitwise_from_memw_register_direct(&memw_register_rows)),
         Box::new(|| collect_bitwise_from_commit(&commit_ops)),
         Box::new(|| collect_bitwise_from_keccak(&keccak_ops)),
         Box::new(|| collect_bitwise_from_ecsm(&ecsm_ops)),
@@ -3301,58 +3225,38 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
-    if use_histogram {
-        // --- Histogram-on-the-fly (default) ---
-        // Fold the in-walk lookups (from the serial p2a walk + CPU32) into the base
-        // histogram, then free that Vec: it is no longer needed once counted.
-        let mut base = bitwise::BitwiseHistogram::new();
-        base.add_ops(&bitwise_ops);
-        bitwise_ops = Vec::new();
+    // Fold the in-walk lookups (from the serial p2a walk + CPU32) into the base histogram,
+    // then free that Vec: it is no longer needed once counted.
+    let mut base = bitwise::BitwiseHistogram::new();
+    base.add_ops(&bitwise_ops);
+    drop(bitwise_ops);
 
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            // Each collector produces its transient Vec, which is folded into a per-WORKER
-            // histogram and dropped. Using `fold` (not `map`) means one 80 MiB histogram per
-            // worker thread reused across all collectors it handles — not one allocated+zeroed
-            // per collector. Tree-reduce the per-worker histograms (commutative monoid) so we
-            // never hold the concatenated op stream.
-            let reduced = collectors
-                .par_iter()
-                .fold(bitwise::BitwiseHistogram::new, |mut h, f| {
-                    h.add_ops(&f());
-                    h
-                })
-                .reduce(bitwise::BitwiseHistogram::new, |mut a, b| {
-                    a.merge(&b);
-                    a
-                });
-            base.merge(&reduced);
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for f in &collectors {
-                base.add_ops(&f());
-            }
-        }
-        bitwise_histogram = Some(base);
-    } else {
-        // --- Legacy materialize-then-count (LAMBDA_VM_LEGACY_TRACEGEN) ---
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            let parts: Vec<Vec<BitwiseOperation>> = collectors.par_iter().map(|f| f()).collect();
-            for part in parts {
-                bitwise_ops.extend(part);
-            }
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for f in &collectors {
-                bitwise_ops.extend(f());
-            }
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // Each collector produces its transient Vec, which is folded into a per-worker
+        // histogram and dropped. `fold` (not `map`) reuses one histogram per work-split
+        // instead of allocating one per collector. Tree-reduce them (commutative monoid) so
+        // we never hold the concatenated op stream.
+        let reduced = collectors
+            .par_iter()
+            .fold(bitwise::BitwiseHistogram::new, |mut h, f| {
+                h.add_ops(&f());
+                h
+            })
+            .reduce(bitwise::BitwiseHistogram::new, |mut a, b| {
+                a.merge(&b);
+                a
+            });
+        base.merge(&reduced);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        for f in &collectors {
+            base.add_ops(&f());
         }
     }
+    let bitwise_histogram = base;
     drop(collectors);
     #[cfg(feature = "instruments")]
     drop(__sp);
@@ -3420,29 +3324,15 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_registers = || {
-        // Default: direct-to-column fill from compact RegRows (no MemwOperation
-        // materialization). Legacy (`LAMBDA_VM_LEGACY_TRACEGEN`): fill from the
-        // MemwOperation carrier. Dispatch on the SAME flag that chose the carrier at
-        // walk time — not on carrier-emptiness, which would silently pick the direct
-        // path for zero-register-op workloads even under the legacy flag (masking the
-        // A/B parity gate). Both paths chunk identically and produce byte-identical tables.
-        if !legacy_tracegen() {
-            chunk_and_generate(
-                &memw_register_rows,
-                max_rows.memw_register,
-                generate_memw_register_trace_direct,
-                #[cfg(feature = "disk-spill")]
-                storage_mode,
-            )
-        } else {
-            chunk_and_generate(
-                &memw_register_ops,
-                max_rows.memw_register,
-                memw_register::generate_memw_register_trace,
-                #[cfg(feature = "disk-spill")]
-                storage_mode,
-            )
-        }
+        // Direct-to-column fill from compact RegRows — the register fast path never
+        // materializes a `Vec<MemwOperation>`.
+        chunk_and_generate(
+            &memw_register_rows,
+            max_rows.memw_register,
+            generate_memw_register_trace_direct,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
     };
     let gen_loads = || {
         chunk_and_generate(
@@ -3539,13 +3429,8 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let gen_bitwise = || {
         let mut bitwise = bitwise::generate_bitwise_trace();
-        // Default: fill MU columns from the accumulated histogram (no giant op Vec).
-        // Legacy (`LAMBDA_VM_LEGACY_TRACEGEN`): scatter-add over the materialized Vec.
-        // Both write the same summed multiplicities into columns 11..=20.
-        match &bitwise_histogram {
-            Some(h) => h.fill_multiplicities(&mut bitwise),
-            None => bitwise::update_multiplicities(&mut bitwise, &bitwise_ops),
-        }
+        // Fill the MU columns (11..=20) from the accumulated histogram.
+        bitwise_histogram.fill_multiplicities(&mut bitwise);
         bitwise
     };
     // Each CPU operation looks up the DECODE table once; padding rows look up
