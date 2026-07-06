@@ -175,7 +175,13 @@ fn test_vkey_zero_init_slot_enforced() {
         .expect("test ELF must produce at least one zero-init page (the stack)");
     vkey.pages[target] = [0xAB; 32];
     vm_proof.vk_digest = vkey.compute_digest();
-    assert_rejects_vkey(&elf_bytes, &vm_proof, &options, &vkey, "tampered zero-init slot");
+    assert_rejects_vkey(
+        &elf_bytes,
+        &vm_proof,
+        &options,
+        &vkey,
+        "tampered zero-init slot",
+    );
 }
 
 #[test]
@@ -255,7 +261,12 @@ fn test_recursion_commitment_forged_program_rejected() {
     let (_other_elf, other_proof, _other_opts, _other_vkey) = proof_and_vkey_for("deep_stack");
     let mut commitment = commitment_for(&elf_bytes, &vm_proof, &options);
     commitment.vk_digest = other_proof.vk_digest;
-    assert_rejects_commitment(&commitment, &elf_bytes, &options, "forged program vk_digest");
+    assert_rejects_commitment(
+        &commitment,
+        &elf_bytes,
+        &options,
+        "forged program vk_digest",
+    );
 }
 
 #[test]

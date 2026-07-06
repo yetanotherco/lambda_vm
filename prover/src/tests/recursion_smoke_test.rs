@@ -498,8 +498,9 @@ fn run_recursion_pipeline_with_options(
     );
     // The committed digests must satisfy the outer-verifier check against the
     // trusted inner ELF and the same options.
-    let out = crate::verify_recursion_commitment(&commitment, inner_elf_bytes, &inner_proof_options)
-        .expect("outer verifier must accept the honest commitment");
+    let out =
+        crate::verify_recursion_commitment(&commitment, inner_elf_bytes, &inner_proof_options)
+            .expect("outer verifier must accept the honest commitment");
     assert_eq!(out, inner_proof.public_output);
     eprintln!("[{label}] guest committed RecursionCommitment; outer verify accepted ✓");
 }

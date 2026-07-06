@@ -574,10 +574,10 @@ impl VmAirs {
                 Some(vk) => vk.bitwise,
                 None => bitwise::preprocessed_commitment(proof_options),
             };
-            Box::new(create_bitwise_air(proof_options).with_preprocessed(
-                commitment,
-                bitwise::NUM_PRECOMPUTED_COLS,
-            ))
+            Box::new(
+                create_bitwise_air(proof_options)
+                    .with_preprocessed(commitment, bitwise::NUM_PRECOMPUTED_COLS),
+            )
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| {
@@ -660,10 +660,10 @@ impl VmAirs {
                 let register_commitment = vkey.map(|vk| vk.register).unwrap_or_else(|| {
                     register::preprocessed_commitment(proof_options, &register_init)
                 });
-                Box::new(create_register_air(proof_options).with_preprocessed(
-                    register_commitment,
-                    register::NUM_PREPROCESSED_COLS,
-                ))
+                Box::new(
+                    create_register_air(proof_options)
+                        .with_preprocessed(register_commitment, register::NUM_PREPROCESSED_COLS),
+                )
             };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
