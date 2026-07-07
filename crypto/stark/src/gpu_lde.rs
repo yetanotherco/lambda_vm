@@ -101,6 +101,28 @@ pub fn gpu_composition_calls() -> u64 {
     GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
 }
 
+/// Runtime override to force the GPU composition path off (→ CPU accumulation).
+/// An escape hatch, and the A/B toggle for benchmarking the path against the CPU
+/// baseline in one process (no rebuild). Default off (path enabled).
+static GPU_COMPOSITION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_gpu_composition_disabled(v: bool) {
+    GPU_COMPOSITION_DISABLED.store(v, Ordering::Relaxed);
+}
+pub(crate) fn gpu_composition_disabled() -> bool {
+    if GPU_COMPOSITION_DISABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Env fallback (cached), so an unmodified prove binary can A/B the path:
+    // `LAMBDA_VM_DISABLE_GPU_COMPOSITION=1`.
+    static ENV_DISABLED: OnceLock<bool> = OnceLock::new();
+    *ENV_DISABLED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_DISABLE_GPU_COMPOSITION")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 // ============================================================================
 // Shared dispatch helpers
 // ============================================================================
