@@ -3055,6 +3055,8 @@ fn build_traces<I: ImageSource + Sync>(
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
+    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
+    // split into row-ranges in the parallel path below) stays a single whole-source collector.
     let mut collectors: Vec<Collector> = vec![
         Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
@@ -3077,7 +3079,6 @@ fn build_traces<I: ImageSource + Sync>(
             }
         }),
         Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
-        Box::new(|h| memw_register::collect_bitwise_from_memw_register(&memw_register_rows, h)),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
@@ -3092,33 +3093,42 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
-    // Fold the in-walk lookups (from the serial p2a walk + CPU32) into the base histogram,
-    // then free that Vec: it is no longer needed once counted.
     let mut base = bitwise::BitwiseHistogram::new();
-    base.add_ops(&bitwise_ops);
-    drop(bitwise_ops);
 
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        // To keep peak memory from scaling with core count, cap the number of
-        // concurrent histograms: split the collectors into at most `max_par`
-        // chunks (one histogram each), run the chunks in parallel, and process
-        // the collectors within a chunk sequentially (so at most one transient
-        // Vec is live per chunk — the heavy collectors bump their chunk's
-        // histogram directly and have none). `reduce_with` pairs the chunk
-        // histograms directly; `reduce(identity, ..)` would instead allocate a
-        // zeroed 80 MiB identity histogram per leaf, so prefer `reduce_with`.
-        // Tree-reduce is valid because bump/add_ops/merge form a commutative
-        // monoid, so the sum is independent of chunk order and matches the
-        // non-`parallel` fallback below.
-        let max_par = rayon::current_num_threads().clamp(1, 8);
-        let chunk_size = collectors.len().div_ceil(max_par).max(1);
-        if let Some(reduced) = collectors
-            .par_chunks(chunk_size)
-            .map(|chunk| {
+        // Cap concurrent 80 MiB histograms at `cap` to bound peak memory. The two dominant
+        // sources — the in-walk lookups and MEMW_R (each tens of millions of items) — are
+        // split into ~`cap` row-range slices so they parallelize INTERNALLY instead of each
+        // pinning one core while the rest idle. Every unit (whole collectors + the heavy
+        // slices) is round-robined into exactly `cap` buckets, one histogram each, so the
+        // split heavy work is spread across buckets rather than piled into one.
+        // add_ops/bump/merge form a commutative monoid, so any partition yields
+        // byte-identical multiplicities (same as the serial fallback below).
+        let cap = rayon::current_num_threads().clamp(1, 8);
+        let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
+        let iw_chunk = bitwise_ops.len().div_ceil(cap).max(1);
+        for slice in bitwise_ops.chunks(iw_chunk) {
+            units.push(Box::new(move |h| h.add_ops(slice)));
+        }
+        let reg_chunk = memw_register_rows.len().div_ceil(cap).max(1);
+        for slice in memw_register_rows.chunks(reg_chunk) {
+            units.push(Box::new(move |h| {
+                memw_register::collect_bitwise_from_memw_register(slice, h)
+            }));
+        }
+        units.extend(collectors);
+
+        let mut buckets: Vec<Vec<Collector>> = (0..cap).map(|_| Vec::new()).collect();
+        for (i, unit) in units.into_iter().enumerate() {
+            buckets[i % cap].push(unit);
+        }
+        if let Some(reduced) = buckets
+            .par_iter()
+            .map(|bucket| {
                 let mut h = bitwise::BitwiseHistogram::new();
-                for f in chunk {
+                for f in bucket {
                     f(&mut h);
                 }
                 h
@@ -3133,12 +3143,15 @@ fn build_traces<I: ImageSource + Sync>(
     }
     #[cfg(not(feature = "parallel"))]
     {
+        base.add_ops(&bitwise_ops);
+        memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
         for f in &collectors {
             f(&mut base);
         }
     }
     let bitwise_histogram = base;
-    drop(collectors);
+    // The in-walk lookup Vec has been counted into the histogram; free it now.
+    drop(bitwise_ops);
     #[cfg(feature = "instruments")]
     drop(__sp);
 
