@@ -313,6 +313,9 @@ where
         {
             return None;
         }
+        if crate::gpu_lde::gpu_composition_disabled() {
+            return None;
+        }
         if !zerofier_data.is_uniform() {
             return None;
         }
