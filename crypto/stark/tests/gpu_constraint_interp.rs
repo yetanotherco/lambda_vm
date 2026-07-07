@@ -290,3 +290,223 @@ fn gpu_matches_cpu_oracle_all_ops() {
         check_program(&all_ops_program(), "ALL_OPS", seed);
     }
 }
+
+// ------------------------------------------------------------------------
+// Fused composition-poly kernel (`constraint_composition_kernel`): the GPU
+// H(row) must match the CPU accumulation of `constraints::evaluator` applied
+// to the same per-constraint evals — z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace−val).
+// ------------------------------------------------------------------------
+
+use stark::constraint_ir::gpu_interp::{CompositionInputs, try_eval_composition_gpu};
+
+/// CPU reference for one row: mirror `evaluator.rs` (uniform case) exactly,
+/// consuming `eval_device_program`'s per-constraint evals.
+#[allow(clippy::too_many_arguments)]
+fn composition_oracle_row(
+    base_evals: &[u64],
+    ext_evals: &[[u64; 3]],
+    num_base: usize,
+    beta_trans: &[Fp3],
+    z_inv_row: Fp,
+    b_terms: &[(bool, usize, Fp3, Fp3, Fp)], // (is_aux, col, value, beta, z_inv_row)
+    base_row: &[u64],
+    aux_row: &[[u64; 3]],
+) -> Fp3 {
+    let mut sum = Fp3::zero();
+    for (c, beta) in beta_trans.iter().enumerate() {
+        // eval * beta, base×ext for base constraints (matches evaluator.rs:89/92).
+        if c < num_base {
+            sum += Fp::from_raw(base_evals[c]) * *beta;
+        } else {
+            let e = ext_evals[c];
+            sum +=
+                Fp3::from_raw([Fp::from_raw(e[0]), Fp::from_raw(e[1]), Fp::from_raw(e[2])]) * *beta;
+        }
+    }
+    let mut h = z_inv_row * sum; // z * sum (base×ext)
+    for &(is_aux, col, value, beta, zinv) in b_terms {
+        let tcell = if is_aux {
+            let a = aux_row[col];
+            Fp3::from_raw([Fp::from_raw(a[0]), Fp::from_raw(a[1]), Fp::from_raw(a[2])])
+        } else {
+            Fp::from_raw(base_row[col]).to_extension::<Ext>()
+        };
+        let bp = tcell - value;
+        h += zinv * beta * bp; // (base×ext)×ext, matches evaluator.rs:234
+    }
+    h
+}
+
+fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
+    const NUM_ROWS: usize = 8;
+    const NEXT_STEP: usize = 1;
+    const Z_LEN: usize = 2; // blowup-length cyclic transition zerofier inverse
+    let lde_size = NUM_ROWS;
+
+    let dev = DeviceProgram::lower(prog);
+    let (main_cols, aux_cols, rap_len, alpha_len, max_off) = program_footprint(&dev);
+    assert!(max_off < NUM_ROWS);
+    let n = dev.roots.len();
+    let num_base = dev.num_base as usize;
+
+    let mut rng = SplitMix64(seed);
+
+    let base_host: Vec<Vec<u64>> = (0..main_cols)
+        .map(|_| (0..NUM_ROWS).map(|_| rng.next_u64()).collect())
+        .collect();
+    let aux_host: Vec<Vec<[u64; 3]>> = (0..aux_cols)
+        .map(|_| (0..NUM_ROWS).map(|_| enc(&rng.fp3())).collect())
+        .collect();
+    let rap: Vec<Fp3> = (0..rap_len.max(1)).map(|_| rng.fp3()).collect();
+    let alpha: Vec<Fp3> = (0..alpha_len.max(1)).map(|_| rng.fp3()).collect();
+    let offset = rng.fp3();
+
+    // Accumulation inputs (synthetic but shaped exactly like the real ones).
+    let beta_trans: Vec<Fp3> = (0..n).map(|_| rng.fp3()).collect();
+    let z_inv: Vec<Fp> = (0..Z_LEN).map(|_| fp(rng.next_u64())).collect();
+
+    // Two boundary constraints: one main (col 0), one aux (last aux col).
+    let b_defs: Vec<(bool, usize)> = {
+        let mut v = Vec::new();
+        if main_cols > 0 {
+            v.push((false, 0));
+        }
+        if aux_cols > 0 {
+            v.push((true, aux_cols - 1));
+        }
+        v
+    };
+    let num_boundary = b_defs.len();
+    let b_col: Vec<usize> = b_defs.iter().map(|&(_, c)| c).collect();
+    let b_is_aux: Vec<bool> = b_defs.iter().map(|&(a, _)| a).collect();
+    let b_value: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
+    let b_beta: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
+    // b_z_inv laid out b*num_rows + row.
+    let b_z_inv: Vec<Fp> = (0..num_boundary * NUM_ROWS)
+        .map(|_| fp(rng.next_u64()))
+        .collect();
+
+    // Upload the LDE and build handles.
+    let mut base_flat = vec![0u64; main_cols.max(1) * lde_size];
+    for (c, col) in base_host.iter().enumerate() {
+        for (r, v) in col.iter().enumerate() {
+            base_flat[c * lde_size + r] = *v;
+        }
+    }
+    let mut aux_flat = vec![0u64; aux_cols.max(1) * 3 * lde_size];
+    for (c, col) in aux_host.iter().enumerate() {
+        for (r, v) in col.iter().enumerate() {
+            aux_flat[(c * 3) * lde_size + r] = v[0];
+            aux_flat[(c * 3 + 1) * lde_size + r] = v[1];
+            aux_flat[(c * 3 + 2) * lde_size + r] = v[2];
+        }
+    }
+    let be = backend().expect("cuda backend");
+    let stream = be.next_stream();
+    let base_dev = stream.clone_htod(&base_flat).expect("upload base");
+    let aux_dev = stream.clone_htod(&aux_flat).expect("upload aux");
+    stream.synchronize().expect("sync");
+    let main = GpuLdeBase {
+        buf: Arc::new(base_dev),
+        m: main_cols,
+        lde_size,
+        tree: None,
+        trace_dev: None,
+        trace_rows: 0,
+    };
+    let aux = GpuLdeExt3 {
+        buf: Arc::new(aux_dev),
+        m: aux_cols,
+        lde_size,
+        tree: None,
+    };
+
+    let inputs = CompositionInputs {
+        beta_trans: &beta_trans,
+        z_inv: &z_inv,
+        b_col: &b_col,
+        b_is_aux: &b_is_aux,
+        b_value: &b_value,
+        b_beta: &b_beta,
+        b_z_inv: &b_z_inv,
+    };
+    let gpu = try_eval_composition_gpu(
+        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs,
+    )
+    .unwrap_or_else(|| panic!("[{label}] GPU composition path must engage"));
+    assert_eq!(gpu.len(), NUM_ROWS * 3, "[{label}] H shape");
+
+    // CPU oracle, row by row.
+    let rap_raw: Vec<[u64; 3]> = rap.iter().map(enc).collect();
+    let alpha_raw: Vec<[u64; 3]> = alpha.iter().map(enc).collect();
+    let off_raw = enc(&offset);
+    let n_off = max_off + 1;
+
+    for r in 0..NUM_ROWS {
+        let main_raw: Vec<Vec<u64>> = (0..n_off)
+            .map(|o| {
+                (0..main_cols)
+                    .map(|c| base_host[c][(r + o) % NUM_ROWS])
+                    .collect()
+            })
+            .collect();
+        let aux_raw: Vec<Vec<[u64; 3]>> = (0..n_off)
+            .map(|o| {
+                (0..aux_cols)
+                    .map(|c| aux_host[c][(r + o) % NUM_ROWS])
+                    .collect()
+            })
+            .collect();
+        let mut base_o = vec![0u64; num_base];
+        let mut ext_o = vec![[0u64; 3]; n];
+        eval_device_program(
+            &dev,
+            &main_raw,
+            &aux_raw,
+            &rap_raw,
+            &alpha_raw,
+            off_raw,
+            &mut base_o,
+            &mut ext_o,
+        );
+
+        // Boundary terms read the current row (offset 0).
+        let b_terms: Vec<(bool, usize, Fp3, Fp3, Fp)> = (0..num_boundary)
+            .map(|b| {
+                (
+                    b_is_aux[b],
+                    b_col[b],
+                    b_value[b],
+                    b_beta[b],
+                    b_z_inv[b * NUM_ROWS + r],
+                )
+            })
+            .collect();
+
+        let h_cpu = composition_oracle_row(
+            &base_o,
+            &ext_o,
+            num_base,
+            &beta_trans,
+            z_inv[r % Z_LEN],
+            &b_terms,
+            &main_raw[0],
+            &aux_raw[0],
+        );
+
+        let h_gpu = [gpu[r * 3], gpu[r * 3 + 1], gpu[r * 3 + 2]];
+        assert_eq!(
+            h_gpu,
+            enc(&h_cpu),
+            "[{label}] H mismatch row {r} seed {seed:#x}: GPU {h_gpu:?} vs CPU {:?}",
+            enc(&h_cpu)
+        );
+    }
+}
+
+#[test]
+fn gpu_composition_matches_cpu_oracle_all_ops() {
+    for seed in [0x0123_4567_89AB_CDEF, 0xDEAD_BEEF_CAFE_F00D, 7] {
+        check_composition(&all_ops_program(), "ALL_OPS_COMP", seed);
+    }
+}

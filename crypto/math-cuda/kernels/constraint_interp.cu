@@ -179,3 +179,133 @@ extern "C" __global__ void constraint_interp_kernel(
         }
     }
 }
+
+// Fused composition-polynomial kernel: same node walk as
+// `constraint_interp_kernel`, but instead of emitting the per-constraint matrix
+// it accumulates the composition-poly evaluation H(row) on-device — no matrix
+// materialization, no D2H. Mirrors the CPU accumulation in
+// `crypto/stark/src/constraints/evaluator.rs` (uniform-zerofier case):
+//
+//   H(row) = z_inv[row % z_len] * Σ_c beta_trans[c] * C_c(row)          (transition)
+//          + Σ_b z_b_inv[b*num_rows + row] * beta_bnd[b] * (trace_b - value_b)
+//
+// where a base-rooted C_c is carried as the embedding {C,0,0} (all-ext, exactly
+// as the interpreter), z_inv is the cyclic base transition-zerofier inverse, and
+// the boundary term reads the resident trace at column `b_col[b]` (main or aux).
+extern "C" __global__ void constraint_composition_kernel(
+    // output: one H(row) per LDE row
+    Fe3 *__restrict__ d_h,
+    // program (flat blob) — identical to the interpreter kernel
+    const uint64_t *__restrict__ d_nodes,
+    uint64_t num_nodes,
+    const uint64_t *__restrict__ d_base_consts,
+    const Fe3 *__restrict__ d_ext_consts,
+    const uint64_t *__restrict__ d_roots,
+    uint64_t num_roots,
+    // per-proof uniforms
+    const Fe3 *__restrict__ d_rap_challenges,
+    const Fe3 *__restrict__ d_alpha_powers,
+    const Fe3 *__restrict__ d_table_offset,
+    // device-resident LDE
+    const uint64_t *__restrict__ d_main,
+    uint64_t main_stride,
+    const uint64_t *__restrict__ d_aux,
+    uint64_t aux_stride,
+    uint64_t next_step,
+    uint64_t num_rows,
+    // transition accumulation
+    const Fe3 *__restrict__ d_beta_trans, // [num_roots]
+    const uint64_t *__restrict__ d_z_inv, // [z_len], cyclic
+    uint64_t z_len,
+    // boundary accumulation
+    uint64_t num_boundary,
+    const uint64_t *__restrict__ d_b_col,    // [num_boundary]
+    const uint64_t *__restrict__ d_b_is_aux, // [num_boundary] (0/1)
+    const Fe3 *__restrict__ d_b_value,       // [num_boundary]
+    const Fe3 *__restrict__ d_b_beta,        // [num_boundary]
+    const uint64_t *__restrict__ d_b_z_inv,  // [num_boundary * num_rows]
+    // scratch value array, [num_nodes * num_threads]
+    Fe3 *__restrict__ d_values) {
+    uint64_t task_offset = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
+
+    Fe3 *vals = d_values + task_offset;
+    uint64_t vstride = num_threads;
+    Fe3 table_offset = *d_table_offset;
+
+    for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
+        // Forward pass (identical to the interpreter kernel).
+        for (uint64_t i = 0; i < num_nodes; i++) {
+            Node nd = load_node(d_nodes, i);
+            Fe3 v;
+            switch (nd.op) {
+            case OP_CONST_BASE:
+                v = ext3::make(d_base_consts[nd.a], 0, 0);
+                break;
+            case OP_CONST_EXT:
+                v = d_ext_consts[nd.a];
+                break;
+            case OP_VAR:
+                v = read_var(nd.a, nd.b, row, next_step, num_rows, d_main, main_stride, d_aux,
+                             aux_stride);
+                break;
+            case OP_RAP_CHALLENGE:
+                v = d_rap_challenges[nd.a];
+                break;
+            case OP_ALPHA_POW:
+                v = d_alpha_powers[nd.a];
+                break;
+            case OP_TABLE_OFFSET:
+                v = table_offset;
+                break;
+            case OP_ADD:
+                v = ext3::add(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+                break;
+            case OP_SUB:
+                v = ext3::sub(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+                break;
+            case OP_MUL:
+                v = ext3::mul(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+                break;
+            case OP_NEG:
+                v = ext3::neg(vals[(uint64_t)nd.a * vstride]);
+                break;
+            case OP_EMBED:
+                v = vals[(uint64_t)nd.a * vstride];
+                break;
+            default:
+                v = ext3::zero();
+                break;
+            }
+            vals[i * vstride] = v;
+        }
+
+        // Transition: z_inv * Σ_c beta_c * C_c.
+        Fe3 sum = ext3::zero();
+        for (uint64_t c = 0; c < num_roots; c++) {
+            Fe3 cval = vals[(uint64_t)d_roots[c] * vstride];
+            sum = ext3::add(sum, ext3::mul(d_beta_trans[c], cval));
+        }
+        Fe3 h = ext3::mul_base(sum, d_z_inv[row % z_len]);
+
+        // Boundary: Σ_b z_b_inv[row] * beta_b * (trace[col_b] - value_b).
+        for (uint64_t b = 0; b < num_boundary; b++) {
+            uint64_t col = d_b_col[b];
+            Fe3 tcell;
+            if (d_b_is_aux[b] != 0) {
+                uint64_t base = col * 3;
+                tcell = ext3::make(d_aux[(base + 0) * aux_stride + row],
+                                   d_aux[(base + 1) * aux_stride + row],
+                                   d_aux[(base + 2) * aux_stride + row]);
+            } else {
+                tcell = ext3::make(d_main[col * main_stride + row], 0, 0);
+            }
+            Fe3 bp = ext3::sub(tcell, d_b_value[b]);
+            // (z_b_inv * beta_b) * bp — matches the CPU op order.
+            Fe3 zb = ext3::mul_base(d_b_beta[b], d_b_z_inv[b * num_rows + row]);
+            h = ext3::add(h, ext3::mul(zb, bp));
+        }
+
+        d_h[row] = h;
+    }
+}
