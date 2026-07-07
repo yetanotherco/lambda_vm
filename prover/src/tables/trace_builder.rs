@@ -1983,32 +1983,21 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 ///
 /// Per padding row: 1 AreBytes(0,0) for RS1+RS2, 1 AreBytes(0) for RD, and
 /// 12 AreBytes(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
-fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
-    if num_padding_rows == 0 {
-        return Vec::new();
-    }
-
-    let mut ops = Vec::with_capacity(num_padding_rows * 14);
-    for _ in 0..num_padding_rows {
-        // The shrunk CPU sends, per row (incl. padding where all values are 0):
-        // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
-        // 4× IS_HALF (the four `res` halves).
-        for _ in 0..3 {
-            ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
-                0,
-                0,
-            ));
-        }
-        for _ in 0..4 {
-            ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                0,
-                0,
-            ));
-        }
-    }
-    ops
+fn add_padding_byte_checks(hist: &mut bitwise::BitwiseHistogram, num_padding_rows: usize) {
+    // The shrunk CPU sends, per row (incl. padding where all values are 0):
+    // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
+    // 4× IS_HALF (the four `res` halves). Padding rows all send the identical
+    // all-zero lookups, so this is two O(1) histogram bumps instead of an
+    // O(num_padding_rows) op vector.
+    let n = num_padding_rows as u64;
+    hist.bump_n(
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+        3 * n,
+    );
+    hist.bump_n(
+        BitwiseOperation::halfword(BitwiseOperationType::IsHalf, 0, 0),
+        4 * n,
+    );
 }
 
 /// Collects ARE_BYTES lookups from PAGE data (init and fini values).
@@ -2128,11 +2117,11 @@ fn collect_bitwise_from_page<I: ImageSource>(
     image: &I,
     memory_state: &MemoryState,
     exclude_touched: bool,
-) -> Vec<BitwiseOperation> {
+    hist: &mut bitwise::BitwiseHistogram,
+) {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut bitwise_ops = Vec::new();
 
     let init_page_data = build_init_page_data(image);
 
@@ -2164,16 +2153,16 @@ fn collect_bitwise_from_page<I: ImageSource>(
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes
-            bitwise_ops.push(BitwiseOperation::byte_op(
+            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes.
+            // Bumped straight into the histogram: this loop visits every byte of
+            // every touched page, and the histogram is the only consumer.
+            hist.bump(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
                 init,
                 fini,
             ));
         }
     }
-
-    bitwise_ops
 }
 
 // =============================================================================
@@ -3047,64 +3036,58 @@ fn build_traces<I: ImageSource + Sync>(
 
     // The per-source bitwise collectors are all pure functions of their inputs and the
     // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
-    // so we collect every source in parallel and concatenate. The result is byte-identical
-    // to the previous serial `.extend()` chain regardless of order.
+    // so we collect every source in parallel. The result is byte-identical to the previous
+    // serial `.extend()` chain regardless of order.
     //
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
     // chunk size used to split them into instances so multiplicities match the per-instance
     // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
     // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
     // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
-    // Every source's bitwise lookups are collected by a pure `collect_*` function. We never
-    // concatenate them into one giant `Vec<BitwiseOperation>` (~140 M ops / ~560 MB at 10-tx
-    // whose only consumer is the multiplicity count). Instead each collector's transient
-    // per-source Vec is folded into a `BitwiseHistogram` and dropped, and the per-worker
-    // histograms are tree-reduced. The histogram is a commutative monoid, so the summed
-    // multiplicities are independent of accumulation order (the lookups ride a
-    // permutation-invariant bus).
-
-    // Shared collector list: each is a pure `Fn() -> Vec<BitwiseOperation>` of its source.
-    // Order does not affect the histogram (commutative).
-    type Collector<'a> = Box<dyn Fn() -> Vec<BitwiseOperation> + Sync + 'a>;
+    // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
+    // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
+    // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
+    // one-per-byte, padding) count directly with no per-source Vec at all, and the small
+    // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
+    // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
+    // independent of accumulation order.
+    type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
     let mut collectors: Vec<Collector> = vec![
-        Box::new(|| collect_bitwise_from_lt(&lt_ops)),
-        Box::new(|| collect_bitwise_from_mul(&mul_ops, mul_chunk)),
-        Box::new(|| collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk)),
-        Box::new(|| collect_bitwise_from_branch(&branch_ops)),
-        Box::new(|| shift::collect_bitwise_from_shift(&shift_ops)),
-        Box::new(|| {
-            bytewise_ops
-                .iter()
-                .flat_map(|op| op.collect_bitwise_ops())
-                .collect()
+        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
+        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
+        Box::new(|h| {
+            for op in &bytewise_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
         }),
-        Box::new(|| {
-            eq_ops
-                .iter()
-                .flat_map(|op| op.collect_bitwise_ops())
-                .collect()
+        Box::new(|h| {
+            for op in &eq_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
         }),
-        Box::new(|| {
-            store_ops
-                .iter()
-                .flat_map(|op| op.collect_bitwise_ops())
-                .collect()
+        Box::new(|h| {
+            for op in &store_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
         }),
-        Box::new(|| collect_bitwise_from_memw_aligned(&memw_aligned_ops)),
-        Box::new(|| memw_register::collect_bitwise_from_memw_register(&memw_register_rows)),
-        Box::new(|| collect_bitwise_from_commit(&commit_ops)),
-        Box::new(|| collect_bitwise_from_keccak(&keccak_ops)),
-        Box::new(|| collect_bitwise_from_ecsm(&ecsm_ops)),
-        Box::new(|| collect_bitwise_from_ecdas(&ecdas_ops)),
-        Box::new(|| collect_byte_check_ops_for_padding(num_padding_rows)),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
+        Box::new(|h| memw_register::collect_bitwise_from_memw_register(&memw_register_rows, h)),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image
         && !l2g_memory_bookend
     {
-        collectors.push(Box::new(move || {
-            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend)
+        collectors.push(Box::new(move |h| {
+            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
         }));
     }
 
@@ -3117,35 +3100,39 @@ fn build_traces<I: ImageSource + Sync>(
     #[cfg(feature = "parallel")]
     {
         use rayon::prelude::*;
-        // Each collector produces a transient Vec of lookups that is folded into a
-        // dense 80 MiB histogram and dropped. To keep peak memory from scaling with
-        // core count, cap the number of concurrent histograms: split the collectors
-        // into at most `max_par` chunks (one histogram each), run the chunks in
-        // parallel, and process the collectors within a chunk sequentially (so at most
-        // one transient Vec is live per chunk). Tree-reduce the chunk histograms —
-        // add_ops/merge form a commutative monoid, so the result is order-independent
-        // and byte-identical to the sequential path.
+        // To keep peak memory from scaling with core count, cap the number of
+        // concurrent histograms: split the collectors into at most `max_par`
+        // chunks (one histogram each), run the chunks in parallel, and process
+        // the collectors within a chunk sequentially (so at most one transient
+        // Vec is live per chunk — the heavy collectors bump their chunk's
+        // histogram directly and have none). `reduce_with` pairs the chunk
+        // histograms directly; unlike `reduce(identity, ..)` it allocates NO
+        // per-leaf identity histograms (each a zeroed 80 MiB). Tree-reduce is
+        // valid because bump/add_ops/merge form a commutative monoid, so the
+        // result is order-independent and byte-identical to the sequential path.
         let max_par = rayon::current_num_threads().clamp(1, 8);
         let chunk_size = collectors.len().div_ceil(max_par).max(1);
-        let reduced = collectors
+        if let Some(reduced) = collectors
             .par_chunks(chunk_size)
             .map(|chunk| {
                 let mut h = bitwise::BitwiseHistogram::new();
                 for f in chunk {
-                    h.add_ops(&f());
+                    f(&mut h);
                 }
                 h
             })
-            .reduce(bitwise::BitwiseHistogram::new, |mut a, b| {
+            .reduce_with(|mut a, b| {
                 a.merge(&b);
                 a
-            });
-        base.merge(&reduced);
+            })
+        {
+            base.merge(&reduced);
+        }
     }
     #[cfg(not(feature = "parallel"))]
     {
         for f in &collectors {
-            base.add_ops(&f());
+            f(&mut base);
         }
     }
     let bitwise_histogram = base;

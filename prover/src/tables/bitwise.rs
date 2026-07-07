@@ -517,6 +517,13 @@ impl BitwiseHistogram {
     /// Increment the counter for one lookup.
     #[inline]
     pub fn bump(&mut self, op: BitwiseOperation) {
+        self.bump_n(op, 1);
+    }
+
+    /// Add `n` occurrences of one lookup in a single step (e.g. CPU padding rows,
+    /// which all send identical all-zero lookups).
+    #[inline]
+    pub fn bump_n(&mut self, op: BitwiseOperation, n: u64) {
         let idx = lookup_type_index(op.lookup_type) * NUM_ROWS + row_index(op.x, op.y, op.z);
         // (x, y) are u8, and row_index debug-asserts z < 16, so in debug builds a
         // corrupt op fails loudly here. In release an out-of-domain z would NOT
@@ -524,7 +531,7 @@ impl BitwiseHistogram {
         // mis-count both cells — the proof then fails verification instead of the
         // prover crashing. What actually upholds the invariant is that every
         // `BitwiseOperation` constructor masks or debug-asserts z < 16.
-        self.counters[idx] += 1;
+        self.counters[idx] += n;
     }
 
     /// Fold a slice of lookups into the histogram.
