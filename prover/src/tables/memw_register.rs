@@ -43,6 +43,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
+use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
@@ -85,28 +86,81 @@ pub mod cols {
 // Trace generation
 // =========================================================================
 
-/// Generates the MEMW_R trace table from register operations.
+/// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
 ///
-/// Reuses `MemwOperation` -- the trace generator divides `base_address` by 2
-/// to recover the register index (CPU sends `2 * register_index`).
-pub fn generate_memw_register_trace(
-    operations: &[MemwOperation],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    let num_rows = operations.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
-        cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
+/// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
+/// column fill ([`generate_memw_register_trace_from_rows`]) and its IS_HALFWORD
+/// bitwise collector ([`collect_bitwise_from_memw_register`]) need, and nothing
+/// else. It replaces the full `MemwOperation` (~152 B after the `[u32; 8]`
+/// value/old shrink, but still 8-element arrays) for register accesses — the
+/// largest table by rows — so the walk never materializes a `MemwOperation` for
+/// the register fast path.
+///
+/// Field domains mirror `MemwOperation`'s:
+/// - `address`   = `base_address / 2` (the register index 0..=255; ADDRESS column,
+///   and `2*ADDRESS` on the memory/MEMW buses)
+/// - `val0/val1` = `value[0]`/`value[1]` (the 32-bit register halves)
+/// - `old0/old1` = `old[0]`/`old[1]`
+/// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
+///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RegRow {
+    address: u64,
+    timestamp: u64,
+    val0: u32,
+    val1: u32,
+    old0: u32,
+    old1: u32,
+    old_ts_lo: u32,
+    is_read: bool,
+}
 
-    for (row_idx, op) in operations.iter().enumerate() {
+impl RegRow {
+    /// Build a `RegRow` from pre-decomposed register-access fields.
+    ///
+    /// `reg_addr` is `2 * reg_index` as sent by the CPU; `old_ts` is the (shared)
+    /// old_timestamp of both register words. This is the ONLY place the MEMW_R
+    /// row encoding (halved address, masked `old_ts_lo`) is defined —
+    /// [`Self::from_memw`] delegates here, so the walk fast path and the
+    /// `MemwOperation` paths cannot drift.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        reg_addr: u64,
+        timestamp: u64,
+        val0: u32,
+        val1: u32,
+        old0: u32,
+        old1: u32,
+        old_ts: u64,
+        is_read: bool,
+    ) -> Self {
         debug_assert_eq!(
-            op.base_address % 2,
+            reg_addr % 2,
             0,
-            "register base_address must be even (got {})",
-            op.base_address
+            "register base_address must be even (got {reg_addr})"
         );
+        RegRow {
+            address: reg_addr / 2,
+            timestamp,
+            val0,
+            val1,
+            old0,
+            old1,
+            old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
+            is_read,
+        }
+    }
+
+    /// Build a `RegRow` from a fully-formed register `MemwOperation`. Used on the
+    /// precompile / commit / keccak / halt paths, which construct a `MemwOperation`
+    /// first and only convert to the compact row once the op is known to route to
+    /// MEMW_R.
+    ///
+    /// Only valid for ops for which `is_register_op` is true (width==2, atomic
+    /// old_timestamp).
+    #[inline]
+    pub(crate) fn from_memw(op: &MemwOperation) -> Self {
         // Both register words must have been last accessed at the same timestamp.
         // MEMW_R stores a single old_timestamp_lo and shares TIMESTAMP_1 as the
         // upper limb, so if the two words differ, the wrong token would be sent
@@ -116,34 +170,93 @@ pub fn generate_memw_register_trace(
             "register words must share old_timestamp ({} != {})",
             op.old_timestamp[0], op.old_timestamp[1]
         );
+        Self::new(
+            op.base_address,
+            op.timestamp,
+            op.value[0],
+            op.value[1],
+            op.old[0],
+            op.old[1],
+            op.old_timestamp[0],
+            op.is_read,
+        )
+    }
+}
 
-        // ADDRESS = base_address / 2 (CPU sends 2 * register_index)
-        table.set_u64(row_idx, cols::ADDRESS, op.base_address / 2);
+/// Generates the MEMW_R trace table from register operations.
+///
+/// Thin wrapper over [`generate_memw_register_trace_from_rows`] (via
+/// [`RegRow::from_memw`]) so there is exactly one MEMW_R column-write sequence.
+pub fn generate_memw_register_trace(
+    operations: &[MemwOperation],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let rows: Vec<RegRow> = operations.iter().map(RegRow::from_memw).collect();
+    generate_memw_register_trace_from_rows(&rows)
+}
 
-        // Timestamp split into lo/hi 32-bit words
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+/// The MEMW_R column fill from compact [`RegRow`]s. This is the single source of
+/// truth for the MEMW_R trace layout; both the walk's direct fast path and the
+/// `MemwOperation`-based [`generate_memw_register_trace`] land here.
+pub(crate) fn generate_memw_register_trace_from_rows(
+    rows: &[RegRow],
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let num_rows = rows.len().next_power_of_two().max(4);
+    let mut trace = TraceTable::new_main(
+        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
 
-        // Value: registers are DWordWL = 2 words
-        table.set_u64(row_idx, cols::VAL_0, op.value[0] as u64);
-        table.set_u64(row_idx, cols::VAL_1, op.value[1] as u64);
-
-        // Old value
-        table.set_u64(row_idx, cols::OLD_0, op.old[0] as u64);
-        table.set_u64(row_idx, cols::OLD_1, op.old[1] as u64);
-
-        // Old timestamp low (upper limb shared with TIMESTAMP_1)
-        table.set_u64(
-            row_idx,
-            cols::OLD_TIMESTAMP_LO,
-            op.old_timestamp[0] & 0xFFFF_FFFF,
-        );
-
-        // Multiplicity
-        table.set_bool(row_idx, cols::MU_READ, op.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
+    for (row_idx, r) in rows.iter().enumerate() {
+        // ADDRESS = base_address / 2 (already divided in RegRow).
+        table.set_u64(row_idx, cols::ADDRESS, r.address);
+        // Timestamp split into lo/hi 32-bit words.
+        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
+        // Value: registers are DWordWL = 2 words.
+        table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
+        table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
+        // Old value.
+        table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
+        table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
+        // Old timestamp low (upper limb shared with TIMESTAMP_1).
+        table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
+        // Multiplicity.
+        table.set_bool(row_idx, cols::MU_READ, r.is_read);
+        table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
     }
 
     trace
+}
+
+/// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta
+/// `ts_lo - old_ts_lo` is in [1, 2^16] by decomposing `ts_lo - old_ts_lo - 1` into
+/// two bytes.
+///
+/// Must stay in lockstep with the IS_HALFWORD send in [`bus_interactions`]: the
+/// lookup counted here has to be exactly the lookup each MEMW_R row sends, or the
+/// BITWISE bus goes unbalanced.
+#[inline]
+fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation {
+    debug_assert!(
+        ts_lo > old_ts_lo,
+        "ts_lo must exceed old_ts_lo (enforced by the MEMW_R routing predicate)"
+    );
+    let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
+    BitwiseOperation::halfword(
+        BitwiseOperationType::IsHalf,
+        (diff_minus_1 & 0xFF) as u8,
+        (diff_minus_1 >> 8) as u8,
+    )
+}
+
+/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s via
+/// the shared [`memw_register_is_half_lookup`] helper (the same lookup the MEMW_R
+/// trace fill uses), so the multiplicities stay consistent with that table.
+pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow]) -> Vec<BitwiseOperation> {
+    rows.iter()
+        .map(|r| memw_register_is_half_lookup((r.timestamp & 0xFFFF_FFFF) as u32, r.old_ts_lo))
+        .collect()
 }
 
 // =========================================================================

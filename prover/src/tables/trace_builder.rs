@@ -60,7 +60,7 @@ use super::local_to_global;
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
-use super::memw_register;
+use super::memw_register::{self, RegRow};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -352,128 +352,30 @@ fn collect_cpu_ops(
 // Phase 2: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
 
-/// Compact, already-decomposed record for one MEMW_R (register fast-path) access.
+/// Destination table for a `MemwOperation`.
 ///
-/// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
-/// column fill (`generate_memw_register_trace_direct`) and its IS_HALFWORD bitwise
-/// collector (`collect_bitwise_from_memw_register_direct`) need, and nothing else.
-/// It replaces the full `MemwOperation` (~152 B after the `[u32; 8]` value/old
-/// shrink, but still 8-element arrays) for register accesses — the largest table
-/// by rows — so the walk never materializes a `MemwOperation` for the register
-/// fast path.
-///
-/// Field domains mirror `MemwOperation`'s so the produced table is byte-identical:
-/// - `address`   = `base_address / 2` (the register index 0..=255; ADDRESS column,
-///   and `2*ADDRESS` on the memory/MEMW buses)
-/// - `val0/val1` = `value[0]`/`value[1]` (the 32-bit register halves)
-/// - `old0/old1` = `old[0]`/`old[1]`
-/// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
-///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
-#[derive(Debug, Clone, Copy)]
-struct RegRow {
-    address: u64,
-    timestamp: u64,
-    val0: u32,
-    val1: u32,
-    old0: u32,
-    old1: u32,
-    old_ts_lo: u32,
-    is_read: bool,
+/// The order of the checks matters and must never change: register ops would
+/// also pass `is_aligned_op`, so MEMW_R is decided first, then MEMW_A, and the
+/// rest goes to the general MEMW table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemwRoute {
+    Register,
+    Aligned,
+    General,
 }
 
-impl RegRow {
-    /// Build a `RegRow` from a fully-formed register `MemwOperation`. Used on the
-    /// precompile / commit / keccak / halt paths, which construct a `MemwOperation`
-    /// first (their computation is unchanged) and only convert to the compact row
-    /// once the op is known to route to MEMW_R.
-    ///
-    /// Only valid for ops for which `is_register_op` is true (width==2, atomic
-    /// old_timestamp). The debug asserts mirror `generate_memw_register_trace`.
-    #[inline]
-    fn from_memw(op: &MemwOperation) -> Self {
-        debug_assert_eq!(op.base_address % 2, 0);
-        debug_assert_eq!(op.old_timestamp[0], op.old_timestamp[1]);
-        RegRow {
-            address: op.base_address / 2,
-            timestamp: op.timestamp,
-            val0: op.value[0],
-            val1: op.value[1],
-            old0: op.old[0],
-            old1: op.old[1],
-            old_ts_lo: (op.old_timestamp[0] & 0xFFFF_FFFF) as u32,
-            is_read: op.is_read,
-        }
-    }
-}
-
-/// Direct-to-column MEMW_R trace fill from compact [`RegRow`]s.
-///
-/// This is the fused replacement for `generate_memw_register_trace` (which fills from
-/// `&[MemwOperation]`): it produces a BYTE-IDENTICAL table. Every column write below
-/// mirrors `memw_register::generate_memw_register_trace` cell-for-cell — the only
-/// difference is the source carrier (`RegRow` vs `MemwOperation`). Keep the two in sync.
-fn generate_memw_register_trace_direct(
-    rows: &[RegRow],
-) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    use super::types::{FE, VmTable};
-
-    let num_rows = rows.len().next_power_of_two().max(4);
-    let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * memw_register::cols::NUM_COLUMNS],
-        memw_register::cols::NUM_COLUMNS,
-        1,
-    );
-    let table = &mut trace.main_table;
-
-    use memw_register::cols;
-    for (row_idx, r) in rows.iter().enumerate() {
-        // ADDRESS = base_address / 2 (already divided in RegRow).
-        table.set_u64(row_idx, cols::ADDRESS, r.address);
-        // Timestamp split into lo/hi 32-bit words.
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
-        // Value: registers are DWordWL = 2 words.
-        table.set_u64(row_idx, cols::VAL_0, r.val0 as u64);
-        table.set_u64(row_idx, cols::VAL_1, r.val1 as u64);
-        // Old value.
-        table.set_u64(row_idx, cols::OLD_0, r.old0 as u64);
-        table.set_u64(row_idx, cols::OLD_1, r.old1 as u64);
-        // Old timestamp low (upper limb shared with TIMESTAMP_1).
-        table.set_u64(row_idx, cols::OLD_TIMESTAMP_LO, r.old_ts_lo as u64);
-        // Multiplicity.
-        table.set_bool(row_idx, cols::MU_READ, r.is_read);
-        table.set_bool(row_idx, cols::MU_WRITE, !r.is_read);
-    }
-
-    trace
-}
-
-/// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta
-/// `ts_lo - old_ts_lo` is in [1, 2^16] by decomposing `ts_lo - old_ts_lo - 1` into two bytes.
-///
-/// Must stay in lockstep with the IS_HALFWORD send in
-/// `memw_register::bus_interactions()`: the lookup counted here has to be exactly
-/// the lookup each MEMW_R row sends, or the BITWISE bus goes unbalanced.
+/// The single classification used everywhere a `MemwOperation` is routed to a
+/// table — the walk's [`MemwBuckets`] and the sizing pass (`count_table_lengths`)
+/// share it, so their routing cannot drift.
 #[inline]
-fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation {
-    debug_assert!(
-        ts_lo > old_ts_lo,
-        "ts_lo must exceed old_ts_lo (enforced by reg_ts_delta_in_range)"
-    );
-    let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
-    BitwiseOperation::halfword(
-        BitwiseOperationType::IsHalf,
-        (diff_minus_1 & 0xFF) as u8,
-        (diff_minus_1 >> 8) as u8,
-    )
-}
-
-/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s via
-/// the shared [`memw_register_is_half_lookup`] helper (the same lookup the MEMW_R
-/// trace fill uses), so the multiplicities stay consistent with that table.
-fn collect_bitwise_from_memw_register_direct(rows: &[RegRow]) -> Vec<BitwiseOperation> {
-    rows.iter()
-        .map(|r| memw_register_is_half_lookup((r.timestamp & 0xFFFF_FFFF) as u32, r.old_ts_lo))
-        .collect()
+fn classify_memw(op: &MemwOperation) -> MemwRoute {
+    if is_register_op(op) {
+        MemwRoute::Register
+    } else if is_aligned_op(op) {
+        MemwRoute::Aligned
+    } else {
+        MemwRoute::General
+    }
 }
 
 /// Routes each `MemwOperation` into its destination table bucket at CREATION time
@@ -505,26 +407,12 @@ impl MemwBuckets {
         }
     }
 
-    /// Store an op already known to route to MEMW_R.
-    #[inline]
-    fn push_register(&mut self, op: MemwOperation) {
-        self.register_rows.push(RegRow::from_memw(&op));
-    }
-
-    /// Store a compact register row directly.
-    #[inline]
-    fn push_register_row(&mut self, row: RegRow) {
-        self.register_rows.push(row);
-    }
-
     #[inline]
     fn push(&mut self, op: MemwOperation) {
-        if is_register_op(&op) {
-            self.push_register(op);
-        } else if is_aligned_op(&op) {
-            self.aligned.push(op);
-        } else {
-            self.general.push(op);
+        match classify_memw(&op) {
+            MemwRoute::Register => self.register_rows.push(RegRow::from_memw(&op)),
+            MemwRoute::Aligned => self.aligned.push(op),
+            MemwRoute::General => self.general.push(op),
         }
     }
     fn extend_ops(&mut self, ops: impl IntoIterator<Item = MemwOperation>) {
@@ -599,25 +487,13 @@ impl MemwSink for MemwBuckets {
         // `old_ts` (always true here by construction). If it passes, fill a RegRow
         // directly; otherwise fall back to the general/aligned MemwOperation path.
         if reg_ts_delta_in_range(timestamp, old_ts) {
-            let row = RegRow {
-                address: reg_addr / 2,
-                timestamp,
-                val0,
-                val1,
-                old0,
-                old1,
-                old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
-                is_read,
-            };
-            self.push_register_row(row);
+            self.register_rows.push(RegRow::new(
+                reg_addr, timestamp, val0, val1, old0, old1, old_ts, is_read,
+            ));
         } else {
             let op = build_fallback();
             debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
-            if is_aligned_op(&op) {
-                self.aligned.push(op);
-            } else {
-                self.general.push(op);
-            }
+            self.push(op);
         }
     }
 }
@@ -3208,7 +3084,7 @@ fn build_traces<I: ImageSource + Sync>(
                 .collect()
         }),
         Box::new(|| collect_bitwise_from_memw_aligned(&memw_aligned_ops)),
-        Box::new(|| collect_bitwise_from_memw_register_direct(&memw_register_rows)),
+        Box::new(|| memw_register::collect_bitwise_from_memw_register(&memw_register_rows)),
         Box::new(|| collect_bitwise_from_commit(&commit_ops)),
         Box::new(|| collect_bitwise_from_keccak(&keccak_ops)),
         Box::new(|| collect_bitwise_from_ecsm(&ecsm_ops)),
@@ -3336,7 +3212,7 @@ fn build_traces<I: ImageSource + Sync>(
         chunk_and_generate(
             &memw_register_rows,
             max_rows.memw_register,
-            generate_memw_register_trace_direct,
+            memw_register::generate_memw_register_trace_from_rows,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )
@@ -3756,19 +3632,21 @@ pub fn count_table_lengths(
                           by_width: &mut [usize; 4],
                           aligned: &mut usize,
                           register: &mut usize| {
-        if is_register_op(op) {
-            *register += 1;
-        } else if is_aligned_op(op) {
-            *aligned += 1;
-        } else {
-            let idx = match op.width {
-                1 => 0,
-                2 => 1,
-                4 => 2,
-                8 => 3,
-                _ => return,
-            };
-            by_width[idx] += 1;
+        // Same classifier as the walk's MemwBuckets, so the sizing pass counts
+        // exactly the rows trace generation will produce.
+        match classify_memw(op) {
+            MemwRoute::Register => *register += 1,
+            MemwRoute::Aligned => *aligned += 1,
+            MemwRoute::General => {
+                let idx = match op.width {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
+                    _ => return,
+                };
+                by_width[idx] += 1;
+            }
         }
     };
 
