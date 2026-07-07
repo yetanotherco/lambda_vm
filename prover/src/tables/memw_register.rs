@@ -17,7 +17,7 @@
 //!
 //! ## Column layout (10 columns)
 //!
-//! - `ADDRESS`:          Byte  (register index 0-31)
+//! - `ADDRESS`:          Byte  (register index 0-255: x0-x31, plus x254/x255)
 //! - `TIMESTAMP_0`:      Word  (low 32 bits)
 //! - `TIMESTAMP_1`:      Word  (high 32 bits)
 //! - `VAL_0`:            Word  (low 32 bits of register value)
@@ -43,7 +43,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::bitwise::{BitwiseHistogram, BitwiseOperation, BitwiseOperationType};
 use super::memw::MemwOperation;
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
@@ -53,7 +53,7 @@ use crate::constraints::templates::emit_is_bit;
 // =========================================================================
 
 pub mod cols {
-    /// Register index (0-31). CPU sends base_address = 2*reg_index.
+    /// Register index (0-255: x0-x31, plus x254/x255). CPU sends base_address = 2*reg_index.
     pub const ADDRESS: usize = 0;
 
     /// Timestamp low 32 bits
@@ -105,7 +105,9 @@ pub mod cols {
 ///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RegRow {
-    address: u64,
+    /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
+    /// 32 bytes — it is the largest persisted array of the walk.
+    address: u16,
     timestamp: u64,
     val0: u32,
     val1: u32,
@@ -140,8 +142,12 @@ impl RegRow {
             0,
             "register base_address must be even (got {reg_addr})"
         );
+        debug_assert!(
+            reg_addr / 2 <= u16::MAX as u64,
+            "register index exceeds u16 (got base_address {reg_addr})"
+        );
         RegRow {
-            address: reg_addr / 2,
+            address: (reg_addr / 2) as u16,
             timestamp,
             val0,
             val1,
@@ -210,7 +216,7 @@ pub(crate) fn generate_memw_register_trace_from_rows(
 
     for (row_idx, r) in rows.iter().enumerate() {
         // ADDRESS = base_address / 2 (already divided in RegRow).
-        table.set_u64(row_idx, cols::ADDRESS, r.address);
+        table.set_u64(row_idx, cols::ADDRESS, r.address as u64);
         // Timestamp split into lo/hi 32-bit words.
         table.set_dword_wl(row_idx, cols::TIMESTAMP_0, r.timestamp);
         // Value: registers are DWordWL = 2 words.
@@ -250,13 +256,17 @@ fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation 
     )
 }
 
-/// IS_HALFWORD bitwise lookups for MEMW_R, computed directly from [`RegRow`]s via
-/// the shared [`memw_register_is_half_lookup`] helper (the same lookup the MEMW_R
-/// trace fill uses), so the multiplicities stay consistent with that table.
-pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow]) -> Vec<BitwiseOperation> {
-    rows.iter()
-        .map(|r| memw_register_is_half_lookup((r.timestamp & 0xFFFF_FFFF) as u32, r.old_ts_lo))
-        .collect()
+/// IS_HALFWORD bitwise lookups for MEMW_R, bumped straight into the histogram
+/// via the shared [`memw_register_is_half_lookup`] helper (the same lookup the
+/// MEMW_R trace fill uses), one per row. No intermediate op vector: register
+/// rows number in the tens of millions and the histogram is the only consumer.
+pub(crate) fn collect_bitwise_from_memw_register(rows: &[RegRow], hist: &mut BitwiseHistogram) {
+    for r in rows {
+        hist.bump(memw_register_is_half_lookup(
+            (r.timestamp & 0xFFFF_FFFF) as u32,
+            r.old_ts_lo,
+        ));
+    }
 }
 
 // =========================================================================
