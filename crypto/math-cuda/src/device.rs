@@ -192,6 +192,7 @@ pub struct Backend {
 
     // constraint_interp.ptx
     pub constraint_interp_kernel: CudaFunction,
+    pub constraint_composition_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -386,6 +387,8 @@ impl Backend {
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
+            constraint_composition_kernel: constraint_interp
+                .load_function("constraint_composition_kernel")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

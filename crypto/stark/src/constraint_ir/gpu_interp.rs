@@ -55,6 +55,112 @@ unsafe fn ext3_slice_to_u64<E: IsField>(xs: &[FieldElement<E>]) -> Vec<u64> {
     raw.to_vec()
 }
 
+/// Reinterpret a slice of base field elements as flat `u64` (1 per element).
+///
+/// # Safety
+/// The caller must have established `F == GoldilocksField`, whose `FieldElement`
+/// is `#[repr(transparent)]` over `u64`.
+unsafe fn base_slice_to_u64<F: IsField>(xs: &[FieldElement<F>]) -> Vec<u64> {
+    let raw = unsafe { std::slice::from_raw_parts(xs.as_ptr() as *const u64, xs.len()) };
+    raw.to_vec()
+}
+
+/// Per-proof accumulation inputs (in `FieldElement` form) for
+/// [`try_eval_composition_gpu`], mirroring the CPU accumulation in
+/// `constraints::evaluator`.
+pub struct CompositionInputs<'a, F: IsField, E: IsField> {
+    /// Transition coefficients β, one per constraint root.
+    pub beta_trans: &'a [FieldElement<E>],
+    /// Cyclic transition-zerofier inverse (base field, `blowup`-length).
+    pub z_inv: &'a [FieldElement<F>],
+    /// Boundary constraint columns.
+    pub b_col: &'a [usize],
+    /// Boundary main/aux selector.
+    pub b_is_aux: &'a [bool],
+    /// Boundary target values.
+    pub b_value: &'a [FieldElement<E>],
+    /// Boundary coefficients β_b.
+    pub b_beta: &'a [FieldElement<E>],
+    /// Boundary zerofier inverses (base field), laid out `b * num_rows + row`.
+    pub b_z_inv: &'a [FieldElement<F>],
+}
+
+/// Fused composition-poly evaluation on the GPU: returns `H(row)` as raw ext3
+/// limbs (`num_rows * 3` u64), or `None` for non-Goldilocks towers (→ CPU
+/// fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
+/// the uniform-zerofier accumulation of `evaluator::evaluate`.
+#[allow(clippy::too_many_arguments)]
+pub fn try_eval_composition_gpu<F, E>(
+    prog: &ConstraintProgram<F, E>,
+    main: &GpuLdeBase,
+    aux: &GpuLdeExt3,
+    rap_challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
+    table_offset: &FieldElement<E>,
+    next_step: usize,
+    num_rows: usize,
+    inputs: &CompositionInputs<F, E>,
+) -> Option<Vec<u64>>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
+    {
+        return None;
+    }
+
+    // SAFETY: the TypeId gate established the concrete Goldilocks tower.
+    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
+        unsafe { &*(prog as *const _ as *const _) };
+
+    let dev = DeviceProgram::lower(prog);
+    let nodes = pack_nodes(&dev);
+    let ext_consts = flatten_ext3(&dev.ext_consts);
+    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+
+    // SAFETY: `E`/`F` are the Goldilocks tower (gated above).
+    let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
+    let alpha = unsafe { ext3_slice_to_u64(alpha_powers) };
+    let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
+
+    let beta_trans = unsafe { ext3_slice_to_u64(inputs.beta_trans) };
+    let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
+    let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
+    let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
+    let b_z_inv = unsafe { base_slice_to_u64(inputs.b_z_inv) };
+    let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
+    let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
+
+    let accum = math_cuda::constraint_interp::CompositionAccum {
+        beta_trans: &beta_trans,
+        z_inv: &z_inv,
+        b_col: &b_col,
+        b_is_aux: &b_is_aux,
+        b_value: &b_value,
+        b_beta: &b_beta,
+        b_z_inv: &b_z_inv,
+    };
+
+    math_cuda::constraint_interp::eval_composition_on_device(
+        &nodes,
+        dev.nodes.len(),
+        &dev.base_consts,
+        &ext_consts,
+        &roots,
+        &rap,
+        &alpha,
+        &offset,
+        main,
+        aux,
+        next_step,
+        num_rows,
+        &accum,
+    )
+    .ok()
+}
+
 /// Evaluate a captured program on the GPU, returning the per-constraint eval
 /// matrix as raw ext3 limbs (constraint-major: constraint `c`, row `r`,
 /// component `k` at `out[(c * num_rows + r) * 3 + k]`), or `None` if the field
