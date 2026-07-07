@@ -75,6 +75,24 @@ where
     pub grinding_seed: [u8; 32],
 }
 
+/// Verifier state carried across the batched (unified-shard) round-4 seam:
+/// everything `batched_verify_round_4` needs that rounds 1-3 derived from the
+/// transcript (per-table domains/heights, the shared OOD point `z`, the round-2
+/// constraint coefficients, and the shared LogUp challenges). Produced by
+/// `batched_verify_rounds_1_to_3`; lets the continuation epoch verifier weave the
+/// separate L2G lane in at the seam.
+pub struct VmMidState<Field: IsFFTField, FieldExtension: IsField + Send + Sync> {
+    pub(crate) domains: Vec<VerifierDomain<Field>>,
+    pub(crate) heights: Vec<usize>,
+    pub(crate) h_max: usize,
+    pub(crate) tallest: usize,
+    pub(crate) needs_lookup_challenges: bool,
+    pub(crate) lookup_challenges: Vec<FieldElement<FieldExtension>>,
+    pub(crate) boundary_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) transition_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) z: FieldElement<FieldExtension>,
+}
+
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
 
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
@@ -1300,9 +1318,32 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
+        let mid = match Self::batched_verify_rounds_1_to_3(airs, proof, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+        Self::batched_verify_round_4(mid, airs, proof, transcript, expected_bus_balance)
+    }
+
+    /// Rounds 1-3 of the batched (unified-shard) verifier: replays the Fiat-Shamir
+    /// transcript from Phase A (preprocessed roots + the single main MMCS root)
+    /// through the OOD absorption, returning the derived `VmMidState` that round 4
+    /// consumes. Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can weave the separate L2G lane in at the seam.
+    /// Returns `None` on any structural rejection.
+    fn batched_verify_rounds_1_to_3(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Option<VmMidState<Field, FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
         let num_tables = airs.len();
         if num_tables == 0 || num_tables != proof.per_table.len() {
-            return false;
+            return None;
         }
 
         // Per-table lightweight domains + FRI heights (= lde_log_height).
@@ -1337,17 +1378,17 @@ pub trait IsStarkVerifier<
                 || t.composition_poly_parts_ood_evaluation.len()
                     != air.composition_poly_degree_bound(t.trace_length) / t.trace_length
             {
-                return false;
+                return None;
             }
             if air.is_preprocessed() {
                 let expected = air.precomputed_commitment();
                 match t.precomputed_root {
                     Some(actual) if actual == expected => {}
-                    _ => return false,
+                    _ => return None,
                 }
                 transcript.append_bytes(&expected);
             } else if t.precomputed_root.is_some() {
-                return false;
+                return None;
             }
         }
         transcript.append_bytes(&proof.main_root);
@@ -1356,7 +1397,7 @@ pub trait IsStarkVerifier<
         // omit bus_public_inputs to bypass the balance check).
         for (air, t) in airs.iter().zip(&proof.per_table) {
             if air.has_trace_interaction() != t.bus_public_inputs.is_some() {
-                return false;
+                return None;
             }
         }
 
@@ -1371,7 +1412,7 @@ pub trait IsStarkVerifier<
 
         // Phase C: single batched aux MMCS root (present iff any table has aux).
         if needs_lookup_challenges != proof.aux_root.is_some() {
-            return false;
+            return None;
         }
         if let Some(root) = proof.aux_root {
             transcript.append_bytes(&root);
@@ -1425,6 +1466,48 @@ pub trait IsStarkVerifier<
                 transcript.append_field_element(elem);
             }
         }
+
+        Some(VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        })
+    }
+
+    /// Round 4 of the batched (unified-shard) verifier: the FRI + query phase over
+    /// the height-combined per-table DEEP codewords, plus the bus-balance check.
+    /// Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can run it AFTER the L2G lane at the seam.
+    fn batched_verify_round_4(
+        mid: VmMidState<Field, FieldExtension>,
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        } = mid;
+        let num_tables = airs.len();
 
         // ===== Round 4: shared gamma, per-table DEEP coeffs, batched FRI challenges. =====
         let gamma = transcript.sample_field_element();
@@ -1755,5 +1838,62 @@ pub trait IsStarkVerifier<
         }
 
         true
+    }
+
+    /// Continuation epoch verifier: verify the epoch's VM tables with the batched
+    /// (unified-shard) FRI while verifying the single L2G sub-table as a SEPARATE
+    /// commitment lane. Mirrors `IsStarkProver::multi_prove_batched_epoch`'s
+    /// transcript order exactly:
+    ///
+    /// 1. Absorb the L2G main root FIRST.
+    /// 2. `batched_verify_rounds_1_to_3` over the VM tables (to the round-4 seam).
+    /// 3. At the seam, FORK the transcript (single lane -> no idx bytes; then absorb
+    ///    the L2G aux root, then the L2G bus `table_contribution`) and verify the
+    ///    L2G lane via `verify_rounds_2_to_4` with the shared LogUp challenges.
+    /// 4. `batched_verify_round_4` for the VM tables on the main transcript.
+    fn batched_verify_epoch(
+        vm_refs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        l2g_ref: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        vm_proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        l2g_proof: &StarkProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        // (1) Mirror the prover: absorb the L2G main root FIRST (canonical order).
+        transcript.append_bytes(&l2g_proof.lde_trace_main_merkle_root);
+
+        // (2) VM rounds 1-3 to the round-4 seam.
+        let mid = match Self::batched_verify_rounds_1_to_3(vm_refs, vm_proof, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // (3) L2G lane on a fork of the post-seam transcript. Single lane -> no idx
+        // bytes; absorb the aux root then the bus table_contribution (matches the
+        // prover's fork in `multi_prove_batched_epoch`).
+        let mut l2g_fork = transcript.clone();
+        if let Some(aux_root) = l2g_proof.lde_trace_aux_merkle_root {
+            l2g_fork.append_bytes(&aux_root);
+        }
+        if let Some(bpi) = l2g_proof.bus_public_inputs.as_ref() {
+            l2g_fork.append_field_element(&bpi.table_contribution);
+        }
+        let l2g_ok = Self::verify_rounds_2_to_4(
+            l2g_ref,
+            l2g_proof,
+            &mut l2g_fork,
+            mid.lookup_challenges.clone(),
+        );
+
+        // (4) VM batched Round 4 continues on the main (un-cloned) transcript.
+        let vm_ok =
+            Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, expected_bus_balance);
+
+        l2g_ok && vm_ok
     }
 }
