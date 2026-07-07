@@ -1,6 +1,7 @@
 pub mod fri_commitment;
 pub mod fri_decommit;
 pub(crate) mod fri_functions;
+pub(crate) mod terminal;
 
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use math::field::element::FieldElement;
@@ -16,25 +17,28 @@ use self::fri_functions::{
 };
 
 /// FRI commit phase from pre-computed bit-reversed evaluations, skipping the
-/// initial FFT. Use this when the caller already has the evaluation vector
-/// (e.g. from a fused LDE pipeline).
+/// initial FFT. Stops folding when the remaining codeword encodes a polynomial
+/// of degree < 2^`final_poly_log_degree` with blowup 2^`blowup_log`, and
+/// returns the coefficient vector of that terminal polynomial.
 ///
 /// The `T: Clone` and `F/E: 'static` bounds are required by the cuda GPU
 /// fast path (`try_fri_commit_gpu` snapshots the transcript and TypeId-
 /// checks the field types). They are present unconditionally (including
 /// in builds without the `cuda` feature) to keep one stable signature.
+#[allow(clippy::type_complexity)]
 pub fn commit_phase_from_evaluations<
     F: IsFFTField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
+    E: IsField + 'static + Send + Sync,
     T: IsStarkTranscript<E, F> + Clone,
 >(
-    number_layers: usize,
     mut evals: Vec<FieldElement<E>>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
 ) -> (
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )
 where
@@ -50,27 +54,39 @@ where
     // had never been tried.
     #[cfg(feature = "cuda")]
     {
+        // Try the GPU early-termination FRI commit first. `try_fri_commit_gpu`
+        // drives the same commit phase on-device (Goldilocks + Ext3, above the
+        // LDE size threshold, and only when folding actually happens) and returns
+        // `Some` with the final-polynomial coefficients. It returns `None` on any
+        // precondition miss or cudarc error — restoring the transcript first — so
+        // the CPU path below then runs as if the GPU had never been tried.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
-            number_layers,
             &evals,
             transcript,
             coset_offset,
             domain_size,
+            blowup_log,
+            final_poly_log_degree,
         ) {
             return result;
         }
     }
 
+    // Fold layout, shared with the GPU prover and the verifier — see `FriFoldLayout`.
+    let layout = crate::fri::terminal::FriFoldLayout::new(
+        evals.len().trailing_zeros(),
+        blowup_log,
+        final_poly_log_degree,
+    );
+    let num_committed = layout.num_committed;
+
     // Inverse twiddle factors for evaluation-form folding.
     let mut inv_twiddles = compute_coset_twiddles_inv(coset_offset, domain_size);
+    let mut fri_layer_list = Vec::with_capacity(num_committed);
 
-    // The loop commits `number_layers - 1` folded layers; the final fold below
-    // produces the (uncommitted) last value.
-    let num_committed_layers = number_layers.saturating_sub(1);
-    let mut fri_layer_list = Vec::with_capacity(num_committed_layers);
-
-    for _ in 0..num_committed_layers {
-        // <<<< Receive challenge 𝜁ₖ₋₁
+    // Commit `num_committed` folded layers to the transcript.
+    for _ in 0..num_committed {
+        // <<<< Receive challenge 𝜁ₖ
         let zeta = transcript.sample_field_element();
 
         // Fold evaluations in-place (no FFT needed).
@@ -93,21 +109,40 @@ where
         update_twiddles_in_place(&mut inv_twiddles);
     }
 
-    // <<<< Receive challenge: 𝜁ₙ₋₁
-    let zeta = transcript.sample_field_element();
+    // One final fold to reach the terminal codeword (size terminal_len), unless
+    // already there (total_folds == 0 means initial_len == terminal_len).
+    if layout.total_folds > 0 {
+        // <<<< Receive challenge: 𝜁_final
+        let zeta = transcript.sample_field_element();
+        fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+    }
+    debug_assert_eq!(
+        evals.len(),
+        layout.terminal_len,
+        "terminal codeword size mismatch"
+    );
 
-    // Final fold.
-    fold_evaluations_in_place(&mut evals, &zeta, &inv_twiddles);
+    // Recover the low-degree polynomial coefficients from the terminal codeword
+    // and send them to the verifier.
+    //
+    // The coefficient count follows the *actual* terminal codeword via
+    // `layout.effective_k` (`min(k, trace_bits)`), not the requested
+    // `final_poly_log_degree`: for tiny inputs the codeword is clamped to the
+    // full LDE, so passing the raw `k` would over-pad with zeros and break the
+    // round-trip against the verifier's own `expected_k` reconstruction.
+    // The terminal coset offset is `coset_offset^(2^total_folds)` — the offset
+    // after `total_folds` squarings (matches the GPU prover and the verifier).
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &evals,
+        &terminal_offset,
+        layout.effective_k,
+    );
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
 
-    let last_value = evals
-        .first()
-        .expect("FRI evals are non-empty after folding")
-        .clone();
-
-    // >>>> Send value: pₙ
-    transcript.append_field_element(&last_value);
-
-    (last_value, fri_layer_list)
+    (final_poly_coeffs, fri_layer_list)
 }
 
 pub fn query_phase<F: IsField>(

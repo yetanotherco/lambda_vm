@@ -131,3 +131,127 @@ fn test_eval_fold_matches_coeff_fold() {
 
     assert_eq!(path_a_evals, path_b_evals);
 }
+
+/// FRI commit-phase early-termination roundtrip.
+///
+/// Builds a known low-degree FRI codeword, runs `commit_phase_from_evaluations`
+/// with `blowup_log = 1`, `final_poly_log_degree = 2`, and checks:
+///   * the emitted final polynomial has exactly `2^final_poly_log_degree` coeffs,
+///   * the number of committed FRI layers equals `total_folds - 1`,
+///   * folding each queried evaluation through the committed layers reaches the
+///     reconstructed terminal codeword at the query's terminal-layer position.
+#[test]
+fn test_commit_phase_early_termination_roundtrip() {
+    use crate::fri::fri_functions::update_twiddles_in_place;
+    use crate::fri::terminal::terminal_codeword_from_coeffs;
+    use crate::fri::{commit_phase_from_evaluations, query_phase};
+    use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+    use crypto::fiat_shamir::is_transcript::IsTranscript;
+    use math::fft::bit_reversing::reverse_index;
+    use math::field::traits::IsFFTField;
+
+    type F = GoldilocksField;
+
+    let blowup_log: u32 = 1;
+    let final_poly_log_degree: u32 = 2;
+    let initial_len = 64usize;
+    let root_order = initial_len.trailing_zeros(); // 6
+    let total_folds = (root_order - (blowup_log + final_poly_log_degree)) as usize; // 3
+    let num_committed = total_folds - 1; // 2
+
+    let offset = FE::from(3u64);
+
+    // Degree-<32 polynomial; with blowup 2 its terminal poly has degree < 2^2 = 4,
+    // so the emitted 2^2 coefficients capture it exactly.
+    let coeffs_in: Vec<FE> = (1u64..=32).map(FE::new).collect();
+    let poly = Polynomial::new(&coeffs_in);
+
+    // Coset LDE (blowup 2) -> natural order -> bit-reverse -> FRI-order codeword.
+    let mut codeword =
+        Polynomial::evaluate_offset_fft::<F>(&poly, 2, Some(32), &offset).expect("LDE FFT");
+    in_place_bit_reverse_permute(&mut codeword);
+    assert_eq!(codeword.len(), initial_len);
+
+    // ---- Commit phase with early termination ----
+    let mut transcript = DefaultTranscript::<F>::new(&[]);
+    let (final_poly_coeffs, fri_layers) = commit_phase_from_evaluations::<F, F, _>(
+        codeword.clone(),
+        &mut transcript,
+        &offset,
+        initial_len,
+        blowup_log,
+        final_poly_log_degree,
+    );
+
+    assert_eq!(
+        final_poly_coeffs.len(),
+        1 << final_poly_log_degree,
+        "final poly must have 2^k coefficients"
+    );
+    assert_eq!(
+        fri_layers.len(),
+        num_committed,
+        "committed layers must equal total_folds - 1"
+    );
+
+    // query_phase must still work against the committed layers.
+    let iotas = vec![0usize, 1, 5, 17, 30];
+    let _decommitments = query_phase(&fri_layers, &iotas);
+
+    // ---- Reconstruct terminal codeword from the emitted coefficients ----
+    let terminal_len = (1usize << blowup_log) << final_poly_log_degree; // 8
+    let terminal_offset = offset.pow(1u64 << total_folds); // offset^(2^3)
+    let terminal_codeword =
+        terminal_codeword_from_coeffs::<F, F>(&final_poly_coeffs, &terminal_offset, terminal_len);
+    assert_eq!(terminal_codeword.len(), terminal_len);
+
+    // Re-derive the prover's folding challenges by replaying the transcript.
+    let mut replay = DefaultTranscript::<F>::new(&[]);
+    let mut zetas: Vec<FE> = Vec::with_capacity(total_folds);
+    for layer in &fri_layers {
+        zetas.push(replay.sample_field_element());
+        replay.append_bytes(&layer.merkle_tree.root);
+    }
+    zetas.push(replay.sample_field_element()); // final-fold challenge
+    assert_eq!(zetas.len(), total_folds);
+
+    // Strong check: folding the whole codeword with those challenges reproduces
+    // the reconstructed terminal codeword.
+    let mut refold = codeword.clone();
+    let mut inv_tw = compute_coset_twiddles_inv::<F>(&offset, initial_len);
+    for zeta in zetas.iter().take(total_folds) {
+        fold_evaluations_in_place(&mut refold, zeta, &inv_tw);
+        update_twiddles_in_place(&mut inv_tw);
+    }
+    assert_eq!(
+        refold, terminal_codeword,
+        "full re-fold must match reconstructed terminal codeword"
+    );
+
+    // Per-query check: replicate the verifier's fold path and land on
+    // terminal_codeword[index] at the terminal-layer position.
+    let omega = F::get_primitive_root_of_unity(root_order as u64).expect("root of unity");
+    for &iota in &iotas {
+        // p0(nu) and p0(-nu) live at FRI-order positions 2*iota and 2*iota+1.
+        let p0 = codeword[2 * iota];
+        let p0_sym = codeword[2 * iota + 1];
+        // nu = offset * omega^reverse_index(2*iota, initial_len)
+        let nu = &offset * omega.pow(reverse_index(2 * iota, initial_len as u64) as u64);
+        let nu_inv = nu.inv().expect("evaluation point is non-zero");
+
+        // Fold layer 0 -> 1 using the first challenge.
+        let mut v = (&p0 + &p0_sym) + &nu_inv * &zetas[0] * (&p0 - &p0_sym);
+        let mut index = iota;
+        let mut ep_inv = nu_inv.square(); // nu^{-2} for the first committed layer
+        for (i, layer) in fri_layers.iter().enumerate() {
+            let sym = layer.evaluation[index ^ 1];
+            v = (&v + &sym) + &ep_inv * &zetas[i + 1] * (&v - &sym);
+            index >>= 1;
+            ep_inv = ep_inv.square();
+        }
+        assert_eq!(
+            v, terminal_codeword[index],
+            "query {iota}: folded value must equal terminal_codeword[{index}]"
+        );
+    }
+}

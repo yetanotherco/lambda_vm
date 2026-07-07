@@ -17,9 +17,9 @@ use crate::device::backend;
 use crate::merkle::build_inner_tree_levels;
 
 /// Test-only fault injection. When the `test-faults` feature is on, setting
-/// this to a finite value forces the next `fold_and_commit_layer` /
-/// `fold_final` call to return Err and decrement the counter. Tests use
-/// this to exercise the CPU-fallback path in `try_fri_commit_gpu`.
+/// this to a finite value forces the next `fold_and_commit_layer` call to
+/// return Err and decrement the counter. Tests use this to exercise the
+/// CPU-fallback path in `try_fri_commit_gpu`.
 #[cfg(feature = "test-faults")]
 pub static FAULT_FOLDS_REMAINING_UNTIL_ERR: std::sync::atomic::AtomicI64 =
     std::sync::atomic::AtomicI64::new(-1);
@@ -104,10 +104,11 @@ impl FriCommitState {
         let be = backend()?;
         let n_in = self.current_n;
         let n_out = n_in / 2;
-        // fold_final handles the n_out == 1 last layer (no Merkle commit).
+        // n_out == 1 (terminal_len < 2) never reaches this path: `try_fri_commit_gpu`
+        // filters it out and returns None so the CPU fallback handles it.
         assert!(
             n_out >= 2,
-            "fold_and_commit_layer requires n_out >= 2; use fold_final"
+            "fold_and_commit_layer requires n_out >= 2 (n_out == 1 falls back to the CPU path)"
         );
 
         // Row-pair leaves: each leaf hashes two consecutive ext3 evals.
@@ -230,53 +231,5 @@ impl FriCommitState {
             root,
         };
         Ok((layer_evals, tree))
-    }
-
-    /// Final fold, no Merkle commit. Returns the single ext3 output
-    /// element (the FRI last_value).
-    pub fn fold_final(&mut self, zeta_raw: [u64; 3]) -> Result<[u64; 3]> {
-        #[cfg(feature = "test-faults")]
-        check_fault_injection()?;
-        let be = backend()?;
-        let n_in = self.current_n;
-        let n_out = n_in / 2;
-        assert!(n_out >= 1);
-
-        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
-        let cfg = LaunchConfig {
-            grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
-            block_dim: (128, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let n_out_u64 = n_out as u64;
-
-        let (input_evals, output_evals): (&CudaSlice<u64>, &mut CudaSlice<u64>) = if self.a_is_input
-        {
-            (&self.evals_a, &mut self.evals_b)
-        } else {
-            (&self.evals_b, &mut self.evals_a)
-        };
-        unsafe {
-            self.stream
-                .launch_builder(&be.fri_fold_ext3)
-                .arg(input_evals)
-                .arg(&n_out_u64)
-                .arg(&self.inv_tw)
-                .arg(&zeta_dev)
-                .arg(output_evals)
-                .launch(cfg)?;
-        }
-
-        self.stream.synchronize()?;
-        let out_first: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3);
-            self.stream.clone_dtoh(&view)?
-        } else {
-            let view = self.evals_a.slice(0..3);
-            self.stream.clone_dtoh(&view)?
-        };
-        self.a_is_input = !self.a_is_input;
-        self.current_n = n_out;
-        Ok([out_first[0], out_first[1], out_first[2]])
     }
 }

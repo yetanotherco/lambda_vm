@@ -5,9 +5,9 @@
 //! (`DefaultTranscript`), so a single hash suffices — no external digest
 //! needed beyond the ELF.
 //!
-//! All three call sites (prove, verify, bus-balance replay) must absorb
-//! identical bytes; any divergence makes every derived challenge differ and
-//! verification reject.
+//! Both call sites (prove, verify) must absorb identical bytes; the bus-balance
+//! replay inherits the post-absorb transcript via clone(). Any divergence makes
+//! every derived challenge differ and verification reject.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use sha3::{Digest, Keccak256};
@@ -16,7 +16,7 @@ use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
-const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V2";
+const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
 fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
@@ -36,6 +36,7 @@ pub(crate) enum StatementKind {
     ContinuationEpoch { epoch_label: u64 },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn absorb_statement(
     t: &mut impl IsTranscript<E>,
     kind: StatementKind,
@@ -44,6 +45,7 @@ pub(crate) fn absorb_statement(
     table_counts: &TableCounts,
     num_private_input_pages: usize,
     runtime_page_ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
 ) {
     // Leading domain tag — distinct per statement kind, so a monolithic proof and
     // a continuation epoch proof can never share a transcript prefix.
@@ -100,6 +102,9 @@ pub(crate) fn absorb_statement(
 
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
 
+    // fri_final_poly_log_degree: single byte, no endianness concern.
+    t.append_bytes(&[fri_final_poly_log_degree]);
+
     // runtime_page_ranges: count-prefixed; each entry fixed width.
     t.append_bytes(&(runtime_page_ranges.len() as u64).to_le_bytes());
     for r in runtime_page_ranges {
@@ -119,27 +124,33 @@ pub(crate) fn absorb_statement(
 
 /// Continuation domain tags. Distinct from the monolithic `DOMAIN_TAG` so a
 /// monolithic proof and a continuation proof can never share a transcript prefix.
-const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V1";
-const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V1";
+const CONTINUATION_EPOCH_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_EPOCH_V2";
+const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 
 /// Statement bound into the cross-epoch **global** proof's transcript before
 /// Phase A: the ELF (so the global proof is program-bound), the epoch count (so a
 /// global proof from a run with a different number of epochs cannot be spliced in),
 /// the private-input page count (so the global proof's AIR layout — which touched pages
 /// are built non-preprocessed — is canonically pinned, like the monolithic path's
-/// `absorb_statement`), and the touched page-base set (which GLOBAL_MEMORY tables exist).
+/// `absorb_statement`), `fri_final_poly_log_degree` (which sets the FRI transcript
+/// shape, exactly as the monolithic and epoch statements bind it), and the touched
+/// page-base set (which GLOBAL_MEMORY tables exist).
 /// Prove and verify must call this with identical arguments.
 pub(crate) fn absorb_continuation_global_statement(
     t: &mut impl IsTranscript<E>,
     elf_bytes: &[u8],
     num_epochs: usize,
     num_private_input_pages: usize,
+    fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) {
     t.append_bytes(CONTINUATION_GLOBAL_TAG);
     t.append_bytes(&elf_digest(elf_bytes));
     t.append_bytes(&(num_epochs as u64).to_le_bytes());
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
+
+    // fri_final_poly_log_degree: single byte, no endianness concern.
+    t.append_bytes(&[fri_final_poly_log_degree]);
 
     // Touched page-base set: count-prefixed, each fixed-width u64. Binds the exact set
     // (and order) of GLOBAL_MEMORY tables the verifier rebuilds, so a tampered list
