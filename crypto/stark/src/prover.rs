@@ -931,6 +931,44 @@ pub trait IsStarkProver<
         Ok((commit, (main_data, total_cols)))
     }
 
+    /// Commit a single table's auxiliary (LogUp) trace: row-major coset LDE over
+    /// the extension field, then a bit-reversed Merkle tree. CPU path (mirrors the
+    /// CPU branch of `commit_main_trace` / Round-1 Phase-C aux commit) — used by
+    /// the continuation epoch driver for the standalone L2G lane, whose aux table
+    /// is small and always host-resident. The verifier is agnostic to how the tree
+    /// was built, so a CPU-only commit is valid under every build.
+    #[cfg_attr(not(any(test, feature = "cuda")), allow(dead_code))]
+    fn commit_aux_trace(
+        trace: &TraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<(TableCommit<FieldExtension>, (Vec<FieldElement<FieldExtension>>, usize)), ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+    {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let (trace_data, total_cols) = trace.aux_data_row_major();
+        let mut aux_data: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(lde_size * total_cols);
+        aux_data.extend_from_slice(trace_data);
+        Polynomial::<FieldElement<FieldExtension>>::coset_lde_full_expand_row_major::<Field>(
+            &mut aux_data,
+            total_cols,
+            domain.blowup_factor,
+            &twiddles.coset_weights,
+            &twiddles.two_half_inv,
+            &twiddles.two_half_fwd,
+        )?;
+        #[allow(unused_mut)]
+        let (mut tree, root) = Self::commit_rows_bit_reversed(&aux_data, total_cols)
+            .ok_or(ProvingError::EmptyCommitment)?;
+        #[cfg(feature = "disk-spill")]
+        Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
+        Ok((TableCommit::plain(tree, root), (aux_data, total_cols)))
+    }
+
     /// Spill a committed Merkle tree to disk when `storage_mode` is `Disk`,
     /// tagging any I/O error with `label`. No-op otherwise. Shared by every commit
     /// site (main / preprocessed split / aux).
@@ -3666,6 +3704,144 @@ pub trait IsStarkProver<
             deep_poly_openings,
             per_table,
         })
+    }
+
+    /// Continuation epoch driver: prove the epoch's VM tables with the batched
+    /// (unified-shard) FRI while proving the single L2G sub-table as a SEPARATE
+    /// commitment lane (its own tree + own FRI), so the L2G<->global root binding
+    /// still holds. Both lanes are woven through ONE transcript:
+    ///
+    /// 1. Absorb the L2G main root FIRST (canonical order).
+    /// 2. `prove_rounds_1_to_3` over the VM tables (absorbs the VM roots, samples
+    ///    the shared LogUp challenge, through OOD — ends at the round-4 seam).
+    /// 3. At the seam, FORK the transcript (single lane -> no idx bytes; then absorb
+    ///    the L2G aux root, then the L2G bus `table_contribution`) and run
+    ///    `prove_rounds_2_to_4` for L2G -> its own `StarkProof`.
+    /// 4. `batched_round_4` for the VM tables on the main transcript.
+    ///
+    /// The L2G lane is NOT a member of the VM shared MMCS nor the unified FRI: its
+    /// own tree authenticates the binding root. Mirrored in
+    /// `IsStarkVerifier::batched_verify_epoch`.
+    #[allow(clippy::type_complexity)]
+    fn multi_prove_batched_epoch(
+        mut vm_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        l2g_pair: AirTracePair<'_, Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<
+        (
+            BatchedMultiProof<Field, FieldExtension, PI>,
+            StarkProof<Field, FieldExtension, PI>,
+        ),
+        ProvingError,
+    >
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        let (l2g_air, l2g_trace, l2g_pub) = l2g_pair;
+
+        // L2G domain + twiddles (its own lane, never in the VM shared MMCS).
+        let l2g_domain = Domain::new(l2g_air, l2g_trace.num_rows());
+        let l2g_tw = LdeTwiddles::new(&l2g_domain);
+
+        // (2) Commit the L2G main trace to its own tree. L2G is never preprocessed.
+        #[cfg(feature = "cuda")]
+        let (l2g_main_commit, l2g_main_lde, l2g_gpu_main) = Self::commit_main_trace(
+            l2g_trace,
+            &l2g_domain,
+            &l2g_tw,
+            None,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        #[cfg(not(feature = "cuda"))]
+        let (l2g_main_commit, l2g_main_lde) = Self::commit_main_trace(
+            l2g_trace,
+            &l2g_domain,
+            &l2g_tw,
+            None,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+
+        // (3) Canonical transcript order: L2G main root FIRST.
+        transcript.append_bytes(&l2g_main_commit.root);
+
+        // (4) VM rounds 1-3 on the main transcript (absorbs the VM roots + the
+        // shared LogUp challenge; ends at the round-4 seam, post-OOD).
+        let vm_rounds = Self::prove_rounds_1_to_3(
+            &mut vm_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+
+        // (5) Shared LogUp challenges (sampled inside prove_rounds_1_to_3 Phase B).
+        let lookup_challenges = vm_rounds
+            .round1s
+            .first()
+            .map(|r| r.rap_challenges.clone())
+            .unwrap_or_default();
+
+        // (6) Build the L2G aux (LogUp) trace with the shared challenges, then
+        // commit it to its own tree.
+        let l2g_bus = l2g_air.build_auxiliary_trace(l2g_trace, &lookup_challenges);
+        let (l2g_aux_commit, l2g_aux_lde) = Self::commit_aux_trace(
+            l2g_trace,
+            &l2g_domain,
+            &l2g_tw,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+
+        // (7) Assemble the L2G Round1 from its own commitments + LDEs.
+        let l2g_r1c = Round1Commitments {
+            main: l2g_main_commit,
+            aux: Some(l2g_aux_commit),
+            rap_challenges: lookup_challenges,
+            bus_public_inputs: l2g_bus,
+        };
+        let l2g_lde = Lde {
+            main: l2g_main_lde,
+            aux: l2g_aux_lde,
+            #[cfg(feature = "cuda")]
+            gpu_main: l2g_gpu_main,
+            #[cfg(feature = "cuda")]
+            gpu_aux: None,
+        };
+        let mut l2g_round1 =
+            l2g_r1c.build_round1(l2g_lde, l2g_air.step_size(), l2g_domain.blowup_factor);
+
+        // (8) Fork the transcript at the seam. Single lane -> no idx bytes. Absorb
+        // the L2G aux root, then the bus table_contribution (matches the
+        // non-batched per-table fork convention used by `multi_prove`).
+        let mut l2g_fork = transcript.clone();
+        if let Some(aux) = l2g_round1.aux.as_ref() {
+            l2g_fork.append_bytes(&aux.root);
+        }
+        if let Some(bpi) = l2g_round1.bus_public_inputs.as_ref() {
+            l2g_fork.append_field_element(&bpi.table_contribution);
+        }
+        let l2g_proof = Self::prove_rounds_2_to_4(
+            l2g_air,
+            l2g_pub,
+            &mut l2g_round1,
+            &mut l2g_fork,
+            &l2g_domain,
+            &l2g_tw,
+        )?;
+
+        // (9) VM batched Round 4 continues on the main (un-cloned) transcript.
+        let vm_proof = Self::batched_round_4(vm_pairs, vm_rounds, transcript)?;
+
+        // (10) Two lanes: batched VM proof + standalone L2G proof.
+        Ok((vm_proof, l2g_proof))
     }
 
     /// Generate a STARK proof for a single AIR/trace.
