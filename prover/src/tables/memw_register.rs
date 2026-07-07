@@ -193,7 +193,11 @@ impl RegRow {
 ///
 /// Thin wrapper over [`generate_memw_register_trace_from_rows`] (via
 /// [`RegRow::from_memw`]) so there is exactly one MEMW_R column-write sequence.
-pub fn generate_memw_register_trace(
+///
+/// Test-only: production code fills MEMW_R directly from [`RegRow`]s, so the walk
+/// never routes through this `MemwOperation`-based entry point.
+#[cfg(test)]
+pub(crate) fn generate_memw_register_trace(
     operations: &[MemwOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let rows: Vec<RegRow> = operations.iter().map(RegRow::from_memw).collect();
@@ -202,7 +206,7 @@ pub fn generate_memw_register_trace(
 
 /// The MEMW_R column fill from compact [`RegRow`]s. This is the single source of
 /// truth for the MEMW_R trace layout; both the walk's direct fast path and the
-/// `MemwOperation`-based [`generate_memw_register_trace`] land here.
+/// `MemwOperation`-based `generate_memw_register_trace` test wrapper land here.
 pub(crate) fn generate_memw_register_trace_from_rows(
     rows: &[RegRow],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {

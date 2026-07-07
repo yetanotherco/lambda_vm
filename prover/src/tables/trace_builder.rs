@@ -433,7 +433,8 @@ impl MemwBuckets {
 }
 
 /// Sink for `MemwOperation`s so `collect_register_ops_from_cpu` can feed either a plain
-/// `Vec` (tests/scratch paths) or the classifying [`MemwBuckets`] (the walk).
+/// `Vec` (the `count_table_lengths` trace-sizing pass) or the classifying
+/// [`MemwBuckets`] (the walk).
 trait MemwSink {
     fn push_op(&mut self, op: MemwOperation);
 
@@ -443,28 +444,25 @@ trait MemwSink {
     /// (via the same predicate as `is_register_op`): if the timestamp delta admits the
     /// op into MEMW_R it fills a compact [`RegRow`] DIRECTLY — no `MemwOperation` is
     /// built. Only on the (rare) fallback (delta out of IS_HALF range, or upper-limb
-    /// mismatch) does it call `build_fallback` to materialize the `MemwOperation` and
+    /// mismatch) does it build the `MemwOperation` (via [`build_reg_fallback`]) and
     /// route it to the aligned/general bucket exactly as before.
     ///
-    /// `reg_addr` is `2 * reg_index`; `[val0,val1]`/`[old0,old1]` are the 32-bit halves;
-    /// `old_ts` is the (shared) old_timestamp of both words.
+    /// `reg_addr` is `2 * reg_index`; `val`/`old` are the two 32-bit halves of the new
+    /// and previous register words; `old_ts` is the (shared) old_timestamp of both words.
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn push_reg_access(
         &mut self,
         reg_addr: u64,
-        val0: u32,
-        val1: u32,
-        old0: u32,
-        old1: u32,
+        val: [u32; 2],
+        old: [u32; 2],
         timestamp: u64,
         old_ts: u64,
         is_read: bool,
-        build_fallback: impl FnOnce() -> MemwOperation,
     ) {
         // Default impl (plain Vec): register accesses are still ordinary MemwOperations.
-        let _ = (reg_addr, val0, val1, old0, old1, timestamp, old_ts, is_read);
-        self.push_op(build_fallback());
+        self.push_op(build_reg_fallback(
+            reg_addr, val, old, timestamp, old_ts, is_read,
+        ));
     }
 }
 impl MemwSink for Vec<MemwOperation> {
@@ -480,32 +478,47 @@ impl MemwSink for MemwBuckets {
     }
 
     #[inline]
-    #[allow(clippy::too_many_arguments)]
     fn push_reg_access(
         &mut self,
         reg_addr: u64,
-        val0: u32,
-        val1: u32,
-        old0: u32,
-        old1: u32,
+        val: [u32; 2],
+        old: [u32; 2],
         timestamp: u64,
         old_ts: u64,
         is_read: bool,
-        build_fallback: impl FnOnce() -> MemwOperation,
     ) {
         // Mirror `is_register_op` for a width-2 register access whose two words share
         // `old_ts` (always true here by construction). If it passes, fill a RegRow
         // directly; otherwise fall back to the general/aligned MemwOperation path.
         if reg_ts_delta_in_range(timestamp, old_ts) {
             self.register_rows.push(RegRow::new(
-                reg_addr, timestamp, val0, val1, old0, old1, old_ts, is_read,
+                reg_addr, timestamp, val[0], val[1], old[0], old[1], old_ts, is_read,
             ));
         } else {
-            let op = build_fallback();
+            let op = build_reg_fallback(reg_addr, val, old, timestamp, old_ts, is_read);
             debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
             self.push(op);
         }
     }
+}
+
+/// Materialize the aligned/general `MemwOperation` for a register access that does
+/// NOT fit the MEMW_R fast path. Register values pack as `[lo, hi, 0, …]` (see
+/// [`pack_register_value`]) and both words share `old_ts`, so this rebuilds exactly
+/// the op the fast-path callers would otherwise have routed to the buckets.
+fn build_reg_fallback(
+    reg_addr: u64,
+    val: [u32; 2],
+    old: [u32; 2],
+    timestamp: u64,
+    old_ts: u64,
+    is_read: bool,
+) -> MemwOperation {
+    let value = [val[0], val[1], 0, 0, 0, 0, 0, 0];
+    let old_value = [old[0], old[1], 0, 0, 0, 0, 0, 0];
+    let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+    MemwOperation::new(true, reg_addr, value, timestamp, 2, is_read)
+        .with_old(old_value, old_timestamps)
 }
 
 /// Collects all derived operations from CPU operations in a single pass.
@@ -957,22 +970,16 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
             register_state.read(d.rs1)
         };
         let ts = op.timestamp;
-        // Direct fast path: fill a RegRow when routing to MEMW_R; the closure rebuilds
-        // the identical MemwOperation only on the (rare) general/aligned fallback.
+        // Direct fast path: fill a RegRow when routing to MEMW_R; push_reg_access
+        // rebuilds the identical MemwOperation only on the (rare) general/aligned
+        // fallback. Reads leave the value unchanged, so old == new here.
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0],
-            reg_value[1],
-            reg_value[0],
-            reg_value[1],
+            [reg_value[0], reg_value[1]],
+            [reg_value[0], reg_value[1]],
             ts,
             old_ts,
             true,
-            || {
-                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-                MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
-                    .with_old(reg_value, old_timestamps)
-            },
         );
         if d.rs1 == 255 {
             register_state.write_pc(op.rv1, op.timestamp);
@@ -989,18 +996,11 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
         let ts = op.timestamp + 1;
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0],
-            reg_value[1],
-            reg_value[0],
-            reg_value[1],
+            [reg_value[0], reg_value[1]],
+            [reg_value[0], reg_value[1]],
             ts,
             old_ts,
             true,
-            || {
-                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-                MemwOperation::new(true, reg_addr, reg_value, ts, 2, true)
-                    .with_old(reg_value, old_timestamps)
-            },
         );
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
@@ -1014,18 +1014,11 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
         let ts = op.timestamp + 2;
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0],
-            reg_value[1],
-            old_value[0],
-            old_value[1],
+            [reg_value[0], reg_value[1]],
+            [old_value[0], old_value[1]],
             ts,
             old_ts,
             false,
-            || {
-                let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-                MemwOperation::new(true, reg_addr, reg_value, ts, 2, false)
-                    .with_old(old_value, old_timestamps)
-            },
         );
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
