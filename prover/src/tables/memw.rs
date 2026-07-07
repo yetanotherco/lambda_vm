@@ -131,7 +131,7 @@ impl MemwOperation {
     pub fn new(
         is_register: bool,
         base_address: u64,
-        value: [u64; 8],
+        value: [u32; 8],
         timestamp: u64,
         width: u8,
         is_read: bool,
@@ -139,20 +139,7 @@ impl MemwOperation {
         Self {
             is_register,
             base_address,
-            // Callers build a [u64; 8] transiently on the stack; we store the u32
-            // domain (byte / 32-bit register half) so the persisted struct is half
-            // the size. Values never exceed u32 (every element is a byte or a
-            // pack_register_value 32-bit limb). This is an always-on `assert!` (not
-            // `debug_assert!`): a caller passing an out-of-domain value would
-            // otherwise silently truncate here and produce an unsound witness in
-            // release builds, so the invariant is enforced in every build profile.
-            value: value.map(|v| {
-                assert!(
-                    v <= u32::MAX as u64,
-                    "MemwOperation value element exceeds u32: {v}"
-                );
-                v as u32
-            }),
+            value,
             timestamp,
             width,
             is_read,
@@ -162,14 +149,8 @@ impl MemwOperation {
     }
 
     /// Set the old values (from memory model).
-    pub fn with_old(mut self, old: [u64; 8], old_timestamp: [u64; 8]) -> Self {
-        self.old = old.map(|v| {
-            assert!(
-                v <= u32::MAX as u64,
-                "MemwOperation old element exceeds u32: {v}"
-            );
-            v as u32
-        });
+    pub fn with_old(mut self, old: [u32; 8], old_timestamp: [u64; 8]) -> Self {
+        self.old = old;
         self.old_timestamp = old_timestamp;
         self
     }
