@@ -133,12 +133,12 @@ impl MemoryState {
     }
 
     /// Read multiple bytes. Returns arrays of values and timestamps.
-    fn read_bytes(&self, base_address: u64, count: usize) -> ([u64; 8], [u64; 8]) {
-        let mut values = [0u64; 8];
+    fn read_bytes(&self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
+        let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
         for i in 0..count {
             let (val, ts) = self.read_byte(base_address.wrapping_add(i as u64));
-            values[i] = val as u64;
+            values[i] = val as u32;
             timestamps[i] = ts;
         }
         (values, timestamps)
@@ -313,8 +313,17 @@ fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
 /// Pack a 64-bit register value into the MEMW value format.
 ///
 /// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
-fn pack_register_value(value: u64) -> [u64; 8] {
-    [value & 0xFFFF_FFFF, value >> 32, 0, 0, 0, 0, 0, 0]
+fn pack_register_value(value: u64) -> [u32; 8] {
+    [
+        (value & 0xFFFF_FFFF) as u32,
+        (value >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 // =============================================================================
@@ -711,9 +720,9 @@ fn collect_load_op_from_cpu(
     let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Extract individual bytes from loaded value
-    let mut value_bytes = [0u64; 8];
+    let mut value_bytes = [0u32; 8];
     for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
-        *byte = (loaded_value >> (j * 8)) & 0xFF;
+        *byte = ((loaded_value >> (j * 8)) & 0xFF) as u32;
     }
 
     // Sign/zero extend the upper bytes
@@ -744,7 +753,7 @@ fn collect_load_op_from_cpu(
         op.timestamp,
         byte_count as u8,
         signed,
-        res_bytes,
+        res_bytes.map(u64::from),
     );
 
     // Collect MSB8 lookups for sign bit extraction
@@ -774,9 +783,9 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     //   of all 8 bytes. Must match CPU M7 which sends full rv2 as [lo32, hi32].
     // Bus 16: only positions 0..byte_count participate (controlled by w2/w4/write8
     //   multiplicities), so extra bytes don't affect memory consistency.
-    let mut value_bytes = [0u64; 8];
+    let mut value_bytes = [0u32; 8];
     for (j, byte) in value_bytes.iter_mut().enumerate() {
-        *byte = (store_value >> (j * 8)) & 0xFF;
+        *byte = ((store_value >> (j * 8)) & 0xFF) as u32;
     }
 
     // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
@@ -849,10 +858,10 @@ fn collect_ecsm_ops(
     for (base, bytes) in [(addr_xg, &witness.x_g), (addr_k, &witness.k)] {
         for i in 0..4 {
             let addr = base.wrapping_add((8 * i) as u64);
-            let mut value = [0u64; 8];
+            let mut value = [0u32; 8];
             let mut dword = 0u64;
             for j in 0..8 {
-                value[j] = bytes[8 * i + j] as u64;
+                value[j] = bytes[8 * i + j] as u32;
                 dword |= (bytes[8 * i + j] as u64) << (8 * j);
             }
             let (_old, old_ts) = memory_state.read_bytes(addr, 8);
@@ -877,7 +886,7 @@ fn collect_ecsm_ops(
     for offset in 0..32u64 {
         let addr = addr_k.wrapping_add(offset);
         let byte = k[offset as usize];
-        let value = [byte as u64, 0, 0, 0, 0, 0, 0, 0];
+        let value = [byte as u32, 0, 0, 0, 0, 0, 0, 0];
         let (_v, old_ts) = memory_state.read_byte(addr);
         memw_ops.push(
             MemwOperation::new(false, addr, value, t + 1, 1, true)
@@ -889,10 +898,10 @@ fn collect_ecsm_ops(
     // xR writes at T + 2 (4 doublewords).
     for i in 0..4 {
         let addr = addr_xr.wrapping_add((8 * i) as u64);
-        let mut value = [0u64; 8];
+        let mut value = [0u32; 8];
         let mut dword = 0u64;
         for j in 0..8 {
-            value[j] = witness.x_r[8 * i + j] as u64;
+            value[j] = witness.x_r[8 * i + j] as u32;
             dword |= (witness.x_r[8 * i + j] as u64) << (8 * j);
         }
         let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
@@ -949,10 +958,10 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
         // the identical MemwOperation only on the (rare) general/aligned fallback.
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0] as u32,
-            reg_value[1] as u32,
-            reg_value[0] as u32,
-            reg_value[1] as u32,
+            reg_value[0],
+            reg_value[1],
+            reg_value[0],
+            reg_value[1],
             ts,
             old_ts,
             true,
@@ -977,10 +986,10 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
         let ts = op.timestamp + 1;
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0] as u32,
-            reg_value[1] as u32,
-            reg_value[0] as u32,
-            reg_value[1] as u32,
+            reg_value[0],
+            reg_value[1],
+            reg_value[0],
+            reg_value[1],
             ts,
             old_ts,
             true,
@@ -1002,10 +1011,10 @@ fn collect_register_ops_from_cpu<S: MemwSink>(
         let ts = op.timestamp + 2;
         memw_ops.push_reg_access(
             reg_addr,
-            reg_value[0] as u32,
-            reg_value[1] as u32,
-            old_value[0] as u32,
-            old_value[1] as u32,
+            reg_value[0],
+            reg_value[1],
+            old_value[0],
+            old_value[1],
             ts,
             old_ts,
             false,
@@ -1249,8 +1258,8 @@ fn collect_commit_memw_ops(
         let new_index = old_index
             .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
             .expect("commit index exceeds u32 range");
-        let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
-        let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
+        let old_value = [old_index, 0, 0, 0, 0, 0, 0, 0];
+        let new_value = [new_index, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
         let memw_op = MemwOperation::new(
             true,
@@ -1269,7 +1278,7 @@ fn collect_commit_memw_ops(
     for i in 0..count {
         let addr = buf_addr.wrapping_add(i);
         let (byte_val, old_ts) = memory_state.read_byte(addr);
-        let value = [byte_val as u64, 0, 0, 0, 0, 0, 0, 0];
+        let value = [byte_val as u32, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
         let memw_op =
             MemwOperation::new(false, addr, value, ts, 1, true).with_old(value, old_timestamps);
@@ -1377,10 +1386,10 @@ fn collect_keccak_memw_ops(
             .checked_add(lane_idx as u64 * 8)
             .expect("keccak state address range must be validated by the executor");
 
-        let mut old_bytes = [0u64; 8];
+        let mut old_bytes = [0u32; 8];
         let mut old_timestamps = [0u64; 8];
         for b in 0..8 {
-            old_bytes[b] = (in_lane >> (b * 8)) & 0xFF;
+            old_bytes[b] = ((in_lane >> (b * 8)) & 0xFF) as u32;
             let byte_addr = lane_addr
                 .checked_add(b as u64)
                 .expect("keccak state address range must be validated by the executor");
@@ -1388,9 +1397,9 @@ fn collect_keccak_memw_ops(
             old_timestamps[b] = old_ts;
         }
 
-        let mut value_bytes = [0u64; 8];
+        let mut value_bytes = [0u32; 8];
         for (b, byte) in value_bytes.iter_mut().enumerate() {
-            *byte = (out_lane >> (b * 8)) & 0xFF;
+            *byte = ((out_lane >> (b * 8)) & 0xFF) as u32;
         }
 
         let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
