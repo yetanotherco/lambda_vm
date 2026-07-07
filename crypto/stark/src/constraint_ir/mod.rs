@@ -16,12 +16,19 @@
 //! - [`ir`]: the IR data structures ([`ConstraintProgram`], [`Op`], [`Dim`]).
 //! - [`builder`]: the [`IrBuilder`] and [`Expr`] capture API.
 //! - [`interp`]: a CPU forward-pass interpreter over the IR.
+//! - [`device`]: the concrete-Goldilocks flat lowering ([`DeviceProgram`]) for
+//!   the GPU kernel, plus a CPU walker over that flat blob (the pre-GPU parity
+//!   oracle).
 //!
 //! [`ConstraintProgram`]: ir::ConstraintProgram
 //! [`Op`]: ir::Op
 //! [`Dim`]: ir::Dim
+//! [`DeviceProgram`]: device::DeviceProgram
 
 pub mod builder;
+pub mod device;
+#[cfg(feature = "cuda")]
+pub mod gpu_interp;
 pub mod interp;
 pub mod ir;
 
@@ -29,5 +36,6 @@ pub mod ir;
 mod tests;
 
 pub use builder::{Expr, IrBuilder};
+pub use device::{DeviceNode, DeviceProgram, eval_device_program};
 pub use interp::{eval_program, eval_program_base, eval_program_verifier};
 pub use ir::{ConstraintProgram, Dim, Op};
