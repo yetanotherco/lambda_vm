@@ -3503,6 +3503,33 @@ pub trait IsStarkProver<
         <Field as IsField>::BaseType: SpillSafe,
         <FieldExtension as IsField>::BaseType: SpillSafe,
     {
+        let rounds = Self::prove_rounds_1_to_3(
+            &mut air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        Self::batched_round_4(air_trace_pairs, rounds, transcript)
+    }
+
+    /// Round 4 of the batched (unified-shard) path, factored out so the
+    /// continuation epoch driver can reuse it for the VM-table lane. Consumes
+    /// the shared `RoundsOneToThree`, runs ONE FRI over the height-combined
+    /// per-table DEEP codewords, and opens the three shared MMCS trees.
+    fn batched_round_4(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        rounds: RoundsOneToThree<Field, FieldExtension>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+    ) -> Result<BatchedMultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
         let RoundsOneToThree {
             round1s,
             round2s,
@@ -3514,12 +3541,7 @@ pub trait IsStarkProver<
             comp_mmcs,
             heights,
             ..
-        } = Self::prove_rounds_1_to_3(
-            &mut air_trace_pairs,
-            transcript,
-            #[cfg(feature = "disk-spill")]
-            storage_mode,
-        )?;
+        } = rounds;
 
         let num_airs = round1s.len();
 
@@ -3544,12 +3566,19 @@ pub trait IsStarkProver<
             deep_inputs.push((codeword, heights[idx]));
         }
 
+        // All tables' composition-poly LDE evaluations are now baked into the DEEP
+        // codewords above and are never read again. Free them before the FRI commit
+        // and query-opening phases, which keep every table's round1 LDE resident.
+        drop(round2s);
+
         // Bind the height histogram, then sample the cross-table batching alpha.
         crate::fri::batched::absorb_height_histogram::<FieldExtension, _>(transcript, &heights);
         let alpha = transcript.sample_field_element();
 
         // Combine per-height, then run the batched (fold-and-inject) FRI.
         let combined = crate::fri::batched::combine_by_height(&deep_inputs, &alpha);
+        // All per-table DEEP codewords are folded into `combined`; free them before FRI.
+        drop(deep_inputs);
         let coset_offset =
             FieldElement::<Field>::from(air_trace_pairs[0].0.context().proof_options.coset_offset);
         let (fri_last_value, fri_layers) = crate::fri::batched::batched_commit_phase::<
