@@ -143,7 +143,7 @@ where
         b_z_inv: &b_z_inv,
     };
 
-    math_cuda::constraint_interp::eval_composition_on_device(
+    let result = math_cuda::constraint_interp::eval_composition_on_device(
         &nodes,
         dev.nodes.len(),
         &dev.base_consts,
@@ -157,8 +157,11 @@ where
         next_step,
         num_rows,
         &accum,
-    )
-    .ok()
+    );
+    if result.is_ok() {
+        crate::gpu_lde::GPU_COMPOSITION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result.ok()
 }
 
 /// Evaluate a captured program on the GPU, returning the per-constraint eval

@@ -77,6 +77,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -90,6 +91,14 @@ pub fn gpu_extend_halves_calls() -> u64 {
 pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_logup_calls() -> u64 {
     GPU_LOGUP_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful GPU composition-poly (`H(row)`) dispatches — one per table whose
+/// round-2 constraint evaluation took the fused on-device path (a failed attempt
+/// or a gate miss falls back to the CPU accumulation and is not counted).
+pub(crate) static GPU_COMPOSITION_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_calls() -> u64 {
+    GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
 }
 
 // ============================================================================
