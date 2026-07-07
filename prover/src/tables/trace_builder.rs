@@ -1981,14 +1981,12 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 AreBytes(0,0) for RS1+RS2, 1 AreBytes(0) for RD, and
-/// 12 AreBytes(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
+/// Add the BITWISE lookups every CPU padding row sends. A padding row has all
+/// values zero, so per row it sends 3× ARE_BYTES[0,0] (rs1/rs2,
+/// rd/instruction_length, alu_flags/mem_flags) and 4× IS_HALF[0] (the four `res`
+/// halves). Every padding row sends the same lookups, so their whole
+/// contribution is a per-cell count: two `bump_n`s, no per-row work.
 fn add_padding_byte_checks(hist: &mut bitwise::BitwiseHistogram, num_padding_rows: usize) {
-    // The shrunk CPU sends, per row (incl. padding where all values are 0):
-    // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
-    // 4× IS_HALF (the four `res` halves). Padding rows all send the identical
-    // all-zero lookups, so this is two O(1) histogram bumps instead of an
-    // O(num_padding_rows) op vector.
     let n = num_padding_rows as u64;
     hist.bump_n(
         BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
@@ -3034,10 +3032,10 @@ fn build_traces<I: ImageSource + Sync>(
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
 
-    // The per-source bitwise collectors are all pure functions of their inputs and the
+    // The per-source bitwise collectors are all pure functions of their inputs, and the
     // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
-    // so we collect every source in parallel. The result is byte-identical to the previous
-    // serial `.extend()` chain regardless of order.
+    // so every source can be collected in parallel and the per-worker histograms summed in
+    // any order.
     //
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
     // chunk size used to split them into instances so multiplicities match the per-instance
@@ -3106,10 +3104,11 @@ fn build_traces<I: ImageSource + Sync>(
         // the collectors within a chunk sequentially (so at most one transient
         // Vec is live per chunk — the heavy collectors bump their chunk's
         // histogram directly and have none). `reduce_with` pairs the chunk
-        // histograms directly; unlike `reduce(identity, ..)` it allocates NO
-        // per-leaf identity histograms (each a zeroed 80 MiB). Tree-reduce is
-        // valid because bump/add_ops/merge form a commutative monoid, so the
-        // result is order-independent and byte-identical to the sequential path.
+        // histograms directly; `reduce(identity, ..)` would instead allocate a
+        // zeroed 80 MiB identity histogram per leaf, so prefer `reduce_with`.
+        // Tree-reduce is valid because bump/add_ops/merge form a commutative
+        // monoid, so the sum is independent of chunk order and matches the
+        // non-`parallel` fallback below.
         let max_par = rayon::current_num_threads().clamp(1, 8);
         let chunk_size = collectors.len().div_ceil(max_par).max(1);
         if let Some(reduced) = collectors
