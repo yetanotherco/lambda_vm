@@ -313,7 +313,7 @@ mod tests {
 
         // Height 3: combined[j] = alpha^0 * cw0[j] + alpha^1 * cw1[j]
         let alpha0 = FE::one();
-        let alpha1 = alpha.clone();
+        let alpha1 = alpha;
         let expected3: Vec<FE> = cw0
             .iter()
             .zip(cw1.iter())

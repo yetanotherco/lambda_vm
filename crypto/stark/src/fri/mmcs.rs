@@ -395,7 +395,7 @@ mod tests {
         for (r, chunk) in out.chunks_exact_mut(width).enumerate() {
             let br = reverse_index(r, num_rows as u64);
             for (c, col) in columns.iter().enumerate() {
-                chunk[c] = col[br].clone();
+                chunk[c] = col[br];
             }
         }
         out
@@ -685,7 +685,7 @@ mod tests {
         for (r, chunk) in data.chunks_exact_mut(width).enumerate() {
             let br = reverse_index(r, num_rows as u64);
             for (c, col) in columns.iter().enumerate() {
-                chunk[c] = col[br].clone();
+                chunk[c] = col[br];
             }
         }
 
