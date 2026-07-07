@@ -213,6 +213,11 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
 
+# Both presets build the same crate to the same CARGO_TARGET_DIR / same
+# release/recursion-bench, so the post-lock cp races under `make -j` (one
+# preset's cp reads the file while the other overwrites it). Serialize them.
+.NOTPARALLEL: $(RECURSION_VERIFIER_ARTIFACTS)
+
 # The recursion verifier's `min`/`blowup8` presets: same crate dir, same
 # built-binary filename, different Cargo feature -> different artifact name.
 # Not a pattern rule (the stem "recursion-min" wouldn't match the crate dir
@@ -280,12 +285,13 @@ test: compile-programs
 
 # === Quick test shortcuts ===
 
-# Fast prover tests (skips ignored slow tests)
-test-fast:
+# Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
+# prebuilt guest ELFs, so build them first.
+test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
 # Prover tests only
-test-prover:
+test-prover: compile-recursion-elfs
 	cargo test -p lambda-vm-prover
 
 # Prover tests including slow ones. The recursion smoke tests (#[ignore]d) read

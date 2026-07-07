@@ -417,36 +417,20 @@ impl VmAirs {
         refs
     }
 
-    /// Create all VM AIR instances. `minimal_bitwise` controls whether the full
-    /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
-    /// DECODE is always preprocessed.
+    /// Create all VM AIR instances. `minimal_bitwise` picks the minimal vs full
+    /// 2^20 bitwise preprocessed table. DECODE is always preprocessed.
+    /// `page_configs`/`table_counts` give the PAGE bases and split-table chunk
+    /// counts.
     ///
-    /// `page_configs` provides the page base addresses for creating PAGE AIRs.
-    /// `table_counts` specifies how many chunks for each split table.
+    /// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+    /// (skipping the FFT + Merkle build) for the DECODE root and any matching
+    /// ELF-data page (keyed by `page_base`); `None` or unmatched pages recompute
+    /// from the ELF. Zero-init pages always use the shared compile-time constant.
     ///
-    /// `decode_commitment` is an optional precomputed DECODE preprocessed
-    /// commitment. When `Some`, the supplied value is used directly and the
-    /// FFT + Merkle build is skipped — useful for callers who have already
-    /// computed the commitment offline and embedded it as a compile-time
-    /// constant (e.g. the recursion guest, where the in-VM recompute is too
-    /// expensive). When `None`, the commitment is computed from the ELF.
-    ///
-    /// `page_commitments` is an optional list of precomputed ELF-data-page
-    /// preprocessed commitments, keyed by `page_base`. For each ELF data page
-    /// the verifier constructs, if a matching `(page_base, commitment)` pair
-    /// is supplied, it is used directly and that page's FFT + Merkle build is
-    /// skipped. Pages not in the list — including all zero-init pages and
-    /// pages without a match — take the normal compute path (zero-init pages
-    /// hit a compile-time constant via
-    /// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-    /// from the ELF). When `None`, every ELF data page recomputes from
-    /// scratch.
-    ///
-    /// The trust anchor for both `decode_commitment` and `page_commitments`
-    /// is the caller's compiled binary — never accept prover-supplied bytes
-    /// here. A wrong value is rejected, never silently accepted: it either
-    /// mismatches the prover's committed precomputed root (an explicit
-    /// verifier check) or yields diverging Fiat-Shamir challenges.
+    /// Supplied roots are used verbatim and NOT checked against `elf`. A wrong
+    /// caller-constant root is rejected (mismatches the proof root or diverges
+    /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
+    /// callers must bind identity externally (see `statement::program_id`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
@@ -1008,28 +992,19 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
 ///
-/// `decode_commitment` is an optional precomputed DECODE preprocessed
-/// commitment. When `Some`, the supplied value is used directly and the
-/// in-verifier FFT + Merkle build for the DECODE preprocessed columns is
-/// skipped — useful for callers (e.g. the recursion guest) that embed the
-/// commitment as a compile-time constant to avoid the in-VM recompute
-/// cost. When `None`, the verifier computes the commitment from the ELF.
+/// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+/// (skipping the in-verifier FFT + Merkle build) for the DECODE root and any
+/// ELF-data page matching by `page_base`; `None` or unmatched pages recompute
+/// from the ELF, and zero-init pages always use the shared compile-time
+/// constant. Callers (e.g. the recursion guest) supply these to avoid the
+/// in-VM recompute cost.
 ///
-/// `page_commitments` is an optional list of precomputed ELF-data-page
-/// preprocessed commitments, keyed by `page_base`. For each ELF data page
-/// the verifier constructs, if a matching `(page_base, commitment)` pair is
-/// supplied, the FFT + Merkle build for that page is skipped. Pages without
-/// a match — including all zero-init pages — take the normal compute path
-/// (zero-init pages hit a compile-time constant via
-/// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-/// from the ELF). When `None`, every ELF data page recomputes from scratch.
-///
-/// Trust model: both `decode_commitment` and `page_commitments`, when
-/// supplied, must come from the caller's compiled binary (e.g. a
-/// `const [u8; 32]` and a `const [(u64, [u8; 32])]`), never from prover-
-/// supplied bytes. A wrong value is rejected, never silently accepted: it
-/// either mismatches the prover's committed precomputed root (an explicit
-/// verifier check) or yields diverging Fiat-Shamir challenges.
+/// Trust model: a supplied root is used verbatim — this function does NOT
+/// check it against `elf_bytes`. If it is a caller constant (from the compiled
+/// binary), a wrong value is rejected (it mismatches the proof's precomputed
+/// root or diverges Fiat-Shamir). If it is prover-supplied (e.g. the recursion
+/// guest's private input), a consistent mismatched root is NOT rejected here;
+/// the caller must bind identity externally (see `statement::program_id`).
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],

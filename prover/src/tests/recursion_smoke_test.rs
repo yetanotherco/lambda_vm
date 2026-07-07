@@ -1,22 +1,10 @@
 //! End-to-end naive recursion pipeline smoke tests: prove an inner program,
 //! hand `(VmProof, elf, decode_commitment, page_commitments)` to the in-VM
-//! verifier guest, then either prove the guest's execution
-//! (`OuterMode::Prove`) or just execute it (`OuterMode::ExecuteOnly`). Guest
-//! ELFs come from `make compile-recursion-elfs`.
-//!
-//! `ProofOptions` is NOT part of private input — the guest is built once per
-//! preset (`recursion-min.elf` / `recursion-blowup8.elf`, one Cargo feature
-//! each), fixing the security level at build time (see
-//! `bench_vs/lambda/recursion/src/main.rs`). `decode_commitment`/
-//! `page_commitments` ARE private input, precomputed here host-side via the
-//! same functions the guest would otherwise call in-VM
-//! (`precomputed_commitments`) — the guest passes them straight through as
-//! `Some(..)` instead of recomputing (~45x fewer cycles).
-//!
-//! Every pipeline host-verifies the inner proof (independently, via full
-//! recompute — `None, None` — not reusing our own precomputed values, so it's
-//! a real ground-truth check), so building with `--features stark/instruments`
-//! makes any of these tests print the verifier's per-step `Time spent:` timings.
+//! verifier guest, then execute or prove the guest. Guest ELFs come from
+//! `make compile-recursion-elfs`. `ProofOptions` is fixed per preset at build
+//! time; `decode_commitment`/`page_commitments` are private input, precomputed
+//! host-side. Each pipeline also host-verifies the inner proof via full
+//! recompute (`None, None`) as a ground-truth check.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
@@ -51,10 +39,8 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         fri_final_poly_log_degree: 7,
     };
 
-/// DECODE/ELF-data-page commitments for `elf_bytes` under `opts` — exactly
-/// what `bench_vs/lambda/recursion`'s guest receives via private input instead
-/// of recomputing in-VM. Reuses the same functions the (now-uniform) guest
-/// would otherwise call itself.
+/// DECODE/ELF-data-page commitments for `elf_bytes` under `opts` — what the
+/// guest receives via private input instead of recomputing in-VM.
 fn precomputed_commitments(
     elf_bytes: &[u8],
     opts: &stark::proof::options::ProofOptions,
@@ -76,21 +62,20 @@ fn precomputed_commitments(
     (decode_commitment, page_commitments)
 }
 
-/// The bytes the guest commits on success: `elf_digest(inner_elf) ||
-/// decode_commitment || page_commitments` (page entries as `page_base` LE u64
-/// followed by the 32-byte commitment) — must match `main.rs` byte-for-byte.
+/// The bytes the guest commits on success: `program_id(inner_elf,
+/// decode_commitment, page_commitments) || inner_public_output` — must match
+/// `main.rs` byte-for-byte.
 fn expected_committed_output(
     inner_elf: &[u8],
     decode_commitment: &crate::Commitment,
     page_commitments: &[(u64, crate::Commitment)],
+    inner_public_output: &[u8],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + decode_commitment.len() + page_commitments.len() * 40);
-    out.extend_from_slice(&crate::statement::elf_digest(inner_elf));
-    out.extend_from_slice(decode_commitment);
-    for (page_base, commitment) in page_commitments {
-        out.extend_from_slice(&page_base.to_le_bytes());
-        out.extend_from_slice(commitment);
-    }
+    let mut out =
+        crate::statement::program_id_from_elf(inner_elf, decode_commitment, page_commitments)
+            .expect("program_id")
+            .to_vec();
+    out.extend_from_slice(inner_public_output);
     out
 }
 
@@ -303,12 +288,9 @@ fn step_tag(bucket: u8) -> &'static str {
     }
 }
 
-/// Print one top-25 table: `rows` is `(name, cycles, distinct_pcs)`, already
-/// unsorted; `denom_cycles` is the denominator for percentages — the global
-/// total for the all-steps table, but *that step's own total* for a per-step
-/// table, so `%`/`cum %` show what dominates within that step (a `keccak`
-/// that's 90% of a cheap step should read as 90%, not as a fraction of a
-/// percent of the whole run).
+/// Print one top-25 table. `rows` is `(name, cycles, distinct_pcs)`;
+/// `denom_cycles` is the percentage denominator (global total for the all-steps
+/// table, that step's own total for a per-step table).
 fn print_top25_table(rows: &mut [(String, u64, u64)], denom_cycles: u64) {
     rows.sort_unstable_by_key(|(_name, cycles, _pcs)| std::cmp::Reverse(*cycles));
     let pct = |n: u64| 100.0 * (n as f64) / (denom_cycles as f64);
@@ -547,8 +529,12 @@ fn run_recursion_pipeline_with_options(
         OuterMode::Prove => prove_outer_and_commit(label, &recursion_elf_bytes, &blob),
     };
 
-    let expected =
-        expected_committed_output(inner_elf_bytes, &decode_commitment, &page_commitments);
+    let expected = expected_committed_output(
+        inner_elf_bytes,
+        &decode_commitment,
+        &page_commitments,
+        &inner_proof.public_output,
+    );
     assert_eq!(
         committed, expected,
         "recursion guest must commit elf_digest||decode_commitment||page_commitments (in-VM verify accepted)"
@@ -578,7 +564,6 @@ fn run_recursion_pipeline(
 /// Decode the blob on the host and verify — a cheap guard on the encode/decode
 /// contract without running the VM.
 #[test]
-#[ignore = "needs prebuilt guest ELF (make compile-recursion-elfs)"]
 fn test_recursion_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
@@ -618,11 +603,12 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
     }
 }
 
-/// Corrupting a private-input commitment must make verification fail
-/// (`Ok(false)`), never a soundness gap — the safety property the whole
-/// private-input-supplied-commitment design rests on.
+/// Corrupting a private-input commitment on an *honest* proof makes
+/// verification fail (`Ok(false)`). Necessary but not sufficient alone — a
+/// custom prover can supply consistent mismatched roots (see
+/// `recursion_soundness_gap_poc`); the identity binding is the `program_id`
+/// fold, not this check.
 #[test]
-#[ignore = "needs prebuilt guest ELF (make compile-recursion-elfs)"]
 fn test_recursion_rejects_corrupted_commitment() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");

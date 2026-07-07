@@ -1,45 +1,30 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
-//! Private input layout (postcard-encoded):
-//!   `(VmProof, Vec<u8>, Commitment, Vec<(u64, Commitment)>)`
-//! where the `Vec<u8>` holds the inner program's ELF bytes, and the
-//! `Commitment`/`Vec<(u64, Commitment)>` are the inner program's precomputed
-//! DECODE and ELF-data-page commitments — supplied here instead of recomputed
-//! in-VM (an ~45x cycle-count win: recomputing them via FFT+Merkle dominates
-//! this guest's cost otherwise). They're untrusted, like every other private
-//! input value: a wrong commitment diverges the inner proof's Fiat-Shamir
-//! transcript, so `verify_with_options` returns `Ok(false)` rather than a
-//! soundness gap.
+//! Private input (postcard): `(VmProof, Vec<u8>, Commitment, Vec<(u64, Commitment)>)`
+//! — the inner program's ELF bytes plus its precomputed DECODE and
+//! ELF-data-page commitments, supplied instead of recomputed in-VM.
+//! `verify_with_options` does NOT bind the supplied roots to `inner_elf`; that
+//! binding is established by folding them into `program_id` (below) and having
+//! the host recompute that id and compare. That recompute is expensive, so it
+//! happens once at the top level in the host, never in the guest — see
+//! `program_id` in the prover's `statement` module.
 //!
-//! `ProofOptions` is deliberately NOT part of private input — it's fixed by
-//! the `min`/`blowup8` Cargo feature this binary was built with (see
-//! `recursion_proof_options` below). If it were attacker-supplied, a
-//! malicious private input could pick trivially weak options (e.g. 1 FRI
-//! query) and get the guest to accept + commit as if a real proof had been
-//! checked, since the committed output can't otherwise convey what security
-//! level was actually used.
+//! `ProofOptions` is fixed by the `min`/`blowup8` Cargo feature, not private
+//! input (an attacker could otherwise pick trivially weak options and have the
+//! guest accept as if a real proof had been checked).
 //!
-//! On success, commits `elf_digest(inner_elf) || decode_commitment ||
-//! page_commitments` — the full identity of what was verified. Just the two
-//! precomputed commitments wouldn't be enough: they only cover segment
-//! *content* (executable segments / ELF-backed data pages), not e.g.
-//! `entry_point`, so two ELFs could share both without being the same
-//! program. `elf_digest` is the exact function `absorb_statement` already
-//! binds into the transcript, reused as-is rather than inventing a second
-//! identity scheme.
+//! On success commits `program_id(inner_elf, decode_commitment,
+//! page_commitments) || inner_public_output` — the program identity (a fold
+//! pinning the ELF together with the roots it was verified against) plus the
+//! result the inner proof attested.
 //!
-//! Not `no_std` (std/alloc are available — `build-std` provides them, and the
-//! prover links as a normal std crate; its prove-side code is dead-code
-//! eliminated since we only call `verify`). Like every other allocating guest
-//! it is `#![no_main]` and uses the syscalls crate's global allocator (a large
-//! `TlsfHeap`), initialized first thing in `main` — `verify` allocates far more
-//! than the target's default heap provides.
+//! std (not `no_std`): `build-std` provides it, prove-side code is DCE'd.
+//! `#![no_main]`; inits the syscalls global allocator first thing in `main`.
 
 #![no_main]
 
 #[cfg(feature = "blowup8")]
 use lambda_vm_prover::GoldilocksCubicProofOptions;
-use lambda_vm_prover::statement::elf_digest;
 use lambda_vm_prover::{Commitment, ProofOptions, VmProof};
 
 #[cfg(not(any(feature = "min", feature = "blowup8")))]
@@ -69,9 +54,7 @@ fn recursion_proof_options() -> ProofOptions {
 pub fn main() -> ! {
     lambda_vm_syscalls::allocator::init_allocator();
 
-    // Install panic handler to make sure any OOM is because verifying itself is
-    // expensive rather than panics causing stack unwinding, which itself is very
-    // expensive in the guest.
+    // Panic -> sys_panic; unwinding is very expensive in-guest.
     const PANIC_MSG: &str = "PANICKED";
     std::panic::set_hook(Box::new(|_| unsafe {
         lambda_vm_syscalls::syscalls::sys_panic(PANIC_MSG.as_ptr(), PANIC_MSG.len())
@@ -99,13 +82,16 @@ pub fn main() -> ! {
     .expect("verify errored");
     assert!(ok, "inner proof failed verification");
 
-    let mut output = Vec::with_capacity(32 + decode_commitment.len() + page_commitments.len() * 40);
-    output.extend_from_slice(&elf_digest(&inner_elf));
-    output.extend_from_slice(&decode_commitment);
-    for (page_base, commitment) in &page_commitments {
-        output.extend_from_slice(&page_base.to_le_bytes());
-        output.extend_from_slice(commitment);
-    }
+    // program_id is not self-enforcing: a consumer must recompute it natively
+    // and reject on mismatch. Commit the inner output alongside it.
+    let id = lambda_vm_prover::statement::program_id_from_elf(
+        &inner_elf,
+        &decode_commitment,
+        &page_commitments,
+    )
+    .expect("program_id");
+    let mut output = id.to_vec();
+    output.extend_from_slice(&vm_proof.public_output);
     lambda_vm_syscalls::syscalls::commit(&output);
     lambda_vm_syscalls::syscalls::sys_halt();
 }
