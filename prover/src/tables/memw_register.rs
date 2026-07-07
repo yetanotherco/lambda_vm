@@ -17,7 +17,7 @@
 //!
 //! ## Column layout (10 columns)
 //!
-//! - `ADDRESS`:          Byte  (register index 0-31)
+//! - `ADDRESS`:          Byte  (register index 0-255: x0-x31, plus x254/x255)
 //! - `TIMESTAMP_0`:      Word  (low 32 bits)
 //! - `TIMESTAMP_1`:      Word  (high 32 bits)
 //! - `VAL_0`:            Word  (low 32 bits of register value)
@@ -53,7 +53,7 @@ use crate::constraints::templates::emit_is_bit;
 // =========================================================================
 
 pub mod cols {
-    /// Register index (0-31). CPU sends base_address = 2*reg_index.
+    /// Register index (0-255: x0-x31, plus x254/x255). CPU sends base_address = 2*reg_index.
     pub const ADDRESS: usize = 0;
 
     /// Timestamp low 32 bits

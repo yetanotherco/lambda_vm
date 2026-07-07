@@ -389,16 +389,17 @@ fn classify_memw(op: &MemwOperation) -> MemwRoute {
 
 /// Routes each `MemwOperation` into its destination table bucket at CREATION time
 /// (register fast-path / aligned / general), so the walk fills the three buckets directly
-/// and no separate partition pass is needed downstream. Classification order matches the old
-/// two-stage partition (register first, then aligned), and push order within each bucket is
-/// preserved, so the buckets are byte-identical to `partition`-ing one combined vec.
+/// and no separate routing pass is needed downstream. Classification order is register
+/// first, then aligned (see [`classify_memw`]), and push order within each bucket is the
+/// walk's insertion order — the buckets are fully deterministic, which the per-cell
+/// multiplicity counts rely on.
 ///
 /// ## Direct-to-column register fill
 ///
 /// For the register fast path we do NOT materialize a `Vec<MemwOperation>`. Ops that route
 /// to MEMW_R are stored as compact [`RegRow`]s (`register_rows`) and later filled directly
 /// into the MEMW_R columns. The `aligned` / `general` buckets hold `MemwOperation`s — an op
-/// that FAILS `is_register_op` is routed there exactly as the old two-stage partition did.
+/// that FAILS `is_register_op` is routed there (aligned if `is_aligned_op`, else general).
 #[derive(Default)]
 struct MemwBuckets {
     /// Compact register rows (filled directly into the MEMW_R columns).
@@ -2827,14 +2828,14 @@ fn collect_all_ops(
     // register state (no zeroizing) so it can seed the next epoch.
     if is_final {
         // Route halt ops through the same classifier; they append to the end of their
-        // buckets, matching the old "append then partition" order.
+        // buckets.
         memw.extend_ops(collect_halt_ops(register_state));
     }
 
     // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
-    // creation via `MemwBuckets`, so there is no separate partition pass here — the old
-    // two-`partition` sweep (which moved millions of structs a second time, a bandwidth-bound
-    // cost) is gone. Order within each bucket matches the old stable partitions → byte-identical.
+    // creation via `MemwBuckets`, so there is no separate routing pass here: the ops are not
+    // moved a second time. Order within each bucket is the walk's insertion order, which the
+    // multiplicity counts depend on being deterministic.
     let MemwBuckets {
         register_rows: memw_register_rows,
         aligned: memw_aligned_ops,
