@@ -357,9 +357,10 @@ fn collect_cpu_ops(
 /// This is the "direct-to-column" carrier: it holds exactly the fields the MEMW_R
 /// column fill (`generate_memw_register_trace_direct`) and its IS_HALFWORD bitwise
 /// collector (`collect_bitwise_from_memw_register_direct`) need, and nothing else.
-/// It replaces the full `MemwOperation` (216→~152 B via the E6 shrink, but still 8
-/// `[u32;8]`/`[u64;8]` arrays) for register accesses — the largest table by rows —
-/// so the walk never materializes a `MemwOperation` for the register fast path.
+/// It replaces the full `MemwOperation` (~152 B after the `[u32; 8]` value/old
+/// shrink, but still 8-element arrays) for register accesses — the largest table
+/// by rows — so the walk never materializes a `MemwOperation` for the register
+/// fast path.
 ///
 /// Field domains mirror `MemwOperation`'s so the produced table is byte-identical:
 /// - `address`   = `base_address / 2` (the register index 0..=255; ADDRESS column,
@@ -448,8 +449,10 @@ fn generate_memw_register_trace_direct(
 
 /// The single IS_HALFWORD lookup a MEMW_R access sends: proves the timestamp delta
 /// `ts_lo - old_ts_lo` is in [1, 2^16] by decomposing `ts_lo - old_ts_lo - 1` into two bytes.
-/// Shared by BOTH the direct (`RegRow`) and `MemwOperation` collectors so they can never drift
-/// (a divergence would be a silent soundness bug — see the E7 review).
+///
+/// Must stay in lockstep with the IS_HALFWORD send in
+/// `memw_register::bus_interactions()`: the lookup counted here has to be exactly
+/// the lookup each MEMW_R row sends, or the BITWISE bus goes unbalanced.
 #[inline]
 fn memw_register_is_half_lookup(ts_lo: u32, old_ts_lo: u32) -> BitwiseOperation {
     debug_assert!(
@@ -622,7 +625,8 @@ impl MemwSink for MemwBuckets {
 /// Collects all derived operations from CPU operations in a single pass.
 ///
 /// This includes:
-/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7)
+/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7),
+///   already routed into their MEMW_R / MEMW_A / MEMW buckets (see [`MemwBuckets`])
 /// - LOAD ops (memory loads with sign/zero extension)
 /// - LT ops (from SLT/BLT instructions)
 /// - Bitwise lookups (from CPU operations)

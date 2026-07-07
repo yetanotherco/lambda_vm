@@ -442,7 +442,9 @@ pub const fn lookup_type_index(t: BitwiseOperationType) -> usize {
     }
 }
 
-/// Multiplicity column for a lookup type (used by the legacy per-op path).
+/// Multiplicity column for a lookup type. Used by the per-op path
+/// ([`update_multiplicities`]), which is still live production code: continuation
+/// epochs add their L2G lookups through it on top of the histogram-filled trace.
 #[inline]
 pub const fn mu_column(t: BitwiseOperationType) -> usize {
     match t {
@@ -553,16 +555,15 @@ impl BitwiseHistogram {
         }
     }
 
-    /// Total number of lookups counted (for instrumentation only).
-    pub fn total(&self) -> u64 {
-        self.counters.iter().sum()
-    }
-
     /// Write the accumulated multiplicities into the BITWISE trace's MU columns.
     ///
-    /// Produces exactly the same MU columns as calling [`update_multiplicities`]
-    /// with the full op vector, because both sum one increment per lookup into
-    /// the `(row, mu_col)` cell.
+    /// OVERWRITES each nonzero cell with its count (it does not add to what is
+    /// there), so it assumes the MU columns are still zero — true for a fresh
+    /// [`generate_bitwise_trace`] output, where it produces exactly the same MU
+    /// columns as calling [`update_multiplicities`] with the full op vector.
+    /// Callers that layer additional lookups on top (continuation epochs add
+    /// their L2G lookups via `update_multiplicities`, which increments) must do
+    /// so strictly AFTER this fill, never before.
     pub fn fill_multiplicities(
         &self,
         trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
