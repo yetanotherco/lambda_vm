@@ -780,8 +780,10 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Pack ALL 8 bytes of store_value into value_bytes.
-    // Bus 14: MEMW Memory Write receiver reconstructs lo32/hi32 via linear combination
-    //   of all 8 bytes. Must match CPU M7 which sends full rv2 as [lo32, hi32].
+    // Bus 14: the MEMW Memory Write receiver reconstructs lo32/hi32 via a linear
+    //   combination of all 8 bytes, so it must match the store value the CPU sends
+    //   as [lo32, hi32] on the MEMORY bus (MEMOP) and that this STORE chip forwards
+    //   as the MEMW write (the CPU no longer emits an inline store MEMW — see below).
     // Bus 16: only positions 0..byte_count participate (controlled by w2/w4/write8
     //   multiplicities), so extra bytes don't affect memory consistency.
     let mut value_bytes = [0u32; 8];
