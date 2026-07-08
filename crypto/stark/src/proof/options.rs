@@ -40,7 +40,9 @@ impl fmt::Display for ProofOptionsError {
 /// - `grinding_factor`: the number of leading zeros that we want for the Hash(hash || nonce)
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Clone, Debug, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize
+)]
 pub struct ProofOptions {
     pub blowup_factor: u8,
     pub fri_number_of_queries: usize,

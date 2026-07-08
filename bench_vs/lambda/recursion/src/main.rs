@@ -1,13 +1,22 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
-//! Private input (postcard): `(VmProof, Vec<u8>, Commitment, Vec<(u64, Commitment)>)`
-//! — the inner program's ELF bytes plus its precomputed DECODE and
-//! ELF-data-page commitments, supplied instead of recomputed in-VM.
-//! `verify_with_options` does NOT bind the supplied roots to `inner_elf`; that
-//! binding is established by folding them into `program_id` (below) and having
-//! the host recompute that id and compare. That recompute is expensive, so it
-//! happens once at the top level in the host, never in the guest — see
-//! `program_id` in the prover's `statement` module.
+//! Private input layout: a 12-byte `"LVMR" + version + reserved` prefix
+//! followed by an rkyv archive of `lambda_vm_prover::RecursionInput`
+//! `{ vm_proof, inner_elf, decode_commitment, page_commitments }` — the inner
+//! program's ELF bytes plus its precomputed DECODE and ELF-data-page
+//! commitments, supplied instead of recomputed in-VM. The prefix 16-aligns
+//! the archive in guest memory (the executor maps the payload at
+//! `PRIVATE_INPUT_START + 4`, which is only 4-aligned) and tags the format so
+//! the guest rejects a wrong-format blob before the unsafe access. The proof
+//! is verified **in place** via `verify_recursion_blob` — no deserialization
+//! pass, no owned `VmProof`.
+//!
+//! `verify_recursion_blob`/`verify_with_options` does NOT bind the supplied
+//! roots to `inner_elf`; that binding is established by folding them into
+//! `program_id` (below) and having the host recompute that id and compare.
+//! That recompute is expensive, so it happens once at the top level in the
+//! host, never in the guest — see `program_id` in the prover's `statement`
+//! module.
 //!
 //! `ProofOptions` is fixed by the `min`/`blowup8` Cargo feature, not private
 //! input (an attacker could otherwise pick trivially weak options and have the
@@ -25,7 +34,7 @@
 
 #[cfg(feature = "blowup8")]
 use lambda_vm_prover::GoldilocksCubicProofOptions;
-use lambda_vm_prover::{Commitment, ProofOptions, VmProof};
+use lambda_vm_prover::ProofOptions;
 
 #[cfg(not(any(feature = "min", feature = "blowup8")))]
 compile_error!("select exactly one of the `min`/`blowup8` features");
@@ -61,38 +70,29 @@ pub fn main() -> ! {
         lambda_vm_syscalls::syscalls::sys_panic(PANIC_MSG.as_ptr(), PANIC_MSG.len())
     }));
 
-    let blob = lambda_vm_syscalls::syscalls::get_private_input();
-    let (vm_proof, inner_elf, decode_commitment, page_commitments): (
-        VmProof,
-        Vec<u8>,
-        Commitment,
-        Vec<(u64, Commitment)>,
-    ) = postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
+    // Zero-copy: borrow the blob straight from the mapped private-input region.
+    // The 12-byte prefix puts the archive at a 16-aligned guest address, so the
+    // verifier's in-place doubleword loads don't trap.
+    let blob = lambda_vm_syscalls::syscalls::get_private_input_slice();
     lambda_vm_prover::profile_markers::step_marker::<
         { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
     >();
 
     let options = recursion_proof_options();
-    let ok = lambda_vm_prover::verify_with_options(
-        &vm_proof,
-        &inner_elf,
-        &options,
-        Some(decode_commitment),
-        Some(&page_commitments),
-    )
-    .expect("verify errored");
-    assert!(ok, "inner proof failed verification");
+    let verification =
+        lambda_vm_prover::verify_recursion_blob(blob, &options).expect("verify errored");
+    assert!(verification.ok, "inner proof failed verification");
 
     // program_id is not self-enforcing: a consumer must recompute it natively
     // and reject on mismatch. Commit the inner output alongside it.
     let id = lambda_vm_prover::statement::program_id_from_elf(
-        &inner_elf,
-        &decode_commitment,
-        &page_commitments,
+        verification.inner_elf,
+        &verification.decode_commitment,
+        &verification.page_commitments,
     )
     .expect("program_id");
     let mut output = id.to_vec();
-    output.extend_from_slice(&vm_proof.public_output);
+    output.extend_from_slice(verification.public_output);
     lambda_vm_syscalls::syscalls::commit(&output);
     lambda_vm_syscalls::syscalls::sys_halt();
 }

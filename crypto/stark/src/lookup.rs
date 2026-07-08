@@ -1498,7 +1498,9 @@ impl BusInteraction {
 ///
 /// For the circular constraint, `table_contribution / N` is the per-row offset
 /// that makes the accumulated column wrap to zero at row N-1.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize
+)]
 #[serde(bound = "")]
 pub struct BusPublicInputs<E>
 where
@@ -1507,18 +1509,43 @@ where
     /// Total sum of all LogUp terms across all rows (L).
     /// Used for bus balance check and to derive the per-row offset L/N.
     pub table_contribution: FieldElement<E>,
-    /// Per-bus sums for this table (bus_id → sum) - for debug aggregation
+    /// Per-bus sums for this table (bus_id → sum) - for debug aggregation.
+    /// Debug-only aggregation state; not part of the archived proof (`Skip`).
     #[cfg(feature = "debug-checks")]
+    #[rkyv(with = rkyv::with::Skip)]
     pub per_bus_sums: HashMap<u64, FieldElement<E>>,
     /// Per-bus sender sums (bus_id → sum) - positive contributions
     #[cfg(feature = "debug-checks")]
+    #[rkyv(with = rkyv::with::Skip)]
     pub per_bus_sender_sums: HashMap<u64, FieldElement<E>>,
     /// Per-bus receiver sums (bus_id → sum) - absolute value (before negation)
     #[cfg(feature = "debug-checks")]
+    #[rkyv(with = rkyv::with::Skip)]
     pub per_bus_receiver_sums: HashMap<u64, FieldElement<E>>,
     /// Table name for debug output
     #[cfg(feature = "debug-checks")]
+    #[rkyv(with = rkyv::with::Skip)]
     pub table_name: String,
+}
+
+impl<E: IsField> BusPublicInputs<E> {
+    /// Build a `BusPublicInputs` carrying just the table contribution `L`.
+    /// The debug-only per-bus aggregation fields are defaulted (empty). Used by
+    /// the zero-copy verifier, which reads only `table_contribution` from the
+    /// archived proof.
+    pub fn from_contribution(table_contribution: FieldElement<E>) -> Self {
+        Self {
+            table_contribution,
+            #[cfg(feature = "debug-checks")]
+            per_bus_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_sender_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            per_bus_receiver_sums: HashMap::new(),
+            #[cfg(feature = "debug-checks")]
+            table_name: String::new(),
+        }
+    }
 }
 
 /// Trait representing boundary constraint building behaviour.

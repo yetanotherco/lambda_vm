@@ -16,7 +16,7 @@ lambda-vm-prover = { path = "../../../prover", default-features = false, feature
     "profile-markers",
 ] }
 lambda-vm-syscalls = { path = "../../../syscalls" }
-postcard = { version = "1.0", features = ["alloc"] }
+rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "bytecheck", "aligned"] }
 
 [profile.release]
 debug = 2

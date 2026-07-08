@@ -850,3 +850,148 @@ impl<'de, F: IsPrimeField> Deserialize<'de> for FieldElement<F> {
         deserializer.deserialize_struct("FieldElement", FIELDS, FieldElementVisitor(PhantomData))
     }
 }
+
+// ============================================================================
+// rkyv zero-copy (de)serialization
+// ============================================================================
+//
+// `FieldElement<F>` is `#[repr(transparent)]` over `F::BaseType`. Its archived
+// form is a local `#[repr(transparent)]` newtype wrapping the archived form of
+// `F::BaseType` (e.g. archived `u64` for Goldilocks, `[ArchivedFieldElement; 3]`
+// for the cubic extension). Keeping it a LOCAL type (rather than reusing
+// `<F::BaseType as Archive>::Archived` directly) is what lets us implement
+// `Deserialize` without colliding with rkyv's blanket impls — while the
+// transparent repr keeps the archived bytes identical to the base type, so the
+// recursion verifier still reads field elements straight from the proof buffer.
+
+/// Archived form of [`FieldElement<F>`]; see the module note above.
+#[cfg(feature = "rkyv")]
+#[repr(transparent)]
+pub struct ArchivedFieldElement<F: IsField>
+where
+    F::BaseType: rkyv::Archive,
+{
+    value: <F::BaseType as rkyv::Archive>::Archived,
+}
+
+#[cfg(feature = "rkyv")]
+const _: () = {
+    use rkyv::{Archive, Deserialize, Place, Portable, Serialize};
+
+    // SAFETY: `ArchivedFieldElement<F>` is `#[repr(transparent)]` over the base
+    // type's archived form, which is itself `Portable` (required by `Archive`).
+    // A transparent wrapper over a `Portable` type is position-independent and
+    // valid for the same byte patterns, so it is `Portable` too.
+    unsafe impl<F> Portable for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: Portable,
+    {
+    }
+
+    impl<F> Archive for FieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+    {
+        type Archived = ArchivedFieldElement<F>;
+        type Resolver = <F::BaseType as Archive>::Resolver;
+
+        #[inline]
+        fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+            // `ArchivedFieldElement` is `#[repr(transparent)]` over the base
+            // type's archived form, so resolving into the inner field resolves
+            // the whole newtype.
+            let inner = unsafe { out.cast_unchecked::<<F::BaseType as Archive>::Archived>() };
+            self.value.resolve(resolver, inner);
+        }
+    }
+
+    impl<F, S> Serialize<S> for FieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Serialize<S>,
+        S: rkyv::rancor::Fallible + ?Sized,
+    {
+        #[inline]
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            self.value.serialize(serializer)
+        }
+    }
+
+    impl<F, D> Deserialize<FieldElement<F>, D> for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: Deserialize<F::BaseType, D>,
+        D: rkyv::rancor::Fallible + ?Sized,
+    {
+        #[inline]
+        fn deserialize(&self, deserializer: &mut D) -> Result<FieldElement<F>, D::Error> {
+            Ok(FieldElement {
+                value: self.value.deserialize(deserializer)?,
+            })
+        }
+    }
+
+    // SAFETY: `#[repr(transparent)]` over the inner archived value, so checking
+    // the inner type's bytes checks the whole newtype.
+    unsafe impl<F, C> rkyv::bytecheck::CheckBytes<C> for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: rkyv::bytecheck::CheckBytes<C>,
+        C: rkyv::rancor::Fallible + ?Sized,
+    {
+        unsafe fn check_bytes(value: *const Self, context: &mut C) -> Result<(), C::Error> {
+            unsafe {
+                <<F::BaseType as Archive>::Archived as rkyv::bytecheck::CheckBytes<C>>::check_bytes(
+                    value as *const <F::BaseType as Archive>::Archived,
+                    context,
+                )
+            }
+        }
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Zero-copy native views (little-endian only)
+// ----------------------------------------------------------------------------
+//
+// rkyv archives integers as `rend::*_le` types, which are `#[repr(C, align(N))]`
+// and bit-identical to the native little-endian primitive. `FieldElement<F>` is
+// `#[repr(transparent)]` over `F::BaseType` and `ArchivedFieldElement<F>` is
+// `#[repr(transparent)]` over `<F::BaseType as Archive>::Archived`. So on a
+// little-endian target the two types share size, alignment, and bit layout —
+// an archived field element *is* a native field element. These views let the
+// verifier read field elements straight out of the proof buffer with no copy
+// and no allocation.
+//
+// Restricted to `target_endian = "little"` (the lambda-vm guest target). On a
+// big-endian host these would be wrong, so they simply don't exist there.
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+impl<F: IsField> ArchivedFieldElement<F>
+where
+    F::BaseType: rkyv::Archive,
+{
+    /// Reinterpret this archived element as a native [`FieldElement`] (no copy).
+    ///
+    /// Sound on little-endian: see the module note above.
+    #[inline]
+    pub fn as_native(&self) -> &FieldElement<F> {
+        // SAFETY: identical size/align/bit-layout on little-endian.
+        unsafe { &*(self as *const Self as *const FieldElement<F>) }
+    }
+
+    /// Reinterpret a slice of archived elements as a slice of native
+    /// [`FieldElement`]s (no copy, no allocation).
+    #[inline]
+    pub fn slice_as_native(slice: &[Self]) -> &[FieldElement<F>] {
+        // SAFETY: element-wise identical layout on little-endian, so the slice
+        // (same length, same element stride) reinterprets directly.
+        unsafe {
+            core::slice::from_raw_parts(slice.as_ptr() as *const FieldElement<F>, slice.len())
+        }
+    }
+}
