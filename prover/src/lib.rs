@@ -751,8 +751,15 @@ pub(crate) fn compute_expected_commit_bus_balance(
 pub(crate) fn replay_transcript_phase_a_batched(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &BatchedMultiProof<F, E, ()>,
+    l2g_main_root: Option<&Commitment>,
     transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
+    // Continuation epochs absorb the standalone L2G main root FIRST (mirrors
+    // `Prover::multi_prove_batched_epoch`, which appends it before the VM roots);
+    // monolithic proofs have no separate L2G lane and pass `None`.
+    if let Some(root) = l2g_main_root {
+        transcript.append_bytes(root);
+    }
     for air in airs.iter() {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
@@ -771,9 +778,10 @@ pub(crate) fn compute_expected_commit_bus_balance_batched(
     proof: &BatchedMultiProof<F, E, ()>,
     public_output_bytes: &[u8],
     start_index: u64,
+    l2g_main_root: Option<&Commitment>,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a_batched(airs, proof, transcript);
+    let (z, alpha) = replay_transcript_phase_a_batched(airs, proof, l2g_main_root, transcript);
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
@@ -1150,6 +1158,8 @@ pub fn verify_with_options(
         &vm_proof.public_output,
         // Monolithic proof: commits are indexed from 0.
         0,
+        // No standalone L2G lane in a monolithic proof.
+        None,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,

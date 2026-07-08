@@ -1891,8 +1891,22 @@ pub trait IsStarkVerifier<
         );
 
         // (4) VM batched Round 4 continues on the main (un-cloned) transcript.
+        //
+        // Bus balance: L2G shares the in-trace Memory / range-check buses with the
+        // VM tables. The monolithic check summed table_contribution over VM + L2G
+        // against the COMMIT offset; batched_verify_round_4 sums only the VM lane,
+        // so fold L2G's contribution into the target:
+        //   Sum_VM table_contribution == expected - L2G_contribution
+        // i.e. Sum_VM + L2G == expected. L2G's table_contribution is bound to its
+        // committed trace by the L2G proof verified above, so this stays sound.
+        let mut vm_expected = expected_bus_balance.clone();
+        if l2g_ref.has_trace_interaction()
+            && let Some(bpi) = l2g_proof.bus_public_inputs.as_ref()
+        {
+            vm_expected = &vm_expected - &bpi.table_contribution;
+        }
         let vm_ok =
-            Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, expected_bus_balance);
+            Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, &vm_expected);
 
         l2g_ok && vm_ok
     }

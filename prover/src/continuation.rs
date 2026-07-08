@@ -54,7 +54,7 @@ use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
-use stark::proof::stark::MultiProof;
+use stark::proof::stark::{BatchedMultiProof, MultiProof, StarkProof};
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
@@ -69,7 +69,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
+    compute_expected_commit_bus_balance_batched, verify_l2g_commitment_binding,
 };
 
 type F = GoldilocksField;
@@ -343,8 +343,11 @@ struct EpochStart<'a> {
 /// tables rather than trusting any prover-supplied page config.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct EpochProof {
-    /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
-    proof: MultiProof<F, E, ()>,
+    /// Batched proof over the epoch's VM tables (shared MMCS + unified FRI).
+    vm_proof: BatchedMultiProof<F, E, ()>,
+    /// Standalone proof over the single L2G sub-table (its own tree + own FRI).
+    /// Its `lde_trace_main_merkle_root` is the binding root (== `l2g_root`).
+    l2g_proof: StarkProof<F, E, ()>,
     /// Bytes this epoch committed — the COMMIT-bus receiver reference.
     public_output: Vec<u8>,
     /// Statement values the epoch transcript is seeded with (re-derived on verify).
@@ -500,26 +503,25 @@ fn prove_epoch(
     // roots). It is appended to the proof below, not through `air_trace_pairs`.
     let mut l2g_trace = local_to_global::generate_local_to_global_trace(boundary);
 
-    let mut pairs = airs.air_trace_pairs(&mut traces);
-    pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let proof = Prover::multi_prove(
-        pairs,
+    // VM tables ride the batched (unified-shard) FRI; the single L2G sub-table is a
+    // SEPARATE commitment lane (its own tree + own FRI) so the L2G<->global root
+    // binding still holds. Do NOT push L2G into the VM pairs.
+    let vm_pairs = airs.air_trace_pairs(&mut traces);
+    let l2g_pair = (&l2g_air as AirRef, &mut l2g_trace, &());
+    let (vm_proof, l2g_proof) = Prover::multi_prove_batched_epoch(
+        vm_pairs,
+        l2g_pair,
         &mut seed(),
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
-    let l2g_root = proof
-        .proofs
-        .last()
-        .ok_or_else(|| {
-            Error::ContinuationInvariant("epoch proof is missing the L2G sub-table".to_string())
-        })?
-        .lde_trace_main_merkle_root;
+    let l2g_root = l2g_proof.lde_trace_main_merkle_root;
 
     Ok(EpochProof {
-        proof,
+        vm_proof,
+        l2g_proof,
         public_output,
         table_counts,
         runtime_page_ranges,
@@ -558,8 +560,10 @@ fn verify_epoch(
     } else {
         FIXED_TABLE_COUNT - 1
     };
-    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != epoch.proof.proofs.len() {
+    // VM tables ride the batched lane (counted in vm_proof.per_table); the single
+    // L2G sub-table is a SEPARATE lane (l2g_proof), no longer a +1 here.
+    let expected_proof_count = epoch.table_counts.total() + fixed_tables;
+    if expected_proof_count != epoch.vm_proof.per_table.len() {
         return false;
     }
 
@@ -573,8 +577,9 @@ fn verify_epoch(
         is_final,
     );
     let l2g_air = l2g_memory_air(opts, label);
-    let mut refs = airs.air_refs();
-    refs.push(&l2g_air);
+    // VM tables only — L2G is verified as its own lane, NOT pushed into vm_refs.
+    let vm_refs = airs.air_refs();
+    let l2g_ref: AirRef = &l2g_air;
 
     let seed = || {
         epoch_transcript(
@@ -594,29 +599,39 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
-    let expected = match compute_expected_commit_bus_balance(
-        &refs,
-        &epoch.proof,
+    let expected = match compute_expected_commit_bus_balance_batched(
+        &vm_refs,
+        &epoch.vm_proof,
         &epoch.public_output,
         commit_start_index,
+        // The epoch transcript absorbs the L2G main root FIRST (mirrors
+        // `multi_prove_batched_epoch`) so the sampled LogUp `(z, alpha)` — and the
+        // expected COMMIT-bus offset — match the prover's. Empty output masks a
+        // mismatch (offset is zero regardless of the challenges).
+        Some(&epoch.l2g_root),
         &mut seed(),
     ) {
         Some(expected) => expected,
         None => return false,
     };
 
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
+    // Two-lane epoch verify: batched VM FRI + standalone L2G lane, woven through
+    // ONE transcript (L2G main root first, VM rounds 1-3, fork for L2G at the seam,
+    // then VM round 4). The expected COMMIT balance is shared across both lanes.
+    if !Verifier::batched_verify_epoch(
+        &vm_refs,
+        l2g_ref,
+        &epoch.vm_proof,
+        &epoch.l2g_proof,
+        &mut seed(),
+        &expected,
+    ) {
         return false;
     }
 
-    // The claimed L2G root must be the one this proof actually committed (it is what
-    // verify_l2g_commitment_binding later ties to the global proof).
-    epoch
-        .proof
-        .proofs
-        .last()
-        .map(|p| p.lde_trace_main_merkle_root)
-        == Some(epoch.l2g_root)
+    // The claimed L2G root must be the one the L2G lane actually committed (it is
+    // what verify_l2g_commitment_binding later ties to the global proof).
+    epoch.l2g_proof.lde_trace_main_merkle_root == epoch.l2g_root
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the

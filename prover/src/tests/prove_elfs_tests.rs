@@ -170,6 +170,7 @@ fn verify_vm_minimal(vm_proof: &VmProof, elf_bytes: &[u8]) -> bool {
         &vm_proof.proof,
         &vm_proof.public_output,
         0,
+        None,
         &mut replay_transcript,
     )
     .expect("fingerprint collision in test");
