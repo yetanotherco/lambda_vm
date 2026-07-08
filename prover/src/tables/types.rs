@@ -43,6 +43,40 @@ pub fn dword_wl(x: u64) -> [FE; 2] {
     [FE::from(x & 0xFFFF_FFFF), FE::from(x >> 32)]
 }
 
+/// Allocate a zeroed `Vec<FE>` via the allocator's calloc path (demand-zeroed OS
+/// pages, touched lazily on first write) instead of the element-wise clone loop
+/// that `vec![FE::zero(); n]` runs. Trace fill is memory-bandwidth-bound, so
+/// skipping the eager zeroing sweep of the (multi-GB) trace is a real win.
+///
+/// Sound because `FE` is `#[repr(transparent)]` over its `u64` base value
+/// (Goldilocks has no Montgomery form), so `FE`'s canonical zero is the all-zero
+/// bit pattern — identical to `0u64`. The `zeroed_fe_vec_matches_fe_zero` test
+/// guards this invariant. Technique borrowed from SP1's `zeroed_f_vec`.
+#[inline]
+pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
+    const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
+    const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
+    let zeros: Vec<u64> = vec![0u64; len];
+    // SAFETY: `FE` is `#[repr(transparent)]` over `u64` with identical size and
+    // alignment (asserted above), and `0u64` is exactly `FE::zero()`'s bit
+    // pattern (no Montgomery form), so reinterpreting the buffer is valid.
+    unsafe { core::mem::transmute::<Vec<u64>, Vec<FE>>(zeros) }
+}
+
+#[cfg(test)]
+mod zeroed_fe_vec_tests {
+    use super::*;
+
+    /// Guards the `zeroed_fe_vec` invariant: a calloc'd all-zero buffer
+    /// reinterpreted as `Vec<FE>` must equal an element-wise `FE::zero()` fill.
+    #[test]
+    fn zeroed_fe_vec_matches_fe_zero() {
+        for len in [0usize, 1, 7, 64, 1024] {
+            assert_eq!(zeroed_fe_vec(len), vec![FE::zero(); len], "len={len}");
+        }
+    }
+}
+
 /// Decompose a `u64` into its four little-endian 16-bit limbs as field elements:
 /// `[x[0..16], x[16..32], x[32..48], x[48..64]]` (the `DWordHL` column encoding).
 #[inline]
