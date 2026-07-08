@@ -730,6 +730,13 @@ fn test_l2g_filler_value_mismatch_rejects() {
     )
     .unwrap();
 
+    // Honest baseline balances before the forgery (guards against a
+    // reject-everything regression masking the forgery check).
+    assert!(
+        prove_verify_memory(&l2g_boundary, &l2g_boundary[..3]),
+        "baseline must verify before forgery"
+    );
+
     // Forge the filler row (row 3) to change its value between init and fini.
     let mut forged = generate_local_to_global_trace(&l2g_boundary);
     forged
@@ -762,6 +769,13 @@ fn test_l2g_filler_nonzero_fini_timestamp_rejects() {
     )
     .unwrap();
 
+    // Honest baseline balances before the forgery (guards against a
+    // reject-everything regression masking the forgery check).
+    assert!(
+        prove_verify_memory(&l2g_boundary, &l2g_boundary[..3]),
+        "baseline must verify before forgery"
+    );
+
     // Forge the filler row (row 3) to carry a nonzero fini timestamp.
     let mut forged = generate_local_to_global_trace(&l2g_boundary);
     forged
@@ -771,6 +785,109 @@ fn test_l2g_filler_nonzero_fini_timestamp_rejects() {
     assert!(
         !prove_verify_memory_with_trace(&mut forged, &l2g_boundary[..3]),
         "a filler with fini_timestamp != 0 must dangle on the Memory bus"
+    );
+}
+
+/// Companion to `test_l2g_filler_nonzero_fini_timestamp_rejects` covering the HIGH
+/// timestamp limb. `fini_timestamp` is split into two independent columns
+/// (`FINI_TIMESTAMP_LO`/`_HI`); forging only the HI limb (leaving LO = 0) still makes
+/// the filler's fini-send differ from its ts=0 init-receive, so both limbs must be
+/// pinned to 0 for a filler to self-cancel.
+#[test]
+fn test_l2g_filler_nonzero_fini_timestamp_hi_rejects() {
+    // 3 touched cells → one filler at row 3.
+    let mut provenance = local_to_global::genesis_provenance([(10u64, 5u64)]);
+    let mut l2g_boundary = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(0),
+        &[(10, 7, 3), (11, 8, 4), (12, 9, 5)],
+    );
+    local_to_global::append_bring_forward_fillers(
+        &mut l2g_boundary,
+        &mut provenance,
+        &[0],
+        local_to_global::epoch_label(0),
+    )
+    .unwrap();
+
+    // Honest baseline balances before the forgery.
+    assert!(
+        prove_verify_memory(&l2g_boundary, &l2g_boundary[..3]),
+        "baseline must verify before forgery"
+    );
+
+    // Forge the filler row (row 3) to carry a nonzero HIGH timestamp limb only.
+    let mut forged = generate_local_to_global_trace(&l2g_boundary);
+    forged
+        .main_table
+        .set(3, local_to_global::cols::FINI_TIMESTAMP_HI, FE::from(1u64));
+
+    assert!(
+        !prove_verify_memory_with_trace(&mut forged, &l2g_boundary[..3]),
+        "a filler with a nonzero fini_timestamp high limb must dangle on the Memory bus"
+    );
+}
+
+/// Symmetric to `test_l2g_filler_value_mismatch_rejects`: forging the filler's
+/// `INIT_VALUE` (rather than `FINI_VALUE`) likewise breaks self-cancellation. The
+/// init-receive token no longer equals the fini-send token, and an untouched cell has
+/// no MEMW partner for either → the bus dangles → reject.
+#[test]
+fn test_l2g_filler_init_value_mismatch_rejects() {
+    // 3 touched cells → one filler at row 3.
+    let mut provenance = local_to_global::genesis_provenance([(10u64, 5u64)]);
+    let mut l2g_boundary = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(0),
+        &[(10, 7, 3), (11, 8, 4), (12, 9, 5)],
+    );
+    local_to_global::append_bring_forward_fillers(
+        &mut l2g_boundary,
+        &mut provenance,
+        &[0],
+        local_to_global::epoch_label(0),
+    )
+    .unwrap();
+
+    // Honest baseline balances before the forgery.
+    assert!(
+        prove_verify_memory(&l2g_boundary, &l2g_boundary[..3]),
+        "baseline must verify before forgery"
+    );
+
+    // Forge the filler row (row 3) to change its value between fini and init.
+    let mut forged = generate_local_to_global_trace(&l2g_boundary);
+    forged
+        .main_table
+        .set(3, local_to_global::cols::INIT_VALUE, FE::from(0x33u64));
+
+    assert!(
+        !prove_verify_memory_with_trace(&mut forged, &l2g_boundary[..3]),
+        "a filler with init_value != fini_value must dangle on the Memory bus"
+    );
+}
+
+/// The `ContinuationFillerShortage` error surfaces with a descriptive message.
+/// Its production trigger — an epoch whose touched-cell count exceeds every distinct
+/// cell available to bring forward — is exercised at the unit level by
+/// `local_to_global::tests::test_append_fillers_reports_shortage_when_pool_too_small`.
+/// Driving it through a real `prove_continuation` would require an epoch touching
+/// more than a full page of distinct addresses, which is impractical here, so this
+/// test pins the variant's surfacing (the `Display` arm added with the selector-free
+/// filler design).
+#[test]
+fn test_continuation_filler_shortage_error_surfaces() {
+    let err = crate::Error::ContinuationFillerShortage(
+        "epoch 1 needs 4 local-to-global rows but only 3 could be filled".to_string(),
+    );
+    let msg = err.to_string();
+    assert!(
+        msg.contains("continuation local-to-global filler shortage"),
+        "unexpected message: {msg}"
+    );
+    assert!(
+        msg.contains("only 3 could be filled"),
+        "unexpected message: {msg}"
     );
 }
 
@@ -1075,6 +1192,50 @@ fn test_l2g_forged_filler_value_rejects_global_bus() {
     assert!(
         !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
         "a forged filler value must break the GlobalMemory telescoping chain"
+    );
+}
+
+/// Multi-epoch analog of `test_l2g_dropped_touched_row_rejects_memory_bus`, on the
+/// cross-epoch GlobalMemory bus. A cell touched in two consecutive epochs telescopes
+/// genesis → e0.fini → e1.init → e1.fini → program-end. Forging the EARLIER epoch's
+/// touched-cell fini value truncates that chain: the later epoch's init (built from
+/// the honest value) no longer consumes the forged e0 token, and the forged token has
+/// no consumer → the GlobalMemory bus cannot balance. The single-epoch Memory-bus
+/// drop test covers omission; this covers a broken cross-epoch link.
+#[test]
+fn test_l2g_truncated_touched_chain_rejects_global_bus() {
+    let mut provenance = local_to_global::genesis_provenance([(10u64, 5u64)]);
+    // Both epochs touch cell 10 (plus a second cell to keep each a power of two).
+    let epoch0 = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(0),
+        &[(10, 7, 3), (20, 9, 4)],
+    );
+    let epoch1 = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(1),
+        &[(10, 8, 10), (20, 5, 11)],
+    );
+    let boundaries = vec![epoch0, epoch1];
+
+    // Honest baseline balances.
+    assert!(
+        prove_and_verify(&boundaries),
+        "baseline multi-epoch chain must verify before forgery"
+    );
+
+    // Forge epoch 0's cell-10 fini value (row 0). The e0→e1 link for cell 10 is now
+    // broken: epoch 1's init still expects the honest value 7.
+    let mut epoch0_trace = generate_local_to_global_trace(&boundaries[0]);
+    epoch0_trace
+        .main_table
+        .set(0, local_to_global::cols::FINI_VALUE, FE::from(0x33u64));
+    let epoch1_trace = generate_local_to_global_trace(&boundaries[1]);
+    let mut l2g_traces = vec![epoch0_trace, epoch1_trace];
+
+    assert!(
+        !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
+        "truncating a touched cell's cross-epoch link must dangle on the GlobalMemory bus"
     );
 }
 
