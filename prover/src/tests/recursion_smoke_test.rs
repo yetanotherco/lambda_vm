@@ -33,8 +33,8 @@ fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
 
 /// Prove `inner_elf` under `opts` and build the guest's private-input blob via
 /// [`recursion::encode_guest_input`] (which precomputes the DECODE/page roots
-/// and postcard-encodes the [`recursion::GuestInput`] tuple). Returns the proof
-/// and the blob.
+/// and rkyv-encodes the [`crate::GuestInput`]). Returns the proof and the
+/// blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
@@ -55,7 +55,7 @@ fn prove_inner_and_encode_blob(
 
     let blob = recursion::encode_guest_input(&inner_proof, inner_elf, opts)
         .expect("recursion::encode_guest_input failed");
-    eprintln!("[{tag}] postcard blob: {} bytes", blob.len());
+    eprintln!("[{tag}] rkyv blob: {} bytes", blob.len());
     (inner_proof, blob)
 }
 
@@ -200,7 +200,7 @@ fn resolve_pc(symbols: &executor::elf::SymbolTable, pc: u64) -> String {
 /// so `multi_verify`'s per-table `3,4,5,6` repetition re-attributes cycles to
 /// the correct step on each table's `6->3` transition instead of latching at 6.
 const STEP_LABELS: [&str; 7] = [
-    "0. setup (alloc init + postcard decode)",
+    "0. setup (alloc init + blob prefix check)",
     "1. airs_and_bus_balance (Elf::load/VmAirs::new preprocessed FFT+Merkle/bus balance)",
     "2. multi_verify setup (transcript replay phase A/B, per-table fork)",
     "3. step 1: replay_rounds_after_round_1",
@@ -493,48 +493,42 @@ fn run_recursion_pipeline(
 fn test_recursion_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let (_inner, blob) =
+    let (inner, blob) =
         prove_inner_and_encode_blob("roundtrip", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
-    // Decode exactly as the guest does (built with the `min` feature).
-    let decoded: Result<recursion::GuestInput, _> = postcard::from_bytes(&blob);
-    let (vm_proof, inner_elf, decode_commitment, page_commitments) = match decoded {
-        Ok(t) => t,
-        Err(e) => panic!("[roundtrip] postcard DECODE failed (this is the guest panic): {e}"),
-    };
-    eprintln!(
-        "[roundtrip] decode ok: elf {} bytes, {} page commitments",
-        inner_elf.len(),
-        page_commitments.len(),
-    );
-
-    // Mirror the guest exactly: verify_and_attest over the supplied roots.
-    let attestation = match recursion::verify_and_attest(
-        &vm_proof,
-        &inner_elf,
-        &MIN_PROOF_OPTIONS,
-        decode_commitment,
-        &page_commitments,
-    ) {
+    // Mirror the guest exactly: decode + verify_and_attest_blob over the blob.
+    let attestation = match recursion::verify_and_attest_blob(&blob, &MIN_PROOF_OPTIONS) {
         Ok(Some(a)) => {
-            eprintln!("[roundtrip] verify_and_attest accepted — guest path is sound");
+            eprintln!("[roundtrip] verify_and_attest_blob accepted — guest path is sound");
             a
         }
         Ok(None) => panic!(
-            "[roundtrip] verify_and_attest returned None (guest hits the failed-verification expect) — proof did not survive the postcard round-trip"
+            "[roundtrip] verify_and_attest_blob returned None (guest hits the failed-verification expect) — proof did not survive the rkyv round-trip"
         ),
-        Err(e) => panic!("[roundtrip] verify_and_attest ERRORED (guest hits .expect): {e:?}"),
+        Err(e) => panic!("[roundtrip] verify_and_attest_blob ERRORED (guest hits .expect): {e:?}"),
     };
 
     // Consumer check: the committed attestation must bind to the trusted inner
     // ELF and carry the inner proof's public output.
-    let output = recursion::check_attestation(&attestation, &inner_elf, &MIN_PROOF_OPTIONS)
+    let output = recursion::check_attestation(&attestation, &empty_elf_bytes, &MIN_PROOF_OPTIONS)
         .expect("check_attestation errored")
         .expect("attestation must match the trusted inner ELF (program_id recompute+compare)");
     assert_eq!(
-        output, vm_proof.public_output,
+        output, inner.public_output,
         "attested public output must equal the inner proof's public output"
     );
+
+    // Host buffers carry no alignment guarantee, so `verify_recursion_blob`
+    // must accept the blob at any base alignment (falling back to an aligned
+    // copy when needed). The plain call above already exercises the common
+    // misaligned case (`Vec` base + 12-byte prefix → 4-aligned archive);
+    // shifting the base by 4 covers another residue class.
+    let mut padded: Vec<u8> = Vec::with_capacity(blob.len() + 4);
+    padded.extend_from_slice(&[0u8; 4]);
+    padded.extend_from_slice(&blob);
+    let v = crate::verify_recursion_blob(&padded[4..], &MIN_PROOF_OPTIONS)
+        .expect("verify_recursion_blob errored on misaligned buffer");
+    assert!(v.ok, "misaligned-buffer verify must also succeed");
 }
 
 /// Corrupting a private-input commitment on an *honest* proof makes
