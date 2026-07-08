@@ -57,10 +57,22 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
     const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
     let zeros: Vec<u64> = vec![0u64; len];
+    // Reinterpret the buffer as `Vec<FE>` via its raw parts rather than
+    // `mem::transmute::<Vec<u64>, Vec<FE>>`. `Vec`'s field layout is unspecified
+    // and may depend on its element type, so transmuting one `Vec` to another
+    // relies on that unspecified layout (the std `mem::transmute` docs call this
+    // out and recommend `from_raw_parts`). Rebuilding from `(ptr, len, cap)`
+    // reuses the same allocation and carries no `Vec`-layout assumption.
+    let mut zeros = core::mem::ManuallyDrop::new(zeros);
     // SAFETY: `FE` is `#[repr(transparent)]` over `u64` with identical size and
     // alignment (asserted above), and `0u64` is exactly `FE::zero()`'s bit
-    // pattern (no Montgomery form), so reinterpreting the buffer is valid.
-    unsafe { core::mem::transmute::<Vec<u64>, Vec<FE>>(zeros) }
+    // pattern (Goldilocks has no Montgomery form), so the zeroed `u64` buffer is
+    // a valid `[FE]` of all `FE::zero()`. `len`/`capacity` are element counts and
+    // the element sizes are equal, so they carry over unchanged; the eventual
+    // dealloc uses the same `size * capacity` and alignment as the original
+    // allocation. `ManuallyDrop` stops the source `Vec` from freeing the buffer
+    // that the returned `Vec` now owns.
+    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
 }
 
 #[cfg(test)]
