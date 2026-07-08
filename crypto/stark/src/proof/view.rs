@@ -8,8 +8,8 @@
 //! with no serialization and no logic duplication.
 
 use crate::config::Commitment;
-use crate::fri::fri_decommit::{ArchivedFriDecommitment, FriDecommitment};
 use crate::frame::Frame;
+use crate::fri::fri_decommit::{ArchivedFriDecommitment, FriDecommitment};
 use crate::proof::stark::{
     ArchivedDeepPolynomialOpening, ArchivedPolynomialOpenings, ArchivedStarkProof,
     DeepPolynomialOpening, PolynomialOpenings, StarkProof,
@@ -138,7 +138,10 @@ where
 
     pub fn aux_trace_polys(&self) -> Option<PolynomialOpeningsView<'a, E>> {
         match self {
-            Self::Owned(p) => p.aux_trace_polys.as_ref().map(PolynomialOpeningsView::Owned),
+            Self::Owned(p) => p
+                .aux_trace_polys
+                .as_ref()
+                .map(PolynomialOpeningsView::Owned),
             Self::Archived(p) => p
                 .aux_trace_polys
                 .as_ref()
@@ -407,7 +410,10 @@ where
     /// out (it's a single field element, not worth a dedicated view type).
     pub fn bus_table_contribution(&self) -> Option<FieldElement<E>> {
         match self {
-            Self::Owned(p) => p.bus_public_inputs.as_ref().map(|b| b.table_contribution.clone()),
+            Self::Owned(p) => p
+                .bus_public_inputs
+                .as_ref()
+                .map(|b| b.table_contribution.clone()),
             Self::Archived(p) => p
                 .bus_public_inputs
                 .as_ref()
@@ -430,7 +436,9 @@ where
     {
         match self {
             Self::Owned(p) => Some(p.public_inputs.clone()),
-            Self::Archived(p) => rkyv::deserialize::<PI, rkyv::rancor::Error>(&p.public_inputs).ok(),
+            Self::Archived(p) => {
+                rkyv::deserialize::<PI, rkyv::rancor::Error>(&p.public_inputs).ok()
+            }
         }
     }
 }

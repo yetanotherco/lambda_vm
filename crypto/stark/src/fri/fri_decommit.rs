@@ -5,7 +5,13 @@ use math::field::traits::IsField;
 use crate::config::Commitment;
 
 #[derive(
-    Debug, Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 #[serde(bound = "")]
 pub struct FriDecommitment<F: IsField> {

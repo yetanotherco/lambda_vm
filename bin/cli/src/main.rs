@@ -784,17 +784,16 @@ fn cmd_verify_continuation(
             return ExitCode::FAILURE;
         }
     };
-    let bundle: prover::continuation::ContinuationProof = match rkyv::from_bytes::<
-        prover::continuation::ContinuationProof,
-        rkyv::rancor::Error,
-    >(&proof_bytes)
-    {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to deserialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let bundle: prover::continuation::ContinuationProof =
+        match rkyv::from_bytes::<prover::continuation::ContinuationProof, rkyv::rancor::Error>(
+            &proof_bytes,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to deserialize proof: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
         Ok(opts) => opts,

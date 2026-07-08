@@ -301,9 +301,8 @@ pub fn verify_recursion_blob<'a>(
     // precisely so the archive lands aligned at
     // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
     // loads do not trap.
-    let archive_bytes = recursion_archive_bytes(blob).ok_or_else(|| {
-        Error::Execution(String::from("recursion blob: bad magic or version"))
-    })?;
+    let archive_bytes = recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
 
     // A host caller's buffer carries no alignment guarantee (`Vec<u8>` is
     // align-1) — in-place access there would be UB. Fall back to one aligned
@@ -337,9 +336,11 @@ pub fn verify_recursion_blob<'a>(
         RkyvError,
     >(&archived.vm_proof.runtime_page_ranges)
     .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
-    let page_commitments: Vec<(u64, Commitment)> =
-        rkyv::deserialize::<Vec<(u64, Commitment)>, RkyvError>(&archived.page_commitments)
-            .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
     let num_private_input_pages = archived.vm_proof.num_private_input_pages.to_native() as usize;
     // Bytes read straight from the archived buffer (zero-copy).
     let inner_elf: &[u8] = archived.inner_elf.as_slice();
@@ -1255,8 +1256,12 @@ pub fn verify_with_options(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
-    let views: Vec<StarkProofView<F, E, ()>> =
-        vm_proof.proof.proofs.iter().map(StarkProofView::Owned).collect();
+    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
+        .proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
 
     verify_proof_parts(
         &views,

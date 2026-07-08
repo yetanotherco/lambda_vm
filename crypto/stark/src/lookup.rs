@@ -1499,7 +1499,13 @@ impl BusInteraction {
 /// For the circular constraint, `table_contribution / N` is the per-row offset
 /// that makes the accumulated column wrap to zero at row N-1.
 #[derive(
-    Debug, Clone, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 #[serde(bound = "")]
 pub struct BusPublicInputs<E>
