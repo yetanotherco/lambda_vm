@@ -1809,6 +1809,36 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Build a [`PolynomialOpenings`] from a device Merkle proof and a pair of
+    /// row-value vectors already gathered off the resident device LDE — the
+    /// fully device-sourced counterpart of [`Self::open_polys_with_proofs`],
+    /// which still reads its evaluations from the host LDE.
+    #[cfg(feature = "cuda")]
+    fn open_polys_from_values<C: IsField>(
+        proof: Proof<Commitment>,
+        evaluations: Vec<FieldElement<C>>,
+        evaluations_sym: Vec<FieldElement<C>>,
+    ) -> PolynomialOpenings<C> {
+        PolynomialOpenings {
+            proof,
+            evaluations,
+            evaluations_sym,
+        }
+    }
+
+    /// Slice out query `qi`'s even/odd row (each `ncols` field elements) from the
+    /// row-major device gather `[even(q0), odd(q0), even(q1), odd(q1), ...]`.
+    #[cfg(feature = "cuda")]
+    fn device_row_pair<C: IsField>(
+        vals: &[FieldElement<C>],
+        qi: usize,
+        ncols: usize,
+    ) -> (Vec<FieldElement<C>>, Vec<FieldElement<C>>) {
+        let even = vals[(2 * qi) * ncols..(2 * qi + 1) * ncols].to_vec();
+        let odd = vals[(2 * qi + 1) * ncols..(2 * qi + 2) * ncols].to_vec();
+        (even, odd)
+    }
+
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
@@ -1827,6 +1857,23 @@ pub trait IsStarkProver<
         let is_preprocessed = main_commit.is_preprocessed();
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
+
+        // Row-pair LDE positions for every query, `[even(q0), odd(q0), ...]`.
+        // Each query opens the leaf at `challenge`, which pairs LDE rows
+        // `reverse_index(2·challenge)` (the queried point) and
+        // `reverse_index(2·challenge+1)` (its symmetric `-x` point).
+        #[cfg(feature = "cuda")]
+        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        #[cfg(feature = "cuda")]
+        let query_rows: Vec<u32> = indexes_to_open
+            .iter()
+            .flat_map(|&c| {
+                [
+                    reverse_index(c * 2, domain_size) as u32,
+                    reverse_index(c * 2 + 1, domain_size) as u32,
+                ]
+            })
+            .collect();
 
         // R4 trace proofs from the resident device trees, gathered in one batch
         // over all query positions instead of walking the host trees (byte
@@ -1882,6 +1929,45 @@ pub trait IsStarkProver<
                 )
             });
 
+        // Full-residency Stage 2: gather each query's row-pair straight off the
+        // resident device LDE (a small D2H of only the queried rows), instead of
+        // indexing the full host LDE trace. The host trace is still resident this
+        // stage and every device row is cross-checked against it in the loop
+        // below; Stage 3 drops the host copy once this path is proven. `None`
+        // when the LDE is not device resident or the tower is not Goldilocks (→
+        // host gather). Row-major: `q`-th row's columns at `[q*ncols ..]`.
+        // Gate the value gathers on the corresponding device-tree proofs so the
+        // two device arms stay aligned (`*_dev_proofs.is_some() ⇔
+        // *_dev_values.is_some()` on the Goldilocks path) and we never gather
+        // rows for a tree that is not device resident.
+        #[cfg(feature = "cuda")]
+        let main_dev_values: Option<Vec<FieldElement<Field>>> =
+            main_dev_proofs.as_ref().and_then(|_| {
+                lde_trace.gpu_main().and_then(|h| {
+                    let stream = lde_trace
+                        .bound_stream()
+                        .expect("bound stream for device-resident main-row gather");
+                    let raw =
+                        math_cuda::barycentric::gather_rows_base_on_device(h, &query_rows, &stream)
+                            .expect("device main-row gather failed");
+                    crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
+                })
+            });
+
+        #[cfg(feature = "cuda")]
+        let aux_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
+            aux_dev_proofs.as_ref().and_then(|_| {
+                lde_trace.gpu_aux().and_then(|h| {
+                    let stream = lde_trace
+                        .bound_stream()
+                        .expect("bound stream for device-resident aux-row gather");
+                    let raw =
+                        math_cuda::barycentric::gather_rows_ext3_on_device(h, &query_rows, &stream)
+                            .expect("device aux-row gather failed");
+                    crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(&raw)
+                })
+            });
+
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
@@ -1895,9 +1981,29 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &main_dev_proofs {
-                        Self::open_polys_with_proofs(domain, proofs[qi].clone(), *index, |row| {
-                            lde_trace.gather_main_row(row)
-                        })
+                        let proof = proofs[qi].clone();
+                        if let Some(dev_vals) = &main_dev_values {
+                            let (even, odd) = Self::device_row_pair(dev_vals, qi, total_cols);
+                            // Cross-check the device gather against the (still
+                            // resident) host LDE before trusting it in the proof.
+                            let r_even = reverse_index(*index * 2, domain_size);
+                            let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                            assert_eq!(
+                                even,
+                                lde_trace.gather_main_row(r_even),
+                                "device main-row gather mismatch (even), query {qi}"
+                            );
+                            assert_eq!(
+                                odd,
+                                lde_trace.gather_main_row(r_odd),
+                                "device main-row gather mismatch (odd), query {qi}"
+                            );
+                            Self::open_polys_from_values(proof, even, odd)
+                        } else {
+                            Self::open_polys_with_proofs(domain, proof, *index, |row| {
+                                lde_trace.gather_main_row(row)
+                            })
+                        }
                     } else {
                         Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
                             lde_trace.gather_main_row(row)
@@ -1950,9 +2056,28 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &aux_dev_proofs {
-                        Self::open_polys_with_proofs(domain, proofs[qi].clone(), *index, |row| {
-                            lde_trace.gather_aux_row(row)
-                        })
+                        let proof = proofs[qi].clone();
+                        if let Some(dev_vals) = &aux_dev_values {
+                            let ncols = lde_trace.num_aux_cols();
+                            let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
+                            let r_even = reverse_index(*index * 2, domain_size);
+                            let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                            assert_eq!(
+                                even,
+                                lde_trace.gather_aux_row(r_even),
+                                "device aux-row gather mismatch (even), query {qi}"
+                            );
+                            assert_eq!(
+                                odd,
+                                lde_trace.gather_aux_row(r_odd),
+                                "device aux-row gather mismatch (odd), query {qi}"
+                            );
+                            Self::open_polys_from_values(proof, even, odd)
+                        } else {
+                            Self::open_polys_with_proofs(domain, proof, *index, |row| {
+                                lde_trace.gather_aux_row(row)
+                            })
+                        }
                     } else {
                         Self::open_polys_with(domain, &aux.tree, *index, |row| {
                             lde_trace.gather_aux_row(row)
