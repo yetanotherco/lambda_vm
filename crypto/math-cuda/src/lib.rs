@@ -1,8 +1,9 @@
 //! GPU backend for the lambda-vm STARK prover.
 //!
-//! Primary entry point: [`lde::coset_lde_base`]. Everything else (`ntt`,
-//! element-wise arith) is either internal to the LDE pipeline or used by the
-//! parity test suite.
+//! Primary entry points: [`lde::coset_lde_base`] for the LDE pipeline and
+//! [`logup::logup_aux_resident`] for the device-resident LogUp aux build.
+//! Everything else (`ntt`, element-wise arith) is either internal to those
+//! pipelines or used by the parity test suite.
 
 pub mod barycentric;
 pub mod deep;
@@ -10,6 +11,7 @@ pub mod device;
 pub mod fri;
 pub mod inverse;
 pub mod lde;
+pub mod logup;
 pub mod merkle;
 pub mod ntt;
 

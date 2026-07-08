@@ -76,11 +76,20 @@ pub fn reset_all_gpu_call_counters() {
     GPU_DEEP_CALLS.store(0, Ordering::Relaxed);
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
+    GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_extend_halves_calls() -> u64 {
     GPU_EXTEND_HALVES_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful LogUp aux-build GPU dispatches (one per table that took either
+/// the resident or the term-column path; failed attempts fall back to CPU and
+/// are not counted).
+pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_logup_calls() -> u64 {
+    GPU_LOGUP_CALLS.load(Ordering::Relaxed)
 }
 
 // ============================================================================
@@ -1101,10 +1110,65 @@ unsafe fn ext3_slice_to_u64<E: IsField>(col: &[FieldElement<E>]) -> &[u64] {
     unsafe { from_raw_parts(ptr, len) }
 }
 
+/// Like [`try_expand_leaf_and_tree_ext3_row_major_keep`] but the aux columns are
+/// already resident on device (from the GPU LogUp aux build) — no host upload.
+/// The resident buffer is only borrowed: the device-input LDE copies it
+/// device-to-device into its own scratch, so `ra` stays valid afterwards.
+pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
+    ra: &math_cuda::logup::ResidentAux,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeExt3,
+    Vec<FieldElement<E>>,
+)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>()
+    {
+        return None;
+    }
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add((ra.num_aux_cols * 3) as u64, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+        &ra.buf,
+        ra.num_rows,
+        ra.num_aux_cols,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
+
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        debug_assert!(
+            v.len() % 3 == 0 && v.capacity() % 3 == 0,
+            "lde_u64 len/capacity must be a multiple of 3 for Fp3 reinterpret"
+        );
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len() / 3,
+            v.capacity() / 3,
+        )
+    };
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
+    Some((tree, handle, lde_out))
+}
+
 /// Convert ext3 evals (3*n u64s, interleaved) into a freshly allocated
 /// `Vec<FieldElement<E>>` of length `n`. Caller must have established
 /// `E == Ext3`.
-fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
+pub(crate) fn u64_to_ext3_vec<E>(raw: &[u64]) -> Vec<FieldElement<E>>
 where
     E: IsField + 'static,
 {
@@ -1567,22 +1631,27 @@ where
 /// concrete transcript type to support snapshot semantics via `Clone`.
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E, T>(
-    number_layers: usize,
     evals: &[FieldElement<E>],
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
+    blowup_log: u32,
+    final_poly_log_degree: u32,
 ) -> Option<(
-    FieldElement<E>,
+    Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
 )>
 where
     F: IsFFTField + IsField + IsSubFieldOf<E> + 'static,
-    E: IsField + 'static,
+    E: IsField + 'static + Send + Sync,
     FieldElement<F>: AsBytes,
     FieldElement<E>: AsBytes,
     T: IsStarkTranscript<E, F> + Clone,
 {
+    // GPU drives the early-termination FRI commit phase, mirroring
+    // `commit_phase_from_evaluations`: for each committed layer (sample zeta,
+    // fold, append root); then one final fold to the terminal codeword whose
+    // coefficients are emitted (not a single value).
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
         return None;
     }
@@ -1624,11 +1693,25 @@ where
     // produced had this dispatch never been called.
     let transcript_snapshot = transcript.clone();
 
-    let num_committed_layers = number_layers.saturating_sub(1);
+    // Fold layout, shared with the CPU prover and the verifier — see `FriFoldLayout`.
+    let layout = crate::fri::terminal::FriFoldLayout::new(
+        n0.trailing_zeros(),
+        blowup_log,
+        final_poly_log_degree,
+    );
+    // The GPU path only runs above gpu_lde_threshold(). Two cases fall back to
+    // the CPU path (which handles both correctly): tiny clamped traces
+    // (total_folds == 0), and terminal_len == 1 (blowup_log + k == 0), whose
+    // final fold would reach n_out == 1 and trip `fold_and_commit_layer`'s
+    // `n_out >= 2` assert. The final fold below is therefore always n_out >= 2.
+    if layout.total_folds == 0 || layout.terminal_len < 2 {
+        return None;
+    }
+    let num_committed = layout.num_committed;
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
-        Vec::with_capacity(num_committed_layers);
+        Vec::with_capacity(num_committed);
 
-    for _ in 0..num_committed_layers {
+    for _ in 0..num_committed {
         // <<<< Receive challenge zeta_k
         let zeta: FieldElement<E> = transcript.sample_field_element();
         // SAFETY: E == Ext3.
@@ -1657,29 +1740,38 @@ where
         transcript.append_bytes(&root);
     }
 
-    // <<<< Receive challenge zeta_{n-1}
-    let zeta_last: FieldElement<E> = transcript.sample_field_element();
-    let zeta_ptr = &zeta_last as *const FieldElement<E> as *const u64;
+    // Final (uncommitted) fold to the terminal codeword. n_out == terminal_len
+    // >= 2, so reuse fold_and_commit_layer and keep only its evaluations; the
+    // Merkle root/nodes are discarded (the terminal layer is sent as coeffs).
+    let zeta_final: FieldElement<E> = transcript.sample_field_element();
+    let zeta_ptr = &zeta_final as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let last_raw = match state.fold_final(zeta_raw) {
+    let (terminal_evals_u64, _tree) = match state.fold_and_commit_layer(zeta_raw) {
         Ok(v) => v,
         Err(_) => {
             *transcript = transcript_snapshot;
             return None;
         }
     };
-    let last_vec = u64_to_ext3_vec::<E>(&last_raw);
-    let last_value = last_vec
-        .into_iter()
-        .next()
-        .expect("fold_final returns 1 elt");
+    debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
+    let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
 
-    // >>>> Send value: p_n
-    transcript.append_field_element(&last_value);
+    // CPU-side coefficient extraction, identical to commit_phase_from_evaluations.
+    let terminal_offset = coset_offset.pow(1u64 << layout.total_folds);
+    let final_poly_coeffs = crate::fri::terminal::coeffs_from_terminal_codeword::<F, E>(
+        &terminal_codeword,
+        &terminal_offset,
+        layout.effective_k,
+    );
+
+    // >>>> Send the final polynomial coefficients.
+    for c in &final_poly_coeffs {
+        transcript.append_field_element(c);
+    }
 
     GPU_FRI_CALLS.fetch_add(1, Ordering::Relaxed);
-    Some((last_value, fri_layer_list))
+    Some((final_poly_coeffs, fri_layer_list))
 }
 
 /// GPU FRI query phase: gather each layer's paths on device instead of walking

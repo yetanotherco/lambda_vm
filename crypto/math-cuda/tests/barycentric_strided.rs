@@ -50,6 +50,8 @@ fn run_base(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
         m: num_cols,
         lde_size,
         tree: None,
+        trace_dev: None,
+        trace_rows: 0,
     };
 
     // Pre-strided buffer for non-strided reference: trace-size picks of each col.

@@ -114,7 +114,7 @@ const LOGUP_CHUNK_SIZE: usize = 1024;
 /// Returns `(num_committed_pairs, absorbed_count)` where:
 /// - Committed pairs get dedicated auxiliary term columns (2 interactions per column)
 /// - Absorbed interactions (1 or 2) are folded into the accumulated constraint
-fn split_interactions(num_interactions: usize) -> (usize, usize) {
+pub(crate) fn split_interactions(num_interactions: usize) -> (usize, usize) {
     if num_interactions <= 2 {
         (0, num_interactions)
     } else if num_interactions % 2 == 1 {
@@ -971,8 +971,8 @@ impl<
 
 impl<F, E, B, PI, CS> crate::traits::AIR for AirWithBuses<F, E, B, PI, CS>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
-    E: IsField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
+    E: IsField + Send + Sync + 'static,
     B: BoundaryConstraintBuilder<F, E, PI>,
     PI: Send + Sync,
     CS: ConstraintSet<F, E>,
@@ -1109,6 +1109,13 @@ where
         let trace_len = trace.num_rows();
         let _table_name = self.name.as_deref().unwrap_or("UNKNOWN");
 
+        // Device-resident trace-domain main columns from the R1 main LDE, cloned
+        // (Arc, cheap) into a local so no borrow of `trace` is held across the
+        // `set_aux_resident` mutable borrow below. When present, the resident aux
+        // build reads them in place and skips the ~3 GB main re-upload.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        let resident_main = trace.main_trace_dev.clone();
+
         // Split interactions: committed pairs get term columns, last 1-2 are absorbed (virtual)
         let (num_committed_pairs, absorbed_count) = split_interactions(num_interactions);
 
@@ -1121,49 +1128,91 @@ where
         // tables with many interactions.
         // Without `parallel`: sequential over pairs, sequential over rows.
         let interactions = &self.auxiliary_trace_build_data.interactions;
-        let build_pair = |i: usize| {
-            compute_logup_term_column(
-                &[&interactions[i * 2], &interactions[i * 2 + 1]],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
-        };
 
-        #[cfg(feature = "parallel")]
-        let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE {
-            (0..num_committed_pairs)
-                .into_par_iter()
-                .map(build_pair)
-                .collect()
-        } else {
-            (0..num_committed_pairs).map(build_pair).collect()
-        };
-        #[cfg(not(feature = "parallel"))]
-        let committed_columns: Vec<Vec<FieldElement<E>>> =
-            (0..num_committed_pairs).map(build_pair).collect();
+        // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
+        // debug-checks): build the aux columns on device and keep them resident
+        // for the aux LDE (no term-column download). Returns the table
+        // contribution; the host set_aux + CPU accumulate below are skipped.
+        #[cfg(all(feature = "cuda", not(feature = "debug-checks")))]
+        if trace.resident_aux_ok()
+            && let Some(ra) = crate::logup_gpu::try_build_aux_resident_gpu::<F, E>(
+                interactions,
+                &main_segment_cols,
+                resident_main.as_ref().map(|r| (r.buf.as_ref(), r.rows)),
+                trace_len,
+                challenges,
+            )
+        {
+            let table_contribution = crate::gpu_lde::u64_to_ext3_vec::<E>(&ra.table_contribution)
+                .pop()
+                .expect("one ext3 element");
+            trace.set_aux_resident(ra);
+            return Some(BusPublicInputs { table_contribution });
+        }
 
-        // Virtual column for absorbed interactions (NOT written to trace).
-        let virtual_column = if absorbed_count == 2 {
-            compute_logup_term_column(
-                &[
-                    &interactions[num_interactions - 2],
-                    &interactions[num_interactions - 1],
-                ],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
-        } else {
-            compute_logup_term_column(
-                &[&interactions[num_interactions - 1]],
-                &main_segment_cols,
-                trace_len,
-                challenges,
-                _table_name,
-            )
+        // GPU aux build (Goldilocks + ext3 + above threshold) computes all term
+        // columns on device, byte identical, and falls back to the CPU build.
+        #[cfg(feature = "cuda")]
+        let gpu_term_cols = crate::logup_gpu::try_build_term_columns_gpu::<F, E>(
+            interactions,
+            &main_segment_cols,
+            trace_len,
+            challenges,
+        );
+        #[cfg(not(feature = "cuda"))]
+        #[allow(clippy::type_complexity)]
+        let gpu_term_cols: Option<(Vec<Vec<FieldElement<E>>>, Vec<FieldElement<E>>)> = None;
+
+        let (committed_columns, virtual_column) = match gpu_term_cols {
+            Some(cols) => cols,
+            None => {
+                let build_pair = |i: usize| {
+                    compute_logup_term_column(
+                        &[&interactions[i * 2], &interactions[i * 2 + 1]],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                };
+
+                #[cfg(feature = "parallel")]
+                let committed_columns: Vec<Vec<FieldElement<E>>> = if trace_len <= LOGUP_CHUNK_SIZE
+                {
+                    (0..num_committed_pairs)
+                        .into_par_iter()
+                        .map(build_pair)
+                        .collect()
+                } else {
+                    (0..num_committed_pairs).map(build_pair).collect()
+                };
+                #[cfg(not(feature = "parallel"))]
+                let committed_columns: Vec<Vec<FieldElement<E>>> =
+                    (0..num_committed_pairs).map(build_pair).collect();
+
+                // Virtual column for absorbed interactions (NOT written to trace).
+                let virtual_column = if absorbed_count == 2 {
+                    compute_logup_term_column(
+                        &[
+                            &interactions[num_interactions - 2],
+                            &interactions[num_interactions - 1],
+                        ],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                } else {
+                    compute_logup_term_column(
+                        &[&interactions[num_interactions - 1]],
+                        &main_segment_cols,
+                        trace_len,
+                        challenges,
+                        _table_name,
+                    )
+                };
+                (committed_columns, virtual_column)
+            }
         };
 
         // Write only committed columns to trace
@@ -1338,7 +1387,7 @@ impl Multiplicity {
 
     /// Evaluate the multiplicity for a single row of column-major main data.
     #[inline]
-    fn evaluate_at_row<F: IsField>(
+    pub(crate) fn evaluate_at_row<F: IsField>(
         &self,
         main_segment_cols: &[Vec<FieldElement<F>>],
         row: usize,
@@ -1544,6 +1593,8 @@ where
 
     let process_chunk = |chunk_start: usize, result_chunk: &mut [FieldElement<E>]| {
         let chunk_len = result_chunk.len();
+        #[cfg(feature = "instruments")]
+        let _t0 = std::time::Instant::now();
 
         // Phase 1 — fingerprints, laid out as [int_0 rows…, int_1 rows…].
         // fp[k*chunk_len + i] = interaction k at row chunk_start+i.
@@ -1595,10 +1646,14 @@ where
             }
         }
 
+        #[cfg(feature = "instruments")]
+        let _t1 = std::time::Instant::now();
         // Phase 2: batch invert
         FieldElement::inplace_batch_inverse(&mut fingerprints)
             .expect("fingerprint is zero - probability of sampling zero is negligible");
 
+        #[cfg(feature = "instruments")]
+        let _t2 = std::time::Instant::now();
         // Phase 3: Compute terms
         for (i, result_elem) in result_chunk.iter_mut().enumerate() {
             let row = chunk_start + i;
@@ -1612,6 +1667,8 @@ where
             }
             *result_elem = acc;
         }
+        #[cfg(feature = "instruments")]
+        crate::instruments::accum_aux_term(_t1 - _t0, _t2 - _t1, std::time::Instant::now() - _t2);
     };
 
     #[cfg(feature = "parallel")]
@@ -1646,6 +1703,8 @@ where
         return FieldElement::zero();
     }
     let trace_len = term_columns[0].len();
+    #[cfg(feature = "instruments")]
+    let _t_acc = std::time::Instant::now();
 
     // Compute L = sum of all terms across all rows
     let mut table_contribution = FieldElement::<E>::zero();
@@ -1670,6 +1729,8 @@ where
         trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
 
+    #[cfg(feature = "instruments")]
+    crate::instruments::accum_aux_accumulate(std::time::Instant::now() - _t_acc);
     table_contribution
 }
 

@@ -97,6 +97,7 @@ const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx")
 const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
+const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -179,6 +180,13 @@ pub struct Backend {
     pub block_inclusive_scan_rev_ext3: CudaFunction,
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
+    pub logup_fingerprint_ext3: CudaFunction,
+    pub logup_term_ext3: CudaFunction,
+    pub logup_row_sum_ext3: CudaFunction,
+    pub logup_scan_block_add_ext3: CudaFunction,
+    pub logup_apply_offsets_add_ext3: CudaFunction,
+    pub logup_finalize_accum_ext3: CudaFunction,
+    pub logup_assemble_aux_ext3: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -257,9 +265,11 @@ impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
-        // per alloc and serialises under the context lock. We never share
-        // slices across streams (every call scopes its own buffers and syncs
-        // before returning), so the tracking is pure overhead. Disable it.
+        // per alloc and serialises under the context lock. Slices are only
+        // shared across streams after the producing stream has been host-
+        // synchronised (e.g. the retained trace snapshot and the resident
+        // LogUp aux buffer; every producer syncs before its handle escapes),
+        // so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
 
         // Retain freed device memory in the stream ordered pool for reuse.
@@ -280,6 +290,7 @@ impl Backend {
         let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
+        let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -360,6 +371,13 @@ impl Backend {
                 .load_function("block_inclusive_scan_rev_ext3")?,
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            logup_fingerprint_ext3: logup.load_function("logup_fingerprint_ext3")?,
+            logup_term_ext3: logup.load_function("logup_term_ext3")?,
+            logup_row_sum_ext3: logup.load_function("logup_row_sum_ext3")?,
+            logup_scan_block_add_ext3: logup.load_function("logup_scan_block_add_ext3")?,
+            logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
+            logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
+            logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

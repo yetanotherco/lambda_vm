@@ -127,7 +127,7 @@ jobs:
   test:
     name: Test
     if: always()
-    needs: [test-executor, test-cli, test-prover, test-disk-spill]
+    needs: [test-executor, test-cli, test-prover, test-disk-spill, test-stark-cuda-lib]
     runs-on: ubuntu-latest
     steps:
       - name: Check results
@@ -136,11 +136,13 @@ jobs:
           cli="${{ needs.test-cli.result }}"
           prover="${{ needs.test-prover.result }}"
           disk_spill="${{ needs.test-disk-spill.result }}"
+          stark_cuda_lib="${{ needs.test-stark-cuda-lib.result }}"
 
           echo "test-executor: $executor"
           echo "test-cli: $cli"
           echo "test-prover: $prover"
           echo "test-disk-spill: $disk_spill"
+          echo "test-stark-cuda-lib: $stark_cuda_lib"
 
           # Allow "success" or "skipped" (skipped on merge queue pushes)
           if [[ "$executor" != "success" && "$executor" != "skipped" ]]; then
@@ -153,6 +155,9 @@ jobs:
             exit 1
           fi
           if [[ "$disk_spill" != "success" && "$disk_spill" != "skipped" ]]; then
+            exit 1
+          fi
+          if [[ "$stark_cuda_lib" != "success" && "$stark_cuda_lib" != "skipped" ]]; then
             exit 1
           fi
 
@@ -214,6 +219,33 @@ jobs:
           FORCE_DISK_SPILL: "1"
         run: |
           cargo test --release -p lambda-vm-prover --features disk-spill -- disk_spill count_table_lengths
+
+  test-stark-cuda-lib:
+    name: Stark cuda-feature lib tests
+    runs-on: ubuntu-latest
+    if: github.event_name != 'push' || github.actor != 'github-merge-queue[bot]'
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
+
+      - name: Setup Rust Environment
+        uses: ./.github/actions/setup-rust
+
+      - name: Cache cargo build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "lambda-vm-stark-cuda-lib"
+          cache-all-crates: "true"
+
+      # The cuda feature gates the logup_gpu module, whose descriptor /
+      # CPU-mirror parity tests are pure CPU (they never touch the driver).
+      # Without nvcc the kernels build as empty PTX stubs, so these run on a
+      # plain runner; GPU-dependent tests are #[ignore] and stay skipped.
+      # Scoped to logup_gpu: the rest of the cuda-feature lib suite dispatches
+      # to the GPU and needs the CUDA driver.
+      - name: Run stark logup_gpu parity tests (no GPU required)
+        run: |
+          cargo test --release -p stark --features cuda --lib logup_gpu
 
   build-prover-tests:
     name: Build prover tests
