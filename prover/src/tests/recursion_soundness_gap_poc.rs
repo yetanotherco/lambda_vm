@@ -34,6 +34,7 @@ const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
 fn workspace_root() -> PathBuf {
@@ -166,8 +167,15 @@ fn custom_prove_with_statement_elf(
     let result = executor.run().expect("run failed");
 
     let max_rows = MaxRowsConfig::default();
-    let mut traces = Traces::from_elf_and_logs(&program, &result.logs, &max_rows, &[])
-        .expect("trace build failed");
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        &max_rows,
+        &[],
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("trace build failed");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -199,10 +207,16 @@ fn custom_prove_with_statement_elf(
         &table_counts,
         num_private_input_pages,
         &runtime_page_ranges,
+        opts.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(airs.air_trace_pairs(&mut traces), &mut transcript)
-        .expect("multi_prove failed");
+    let proof = Prover::multi_prove(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    )
+    .expect("multi_prove failed");
 
     VmProof {
         proof,
