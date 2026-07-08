@@ -26,11 +26,7 @@
 //! - Receiver: ALU (all less-than lookups — CPU SLT/BLT/BGE dispatch and the
 //!   internal `memw`/`memw_aligned`/`dvrm` timestamp / |r|<|d| checks)
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use std::collections::HashMap;
@@ -350,256 +346,104 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..6.
 
-/// LT table constraint for virtual carry IS_BIT checks and the LT formula.
-///
-/// This constraint embeds the virtual carry computations and verifies:
-/// 1. IS_BIT<carry[0]> and IS_BIT<carry[1]> (carry values are 0 or 1)
-/// 2. LT formula: lt = signed * (A*(1-B) + A*C + (1-B)*C) + (1-signed) * unsigned_lt
-///
-/// Where A = lhs_msb, B = rhs_msb, C = carry[1], unsigned_lt = carry[1]
-pub struct LtConstraint {
-    /// Unique constraint identifier
-    constraint_idx: usize,
-    /// Which constraint to check (0 = carry[0] IS_BIT, 1 = carry[1] IS_BIT, 2 = LT formula)
-    kind: LtConstraintKind,
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// Kind of LT constraint.
-#[derive(Debug, Clone, Copy)]
-pub enum LtConstraintKind {
-    /// IS_BIT constraint on virtual carry[0]
-    Carry0IsBit,
-    /// IS_BIT constraint on virtual carry[1]
-    Carry1IsBit,
-    /// LT formula constraint
-    LtFormula,
-    /// `out = lt XOR invert`, i.e. `out - (lt + invert - 2*lt*invert) = 0`
-    /// (`lt.toml:159`). The ALU bus consumes `out`, while `LtFormula` only binds
-    /// `lt` — without this the `out` column (used for BGE/BGEU via `invert`) is
-    /// free and any comparison result can be forged.
-    OutXorInvert,
-    /// IS_BIT constraint on `invert` (`lt:c:range_invert`).
-    InvertIsBit,
-    /// IS_BIT constraint on `signed` (`lt:c:range_signed`).
-    SignedIsBit,
-}
+/// LT table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the LT layout is fixed via `cols`).
+pub struct LtConstraints;
 
-impl LtConstraint {
-    /// Creates a new LT constraint.
-    pub fn new(kind: LtConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
-    }
-
-    /// Compute virtual carry[0] from the addition check.
-    ///
-    /// carry[0] = 2^(-32) * (rhs[0] + cast(lhs_sub_rhs, DWordWL)[0] - lhs[0])
-    ///
-    /// Where cast(lhs_sub_rhs, DWordWL)[0] = lhs_sub_rhs[0] + 2^16 * lhs_sub_rhs[1]
-    fn compute_carry_0<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_0 = step.get_main_evaluation_element(0, cols::LHS_0).clone();
-        let rhs_0 = step.get_main_evaluation_element(0, cols::RHS_0).clone();
-        let sub_0 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_0)
-            .clone();
-        let sub_1 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_1)
-            .clone();
-
-        // cast(lhs_sub_rhs, DWordWL)[0] = sub_0 + 2^16 * sub_1
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let sub_lo = &sub_0 + &sub_1 * &shift_16;
-
+impl LtConstraints {
+    /// `cast(lhs_sub_rhs, DWordWL)[0] = sub_0 + 2^16 · sub_1`.
+    fn carry_0<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let lhs_0 = b.main(0, cols::LHS_0);
+        let rhs_0 = b.main(0, cols::RHS_0);
+        let sub_0 = b.main(0, cols::LHS_SUB_RHS_0);
+        let sub_1 = b.main(0, cols::LHS_SUB_RHS_1);
+        let shift_16 = b.const_base(SHIFT_16);
+        let sub_lo = sub_0 + sub_1 * shift_16;
         // carry[0] = (rhs[0] + sub_lo - lhs[0]) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        (&rhs_0 + &sub_lo - &lhs_0) * &inv_2_32
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        (rhs_0 + sub_lo - lhs_0) * inv_2_32
     }
 
-    /// Compute virtual carry[1] from the addition check.
+    /// carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32.
     ///
-    /// carry[1] = 2^(-32) * (cast(rhs, DWordWL)[1] + cast(lhs_sub_rhs, DWordWL)[1] + carry[0] - cast(lhs, DWordWL)[1])
-    ///
-    /// Where:
-    /// - cast(rhs, DWordWL)[1] = rhs[1] + 2^16 * rhs[2]
-    /// - cast(lhs_sub_rhs, DWordWL)[1] = lhs_sub_rhs[2] + 2^16 * lhs_sub_rhs[3]
-    /// - cast(lhs, DWordWL)[1] = lhs[1] + 2^16 * lhs[2]
-    fn compute_carry_1<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let lhs_1 = step.get_main_evaluation_element(0, cols::LHS_1).clone();
-        let lhs_2 = step.get_main_evaluation_element(0, cols::LHS_2).clone();
-        let rhs_1 = step.get_main_evaluation_element(0, cols::RHS_1).clone();
-        let rhs_2 = step.get_main_evaluation_element(0, cols::RHS_2).clone();
-        let sub_2 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_2)
-            .clone();
-        let sub_3 = step
-            .get_main_evaluation_element(0, cols::LHS_SUB_RHS_3)
-            .clone();
-
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-
+    /// Known redundancy: this rebuilds [`Self::carry_0`], which idx 0 also
+    /// computes. Threading the value through was tried and showed no
+    /// measurable speedup (ABBA), so the helpers stay self-contained.
+    fn carry_1<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(b: &B) -> B::Expr {
+        let lhs_1 = b.main(0, cols::LHS_1);
+        let lhs_2 = b.main(0, cols::LHS_2);
+        let rhs_1 = b.main(0, cols::RHS_1);
+        let rhs_2 = b.main(0, cols::RHS_2);
+        let sub_2 = b.main(0, cols::LHS_SUB_RHS_2);
+        let sub_3 = b.main(0, cols::LHS_SUB_RHS_3);
+        let shift_16 = b.const_base(SHIFT_16);
         // cast(lhs, DWordWL)[1] = lhs[1] + 2^16 * lhs[2]
-        let lhs_hi = &lhs_1 + &lhs_2 * &shift_16;
-
+        let lhs_hi = lhs_1 + lhs_2 * shift_16.clone();
         // cast(rhs, DWordWL)[1] = rhs[1] + 2^16 * rhs[2]
-        let rhs_hi = &rhs_1 + &rhs_2 * &shift_16;
-
+        let rhs_hi = rhs_1 + rhs_2 * shift_16.clone();
         // cast(lhs_sub_rhs, DWordWL)[1] = sub_2 + 2^16 * sub_3
-        let sub_hi = &sub_2 + &sub_3 * &shift_16;
-
-        // carry[0]
-        let carry_0 = self.compute_carry_0(step);
-
-        // carry[1] = (rhs_hi + sub_hi + carry_0 - lhs_hi) / 2^32
-        let inv_2_32 = FieldElement::<F>::from(crate::constraints::templates::INV_SHIFT_32);
-        (&rhs_hi + &sub_hi + &carry_0 - &lhs_hi) * &inv_2_32
-    }
-
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let one = FieldElement::<F>::one();
-
-        match self.kind {
-            LtConstraintKind::Carry0IsBit => {
-                // IS_BIT<carry[0]>: carry[0] * (1 - carry[0]) = 0
-                let c0 = self.compute_carry_0(step);
-                &c0 * (one - &c0)
-            }
-            LtConstraintKind::Carry1IsBit => {
-                // IS_BIT<carry[1]>: carry[1] * (1 - carry[1]) = 0
-                let c1 = self.compute_carry_1(step);
-                &c1 * (one - &c1)
-            }
-            LtConstraintKind::LtFormula => {
-                // LT formula:
-                // lt = signed * (A*(1-B) + A*C + (1-B)*C) + (1-signed) * unsigned_lt
-                // Where A = lhs_msb, B = rhs_msb, C = carry[1], unsigned_lt = carry[1]
-                let lt = step.get_main_evaluation_element(0, cols::LT).clone();
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                let a = step.get_main_evaluation_element(0, cols::LHS_MSB).clone();
-                let b = step.get_main_evaluation_element(0, cols::RHS_MSB).clone();
-                let c = self.compute_carry_1(step);
-
-                // unsigned_lt = carry[1]
-                let unsigned_lt = c.clone();
-
-                // signed_lt = A*(1-B) + A*C + (1-B)*C
-                // = A - A*B + A*C + C - B*C
-                // = A*(1-B+C) + C*(1-B)
-                let one_minus_b = &one - &b;
-                let signed_lt = &a * &one_minus_b + &a * &c + &one_minus_b * &c;
-
-                // lt = signed * signed_lt + (1 - signed) * unsigned_lt
-                let expected_lt = &signed * &signed_lt + (&one - &signed) * &unsigned_lt;
-
-                // Constraint: lt - expected_lt = 0
-                lt - expected_lt
-            }
-            LtConstraintKind::OutXorInvert => {
-                // out = lt XOR invert = lt + invert - 2*lt*invert
-                let out = step.get_main_evaluation_element(0, cols::OUT).clone();
-                let lt = step.get_main_evaluation_element(0, cols::LT).clone();
-                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
-                let two = FieldElement::<F>::from(2u64);
-                out - (&lt + &invert - two * &lt * &invert)
-            }
-            LtConstraintKind::InvertIsBit => {
-                // invert * (1 - invert) = 0
-                let invert = step.get_main_evaluation_element(0, cols::INVERT).clone();
-                &invert * (one - &invert)
-            }
-            LtConstraintKind::SignedIsBit => {
-                // signed * (1 - signed) = 0
-                let signed = step.get_main_evaluation_element(0, cols::SIGNED).clone();
-                &signed * (one - &signed)
-            }
-        }
+        let sub_hi = sub_2 + sub_3 * shift_16;
+        let carry_0 = Self::carry_0(b);
+        let inv_2_32 = b.const_base(crate::constraints::templates::INV_SHIFT_32);
+        (rhs_hi + sub_hi + carry_0 - lhs_hi) * inv_2_32
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for LtConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // IS_BIT on virtual carry involves computing carry (degree 1) then X*(1-X) (degree 2)
-            LtConstraintKind::Carry0IsBit => 2,
-            LtConstraintKind::Carry1IsBit => 2,
-            // LT formula involves products like signed * A * (1-B)
-            LtConstraintKind::LtFormula => 3,
-            // out - (lt + invert - 2*lt*invert): the lt*invert product is degree 2
-            LtConstraintKind::OutXorInvert => 2,
-            // X*(1-X)
-            LtConstraintKind::InvertIsBit => 2,
-            LtConstraintKind::SignedIsBit => 2,
-        }
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for LtConstraints {
+    // The LT formula (idx 2) is degree 3; the rest are degree 2.
+    fn max_degree(&self) -> usize {
+        3
     }
 
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0: IS_BIT<carry[0]>: carry[0] * (1 - carry[0])
+        let c0 = Self::carry_0(b);
+        let one = b.one();
+        b.emit_base(0, c0.clone() * (one - c0));
 
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
+        // idx 1: IS_BIT<carry[1]>: carry[1] * (1 - carry[1])
+        let c1 = Self::carry_1(b);
+        let one = b.one();
+        b.emit_base(1, c1.clone() * (one - c1));
 
-/// Creates all constraints for the LT table.
-///
-/// Returns: (constraints, next_constraint_idx)
-pub fn lt_constraints(constraint_idx_start: usize) -> (Vec<LtConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let constraints = vec![
-        LtConstraint::new(LtConstraintKind::Carry0IsBit, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-        LtConstraint::new(LtConstraintKind::Carry1IsBit, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-        LtConstraint::new(LtConstraintKind::LtFormula, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-        // out = lt XOR invert (binds the ALU-bus-consumed `out` column).
-        LtConstraint::new(LtConstraintKind::OutXorInvert, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-        // Range-check the boolean flags that drive the formula / bus.
-        LtConstraint::new(LtConstraintKind::InvertIsBit, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-        LtConstraint::new(LtConstraintKind::SignedIsBit, {
-            let i = idx;
-            idx += 1;
-            i
-        }),
-    ];
-    (constraints, idx)
+        // idx 2: LT formula: lt - (signed*signed_lt + (1-signed)*unsigned_lt)
+        // signed_lt = A*(1-B) + A*C + (1-B)*C; unsigned_lt = C = carry[1]
+        let lt = b.main(0, cols::LT);
+        let signed = b.main(0, cols::SIGNED);
+        let a = b.main(0, cols::LHS_MSB);
+        let bb = b.main(0, cols::RHS_MSB);
+        let c = Self::carry_1(b);
+        let unsigned_lt = c.clone();
+        let one = b.one();
+        let one_minus_b = one - bb;
+        let signed_lt = a.clone() * one_minus_b.clone() + a * c.clone() + one_minus_b * c;
+        let one = b.one();
+        let expected_lt = signed.clone() * signed_lt + (one - signed) * unsigned_lt;
+        b.emit_base(2, lt - expected_lt);
+
+        // idx 3: out = lt XOR invert = lt + invert - 2*lt*invert
+        let out = b.main(0, cols::OUT);
+        let lt = b.main(0, cols::LT);
+        let invert = b.main(0, cols::INVERT);
+        let two = b.const_base(2);
+        b.emit_base(3, out - (lt.clone() + invert.clone() - two * lt * invert));
+
+        // idx 4: invert * (1 - invert)
+        let invert = b.main(0, cols::INVERT);
+        let one = b.one();
+        b.emit_base(4, invert.clone() * (one - invert));
+
+        // idx 5: signed * (1 - signed)
+        let signed = b.main(0, cols::SIGNED);
+        let one = b.one();
+        b.emit_base(5, signed.clone() * (one - signed));
+    }
 }

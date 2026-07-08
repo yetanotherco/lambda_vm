@@ -6,6 +6,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-lambda-vm-prover = { path = "../../../prover", default-features = false }
+lambda-vm-prover = { path = "../../../prover", default-features = false, features = [
+    "profile-markers",
+] }
 lambda-vm-syscalls = { path = "../../../syscalls" }
 postcard = { version = "1.0", features = ["alloc"] }
+
+[profile.release]
+debug = 2

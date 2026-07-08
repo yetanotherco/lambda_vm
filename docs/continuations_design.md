@@ -62,8 +62,12 @@ makes the proof fail.
   - across epochs, on the **GlobalMemory bus**, it carries each cell's
     "where did this value come from / where is it going" claims.
 - **global_memory** — the *anchors* on the GlobalMemory bus:
-  - **genesis**: a cell's starting value, read from the **ELF** (preprocessed,
-    so the verifier recomputes it — the prover cannot choose initial memory).
+  - **genesis**: a cell's starting value. For ELF/runtime pages it is **preprocessed**
+    (read from the ELF, so the verifier recomputes it — the prover cannot choose initial
+    memory). For **private-input pages** it is a **committed** (non-preprocessed) column
+    the verifier never recomputes from the ELF — the raw private input is neither bundled
+    nor reconstructed by the verifier, and the value is pinned by the bus instead (see
+    §3.6); this mirrors the monolithic PAGE table. (Not a ZK/hiding guarantee — see §3.6.)
   - **finalization**: a cell's final value after the last epoch that touched it.
 
 ### A single L2G row
@@ -261,6 +265,62 @@ This is a **completeness** fix: it changes no constraint and nothing the verifie
 accepts — only how the driver slices cycles. A debug-assert enforces the
 "intermediate epoch ⟹ power-of-two cycle count" invariant.
 
+### 3.6 Private-input genesis (committed, not ELF-bound)
+
+Genesis for ELF/runtime pages is preprocessed, so the verifier recomputes it from the
+ELF — that is what stops a prover from choosing initial memory (§2). But **private
+input** is, by definition, *not* in the ELF, so it must not be verifier-recomputed and
+must not be shipped in the proof bundle. So a private-input page's genesis cannot be
+ELF-recomputed.
+
+Fix (mirrors the monolithic PAGE table exactly): build the `global_memory` AIR for a
+private-input page **non-preprocessed**, so its `INIT` (genesis) is a **committed
+main-trace column** the verifier never recomputes from the ELF. Correctness is enforced by
+the same bus chain as everything else: the genesis token telescopes into the first
+touching epoch's L2G `init`, which is pinned on the epoch-local Memory bus to MEMW's
+true first-read value. A forged genesis would leave an unmatched Memory-bus term. This
+is the same "output pinned by a complete chain" argument as the finalization (§4): the
+private genesis is prover-supplied *by design* (it is the private input), so the proof
+attests "**there exists** a private input producing this output" — the intended
+semantics, identical to the monolithic prover.
+
+**Scope of the guarantee (not zero-knowledge).** What this buys is that the raw private
+input is **neither bundled in the proof nor recomputed by the verifier** — not that it is
+cryptographically hidden. This proving stack is a non-ZK STARK: the committed private
+`INIT` column, like every committed column, is opened at FRI query positions, so a
+verifier does learn some trace evaluations. Cryptographic hiding of the private input
+would require a ZK/blinded proof system (a separate, larger change). Phrase any external
+claim as "raw private input is not bundled or recomputed by the verifier," not "the
+verifier never sees it."
+
+**One prerequisite — the region must hold only private input.** Skipping the ELF
+recomputation is safe *only* if no ELF-declared data lives in the private-input region;
+otherwise a prover could classify that page private and forge the ELF byte's genesis
+(the value would be committed but never checked against the ELF). This reservation is
+**enforced by the loader**: `Elf::load` rejects any `PT_LOAD` segment reaching at or above
+`PRIVATE_INPUT_START_INDEX` (`ElfError::SegmentInPrivateInputRegion`) — covering every page
+the verifier can classify private, which slightly exceeds `[base, base+MAX_PRIVATE_INPUT_SIZE)`
+because the length prefix pushes an honest max-size input onto one more page (the count
+bound is that tight span, with no extra slack).
+Turning the reservation from convention into an enforced invariant closes this gap for
+**both** the continuation and monolithic paths (they share the loader and the same
+non-preprocessed-private-page design).
+
+**Which pages are private** is decided by **count**, not by the raw byte range: the
+first `num_private_input_pages` pages from `PRIVATE_INPUT_START_INDEX` (the page-aligned
+span the input occupies), exactly matching the monolithic verifier's
+`page_configs_from_elf_and_runtime`. The count is a public value in the bundle:
+bound-checked against the max, absorbed into the global Fiat-Shamir statement (§7), and
+additionally pinned by the committed AIR shape — a wrong count flips a *touched* page's
+preprocessed mode, so the rebuilt AIR no longer matches the committed trace and the
+proof fails. The verifier is given **only the count**, never the private bytes
+(`verify_continuation` takes `elf + bundle` alone).
+
+Before this, the continuation bundle shipped the raw `private_inputs` and the verifier
+recomputed the private genesis from them — which both **leaked** the input and
+contradicted the memory spec (`memory.md`: prover/private input is a *committed* column,
+not verifier-recomputed). §3.6 removes both problems.
+
 ---
 
 ## 4. Chain completeness — why the design is selector-free (and safe)
@@ -451,8 +511,11 @@ can't be replayed elsewhere:
 
 - Each **epoch** absorbs: a domain tag, the ELF digest, the public output, the
   table layout, and the **epoch label** (its position).
-- The **global** proof absorbs: a (distinct) domain tag, the ELF digest, and the
-  **epoch count**.
+- The **global** proof absorbs: a (distinct) domain tag, the ELF digest, the
+  **epoch count**, the **private-input page count** (§3.6), and the **touched page-base
+  set** — so the whole genesis AIR layout (which GLOBAL_MEMORY tables exist and which are
+  non-preprocessed) is pinned in the statement, matching the monolithic path's
+  `absorb_statement`.
 
 The monolithic encoding is unchanged (same function, monolithic tag, no label).
 The genesis / register / memory anchor values are *additionally* bound via the
@@ -474,10 +537,17 @@ The integrated `prove_and_verify_continuation` is now a thin wrapper
 likewise split into `prove_epoch` + `verify_epoch`.
 
 The bundle is prover-supplied and therefore **untrusted**. Per epoch it carries the
-`MultiProof`, the `public_output` slice, `table_counts`,
-`num_private_input_pages`, `runtime_page_ranges`, the bound `reg_fini` (`R_{i+1}`),
-the epoch `l2g_root`, and the touched-cell `boundary`; plus the global `MultiProof`
-and the `private_inputs`. Everything the integrated path reused from prover memory
+`MultiProof`, the `public_output` slice, `table_counts`, `runtime_page_ranges`, the bound
+`reg_fini` (`R_{i+1}`), and the epoch `l2g_root`; plus the global `MultiProof`, a top-level
+`num_private_input_pages` **count** (§3.6), and the top-level **`touched_page_bases`** — the
+sorted, deduped set of page bases the run touched. It carries **no cell values**: not the
+raw private input, and — since the per-epoch `CellBoundary` list is *not* serialized — not
+the touched-cell values either (a `CellBoundary.init.value` is a private-input byte for a
+private read, so shipping it would leak the input in plaintext even though the raw blob is
+gone). The verifier only ever needed the epoch count and the touched page-base set from
+those boundaries; `touched_page_bases` supplies exactly that, value-free and at page
+granularity. The full boundaries stay prover-local (they build the L2G traces and
+final-state inside `prove_global`). Everything the integrated path reused from prover memory
 becomes an **explicit verifier action**:
 
 - **Enumerate, don't trust.** The verifier assigns each epoch's `label` and the
@@ -491,11 +561,16 @@ becomes an **explicit verifier action**:
   rebuilding the AIR from the previous FINI* (via the shared `build_epoch_airs`),
   not merely true-by-construction. The commit-bus `start_index` is taken from the
   carried `register_init[508]`, not a free scalar.
-- **Genesis from the ELF.** `verify_global` rebuilds the memory genesis from the ELF
-  (+ bundle private inputs) and closes the GlobalMemory bus;
+- **Genesis from the ELF (private input excepted).** `verify_global` rebuilds the
+  ELF/runtime genesis from the ELF alone (no private bytes) and closes the GlobalMemory
+  bus; private-input pages are built non-preprocessed (§3.6), so their genesis is a
+  committed, bus-pinned column the verifier neither recomputes nor sees.
   `verify_l2g_commitment_binding` ties each epoch's `l2g_root` to the corresponding
-  global-proof sub-table root — which is what makes the prover-supplied `boundary`
-  trustworthy.
+  global-proof sub-table root. The prover-supplied `touched_page_bases` is canonicalized
+  (sorted/deduped) on ingest and pinned the same way the old `boundary` addresses were: a
+  wrong set imbalances the GlobalMemory bus / mismatches the AIR count, and it is bound
+  into the global Fiat-Shamir statement — so a reordered-but-same-set list still verifies
+  while any different set is rejected.
 - **Reconstruct the output** by concatenating the per-epoch commit slices (each
   commit-bus-bound, contiguous via the x254 chain).
 - The verifier also `validate()`s `table_counts` and never trusts a prover-supplied
@@ -530,10 +605,10 @@ recursion/aggregation layer (deferred).
 
 - Implemented and tested: range checks (§3.1), `fini_epoch` constant (§3.2),
   ordering check (§3.3), **selector-free brought-forward filler padding** (§3.4),
-  the **power-of-two epoch size** (§3.5), **cross-epoch registers** (§6), the
-  **commit index x254** across epochs (§6), the **Fiat-Shamir statement binding**
-  (§7), and the **standalone split prover/verifier** (§8) — bundle serialized with
-  `bincode` and driven from the CLI (`prove`/`verify --continuations`).
+  the **power-of-two epoch size** (§3.5), **private-input genesis not bundled/recomputed**
+  (§3.6), **cross-epoch registers** (§6), the **commit index x254** across epochs (§6),
+  the **Fiat-Shamir statement binding** (§7), and the **standalone split prover/verifier**
+  (§8) — bundle serialized with `bincode` and driven from the CLI (`prove`/`verify --continuations`).
 - **The L2G table has no selector column.** An earlier `MU`-gated design (and the
   briefly-implemented, unsound Design Y that gated only the GlobalMemory bus) were
   both replaced by the selector-free filler design (§3.4). Do **not** reintroduce a
@@ -542,10 +617,15 @@ recursion/aggregation layer (deferred).
 - Deferred:
   - **Succinctness.** The split verifier is non-succinct (N+1 proofs, §8). A single
     small proof needs a recursion/aggregation layer — a separate, larger effort.
-  - **Private-input binding.** The genesis image depends on `private_inputs`, which
-    the bundle carries in the clear; binding them into the statement (so "which input
-    produced this output" is pinned) is a follow-up that also touches the monolithic
-    proof.
+  - **Private-input *content* binding.** The bundle no longer carries the private input
+    in the clear (§3.6 — it carries only the page count; the raw input is neither bundled
+    nor recomputed by the verifier). What remains deferred is pinning *which specific input*
+    produced the output: the proof attests only that *some* private input does. A guest that
+    needs "this exact input" must commit a hash of it to the public output — the framework
+    provides no such binding on either the continuation or monolithic path.
+  - **Zero-knowledge / hiding.** As noted in §3.6, this is a non-ZK STARK: committed private
+    columns are opened at query positions, so the private input is not cryptographically
+    hidden. Cryptographic hiding would need a ZK/blinded proof system.
 
 ---
 
@@ -554,8 +634,8 @@ recursion/aggregation layer (deferred).
 - `prover/src/tables/local_to_global.rs` — L2G columns, trace generation, the
   Memory/GlobalMemory bus interactions, range checks, the ordering lookup, and
   `append_bring_forward_fillers` (the selector-free power-of-two padding).
-- `prover/src/tables/global_memory.rs` — the genesis (ELF-bound) and
-  finalization anchors.
+- `prover/src/tables/global_memory.rs` — the genesis (ELF-bound for ELF/runtime pages,
+  committed/private for private-input pages, §3.6) and finalization anchors.
 - `prover/src/tables/register.rs` — the REGISTER table: REG-C1/REG-C2 Memory-bus
   tokens, the preprocessed FINI commitment (`compute_precomputed_commitment_with_fini`,
   `NUM_PREPROCESSED_COLS_WITH_FINI`), and `fini_from_trace`.

@@ -185,7 +185,11 @@ See [`spec/README.md`](./spec/README.md) for full setup instructions.
 | `make test-asm` | Compile and run ASM tests |
 | `make test-rust` | Compile and run Rust tests |
 | `make test-executor` | Compile all programs and run executor tests |
-| `make test-math-cuda` | math-cuda parity tests (requires NVIDIA GPU + nvcc) |
+| `make test-math-cuda` | math-cuda GPU kernel parity tests (requires NVIDIA GPU + nvcc; see GPU Tests) |
+| `make test-cuda-integration` | End-to-end GPU dispatch + proof verification (requires NVIDIA GPU + nvcc) |
+| `make test-cuda-fallback` | GPU error-path / CPU-fallback tests (requires NVIDIA GPU + nvcc) |
+| `make test-prover-cuda` | Prover/stark/crypto/ecsm suite on the GPU path (requires NVIDIA GPU + nvcc) |
+| `make test-prover-comprehensive-cuda` | Comprehensive all-instructions prove on the GPU path (requires NVIDIA GPU + nvcc) |
 | `make build` | Build all workspace crates |
 | `make check` | Check all crates (faster than build, no codegen) |
 | `make clippy` | Run clippy on all crates |
@@ -218,6 +222,21 @@ Then add the corresponding test under `executor/tests/rust.rs`
 You can run it with
 
 `make test-rust`
+
+### GPU Tests
+
+The CUDA test groups run only on a machine with an NVIDIA GPU and `nvcc`:
+
+- `make test-math-cuda` — GPU-vs-CPU kernel parity (NTT, LDE, barycentric, FRI, …)
+- `make test-cuda-integration` — proves a guest on GPU and checks every dispatch fired + the proof verifies
+- `make test-cuda-fallback` — forces GPU dispatch errors and checks the CPU fallback still verifies
+- `make test-prover-cuda` — the prover/stark/crypto/ecsm suite with the GPU path enabled
+- `make test-prover-comprehensive-cuda` — the comprehensive all-instructions prove on the GPU path
+
+The kernels are compiled by `nvcc` into PTX that the driver JIT-compiles at load, so the GPU's
+driver must be new enough for the toolkit — an older driver rejects the PTX with
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. These groups run automatically on a rented GPU in the merge
+queue via `.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
 
 ## Benchmarking & Profiling
 
@@ -298,3 +317,4 @@ at your option.
 Unless you explicitly state otherwise, any contribution intentionally submitted
 for inclusion in the work by you, as defined in the Apache-2.0 license, shall
 be dual licensed as above, without any additional terms or conditions.
+

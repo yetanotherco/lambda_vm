@@ -57,8 +57,8 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     // [pₖ]
     pub fri_layers_merkle_roots: Vec<Commitment>,
-    // pₙ
-    pub fri_last_value: FieldElement<E>,
+    /// Coefficients of the FRI final polynomial (degree < 2^k).
+    pub fri_final_poly_coeffs: Vec<FieldElement<E>>,
     // Open(pₖ(Dₖ), −𝜐ₛ^(2ᵏ))
     pub query_list: Vec<FriDecommitment<E>>,
     // Open(H₁(D_LDE, 𝜐ᵢ), Open(H₂(D_LDE, 𝜐ᵢ), Open(tⱼ(D_LDE), 𝜐ᵢ)

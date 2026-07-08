@@ -6,6 +6,7 @@ compile_error!("the `disk-spill` feature requires memmap2, which does not compil
 #[cfg(feature = "debug-checks")]
 pub mod bus_debug;
 pub mod commitment;
+pub mod constraint_ir;
 pub mod constraints;
 pub mod context;
 pub mod debug;
@@ -19,8 +20,11 @@ pub mod gpu_lde;
 pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+#[cfg(feature = "cuda")]
+pub mod logup_gpu;
 pub mod lookup;
 pub(crate) mod par;
+pub mod profile_markers;
 pub mod proof;
 pub mod prover;
 pub mod r4_denoms;

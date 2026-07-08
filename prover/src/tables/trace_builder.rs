@@ -2457,19 +2457,12 @@ fn generate_page_tables<I: ImageSource>(
     let mut pages = Vec::new();
     let mut page_configs = Vec::new();
 
-    // Determine which page bases hold private input data.
-    let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
-        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-        let total_bytes = 4 + private_input.len(); // length prefix + data
-        (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    // Determine which page bases hold private input data — count-based, via the
+    // shared helpers (single source of truth with the continuation path).
+    let num_private_input_pages = page::private_input_page_count(private_input);
 
     for &page_base in &page_bases {
-        let config = if private_input_page_bases.contains(&page_base) {
+        let config = if page::is_private_input_page(page_base, num_private_input_pages) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
             PageConfig::with_private_input(page_base, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
@@ -2852,6 +2845,8 @@ fn build_traces<I: ImageSource + Sync>(
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p4_bitwise_collect");
     bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
     // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
     // the same chunk size used to split them into instances (see chunk_and_generate
@@ -2905,10 +2900,14 @@ fn build_traces<I: ImageSource + Sync>(
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
     bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p5_generate_tables");
 
     // A monolithic run or the final continuation epoch terminates on the program's
     // halt ECALL. Intermediate continuation epochs do not halt, so fall back to the
@@ -3275,6 +3274,8 @@ fn build_traces<I: ImageSource + Sync>(
     };
     let local_to_global = local_to_global::generate_local_to_global_trace(&[]);
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     Ok(Traces {
         cpus,
         bitwise,
@@ -3871,16 +3872,12 @@ impl Traces {
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
-        if num_private_input_pages > 0 {
-            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
-            for i in 0..num_private_input_pages {
-                configs.push(PageConfig {
-                    page_base: first_page_base + i as u64 * page_size as u64,
-                    init_values: None, // Verifier doesn't know these
-                    is_private_input: true,
-                });
-            }
+        for page_base in page::private_input_page_bases(num_private_input_pages) {
+            configs.push(PageConfig {
+                page_base,
+                init_values: None, // Verifier doesn't know these
+                is_private_input: true,
+            });
         }
 
         configs.sort_by_key(|c| c.page_base);
@@ -3995,16 +3992,26 @@ impl Traces {
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p0_decode");
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 1: Logs → CPU operations
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p1_cpu_ops");
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::from_image(initial_image);
         let mut register_state = RegisterState::from_init(register_init);
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2a_collect_cpu");
         let (
             memw_ops,
             load_ops,
@@ -4018,7 +4025,11 @@ impl Traces {
             ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
             cpu_ops,
             memw_ops,
@@ -4035,9 +4046,13 @@ impl Traces {
             &mut register_state,
             is_final,
         );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phases 3-5
-        build_traces(
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p3to5_build_traces");
+        let result = build_traces(
             ops,
             Some(initial_image),
             &memory_state,
@@ -4051,7 +4066,10 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
-        )
+        );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        result
     }
 
     /// Generates all traces from execution logs (legacy API).

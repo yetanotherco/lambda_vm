@@ -5,13 +5,13 @@
 //! program-end receiver (final value of each cell). The bus balances iff every
 //! epoch's `fini` matches the next epoch's `init` (the cross-epoch telescoping).
 
+use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 
 use stark::config::Commitment;
-use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
@@ -48,8 +48,7 @@ type Token = (u64, u64, u64);
 fn l2g_air(
     proof_options: &ProofOptions,
     epoch_label: u64,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -57,15 +56,14 @@ fn l2g_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 fn anchor_air(
     proof_options: &ProofOptions,
     is_sender: bool,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let values = vec![
         BusValue::Packed {
             start_column: anchor_cols::ADDR_LO,
@@ -96,7 +94,7 @@ fn anchor_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
@@ -116,8 +114,7 @@ fn anchor_trace(tokens: &[Token]) -> TraceTable<F, E> {
 /// L2G air on the epoch-LOCAL `Memory` bus (uses `memory_bus_interactions`).
 fn l2g_memory_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -125,7 +122,7 @@ fn l2g_memory_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
@@ -159,8 +156,7 @@ mod range_recv_cols {
 /// cell's fini token at the last timestamp (cancelling L2G's fini-send).
 fn memw_sub_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let init_send = BusInteraction::sender(
         BusId::Memory,
         Multiplicity::One,
@@ -216,15 +212,14 @@ fn memw_sub_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 fn l2g_range_air(
     proof_options: &ProofOptions,
     epoch_label: u64,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -232,14 +227,13 @@ fn l2g_range_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 fn range_receiver_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let interactions = vec![
         BusInteraction::receiver(
             BusId::AreBytes,
@@ -293,7 +287,7 @@ fn range_receiver_air(
         AuxiliaryTraceBuildData { interactions },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
@@ -389,8 +383,7 @@ fn prove_verify_l2g_range_with_trace(
 /// sub-table root committed in the bus proof.
 fn inert_l2g_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
         AuxiliaryTraceBuildData {
@@ -398,7 +391,7 @@ fn inert_l2g_air(
         },
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 

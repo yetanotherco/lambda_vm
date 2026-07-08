@@ -548,6 +548,7 @@ dependencies = [
  "executor",
  "lambda-vm-prover",
  "stark",
+ "tempfile",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
 ]

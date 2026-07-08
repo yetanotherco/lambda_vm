@@ -15,7 +15,7 @@
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
-use stark::constraints::transition::TransitionConstraintEvaluator;
+use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
 use stark::traits::AIR;
@@ -203,18 +203,22 @@ fn test_cpu_only_no_bus() {
     let proof_options = ProofOptions::default_test_options();
 
     // Create AIR with NO bus interactions
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![], // NO bus interactions
     };
-    let cpu_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
-        AirWithBuses::new(
-            crate::tables::cpu::cols::NUM_COLUMNS,
-            auxiliary_trace_build_data,
-            &proof_options,
-            1,
-            transition_constraints,
-        );
+    let cpu_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        crate::tables::cpu::cols::NUM_COLUMNS,
+        auxiliary_trace_build_data,
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
 
     let air_trace_pairs: Vec<(
         &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
@@ -1436,7 +1440,7 @@ fn test_verify_rejects_tampered_public_output() {
 /// - Division: DIV, DIVU, REM, REMU
 /// - Control: LUI, AUIPC, JALR
 #[test]
-#[ignore] // Slow: run with `cargo test --ignored` or `make test-prover-all`
+#[ignore] // Slow: run with `cargo test -- --ignored` or `make test-prover-all`
 fn test_prove_elfs_all_instructions_64_full() {
     let _ = env_logger::builder().is_test(true).try_init();
 
@@ -2493,8 +2497,8 @@ fn test_crafted_zero_count_proof_must_not_verify() {
         _,
         _,
     )> = vec![
-        (&airs.bitwise, &mut bitwise_trace, &()),
-        (&airs.decode, &mut decode_trace, &()),
+        (airs.bitwise.as_ref(), &mut bitwise_trace, &()),
+        (airs.decode.as_ref(), &mut decode_trace, &()),
     ];
 
     let proof = multi_prove_ram(pairs, &mut DefaultTranscript::<E>::new(&[]))
@@ -3138,17 +3142,21 @@ fn test_epoch_proof_commits_l2g() {
     );
 
     // Inert L2G AIR: commits the trace columns, but no bus and no constraints.
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-    let inert_l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
-        AirWithBuses::new(
-            local_to_global::cols::NUM_COLUMNS,
-            AuxiliaryTraceBuildData {
-                interactions: vec![],
-            },
-            &proof_options,
-            1,
-            transition_constraints,
-        );
+    let inert_l2g_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
@@ -3342,17 +3350,21 @@ fn test_continuation_pipeline_end_to_end() {
         );
 
         let mut l2g_trace = local_to_global::generate_local_to_global_trace(&boundaries[i]);
-        let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-        let inert_l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
-            AirWithBuses::new(
-                local_to_global::cols::NUM_COLUMNS,
-                AuxiliaryTraceBuildData {
-                    interactions: vec![],
-                },
-                &proof_options,
-                1,
-                transition_constraints,
-            );
+        let inert_l2g_air: AirWithBuses<
+            F,
+            E,
+            stark::lookup::NullBoundaryConstraintBuilder,
+            (),
+            EmptyConstraints,
+        > = AirWithBuses::new(
+            local_to_global::cols::NUM_COLUMNS,
+            AuxiliaryTraceBuildData {
+                interactions: vec![],
+            },
+            &proof_options,
+            1,
+            EmptyConstraints,
+        );
 
         let mut pairs = airs.air_trace_pairs(&mut traces);
         pairs.push((&inert_l2g_air, &mut l2g_trace, &()));
@@ -3467,17 +3479,21 @@ fn test_epoch_memory_bus_with_l2g_bookend() {
     );
 
     // L2G air on the epoch-local Memory bus (the bookend that replaces PAGE).
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-    let l2g_air: AirWithBuses<F, E, stark::lookup::NullBoundaryConstraintBuilder, ()> =
-        AirWithBuses::new(
-            local_to_global::cols::NUM_COLUMNS,
-            AuxiliaryTraceBuildData {
-                interactions: local_to_global::memory_bus_interactions(),
-            },
-            &proof_options,
-            1,
-            transition_constraints,
-        );
+    let l2g_air: AirWithBuses<
+        F,
+        E,
+        stark::lookup::NullBoundaryConstraintBuilder,
+        (),
+        EmptyConstraints,
+    > = AirWithBuses::new(
+        local_to_global::cols::NUM_COLUMNS,
+        AuxiliaryTraceBuildData {
+            interactions: local_to_global::memory_bus_interactions(),
+        },
+        &proof_options,
+        1,
+        EmptyConstraints,
+    );
 
     // Take the L2G trace out of `traces` so `air_trace_pairs` can borrow the rest.
     let mut l2g_trace = std::mem::replace(

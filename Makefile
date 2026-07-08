@@ -1,8 +1,9 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
-test-rust test-executor test-flamegraph flamegraph-prover \
-test-fast test-prover test-prover-all test-disk-spill test-math-cuda test-cuda-integration \
+test-rust test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
+test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
+test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
@@ -232,6 +233,14 @@ test-rust: compile-programs-rust
 test-flamegraph:
 	cargo test -p executor --test flamegraph
 
+test-profile-recursion: test-profile-recursion-single test-profile-recursion-multi
+
+test-profile-recursion-single: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_1query -- --ignored --nocapture
+
+test-profile-recursion-multi: compile-recursion-elfs
+	cargo test --package lambda-vm-prover --lib test_recursion_profile_multiquery -- --ignored --nocapture
+
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
 # Run after bumping the ethrex rev; README checksums are refreshed automatically.
 regen-ethrex-fixtures:
@@ -279,10 +288,33 @@ test-math-cuda:
 	cargo test -p math-cuda --release
 
 # End-to-end cuda dispatch coverage (requires NVIDIA GPU + nvcc).
-# Asserts every R1/R2/R3 GPU counter fired on a real prove.
+# Asserts the R1-R4 GPU dispatch counters fired on a real prove.
+# --test-threads=1: these tests reset and assert on process-global GPU call
+# counters, so they must run serially or one test's reset races another's read.
 test-cuda-integration:
 	cargo test -p lambda-vm-prover --release --features cuda \
-	    --test cuda_path_integration -- --ignored --nocapture
+	    --test cuda_path_integration -- --ignored --nocapture --test-threads=1
+
+# GPU error-path coverage (requires NVIDIA GPU + nvcc).
+# Forces cuda dispatch errors and asserts the CPU fallback still produces a verifying proof.
+test-cuda-fallback:
+	cargo test -p lambda-vm-prover --release --features test-cuda-faults \
+	    --test cuda_fallback_tests -- --ignored --nocapture --test-threads=1
+
+# The prover/stark/crypto/ecsm test suite with the GPU (cuda) path enabled (requires NVIDIA
+# GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
+# GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
+# to stark; crypto/ecsm build without it (they have no GPU path).
+test-prover-cuda:
+	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
+	    --features lambda-vm-prover/cuda -- --test-threads=1
+
+# The comprehensive all-instructions prove (ignored by default) on the GPU path (requires
+# NVIDIA GPU + nvcc). GPU counterpart of the all-instructions half of CPU CI's merge-queue-only
+# comprehensive job (the CPU job also runs test_recursion_execute; recursion has no GPU leg yet).
+test-prover-comprehensive-cuda:
+	cargo test --release -p lambda-vm-prover --features cuda \
+	    test_prove_elfs_all_instructions_64_full -- --ignored --test-threads=1 --nocapture
 
 # math-cuda quick microbench (median of 10 runs)
 bench-math-cuda:
