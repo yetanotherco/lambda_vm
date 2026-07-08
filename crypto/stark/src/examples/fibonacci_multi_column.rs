@@ -20,7 +20,15 @@ use math::field::{
 
 /// Public inputs for the multi-column Fibonacci AIR.
 /// Contains the initial values (first two elements) for each column.
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "FieldElement<F>: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct FibonacciMultiColumnPublicInputs<F: IsFFTField> {
     /// Initial values for each column: (a0, a1) pairs

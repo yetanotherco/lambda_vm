@@ -5,18 +5,16 @@ use super::{
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
 };
+pub use crate::proof::view::PiDeserializer;
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
-    lookup::{
-        BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers,
-    },
+    lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{ArchivedStarkProof, MultiProof},
     proof::view::{
         DeepPolynomialOpeningView, FriDecommitmentView, PolynomialOpeningsView, StarkProofView,
     },
 };
-pub use crate::proof::view::PiDeserializer;
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::proof::verify_merkle_path;
 #[cfg(not(feature = "test_fiat_shamir"))]
@@ -31,10 +29,10 @@ use math::{
     },
     traits::AsBytes,
 };
+use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
 use std::time::Instant;
-use std::collections::HashMap;
 
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
@@ -138,7 +136,9 @@ pub trait IsStarkVerifier<
         let trace_length = proof.trace_length();
         // Owned `BusPublicInputs` (just the table contribution L — one field
         // element) reconstructed for the AIR boundary call.
-        let bus_public_inputs = proof.bus_table_contribution().map(BusPublicInputs::from_contribution);
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(BusPublicInputs::from_contribution);
         let boundary_constraints = air.boundary_constraints(
             public_inputs,
             &challenges.rap_challenges,
@@ -828,8 +828,11 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> =
-            multi_proof.proofs.iter().map(StarkProofView::Owned).collect();
+        let views: Vec<StarkProofView<Field, FieldExtension, PI>> = multi_proof
+            .proofs
+            .iter()
+            .map(StarkProofView::Owned)
+            .collect();
         Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
     }
 
@@ -1100,7 +1103,9 @@ pub trait IsStarkVerifier<
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
         let trace_length = proof.trace_length();
-        let bus_public_inputs = proof.bus_table_contribution().map(BusPublicInputs::from_contribution);
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(BusPublicInputs::from_contribution);
         let num_boundary_constraints = air
             .boundary_constraints(
                 public_inputs,

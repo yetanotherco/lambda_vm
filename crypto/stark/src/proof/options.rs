@@ -41,7 +41,13 @@ impl fmt::Display for ProofOptionsError {
 /// - `fri_final_poly_log_degree`: log2 degree bound at which FRI terminates folding
 #[cfg_attr(feature = "wasm", wasm_bindgen)]
 #[derive(
-    Clone, Debug, serde::Serialize, serde::Deserialize, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize
+    Clone,
+    Debug,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
 )]
 pub struct ProofOptions {
     pub blowup_factor: u8,
