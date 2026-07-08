@@ -2420,7 +2420,7 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "debug-checks")]
-        Self::run_debug_checks(&air_trace_pairs, &commitments, &domains, &twiddle_caches);
+        Self::run_debug_checks(air_trace_pairs, &commitments, &domains, &twiddle_caches);
 
         // =====================================================================
         // Rounds 2-4: linear shared transcript (unified-shard; forks dropped)
