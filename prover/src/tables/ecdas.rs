@@ -8,7 +8,7 @@
 //! bus (an add follows). ECSM seeds and drains the bus; interior rows telescope.
 //!
 //! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set quotients
-//! to 0 and `op = 1`. The `R·P` term in the λ and xR relations is gated with `μ`, so it
+//! to 0 and `op = 1`. The `R·P` term in the λ, xR, and yR relations is gated with `μ`, so it
 //! vanishes on padding rows (μ=0) and all relations hold with zero carries.
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
