@@ -30,6 +30,11 @@
 #   Env: REBUILD=1 forces a rebuild even if cached binaries exist.
 #        BENCH_FEATURES=<list> cargo features for the cli build (default: jemalloc-stats).
 #          The GPU ABBA workflow passes "jemalloc-stats,prover/cuda" to bench the GPU path.
+#        CONTINUATIONS=1 proves with --continuations (epochs; flat peak memory) on
+#          both sides — needed for large workloads that OOM monolithically.
+#        EPOCH_SIZE_LOG2=<n> continuation epoch size (default 20; min 18).
+#        TX_COUNT=<n> ethrex transfer fixture to prove (default 5; use 20 for a
+#          large continuation trace where GPU-residency wins are visible).
 #
 #   Sizing (ethrex pair-noise sd ~1.2%, 80% power): ~12 pairs for a 1% effect,
 #   ~18 for 0.8%, ~32 for 0.6%. Default 20 -> solid on 0.8-1%, ~60% power at 0.6%
@@ -51,9 +56,23 @@ N_PAIRS="${3:-20}"
 # cli build features. Default matches the CPU bench; the GPU ABBA workflow overrides
 # with "jemalloc-stats,prover/cuda" to exercise the CUDA prover path.
 BENCH_FEATURES="${BENCH_FEATURES:-jemalloc-stats}"
+# Continuation mode: split execution into epochs (flat peak memory) instead of a
+# single monolithic prove. Required for large workloads (e.g. ethrex-20tx) that
+# OOM monolithically, and the only way to bench a per-epoch GPU-residency change
+# at a realistic trace size. When on, both binaries prove with
+# `--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2`.
+CONTINUATIONS="${CONTINUATIONS:-0}"
+EPOCH_SIZE_LOG2="${EPOCH_SIZE_LOG2:-20}"
+# ethrex transfer-count fixture to prove (executor/tests/ethrex_${TX_COUNT}_transfers.bin).
+TX_COUNT="${TX_COUNT:-5}"
+if [ "$CONTINUATIONS" = "1" ]; then
+  CONT_ARGS="--continuations --epoch-size-log2 $EPOCH_SIZE_LOG2"
+else
+  CONT_ARGS=""
+fi
 
 ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_5_transfers.bin"
+INPUT_REL="executor/tests/ethrex_${TX_COUNT}_transfers.bin"
 WORK="/tmp/abba_run"
 WT="/tmp/abba_wt"
 PROOF="/tmp/abba_proof.bin"
@@ -84,9 +103,9 @@ if [ ! -f "$ELF_REL" ]; then
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex 5-transfer fixture (missing)"
+  echo "==> Generating ethrex ${TX_COUNT}-transfer fixture (missing)"
   ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures 5 "$INPUT_REL" distinct
+  tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TX_COUNT" "$INPUT_REL" distinct
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
@@ -143,7 +162,8 @@ fi
 # --- 3. Interleaved A/B/B/A measurement (fresh CSV -- pre-committed batch) ---
 run_prove() {  # $1=binary -> echoes proving time (s)
   local out t
-  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time 2>&1)"
+  # shellcheck disable=SC2086  # CONT_ARGS is intentionally word-split (0 or 2 args)
+  out="$("$1" prove "$ELF" --private-input "$INPUT" -o "$PROOF" --time $CONT_ARGS 2>&1)"
   rm -f "$PROOF"
   t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
   if [ -z "$t" ]; then
