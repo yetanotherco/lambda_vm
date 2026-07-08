@@ -133,9 +133,12 @@ if [ "$need_build" = "1" ]; then
     # -f: discard any prior worktree edit (e.g. the CUDARC_PIN sed below) before switching
     # refs, so the checkout can't conflict.
     git -C "$WT" checkout --quiet -f "$1"
-    # CUDARC_PIN: pin math-cuda's cudarc to a fixed CUDA version and drop fallback-latest, so
-    # cudarc binds a known driver-symbol set instead of its newest (which can request symbols
-    # the rented box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
+    # CUDARC_PIN: compat shim for benching *pre-pin* baseline shas. Newer shas pin cudarc's
+    # CUDA version permanently in crypto/math-cuda/Cargo.toml (feature `cuda-12080`), so this
+    # sed no-ops on them (the `cuda-version-from-build-system` anchor is gone). On an older
+    # baseline sha it still swaps in the pin + drops fallback-latest, so cudarc binds a known
+    # driver-symbol set instead of its newest (which can request symbols the rented box's
+    # driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
     if [ -n "${CUDARC_PIN:-}" ]; then
       sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
         "$WT/crypto/math-cuda/Cargo.toml"
