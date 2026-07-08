@@ -22,6 +22,11 @@ rand_chacha = { version = "0.3.1", default-features = false }
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 libc = { version = "0.2", optional = true }
+rkyv = { version = "0.8.10", default-features = false, features = [
+    "alloc",
+    "bytecheck",
+    "aligned",
+], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 lambda-vm-syscalls = { path = "../../syscalls" }
@@ -41,3 +46,4 @@ serde = ["dep:serde"]
 parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
+rkyv = ["dep:rkyv", "math/rkyv"]

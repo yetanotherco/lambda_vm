@@ -627,7 +627,7 @@ fn cmd_prove(
     };
     let mut writer = BufWriter::new(file);
 
-    let bytes = match bincode::serialize(&proof) {
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to serialize proof: {}", e);
@@ -678,7 +678,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
 
-    let proof: VmProof = match bincode::deserialize(&proof_bytes) {
+    let proof: VmProof = match rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&proof_bytes) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to deserialize proof: {}", e);
@@ -799,7 +799,7 @@ fn cmd_prove_continuation(
         }
     };
     let mut writer = BufWriter::new(file);
-    let bytes = match bincode::serialize(&bundle) {
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&bundle) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to serialize proof: {}", e);
@@ -845,7 +845,11 @@ fn cmd_verify_continuation(
             return ExitCode::FAILURE;
         }
     };
-    let bundle: prover::continuation::ContinuationProof = match bincode::deserialize(&proof_bytes) {
+    let bundle: prover::continuation::ContinuationProof = match rkyv::from_bytes::<
+        prover::continuation::ContinuationProof,
+        rkyv::rancor::Error,
+    >(&proof_bytes)
+    {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to deserialize proof: {}", e);

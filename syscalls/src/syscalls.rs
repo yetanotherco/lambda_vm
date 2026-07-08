@@ -97,6 +97,27 @@ pub fn get_private_input() -> Vec<u8> {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
+/// Borrow the private input bytes in place from the memory-mapped region —
+/// no copy, no allocation. Same layout as [`get_private_input`]; the returned
+/// slice starts at `PRIVATE_INPUT_START + 4` (a 4-aligned address) and lives
+/// for the whole execution (the host never remaps the region).
+#[cfg(target_arch = "riscv64")]
+pub fn get_private_input_slice() -> &'static [u8] {
+    // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
+    // execution and never remaps it afterward, so the returned slice is valid
+    // for the `'static` lifetime of the guest's single-threaded execution
+    // region, which stays mapped and unmodified for the whole execution.
+    let len_ptr = PRIVATE_INPUT_START as *const u32;
+    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
+    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+    unsafe { core::slice::from_raw_parts(data_ptr, len) }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn get_private_input_slice() -> &'static [u8] {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
 #[cfg(target_arch = "riscv64")]
 pub fn sys_halt() -> ! {
     // NOTE: no print_string here — the Print ecall is unmatched on the Ecall bus
