@@ -13,7 +13,7 @@ use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
     gpu_deep_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls,
-    gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -151,5 +151,28 @@ fn gpu_proof_verifies_row_pair_commitment() {
     assert!(
         verify(&proof, &elf).expect("verify"),
         "GPU-produced proof (row-pair commitment) failed verification"
+    );
+}
+
+/// The full-residency Stage-2 R4 opening path fires: query row values are
+/// gathered straight off the device LDE (not the host trace) and, guarded by the
+/// in-prover cross-check against the host gather, still yield a verifying proof.
+/// Guards a silent regression where the openings quietly revert to the host
+/// path (which would still verify but drop the data-residency win). The
+/// cross-check `assert_eq!`s inside `open_deep_composition_poly` are
+/// release-active, so a divergent device gather would panic the prove here.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_opening_gather_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_opening_gather_calls() > 0,
+        "device-resident opening gather did not fire (openings fell back to the host LDE)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (device-gathered openings) failed verification"
     );
 }

@@ -1953,6 +1953,11 @@ pub trait IsStarkProver<
                     crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
                 })
             });
+        #[cfg(feature = "cuda")]
+        if main_dev_values.is_some() {
+            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         #[cfg(feature = "cuda")]
         let aux_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
@@ -1967,6 +1972,11 @@ pub trait IsStarkProver<
                     crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(&raw)
                 })
             });
+        #[cfg(feature = "cuda")]
+        if aux_dev_values.is_some() {
+            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
 
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
