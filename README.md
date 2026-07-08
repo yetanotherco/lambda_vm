@@ -233,10 +233,15 @@ The CUDA test groups run only on a machine with an NVIDIA GPU and `nvcc`:
 - `make test-prover-cuda` — the prover/stark/crypto/ecsm suite with the GPU path enabled
 - `make test-prover-comprehensive-cuda` — the comprehensive all-instructions prove on the GPU path
 
-The kernels are compiled by `nvcc` into PTX that the driver JIT-compiles at load, so the GPU's
-driver must be new enough for the toolkit — an older driver rejects the PTX with
-`CUDA_ERROR_UNSUPPORTED_PTX_VERSION`. These groups run automatically on a rented GPU in the merge
-queue via `.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
+The kernels are AOT-compiled by `nvcc` into native cubin (SASS) for the host GPU's real arch
+(detected via `nvidia-smi`, or overridden with `CUDARC_NVCC_ARCH`), not PTX. This sidesteps the
+PTX-ISA JIT version check, so a CUDA toolkit *newer* than the driver still loads and runs — no
+`CUDA_ERROR_UNSUPPORTED_PTX_VERSION` and no need to hand-match the toolkit to the driver. The only
+requirement is that the toolkit knows the GPU's compute capability (a too-old toolkit fails loudly
+at `nvcc` build time). cudarc's host-side driver-API symbol set is likewise pinned to a safe floor
+(`cuda-12080`) in `crypto/math-cuda/Cargo.toml`, so no `CUDARC_CUDA_VERSION` env is needed either.
+These groups run automatically on a rented GPU in the merge queue via
+`.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
 
 ## Benchmarking & Profiling
 
