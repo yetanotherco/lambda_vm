@@ -9,32 +9,30 @@
 //!
 //! The general MEMW table proves `old_timestamp < timestamp` by routing through
 //! the LT table, which requires extra LT trace rows and bus interactions.
-//! MEMW_R instead checks `IS_HALF[timestamp[0] - old_timestamp[0] - 1]`,
+//! MEMW_R instead checks `IS_HALF[timestamp - old_timestamp - 1]`,
 //! which proves the delta is in `[1, 2^16]` in a single lookup. This is safe
 //! because registers are accessed very frequently — their timestamp deltas are
 //! almost always small — and the routing predicate (`is_register_op`) enforces
 //! the delta fits before admitting an op into this table.
 //!
-//! ## Column layout (10 columns)
+//! ## Column layout (9 columns)
 //!
 //! - `ADDRESS`:          Byte  (register index 0-31)
-//! - `TIMESTAMP_0`:      Word  (low 32 bits)
-//! - `TIMESTAMP_1`:      Word  (high 32 bits)
+//! - `TIMESTAMP`:        Word  (32-bit timestamp)
 //! - `VAL_0`:            Word  (low 32 bits of register value)
 //! - `VAL_1`:            Word  (high 32 bits of register value)
 //! - `OLD_0`:            Word  (low 32 bits of previous value)
 //! - `OLD_1`:            Word  (high 32 bits of previous value)
-//! - `OLD_TIMESTAMP_LO`: Word  (low 32 bits of old timestamp; upper limb = TIMESTAMP_1)
+//! - `OLD_TIMESTAMP`:    Word  (32-bit timestamp at which this register was last accessed)
 //! - `MU_READ`:          Bit
 //! - `MU_WRITE`:         Bit
 //!
 //! ## Virtual
 //!
-//! - `old_timestamp = [OLD_TIMESTAMP_LO, TIMESTAMP_1]` (shares upper limb!)
 //! - `mu_sum = MU_READ + MU_WRITE`
 //!
 //! ## Bus Interactions (7)
-//! - 1 IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+//! - 1 IS_HALFWORD[timestamp - old_timestamp - 1]
 //! - 4 Memory bus tokens (read-old + write-new, per word)
 //! - 2 MEMW output interactions (read + write, from CPU)
 
@@ -48,37 +46,35 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 use crate::constraints::templates::emit_is_bit;
 
 // =========================================================================
-// Column indices (10 columns)
+// Column indices (9 columns)
 // =========================================================================
 
 pub mod cols {
     /// Register index (0-31). CPU sends base_address = 2*reg_index.
     pub const ADDRESS: usize = 0;
 
-    /// Timestamp low 32 bits
-    pub const TIMESTAMP_0: usize = 1;
-    /// Timestamp high 32 bits
-    pub const TIMESTAMP_1: usize = 2;
+    /// Timestamp: Word (32 bits)
+    pub const TIMESTAMP: usize = 1;
 
     /// Register value low 32 bits
-    pub const VAL_0: usize = 3;
+    pub const VAL_0: usize = 2;
     /// Register value high 32 bits
-    pub const VAL_1: usize = 4;
+    pub const VAL_1: usize = 3;
 
     /// Previous value low 32 bits
-    pub const OLD_0: usize = 5;
+    pub const OLD_0: usize = 4;
     /// Previous value high 32 bits
-    pub const OLD_1: usize = 6;
+    pub const OLD_1: usize = 5;
 
-    /// Old timestamp low 32 bits (upper limb shared with TIMESTAMP_1)
-    pub const OLD_TIMESTAMP_LO: usize = 7;
+    /// Old timestamp: Word (32 bits)
+    pub const OLD_TIMESTAMP: usize = 6;
 
     /// Read multiplicity
-    pub const MU_READ: usize = 8;
+    pub const MU_READ: usize = 7;
     /// Write multiplicity
-    pub const MU_WRITE: usize = 9;
+    pub const MU_WRITE: usize = 8;
 
-    pub const NUM_COLUMNS: usize = 10;
+    pub const NUM_COLUMNS: usize = 9;
 }
 
 // =========================================================================
@@ -108,9 +104,9 @@ pub fn generate_memw_register_trace(
             op.base_address
         );
         // Both register words must have been last accessed at the same timestamp.
-        // MEMW_R stores a single old_timestamp_lo and shares TIMESTAMP_1 as the
-        // upper limb, so if the two words differ, the wrong token would be sent
-        // to the memory bus. The routing predicate enforces this before dispatch.
+        // MEMW_R stores a single old_timestamp shared by both words, so if the two
+        // words differ, the wrong token would be sent to the memory bus. The routing
+        // predicate enforces this before dispatch.
         debug_assert_eq!(
             op.old_timestamp[0], op.old_timestamp[1],
             "register words must share old_timestamp ({} != {})",
@@ -120,8 +116,8 @@ pub fn generate_memw_register_trace(
         // ADDRESS = base_address / 2 (CPU sends 2 * register_index)
         table.set_u64(row_idx, cols::ADDRESS, op.base_address / 2);
 
-        // Timestamp split into lo/hi 32-bit words
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        // Timestamp: single Word
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
 
         // Value: registers are DWordWL = 2 words
         table.set_u64(row_idx, cols::VAL_0, op.value[0]);
@@ -131,12 +127,8 @@ pub fn generate_memw_register_trace(
         table.set_u64(row_idx, cols::OLD_0, op.old[0]);
         table.set_u64(row_idx, cols::OLD_1, op.old[1]);
 
-        // Old timestamp low (upper limb shared with TIMESTAMP_1)
-        table.set_u64(
-            row_idx,
-            cols::OLD_TIMESTAMP_LO,
-            op.old_timestamp[0] & 0xFFFF_FFFF,
-        );
+        // Old timestamp: single Word
+        table.set_u64(row_idx, cols::OLD_TIMESTAMP, op.old_timestamp[0]);
 
         // Multiplicity
         table.set_bool(row_idx, cols::MU_READ, op.is_read);
@@ -156,7 +148,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu_sum = Multiplicity::Sum(cols::MU_READ, cols::MU_WRITE);
 
     // -------------------------------------------------------------------------
-    // IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1] with mu_sum
+    // IS_HALFWORD[timestamp - old_timestamp - 1] with mu_sum
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::IsHalfword,
@@ -164,11 +156,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
-                column: cols::TIMESTAMP_0,
+                column: cols::TIMESTAMP,
             },
             LinearTerm::Column {
                 coefficient: -1,
-                column: cols::OLD_TIMESTAMP_LO,
+                column: cols::OLD_TIMESTAMP,
             },
             LinearTerm::Constant(-1),
         ])],
@@ -177,7 +169,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Memory bus read-old (sender, for i=0,1)
     // memory[is_register=1, addr_lo=2*ADDRESS+i, addr_hi=0,
-    //        OLD_TIMESTAMP_LO, TIMESTAMP_1, OLD[i]]
+    //        OLD_TIMESTAMP, OLD[i]]
     // -------------------------------------------------------------------------
     for i in 0..2 {
         let addr_lo = BusValue::linear(vec![
@@ -196,11 +188,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_lo,
                 BusValue::constant(0),
                 BusValue::Packed {
-                    start_column: cols::OLD_TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
+                    start_column: cols::OLD_TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -214,7 +202,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // -------------------------------------------------------------------------
     // Memory bus write-new (receiver, for i=0,1)
     // memory[is_register=1, addr_lo=2*ADDRESS+i, addr_hi=0,
-    //        TIMESTAMP_0, TIMESTAMP_1, VAL[i]]
+    //        TIMESTAMP, VAL[i]]
     // -------------------------------------------------------------------------
     for i in 0..2 {
         let addr_lo = BusValue::linear(vec![
@@ -233,11 +221,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_lo,
                 BusValue::constant(0),
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
+                    start_column: cols::TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -297,11 +281,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // timestamp
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             // write flags: write2=1, write4=0, write8=0 (registers are always 2 words)
@@ -340,11 +320,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusValue::constant(0),
             // timestamp
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             // write flags: write2=1, write4=0, write8=0

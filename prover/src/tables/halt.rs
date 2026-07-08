@@ -4,14 +4,14 @@
 //! instruction with syscall number 93 (`sys_exit`).
 //!
 //! ## Columns
-//! - `timestamp`: DWordWL (2 columns) - timestamp at which to halt the program
+//! - `timestamp`: Word (1 column) - timestamp at which to halt the program
 //! - `pc`: DWordWL (2 columns) - the `next_pc` the CPU wrote during the halting
 //!   instruction (consumed off the `memory` bus and replaced by the padding PC=1)
 //!
 //! ## Bus Interactions
 //! - **Receiver**: ECALL bus - receives `[timestamp, cast(rv1, DWordWL)]` from CPU
 //!   when the ECALL flag is set (rv1 must be 93 = sys_exit)
-//! - **Sender**: MEMW bus - 31 register finalization interactions at `ts = 2^64-1`:
+//! - **Sender**: MEMW bus - 31 register finalization interactions at `ts = 2^32-1`:
 //!   - x1-x9: write 0 (zeroize lo GPRs)
 //!   - x10: read with old=0 (enforce exit_code=0; non-zero → bus imbalance → proof failure)
 //!   - x11-x31: write 0 (zeroize hi GPRs)
@@ -20,7 +20,7 @@
 //!   the halting instruction and *re-emits* `pc = 1`. This bridges the last real PC
 //!   write to the CPU padding rows (which all carry PC=1); the padding chain then
 //!   carries PC=1 to the REGISTER table's final token. x255 is therefore NOT
-//!   finalized via MEMW at `2^64-1` anymore.
+//!   finalized via MEMW at `2^32-1` anymore.
 //!
 //! Corresponding MEMW table rows are generated in trace_builder.
 //!
@@ -38,18 +38,16 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
 /// Column definitions for the HALT table.
 pub mod cols {
-    /// timestamp[0]: Word (lower 32 bits of halt timestamp)
-    pub const TIMESTAMP_0: usize = 0;
-    /// timestamp[1]: Word (upper 32 bits of halt timestamp)
-    pub const TIMESTAMP_1: usize = 1;
+    /// timestamp: Word (32-bit halt timestamp)
+    pub const TIMESTAMP: usize = 0;
 
     /// pc[0]: Word (lower 32 bits of the halting instruction's next_pc)
-    pub const PC_0: usize = 2;
+    pub const PC_0: usize = 1;
     /// pc[1]: Word (upper 32 bits of the halting instruction's next_pc)
-    pub const PC_1: usize = 3;
+    pub const PC_1: usize = 2;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 4;
+    pub const NUM_COLUMNS: usize = 3;
 }
 
 // =========================================================================
@@ -58,7 +56,7 @@ pub mod cols {
 
 /// Generates the HALT trace table from the halt timestamp.
 ///
-/// This produces a single-row table with the timestamp split into DWordWL format.
+/// This produces a single-row table with the timestamp stored as a single Word.
 /// The HALT table expects exactly one ECALL per execution: the executor stops on the
 /// first ECALL, so a valid trace always contains exactly one. If a program had multiple
 /// ECALLs, the CPU would send multiple bus interactions but HALT only receives one,
@@ -67,7 +65,7 @@ pub fn generate_halt_trace(
     timestamp: u64,
     next_pc: u64,
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
-    // CPU timestamps must fit in u32 (timestamp_hi should be 0)
+    // CPU timestamps must fit in a Word (u32 range)
     debug_assert!(
         timestamp <= u32::MAX as u64,
         "HALT timestamp {timestamp} exceeds u32 range"
@@ -75,7 +73,7 @@ pub fn generate_halt_trace(
     let mut trace = TraceTable::new_main(vec![FE::zero(); cols::NUM_COLUMNS], cols::NUM_COLUMNS, 1);
     let table = &mut trace.main_table;
 
-    table.set_dword_wl(0, cols::TIMESTAMP_0, timestamp);
+    table.set_u64(0, cols::TIMESTAMP, timestamp);
     table.set_dword_wl(0, cols::PC_0, next_pc);
 
     trace
@@ -85,10 +83,10 @@ pub fn generate_halt_trace(
 // Bus interactions
 // =========================================================================
 
-/// Returns the 24-element MEMW read bus values for x10 exit code verification.
+/// Returns the 23-element MEMW read bus values for x10 exit code verification.
 ///
 /// Format matches CO24 (read receiver): `[old[0..7], is_register, base_addr[0..1],
-/// value[0..7], timestamp[0..1], write2, write4, write8]`.
+/// value[0..7], timestamp, write2, write4, write8]`.
 /// old=0 enforces that x10 was 0 at halt time.
 fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
     vec![
@@ -101,7 +99,7 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
         BusValue::constant(0),
         BusValue::constant(0),
         BusValue::constant(0),
-        // input (same 16 elements as write format)
+        // input (same 15 elements as write format)
         BusValue::constant(1),           // is_register = 1
         BusValue::constant(base_addr),   // base_address[0]
         BusValue::constant(0),           // base_address[1]
@@ -113,18 +111,17 @@ fn halt_read_bus_values(base_addr: u64) -> Vec<BusValue> {
         BusValue::constant(0),           // value[5]
         BusValue::constant(0),           // value[6]
         BusValue::constant(0),           // value[7]
-        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
+        BusValue::constant(0xFFFF_FFFF), // timestamp = 2^32-1
         BusValue::constant(1),           // write2 = 1
         BusValue::constant(0),           // write4 = 0
         BusValue::constant(0),           // write8 = 0
     ]
 }
 
-/// Returns the 16-element MEMW write bus values for a register finalization.
+/// Returns the 15-element MEMW write bus values for a register finalization.
 ///
 /// Format matches CO25 (write receiver): `[is_register, base_addr[0..1], value[0..7],
-/// timestamp[0..1], write2, write4, write8]`.
+/// timestamp, write2, write4, write8]`.
 fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
     vec![
         BusValue::constant(1),           // is_register = 1
@@ -138,8 +135,7 @@ fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
         BusValue::constant(0),           // value[5]
         BusValue::constant(0),           // value[6]
         BusValue::constant(0),           // value[7]
-        BusValue::constant(0xFFFF_FFFF), // timestamp[0] = lo(2^64-1)
-        BusValue::constant(0xFFFF_FFFF), // timestamp[1] = hi(2^64-1)
+        BusValue::constant(0xFFFF_FFFF), // timestamp = 2^32-1
         BusValue::constant(1),           // write2 = 1
         BusValue::constant(0),           // write4 = 0
         BusValue::constant(0),           // write8 = 0
@@ -149,7 +145,7 @@ fn halt_write_bus_values(base_addr: u64, value_lo: u64) -> Vec<BusValue> {
 /// Creates all bus interactions for the HALT table.
 ///
 /// - **ECALL receiver**: receives `[timestamp, cast(rv1, DWordWL)]` from CPU
-/// - **MEMW senders** (31 total): register finalization at `ts = 2^64-1`
+/// - **MEMW senders** (31 total): register finalization at `ts = 2^32-1`
 ///   - x1-x9: write 0 (zeroize lo GPRs)
 ///   - x10: read with old=0 (enforce exit_code=0)
 ///   - x11-x31: write 0 (zeroize hi GPRs)
@@ -165,11 +161,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::One,
         vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::constant(93), // syscall number lo = sys_exit (93)
@@ -177,7 +169,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ],
     ));
 
-    // x1-x9: write 0 at ts=2^64-1 (zeroize lo registers)
+    // x1-x9: write 0 at ts=2^32-1 (zeroize lo registers)
     for i in 1..=9u64 {
         interactions.push(BusInteraction::sender(
             BusId::Memw,
@@ -186,7 +178,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // x10: read with old=0 at ts=2^64-1 (verify exit code = 0)
+    // x10: read with old=0 at ts=2^32-1 (verify exit code = 0)
     // Per spec halt:c:read_zero_exit_code: enforces that x10 was 0 at halt.
     // Non-zero exit code → bus imbalance → proof failure.
     interactions.push(BusInteraction::sender(
@@ -195,7 +187,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         halt_read_bus_values(20),
     ));
 
-    // x11-x31: write 0 at ts=2^64-1 (zeroize hi registers)
+    // x11-x31: write 0 at ts=2^32-1 (zeroize hi registers)
     for i in 11..=31u64 {
         interactions.push(BusInteraction::sender(
             BusId::Memw,
@@ -209,19 +201,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // its real `next_pc` to x255 (addresses 510/511) at this same timestamp; we
     // consume it (sender, +1) and re-emit pc=1 (receiver, -1) so the CPU padding
     // rows — which all carry pc=1 — chain cleanly to the REGISTER final token.
-    // `value` layout on the bus: [is_register, addr_lo, addr_hi, ts_lo, ts_hi, value].
-    let ts_plus_one_lo = || {
+    // `value` layout on the bus: [is_register, addr_lo, addr_hi, timestamp, value].
+    let ts_plus_one = || {
         BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
-                column: cols::TIMESTAMP_0,
+                column: cols::TIMESTAMP,
             },
             LinearTerm::Constant(1),
         ])
-    };
-    let ts_hi = || BusValue::Packed {
-        start_column: cols::TIMESTAMP_1,
-        packing: Packing::Direct,
     };
     for (addr, pc_col) in [(510u64, cols::PC_0), (511u64, cols::PC_1)] {
         // consume_pc (sender, +1): consume the real next_pc the CPU wrote.
@@ -232,8 +220,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
                 BusValue::constant(addr),
                 BusValue::constant(0),
-                ts_plus_one_lo(),
-                ts_hi(),
+                ts_plus_one(),
                 BusValue::Packed {
                     start_column: pc_col,
                     packing: Packing::Direct,
@@ -250,8 +237,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
                 BusValue::constant(addr),
                 BusValue::constant(0),
-                ts_plus_one_lo(),
-                ts_hi(),
+                ts_plus_one(),
                 BusValue::constant(value),
             ],
         ));

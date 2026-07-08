@@ -7,7 +7,7 @@
 //!
 //! | Group          | Size | Description                                       |
 //! |----------------|------|---------------------------------------------------|
-//! | timestamp      |    2 | DWordWL                                           |
+//! | timestamp      |    1 | Word                                              |
 //! | round          |    1 | Round index (0..23)                               |
 //! | start          |  200 | Input state bytes [5][5][8]                       |
 //! | Cxz            |  160 | Column parity chain [5][4][8]                     |
@@ -40,12 +40,12 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu
 // =========================================================================
 
 pub mod cols {
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
-    pub const ROUND: usize = 2;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
+    pub const ROUND: usize = 1;
 
     // start[5][5][8] = 200 bytes — input state for this round
-    pub const START: usize = 3;
+    pub const START: usize = 2;
 
     // Cxz[5][4][8] = 160 bytes — partial XOR chain for column parities
     pub const CXZ: usize = START + 200; // 203
@@ -258,7 +258,7 @@ pub fn generate_keccak_rnd_trace(
             let row_idx = op_idx * 24 + round;
 
             // Timestamp & round
-            table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+            table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
             table.set_u64(row_idx, cols::ROUND, round as u64);
 
             // start = current state as bytes
@@ -444,11 +444,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     {
         let mut values = vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -478,11 +474,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     {
         let mut values = vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::linear(vec![

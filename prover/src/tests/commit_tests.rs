@@ -51,7 +51,7 @@ fn test_commit_single_byte() {
     assert_eq!(r0[cols::COUNT_1], FE::zero());
     assert_eq!(r0[cols::VALUE], FE::from(0x41u64));
     assert_eq!(r0[cols::MU], FE::one());
-    assert_eq!(r0[cols::TIMESTAMP_0], FE::from(100u64));
+    assert_eq!(r0[cols::TIMESTAMP], FE::from(100u64));
     assert_eq!(r0[cols::INDEX], FE::zero());
 
     // Row 0: address = 0x1000
@@ -129,7 +129,7 @@ fn test_commit_multi_byte() {
     // All rows share timestamp and mu=1
     for row in 0..4 {
         let r = trace.main_table.get_row(row);
-        assert_eq!(r[cols::TIMESTAMP_0], FE::from(200u64));
+        assert_eq!(r[cols::TIMESTAMP], FE::from(200u64));
         assert_eq!(r[cols::MU], FE::one());
     }
 
@@ -177,7 +177,7 @@ fn test_commit_trace_padding() {
         assert_eq!(r[cols::END], FE::zero());
         assert_eq!(r[cols::VALUE], FE::zero());
         assert_eq!(r[cols::ADDRESS_0], FE::zero());
-        assert_eq!(r[cols::TIMESTAMP_0], FE::zero());
+        assert_eq!(r[cols::TIMESTAMP], FE::zero());
         assert_eq!(r[cols::INDEX], FE::zero());
     }
 }
@@ -191,7 +191,7 @@ fn test_commit_trace_dimensions() {
     let trace = generate_commit_trace(&ops);
 
     assert_eq!(trace.num_rows(), 8);
-    assert_eq!(cols::NUM_COLUMNS, 19);
+    assert_eq!(cols::NUM_COLUMNS, 18);
 }
 
 // =========================================================================
@@ -385,15 +385,14 @@ fn test_address_incr_overflow() {
 }
 
 #[test]
-fn test_large_timestamp() {
-    // Timestamp with both hi and lo words populated
-    let ts: u64 = 0x0000_0001_0000_0064; // hi=1, lo=100
+fn test_word_timestamp() {
+    // Timestamps are single 32-bit Words.
+    let ts: u64 = 0x0000_0064; // 100
     let ops = vec![op(ts, 0, 0x5000, 1, true, false, 0xAB)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);
 
-    assert_eq!(r0[cols::TIMESTAMP_0], FE::from(ts & 0xFFFF_FFFF));
-    assert_eq!(r0[cols::TIMESTAMP_1], FE::from(ts >> 32));
+    assert_eq!(r0[cols::TIMESTAMP], FE::from(ts));
 }
 
 #[test]

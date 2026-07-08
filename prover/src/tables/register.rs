@@ -16,7 +16,7 @@
 //! | offset | RowIndex | Byte offset within register space |
 //! | init | Word | Initial value (0 for all registers at start) |
 //! | fini | Word | Final value after execution |
-//! | timestamp | DWordWL | Final timestamp (1 if never accessed) |
+//! | timestamp | Word | Final timestamp (1 if never accessed) |
 
 use std::collections::HashMap;
 
@@ -80,14 +80,11 @@ pub mod cols {
     /// fini: Final byte value after execution
     pub const FINI: usize = 2;
 
-    /// timestamp[0]: Final timestamp low word (1 if never accessed, matching REG-C1 init)
-    pub const TIMESTAMP_LO: usize = 3;
-
-    /// timestamp[1]: Final timestamp high word
-    pub const TIMESTAMP_HI: usize = 4;
+    /// timestamp: Final timestamp Word (1 if never accessed, matching REG-C1 init)
+    pub const TIMESTAMP: usize = 3;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 4;
 }
 
 // =========================================================================
@@ -243,14 +240,14 @@ pub fn generate_register_trace(
         };
 
         table.set_word(row, cols::FINI, fini_value);
-        table.set_dword_wl(row, cols::TIMESTAMP_LO, timestamp);
+        table.set_u64(row, cols::TIMESTAMP, timestamp);
     }
 
-    // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES): set TIMESTAMP_LO=1 so
-    // REG-C1's constant ts=1 emission matches REG-C2's ts=TIMESTAMP_LO consumption,
+    // Padding rows (if num_rows > NUM_REGISTER_ADDRESSES): set TIMESTAMP=1 so
+    // REG-C1's constant ts=1 emission matches REG-C2's ts=TIMESTAMP consumption,
     // keeping padding rows self-cancelling on the bus.
     for row in NUM_REGISTER_ADDRESSES..num_rows {
-        table.set_u64(row, cols::TIMESTAMP_LO, 1);
+        table.set_u64(row, cols::TIMESTAMP, 1);
     }
 
     trace
@@ -392,10 +389,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 address_lo.clone(),
                 // address_hi = 0
                 address_hi.clone(),
-                // timestamp_lo = 1 (initial)
+                // timestamp = 1 (initial)
                 BusValue::constant(1),
-                // timestamp_hi = 0
-                BusValue::constant(0),
                 // value = init
                 BusValue::Packed {
                     start_column: cols::INIT,
@@ -415,14 +410,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 address_lo,
                 // address_hi = 0
                 address_hi,
-                // timestamp_lo (final)
+                // timestamp (final)
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                // timestamp_hi (final)
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_HI,
+                    start_column: cols::TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 // value = fini

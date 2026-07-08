@@ -44,7 +44,7 @@ fn test_generate_page_trace_zero_init() {
     assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
-    assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::zero());
+    assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP), FE::zero());
 
     // Sample: some middle row (offset 42)
     assert_eq!(*trace.main_table.get(42, cols::OFFSET), FE::from(42u64));
@@ -113,20 +113,17 @@ fn test_generate_page_trace_with_accesses() {
     // Row 0: address 0 (offset 0) - was accessed
     assert_eq!(*trace.main_table.get(0, cols::INIT), FE::from(0xAAu64));
     assert_eq!(*trace.main_table.get(0, cols::FINI), FE::from(0xFFu64));
-    assert_eq!(
-        *trace.main_table.get(0, cols::TIMESTAMP_LO),
-        FE::from(100u64)
-    );
+    assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP), FE::from(100u64));
 
     // Row 1: address 1 (offset 1) - not accessed, fini = init = 0xBB
     assert_eq!(*trace.main_table.get(1, cols::INIT), FE::from(0xBBu64));
     assert_eq!(*trace.main_table.get(1, cols::FINI), FE::from(0xBBu64));
-    assert_eq!(*trace.main_table.get(1, cols::TIMESTAMP_LO), FE::zero());
+    assert_eq!(*trace.main_table.get(1, cols::TIMESTAMP), FE::zero());
 
     // Row 2: not in data, not accessed — init=0, fini=0
     assert_eq!(*trace.main_table.get(2, cols::INIT), FE::zero());
     assert_eq!(*trace.main_table.get(2, cols::FINI), FE::zero());
-    assert_eq!(*trace.main_table.get(2, cols::TIMESTAMP_LO), FE::zero());
+    assert_eq!(*trace.main_table.get(2, cols::TIMESTAMP), FE::zero());
 
     // OFFSET column must equal row index
     assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::from(0u64));

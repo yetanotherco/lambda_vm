@@ -26,9 +26,8 @@ fn test_memw_register_trace_generation() {
     // ADDRESS = base_address / 2 = 2 / 2 = 1
     assert_eq!(*trace.get_main(0, cols::ADDRESS), FE::from(1u64));
 
-    // TIMESTAMP split
-    assert_eq!(*trace.get_main(0, cols::TIMESTAMP_0), FE::from(100u64));
-    assert_eq!(*trace.get_main(0, cols::TIMESTAMP_1), FE::from(0u64));
+    // TIMESTAMP (single Word)
+    assert_eq!(*trace.get_main(0, cols::TIMESTAMP), FE::from(100u64));
 
     // Values
     assert_eq!(*trace.get_main(0, cols::VAL_0), FE::from(42u64));
@@ -38,8 +37,8 @@ fn test_memw_register_trace_generation() {
     assert_eq!(*trace.get_main(0, cols::OLD_0), FE::from(10u64));
     assert_eq!(*trace.get_main(0, cols::OLD_1), FE::from(3u64));
 
-    // Old timestamp lo
-    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP_LO), FE::from(50u64));
+    // Old timestamp
+    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP), FE::from(50u64));
 
     // Multiplicity: is_read = true => MU_READ=1, MU_WRITE=0
     assert_eq!(*trace.get_main(0, cols::MU_READ), FE::from(1u64));
@@ -74,8 +73,8 @@ fn test_memw_register_trace_generation_write_op() {
     assert_eq!(*trace.get_main(0, cols::OLD_0), FE::from(11u64));
     assert_eq!(*trace.get_main(0, cols::OLD_1), FE::from(22u64));
 
-    // Old timestamp lo
-    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP_LO), FE::from(180u64));
+    // Old timestamp
+    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP), FE::from(180u64));
 
     // Multiplicity: is_read = false => MU_WRITE=1, MU_READ=0
     assert_eq!(*trace.get_main(0, cols::MU_READ), FE::from(0u64));

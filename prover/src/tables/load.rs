@@ -5,7 +5,7 @@
 //!
 //! ## Inputs
 //! - `base_address`: DWordWL (64-bit address)
-//! - `timestamp`: DWordWL (64-bit timestamp)
+//! - `timestamp`: Word (32-bit timestamp)
 //! - `read2/4/8`: Bit (access width flags)
 //! - `signed`: Bit (1 = sign-extend, 0 = zero-extend)
 //!
@@ -39,33 +39,32 @@ pub mod cols {
     pub const BASE_ADDRESS_0: usize = 0;
     pub const BASE_ADDRESS_1: usize = 1;
 
-    /// timestamp: DWordWL (2 words = 2 columns)
-    pub const TIMESTAMP_0: usize = 2;
-    pub const TIMESTAMP_1: usize = 3;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 2;
 
     /// read2, read4, read8: access width flags
     /// Similar to MEMW write flags - see MEMW for encoding explanation
-    pub const READ2: usize = 4;
-    pub const READ4: usize = 5;
-    pub const READ8: usize = 6;
+    pub const READ2: usize = 3;
+    pub const READ4: usize = 4;
+    pub const READ8: usize = 5;
 
     /// signed: Bit (1 = sign-extend, 0 = zero-extend)
-    pub const SIGNED: usize = 7;
+    pub const SIGNED: usize = 6;
 
     // Output columns
     /// res[8]: 8 bytes of result (DWordBL = 8 columns)
-    pub const RES: [usize; 8] = [8, 9, 10, 11, 12, 13, 14, 15];
+    pub const RES: [usize; 8] = [7, 8, 9, 10, 11, 12, 13, 14];
 
     // Auxiliary columns
     /// sign_bit: Bit (MSB of the relevant byte for sign extension)
-    pub const SIGN_BIT: usize = 16;
+    pub const SIGN_BIT: usize = 15;
 
     // Multiplicity column
     /// μ: Whether this row is active
-    pub const MU: usize = 17;
+    pub const MU: usize = 16;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 18;
+    pub const NUM_COLUMNS: usize = 17;
 }
 
 // =========================================================================
@@ -189,7 +188,7 @@ pub fn generate_load_trace(
     for (row_idx, op) in operations.iter().enumerate() {
         // Input columns
         table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
 
         // read flags
         let (r2, r4, r8) = op.read_flags();
@@ -318,13 +317,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::RES[7],
                 packing: Packing::Direct,
             },
-            // timestamp (DWordWL = 2 words)
+            // timestamp (Word = 1 column)
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             // read flags (same as write flags for MEMW)
@@ -429,10 +424,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::MemoryOp,
         Multiplicity::Column(cols::MU),
         vec![
-            // timestamp (DWordWL = 2 words)
+            // timestamp (Word = 1 column)
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
             },
             // address = base_address (DWordWL = 2 words)
             BusValue::Packed {

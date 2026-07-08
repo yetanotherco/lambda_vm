@@ -1101,7 +1101,7 @@ fn collect_commit_memw_ops(
 
 /// Collects HALT finalization MEMW operations for all 33 registers.
 ///
-/// Per spec (halt.toml): at timestamp 2^64-1, HALT finalizes the GP registers:
+/// Per spec (halt.toml): at timestamp 2^32-1, HALT finalizes the GP registers:
 /// - x1-x9, x11-x31: write 0 (zeroize)
 /// - x10: read (verify exit code = 0; if x10 ≠ 0, proof fails via bus mismatch)
 ///
@@ -1112,7 +1112,9 @@ fn collect_commit_memw_ops(
 /// the finalized GP register values.
 fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     let mut ops = Vec::with_capacity(32);
-    let ts = u64::MAX;
+    // Timestamps are single 32-bit Words, so the finalization sentinel is 2^32-1
+    // (matches halt.rs's register-finalization tokens).
+    let ts = u64::from(u32::MAX);
 
     // x1-x9: write 0
     for i in 1..=9u8 {
@@ -1125,7 +1127,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
         register_state.write(i, 0, ts);
     }
 
-    // x10: read with old=0 at ts=2^64-1 (enforce exit_code=0)
+    // x10: read with old=0 at ts=2^32-1 (enforce exit_code=0)
     // Per spec halt:c:read_zero_exit_code: old=0 enforces x10 was 0 at halt.
     // Non-zero exit code → bus imbalance → proof failure.
     {
@@ -1150,7 +1152,7 @@ fn collect_halt_ops(register_state: &mut RegisterState) -> Vec<MemwOperation> {
     }
 
     // x255 (PC) is finalized via the inline-PC `memory` bus + REGISTER table, not
-    // via a MEMW write at 2^64-1. See `collect_halt_ops` doc and the PC finalization
+    // via a MEMW write at 2^32-1. See `collect_halt_ops` doc and the PC finalization
     // in the caller.
 
     ops
@@ -1363,9 +1365,8 @@ fn collect_bitwise_from_memw_aligned(ops: &[MemwOperation]) -> Vec<BitwiseOperat
 /// An operation routes to MEMW_R if:
 /// 1. It's a 2-word register access (is_register = true, width = 2)
 /// 2. Both words share the same old_timestamp (atomic register write)
-/// 3. timestamp[1] == old_timestamp[1] (upper limbs match)
-/// 4. timestamp[0] > old_timestamp[0] (lower limb ordering)
-/// 5. timestamp[0] - old_timestamp[0] <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
+/// 3. timestamp > old_timestamp (single-Word ordering)
+/// 4. timestamp - old_timestamp <= 0x10000 (delta fits in IS_HALF range [1, 2^16])
 ///
 /// Width-1 register ops (e.g. COMMIT x254) stay in MEMW, which has
 /// dynamic write flags. MEMW_R hardcodes write2=1.
@@ -1388,7 +1389,7 @@ pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
 
 /// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
 ///
-/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
+/// For each register op: checks that `timestamp - old_timestamp - 1` fits
 /// in a halfword (proving the timestamp delta is in range [1, 2^16]).
 fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
     ops.iter()
@@ -2654,7 +2655,7 @@ fn collect_all_ops(
     register_state: &mut RegisterState,
     is_final: bool,
 ) -> CollectedOps {
-    // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
+    // HALT finalization: 33 register MEMW operations at timestamp 2^32-1.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
     // Only the final epoch terminates; intermediate epochs keep their boundary
     // register state (no zeroizing) so it can seed the next epoch.
@@ -2866,7 +2867,7 @@ fn build_traces<I: ImageSource + Sync>(
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
     bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
+    // MEMW_R sends IS_HALFWORD[timestamp - old_timestamp - 1]
     bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
     // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2).
     // Continuation epochs (l2g_memory_bookend) skip PAGE entirely (see the

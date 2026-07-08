@@ -746,10 +746,10 @@ mod keccak_tests {
 
     #[test]
     fn test_keccak_column_counts() {
-        assert_eq!(core_cols::NUM_COLUMNS, 511, "KECCAK core columns");
+        assert_eq!(core_cols::NUM_COLUMNS, 510, "KECCAK core columns");
         assert_eq!(
             rnd_cols::NUM_COLUMNS,
-            1480,
+            1479,
             "KECCAK_RND columns (rnc/rbc inlined; pi virtual; Cxz_right Bit-typed)"
         );
         assert_eq!(keccak_rc::cols::NUM_COLUMNS, 10, "KECCAK_RC columns");

@@ -234,15 +234,13 @@ pub mod cols {
     /// Fini value: a single byte.
     pub const FINI_VALUE: usize = 5;
 
-    /// fini_timestamp_lo: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_LO: usize = 6;
-    /// fini_timestamp_hi: 32-bit; matched on the Memory bus against MEMW.
-    pub const FINI_TIMESTAMP_HI: usize = 7;
+    /// fini_timestamp: 32-bit Word; matched on the Memory bus against MEMW.
+    pub const FINI_TIMESTAMP: usize = 6;
 
     /// MU: real-row selector / LogUp multiplicity (1 on real rows, 0 on padding).
-    pub const MU: usize = 8;
+    pub const MU: usize = 7;
 
-    pub const NUM_COLUMNS: usize = 9;
+    pub const NUM_COLUMNS: usize = 8;
 
     /// The halfword columns (cross-epoch-only quantities), in order — every column
     /// that is `IsHalfword`-checked.
@@ -276,8 +274,7 @@ pub fn generate_local_to_global_trace(
         // Plain 32-bit columns (MEMW-checked on the Memory bus).
         data[base + cols::ADDRESS_LO] = FE::from(b.address & 0xFFFF_FFFF);
         data[base + cols::ADDRESS_HI] = FE::from(b.address >> 32);
-        data[base + cols::FINI_TIMESTAMP_LO] = FE::from(b.fini.timestamp & 0xFFFF_FFFF);
-        data[base + cols::FINI_TIMESTAMP_HI] = FE::from(b.fini.timestamp >> 32);
+        data[base + cols::FINI_TIMESTAMP] = FE::from(b.fini.timestamp);
         // Byte values (AreBytes-checked).
         data[base + cols::INIT_VALUE] = FE::from(b.init.value & 0xFF);
         data[base + cols::FINI_VALUE] = FE::from(b.fini.value & 0xFF);
@@ -370,7 +367,7 @@ pub fn bus_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 /// (the epoch-start seed, matching the first MEMW read's `old_timestamp`) and
 /// sends its final token at the last access timestamp. This replaces PAGE's
 /// init/fini bookend for touched bytes. The `Memory` token layout is
-/// `[is_register, address_lo, address_hi, timestamp_lo, timestamp_hi, value]`;
+/// `[is_register, address_lo, address_hi, timestamp, value]`;
 /// RAM only, so `is_register = 0`, and the byte value is the LO column.
 ///
 /// Address, fini timestamp and the values appear here, so MEMW range-checks them
@@ -386,7 +383,6 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
                 BusValue::constant(0),
-                BusValue::constant(0),
                 direct(cols::INIT_VALUE),
             ],
         ),
@@ -398,8 +394,7 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(0),
                 direct(cols::ADDRESS_LO),
                 direct(cols::ADDRESS_HI),
-                direct(cols::FINI_TIMESTAMP_LO),
-                direct(cols::FINI_TIMESTAMP_HI),
+                direct(cols::FINI_TIMESTAMP),
                 direct(cols::FINI_VALUE),
             ],
         ),
@@ -653,7 +648,7 @@ mod tests {
 
     #[test]
     fn test_num_columns() {
-        assert_eq!(cols::NUM_COLUMNS, 9);
+        assert_eq!(cols::NUM_COLUMNS, 8);
         assert_eq!(cols::RANGE_CHECKED_HALFWORDS.len(), 2);
     }
 
@@ -669,11 +664,11 @@ mod tests {
         let byte = |v: u64| FE::from(v & 0xFF);
         let at = |c: usize| *trace.main_table.get(0, c);
 
-        // Address and fini timestamp are plain 32-bit columns (MEMW-checked).
+        // Address is a plain 32-bit-limb column; fini timestamp is a single Word
+        // (both MEMW-checked).
         assert_eq!(at(cols::ADDRESS_LO), lo32(b.address));
         assert_eq!(at(cols::ADDRESS_HI), hi32(b.address));
-        assert_eq!(at(cols::FINI_TIMESTAMP_LO), lo32(b.fini.timestamp));
-        assert_eq!(at(cols::FINI_TIMESTAMP_HI), hi32(b.fini.timestamp));
+        assert_eq!(at(cols::FINI_TIMESTAMP), FE::from(b.fini.timestamp));
         // Values are stored as single bytes.
         assert_eq!(at(cols::INIT_VALUE), byte(b.init.value));
         assert_eq!(at(cols::FINI_VALUE), byte(b.fini.value));

@@ -30,7 +30,7 @@ fn test_generate_register_trace_empty() {
     assert_eq!(*trace.main_table.get(0, cols::OFFSET), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::INIT), FE::zero());
     assert_eq!(*trace.main_table.get(0, cols::FINI), FE::zero());
-    assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP_LO), FE::from(1u64));
+    assert_eq!(*trace.main_table.get(0, cols::TIMESTAMP), FE::from(1u64));
 
     // Check x254 row (row 64 = addr 508)
     assert_eq!(*trace.main_table.get(64, cols::OFFSET), FE::from(508u64));
@@ -74,10 +74,7 @@ fn test_generate_register_trace_with_access() {
     assert_eq!(*trace.main_table.get(10, cols::OFFSET), FE::from(10u64));
     assert_eq!(*trace.main_table.get(10, cols::INIT), FE::zero()); // init is always 0
     assert_eq!(*trace.main_table.get(10, cols::FINI), FE::from(0x42u64));
-    assert_eq!(
-        *trace.main_table.get(10, cols::TIMESTAMP_LO),
-        FE::from(100u64)
-    );
+    assert_eq!(*trace.main_table.get(10, cols::TIMESTAMP), FE::from(100u64));
 }
 
 #[test]

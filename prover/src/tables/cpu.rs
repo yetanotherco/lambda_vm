@@ -110,7 +110,7 @@ pub mod cols {
     // -------------------------------------------------------------------------
 
     /// prev_pc_timestamp_borrow: borrow bit for the inline-PC `timestamp - 3`
-    /// subtraction (fires when `timestamp_lo < 3` and `pc_double_read = 0`).
+    /// subtraction (fires when `timestamp < 3` and `pc_double_read = 0`).
     pub const PREV_PC_TIMESTAMP_BORROW: usize = 25;
     /// pc_double_read: PC is read as a general register (`rs1 = 255`) this cycle
     /// (AUIPC/JAL) (Bit).
@@ -688,7 +688,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // CPU32: delegate word (`*W`) instructions (mult = word_instr).
-    // CPU32[timestamp::DWordWL, pc::DWordWL, half_instruction_length].
+    // CPU32[timestamp::Word, pc::DWordWL, half_instruction_length].
     // -------------------------------------------------------------------------
     interactions.push(BusInteraction::sender(
         BusId::Cpu32,
@@ -698,7 +698,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
-            BusValue::constant(0), // timestamp_hi (CPU timestamps fit in 32 bits)
             BusValue::Packed {
                 start_column: cols::PC_0,
                 packing: Packing::DWordWL,
@@ -711,7 +710,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // -------------------------------------------------------------------------
-    // Register reads/writes via MEMW (24-element read, 16-element write).
+    // Register reads/writes via MEMW (23-element read, 15-element write).
     // rv1/rv2/rvd are DWordWL, so the value words are emitted directly.
     // -------------------------------------------------------------------------
     interactions.push(memw_register_read(
@@ -728,7 +727,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         cols::RV2_1,
         1,
     ));
-    // Register write of rvd at timestamp+2 (16 elements, no `old`).
+    // Register write of rvd at timestamp+2 (15 elements, no `old`).
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::WRITE_REGISTER),
@@ -761,7 +760,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 },
                 LinearTerm::Constant(2),
             ]),
-            BusValue::constant(0),
             BusValue::constant(1), // write2 (register access = 2 words)
             BusValue::constant(0),
             BusValue::constant(0),
@@ -780,8 +778,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
-            BusValue::constant(0), // timestamp_hi
-            res_cast_wl(),         // address (2 words)
+            res_cast_wl(), // address (2 words)
             BusValue::Packed {
                 start_column: cols::RV2_0,
                 packing: Packing::DWordWL,
@@ -805,8 +802,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     // to the padding chain. See `docs/cpu-rework-deviations.md` (D-PAD).
     // -------------------------------------------------------------------------
     let pc_mult = Multiplicity::One;
-    // prev_ts_lo = timestamp - 3*(1 - pc_double_read) + 2^32 * borrow
-    let prev_ts_lo = BusValue::linear(vec![
+    // prev_ts = timestamp - 3*(1 - pc_double_read)
+    let prev_ts = BusValue::linear(vec![
         LinearTerm::Column {
             coefficient: 1,
             column: cols::TIMESTAMP,
@@ -816,15 +813,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             coefficient: 3,
             column: cols::PC_DOUBLE_READ,
         },
-        LinearTerm::Column {
-            coefficient: 1i64 << 32,
-            column: cols::PREV_PC_TIMESTAMP_BORROW,
-        },
     ]);
-    let prev_ts_hi = BusValue::linear(vec![LinearTerm::Column {
-        coefficient: -1,
-        column: cols::PREV_PC_TIMESTAMP_BORROW,
-    }]);
     for i in 0..2u64 {
         let pc_col = if i == 0 { cols::PC_0 } else { cols::PC_1 };
         let next_pc_col = if i == 0 {
@@ -840,8 +829,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 BusValue::constant(1),
                 BusValue::constant(510 + i),
                 BusValue::constant(0),
-                prev_ts_lo.clone(),
-                prev_ts_hi.clone(),
+                prev_ts.clone(),
                 BusValue::Packed {
                     start_column: pc_col,
                     packing: Packing::Direct,
@@ -863,7 +851,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                     },
                     LinearTerm::Constant(1),
                 ]),
-                BusValue::constant(0),
                 BusValue::Packed {
                     start_column: next_pc_col,
                     packing: Packing::Direct,
@@ -967,7 +954,6 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
-            BusValue::constant(0),
             BusValue::Packed {
                 start_column: cols::RV1_0,
                 packing: Packing::DWordWL,
@@ -978,8 +964,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     interactions
 }
 
-/// MEMW register-read interaction (24 elements: `old(8), is_register, base(2),
-/// value(8), timestamp(2), w2, w4, w8`). Register values are DWordWL (the two
+/// MEMW register-read interaction (23 elements: `old(8), is_register, base(2),
+/// value(8), timestamp(1), w2, w4, w8`). Register values are DWordWL (the two
 /// value words are read directly; the remaining 6 byte slots are 0).
 fn memw_register_read(
     read_flag_col: usize,
@@ -1040,9 +1026,8 @@ fn memw_register_read(
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // timestamp[0..2]
+            // timestamp
             ts,
-            BusValue::constant(0),
             // write2 = 1, write4 = 0, write8 = 0 (register = 2 words)
             BusValue::constant(1),
             BusValue::constant(0),

@@ -18,7 +18,7 @@
 //! | offset | RowIndex | 0, 1, ..., page_size-1 (preprocessed) |
 //! | init | Byte | Initial value (from ELF or 0) |
 //! | fini | Byte | Final value after execution |
-//! | timestamp | DWordWL | Final timestamp (0 if never accessed) |
+//! | timestamp | Word | Final timestamp (0 if never accessed) |
 //!
 //! Virtual: `address = page + offset` where `page` is constant per table instance.
 //!
@@ -70,14 +70,11 @@ pub mod cols {
     /// fini: Final byte value after execution
     pub const FINI: usize = 2;
 
-    /// timestamp[0]: Final timestamp low word (0 if never accessed)
-    pub const TIMESTAMP_LO: usize = 3;
-
-    /// timestamp[1]: Final timestamp high word
-    pub const TIMESTAMP_HI: usize = 4;
+    /// timestamp: Final timestamp Word (0 if never accessed)
+    pub const TIMESTAMP: usize = 3;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 5;
+    pub const NUM_COLUMNS: usize = 4;
 }
 
 /// Number of preprocessed columns (OFFSET, INIT for ELF pages).
@@ -278,7 +275,7 @@ pub fn generate_page_trace(
         };
 
         table.set_byte(offset, cols::FINI, fini_value);
-        table.set_dword_wl(offset, cols::TIMESTAMP_LO, timestamp);
+        table.set_u64(offset, cols::TIMESTAMP, timestamp);
     }
 
     trace
@@ -485,9 +482,7 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                 address_lo.clone(),
                 // address_hi = page_base_hi
                 address_hi.clone(),
-                // timestamp_lo = 0 (initial)
-                BusValue::constant(0),
-                // timestamp_hi = 0
+                // timestamp = 0 (initial)
                 BusValue::constant(0),
                 // value = init
                 BusValue::Packed {
@@ -507,14 +502,9 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
                 address_lo,
                 // address_hi = page_base_hi
                 address_hi,
-                // timestamp_lo (final)
+                // timestamp (final)
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_LO,
-                    packing: Packing::Direct,
-                },
-                // timestamp_hi (final)
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_HI,
+                    start_column: cols::TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 // value = fini

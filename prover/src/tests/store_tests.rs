@@ -23,7 +23,7 @@ fn test_trace_layout() {
     let row = trace.main_table.get_row(0);
     assert_eq!(row[cols::BASE_ADDRESS_0], FE::from(0x0000_1000u64));
     assert_eq!(row[cols::BASE_ADDRESS_1], FE::from(0xDEAD_BEEFu64));
-    assert_eq!(row[cols::TIMESTAMP_0], FE::from(0x40u64));
+    assert_eq!(row[cols::TIMESTAMP], FE::from(0x40u64));
     assert_eq!(row[cols::WRITE8], FE::from(1u64));
     assert_eq!(row[cols::WRITE2], FE::from(0u64));
     // value little-endian byte split

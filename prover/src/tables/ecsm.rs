@@ -34,31 +34,31 @@ pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 // =========================================================================
 
 pub mod cols {
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
-    pub const ADDR_XG_0: usize = 2;
-    pub const ADDR_XG_1: usize = 3;
-    pub const ADDR_K_0: usize = 4;
-    pub const ADDR_K_1: usize = 5;
-    pub const ADDR_XR_0: usize = 6;
-    pub const ADDR_XR_1: usize = 7;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
+    pub const ADDR_XG_0: usize = 1;
+    pub const ADDR_XG_1: usize = 2;
+    pub const ADDR_K_0: usize = 3;
+    pub const ADDR_K_1: usize = 4;
+    pub const ADDR_XR_0: usize = 5;
+    pub const ADDR_XR_1: usize = 6;
 
-    pub const XR: usize = 8; // U256BL (32)
-    pub const YR: usize = 40; // U256BL (32)
-    pub const K: usize = 72; // U256BL (32)
-    pub const LEN_K: usize = 104; // Byte
-    pub const XG: usize = 105; // U256BL (32)
-    pub const YG: usize = 137; // U256BL (32)
-    pub const X2: usize = 169; // U256BL (32)
-    pub const Q0: usize = 201; // U256BL (32)
-    pub const C0: usize = 233; // BaseField[64]
-    pub const Q1: usize = 297; // Byte[33]
-    pub const C1: usize = 330; // BaseField[64]
-    pub const K_SUB_N: usize = 394; // U256HL (16 halfwords)
-    pub const XR_SUB_P: usize = 410; // U256HL (16 halfwords)
-    pub const MU: usize = 426;
+    pub const XR: usize = 7; // U256BL (32)
+    pub const YR: usize = 39; // U256BL (32)
+    pub const K: usize = 71; // U256BL (32)
+    pub const LEN_K: usize = 103; // Byte
+    pub const XG: usize = 104; // U256BL (32)
+    pub const YG: usize = 136; // U256BL (32)
+    pub const X2: usize = 168; // U256BL (32)
+    pub const Q0: usize = 200; // U256BL (32)
+    pub const C0: usize = 232; // BaseField[64]
+    pub const Q1: usize = 296; // Byte[33]
+    pub const C1: usize = 329; // BaseField[64]
+    pub const K_SUB_N: usize = 393; // U256HL (16 halfwords)
+    pub const XR_SUB_P: usize = 409; // U256HL (16 halfwords)
+    pub const MU: usize = 425;
 
-    pub const NUM_COLUMNS: usize = 427;
+    pub const NUM_COLUMNS: usize = 426;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
@@ -157,7 +157,7 @@ pub fn generate_ecsm_trace(
     for (row_idx, op) in ops.iter().enumerate() {
         let w = &op.witness;
 
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
         table.set_dword_wl(row_idx, cols::ADDR_XG_0, op.addr_xg);
         table.set_dword_wl(row_idx, cols::ADDR_K_0, op.addr_k);
         table.set_dword_wl(row_idx, cols::ADDR_XR_0, op.addr_xr);
@@ -205,50 +205,46 @@ fn packed(col: usize) -> BusValue {
     }
 }
 
-/// `[old[8], is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
-/// a 24-element MEMW **read** tuple (`old == value`).
+/// `[old[8], is_register, base_lo, base_hi, value[8], ts, w2, w4, w8]` —
+/// a 23-element MEMW **read** tuple (`old == value`).
 #[allow(clippy::too_many_arguments)]
 fn memw_read(
     value: [BusValue; 8],
     is_register: u64,
     base_lo: BusValue,
     base_hi: BusValue,
-    ts_lo: BusValue,
-    ts_hi: BusValue,
+    ts: BusValue,
     w2: u64,
     w8: u64,
 ) -> Vec<BusValue> {
-    let mut v = Vec::with_capacity(24);
+    let mut v = Vec::with_capacity(23);
     v.extend(value.clone()); // old == value (read)
     v.push(BusValue::constant(is_register));
     v.push(base_lo);
     v.push(base_hi);
     v.extend(value);
-    v.push(ts_lo);
-    v.push(ts_hi);
+    v.push(ts);
     v.push(BusValue::constant(w2));
     v.push(BusValue::constant(0));
     v.push(BusValue::constant(w8));
     v
 }
 
-/// `[is_register, base_lo, base_hi, value[8], ts_lo, ts_hi, w2, w4, w8]` —
-/// a 16-element MEMW **write** tuple (MEMW table supplies `old`).
+/// `[is_register, base_lo, base_hi, value[8], ts, w2, w4, w8]` —
+/// a 15-element MEMW **write** tuple (MEMW table supplies `old`).
 fn memw_write(
     value: [BusValue; 8],
     base_lo: BusValue,
     base_hi: BusValue,
-    ts_lo: BusValue,
-    ts_hi: BusValue,
+    ts: BusValue,
     w8: u64,
 ) -> Vec<BusValue> {
-    let mut v = Vec::with_capacity(16);
+    let mut v = Vec::with_capacity(15);
     v.push(BusValue::constant(0)); // is_register = 0 (memory)
     v.push(base_lo);
     v.push(base_hi);
     v.extend(value);
-    v.push(ts_lo);
-    v.push(ts_hi);
+    v.push(ts);
     v.push(BusValue::constant(0)); // w2
     v.push(BusValue::constant(0)); // w4
     v.push(BusValue::constant(w8));
@@ -280,17 +276,15 @@ pub fn point_coord_busvalues(col: usize) -> Vec<BusValue> {
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
-    let ts_lo = || packed(cols::TIMESTAMP_0);
-    let ts_hi = || packed(cols::TIMESTAMP_1);
+    let ts = || packed(cols::TIMESTAMP);
     let mut out = Vec::new();
 
-    // ECALL receiver (mult = mu): [ts_lo, ts_hi, syscall_lo32, syscall_hi32].
+    // ECALL receiver (mult = mu): [timestamp, syscall_lo32, syscall_hi32].
     out.push(BusInteraction::receiver(
         BusId::Ecall,
         mu(),
         vec![
-            ts_lo(),
-            ts_hi(),
+            ts(),
             BusValue::constant(ECSM_SYSCALL_NUMBER & 0xFFFF_FFFF),
             BusValue::constant(ECSM_SYSCALL_NUMBER >> 32),
         ],
@@ -305,8 +299,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 11),
             BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
+            ts(),
             1,
             0,
         ),
@@ -328,8 +321,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 0,
                 base_lo,
                 packed(cols::ADDR_XG_1),
-                ts_lo(),
-                ts_hi(),
+                ts(),
                 0,
                 1,
             ),
@@ -345,8 +337,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 12),
             BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
+            ts(),
             1,
             0,
         ),
@@ -368,8 +359,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 0,
                 base_lo,
                 packed(cols::ADDR_K_1),
-                ts_lo(),
-                ts_hi(),
+                ts(),
                 0,
                 1,
             ),
@@ -377,11 +367,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // read x10 -> addr_xR (register read at ts + 1).
-    let ts_lo_plus = |d: i64| {
+    let ts_plus = |d: i64| {
         BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
-                column: cols::TIMESTAMP_0,
+                column: cols::TIMESTAMP,
             },
             LinearTerm::Constant(d),
         ])
@@ -394,8 +384,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 10),
             BusValue::constant(0),
-            ts_lo_plus(1),
-            ts_hi(),
+            ts_plus(1),
             1,
             0,
         ),
@@ -416,8 +405,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 dword_bytes(cols::XR, i),
                 base_lo,
                 packed(cols::ADDR_XR_1),
-                ts_lo_plus(2),
-                ts_hi(),
+                ts_plus(2),
                 1,
             ),
         ));
@@ -501,8 +489,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         BusId::ServeK,
         mu(),
         vec![
-            ts_lo(),
-            ts_hi(),
+            ts(),
             packed(cols::ADDR_K_0),
             packed(cols::ADDR_K_1),
             BusValue::constant(31),
@@ -512,7 +499,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out.push(BusInteraction::sender(
         BusId::Bit,
         mu(),
-        vec![ts_lo(), ts_hi(), packed(cols::LEN_K)],
+        vec![ts(), packed(cols::LEN_K)],
     ));
     // ECDAS start: [ts, xG, yG, xG, yG, len_k - 1, 0].
     out.push(BusInteraction::sender(
@@ -531,8 +518,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(-1),
             ]),
             BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
+            ts(),
         ),
     ));
     // ECDAS final receiver: [ts, xR, yR, xG, yG, -1, 0].
@@ -546,15 +532,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             cols::YG,
             BusValue::linear(vec![LinearTerm::Constant(-1)]),
             BusValue::constant(0),
-            ts_lo(),
-            ts_hi(),
+            ts(),
         ),
     ));
 
     out
 }
 
-/// Builds the ECDAS bus tuple `[ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32),
+/// Builds the ECDAS bus tuple `[ts, accX(32), accY(32), genX(32), genY(32),
 /// round, op]`. Shared so the ECSM sender and the ECDAS receiver/sender pack it identically.
 #[allow(clippy::too_many_arguments)]
 pub fn ecdas_tuple(
@@ -564,12 +549,10 @@ pub fn ecdas_tuple(
     gen_y: usize,
     round: BusValue,
     op: BusValue,
-    ts_lo: BusValue,
-    ts_hi: BusValue,
+    ts: BusValue,
 ) -> Vec<BusValue> {
-    let mut v = Vec::with_capacity(2 + 4 * 32 + 2);
-    v.push(ts_lo);
-    v.push(ts_hi);
+    let mut v = Vec::with_capacity(1 + 4 * 32 + 2);
+    v.push(ts);
     v.extend(point_coord_busvalues(acc_x));
     v.extend(point_coord_busvalues(acc_y));
     v.extend(point_coord_busvalues(gen_x));

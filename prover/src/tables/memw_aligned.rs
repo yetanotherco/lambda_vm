@@ -4,7 +4,7 @@
 //! same old_timestamp. Most operations (aligned memory + all register accesses)
 //! route here instead of the heavier MEMW table.
 //!
-//! ## Column layout (29 columns)
+//! ## Column layout (27 columns)
 //!
 //! - `is_register`: Bit
 //! - `base_address[3]`: DWordWHH
@@ -12,10 +12,10 @@
 //!   - `base_address[1]`: Half (mid 16 bits)
 //!   - `base_address[2]`: Word (high 32 bits)
 //! - `value[8]`: BaseField[8]
-//! - `timestamp`: DWordWL (2 cols)
+//! - `timestamp`: Word (1 col)
 //! - `write2/4/8`: Bit (access width flags)
 //! - `old[8]`: BaseField[8]
-//! - `old_timestamp`: DWordWL (2 cols — single, not 8!)
+//! - `old_timestamp`: Word (1 col — single, not 8!)
 //! - `mu_read`, `mu_write`: multiplicity columns
 //!
 //! ## Bus Interactions (20)
@@ -49,7 +49,7 @@ use crate::constraints::templates::emit_is_bit;
 pub const MAX_ROWS: usize = super::max_rows::MEMW_A;
 
 // =========================================================================
-// Column indices (29 columns)
+// Column indices (27 columns)
 // =========================================================================
 
 pub mod cols {
@@ -63,23 +63,22 @@ pub mod cols {
 
     pub const VALUE: [usize; 8] = [4, 5, 6, 7, 8, 9, 10, 11];
 
-    pub const TIMESTAMP_0: usize = 12;
-    pub const TIMESTAMP_1: usize = 13;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 12;
 
-    pub const WRITE2: usize = 14;
-    pub const WRITE4: usize = 15;
-    pub const WRITE8: usize = 16;
+    pub const WRITE2: usize = 13;
+    pub const WRITE4: usize = 14;
+    pub const WRITE8: usize = 15;
 
-    pub const OLD: [usize; 8] = [17, 18, 19, 20, 21, 22, 23, 24];
+    pub const OLD: [usize; 8] = [16, 17, 18, 19, 20, 21, 22, 23];
 
-    /// Single old_timestamp (shared across all bytes, since they're aligned)
-    pub const OLD_TIMESTAMP_0: usize = 25;
-    pub const OLD_TIMESTAMP_1: usize = 26;
+    /// Single old_timestamp (shared across all bytes, since they're aligned): Word (1 column)
+    pub const OLD_TIMESTAMP: usize = 24;
 
-    pub const MU_READ: usize = 27;
-    pub const MU_WRITE: usize = 28;
+    pub const MU_READ: usize = 25;
+    pub const MU_WRITE: usize = 26;
 
-    pub const NUM_COLUMNS: usize = 29;
+    pub const NUM_COLUMNS: usize = 27;
 }
 
 // =========================================================================
@@ -110,7 +109,7 @@ pub fn generate_memw_aligned_trace(
             table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
         }
 
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
 
         let (w2, w4, w8) = op.write_flags();
         table.set_bool(row_idx, cols::WRITE2, w2);
@@ -122,7 +121,7 @@ pub fn generate_memw_aligned_trace(
         }
 
         // Single old_timestamp (from old_timestamp[0], verified equal for all bytes)
-        table.set_dword_wl(row_idx, cols::OLD_TIMESTAMP_0, op.old_timestamp[0]);
+        table.set_u64(row_idx, cols::OLD_TIMESTAMP, op.old_timestamp[0]);
 
         table.set_bool(row_idx, cols::MU_READ, op.is_read);
         table.set_bool(row_idx, cols::MU_WRITE, !op.is_read);
@@ -179,13 +178,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         mu_sum.clone(),
         vec![
             BusValue::Packed {
-                start_column: cols::OLD_TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::OLD_TIMESTAMP,
+                packing: Packing::Direct,
             },
+            BusValue::constant(0),
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
             },
+            BusValue::constant(0),
             BusValue::constant(alu_op::LT as u64),
             BusValue::constant(1),
             BusValue::constant(0),
@@ -228,11 +229,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             base_addr_lo.clone(),
             base_addr_hi.clone(),
             BusValue::Packed {
-                start_column: cols::OLD_TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::OLD_TIMESTAMP_1,
+                start_column: cols::OLD_TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -254,11 +251,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             base_addr_lo.clone(),
             base_addr_hi.clone(),
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -296,11 +289,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             addr_1_lo.clone(),
             base_addr_hi.clone(),
             BusValue::Packed {
-                start_column: cols::OLD_TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::OLD_TIMESTAMP_1,
+                start_column: cols::OLD_TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -321,11 +310,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             addr_1_lo,
             base_addr_hi.clone(),
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::Packed {
@@ -360,11 +345,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_i_lo.clone(),
                 base_addr_hi.clone(),
                 BusValue::Packed {
-                    start_column: cols::OLD_TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OLD_TIMESTAMP_1,
+                    start_column: cols::OLD_TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -385,11 +366,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_i_lo,
                 base_addr_hi.clone(),
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
+                    start_column: cols::TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -425,11 +402,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_i_lo.clone(),
                 base_addr_hi.clone(),
                 BusValue::Packed {
-                    start_column: cols::OLD_TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::OLD_TIMESTAMP_1,
+                    start_column: cols::OLD_TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -450,11 +423,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 addr_i_lo,
                 base_addr_hi.clone(),
                 BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
+                    start_column: cols::TIMESTAMP,
                     packing: Packing::Direct,
                 },
                 BusValue::Packed {
@@ -548,11 +517,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             // timestamp
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             // write flags
@@ -621,11 +586,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
             // timestamp
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             // write flags

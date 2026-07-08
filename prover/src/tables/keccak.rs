@@ -8,7 +8,7 @@
 //!
 //! | Group          | Size | Description                                    |
 //! |----------------|------|------------------------------------------------|
-//! | timestamp      |    2 | DWordWL                                        |
+//! | timestamp      |    1 | Word                                           |
 //! | addr           |    8 | State address as DWordBL (8 bytes)             |
 //! | input_state    |  200 | Input state bytes [5][5][8]                    |
 //! | output_state   |  200 | Output state bytes [5][5][8]                   |
@@ -29,11 +29,11 @@ use crate::constraints::templates::{AddOperand, INV_SHIFT_32};
 // =========================================================================
 
 pub mod cols {
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
 
     // addr[8] — state address as 8 bytes (DWordBL)
-    pub const ADDR: usize = 2;
+    pub const ADDR: usize = 1;
 
     // input_state[5][5][8] = 200 bytes
     pub const INPUT_STATE: usize = ADDR + 8; // 10
@@ -106,7 +106,7 @@ pub fn generate_keccak_trace(
 
     for (row_idx, op) in ops.iter().enumerate() {
         // Timestamp
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
 
         // Address as 8 bytes
         table.set_dword_bl(row_idx, cols::addr(0), op.state_addr);
@@ -163,18 +163,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(160);
 
     // 1. ECALL receiver (shared bus, per spec keccak:c:output)
-    // Payload: [ts_lo, ts_hi, syscall_lo32, syscall_hi32] in DWordWL [lo, hi]
-    // ordering, matching the CPU ECALL sender shared with HALT/COMMIT.
+    // Payload: [timestamp, syscall_lo32, syscall_hi32] where timestamp is a single
+    // Word, matching the CPU ECALL sender shared with HALT/COMMIT.
     interactions.push(BusInteraction::receiver(
         BusId::Ecall,
         Multiplicity::Column(cols::MU),
         vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::constant(syscall_lo),
@@ -183,7 +179,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // 2. MEMW read_addr: read register x10 to bind addr (per spec keccak:c:read_addr)
-    // Format: [old[8], is_register=1, base_addr=[20,0], value[8], ts, ts_hi, write2=1, write4=0, write8=0]
+    // Format: [old[8], is_register=1, base_addr=[20,0], value[8], timestamp, write2=1, write4=0, write8=0]
     // For register read: old = value = addr as WL + 6 zeros
     {
         // addr as DWordWL from DWordBL bytes: lo32 = sum(addr[0..4] * 256^i), hi32 = sum(addr[4..8] * 256^i)
@@ -243,11 +239,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
         // timestamp
         values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_0,
-            packing: Packing::Direct,
-        });
-        values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_1,
+            start_column: cols::TIMESTAMP,
             packing: Packing::Direct,
         });
         // write2=1, write4=0, write8=0 (register access)
@@ -268,11 +260,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     {
         let mut values = vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::constant(0), // round = 0
@@ -298,11 +286,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     {
         let mut values = vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
+                start_column: cols::TIMESTAMP,
                 packing: Packing::Direct,
             },
             BusValue::constant(24), // round = 24
@@ -429,11 +413,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
         // timestamp
         values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_0,
-            packing: Packing::Direct,
-        });
-        values.push(BusValue::Packed {
-            start_column: cols::TIMESTAMP_1,
+            start_column: cols::TIMESTAMP,
             packing: Packing::Direct,
         });
         // write2=0, write4=0, write8=1

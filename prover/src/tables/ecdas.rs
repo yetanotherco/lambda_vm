@@ -29,27 +29,27 @@ pub(crate) const CARRY_OFFSET_YR: i64 = 16320;
 // =========================================================================
 
 pub mod cols {
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
-    pub const XG: usize = 2; // U256BL (32)
-    pub const YG: usize = 34;
-    pub const XA: usize = 66;
-    pub const YA: usize = 98;
-    pub const ROUND: usize = 130; // Byte
-    pub const OP: usize = 131; // Bit
-    pub const XR: usize = 132; // U256BL (32)
-    pub const YR: usize = 164;
-    pub const LAMBDA: usize = 196; // U256BL (32)
-    pub const Q0: usize = 228; // Byte[33]
-    pub const C0: usize = 261; // BaseField[64]
-    pub const Q1: usize = 325; // Byte[33]
-    pub const C1: usize = 358; // BaseField[64]
-    pub const Q2: usize = 422; // Byte[33]
-    pub const C2: usize = 455; // BaseField[64]
-    pub const NEXT_OP: usize = 519; // Bit
-    pub const MU: usize = 520;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
+    pub const XG: usize = 1; // U256BL (32)
+    pub const YG: usize = 33;
+    pub const XA: usize = 65;
+    pub const YA: usize = 97;
+    pub const ROUND: usize = 129; // Byte
+    pub const OP: usize = 130; // Bit
+    pub const XR: usize = 131; // U256BL (32)
+    pub const YR: usize = 163;
+    pub const LAMBDA: usize = 195; // U256BL (32)
+    pub const Q0: usize = 227; // Byte[33]
+    pub const C0: usize = 260; // BaseField[64]
+    pub const Q1: usize = 324; // Byte[33]
+    pub const C1: usize = 357; // BaseField[64]
+    pub const Q2: usize = 421; // Byte[33]
+    pub const C2: usize = 454; // BaseField[64]
+    pub const NEXT_OP: usize = 518; // Bit
+    pub const MU: usize = 519;
 
-    pub const NUM_COLUMNS: usize = 521;
+    pub const NUM_COLUMNS: usize = 520;
 
     #[inline]
     pub const fn c0(i: usize) -> usize {
@@ -103,7 +103,7 @@ pub fn generate_ecdas_trace(
     for (row_idx, op) in ops.iter().enumerate() {
         let s = &op.step;
 
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
         table.set_bytes(row_idx, cols::XG, &s.x_g);
         table.set_bytes(row_idx, cols::YG, &s.y_g);
         table.set_bytes(row_idx, cols::XA, &s.x_a);
@@ -152,8 +152,7 @@ fn packed(col: usize) -> BusValue {
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
-    let ts_lo = || packed(cols::TIMESTAMP_0);
-    let ts_hi = || packed(cols::TIMESTAMP_1);
+    let ts = || packed(cols::TIMESTAMP);
     let mut out = Vec::new();
 
     // Receive [ts, xA, yA, xG, yG, round, op].
@@ -167,8 +166,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             cols::YG,
             packed(cols::ROUND),
             packed(cols::OP),
-            ts_lo(),
-            ts_hi(),
+            ts(),
         ),
     ));
 
@@ -218,7 +216,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out.push(BusInteraction::sender(
         BusId::Bit,
         Multiplicity::Column(cols::NEXT_OP),
-        vec![ts_lo(), ts_hi(), packed(cols::ROUND)],
+        vec![ts(), packed(cols::ROUND)],
     ));
 
     // Send the updated accumulator: [ts, xR, yR, xG, yG, round - 1 + next_op, next_op].
@@ -242,8 +240,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 LinearTerm::Constant(-1),
             ]),
             packed(cols::NEXT_OP),
-            ts_lo(),
-            ts_hi(),
+            ts(),
         ),
     ));
 

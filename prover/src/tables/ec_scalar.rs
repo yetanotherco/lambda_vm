@@ -6,8 +6,8 @@
 //! (the multiplicity is the bit itself). Unless `last_limb` (offset 0) it recurses by sending
 //! `ServeK[timestamp, ptr, offset-1]` — a self-referential bus, like COMMIT's `CommitNextByte`.
 //!
-//! ## Columns (15 total)
-//! - `timestamp`: DWordWL (2) — the ECALL timestamp
+//! ## Columns (14 total)
+//! - `timestamp`: Word (1) — the ECALL timestamp
 //! - `ptr`: DWordWL (2) — address of `k` (= `addr_k`)
 //! - `offset`: Byte (1) — index of the scalar byte served by this row
 //! - `limb_bits`: Bit[8] (8) — bit decomposition of `k[offset]`
@@ -26,17 +26,17 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 // =========================================================================
 
 pub mod cols {
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
-    pub const PTR_0: usize = 2;
-    pub const PTR_1: usize = 3;
-    pub const OFFSET: usize = 4;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
+    pub const PTR_0: usize = 1;
+    pub const PTR_1: usize = 2;
+    pub const OFFSET: usize = 3;
     /// limb_bits[0..8]
-    pub const LIMB_BITS: usize = 5;
-    pub const LAST_LIMB: usize = 13;
-    pub const MU: usize = 14;
+    pub const LIMB_BITS: usize = 4;
+    pub const LAST_LIMB: usize = 12;
+    pub const MU: usize = 13;
 
-    pub const NUM_COLUMNS: usize = 15;
+    pub const NUM_COLUMNS: usize = 14;
 
     #[inline]
     pub const fn limb_bit(i: usize) -> usize {
@@ -90,7 +90,7 @@ pub fn generate_ec_scalar_trace(
     let table = &mut trace.main_table;
 
     for (row_idx, op) in ops.iter().enumerate() {
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
         table.set_dword_wl(row_idx, cols::PTR_0, op.ptr);
         table.set_byte(row_idx, cols::OFFSET, op.offset);
         for i in 0..8 {
@@ -122,17 +122,9 @@ fn limb_value() -> BusValue {
 }
 
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let ts = || {
-        [
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::Direct,
-            },
-            BusValue::Packed {
-                start_column: cols::TIMESTAMP_1,
-                packing: Packing::Direct,
-            },
-        ]
+    let ts = || BusValue::Packed {
+        start_column: cols::TIMESTAMP,
+        packing: Packing::Direct,
     };
     let ptr = || {
         [
@@ -151,14 +143,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 1. Receive ServeK[timestamp, ptr, offset] (mult = mu).
     {
-        let [t0, t1] = ts();
         let [p0, p1] = ptr();
         interactions.push(BusInteraction::receiver(
             BusId::ServeK,
             Multiplicity::Column(cols::MU),
             vec![
-                t0,
-                t1,
+                ts(),
                 p0,
                 p1,
                 BusValue::Packed {
@@ -170,7 +160,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 2. MEMW: read byte k[offset] at ptr+offset, timestamp+1, width 1 (mult = mu).
-    // CO24 layout: [old[8], is_register, base[2], value[8], ts[2], w2, w4, w8].
+    // CO24 layout: [old[8], is_register, base[2], value[8], ts, w2, w4, w8].
     {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -186,18 +176,14 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             start_column: cols::PTR_1,
             packing: Packing::Direct,
         };
-        let ts_lo_plus_1 = BusValue::linear(vec![
+        let ts_plus_1 = BusValue::linear(vec![
             LinearTerm::Column {
                 coefficient: 1,
-                column: cols::TIMESTAMP_0,
+                column: cols::TIMESTAMP,
             },
             LinearTerm::Constant(1),
         ]);
-        let ts_hi = BusValue::Packed {
-            start_column: cols::TIMESTAMP_1,
-            packing: Packing::Direct,
-        };
-        let mut values = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(23);
         // old[0..8]: read value = limb, rest 0
         values.push(limb_value());
         for _ in 1..8 {
@@ -211,8 +197,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         for _ in 1..8 {
             values.push(BusValue::constant(0));
         }
-        values.push(ts_lo_plus_1);
-        values.push(ts_hi);
+        values.push(ts_plus_1);
         values.push(BusValue::constant(0)); // w2
         values.push(BusValue::constant(0)); // w4
         values.push(BusValue::constant(0)); // w8 (width 1 byte)
@@ -225,13 +210,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 3. Receive Bit[timestamp, 8*offset + i] for each set bit (mult = limb_bits[i]).
     for i in 0..8 {
-        let [t0, t1] = ts();
         interactions.push(BusInteraction::receiver(
             BusId::Bit,
             Multiplicity::Column(cols::limb_bit(i)),
             vec![
-                t0,
-                t1,
+                ts(),
                 BusValue::linear(vec![
                     LinearTerm::Column {
                         coefficient: 8,
@@ -245,14 +228,12 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // 4. Recurse: send ServeK[timestamp, ptr, offset-1] (mult = mu - last_limb).
     {
-        let [t0, t1] = ts();
         let [p0, p1] = ptr();
         interactions.push(BusInteraction::sender(
             BusId::ServeK,
             Multiplicity::Diff(cols::MU, cols::LAST_LIMB),
             vec![
-                t0,
-                t1,
+                ts(),
                 p0,
                 p1,
                 BusValue::linear(vec![

@@ -35,66 +35,66 @@ use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 /// Column definitions for the CPU32 table.
 pub mod cols {
     // Inputs (from the CPU32 interaction)
-    pub const TIMESTAMP_0: usize = 0;
-    pub const TIMESTAMP_1: usize = 1;
-    pub const PC_0: usize = 2;
-    pub const PC_1: usize = 3;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 0;
+    pub const PC_0: usize = 1;
+    pub const PC_1: usize = 2;
 
     // rs1 read
-    pub const RS1: usize = 4;
-    pub const READ_REGISTER1: usize = 5;
+    pub const RS1: usize = 3;
+    pub const READ_REGISTER1: usize = 4;
     // rv1: DWordWHH = [Half, Half, Word] (low word as 2 halves + high word)
-    pub const RV1_0: usize = 6;
-    pub const RV1_1: usize = 7;
-    pub const RV1_2: usize = 8;
-    pub const RV1_SIGN: usize = 9;
+    pub const RV1_0: usize = 5;
+    pub const RV1_1: usize = 6;
+    pub const RV1_2: usize = 7;
+    pub const RV1_SIGN: usize = 8;
     // arg1: DWordWL = sign/zero-extended low word of rv1
-    pub const ARG1_0: usize = 10;
-    pub const ARG1_1: usize = 11;
+    pub const ARG1_0: usize = 9;
+    pub const ARG1_1: usize = 10;
 
     // rs2 read
-    pub const RS2: usize = 12;
-    pub const READ_REGISTER2: usize = 13;
-    pub const RV2_0: usize = 14;
-    pub const RV2_1: usize = 15;
-    pub const RV2_2: usize = 16;
-    pub const RV2_SIGN: usize = 17;
+    pub const RS2: usize = 11;
+    pub const READ_REGISTER2: usize = 12;
+    pub const RV2_0: usize = 13;
+    pub const RV2_1: usize = 14;
+    pub const RV2_2: usize = 15;
+    pub const RV2_SIGN: usize = 16;
     // imm: DWordWL (fully sign-extended immediate)
-    pub const IMM_0: usize = 18;
-    pub const IMM_1: usize = 19;
+    pub const IMM_0: usize = 17;
+    pub const IMM_1: usize = 18;
     // arg2: DWordWL = ext(rv2) or imm
-    pub const ARG2_0: usize = 20;
-    pub const ARG2_1: usize = 21;
+    pub const ARG2_0: usize = 19;
+    pub const ARG2_1: usize = 20;
 
     // res: DWordHL = ALU result (4 halves)
-    pub const RES_0: usize = 22;
-    pub const RES_1: usize = 23;
-    pub const RES_2: usize = 24;
-    pub const RES_3: usize = 25;
-    pub const RES_SIGN: usize = 26;
+    pub const RES_0: usize = 21;
+    pub const RES_1: usize = 22;
+    pub const RES_2: usize = 23;
+    pub const RES_3: usize = 24;
+    pub const RES_SIGN: usize = 25;
 
     // rd write
-    pub const RD: usize = 27;
-    pub const WRITE_REGISTER: usize = 28;
+    pub const RD: usize = 26;
+    pub const WRITE_REGISTER: usize = 27;
     // rvd: DWordWL = sign-extended low word of res
-    pub const RVD_0: usize = 29;
-    pub const RVD_1: usize = 30;
+    pub const RVD_0: usize = 28;
+    pub const RVD_1: usize = 29;
 
     // ALU control
-    pub const ALU: usize = 31;
-    pub const ALU_FLAGS: usize = 32;
-    pub const ADD: usize = 33;
-    pub const SUB: usize = 34;
+    pub const ALU: usize = 30;
+    pub const ALU_FLAGS: usize = 31;
+    pub const ADD: usize = 32;
+    pub const SUB: usize = 33;
     /// half the byte length (1 or 2); real length = `2 * half`.
-    pub const HALF_INSTRUCTION_LENGTH: usize = 35;
+    pub const HALF_INSTRUCTION_LENGTH: usize = 34;
     /// signed: extracted from `alu_flags` bit 5 (via BYTE_ALU[AND, 32, alu_flags]).
-    pub const SIGNED: usize = 36;
+    pub const SIGNED: usize = 35;
 
     /// μ: multiplicity
-    pub const MU: usize = 37;
+    pub const MU: usize = 36;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 38;
+    pub const NUM_COLUMNS: usize = 37;
 }
 
 /// Mask selecting `signed` from the `alu_flags` byte (bit 5).
@@ -207,7 +207,7 @@ pub fn generate_cpu32_trace(
         let aux = op.compute_aux();
 
         // Inputs
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
         table.set_dword_wl(row_idx, cols::PC_0, op.pc);
 
         // rv1 as DWordWHH: [Half, Half, Word]
@@ -282,24 +282,18 @@ fn register_dword(lo0: usize, lo1: usize, hi: usize) -> Vec<BusValue> {
     v
 }
 
-/// `timestamp + offset` as DWordWL: `[TIMESTAMP_0 + offset, TIMESTAMP_1]`.
+/// `timestamp + offset` as a single `Word`: `[TIMESTAMP + offset]`.
 fn timestamp_plus(offset: i64) -> Vec<BusValue> {
-    vec![
-        BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::TIMESTAMP_0,
-            },
-            LinearTerm::Constant(offset),
-        ]),
-        BusValue::Packed {
-            start_column: cols::TIMESTAMP_1,
-            packing: Packing::Direct,
+    vec![BusValue::linear(vec![
+        LinearTerm::Column {
+            coefficient: 1,
+            column: cols::TIMESTAMP,
         },
-    ]
+        LinearTerm::Constant(offset),
+    ])]
 }
 
-/// MEMW register **read** (24 elements: `old == value`, `is_register=1`, `write2=1`).
+/// MEMW register **read** (23 elements: `old == value`, `is_register=1`, `write2=1`).
 fn reg_read(
     rs: usize,
     lo0: usize,
@@ -323,7 +317,7 @@ fn reg_read(
     BusInteraction::sender(BusId::Memw, Multiplicity::Column(mult), values)
 }
 
-/// MEMW register **write** (16 elements: `value = [val_lo, val_hi, 0×6]`, `write2=1`).
+/// MEMW register **write** (15 elements: `value = [val_lo, val_hi, 0×6]`, `write2=1`).
 fn reg_write(
     rd: usize,
     val_lo: usize,
@@ -565,8 +559,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Column(cols::MU),
         vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
             },
             BusValue::Packed {
                 start_column: cols::PC_0,

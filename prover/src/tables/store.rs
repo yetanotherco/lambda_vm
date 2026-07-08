@@ -14,7 +14,7 @@
 //!
 //! ## Columns
 //! - `base_address`: DWordWL (2 words) — effective write address
-//! - `timestamp`: DWordWL (2 words)
+//! - `timestamp`: Word (1 column)
 //! - `write2`/`write4`/`write8`: Bit — exclusive width flags (1 byte = none set)
 //! - `value`: DWordBL (8 bytes) — value to store
 //! - `μ`: multiplicity
@@ -35,18 +35,18 @@ use crate::constraints::templates::emit_is_bit;
 pub mod cols {
     pub const BASE_ADDRESS_0: usize = 0;
     pub const BASE_ADDRESS_1: usize = 1;
-    pub const TIMESTAMP_0: usize = 2;
-    pub const TIMESTAMP_1: usize = 3;
-    pub const WRITE2: usize = 4;
-    pub const WRITE4: usize = 5;
-    pub const WRITE8: usize = 6;
+    /// timestamp: Word (1 column)
+    pub const TIMESTAMP: usize = 2;
+    pub const WRITE2: usize = 3;
+    pub const WRITE4: usize = 4;
+    pub const WRITE8: usize = 5;
     /// value as 8 bytes (DWordBL), little-endian.
-    pub const VALUE: [usize; 8] = [7, 8, 9, 10, 11, 12, 13, 14];
+    pub const VALUE: [usize; 8] = [6, 7, 8, 9, 10, 11, 12, 13];
     /// μ: multiplicity
-    pub const MU: usize = 15;
+    pub const MU: usize = 14;
 
     /// Total number of columns
-    pub const NUM_COLUMNS: usize = 16;
+    pub const NUM_COLUMNS: usize = 15;
 }
 
 // =========================================================================
@@ -105,7 +105,7 @@ pub fn generate_store_trace(
 
     for (row_idx, op) in operations.iter().enumerate() {
         table.set_dword_wl(row_idx, cols::BASE_ADDRESS_0, op.base_address);
-        table.set_dword_wl(row_idx, cols::TIMESTAMP_0, op.timestamp);
+        table.set_u64(row_idx, cols::TIMESTAMP, op.timestamp);
         table.set_bool(row_idx, cols::WRITE2, op.write2);
         table.set_bool(row_idx, cols::WRITE4, op.write4);
         table.set_bool(row_idx, cols::WRITE8, op.write8);
@@ -128,7 +128,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mut interactions = Vec::with_capacity(10);
 
     // MEMW[0, base_address, value, timestamp, write2, write4, write8] (write,
-    // 16 elements, no `old`).
+    // 15 elements, no `old`).
     interactions.push(BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
@@ -172,8 +172,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 packing: Packing::Direct,
             },
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
             },
             BusValue::Packed {
                 start_column: cols::WRITE2,
@@ -198,8 +198,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         Multiplicity::Column(cols::MU),
         vec![
             BusValue::Packed {
-                start_column: cols::TIMESTAMP_0,
-                packing: Packing::DWordWL,
+                start_column: cols::TIMESTAMP,
+                packing: Packing::Direct,
             },
             BusValue::Packed {
                 start_column: cols::BASE_ADDRESS_0,

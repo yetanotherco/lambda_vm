@@ -1455,7 +1455,7 @@ fn test_prove_elfs_all_instructions_64_full() {
 /// Debug test that manually computes Memory bus balance with fixed challenges.
 ///
 /// Uses z=1, α=2 to make manual verification easy.
-/// fingerprint = z - (bus_id + is_reg*α + addr_lo*α² + addr_hi*α³ + ts_lo*α⁴ + ts_hi*α⁵ + value*α⁶)
+/// fingerprint = z - (bus_id + is_reg*α + addr_lo*α² + addr_hi*α³ + ts*α⁴ + value*α⁵)
 /// term = sign * mult / fingerprint
 /// Bus balances when sum of all terms = 0
 #[test]
@@ -1478,8 +1478,8 @@ fn test_debug_memory_bus_tokens() {
     println!("  REGISTER: {} rows", traces.register.num_rows());
 
     // Collect all Memory bus tokens
-    // Token = (is_reg, addr_lo, addr_hi, ts_lo, ts_hi, value)
-    type Token = (u64, u64, u64, u64, u64, u64);
+    // Token = (is_reg, addr_lo, addr_hi, ts, value)
+    type Token = (u64, u64, u64, u64, u64);
 
     // Track sends (+1) and receives (-1) with their sources
     let mut token_balance: HashMap<Token, (i64, Vec<String>)> = HashMap::new();
@@ -1494,23 +1494,14 @@ fn test_debug_memory_bus_tokens() {
 
         let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
         let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
-        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
-        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
-        let old_ts0_lo = memw
+        let ts = memw.main_table.get(row, memw_cols::TIMESTAMP).to_raw();
+        let old_ts0 = memw
             .main_table
-            .get(row, memw_cols::old_timestamp(0)[0])
+            .get(row, memw_cols::old_timestamp(0))
             .to_raw();
-        let old_ts0_hi = memw
+        let old_ts1 = memw
             .main_table
-            .get(row, memw_cols::old_timestamp(0)[1])
-            .to_raw();
-        let old_ts1_lo = memw
-            .main_table
-            .get(row, memw_cols::old_timestamp(1)[0])
-            .to_raw();
-        let old_ts1_hi = memw
-            .main_table
-            .get(row, memw_cols::old_timestamp(1)[1])
+            .get(row, memw_cols::old_timestamp(1))
             .to_raw();
         let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
         let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
@@ -1518,28 +1509,28 @@ fn test_debug_memory_bus_tokens() {
         let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
         // M1: SEND old token for Word 0 (is_reg, base, old_ts[0], old[0])
-        let m1_token: Token = (is_reg, base_lo, base_hi, old_ts0_lo, old_ts0_hi, old0);
+        let m1_token: Token = (is_reg, base_lo, base_hi, old_ts0, old0);
         println!("MEMW row {} M1 SEND: {:?}", row, m1_token);
         let entry = token_balance.entry(m1_token).or_insert((0, vec![]));
         entry.0 += 1; // sender = +1
         entry.1.push(format!("MEMW[{}] M1 SEND", row));
 
         // M2: RECV new token for Word 0 (is_reg, base, ts, value[0])
-        let m2_token: Token = (is_reg, base_lo, base_hi, ts_lo, ts_hi, val0);
+        let m2_token: Token = (is_reg, base_lo, base_hi, ts, val0);
         println!("MEMW row {} M2 RECV: {:?}", row, m2_token);
         let entry = token_balance.entry(m2_token).or_insert((0, vec![]));
         entry.0 -= 1; // receiver = -1
         entry.1.push(format!("MEMW[{}] M2 RECV", row));
 
         // M3: SEND old token for Word 1 (is_reg, base+1, old_ts[1], old[1])
-        let m3_token: Token = (is_reg, base_lo + 1, base_hi, old_ts1_lo, old_ts1_hi, old1);
+        let m3_token: Token = (is_reg, base_lo + 1, base_hi, old_ts1, old1);
         println!("MEMW row {} M3 SEND: {:?}", row, m3_token);
         let entry = token_balance.entry(m3_token).or_insert((0, vec![]));
         entry.0 += 1;
         entry.1.push(format!("MEMW[{}] M3 SEND", row));
 
         // M4: RECV new token for Word 1 (is_reg, base+1, ts, value[1])
-        let m4_token: Token = (is_reg, base_lo + 1, base_hi, ts_lo, ts_hi, val1);
+        let m4_token: Token = (is_reg, base_lo + 1, base_hi, ts, val1);
         println!("MEMW row {} M4 RECV: {:?}", row, m4_token);
         let entry = token_balance.entry(m4_token).or_insert((0, vec![]));
         entry.0 -= 1;
@@ -1556,26 +1547,21 @@ fn test_debug_memory_bus_tokens() {
             .to_raw();
         let init = traces.register.main_table.get(row, reg_cols::INIT).to_raw();
         let fini = traces.register.main_table.get(row, reg_cols::FINI).to_raw();
-        let ts_lo = traces
+        let ts = traces
             .register
             .main_table
-            .get(row, reg_cols::TIMESTAMP_LO)
-            .to_raw();
-        let ts_hi = traces
-            .register
-            .main_table
-            .get(row, reg_cols::TIMESTAMP_HI)
+            .get(row, reg_cols::TIMESTAMP)
             .to_raw();
 
         // REG-C1: RECV init token (1, offset, 0, 0, 0, init)
-        let c1_token: Token = (1, offset, 0, 0, 0, init);
+        let c1_token: Token = (1, offset, 0, 0, init);
         println!("REG row {} C1 RECV: {:?}", row, c1_token);
         let entry = token_balance.entry(c1_token).or_insert((0, vec![]));
         entry.0 -= 1; // receiver = -1
         entry.1.push(format!("REG[{}] C1 RECV", row));
 
-        // REG-C2: SEND final token (1, offset, 0, ts_lo, ts_hi, fini)
-        let c2_token: Token = (1, offset, 0, ts_lo, ts_hi, fini);
+        // REG-C2: SEND final token (1, offset, 0, ts, fini)
+        let c2_token: Token = (1, offset, 0, ts, fini);
         println!("REG row {} C2 SEND: {:?}", row, c2_token);
         let entry = token_balance.entry(c2_token).or_insert((0, vec![]));
         entry.0 += 1; // sender = +1
@@ -1602,7 +1588,7 @@ fn test_debug_memory_bus_tokens() {
 
     // === Compute LogUp balance with fixed challenges z=1000, α=2 ===
     // Using z=1000 to avoid division by zero (fingerprint = z - linear_comb)
-    // fingerprint = z - (bus_id + is_reg*α + addr_lo*α² + addr_hi*α³ + ts_lo*α⁴ + ts_hi*α⁵ + value*α⁶)
+    // fingerprint = z - (bus_id + is_reg*α + addr_lo*α² + addr_hi*α³ + ts*α⁴ + value*α⁵)
     // term = sign * mult / fingerprint
     println!("\n=== LogUp Balance with z=1000, α=2 ===");
 
@@ -1611,17 +1597,15 @@ fn test_debug_memory_bus_tokens() {
     let bus_id: i128 = 16; // BusId::Memory
 
     // Compute fingerprint for a token
-    let fingerprint =
-        |is_reg: u64, addr_lo: u64, addr_hi: u64, ts_lo: u64, ts_hi: u64, value: u64| -> i128 {
-            let linear_comb = bus_id
-                + (is_reg as i128) * alpha
-                + (addr_lo as i128) * alpha.pow(2)
-                + (addr_hi as i128) * alpha.pow(3)
-                + (ts_lo as i128) * alpha.pow(4)
-                + (ts_hi as i128) * alpha.pow(5)
-                + (value as i128) * alpha.pow(6);
-            z - linear_comb
-        };
+    let fingerprint = |is_reg: u64, addr_lo: u64, addr_hi: u64, ts: u64, value: u64| -> i128 {
+        let linear_comb = bus_id
+            + (is_reg as i128) * alpha
+            + (addr_lo as i128) * alpha.pow(2)
+            + (addr_hi as i128) * alpha.pow(3)
+            + (ts as i128) * alpha.pow(4)
+            + (value as i128) * alpha.pow(5);
+        z - linear_comb
+    };
 
     let mut total_sum: f64 = 0.0;
 
@@ -1634,23 +1618,14 @@ fn test_debug_memory_bus_tokens() {
 
         let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
         let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
-        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
-        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
-        let old_ts0_lo = memw
+        let ts = memw.main_table.get(row, memw_cols::TIMESTAMP).to_raw();
+        let old_ts0 = memw
             .main_table
-            .get(row, memw_cols::old_timestamp(0)[0])
+            .get(row, memw_cols::old_timestamp(0))
             .to_raw();
-        let old_ts0_hi = memw
+        let old_ts1 = memw
             .main_table
-            .get(row, memw_cols::old_timestamp(0)[1])
-            .to_raw();
-        let old_ts1_lo = memw
-            .main_table
-            .get(row, memw_cols::old_timestamp(1)[0])
-            .to_raw();
-        let old_ts1_hi = memw
-            .main_table
-            .get(row, memw_cols::old_timestamp(1)[1])
+            .get(row, memw_cols::old_timestamp(1))
             .to_raw();
         let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
         let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
@@ -1658,22 +1633,22 @@ fn test_debug_memory_bus_tokens() {
         let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
 
         // M1: SEND (+1) old token for Word 0
-        let fp = fingerprint(is_reg, base_lo, base_hi, old_ts0_lo, old_ts0_hi, old0);
+        let fp = fingerprint(is_reg, base_lo, base_hi, old_ts0, old0);
         let term = 1.0 / (fp as f64);
         total_sum += term;
 
         // M2: RECV (-1) new token for Word 0
-        let fp = fingerprint(is_reg, base_lo, base_hi, ts_lo, ts_hi, val0);
+        let fp = fingerprint(is_reg, base_lo, base_hi, ts, val0);
         let term = -1.0 / (fp as f64);
         total_sum += term;
 
         // M3: SEND (+1) old token for Word 1
-        let fp = fingerprint(is_reg, base_lo + 1, base_hi, old_ts1_lo, old_ts1_hi, old1);
+        let fp = fingerprint(is_reg, base_lo + 1, base_hi, old_ts1, old1);
         let term = 1.0 / (fp as f64);
         total_sum += term;
 
         // M4: RECV (-1) new token for Word 1
-        let fp = fingerprint(is_reg, base_lo + 1, base_hi, ts_lo, ts_hi, val1);
+        let fp = fingerprint(is_reg, base_lo + 1, base_hi, ts, val1);
         let term = -1.0 / (fp as f64);
         total_sum += term;
     }
@@ -1688,24 +1663,19 @@ fn test_debug_memory_bus_tokens() {
             .to_raw();
         let init = traces.register.main_table.get(row, reg_cols::INIT).to_raw();
         let fini = traces.register.main_table.get(row, reg_cols::FINI).to_raw();
-        let ts_lo = traces
+        let ts = traces
             .register
             .main_table
-            .get(row, reg_cols::TIMESTAMP_LO)
-            .to_raw();
-        let ts_hi = traces
-            .register
-            .main_table
-            .get(row, reg_cols::TIMESTAMP_HI)
+            .get(row, reg_cols::TIMESTAMP)
             .to_raw();
 
         // REG-C1: RECV (-1) init token
-        let fp = fingerprint(1, offset, 0, 0, 0, init);
+        let fp = fingerprint(1, offset, 0, 0, init);
         let term = -1.0 / (fp as f64);
         total_sum += term;
 
         // REG-C2: SEND (+1) final token
-        let fp = fingerprint(1, offset, 0, ts_lo, ts_hi, fini);
+        let fp = fingerprint(1, offset, 0, ts, fini);
         let term = 1.0 / (fp as f64);
         total_sum += term;
     }
@@ -1750,8 +1720,8 @@ fn test_debug_memory_tokens_sb_sh() {
     println!("  REGISTER rows: {}", traces.register.num_rows());
     println!("  PAGE tables: {}", traces.pages.len());
 
-    // Token = (is_reg, addr_lo, addr_hi, ts_lo, ts_hi, value)
-    type Token = (u64, u64, u64, u64, u64, u64);
+    // Token = (is_reg, addr_lo, addr_hi, ts, value)
+    type Token = (u64, u64, u64, u64, u64);
 
     // Track sends (+1) and receives (-1)
     let mut token_balance: HashMap<Token, (i64, Vec<String>)> = HashMap::new();
@@ -1766,38 +1736,29 @@ fn test_debug_memory_tokens_sb_sh() {
             .to_raw();
         let init = traces.register.main_table.get(row, reg_cols::INIT).to_raw();
         let fini = traces.register.main_table.get(row, reg_cols::FINI).to_raw();
-        let ts_lo = traces
+        let ts = traces
             .register
             .main_table
-            .get(row, reg_cols::TIMESTAMP_LO)
-            .to_raw();
-        let ts_hi = traces
-            .register
-            .main_table
-            .get(row, reg_cols::TIMESTAMP_HI)
+            .get(row, reg_cols::TIMESTAMP)
             .to_raw();
 
         // REG-C1: RECV init token (1, offset, 0, 0, 0, init)
-        let c1_token: Token = (1, offset, 0, 0, 0, init);
+        let c1_token: Token = (1, offset, 0, 0, init);
         let entry = token_balance.entry(c1_token).or_insert((0, vec![]));
         entry.0 -= 1; // receiver
         entry.1.push(format!("REG[{}] C1 RECV", row));
 
-        // REG-C2: SEND final token (1, offset, 0, ts_lo, ts_hi, fini)
-        let c2_token: Token = (1, offset, 0, ts_lo, ts_hi, fini);
+        // REG-C2: SEND final token (1, offset, 0, ts, fini)
+        let c2_token: Token = (1, offset, 0, ts, fini);
         let entry = token_balance.entry(c2_token).or_insert((0, vec![]));
         entry.0 += 1; // sender
         entry.1.push(format!("REG[{}] C2 SEND", row));
 
         // Only print changed registers
-        if ts_lo != 0 || ts_hi != 0 || init != fini {
+        if ts != 0 || init != fini {
             println!(
                 "  row {} offset={} init={} fini={} ts={}:",
-                row,
-                offset,
-                init,
-                fini,
-                ts_lo | (ts_hi << 32)
+                row, offset, init, fini, ts
             );
             println!("    C1 RECV: {:?}", c1_token);
             println!("    C2 SEND: {:?}", c2_token);
@@ -1827,15 +1788,10 @@ fn test_debug_memory_tokens_sb_sh() {
 
         let base_lo = memw.main_table.get(row, memw_cols::BASE_ADDRESS_0).to_raw();
         let base_hi = memw.main_table.get(row, memw_cols::BASE_ADDRESS_1).to_raw();
-        let ts_lo = memw.main_table.get(row, memw_cols::TIMESTAMP_0).to_raw();
-        let ts_hi = memw.main_table.get(row, memw_cols::TIMESTAMP_1).to_raw();
-        let old_ts0_lo = memw
+        let ts = memw.main_table.get(row, memw_cols::TIMESTAMP).to_raw();
+        let old_ts0 = memw
             .main_table
-            .get(row, memw_cols::old_timestamp(0)[0])
-            .to_raw();
-        let old_ts0_hi = memw
-            .main_table
-            .get(row, memw_cols::old_timestamp(0)[1])
+            .get(row, memw_cols::old_timestamp(0))
             .to_raw();
         let val0 = memw.main_table.get(row, memw_cols::VALUE[0]).to_raw();
         let old0 = memw.main_table.get(row, memw_cols::OLD[0]).to_raw();
@@ -1850,21 +1806,18 @@ fn test_debug_memory_tokens_sb_sh() {
         );
         println!(
             "  base=0x{:08x}_{:08x}, ts={}, old_ts0={}",
-            base_hi,
-            base_lo,
-            ts_lo | (ts_hi << 32),
-            old_ts0_lo | (old_ts0_hi << 32)
+            base_hi, base_lo, ts, old_ts0
         );
 
         // CM14: SEND old token for byte 0
-        let send_token: Token = (is_reg, base_lo, base_hi, old_ts0_lo, old_ts0_hi, old0);
+        let send_token: Token = (is_reg, base_lo, base_hi, old_ts0, old0);
         println!("  CM14 SEND: {:?}", send_token);
         let entry = token_balance.entry(send_token).or_insert((0, vec![]));
         entry.0 += mu_sum as i64;
         entry.1.push(format!("MEMW[{}] CM14 SEND", row));
 
         // CM15: RECV new token for byte 0
-        let recv_token: Token = (is_reg, base_lo, base_hi, ts_lo, ts_hi, val0);
+        let recv_token: Token = (is_reg, base_lo, base_hi, ts, val0);
         println!("  CM15 RECV: {:?}", recv_token);
         let entry = token_balance.entry(recv_token).or_insert((0, vec![]));
         entry.0 -= mu_sum as i64;
@@ -1873,13 +1826,9 @@ fn test_debug_memory_tokens_sb_sh() {
         // For multi-byte accesses (w2 = write2+write4+write8 > 0)
         let w2 = write2 + write4 + write8;
         if w2 > 0 {
-            let old_ts1_lo = memw
+            let old_ts1 = memw
                 .main_table
-                .get(row, memw_cols::old_timestamp(1)[0])
-                .to_raw();
-            let old_ts1_hi = memw
-                .main_table
-                .get(row, memw_cols::old_timestamp(1)[1])
+                .get(row, memw_cols::old_timestamp(1))
                 .to_raw();
             let val1 = memw.main_table.get(row, memw_cols::VALUE[1]).to_raw();
             let old1 = memw.main_table.get(row, memw_cols::OLD[1]).to_raw();
@@ -1890,14 +1839,14 @@ fn test_debug_memory_tokens_sb_sh() {
             let addr1_hi = base_hi + carry0;
 
             // CM16: SEND old token for byte 1
-            let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1_lo, old_ts1_hi, old1);
+            let send_token1: Token = (is_reg, addr1_lo, addr1_hi, old_ts1, old1);
             println!("  CM16 SEND (byte 1): {:?}", send_token1);
             let entry = token_balance.entry(send_token1).or_insert((0, vec![]));
             entry.0 += w2 as i64;
             entry.1.push(format!("MEMW[{}] CM16 SEND", row));
 
             // CM17: RECV new token for byte 1
-            let recv_token1: Token = (is_reg, addr1_lo, addr1_hi, ts_lo, ts_hi, val1);
+            let recv_token1: Token = (is_reg, addr1_lo, addr1_hi, ts, val1);
             println!("  CM17 RECV (byte 1): {:?}", recv_token1);
             let entry = token_balance.entry(recv_token1).or_insert((0, vec![]));
             entry.0 -= w2 as i64;
@@ -1934,13 +1883,9 @@ fn test_debug_memory_tokens_sb_sh() {
             let offset = page_trace.main_table.get(row, page_cols::OFFSET).to_raw();
             let init = page_trace.main_table.get(row, page_cols::INIT).to_raw();
             let fini = page_trace.main_table.get(row, page_cols::FINI).to_raw();
-            let ts_lo = page_trace
+            let ts = page_trace
                 .main_table
-                .get(row, page_cols::TIMESTAMP_LO)
-                .to_raw();
-            let ts_hi = page_trace
-                .main_table
-                .get(row, page_cols::TIMESTAMP_HI)
+                .get(row, page_cols::TIMESTAMP)
                 .to_raw();
 
             // Compute full address
@@ -1948,27 +1893,22 @@ fn test_debug_memory_tokens_sb_sh() {
             let addr_hi = page_hi;
 
             // C3: RECV init token (all rows)
-            let c3_token: Token = (0, addr_lo, addr_hi, 0, 0, init);
+            let c3_token: Token = (0, addr_lo, addr_hi, 0, init);
             let entry = token_balance.entry(c3_token).or_insert((0, vec![]));
             entry.0 -= 1; // receiver
             entry.1.push(format!("PAGE[{}][{}] C3 RECV", page_idx, row));
 
             // C4: SEND final token (all rows)
-            let c4_token: Token = (0, addr_lo, addr_hi, ts_lo, ts_hi, fini);
+            let c4_token: Token = (0, addr_lo, addr_hi, ts, fini);
             let entry = token_balance.entry(c4_token).or_insert((0, vec![]));
             entry.0 += 1; // sender
             entry.1.push(format!("PAGE[{}][{}] C4 SEND", page_idx, row));
 
             // Only print accessed addresses (non-zero timestamp or changed value)
-            if ts_lo != 0 || ts_hi != 0 || init != fini {
+            if ts != 0 || init != fini {
                 println!(
                     "  row {} addr=0x{:08x}_{:08x} init={} fini={} ts={}:",
-                    row,
-                    addr_hi,
-                    addr_lo,
-                    init,
-                    fini,
-                    ts_lo | (ts_hi << 32)
+                    row, addr_hi, addr_lo, init, fini, ts
                 );
                 println!("    C3 RECV init: {:?}", c3_token);
                 println!("    C4 SEND final: {:?}", c4_token);
