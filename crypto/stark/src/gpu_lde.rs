@@ -78,6 +78,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
+    GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -99,6 +100,17 @@ pub fn gpu_logup_calls() -> u64 {
 pub(crate) static GPU_COMPOSITION_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_composition_calls() -> u64 {
     GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful device-resident-LDE opening-value gathers in
+/// `open_deep_composition_poly` — one per main/aux trace whose R4 query rows
+/// were read straight off the device LDE instead of the host trace (a
+/// non-resident tree or non-Goldilocks tower falls back to the host gather and
+/// is not counted). Guards against a silent regression where Stage-2 openings
+/// quietly revert to the host path.
+pub(crate) static GPU_OPENING_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_opening_gather_calls() -> u64 {
+    GPU_OPENING_GATHER_CALLS.load(Ordering::Relaxed)
 }
 
 /// Runtime override to force the GPU composition path off (→ CPU accumulation).
