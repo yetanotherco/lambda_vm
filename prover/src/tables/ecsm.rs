@@ -741,13 +741,17 @@ impl EcsmConstraints {
                 // Σ (yG_j·yG_{i-j} + µ·P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − µ·b_i
                 // Both the p² offset and the curve constant b are µ-gated: they vanish on
                 // padding rows (µ=0), so all columns (including q1) can pad to zero.
+                // Factor µ out of the p² sum (µ·ΣP_j·P_{i-j}) as ECDAS `rq()` does, so µ
+                // is applied once per limb instead of once per term.
                 let mu = b.main(0, cols::MU);
+                let mut p2 = b.zero();
                 for j in 0..=i {
                     s = s + byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
-                    s = s + mu.clone() * (Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j));
+                    p2 = p2 + Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j);
                     s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
                     s = s - byte(cols::Q1, 33, j) * Self::p_byte_expr(b, i - j);
                 }
+                s = s + mu.clone() * p2;
                 if i == 0 {
                     let curve_b = b.const_base(B);
                     s = s - mu * curve_b;
