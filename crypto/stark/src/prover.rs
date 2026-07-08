@@ -1611,6 +1611,16 @@ pub trait IsStarkProver<
             }
         }
 
+        // Reaching here means both GPU DEEP arms fell through to the host loop
+        // below (which reads `get_main`/`get_aux`). Under the device-only gate
+        // the host trace is empty, so a fall-through is a mis-gate or an
+        // unexpected GPU failure: hard-abort rather than read empty buffers.
+        #[cfg(feature = "cuda")]
+        assert!(
+            !lde_trace.host_trace_empty(),
+            "R4 DEEP composition fell back to the host trace, but it is device-only (empty)"
+        );
+
         // OOD column compression (Plonky3-style): precompute one value per eval point,
         //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
         // The per-LDE-point trace column sums are NOT precomputed — they are fused
@@ -1994,27 +2004,41 @@ pub trait IsStarkProver<
                         let proof = proofs[qi].clone();
                         if let Some(dev_vals) = &main_dev_values {
                             let (even, odd) = Self::device_row_pair(dev_vals, qi, total_cols);
-                            // Cross-check the device gather against the (still
-                            // resident) host LDE before trusting it in the proof.
-                            let r_even = reverse_index(*index * 2, domain_size);
-                            let r_odd = reverse_index(*index * 2 + 1, domain_size);
-                            assert_eq!(
-                                even,
-                                lde_trace.gather_main_row(r_even),
-                                "device main-row gather mismatch (even), query {qi}"
-                            );
-                            assert_eq!(
-                                odd,
-                                lde_trace.gather_main_row(r_odd),
-                                "device main-row gather mismatch (odd), query {qi}"
-                            );
+                            // Cross-check the device gather against the host LDE.
+                            // Skipped under device-only (host trace empty): the
+                            // gather was proven bit-identical while the host copy
+                            // was resident, and there is nothing to check against.
+                            if !lde_trace.host_trace_empty() {
+                                let r_even = reverse_index(*index * 2, domain_size);
+                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                                assert_eq!(
+                                    even,
+                                    lde_trace.gather_main_row(r_even),
+                                    "device main-row gather mismatch (even), query {qi}"
+                                );
+                                assert_eq!(
+                                    odd,
+                                    lde_trace.gather_main_row(r_odd),
+                                    "device main-row gather mismatch (odd), query {qi}"
+                                );
+                            }
                             Self::open_polys_from_values(proof, even, odd)
                         } else {
+                            // Device tree resident but the value gather is absent:
+                            // reading the host gather is invalid under device-only.
+                            assert!(
+                                !lde_trace.host_trace_empty(),
+                                "R4 main opening fell back to the host gather, but it is device-only (empty)"
+                            );
                             Self::open_polys_with_proofs(domain, proof, *index, |row| {
                                 lde_trace.gather_main_row(row)
                             })
                         }
                     } else {
+                        assert!(
+                            !lde_trace.host_trace_empty(),
+                            "R4 main opening fell back to the host tree, but it is device-only (empty)"
+                        );
                         Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
                             lde_trace.gather_main_row(row)
                         })
@@ -2070,25 +2094,36 @@ pub trait IsStarkProver<
                         if let Some(dev_vals) = &aux_dev_values {
                             let ncols = lde_trace.num_aux_cols();
                             let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
-                            let r_even = reverse_index(*index * 2, domain_size);
-                            let r_odd = reverse_index(*index * 2 + 1, domain_size);
-                            assert_eq!(
-                                even,
-                                lde_trace.gather_aux_row(r_even),
-                                "device aux-row gather mismatch (even), query {qi}"
-                            );
-                            assert_eq!(
-                                odd,
-                                lde_trace.gather_aux_row(r_odd),
-                                "device aux-row gather mismatch (odd), query {qi}"
-                            );
+                            // Cross-check skipped under device-only (host empty).
+                            if !lde_trace.host_trace_empty() {
+                                let r_even = reverse_index(*index * 2, domain_size);
+                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
+                                assert_eq!(
+                                    even,
+                                    lde_trace.gather_aux_row(r_even),
+                                    "device aux-row gather mismatch (even), query {qi}"
+                                );
+                                assert_eq!(
+                                    odd,
+                                    lde_trace.gather_aux_row(r_odd),
+                                    "device aux-row gather mismatch (odd), query {qi}"
+                                );
+                            }
                             Self::open_polys_from_values(proof, even, odd)
                         } else {
+                            assert!(
+                                !lde_trace.host_trace_empty(),
+                                "R4 aux opening fell back to the host gather, but it is device-only (empty)"
+                            );
                             Self::open_polys_with_proofs(domain, proof, *index, |row| {
                                 lde_trace.gather_aux_row(row)
                             })
                         }
                     } else {
+                        assert!(
+                            !lde_trace.host_trace_empty(),
+                            "R4 aux opening fell back to the host tree, but it is device-only (empty)"
+                        );
                         Self::open_polys_with(domain, &aux.tree, *index, |row| {
                             lde_trace.gather_aux_row(row)
                         })
