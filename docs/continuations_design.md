@@ -80,9 +80,9 @@ makes the proof fail.
                   which epoch wrote it          access timestamp)
 ```
 
-Column layout (9 columns): `address_lo/hi` (32-bit), `init_value` (byte),
+Column layout (8 columns): `address_lo/hi` (32-bit), `init_value` (byte),
 `init_epoch` (two 16-bit halfwords), `fini_value` (byte),
-`fini_timestamp_lo/hi` (32-bit), `MU` (selector).
+`fini_timestamp` (32-bit `Word`), `MU` (selector).
 
 Note: **`fini_epoch` is NOT a column** — it is supplied as a per-table constant
 (see §4.2).
