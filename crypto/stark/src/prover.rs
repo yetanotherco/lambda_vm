@@ -254,6 +254,29 @@ where
     ) -> Round1<Field, FieldExtension> {
         let (main_data, num_main_cols) = lde.main;
         let (aux_data, num_aux_cols) = lde.aux;
+
+        // Stage-3 device-only detection, inferred from the ACTUAL buffer state
+        // (not the gate's intent): a table whose round-1 D2H was skipped has an
+        // empty host buffer where it should have data. Using the real state is a
+        // safety property — if the `device_only` gate held but the GPU keep path
+        // fell back to CPU, the buffer is populated and this stays false, so the
+        // proof runs on the host trace as normal. `main_empty` additionally
+        // drives the `num_rows` recovery, since `from_row_major` reads it from
+        // `main_data.len()`. A mixed state (one buffer empty, the other full) is
+        // treated as device-only so any host read hard-aborts rather than
+        // indexing an empty buffer.
+        #[cfg(feature = "cuda")]
+        let main_empty = num_main_cols > 0 && main_data.is_empty();
+        #[cfg(feature = "cuda")]
+        let host_trace_empty =
+            main_empty || (num_aux_cols > 0 && aux_data.is_empty() && lde.gpu_aux.is_some());
+        #[cfg(feature = "cuda")]
+        let device_num_rows = lde
+            .gpu_main
+            .as_ref()
+            .map(|h| h.lde_size)
+            .or_else(|| lde.gpu_aux.as_ref().map(|h| h.lde_size));
+
         #[allow(unused_mut)]
         let mut lde_trace = LDETraceTable::from_row_major(
             main_data,
@@ -265,6 +288,14 @@ where
         );
         #[cfg(feature = "cuda")]
         {
+            if host_trace_empty {
+                // Recover the LDE row count from the resident handle when the
+                // (empty) main buffer could not supply it.
+                if main_empty && let Some(n) = device_num_rows {
+                    lde_trace.set_num_rows(n);
+                }
+                lde_trace.set_host_trace_empty(true);
+            }
             if let Some(h) = lde.gpu_main {
                 lde_trace.set_gpu_main(h);
             }
@@ -761,11 +792,37 @@ pub trait IsStarkProver<
     /// as a separate Merkle tree (the precomputed split for preprocessed
     /// tables) and the root is checked against the AIR-hardcoded commitment.
     #[allow(clippy::type_complexity)]
+    /// Stage-3 device-only gate for one table (see
+    /// [`crate::gpu_lde::device_only_gate`]). Derived purely from the AIR +
+    /// domain so the round-1 main-commit and aux-commit closures compute the
+    /// identical value and skip both host D2Hs consistently — the per-table
+    /// `host_trace_empty` flag covers both the main and aux buffers, so they
+    /// must be left empty together.
+    #[cfg(feature = "cuda")]
+    fn device_only_for(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+    ) -> bool {
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let n = domain.interpolation_domain_size;
+        let offsets = &air.context().transition_offsets;
+        let offsets_contiguous = offsets.iter().enumerate().all(|(i, &o)| o == i);
+        let zerofier_uniform = air.constraints_meta().iter().all(|m| m.end_exemptions == 0);
+        crate::gpu_lde::device_only_gate::<Field, FieldExtension>(
+            lde_size,
+            n,
+            air.is_preprocessed(),
+            offsets_contiguous,
+            zerofier_uniform,
+        )
+    }
+
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
+        #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainCommitTuple<Field>, ProvingError>
     where
@@ -798,6 +855,7 @@ pub trait IsStarkProver<
                     num_cols,
                     domain.blowup_factor,
                     &twiddles.coset_weights,
+                    !device_only,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -805,6 +863,13 @@ pub trait IsStarkProver<
                 let root = tree.root;
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
+                // Count a device-only main commit only once the GPU keep path
+                // actually fired (handle produced + host trace intentionally
+                // empty), so the counter reflects real residency, not the gate.
+                if device_only {
+                    crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Ok((
                     TableCommit::plain(tree, root),
                     (main_data, num_cols),
@@ -2325,11 +2390,19 @@ pub trait IsStarkProver<
                     let precomputed = air
                         .is_preprocessed()
                         .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+
+                    // Stage-3 device-only gate: when it holds, `commit_main_trace`
+                    // keeps the R1 LDE device-resident and skips the host D2H.
+                    #[cfg(feature = "cuda")]
+                    let device_only = Self::device_only_for(*air, domain);
+
                     Self::commit_main_trace(
                         *trace,
                         domain,
                         twiddles,
                         precomputed,
+                        #[cfg(feature = "cuda")]
+                        device_only,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     )
@@ -2533,6 +2606,12 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
+                        // Same gate as the main commit (Phase A): skip the aux
+                        // host D2H when device-only, so both buffers are left
+                        // empty together for this table.
+                        #[cfg(feature = "cuda")]
+                        let device_only = Self::device_only_for(*air, domain);
+
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
                         // memory, no upload, no host column extraction. When the
@@ -2549,7 +2628,10 @@ pub trait IsStarkProver<
                                     FieldExtension,
                                     BatchedMerkleTreeBackend<FieldExtension>,
                                 >(
-                                    ra, domain.blowup_factor, &twiddles.coset_weights
+                                    ra,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
+                                    !device_only,
                                 )
                                 .ok_or_else(|| {
                                     ProvingError::Fft(
@@ -2591,6 +2673,7 @@ pub trait IsStarkProver<
                                     num_cols,
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
+                                    !device_only,
                                 )
                             {
                                 #[cfg(feature = "instruments")]

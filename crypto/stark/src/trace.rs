@@ -531,6 +531,15 @@ where
         self.host_trace_empty = empty;
     }
 
+    /// Override the LDE row count. Needed on the device-only path: the host
+    /// buffers are empty, so `from_row_major` cannot infer `num_rows` from
+    /// `main_data.len()` — the caller supplies it from the device handle's
+    /// `lde_size` instead.
+    #[cfg(feature = "cuda")]
+    pub fn set_num_rows(&mut self, num_rows: usize) {
+        self.num_rows = num_rows;
+    }
+
     /// Whether the host LDE trace was intentionally left empty (see
     /// [`Self::set_host_trace_empty`]). Guards on every host-read fallback check
     /// this before touching `main_data`/`aux_data`.
