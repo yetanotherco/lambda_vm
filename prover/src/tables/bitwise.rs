@@ -342,7 +342,7 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// to zero and will be updated when other tables send lookups.
 pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(NUM_ROWS * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -383,8 +383,9 @@ pub fn generate_bitwise_trace() -> TraceTable<GoldilocksField, GoldilocksExtensi
                 table.set_half(row_idx, cols::SLL, sll as u16);
                 table.set_half(row_idx, cols::SLLC, sllc as u16);
 
-                // Multiplicity columns start at zero
-                // They will be updated by update_multiplicities()
+                // Multiplicity columns start at zero. They are filled by
+                // `BitwiseHistogram::fill_multiplicities`; `update_multiplicities`
+                // only tops up the continuation L2G lookups afterward.
             }
         }
     }
@@ -412,22 +413,185 @@ pub fn update_multiplicities(
 ) {
     for op in ops {
         let row = row_index(op.x, op.y, op.z);
-        let mu_col = match op.lookup_type {
-            BitwiseOperationType::Msb8 => cols::MU_MSB8,
-            BitwiseOperationType::Msb16 => cols::MU_MSB16,
-            BitwiseOperationType::Zero => cols::MU_ZERO,
-            BitwiseOperationType::AreBytes => cols::MU_ARE_BYTES,
-            BitwiseOperationType::IsHalf => cols::MU_IS_HALF,
-            BitwiseOperationType::IsB20 => cols::MU_IS_B20,
-            BitwiseOperationType::Hwsl => cols::MU_HWSL,
-            BitwiseOperationType::ByteAluAnd => cols::MU_BYTE_ALU_AND,
-            BitwiseOperationType::ByteAluOr => cols::MU_BYTE_ALU_OR,
-            BitwiseOperationType::ByteAluXor => cols::MU_BYTE_ALU_XOR,
-        };
+        let mu_col = mu_column(op.lookup_type);
 
         // Increment multiplicity
         let current = trace.main_table.get_row(row)[mu_col];
         trace.main_table.set_fe(row, mu_col, current + FE::one());
+    }
+}
+
+/// Number of distinct BITWISE lookup types (one multiplicity column each).
+/// Derived from [`BitwiseOperationType::ALL`], which the compile-time guard
+/// below keeps in lockstep with [`lookup_type_index`].
+pub(crate) const NUM_LOOKUP_TYPES: usize = BitwiseOperationType::ALL.len();
+
+/// Dense index in `[0, NUM_LOOKUP_TYPES)` for a lookup type. Ordering is an
+/// internal detail of the histogram; [`BitwiseOperationType::ALL`] is its
+/// inverse, enforced at compile time.
+#[inline]
+pub(crate) const fn lookup_type_index(t: BitwiseOperationType) -> usize {
+    match t {
+        BitwiseOperationType::Msb8 => 0,
+        BitwiseOperationType::Msb16 => 1,
+        BitwiseOperationType::Zero => 2,
+        BitwiseOperationType::AreBytes => 3,
+        BitwiseOperationType::IsHalf => 4,
+        BitwiseOperationType::IsB20 => 5,
+        BitwiseOperationType::Hwsl => 6,
+        BitwiseOperationType::ByteAluAnd => 7,
+        BitwiseOperationType::ByteAluOr => 8,
+        BitwiseOperationType::ByteAluXor => 9,
+    }
+}
+
+/// The MU_* multiplicity column for each lookup type, in [`lookup_type_index`]
+/// order. This is the single source of truth for the type→column mapping: both
+/// the per-op path ([`mu_column`]) and the histogram fill ([`type_mu_column`])
+/// index into this one array. The compile-time block below checks the entries
+/// are pairwise distinct, so a duplicate column is a build error rather than a
+/// silent overwrite in [`BitwiseHistogram::fill_multiplicities`].
+const MU_COLUMNS: [usize; NUM_LOOKUP_TYPES] = [
+    cols::MU_MSB8,         // Msb8
+    cols::MU_MSB16,        // Msb16
+    cols::MU_ZERO,         // Zero
+    cols::MU_ARE_BYTES,    // AreBytes
+    cols::MU_IS_HALF,      // IsHalf
+    cols::MU_IS_B20,       // IsB20
+    cols::MU_HWSL,         // Hwsl
+    cols::MU_BYTE_ALU_AND, // ByteAluAnd
+    cols::MU_BYTE_ALU_OR,  // ByteAluOr
+    cols::MU_BYTE_ALU_XOR, // ByteAluXor
+];
+
+/// Multiplicity column for a lookup type. Used by the per-op path
+/// ([`update_multiplicities`]), which is still live production code: continuation
+/// epochs add their L2G lookups through it on top of the histogram-filled trace.
+#[inline]
+pub(crate) const fn mu_column(t: BitwiseOperationType) -> usize {
+    MU_COLUMNS[lookup_type_index(t)]
+}
+
+/// Multiplicity column for the histogram lane at dense index `type_idx`
+/// (inverse of [`lookup_type_index`]). Used by [`BitwiseHistogram::fill_multiplicities`].
+///
+/// Reads directly from [`MU_COLUMNS`], the single type→column source of truth.
+#[inline]
+const fn type_mu_column(type_idx: usize) -> usize {
+    MU_COLUMNS[type_idx]
+}
+
+// Compile-time guards on the type↔column bookkeeping.
+//
+// 1. `ALL` must list every lookup type exactly once, in `lookup_type_index`
+//    order (i.e. it is the exact inverse of that mapping). Adding a variant
+//    forces the `lookup_type_index` match to be extended (exhaustiveness), and
+//    this assert then forces `ALL` — and with it `NUM_LOOKUP_TYPES` — to follow.
+// 2. The type→column map is now derived from the single `MU_COLUMNS` array, and
+//    its entries are checked pairwise distinct (injective). A wrong or duplicated
+//    MU column would silently unbalance the BITWISE bus, so both are compile
+//    errors, not test failures.
+const _: () = {
+    let mut i = 0;
+    while i < NUM_LOOKUP_TYPES {
+        assert!(lookup_type_index(BitwiseOperationType::ALL[i]) == i);
+        let mut j = i + 1;
+        while j < NUM_LOOKUP_TYPES {
+            assert!(
+                MU_COLUMNS[i] != MU_COLUMNS[j],
+                "MU_COLUMNS entries must map distinct lookup types to distinct columns"
+            );
+            j += 1;
+        }
+        i += 1;
+    }
+};
+
+/// "Histogram-on-the-fly" accumulator for BITWISE lookup multiplicities.
+///
+/// Replaces materializing the giant `Vec<BitwiseOperation>` (whose only consumer
+/// is the multiplicity count) with a dense counter array. Each lookup increments
+/// `counters[type_idx * NUM_ROWS + row_index(x, y, z)]`.
+///
+/// The histogram is a commutative monoid: increments and [`merge`](Self::merge)
+/// are order-independent, so per-thread histograms can be tree-reduced and the
+/// resulting multiplicities are byte-identical to the serial per-op count that
+/// [`update_multiplicities`] produces (both just sum the same lookups per cell).
+///
+/// Memory: `NUM_ROWS * NUM_LOOKUP_TYPES * 8` bytes = 2^20 * 10 * 8 = 80 MiB.
+pub(crate) struct BitwiseHistogram {
+    counters: Box<[u64]>,
+}
+
+impl BitwiseHistogram {
+    /// Allocate a zeroed histogram (80 MiB).
+    // No `Default` impl on purpose: `new()` allocates 80 MiB, so a stray
+    // `..Default::default()` / `#[derive(Default)]` must not silently do that.
+    #[allow(clippy::new_without_default)]
+    pub(crate) fn new() -> Self {
+        Self {
+            counters: vec![0u64; NUM_ROWS * NUM_LOOKUP_TYPES].into_boxed_slice(),
+        }
+    }
+
+    /// Increment the counter for one lookup.
+    #[inline]
+    pub(crate) fn bump(&mut self, op: BitwiseOperation) {
+        self.bump_n(op, 1);
+    }
+
+    /// Add `n` occurrences of one lookup in a single step (e.g. CPU padding rows,
+    /// which all send identical all-zero lookups).
+    #[inline]
+    pub(crate) fn bump_n(&mut self, op: BitwiseOperation, n: u64) {
+        let idx = lookup_type_index(op.lookup_type) * NUM_ROWS + row_index(op.x, op.y, op.z);
+        // (x, y) are u8, and row_index debug-asserts z < 16, so in debug builds a
+        // corrupt op fails loudly here. In release an out-of-domain z would NOT
+        // panic: the flat index can land in another type's lane and silently
+        // mis-count both cells — the proof then fails verification instead of the
+        // prover crashing. What actually upholds the invariant is that every
+        // `BitwiseOperation` constructor masks or debug-asserts z < 16.
+        self.counters[idx] += n;
+    }
+
+    /// Fold a slice of lookups into the histogram.
+    #[inline]
+    pub(crate) fn add_ops(&mut self, ops: &[BitwiseOperation]) {
+        for &op in ops {
+            self.bump(op);
+        }
+    }
+
+    /// Merge another histogram into this one (commutative, order-independent).
+    pub(crate) fn merge(&mut self, other: &BitwiseHistogram) {
+        for (a, b) in self.counters.iter_mut().zip(other.counters.iter()) {
+            *a += *b;
+        }
+    }
+
+    /// Write the accumulated multiplicities into the BITWISE trace's MU columns.
+    ///
+    /// OVERWRITES each nonzero cell with its count (it does not add to what is
+    /// there), so it assumes the MU columns are still zero — true for a fresh
+    /// [`generate_bitwise_trace`] output, where it produces exactly the same MU
+    /// columns as calling [`update_multiplicities`] with the full op vector.
+    /// Callers that layer additional lookups on top (continuation epochs add
+    /// their L2G lookups via `update_multiplicities`, which increments) must do
+    /// so strictly AFTER this fill, never before.
+    pub(crate) fn fill_multiplicities(
+        &self,
+        trace: &mut TraceTable<GoldilocksField, GoldilocksExtension>,
+    ) {
+        for type_idx in 0..NUM_LOOKUP_TYPES {
+            let mu_col = type_mu_column(type_idx);
+            let base = type_idx * NUM_ROWS;
+            for row in 0..NUM_ROWS {
+                let count = self.counters[base + row];
+                if count != 0 {
+                    trace.main_table.set_fe(row, mu_col, FE::from(count));
+                }
+            }
+        }
     }
 }
 
@@ -444,6 +608,24 @@ pub enum BitwiseOperationType {
     ByteAluAnd,
     ByteAluOr,
     ByteAluXor,
+}
+
+impl BitwiseOperationType {
+    /// Every lookup type exactly once, in [`lookup_type_index`] order (the
+    /// compile-time guard next to [`type_mu_column`] enforces this). The array
+    /// length is the single origin of [`NUM_LOOKUP_TYPES`].
+    pub(crate) const ALL: [Self; 10] = [
+        Self::Msb8,
+        Self::Msb16,
+        Self::Zero,
+        Self::AreBytes,
+        Self::IsHalf,
+        Self::IsB20,
+        Self::Hwsl,
+        Self::ByteAluAnd,
+        Self::ByteAluOr,
+        Self::ByteAluXor,
+    ];
 }
 
 /// A lookup request to the BITWISE precomputed table.

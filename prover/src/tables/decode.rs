@@ -128,7 +128,7 @@ pub fn generate_decode_trace(
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -393,7 +393,7 @@ fn build_decode_table(
     let num_entries = entries.len() + 1;
     let num_rows = num_entries.next_power_of_two().max(2);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
