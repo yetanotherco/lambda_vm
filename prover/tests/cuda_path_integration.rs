@@ -12,8 +12,8 @@ use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
-    gpu_deep_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls,
-    gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls,
+    gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -174,5 +174,28 @@ fn gpu_opening_gather_fires_and_verifies() {
     assert!(
         verify(&proof, &elf).expect("verify"),
         "GPU-produced proof (device-gathered openings) failed verification"
+    );
+}
+
+/// The full-residency Stage-3 device-only path fires: at least one table keeps
+/// its round-1 LDE device-resident (the host D2H is skipped), and the proof
+/// still verifies. This exercises every `host_trace_empty` hard-abort guard on
+/// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
+/// device LDE with no host trace behind them. A regression that silently
+/// reverts to the host D2H drops the counter to 0 (while the proof would still
+/// verify), and a mis-gate that forces a host fallback panics one of the guards.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_device_only_residency_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_device_only_calls() > 0,
+        "device-only residency path did not fire (every table kept its host trace)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (device-only residency) failed verification"
     );
 }
