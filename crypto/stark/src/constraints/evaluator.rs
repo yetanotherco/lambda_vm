@@ -233,6 +233,17 @@ where
             }
         }
 
+        // Reaching here means the GPU composition path fell through to the CPU
+        // boundary + transition evaluation below, both of which read the host
+        // trace (`get_main`/`get_aux`, `RowFrame::from_lde`). Under the
+        // device-only gate that trace is empty, so a fall-through is a mis-gate
+        // or an unexpected GPU failure: hard-abort rather than read empty buffers.
+        #[cfg(feature = "cuda")]
+        assert!(
+            !lde_trace.host_trace_empty(),
+            "R2 composition fell back to the host trace, but it is device-only (empty)"
+        );
+
         // Fused boundary evaluation: compute (trace[col] - value) on-the-fly
         // instead of pre-computing all boundary_polys_evaluations.
         // This eliminates N_constraints × LDE_size intermediate allocations.
