@@ -212,6 +212,10 @@ type MainCommitTuple<F> = (
 #[cfg(not(feature = "cuda"))]
 type MainCommitTuple<F> = (TableCommit<F>, (Vec<FieldElement<F>>, usize));
 
+/// CPU aux-commit result: the committed aux `TableCommit` plus its row-major
+/// extension-field LDE `(data, width)`. No GPU handle — the aux lane is CPU-only.
+type AuxCommitTuple<E> = (TableCommit<E>, (Vec<FieldElement<E>>, usize));
+
 /// Round 1 commitment artifacts — Merkle trees, roots, challenges, and bus inputs.
 /// Borrowed (not consumed) when building `Round1` in Phase D.
 pub(crate) struct Round1Commitments<Field, FieldExtension>
@@ -943,7 +947,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
-    ) -> Result<(TableCommit<FieldExtension>, (Vec<FieldElement<FieldExtension>>, usize)), ProvingError>
+    ) -> Result<AuxCommitTuple<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,

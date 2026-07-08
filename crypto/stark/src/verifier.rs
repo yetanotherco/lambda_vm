@@ -1905,8 +1905,7 @@ pub trait IsStarkVerifier<
         {
             vm_expected = &vm_expected - &bpi.table_contribution;
         }
-        let vm_ok =
-            Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, &vm_expected);
+        let vm_ok = Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, &vm_expected);
 
         l2g_ok && vm_ok
     }

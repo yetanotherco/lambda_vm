@@ -663,6 +663,10 @@ impl VmAirs {
 /// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
 /// trace commitments in the same order as the prover, then samples two
 /// challenge elements.
+///
+/// Only the batched analogue is used in the production path now; this
+/// non-batched replay is retained for the monolithic-style test helpers.
+#[cfg(test)]
 pub(crate) fn replay_transcript_phase_a(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     multi_proof: &MultiProof<F, E, ()>,
@@ -733,6 +737,10 @@ pub(crate) fn compute_commit_bus_offset(
 /// Replays Phase A of the transcript to recover (z, alpha), then computes
 /// the offset from the given public output bytes. Call this after `multi_prove`
 /// and before `multi_verify`.
+///
+/// Superseded by [`compute_expected_commit_bus_balance_batched`] in the
+/// production path; retained for the monolithic-style test helpers.
+#[cfg(test)]
 pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proof: &MultiProof<F, E, ()>,
