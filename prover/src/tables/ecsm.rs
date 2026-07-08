@@ -28,7 +28,7 @@ pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
-// Column indices (~427 columns)
+// Column indices (667 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
 
 pub mod cols {
