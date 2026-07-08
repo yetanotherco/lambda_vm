@@ -190,7 +190,7 @@ pub fn preprocessed_commitment(options: &ProofOptions) -> Commitment {
 /// updated via `update_multiplicities` after all round-chip lookups are known.
 pub fn generate_keccak_rc_trace() -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); NUM_ROWS * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(NUM_ROWS * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
