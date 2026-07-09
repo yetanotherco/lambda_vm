@@ -85,6 +85,67 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     pub b_z_inv: &'a [FieldElement<F>],
 }
 
+/// The lowered device program plus the packed per-proof uniforms shared by both
+/// GPU dispatch entry points. Produced by [`lower_and_pack`].
+struct LoweredCall {
+    dev: DeviceProgram,
+    nodes: Vec<u64>,
+    ext_consts: Vec<u64>,
+    roots: Vec<u64>,
+    rap: Vec<u64>,
+    alpha: Vec<u64>,
+    offset: Vec<u64>,
+}
+
+/// The single concrete-Goldilocks lowering seam shared by
+/// [`try_eval_composition_gpu`] and [`try_eval_program_gpu`]: gate on the
+/// Goldilocks tower, reinterpret the generic program once, lower it to the flat
+/// device blob, and pack the three ext3 uniforms. Returns `None` (→ CPU
+/// fallback) for any other field tower. Factoring this keeps the sole `unsafe`
+/// program reinterpret and the TypeId gate in one place instead of two.
+fn lower_and_pack<F, E>(
+    prog: &ConstraintProgram<F, E>,
+    rap_challenges: &[FieldElement<E>],
+    alpha_powers: &[FieldElement<E>],
+    table_offset: &FieldElement<E>,
+) -> Option<LoweredCall>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
+        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
+    {
+        return None;
+    }
+    // SAFETY: the TypeId gate established `F = GoldilocksField` and
+    // `E = Degree3GoldilocksExtensionField`; the generic program has the exact
+    // layout of the concrete one (constants are `#[repr(transparent)]` over
+    // `u64` / `[u64; 3]`).
+    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
+        unsafe { &*(prog as *const _ as *const _) };
+
+    let dev = DeviceProgram::lower(prog);
+    let nodes = pack_nodes(&dev);
+    let ext_consts = flatten_ext3(&dev.ext_consts);
+    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+
+    // SAFETY: `E` is the ext3 tower (gated above).
+    let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
+    let alpha = unsafe { ext3_slice_to_u64(alpha_powers) };
+    let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
+
+    Some(LoweredCall {
+        dev,
+        nodes,
+        ext_consts,
+        roots,
+        rap,
+        alpha,
+        offset,
+    })
+}
+
 /// Fused composition-poly evaluation on the GPU: returns `H(row)` as raw ext3
 /// limbs (`num_rows * 3` u64), or `None` for non-Goldilocks towers (→ CPU
 /// fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
@@ -105,26 +166,17 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
-        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
-    {
-        return None;
-    }
+    let LoweredCall {
+        dev,
+        nodes,
+        ext_consts,
+        roots,
+        rap,
+        alpha,
+        offset,
+    } = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
 
-    // SAFETY: the TypeId gate established the concrete Goldilocks tower.
-    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
-        unsafe { &*(prog as *const _ as *const _) };
-
-    let dev = DeviceProgram::lower(prog);
-    let nodes = pack_nodes(&dev);
-    let ext_consts = flatten_ext3(&dev.ext_consts);
-    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
-
-    // SAFETY: `E`/`F` are the Goldilocks tower (gated above).
-    let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
-    let alpha = unsafe { ext3_slice_to_u64(alpha_powers) };
-    let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
-
+    // SAFETY: `E`/`F` are the Goldilocks tower (established in `lower_and_pack`).
     let beta_trans = unsafe { ext3_slice_to_u64(inputs.beta_trans) };
     let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
     let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
@@ -187,28 +239,15 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
-        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
-    {
-        return None;
-    }
-
-    // SAFETY: the TypeId gate above established `F = GoldilocksField` and
-    // `E = Degree3GoldilocksExtensionField`, so the generic program has the
-    // exact layout of the concrete one (constants are `#[repr(transparent)]`
-    // over `u64` / `[u64; 3]`).
-    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
-        unsafe { &*(prog as *const _ as *const _) };
-
-    let dev = DeviceProgram::lower(prog);
-    let nodes = pack_nodes(&dev);
-    let ext_consts = flatten_ext3(&dev.ext_consts);
-    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
-
-    // SAFETY: `E` is the ext3 tower (gated above).
-    let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
-    let alpha = unsafe { ext3_slice_to_u64(alpha_powers) };
-    let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
+    let LoweredCall {
+        dev,
+        nodes,
+        ext_consts,
+        roots,
+        rap,
+        alpha,
+        offset,
+    } = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
 
     let result = math_cuda::constraint_interp::eval_constraints_on_device(
         &nodes,
