@@ -197,7 +197,7 @@ pub struct Backend {
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
 
-    // constraint_interp.ptx
+    // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
 
@@ -510,7 +510,26 @@ pub fn backend() -> Result<&'static Backend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let b = Backend::init()?;
+    let b = match Backend::init() {
+        Ok(b) => b,
+        Err(e) => {
+            // Backend init failing means every GPU entry point silently falls
+            // back to CPU. That is expected on a GPU-less host, but it also
+            // fires when the AOT cubins won't load — most often a build-host vs
+            // run-host GPU-arch mismatch (cubins are compiled for the detected
+            // `sm_XX`) or an empty nvcc-less stub. Warn once so the fallback is
+            // never silent: rebuild on the run host, or set `CUDARC_NVCC_ARCH`.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "math-cuda: GPU backend unavailable ({e}) — running on CPU. \
+                     If a GPU is present this is likely a kernel-cubin arch mismatch; \
+                     rebuild on the run host or set CUDARC_NVCC_ARCH to its sm_XX."
+                );
+            });
+            return Err(e);
+        }
+    };
     let _ = BACKEND.set(b);
     Ok(BACKEND.get().expect("backend just initialised"))
 }
