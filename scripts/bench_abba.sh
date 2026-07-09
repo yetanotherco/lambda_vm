@@ -140,9 +140,16 @@ if [ "$need_build" = "1" ]; then
     # driver-symbol set instead of its newest (which can request symbols the rented box's
     # driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
     if [ -n "${CUDARC_PIN:-}" ]; then
-      sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
-        "$WT/crypto/math-cuda/Cargo.toml"
-      echo "    cudarc pinned to ${CUDARC_PIN}"
+      if grep -q '"cuda-version-from-build-system"' "$WT/crypto/math-cuda/Cargo.toml"; then
+        sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
+          "$WT/crypto/math-cuda/Cargo.toml"
+        echo "    cudarc pinned to ${CUDARC_PIN}"
+      else
+        # Post-pin shas already hard-pin cudarc in Cargo.toml, so the anchor is
+        # gone and the sed would silently no-op. Warn rather than mislead.
+        echo "    WARNING: CUDARC_PIN=${CUDARC_PIN} ignored @ ${1:0:10} — cudarc is already" >&2
+        echo "             pinned in crypto/math-cuda/Cargo.toml (no build-system anchor to rewrite)." >&2
+      fi
     fi
     if ! ( cd "$WT" && cargo build --release -p cli --features "$BENCH_FEATURES" >"$WORK/build_$2.log" 2>&1 ); then
       echo "ERROR: cargo build failed for $2 (@ ${1:0:10}). Tail of $WORK/build_$2.log:" >&2
