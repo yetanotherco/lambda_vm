@@ -179,6 +179,19 @@ pub fn eval_composition_on_device(
         num_boundary * num_rows,
         "z_b_inv shape"
     );
+    // The kernel indexes these by `num_boundary`; a caller mismatch would be an
+    // OOB device read rather than a clean panic, so pin all boundary shapes.
+    debug_assert_eq!(accum.b_is_aux.len(), num_boundary, "b_is_aux per boundary");
+    debug_assert_eq!(
+        accum.b_value.len(),
+        num_boundary * 3,
+        "b_value ext3 per boundary"
+    );
+    debug_assert_eq!(
+        accum.b_beta.len(),
+        num_boundary * 3,
+        "b_beta ext3 per boundary"
+    );
 
     let be = backend()?;
     let stream = be.next_stream();
