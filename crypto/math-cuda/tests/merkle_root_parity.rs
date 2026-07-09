@@ -305,6 +305,7 @@ fn new_row_major_pipeline_base_root_matches_cpu() {
                     num_cols,
                     blowup,
                     &weights_u64,
+                    true,
                 )
                 .expect("new row-major GPU pipeline");
                 let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;
@@ -368,6 +369,7 @@ fn new_row_major_pipeline_ext3_root_matches_cpu() {
                         num_cols,
                         blowup,
                         &weights_u64,
+                        true,
                     )
                     .expect("new ext3 row-major GPU pipeline");
                 let gpu_root = handle.tree.as_ref().expect("resident merkle tree").root;

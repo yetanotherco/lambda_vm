@@ -260,11 +260,9 @@ where
         // empty host buffer where it should have data. Using the real state is a
         // safety property — if the `device_only` gate held but the GPU keep path
         // fell back to CPU, the buffer is populated and this stays false, so the
-        // proof runs on the host trace as normal. `main_empty` additionally
-        // drives the `num_rows` recovery, since `from_row_major` reads it from
-        // `main_data.len()`. A mixed state (one buffer empty, the other full) is
-        // treated as device-only so any host read hard-aborts rather than
-        // indexing an empty buffer.
+        // proof runs on the host trace as normal. A mixed state (one buffer
+        // empty, the other full) is treated as device-only so any host read
+        // hard-aborts rather than indexing an empty buffer.
         #[cfg(feature = "cuda")]
         let main_empty = num_main_cols > 0 && main_data.is_empty();
         #[cfg(feature = "cuda")]
@@ -289,9 +287,15 @@ where
         #[cfg(feature = "cuda")]
         {
             if host_trace_empty {
-                // Recover the LDE row count from the resident handle when the
-                // (empty) main buffer could not supply it.
-                if main_empty && let Some(n) = device_num_rows {
+                // Recover the LDE row count from the resident device handle
+                // whenever any host buffer is empty. `from_row_major` derives
+                // `num_rows` from `main_data` (or `aux_data` when there are no
+                // main columns); if that buffer was skipped it reads 0, so we
+                // overwrite from the handle's `lde_size` (the true row count).
+                // Idempotent when `from_row_major` already got it right, and it
+                // covers the aux-only (`num_main_cols == 0`) device-only case
+                // that a `main_empty`-only guard missed.
+                if let Some(n) = device_num_rows {
                     lde_trace.set_num_rows(n);
                 }
                 lde_trace.set_host_trace_empty(true);
@@ -803,6 +807,17 @@ pub trait IsStarkProver<
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         domain: &Domain<Field>,
     ) -> bool {
+        // Preconditions the downstream GPU paths require that the numeric gate
+        // below does not capture. A table missing either would pass the gate,
+        // skip its host D2H, then hard-abort in round 2:
+        //  - R2 composition unconditionally needs a device aux handle
+        //    (`gpu_aux()?`), so the table must declare an aux trace.
+        //  - The composition path needs a uniform zerofier with ≥1 group. An
+        //    empty constraint set makes `all(end_exemptions == 0)` vacuously
+        //    true here but `is_uniform()` false downstream (0 groups).
+        if !air.has_aux_trace() || air.constraints_meta().is_empty() {
+            return false;
+        }
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let n = domain.interpolation_domain_size;
         let offsets = &air.context().transition_offsets;
@@ -2022,9 +2037,24 @@ pub trait IsStarkProver<
                     let stream = lde_trace
                         .bound_stream()
                         .expect("bound stream for device-resident main-row gather");
-                    let raw =
-                        math_cuda::barycentric::gather_rows_base_on_device(h, &query_rows, &stream)
-                            .expect("device main-row gather failed");
+                    let raw = match math_cuda::barycentric::gather_rows_base_on_device(
+                        h,
+                        &query_rows,
+                        &stream,
+                    ) {
+                        Ok(v) => v,
+                        // A gather failure is only fatal under device-only (no host
+                        // trace to fall back to). Otherwise return `None` so the host
+                        // gather arms below serve the openings from the resident LDE.
+                        Err(e) => {
+                            assert!(
+                                !lde_trace.host_trace_empty(),
+                                "device main-row gather failed and the trace is device-only \
+                                 (no host fallback): {e:?}"
+                            );
+                            return None;
+                        }
+                    };
                     crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
                 })
             });
@@ -2041,9 +2071,22 @@ pub trait IsStarkProver<
                     let stream = lde_trace
                         .bound_stream()
                         .expect("bound stream for device-resident aux-row gather");
-                    let raw =
-                        math_cuda::barycentric::gather_rows_ext3_on_device(h, &query_rows, &stream)
-                            .expect("device aux-row gather failed");
+                    let raw = match math_cuda::barycentric::gather_rows_ext3_on_device(
+                        h,
+                        &query_rows,
+                        &stream,
+                    ) {
+                        Ok(v) => v,
+                        // Fatal only under device-only; otherwise fall back to host.
+                        Err(e) => {
+                            assert!(
+                                !lde_trace.host_trace_empty(),
+                                "device aux-row gather failed and the trace is device-only \
+                                 (no host fallback): {e:?}"
+                            );
+                            return None;
+                        }
+                    };
                     crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(&raw)
                 })
             });
