@@ -96,7 +96,7 @@ Then we have local constraints that should be enforced inside of the epoch.
 
 #render_constraint_table(l2gchip, config, groups: "local")
 
-And finally, the interactions that are pare of the global memory consistency proof.
+And finally, the interactions that are part of the global memory consistency proof.
 
 #render_constraint_table(l2gchip, config, groups: "global")
 

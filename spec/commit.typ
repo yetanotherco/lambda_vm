@@ -66,7 +66,7 @@ However, since it is practically impossible to commit more than $2^64-2^32$ byte
 Next, we read the `value` located at buffer address `address` and commit to it under the given `index`.
 This is only performed when we have not yet reached the `end` of the commit sequence.
 Values are committed by letting the verifier initialize and finalize the global memory argument (see @memory and @streaming),
-with the claimed commitments in its own domain separated part of memory, with domain separator value 3.#footnote[
+with the claimed commitments in its own domain separated part of memory, with domain separator value 2.#footnote[
   In order to make sure the verifier can properly finalize the committed values, the last epoch can "bring forward"
   all commitments from earlier epochs, similar to padded values, in the `L2G` table.
   Then the contribution of the commitments only consists of the tuples `(2, address, last_epoch_index, value)`, which is entirely known to the verifier.
