@@ -232,6 +232,38 @@ fn test_keccak() {
 }
 
 #[test]
+fn test_keccak_precompile() {
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // Known-answer vectors for the `keccak_permute`-ecall-backed sponge
+    // (`lambda_vm_syscalls::keccak::keccak256`), computed with the trusted
+    // `sha3::Keccak256` crate. Covers empty input, one rate block (136
+    // bytes) minus one byte, exactly one rate block, and a multi-block
+    // input — the sponge's padding edge cases.
+    let expected: Vec<u8> = [
+        "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470",
+        "4e03657aea45a94fc7d47ba826c8d667c0d1e6e33a64a036ec44f58fa12d6c45",
+        "03c527855334eb2e62b3b9b4d02ab76721707d3dde5fb218369640ee2edc7f3a",
+        "0c0a7040fb3ca12143e59ee4a8d8dceab069cc4c65e725a146563b6304ed6e72",
+        "e4a2f4955400b1a0dd4d52f30bdd542bda1f01f36883b8df6271da7a96cc02ef",
+    ]
+    .iter()
+    .flat_map(|hex| hex_bytes(hex))
+    .collect();
+
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak_precompile.elf",
+        expected,
+        vec![],
+    );
+}
+
+#[test]
 fn test_stdin_read_panics() {
     let result = run_program_without_expect("./program_artifacts/rust/stdin_read.elf", vec![]);
     assert!(result.is_err());

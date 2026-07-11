@@ -9,6 +9,11 @@ members = [
   "crypto/math-cuda",
   "bin/cli",
 ]
+# Riscv-only bare-metal crate, path-dependent from crypto/crypto (target-gated),
+# ethrex-crypto, and guest programs. Without this exclude, Cargo auto-adopts it as
+# a member (nothing else claims it), so `cargo test` runs its unit tests on host,
+# which link against riscv-only symbols and abort.
+exclude = ["syscalls"]
 
 resolver = "2"
 

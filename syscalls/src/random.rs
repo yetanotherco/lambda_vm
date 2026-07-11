@@ -41,10 +41,7 @@ pub unsafe extern "C" fn sys_rand(buf: *mut u8, len: usize) {
 ///
 /// `dest_ptr` must be valid for writes of `len` bytes.
 #[unsafe(no_mangle)]
-unsafe extern "Rust" fn __getrandom_v03_custom(
-    dest_ptr: *mut u8,
-    len: usize,
-) -> Result<(), Error> {
+unsafe extern "Rust" fn __getrandom_v03_custom(dest_ptr: *mut u8, len: usize) -> Result<(), Error> {
     print_string("getrandom called\n");
     print_string("WARNING: Using getrandom is insecure\n");
 
