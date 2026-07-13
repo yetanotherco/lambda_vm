@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
+use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -126,7 +126,10 @@ enum Commands {
         #[arg(long)]
         cycle_budget: Option<u64>,
 
-        /// Print the dynamic instruction (cycle) count
+        /// Print the dynamic instruction (cycle) count, plus `Keccak calls` /
+        /// `Ecsm calls` (accelerator syscall invocations). The accelerator lines
+        /// are omitted when combined with --flamegraph (that path has no per-log
+        /// data).
         #[arg(long)]
         cycles: bool,
     },
@@ -341,35 +344,22 @@ struct FlamegraphCliOptions {
     checkpoint_cycles: Option<u64>,
 }
 
-/// The VM's two syscall accelerators. Each accelerator call is a single ECALL
-/// instruction (one cycle) with the whole permutation / scalar-mul running
-/// inside it, so invocations must be tallied separately from the cycle count.
-#[derive(Clone, Copy)]
-enum Accelerator {
-    /// keccak-f[1600] permutation.
-    Keccak,
-    /// secp256k1 scalar multiplication.
-    Ecsm,
-}
-
 /// Classifies one executed instruction as an accelerator syscall invocation.
 ///
-/// Mirrors `CpuOperation::from_log` (prover/src/tables/cpu.rs): the prover sets
-/// `ecall_keccak`/`ecall_ecsm` from `f.ecall && log.src1_val == <SYSCALL_NUMBER>`.
-/// Here `f.ecall` is the instruction at the log's `current_pc` being
-/// `EcallEbreak`, and `src1_val` carries a7 (the syscall number) on ECALL logs.
-/// Keep this in sync with that classifier so the CLI's counts equal the prover's
-/// chip-trigger counts by construction. (`get_private_input` is a memory-mapped
-/// read, not a syscall, so it never reaches this path.)
+/// Delegates to the executor's canonical `SyscallNumbers::accelerator()` so the
+/// CLI's counts equal the prover's chip-trigger counts by construction: the
+/// prover sets `ecall_keccak`/`ecall_ecsm` from `f.ecall && log.src1_val ==
+/// <SYSCALL_NUMBER>`. Here `f.ecall` is the instruction at the log's
+/// `current_pc` being `EcallEbreak`, and `src1_val` carries a7 (the syscall
+/// number) on ECALL logs. (`get_private_input` is a memory-mapped read, not a
+/// syscall, so it never reaches this path.)
 fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Accelerator> {
     if !matches!(instruction, Some(Instruction::EcallEbreak)) {
         return None;
     }
-    match src1_val {
-        KECCAK_SYSCALL_NUMBER => Some(Accelerator::Keccak),
-        ECSM_SYSCALL_NUMBER => Some(Accelerator::Ecsm),
-        _ => None,
-    }
+    SyscallNumbers::try_from(src1_val)
+        .ok()
+        .and_then(|s| s.accelerator())
 }
 
 fn cmd_execute(
@@ -493,7 +483,9 @@ fn cmd_execute(
             cycle_count += logs.len() as u64;
             if cycles {
                 for log in logs {
-                    if log.src1_val == KECCAK_SYSCALL_NUMBER || log.src1_val == ECSM_SYSCALL_NUMBER
+                    if SyscallNumbers::try_from(log.src1_val)
+                        .map(|s| s.accelerator().is_some())
+                        .unwrap_or(false)
                     {
                         accel_candidates.push((log.current_pc, log.src1_val));
                     }
@@ -1087,28 +1079,37 @@ mod tests {
     // non-ECALL whose src1 collides with an accelerator number, and a cache miss.
     #[test]
     fn accelerator_of_mirrors_prover_classification() {
-        use executor::vm::instruction::execution::SyscallNumbers;
+        use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
 
         let ecall = Instruction::EcallEbreak;
 
-        assert!(matches!(
+        assert_eq!(
             accelerator_of(Some(&ecall), KECCAK_SYSCALL_NUMBER),
             Some(Accelerator::Keccak)
-        ));
-        assert!(matches!(
+        );
+        assert_eq!(
             accelerator_of(Some(&ecall), ECSM_SYSCALL_NUMBER),
             Some(Accelerator::Ecsm)
-        ));
+        );
 
         // Non-accelerator syscalls (Commit=64, Halt=93) count as neither.
-        assert!(accelerator_of(Some(&ecall), SyscallNumbers::Commit as u64).is_none());
-        assert!(accelerator_of(Some(&ecall), SyscallNumbers::Halt as u64).is_none());
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Commit as u64),
+            None
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Halt as u64),
+            None
+        );
 
         // A non-ECALL instruction whose src1 happens to equal an accelerator a7
         // must not count — this is the `f.ecall &&` guard the prover applies.
-        assert!(accelerator_of(Some(&Instruction::Fence), KECCAK_SYSCALL_NUMBER).is_none());
+        assert_eq!(
+            accelerator_of(Some(&Instruction::Fence), KECCAK_SYSCALL_NUMBER),
+            None
+        );
 
         // No decoded instruction at the pc (cache miss) counts as neither.
-        assert!(accelerator_of(None, KECCAK_SYSCALL_NUMBER).is_none());
+        assert_eq!(accelerator_of(None, KECCAK_SYSCALL_NUMBER), None);
     }
 }
