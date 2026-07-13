@@ -2625,6 +2625,11 @@ fn generate_page_tables<I: ImageSource>(
             touched.len(),
             page_bases.len() - touched.len(),
         );
+        // Print each untouched page's base address (hex) so it can be mapped to
+        // ELF sections (`readelf -S`) — i.e. is the wasted data .text / .rodata / .data?
+        for base in page_bases.difference(&touched) {
+            eprintln!("[PAGE-UNTOUCHED] 0x{base:x}");
+        }
     }
 
     // Build final state map from memory_state. When `exclude_touched` (continuation
