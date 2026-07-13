@@ -47,7 +47,6 @@ use super::cpu::{self, CpuOperation};
 use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
-use super::ec_scalar;
 use super::ecdas;
 use super::ecsm;
 use super::eq;
@@ -533,7 +532,7 @@ fn build_reg_fallback(
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
-/// keccak_ops, cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
+/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
@@ -549,7 +548,6 @@ fn collect_ops_from_cpu(
     Vec<KeccakOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
-    Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
@@ -561,7 +559,6 @@ fn collect_ops_from_cpu(
     let mut keccak_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
-    let mut ec_scalar_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
@@ -648,13 +645,12 @@ fn collect_ops_from_cpu(
             });
         }
 
-        // Collect ECSM ecall operations (memory I/O + the three table row sets)
+        // Collect ECSM ecall operations (memory I/O + the two table row sets)
         if op.ecall_ecsm {
-            let (ecsm_memw, ecsm_op, ec_scalar_rows, ecdas_rows) =
+            let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
             memw.extend_ops(ecsm_memw);
             ecsm_ops.push(ecsm_op);
-            ec_scalar_ops.extend(ec_scalar_rows);
             ecdas_ops.extend(ecdas_rows);
         }
 
@@ -712,7 +708,6 @@ fn collect_ops_from_cpu(
         keccak_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     )
 }
@@ -823,11 +818,11 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
-/// Collects all MEMW ops and the ECSM / EC_SCALAR / ECDAS table ops for one ECSM ecall.
+/// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
-/// Timestamp scheme (within the instruction's 4-wide budget): the `x11`/`x12` register reads
-/// and the `xG`/`k` memory reads happen at `T`; the `x10` register read and the EC_SCALAR
-/// byte reads at `T + 1`; the `xR` memory writes at `T + 2`. Every read advances
+/// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
+/// `xR` memory writes at `T + 2`. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
 /// accesses always observe a strictly smaller old timestamp.
 #[allow(clippy::needless_range_loop)]
@@ -838,7 +833,6 @@ fn collect_ecsm_ops(
 ) -> (
     Vec<MemwOperation>,
     ecsm::EcsmOperation,
-    Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
@@ -857,58 +851,68 @@ fn collect_ecsm_ops(
     let witness = ::ecsm::compute_witness(&k, &xg)
         .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
-    let mut memw_ops = Vec::with_capacity(47);
+    let mut memw_ops = Vec::with_capacity(15);
 
-    // x11 -> addr_xG, x12 -> addr_k (register reads at T).
-    for reg in [11u8, 12u8] {
-        let (val, old_ts) = register_state.read(reg);
+    // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(11);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
+            MemwOperation::new(true, 2 * 11, value, t, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(reg, val, t);
+        register_state.write(11, val, t);
     }
 
-    // xG and k: 4 doubleword reads each at T.
-    for (base, bytes) in [(addr_xg, &witness.x_g), (addr_k, &witness.k)] {
-        for i in 0..4 {
-            let addr = base.wrapping_add((8 * i) as u64);
-            let mut value = [0u32; 8];
-            let mut dword = 0u64;
-            for j in 0..8 {
-                value[j] = bytes[8 * i + j] as u32;
-                dword |= (bytes[8 * i + j] as u64) << (8 * j);
-            }
-            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
-            memw_ops
-                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
-            memory_state.write_bytes(addr, dword, 8, t);
+    // xG: 4 doubleword reads at T.
+    for i in 0..4 {
+        let addr = addr_xg.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.x_g[8 * i + j] as u32;
+            dword |= (witness.x_g[8 * i + j] as u64) << (8 * j);
         }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
     }
 
-    // x10 -> addr_xR (register read at T + 1).
+    // x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(12);
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 12, value, t + 1, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(12, val, t + 1);
+    }
+
+    // k: 4 doubleword reads at T+1.
+    for i in 0..4 {
+        let addr = addr_k.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.k[8 * i + j] as u32;
+            dword |= (witness.k[8 * i + j] as u64) << (8 * j);
+        }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, t + 1, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t + 1);
+    }
+
+    // x10 -> addr_xR (register read at T + 2, grouped with xR writes per spec ecsm.toml:658).
     {
         let (val, old_ts) = register_state.read(10);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * 10, value, t + 1, 2, true)
+            MemwOperation::new(true, 2 * 10, value, t + 2, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(10, val, t + 1);
-    }
-
-    // EC_SCALAR byte reads of k at T + 1 (one per scalar byte).
-    for offset in 0..32u64 {
-        let addr = addr_k.wrapping_add(offset);
-        let byte = k[offset as usize];
-        let value = [byte as u32, 0, 0, 0, 0, 0, 0, 0];
-        let (_v, old_ts) = memory_state.read_byte(addr);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 1, 1, true)
-                .with_old(value, [old_ts, 0, 0, 0, 0, 0, 0, 0]),
-        );
-        memory_state.write_byte(addr, byte, t + 1);
+        register_state.write(10, val, t + 2);
     }
 
     // xR writes at T + 2 (4 doublewords).
@@ -927,7 +931,6 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    let ec_scalar_ops = ec_scalar::rows_for_scalar(t, addr_k, &witness.k);
     let ecdas_ops = witness
         .steps
         .iter()
@@ -942,7 +945,7 @@ fn collect_ecsm_ops(
         witness,
     };
 
-    (memw_ops, ecsm_op, ec_scalar_ops, ecdas_ops)
+    (memw_ops, ecsm_op, ecdas_ops)
 }
 
 /// Collects register read/write operations (M1, M3, M5) from CpuOperation,
@@ -2277,20 +2280,27 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG, q1[0..31].
+        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..=32).
+        // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
+        // while the others are 32. Do NOT merge into a single loop — extending the
+        // loop bound would push q1[32] twice and break AreBytes bus balance.
         for i in 0..32 {
             out.push(is_byte_op(w.x2[i]));
             out.push(is_byte_op(w.q0[i]));
             out.push(is_byte_op(w.y_g[i]));
             out.push(is_byte_op(w.q1[i]));
         }
+        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, not covered by the loop above
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
             out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
-        // IS_HALF on the U256HL limbs of k_sub_N and xR_sub_p.
+        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N and xR_sub_p.
         for i in 0..16 {
+            out.push(is_half_op(
+                w.x_g_sub_p[2 * i] as u16 + ((w.x_g_sub_p[2 * i + 1] as u16) << 8),
+            ));
             out.push(is_half_op(
                 w.k_sub_n[2 * i] as u16 + ((w.k_sub_n[2 * i + 1] as u16) << 8),
             ));
@@ -2710,9 +2720,6 @@ pub struct Traces {
     /// ECSM core table (one row per scalar-multiplication ecall)
     pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// EC_SCALAR table (32 rows per ecall)
-    pub ec_scalar: TraceTable<GoldilocksField, GoldilocksExtension>,
-
     /// ECDAS double/add table (variable rows per ecall)
     pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -2757,7 +2764,6 @@ struct CollectedOps {
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
 }
 
@@ -2812,7 +2818,6 @@ fn collect_all_ops(
     keccak_ops: Vec<KeccakOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
@@ -2955,7 +2960,6 @@ fn collect_all_ops(
         store_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     }
 }
@@ -2999,7 +3003,6 @@ fn build_traces<I: ImageSource + Sync>(
         store_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     } = ops;
 
@@ -3510,7 +3513,6 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
     let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
-    let gen_ec_scalar = || ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops);
     let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
@@ -3523,7 +3525,7 @@ fn build_traces<I: ImageSource + Sync>(
     let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
     let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
         (None, None, None, None);
-    let (mut ecsm_slot, mut ec_scalar_slot, mut ecdas_slot) = (None, None, None);
+    let (mut ecsm_slot, mut ecdas_slot) = (None, None);
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3564,7 +3566,6 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(stores_slot, gen_stores);
             spawn_into!(cpu32s_slot, gen_cpu32s);
             spawn_into!(ecsm_slot, gen_ecsm);
-            spawn_into!(ec_scalar_slot, gen_ec_scalar);
             spawn_into!(ecdas_slot, gen_ecdas);
         });
     } else {
@@ -3592,7 +3593,6 @@ fn build_traces<I: ImageSource + Sync>(
         stores_slot = Some(gen_stores());
         cpu32s_slot = Some(gen_cpu32s());
         ecsm_slot = Some(gen_ecsm());
-        ec_scalar_slot = Some(gen_ec_scalar());
         ecdas_slot = Some(gen_ecdas());
     }
 
@@ -3627,7 +3627,6 @@ fn build_traces<I: ImageSource + Sync>(
     #[allow(unused_mut)]
     let mut halt_trace = halt_slot.expect(PHASE5_RAN);
     let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
-    let ec_scalar_trace = ec_scalar_slot.expect(PHASE5_RAN);
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3695,7 +3694,6 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
-        ec_scalar: ec_scalar_trace,
         ecdas: ecdas_trace,
         memw_registers,
         local_to_global,
@@ -3955,7 +3953,6 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::ec_scalar::cols::NUM_COLUMNS as EC_SCALAR_COLS;
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
@@ -3997,7 +3994,6 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             memw_registers,
             eqs,
@@ -4065,7 +4061,6 @@ impl Traces {
             total += (t.num_rows() * CPU32_COLS) as u64;
         }
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
-        total += (ec_scalar.num_rows() * EC_SCALAR_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total
     }
@@ -4107,7 +4102,6 @@ impl Traces {
         let n_store = aux_cols(super::store::bus_interactions().len());
         let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
-        let n_ec_scalar = aux_cols(super::ec_scalar::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
 
         let Traces {
@@ -4130,7 +4124,6 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             memw_registers,
             eqs,
@@ -4198,7 +4191,6 @@ impl Traces {
             total += (t.num_rows() * n_cpu32) as u64;
         }
         total += (ecsm.num_rows() * n_ecsm) as u64;
-        total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total
     }
@@ -4421,7 +4413,6 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
         #[cfg(feature = "instruments")]
@@ -4440,7 +4431,6 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
             &mut register_state,
             is_final,
@@ -4500,7 +4490,6 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -4515,7 +4504,6 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
             &mut register_state,
             true,
