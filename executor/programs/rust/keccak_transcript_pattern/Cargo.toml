@@ -1,0 +1,11 @@
+[workspace]
+
+[package]
+name = "keccak_transcript_pattern"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+lambda-vm-syscalls = { path = "../../../../syscalls" }
+crypto = { path = "../../../../crypto/crypto" }
+digest = "0.10.7"

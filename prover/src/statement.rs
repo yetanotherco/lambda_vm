@@ -10,7 +10,8 @@
 //! every derived challenge differ and verification reject.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use sha3::{Digest, Keccak256};
+use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
+use sha3::Digest;
 
 use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};
