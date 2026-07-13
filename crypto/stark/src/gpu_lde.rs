@@ -123,6 +123,21 @@ pub(crate) fn gpu_composition_disabled() -> bool {
     })
 }
 
+/// `true` when the field tower is concrete Goldilocks + its degree-3 extension —
+/// the only tower with a CUDA lowering. The one home of this check: every GPU
+/// dispatch gate calls it, so the tower test cannot drift between sites.
+pub(crate) fn is_goldilocks_ext3_tower<F: 'static, E: 'static>() -> bool {
+    TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>()
+}
+
+/// `true` when the transition offsets form the contiguous frame `[0, 1, ..]`
+/// the GPU kernels' row math assumes (a `Var` at offset `o` reads LDE row
+/// `row + o·next_step`). Shared by the composition dispatch and its gates.
+pub(crate) fn offsets_are_contiguous(offsets: &[usize]) -> bool {
+    offsets.iter().enumerate().all(|(i, &o)| o == i)
+}
+
 // ============================================================================
 // Shared dispatch helpers
 // ============================================================================

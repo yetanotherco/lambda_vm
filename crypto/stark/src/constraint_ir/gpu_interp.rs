@@ -16,8 +16,6 @@
 //! The whole module is `#[cfg(feature = "cuda")]`; without the feature the
 //! caller only ever has the CPU interpreter.
 
-use std::any::TypeId;
-
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as GoldilocksExtension;
 use math::field::goldilocks::GoldilocksField;
@@ -113,9 +111,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
-        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
-    {
+    if !crate::gpu_lde::is_goldilocks_ext3_tower::<F, E>() {
         return None;
     }
     // SAFETY: the TypeId gate established `F = GoldilocksField` and
