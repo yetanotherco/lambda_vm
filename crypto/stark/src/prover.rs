@@ -811,8 +811,8 @@ pub trait IsStarkProver<
         }
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
         let n = domain.interpolation_domain_size;
-        let offsets = &air.context().transition_offsets;
-        let offsets_contiguous = offsets.iter().enumerate().all(|(i, &o)| o == i);
+        let offsets_contiguous =
+            crate::gpu_lde::offsets_are_contiguous(&air.context().transition_offsets);
         let zerofier_uniform = air.constraints_meta().iter().all(|m| m.end_exemptions == 0);
         crate::gpu_lde::device_only_gate::<Field, FieldExtension>(
             lde_size,
@@ -1929,6 +1929,108 @@ pub trait IsStarkProver<
         (even, odd)
     }
 
+    /// Gather every query's row-pair off a device-resident LDE (a small D2H of
+    /// only the queried rows), lifting the raw limbs to field elements via
+    /// `convert`. Returns `None` (→ the host arms of the openings) when the
+    /// gather fails or the tower is not Goldilocks; a gather failure is fatal
+    /// only under device-only, where no host copy exists to fall back to. Bumps
+    /// the opening-gather counter exactly when values are produced, so the
+    /// counter reflects the device path actually serving the openings. One body
+    /// for the main and aux arms — `what` only labels the messages.
+    #[cfg(feature = "cuda")]
+    fn gather_query_rows_device<C: IsField>(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        what: &str,
+        gather: impl FnOnce(&std::sync::Arc<math_cuda::CudaStream>) -> math_cuda::Result<Vec<u64>>,
+        convert: impl FnOnce(&[u64]) -> Option<Vec<FieldElement<C>>>,
+    ) -> Option<Vec<FieldElement<C>>> {
+        let stream = lde_trace
+            .bound_stream()
+            .expect("bound stream for device-resident row gather");
+        let raw = match gather(&stream) {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(
+                    !lde_trace.host_trace_empty(),
+                    "device {what}-row gather failed and the trace is device-only \
+                     (no host fallback): {e:?}"
+                );
+                return None;
+            }
+        };
+        let vals = convert(&raw);
+        if vals.is_some() {
+            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        vals
+    }
+
+    /// One query's trace-poly opening with the device-resident fast paths:
+    /// device Merkle proof + device-gathered values when both are present, the
+    /// device proof with a host gather when only the tree is resident, and the
+    /// full host walk otherwise. One body for the main and aux arms, so the
+    /// device↔host cross-check and the R4 `host_trace_empty` hard-abort guards
+    /// exist exactly once.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_trace_polys_device<C, G>(
+        domain: &Domain<Field>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        dev_proofs: Option<&Vec<Proof<Commitment>>>,
+        dev_values: Option<&Vec<FieldElement<C>>>,
+        tree: &BatchedMerkleTree<C>,
+        qi: usize,
+        challenge: usize,
+        ncols: usize,
+        what: &str,
+        gather: G,
+    ) -> PolynomialOpenings<C>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
+    {
+        let Some(proofs) = dev_proofs else {
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R4 {what} opening fell back to the host tree, but it is device-only (empty)"
+            );
+            return Self::open_polys_with(domain, tree, challenge, gather);
+        };
+        let proof = proofs[qi].clone();
+        let Some(dev_vals) = dev_values else {
+            // Device tree resident but the value gather is absent: reading the
+            // host gather is invalid under device-only.
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R4 {what} opening fell back to the host gather, but it is device-only (empty)"
+            );
+            return Self::open_polys_with_proofs(domain, proof, challenge, gather);
+        };
+        let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
+        // Cross-check the device gather against the host LDE. Skipped under
+        // device-only (host trace empty): the gather was proven bit-identical
+        // while the host copy was resident, and there is nothing to check
+        // against.
+        if !lde_trace.host_trace_empty() {
+            let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+            let r_even = reverse_index(challenge * 2, domain_size);
+            let r_odd = reverse_index(challenge * 2 + 1, domain_size);
+            assert_eq!(
+                even,
+                gather(r_even),
+                "device {what}-row gather mismatch (even), query {qi}"
+            );
+            assert_eq!(
+                odd,
+                gather(r_odd),
+                "device {what}-row gather mismatch (odd), query {qi}"
+            );
+        }
+        Self::open_polys_from_values(proof, even, odd)
+    }
+
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
@@ -2034,67 +2136,43 @@ pub trait IsStarkProver<
         let main_dev_values: Option<Vec<FieldElement<Field>>> =
             main_dev_proofs.as_ref().and_then(|_| {
                 lde_trace.gpu_main().and_then(|h| {
-                    let stream = lde_trace
-                        .bound_stream()
-                        .expect("bound stream for device-resident main-row gather");
-                    let raw = match math_cuda::barycentric::gather_rows_base_on_device(
-                        h,
-                        &query_rows,
-                        &stream,
-                    ) {
-                        Ok(v) => v,
-                        // A gather failure is only fatal under device-only (no host
-                        // trace to fall back to). Otherwise return `None` so the host
-                        // gather arms below serve the openings from the resident LDE.
-                        Err(e) => {
-                            assert!(
-                                !lde_trace.host_trace_empty(),
-                                "device main-row gather failed and the trace is device-only \
-                                 (no host fallback): {e:?}"
-                            );
-                            return None;
-                        }
-                    };
-                    crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(&raw)
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "main",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_base_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(raw),
+                    )
                 })
             });
-        #[cfg(feature = "cuda")]
-        if main_dev_values.is_some() {
-            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         #[cfg(feature = "cuda")]
         let aux_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
             aux_dev_proofs.as_ref().and_then(|_| {
                 lde_trace.gpu_aux().and_then(|h| {
-                    let stream = lde_trace
-                        .bound_stream()
-                        .expect("bound stream for device-resident aux-row gather");
-                    let raw = match math_cuda::barycentric::gather_rows_ext3_on_device(
-                        h,
-                        &query_rows,
-                        &stream,
-                    ) {
-                        Ok(v) => v,
-                        // Fatal only under device-only; otherwise fall back to host.
-                        Err(e) => {
-                            assert!(
-                                !lde_trace.host_trace_empty(),
-                                "device aux-row gather failed and the trace is device-only \
-                                 (no host fallback): {e:?}"
-                            );
-                            return None;
-                        }
-                    };
-                    crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(&raw)
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "aux",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_ext3_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| {
+                            crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(
+                                raw,
+                            )
+                        },
+                    )
                 })
             });
-        #[cfg(feature = "cuda")]
-        if aux_dev_values.is_some() {
-            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
 
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
@@ -2108,49 +2186,18 @@ pub trait IsStarkProver<
             } else {
                 #[cfg(feature = "cuda")]
                 {
-                    if let Some(proofs) = &main_dev_proofs {
-                        let proof = proofs[qi].clone();
-                        if let Some(dev_vals) = &main_dev_values {
-                            let (even, odd) = Self::device_row_pair(dev_vals, qi, total_cols);
-                            // Cross-check the device gather against the host LDE.
-                            // Skipped under device-only (host trace empty): the
-                            // gather was proven bit-identical while the host copy
-                            // was resident, and there is nothing to check against.
-                            if !lde_trace.host_trace_empty() {
-                                let r_even = reverse_index(*index * 2, domain_size);
-                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
-                                assert_eq!(
-                                    even,
-                                    lde_trace.gather_main_row(r_even),
-                                    "device main-row gather mismatch (even), query {qi}"
-                                );
-                                assert_eq!(
-                                    odd,
-                                    lde_trace.gather_main_row(r_odd),
-                                    "device main-row gather mismatch (odd), query {qi}"
-                                );
-                            }
-                            Self::open_polys_from_values(proof, even, odd)
-                        } else {
-                            // Device tree resident but the value gather is absent:
-                            // reading the host gather is invalid under device-only.
-                            assert!(
-                                !lde_trace.host_trace_empty(),
-                                "R4 main opening fell back to the host gather, but it is device-only (empty)"
-                            );
-                            Self::open_polys_with_proofs(domain, proof, *index, |row| {
-                                lde_trace.gather_main_row(row)
-                            })
-                        }
-                    } else {
-                        assert!(
-                            !lde_trace.host_trace_empty(),
-                            "R4 main opening fell back to the host tree, but it is device-only (empty)"
-                        );
-                        Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                            lde_trace.gather_main_row(row)
-                        })
-                    }
+                    Self::open_trace_polys_device(
+                        domain,
+                        lde_trace,
+                        main_dev_proofs.as_ref(),
+                        main_dev_values.as_ref(),
+                        &main_commit.tree,
+                        qi,
+                        *index,
+                        total_cols,
+                        "main",
+                        |row| lde_trace.gather_main_row(row),
+                    )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
@@ -2197,45 +2244,18 @@ pub trait IsStarkProver<
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
                 #[cfg(feature = "cuda")]
                 {
-                    if let Some(proofs) = &aux_dev_proofs {
-                        let proof = proofs[qi].clone();
-                        if let Some(dev_vals) = &aux_dev_values {
-                            let ncols = lde_trace.num_aux_cols();
-                            let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
-                            // Cross-check skipped under device-only (host empty).
-                            if !lde_trace.host_trace_empty() {
-                                let r_even = reverse_index(*index * 2, domain_size);
-                                let r_odd = reverse_index(*index * 2 + 1, domain_size);
-                                assert_eq!(
-                                    even,
-                                    lde_trace.gather_aux_row(r_even),
-                                    "device aux-row gather mismatch (even), query {qi}"
-                                );
-                                assert_eq!(
-                                    odd,
-                                    lde_trace.gather_aux_row(r_odd),
-                                    "device aux-row gather mismatch (odd), query {qi}"
-                                );
-                            }
-                            Self::open_polys_from_values(proof, even, odd)
-                        } else {
-                            assert!(
-                                !lde_trace.host_trace_empty(),
-                                "R4 aux opening fell back to the host gather, but it is device-only (empty)"
-                            );
-                            Self::open_polys_with_proofs(domain, proof, *index, |row| {
-                                lde_trace.gather_aux_row(row)
-                            })
-                        }
-                    } else {
-                        assert!(
-                            !lde_trace.host_trace_empty(),
-                            "R4 aux opening fell back to the host tree, but it is device-only (empty)"
-                        );
-                        Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                            lde_trace.gather_aux_row(row)
-                        })
-                    }
+                    Self::open_trace_polys_device(
+                        domain,
+                        lde_trace,
+                        aux_dev_proofs.as_ref(),
+                        aux_dev_values.as_ref(),
+                        &aux.tree,
+                        qi,
+                        *index,
+                        lde_trace.num_aux_cols(),
+                        "aux",
+                        |row| lde_trace.gather_aux_row(row),
+                    )
                 }
                 #[cfg(not(feature = "cuda"))]
                 {

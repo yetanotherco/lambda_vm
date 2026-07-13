@@ -179,6 +179,11 @@ pub(crate) fn device_only_disabled() -> bool {
 /// `zerofier_uniform` must be the R1-derived conservative form (all constraints
 /// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
 /// (a single cyclic group) — the condition the GPU composition kernel needs.
+///
+/// LOCKSTEP: this gate must IMPLY the runtime dispatch checks in
+/// `ConstraintEvaluator::try_evaluate_composition_gpu` (plus the R3/R4 device
+/// arms). A fallback condition added to a dispatch without a mirror here turns
+/// every gate-true table into a hard-abort — loud, but an avoidable crash.
 pub(crate) fn device_only_gate<F, E>(
     lde_size: usize,
     n: usize,
@@ -194,8 +199,7 @@ where
     if cfg!(feature = "debug-checks") {
         return false;
     }
-    TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
-        && TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>()
+    is_goldilocks_ext3_tower::<F, E>()
         && !device_only_disabled()
         && !gpu_composition_disabled()
         && lde_size.is_power_of_two()
