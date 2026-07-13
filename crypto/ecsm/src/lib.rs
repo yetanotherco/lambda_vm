@@ -2,7 +2,7 @@
 //!
 //! This crate is shared by the executor (which needs `k·G`'s x-coordinate to write back
 //! to guest memory) and the prover (which replays the full double-and-add sequence to
-//! fill the ECSM / ECDAS / EC_SCALAR trace witnesses). Both entry points compute the same
+//! fill the ECSM / ECDAS trace witnesses). Both entry points compute the same
 //! `k·G` over the audited `k256` curve arithmetic — the executor via `k256`'s scalar
 //! multiplication, the prover via a projective double-and-add replay — so the x-coordinate
 //! they write/prove agrees. It is also independent of the `yG` root: both recover the same
