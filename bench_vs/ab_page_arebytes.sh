@@ -1,18 +1,20 @@
 #!/usr/bin/env bash
 # A/B/C benchmark: monolithic WITH range checks (main) vs monolithic WITHOUT them
-# (this branch, bench/page-drop-arebytes) vs continuation — for 5tx and 10tx ethrex
+# (this branch, bench/page-drop-arebytes) vs continuation — for a set of ethrex
 # blocks, all in ONE session so the numbers are directly comparable.
 #
-# Runs the three versions × two blocks, interleaved, RUNS times each, under
-# `/usr/bin/time -v`, and reports MEDIAN proving time + peak RSS with % differences.
+# Emits three tables: proving time (with % diffs), peak RSS, and page counts
+# (populated / touched / untouched) — the latter from the branch binary, which
+# carries the [PAGE-COUNT] instrumentation.
 #
-# Usage (from the repo root, while on branch bench/page-drop-arebytes):
+# The epoch size for each block's one-epoch continuation is computed automatically
+# as ceil(log2(cycles)), floored at 18.
+#
+# Usage (from repo root, on branch bench/page-drop-arebytes):
 #   ./bench_vs/ab_page_arebytes.sh [--runs R] [--no-color]
 #
-# It builds:
-#   - main's CLI in a detached git worktree at $WT   (monolithic WITH checks)
-#   - this branch's CLI at target/release/cli        (monolithic WITHOUT checks)
-# and proves the SAME input files (from this checkout) with both.
+# Prereq: each block's input file must exist in executor/tests/ (generate the
+# 15-tx fixture first — see the ethrex-fixtures crate).
 
 set -euo pipefail
 
@@ -41,16 +43,17 @@ TIME_BIN=$(command -v time || true)
 ELF="$ROOT_DIR/executor/program_artifacts/rust/ethrex.elf"
 [[ -f "$ELF" ]] || { echo -e "${RED}ethrex.elf not found at $ELF${NC}"; exit 1; }
 
-# Blocks: "label|input_basename|epoch_size_log2"
+# Blocks: "label|input_basename" (epoch size is computed per block).
 BLOCKS=(
-    "5tx|ethrex_5_transfers.bin|22"
-    "10tx|ethrex_10_transfers.bin|23"
+    "5tx|ethrex_5_transfers.bin"
+    "10tx|ethrex_10_transfers.bin"
+    "15tx|ethrex_15_transfers.bin"
 )
 
 mkdir -p "$TMP_DIR"; rm -rf "${TMP_DIR:?}"/*
 
 # --- Build both binaries ----------------------------------------------------
-echo -e "${GREEN}[build] this branch (monolithic WITHOUT range checks)...${NC}"
+echo -e "${GREEN}[build] this branch (monolithic WITHOUT range checks + PAGE-COUNT)...${NC}"
 cargo build --release -p cli --features jemalloc-stats --manifest-path "$ROOT_DIR/Cargo.toml" 2>&1 | tail -2
 BRANCH_CLI="$ROOT_DIR/target/release/cli"
 [[ -x "$BRANCH_CLI" ]] || { echo -e "${RED}branch CLI build failed${NC}"; exit 1; }
@@ -71,16 +74,31 @@ echo -e "${BOLD}main commit:${NC}   $(git -C "$WT" rev-parse --short HEAD)"
 echo -e "${BOLD}branch commit:${NC} $(git -C "$ROOT_DIR" rev-parse --short HEAD)"
 echo ""
 
-# --- One measured run: echoes "time_s rss_kb" (and asserts epochs=1 for cont) ---
+# --- Per-block epoch size (ceil(log2(cycles)), floored at 18) ---------------
+declare -A NMAP
+echo -e "${BOLD}Cycle counts / epoch sizes:${NC}"
+for entry in "${BLOCKS[@]}"; do
+    IFS='|' read -r label basename <<< "$entry"
+    input="$ROOT_DIR/executor/tests/$basename"
+    [[ -f "$input" ]] || { echo -e "${RED}input not found: $input (generate the fixture first)${NC}"; exit 1; }
+    cyc=$("$BRANCH_CLI" execute "$ELF" --private-input "$input" --cycles 2>/dev/null | sed -nE 's/.*Cycles: ([0-9]+).*/\1/p')
+    [[ -n "$cyc" ]] || { echo -e "${RED}could not read cycles for $label${NC}"; exit 1; }
+    n=$(awk -v c="$cyc" 'BEGIN{n=18; while((2^n) < c) n++; print n}')
+    NMAP[$label]=$n
+    printf "  %-5s %12s cycles  ->  epoch-size-log2=%s\n" "$label" "$cyc" "$n"
+done
+echo ""
+
+# --- One measured run: echoes "time_s rss_kb" (writes full output to last_run.out) ---
 one_run() {
-    local out="$TMP_DIR/run.$$.$RANDOM.out"
+    local out="$TMP_DIR/last_run.out"
     "$TIME_BIN" -v "$@" >"$out" 2>&1 || { echo -e "${RED}FAILED:${NC}" >&2; cat "$out" >&2; exit 1; }
     local t rss ep
     t=$(sed -nE 's/.*Proving time: ([0-9.]+)s.*/\1/p' "$out" | head -1)
     rss=$(sed -nE 's/.*Maximum resident set size \(kbytes\): ([0-9]+).*/\1/p' "$out" | head -1)
     ep=$(sed -nE 's/.*Epochs: ([0-9]+).*/\1/p' "$out" | head -1)
     if [[ -n "$ep" && "$ep" != "1" ]]; then
-        echo -e "${RED}continuation ran $ep epochs, not 1 — fix epoch-size-log2${NC}" >&2; exit 1
+        echo -e "${RED}continuation ran $ep epochs, not 1 — epoch size too small${NC}" >&2; exit 1
     fi
     [[ -n "$t" && -n "$rss" ]] || { echo -e "${RED}parse failed${NC}" >&2; cat "$out" >&2; exit 1; }
     printf "%s %s" "$t" "$rss"
@@ -88,10 +106,9 @@ one_run() {
 
 median() { sort -n | awk '{a[NR]=$1} END{ if(NR==0){print "n/a";exit} if(NR%2){print a[(NR+1)/2]} else printf "%.3f\n",(a[NR/2]+a[NR/2+1])/2 }'; }
 
-# Accumulators keyed by "block_version" -> space-separated samples.
-declare -A T_SAMP R_SAMP
+declare -A T_SAMP R_SAMP PC_POP PC_TOUCH PC_UNTOUCH
 
-# Version runner: $1=block_label $2=input_path $3=N $4=version_key
+# $1=block_label $2=input_path $3=N $4=version_key
 run_version() {
     local label=$1 input=$2 n=$3 vkey=$4 res
     case $vkey in
@@ -102,23 +119,30 @@ run_version() {
     local t=${res% *} rss=${res#* }
     T_SAMP["${label}_${vkey}"]+="$t "
     R_SAMP["${label}_${vkey}"]+="$rss "
-    printf "    %-4s %-8s r: %ss, %d MB\n" "$label" "$vkey" "$t" "$((rss/1024))"
+    # Capture page counts once per block from the branch monolithic run.
+    if [[ "$vkey" == "without" && -z "${PC_POP[$label]:-}" ]]; then
+        local line
+        line=$(grep -m1 "PAGE-COUNT] populated=" "$TMP_DIR/last_run.out" || true)
+        if [[ -n "$line" ]]; then
+            PC_POP[$label]=$(sed -nE 's/.*populated=([0-9]+).*/\1/p' <<< "$line")
+            PC_TOUCH[$label]=$(sed -nE 's/.*touched=([0-9]+).*/\1/p' <<< "$line")
+            PC_UNTOUCH[$label]=$(sed -nE 's/.*untouched=([0-9]+).*/\1/p' <<< "$line")
+        fi
+    fi
+    printf "    %-5s %-8s r: %ss, %d MB\n" "$label" "$vkey" "$t" "$((rss/1024))"
 }
 
-# --- Interleaved runs (each round touches all 3 versions of both blocks) ----
 for ((r=1; r<=RUNS; r++)); do
     echo -e "${BOLD}--- round $r/$RUNS ---${NC}"
     for entry in "${BLOCKS[@]}"; do
-        IFS='|' read -r label basename n <<< "$entry"
+        IFS='|' read -r label basename <<< "$entry"
         input="$ROOT_DIR/executor/tests/$basename"
-        [[ -f "$input" ]] || { echo -e "${RED}input not found: $input${NC}"; exit 1; }
-        run_version "$label" "$input" "$n" with
-        run_version "$label" "$input" "$n" without
-        run_version "$label" "$input" "$n" cont
+        run_version "$label" "$input" "${NMAP[$label]}" with
+        run_version "$label" "$input" "${NMAP[$label]}" without
+        run_version "$label" "$input" "${NMAP[$label]}" cont
     done
 done
 
-# --- Medians + table --------------------------------------------------------
 pct() { awk -v a="$1" -v b="$2" 'BEGIN{ if(a==0){print "n/a"} else printf "%+.1f%%", (b-a)/a*100 }'; }
 
 echo ""
@@ -128,7 +152,7 @@ printf "| %-5s | %-15s | %-16s | %-13s | %-11s | %-12s | %-11s |\n" \
     "Block" "Mono w/ checks" "Mono w/o checks" "Continuation" "w/o vs w/" "cont vs w/o" "cont vs w/"
 printf "|-------|-----------------|------------------|---------------|-------------|--------------|-------------|\n"
 for entry in "${BLOCKS[@]}"; do
-    IFS='|' read -r label _ _ <<< "$entry"
+    IFS='|' read -r label _ <<< "$entry"
     mw=$(printf "%s\n" ${T_SAMP["${label}_with"]}    | median)
     mo=$(printf "%s\n" ${T_SAMP["${label}_without"]} | median)
     ct=$(printf "%s\n" ${T_SAMP["${label}_cont"]}    | median)
@@ -142,7 +166,7 @@ echo ""
 printf "| %-5s | %-15s | %-16s | %-13s |\n" "Block" "Mono w/ checks" "Mono w/o checks" "Continuation"
 printf "|-------|-----------------|------------------|---------------|\n"
 for entry in "${BLOCKS[@]}"; do
-    IFS='|' read -r label _ _ <<< "$entry"
+    IFS='|' read -r label _ <<< "$entry"
     mw=$(( $(printf "%s\n" ${R_SAMP["${label}_with"]}    | median) / 1024 ))
     mo=$(( $(printf "%s\n" ${R_SAMP["${label}_without"]} | median) / 1024 ))
     ct=$(( $(printf "%s\n" ${R_SAMP["${label}_cont"]}    | median) / 1024 ))
@@ -150,6 +174,15 @@ for entry in "${BLOCKS[@]}"; do
 done
 
 echo ""
-echo "Legend: w/o vs w/ = removing PAGE range checks' effect on monolithic (negative = faster)."
-echo "        cont vs w/ = full continuation advantage;  cont vs w/o = advantage that remains after removing the checks."
-echo "Raw per-run output in $TMP_DIR/"
+echo -e "${BOLD}=== Page tables (deterministic; from branch binary) ===${NC}"
+echo ""
+printf "| %-5s | %-22s | %-22s | %-18s |\n" "Block" "Populated (monolithic)" "Touched (continuation)" "Untouched (wasted)"
+printf "|-------|------------------------|------------------------|--------------------|\n"
+for entry in "${BLOCKS[@]}"; do
+    IFS='|' read -r label _ <<< "$entry"
+    printf "| %-5s | %-22s | %-22s | %-18s |\n" \
+        "$label" "${PC_POP[$label]:-?}" "${PC_TOUCH[$label]:-?}" "${PC_UNTOUCH[$label]:-?}"
+done
+
+echo ""
+echo "Raw per-run output under $TMP_DIR/"
