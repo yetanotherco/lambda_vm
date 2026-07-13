@@ -398,6 +398,25 @@ impl ContinuationProof {
     }
 }
 
+/// Experiment toggle (disk-spill + continuations mix): the storage mode used for
+/// per-epoch *proving* (`multi_prove`). Defaults to `Ram` — today's continuation
+/// semantics — so with the variable unset behavior is unchanged. Set
+/// `CONTINUATION_EPOCH_DISK_SPILL` (any value) to spill each epoch's trace + Merkle trees
+/// to disk during proving. Applied only at the per-epoch `multi_prove` call: the epoch
+/// trace *build* stays on `Ram` (a later `update_multiplicities` mutation would panic on a
+/// spilled table), and the global aggregation proof stays on `Ram` (its traces are built by
+/// helpers with no storage-mode plumbing). Spill is transparent to the proof (same bundle,
+/// same verify), so it only trades wall time for lower peak RAM.
+#[cfg(feature = "disk-spill")]
+fn epoch_storage_mode() -> stark::storage_mode::StorageMode {
+    if std::env::var("CONTINUATION_EPOCH_DISK_SPILL").is_ok() {
+        log::info!("continuation epoch storage_mode: Disk (CONTINUATION_EPOCH_DISK_SPILL)");
+        stark::storage_mode::StorageMode::Disk
+    } else {
+        stark::storage_mode::StorageMode::Ram
+    }
+}
+
 /// Build an epoch's AIRs identically on the prove and verify sides — the single
 /// source of truth for the AIR set, so the two halves can never diverge. The set
 /// is `VmAirs` (HALT included iff `is_final`), with REGISTER preprocessed to
@@ -506,7 +525,7 @@ fn prove_epoch(
         pairs,
         &mut seed(),
         #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
+        epoch_storage_mode(),
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -786,6 +805,27 @@ pub fn prove_continuation(
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
     let mut epochs: Vec<EpochProof> = Vec::new();
+    // Experiment (mix Lever 2): with CONTINUATION_STREAM_EPOCHS set, each finished epoch
+    // proof is written to a temp file and dropped from RAM instead of accumulating in
+    // `epochs`, so the retained bundle (~0.8-1.4 GB) does not co-reside with the per-epoch
+    // working set / global proof at the memory peak. Read back only at the end to assemble
+    // the returned bundle (a lower peak: full bundle, no active proving).
+    #[cfg(feature = "disk-spill")]
+    let epoch_stream_dir: Option<std::path::PathBuf> =
+        if std::env::var("CONTINUATION_STREAM_EPOCHS").is_ok() {
+            let d = std::env::temp_dir().join(format!("cont_epochs_{}", std::process::id()));
+            std::fs::create_dir_all(&d)
+                .map_err(|e| Error::Prover(format!("stream epochs: create dir: {e}")))?;
+            log::info!(
+                "continuation: streaming epoch proofs to {} (CONTINUATION_STREAM_EPOCHS)",
+                d.display()
+            );
+            Some(d)
+        } else {
+            None
+        };
+    #[cfg(feature = "disk-spill")]
+    let mut epoch_files: Vec<std::path::PathBuf> = Vec::new();
     // Full per-epoch boundaries, kept prover-local for `prove_global` (L2G traces +
     // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
     // holds cell values (private-input bytes for private reads); only the value-free
@@ -853,6 +893,10 @@ pub fn prove_continuation(
             private_inputs,
             is_final,
             true,
+            // Trace build stays in RAM even when the epoch spills: `prove_epoch`
+            // mutates the bitwise table (`update_multiplicities`) AFTER this build,
+            // which would panic on a spilled (read-only mmap) table. The spill happens
+            // inside `multi_prove` (Round 1), after all such mutations.
             #[cfg(feature = "disk-spill")]
             stark::storage_mode::StorageMode::Ram,
         )?;
@@ -870,6 +914,19 @@ pub fn prove_continuation(
         for cell in &boundary {
             image.set(cell.address, (cell.fini.value & 0xFF) as u8);
         }
+        #[cfg(feature = "disk-spill")]
+        match &epoch_stream_dir {
+            Some(dir) => {
+                let path = dir.join(format!("epoch_{:06}.bin", epoch_files.len()));
+                let bytes = bincode::serialize(&epoch)
+                    .map_err(|e| Error::Prover(format!("stream epochs: serialize: {e}")))?;
+                std::fs::write(&path, &bytes)
+                    .map_err(|e| Error::Prover(format!("stream epochs: write: {e}")))?;
+                epoch_files.push(path);
+            }
+            None => epochs.push(epoch),
+        }
+        #[cfg(not(feature = "disk-spill"))]
         epochs.push(epoch);
         all_boundaries.push(boundary);
 
@@ -893,6 +950,21 @@ pub fn prove_continuation(
         num_private_input_pages,
         opts,
     )?;
+
+    // Mix Lever 2: read the streamed epoch proofs back to assemble the bundle. This peak
+    // (full bundle in RAM, but no per-epoch working set / global proof active) is lower
+    // than the proving peak we avoided by not accumulating during the loop + global proof.
+    #[cfg(feature = "disk-spill")]
+    if let Some(dir) = &epoch_stream_dir {
+        for path in &epoch_files {
+            let bytes = std::fs::read(path)
+                .map_err(|e| Error::Prover(format!("stream epochs: read back: {e}")))?;
+            let ep: EpochProof = bincode::deserialize(&bytes)
+                .map_err(|e| Error::Prover(format!("stream epochs: deserialize: {e}")))?;
+            epochs.push(ep);
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     Ok(ContinuationProof {
         epochs,
