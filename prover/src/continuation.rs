@@ -398,23 +398,46 @@ impl ContinuationProof {
     }
 }
 
-/// Experiment toggle (disk-spill + continuations mix): the storage mode used for
-/// per-epoch *proving* (`multi_prove`). Defaults to `Ram` — today's continuation
-/// semantics — so with the variable unset behavior is unchanged. Set
-/// `CONTINUATION_EPOCH_DISK_SPILL` (any value) to spill each epoch's trace + Merkle trees
-/// to disk during proving. Applied only at the per-epoch `multi_prove` call: the epoch
-/// trace *build* stays on `Ram` (a later `update_multiplicities` mutation would panic on a
-/// spilled table), and the global aggregation proof stays on `Ram` (its traces are built by
-/// helpers with no storage-mode plumbing). Spill is transparent to the proof (same bundle,
-/// same verify), so it only trades wall time for lower peak RAM.
+/// Storage mode for per-epoch *proving* (`multi_prove`) in the disk-spill + continuations
+/// mix experiment. Precedence:
+/// - `CONTINUATION_EPOCH_DISK_SPILL` (any value): force `Disk` (Phase-1 manual repro).
+/// - `CONTINUATION_EPOCH_SPILL_AUTO` (any value): decide adaptively from this epoch's
+///   estimated peak RAM vs available memory, reusing `auto_storage::decide` — the same
+///   estimator the monolithic prove path uses. `count_table_lengths` is recomputed from the
+///   epoch's logs; accurate for the dominant cpu/cycle terms (page/byte terms are a
+///   pre-flight estimate, absorbed by the estimator's safety margin).
+/// - unset: `Ram` (unchanged default).
+///
+/// Applied only at the per-epoch `multi_prove` call: the epoch trace *build* stays on `Ram`
+/// (a later `update_multiplicities` mutation would panic on a spilled table), and the global
+/// aggregation proof stays on `Ram`. Spill is transparent to the proof (same bundle, same
+/// verify), so it only trades wall time for lower peak RAM.
 #[cfg(feature = "disk-spill")]
-fn epoch_storage_mode() -> stark::storage_mode::StorageMode {
+fn epoch_storage_mode(
+    elf: &Elf,
+    logs: &[executor::vm::logs::Log],
+    private_inputs: &[u8],
+    opts: &ProofOptions,
+) -> Result<stark::storage_mode::StorageMode, Error> {
+    use stark::storage_mode::StorageMode;
     if std::env::var("CONTINUATION_EPOCH_DISK_SPILL").is_ok() {
         log::info!("continuation epoch storage_mode: Disk (CONTINUATION_EPOCH_DISK_SPILL)");
-        stark::storage_mode::StorageMode::Disk
-    } else {
-        stark::storage_mode::StorageMode::Ram
+        return Ok(StorageMode::Disk);
     }
+    if std::env::var("CONTINUATION_EPOCH_SPILL_AUTO").is_ok() {
+        let lengths = crate::tables::trace_builder::count_table_lengths(
+            elf,
+            logs,
+            &MaxRowsConfig::default(),
+            private_inputs,
+        )?;
+        let mode = crate::auto_storage::decide(&lengths, opts.blowup_factor);
+        log::info!(
+            "continuation epoch storage_mode: {mode:?} (CONTINUATION_EPOCH_SPILL_AUTO, adaptive)"
+        );
+        return Ok(mode);
+    }
+    Ok(StorageMode::Ram)
 }
 
 /// Build an epoch's AIRs identically on the prove and verify sides — the single
@@ -467,6 +490,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
+    #[cfg(feature = "disk-spill")] epoch_storage: stark::storage_mode::StorageMode,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -525,7 +549,7 @@ fn prove_epoch(
         pairs,
         &mut seed(),
         #[cfg(feature = "disk-spill")]
-        epoch_storage_mode(),
+        epoch_storage,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
 
@@ -826,6 +850,16 @@ pub fn prove_continuation(
         };
     #[cfg(feature = "disk-spill")]
     let mut epoch_files: Vec<std::path::PathBuf> = Vec::new();
+    // Mix Lever 2 dial: keep the first K finished epoch proofs resident in RAM and stream the
+    // rest (K=0 = stream all, tightest RAM; large K = effectively P2 off). Peak-equivalent to
+    // keeping the *last* K — K proofs co-reside at the peak either way — but decidable in a
+    // forward loop that does not know the epoch count in advance. Only meaningful when
+    // `epoch_stream_dir` is `Some` (streaming enabled via `CONTINUATION_STREAM_EPOCHS`).
+    #[cfg(feature = "disk-spill")]
+    let epoch_stream_keep: usize = std::env::var("CONTINUATION_STREAM_KEEP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     // Full per-epoch boundaries, kept prover-local for `prove_global` (L2G traces +
     // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
     // holds cell values (private-input bytes for private reads); only the value-free
@@ -907,7 +941,19 @@ pub fn prove_continuation(
             register_init: &register_init,
             label,
         };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        #[cfg(feature = "disk-spill")]
+        let epoch_storage = epoch_storage_mode(&elf, &logs, private_inputs, opts)?;
+        let epoch = prove_epoch(
+            &elf,
+            elf_bytes,
+            &start,
+            traces,
+            is_final,
+            &boundary,
+            opts,
+            #[cfg(feature = "disk-spill")]
+            epoch_storage,
+        )?;
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -916,7 +962,8 @@ pub fn prove_continuation(
         }
         #[cfg(feature = "disk-spill")]
         match &epoch_stream_dir {
-            Some(dir) => {
+            // Stream to disk once the first `epoch_stream_keep` proofs are resident in RAM.
+            Some(dir) if epochs.len() >= epoch_stream_keep => {
                 let path = dir.join(format!("epoch_{:06}.bin", epoch_files.len()));
                 let bytes = bincode::serialize(&epoch)
                     .map_err(|e| Error::Prover(format!("stream epochs: serialize: {e}")))?;
@@ -924,7 +971,8 @@ pub fn prove_continuation(
                     .map_err(|e| Error::Prover(format!("stream epochs: write: {e}")))?;
                 epoch_files.push(path);
             }
-            None => epochs.push(epoch),
+            // Streaming off, or still within the first `epoch_stream_keep` kept in RAM.
+            _ => epochs.push(epoch),
         }
         #[cfg(not(feature = "disk-spill"))]
         epochs.push(epoch);
