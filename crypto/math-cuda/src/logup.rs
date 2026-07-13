@@ -44,12 +44,16 @@ pub struct LogupDescriptor<'a> {
 }
 
 fn cfg(total: usize) -> Result<LaunchConfig> {
-    // See `batch_inverse_ext3_dev` for the rationale: a u32 grid_dim is
-    // truncated past u32::MAX / BLOCK_SIZE, which would silently launch too
-    // few blocks and leave a tail of the (uninitialized) output unwritten.
-    // Runtime Err, not debug_assert, so release builds also route to the
-    // caller's CPU fallback.
-    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+    // One thread per element: `total` must fit in u32 so neither the `total as u32`
+    // cast below nor the kernel's `blockIdx.x*blockDim.x + threadIdx.x` index
+    // truncates. The block count `total.div_ceil(BLOCK_SIZE)` is well within CUDA's
+    // grid.x bound (2^31-1) for any such `total` — grid.x is NOT capped at the
+    // 65535 that applies to grid.y/z. (The previous bound `u32::MAX / BLOCK_SIZE`
+    // conflated the two and spuriously declined large single-chunk tables — e.g.
+    // SHIFT at 2^20 rows × 18 interactions = ~18.9M > u32::MAX/256 — silently
+    // falling back to a wrong, zeroed-host aux.) Runtime Err (not debug_assert) so
+    // release builds route to the caller's CPU fallback rather than truncate.
+    if total > u32::MAX as usize {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));

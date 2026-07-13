@@ -103,7 +103,7 @@ pub mod cols {
 /// - `old0/old1` = `old[0]`/`old[1]`
 /// - `old_ts_lo` = `old_timestamp[0] & 0xFFFF_FFFF` (the two words share old_timestamp,
 ///   enforced by `is_register_op`; the upper limb is TIMESTAMP_1 = timestamp>>32)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RegRow {
     /// Register index 0..=255 (`base_address / 2`); u16 keeps the struct at
     /// 32 bytes — it is the largest persisted array of the walk.
@@ -156,6 +156,25 @@ impl RegRow {
             old_ts_lo: (old_ts & 0xFFFF_FFFF) as u32,
             is_read,
         }
+    }
+
+    /// Marshal to the SoA the on-device MEMW_R fill (`memw_register_fill`)
+    /// consumes: `(reg_addr = 2*address, timestamp, value, is_read, old_value,
+    /// old_ts)`. The old_timestamp upper limb is shared with TIMESTAMP_1
+    /// (`timestamp >> 32`), matching the column encoding.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn fill_soa(&self) -> (u32, u64, u64, u8, u64, u64) {
+        let value = (self.val0 as u64) | ((self.val1 as u64) << 32);
+        let old_value = (self.old0 as u64) | ((self.old1 as u64) << 32);
+        let old_ts = (self.old_ts_lo as u64) | ((self.timestamp >> 32) << 32);
+        (
+            2 * self.address as u32,
+            self.timestamp,
+            value,
+            self.is_read as u8,
+            old_value,
+            old_ts,
+        )
     }
 
     /// Build a `RegRow` from a fully-formed register `MemwOperation`. Used on the

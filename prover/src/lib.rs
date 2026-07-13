@@ -972,6 +972,16 @@ pub fn prove_with_options_and_inputs(
         drop(__root);
         let spans = stark::instruments::take_timeline();
         print!("{}", stark::instruments::format_timeline(&spans));
+        // Main-trace CPU->GPU transfer accounting: the bytes the on-GPU trace
+        // generator aims to eliminate, and how many tables already skipped the
+        // upload by feeding the LDE a device-resident buffer.
+        let (h2d_bytes, h2d_calls, dev_builds) = stark::instruments::take_main_transfer();
+        if h2d_calls > 0 || dev_builds > 0 {
+            println!(
+                "[transfer] main-trace H2D: {:.1} MiB over {h2d_calls} table(s); device-resident builds: {dev_builds}",
+                h2d_bytes as f64 / (1024.0 * 1024.0),
+            );
+        }
         if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
             let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
             println!("[timeline] wrote {path}");

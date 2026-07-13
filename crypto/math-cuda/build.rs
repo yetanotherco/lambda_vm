@@ -121,4 +121,5 @@ fn main() {
     compile_ptx("fri.cu", "fri.ptx", have_nvcc);
     compile_ptx("inverse.cu", "inverse.ptx", have_nvcc);
     compile_ptx("logup.cu", "logup.ptx", have_nvcc);
+    compile_ptx("trace_cpu.cu", "trace_cpu.ptx", have_nvcc);
 }

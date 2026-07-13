@@ -508,6 +508,70 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// Device-input analog of [`try_expand_leaf_and_tree_row_major_keep`]: the main
+/// trace is already resident on device (row-major `[row*m + col]`, produced by
+/// the on-GPU trace generator), so there is NO host upload — the LDE copies it
+/// device-to-device. Returns the same (root-only host tree, resident LDE handle
+/// with the trace-domain snapshot for the aux build, row-major host LDE) triple.
+pub(crate) fn try_expand_leaf_and_tree_row_major_keep_dev<F, E, B>(
+    input_dev: &math_cuda::CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<(
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    // NOTE: no `lde_size < gpu_lde_threshold()` decline here. The threshold is a
+    // host-side heuristic (small tables are faster to LDE on the CPU, avoiding the
+    // H2D). For a DEVICE-resident input there is no valid CPU fallback — the host
+    // trace is a zeroed placeholder — so declining would silently commit zeros
+    // (bus imbalance / wrong proof). The input is already on-device, so we always
+    // run the GPU LDE regardless of size.
+    let _lde_size = n.saturating_mul(blowup_factor);
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if input_dev.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+
+    let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_dev(
+        input_dev,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len(), v.capacity())
+    };
+
+    let root = handle.tree.as_ref()?.root;
+    let tree = MerkleTree::<B>::from_root(root);
+    Some((tree, handle, lde_out))
+}
+
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.
