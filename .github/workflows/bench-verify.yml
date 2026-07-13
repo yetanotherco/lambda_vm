@@ -26,7 +26,14 @@ jobs:
       startsWith(github.event.comment.body, '/bench-verify') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    timeout-minutes: 60
+    # Job cap. The verifier bench is ~4 min and the recursion measurement itself ~1 min,
+    # but on a cold runner the recursion BUILDS dominate: MEASURE_CLI (release cli) once,
+    # plus PER REF a guest build (~10-20 min) and a prover-test build for the blob dump.
+    # All cached in /tmp for later runs, and build-std / the host cargo target are shared
+    # across ref worktrees (see the recursion step's env) to keep the cold run under this
+    # cap. The recursion step also has its own tighter timeout so a runaway build there
+    # can't burn the whole job and lose the already-captured verifier result.
+    timeout-minutes: 90
     steps:
       - name: Acknowledge (react + occupancy notice)
         uses: actions/github-script@v7
@@ -85,6 +92,37 @@ jobs:
           scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
           sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
 
+      # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main).
+      # The measurement is one exact `execute --cycles` reading per ref (~1 min total, no
+      # ABBA). Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli) once, plus
+      # per ref a guest build (~10-20 min) and a prover-test build for the blob dump; the
+      # GUEST_TARGET_DIR / HOST_TARGET_DIR below share build-std and the host cargo target
+      # across the two ref worktrees so the second ref is much cheaper (and per-worktree
+      # disk shrinks). continue-on-error + `!cancelled()` keep this fully isolated from the
+      # verifier bench above: a failure OR timeout here never fails the job nor clobbers the
+      # verifier verdict, and it still runs if the verifier step failed.
+      - name: Run recursion guest cycle benchmark
+        id: recursion
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        # Fail-fast well under the 90-min job cap so a runaway recursion build can't burn
+        # the whole job and lose the already-captured verifier result (continue-on-error
+        # absorbs the timeout; the job still posts the verifier verdict). Sized with
+        # headroom over a cold shared-build run (MEASURE_CLI + 2 guest builds + 2 blob-dump
+        # builds).
+        timeout-minutes: 70
+        env:
+          HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
+          # Share build-std and the host cargo target across ref worktrees, rooted under
+          # the script's /tmp cache dir: cuts cold build time and per-worktree disk.
+          GUEST_TARGET_DIR: /tmp/recursion_cycles_run/shared_guest_target
+          HOST_TARGET_DIR: /tmp/recursion_cycles_run/shared_host_target
+        run: |
+          export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
+          set -o pipefail
+          scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main min 2>&1 | tee /tmp/recursion_out.txt
+          sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out.txt > /tmp/recursion_result.txt
+
       - name: Post result
         if: always()
         uses: actions/github-script@v7
@@ -92,20 +130,42 @@ jobs:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
           OUTCOME: ${{ steps.run.outcome }}
+          RECURSION_OUTCOME: ${{ steps.recursion.outcome }}
         with:
           script: |
             const fs = require('fs');
             const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+            // Bound any raw-log fallback so a future header rename (empty *_result.txt)
+            // can't dump the entire build log into the PR comment.
+            const tail = (s, n) => s.split('\n').slice(-n).join('\n');
             const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
             let body = `## Verifier benchmark — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
             if (process.env.OUTCOME === 'success') {
-              const res = read('/tmp/verify_result.txt') || read('/tmp/verify_out.txt');
+              const res = read('/tmp/verify_result.txt') || tail(read('/tmp/verify_out.txt'), 30);
               body += res + '\n';
               body += '\n<sub>Drift-free interleaved A/B/B/A measurement. - = PR faster. ';
               body += 'Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
             } else {
-              const tail = read('/tmp/verify_out.txt').split('\n').slice(-30).join('\n');
-              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
+              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail(read('/tmp/verify_out.txt'), 30) + '\n```\n';
+            }
+            // Additive recursion-guest cycle section, kept clearly separated from the
+            // verifier verdict above so a failure here can't change how the bench reads.
+            body += '\n---\n\n## Recursion guest cycles (main vs PR)\n\n';
+            if (process.env.RECURSION_OUTCOME === 'success') {
+              const rec = read('/tmp/recursion_result.txt') || tail(read('/tmp/recursion_out.txt'), 20);
+              if (rec) {
+                body += rec + '\n';
+                body += '\n<sub>Deterministic in-VM verifier: one exact `execute --cycles` reading per ref ';
+                body += '(no ABBA needed). - = PR does fewer cycles/calls = better. keccak/ecsm are 0 when ';
+                body += 'the verifier uses Poseidon2. Each ref dumps its own input blob, so for a PR that ';
+                body += 'changes the proof format the delta reflects both guest-code and proof-structure changes.</sub>\n';
+              } else {
+                body += '_No recursion comparison output was captured._\n';
+              }
+            } else {
+              const rtail = tail(read('/tmp/recursion_out.txt'), 20);
+              body += '⚠️ Recursion cycle bench did not complete (does not affect the verifier verdict above).';
+              body += rtail ? ' Last log lines:\n\n' + '```\n' + rtail + '\n```\n' : '\n';
             }
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner, repo: context.repo.repo,
