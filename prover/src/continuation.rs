@@ -885,6 +885,13 @@ pub fn prove_continuation(
     // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
     // tables and is shipped in the bundle, so the two can never diverge in set or order.
     let touched_page_bases = touched_page_bases(&all_boundaries);
+    // INSTRUMENTATION (bench/page-drop-arebytes): number of GLOBAL_MEMORY tables the
+    // continuation builds (touched pages only) — cross-check against monolithic's
+    // `[PAGE-COUNT] touched=` line for the same block.
+    eprintln!(
+        "[PAGE-COUNT] continuation global_memory_tables={}",
+        touched_page_bases.len(),
+    );
     let global = prove_global(
         &all_boundaries,
         elf_bytes,

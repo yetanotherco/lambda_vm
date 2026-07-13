@@ -2607,6 +2607,26 @@ fn generate_page_tables<I: ImageSource>(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
+    // INSTRUMENTATION (bench/page-drop-arebytes): measure how many of the full
+    // 2^18-row PAGE tables monolithic builds are loaded-but-never-touched (no cell
+    // accessed by a load/store, i.e. all timestamps 0). `touched` here should equal
+    // the continuation's `touched_page_bases` count; `untouched` is the tables
+    // monolithic commits for nothing.
+    {
+        let touched: BTreeSet<u64> = memory_state
+            .cells
+            .iter()
+            .filter(|(_, cell)| cell.1 > 0)
+            .map(|(addr, _)| page::page_base_for_address(addr))
+            .collect();
+        eprintln!(
+            "[PAGE-COUNT] populated={} touched={} untouched={}",
+            page_bases.len(),
+            touched.len(),
+            page_bases.len() - touched.len(),
+        );
+    }
+
     // Build final state map from memory_state. When `exclude_touched` (continuation
     // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
     // cancels them (init == fini, ts == 0) and the local-to-global table owns their
