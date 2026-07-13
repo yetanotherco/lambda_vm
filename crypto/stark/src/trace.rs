@@ -332,7 +332,8 @@ where
     /// off the device instead. Any code path that would read the host trace must
     /// hard-abort on this flag rather than index an empty buffer, so a mis-gate
     /// or an unexpected GPU fallback fails loudly instead of producing a wrong
-    /// proof. Always false today until the `device_only` gate is wired.
+    /// proof. Set by `build_round1` when the device-only gate kept this table's
+    /// round-1 LDE on the GPU.
     #[cfg(feature = "cuda")]
     pub(crate) host_trace_empty: bool,
     /// Per table GPU residency session: owns this table's device LDE buffers

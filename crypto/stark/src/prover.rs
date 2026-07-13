@@ -787,15 +787,6 @@ pub trait IsStarkProver<
         });
     }
 
-    /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
-    /// with the owned LDE columns (consumed later in Phase D) and (under
-    /// cuda) the optional device LDE buffer kept alive for downstream rounds
-    /// when the R1 fused GPU pipeline ran.
-    ///
-    /// `precomputed`: if present, the leading `num_cols` columns are committed
-    /// as a separate Merkle tree (the precomputed split for preprocessed
-    /// tables) and the root is checked against the AIR-hardcoded commitment.
-    #[allow(clippy::type_complexity)]
     /// Stage-3 device-only gate for one table (see
     /// [`crate::gpu_lde::device_only_gate`]). Derived purely from the AIR +
     /// domain so the round-1 main-commit and aux-commit closures compute the
@@ -832,6 +823,15 @@ pub trait IsStarkProver<
         )
     }
 
+    /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
+    /// with the owned LDE columns (consumed later in Phase D) and (under
+    /// cuda) the optional device LDE buffer kept alive for downstream rounds
+    /// when the R1 fused GPU pipeline ran.
+    ///
+    /// `precomputed`: if present, the leading `num_cols` columns are committed
+    /// as a separate Merkle tree (the precomputed split for preprocessed
+    /// tables) and the root is checked against the AIR-hardcoded commitment.
+    #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
