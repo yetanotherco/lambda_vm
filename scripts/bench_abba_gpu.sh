@@ -45,15 +45,32 @@ ELF="$ROOT/$ELF_REL"
 INPUT="$ROOT/$INPUT_REL"
 
 if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$WORK/cli" ]; then
+  # CUDARC_PIN: compat shim for benching *pre-pin* checkouts. Newer trees pin
+  # cudarc's CUDA version permanently in crypto/math-cuda/Cargo.toml, so the
+  # `cuda-version-from-build-system` anchor is gone and this sed no-ops on them.
   if [ -n "${CUDARC_PIN:-}" ]; then
-    sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
-      crypto/math-cuda/Cargo.toml
-    echo "    cudarc pinned to ${CUDARC_PIN}"
+    if grep -q '"cuda-version-from-build-system"' crypto/math-cuda/Cargo.toml; then
+      sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
+        crypto/math-cuda/Cargo.toml
+      echo "    cudarc pinned to ${CUDARC_PIN}"
+    else
+      # Post-pin checkouts already hard-pin cudarc in Cargo.toml, so the anchor
+      # is gone and the sed would silently no-op. Warn rather than mislead.
+      echo "    WARNING: CUDARC_PIN=${CUDARC_PIN} ignored — cudarc is already" >&2
+      echo "             pinned in crypto/math-cuda/Cargo.toml (no build-system anchor to rewrite)." >&2
+    fi
   fi
   echo "==> Building cli (features: $BENCH_FEATURES)"
-  cargo build --release -p cli --features "$BENCH_FEATURES"
-  cp target/release/cli "$WORK/cli"
+  # Restore the tracked Cargo.toml whether the build succeeds or fails, so a
+  # build error (set -e) can't leave the sed edit above in the working tree.
+  build_rc=0
+  cargo build --release -p cli --features "$BENCH_FEATURES" || build_rc=$?
   [ -n "${CUDARC_PIN:-}" ] && git checkout -- crypto/math-cuda/Cargo.toml
+  if [ "$build_rc" -ne 0 ]; then
+    echo "ERROR: cargo build failed (rc=$build_rc)." >&2
+    exit "$build_rc"
+  fi
+  cp target/release/cli "$WORK/cli"
 else
   echo "==> Reusing cached cli (REBUILD=1 to force)"
 fi
