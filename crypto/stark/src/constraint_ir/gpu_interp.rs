@@ -146,9 +146,7 @@ where
     F: IsField + 'static,
     E: IsField + 'static,
 {
-    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>()
-        || TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>()
-    {
+    if !crate::gpu_lde::is_goldilocks_ext3_tower::<F, E>() {
         return None;
     }
     // SAFETY: the TypeId gate established `F = GoldilocksField` and

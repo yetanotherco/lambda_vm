@@ -93,6 +93,64 @@ __device__ __forceinline__ Fe3 read_var(uint32_t a, uint32_t b, uint64_t row, ui
     return ext3::make(a0, a1, a2);
 }
 
+// Shared forward pass: evaluate every IR node of the program for one LDE row
+// into the per-thread value scratch (node `i`'s value at `vals[i * vstride]`;
+// id `i` references only nodes `< i`). The single home of the op semantics —
+// both kernels below run this exact walk, so an op change stays in lockstep
+// with `constraint_ir/device.rs` in one place.
+__device__ __forceinline__ void eval_program_row(
+    Fe3 *vals, uint64_t vstride, const uint64_t *d_nodes, uint64_t num_nodes,
+    const uint64_t *d_base_consts, const Fe3 *d_ext_consts, const Fe3 *d_rap_challenges,
+    const Fe3 *d_alpha_powers, Fe3 table_offset, uint64_t row, uint64_t next_step,
+    uint64_t num_rows, const uint64_t *d_main, uint64_t main_stride, const uint64_t *d_aux,
+    uint64_t aux_stride) {
+    for (uint64_t i = 0; i < num_nodes; i++) {
+        Node nd = load_node(d_nodes, i);
+        Fe3 v;
+        switch (nd.op) {
+        case OP_CONST_BASE:
+            v = ext3::make(d_base_consts[nd.a], 0, 0);
+            break;
+        case OP_CONST_EXT:
+            v = d_ext_consts[nd.a];
+            break;
+        case OP_VAR:
+            v = read_var(nd.a, nd.b, row, next_step, num_rows, d_main, main_stride, d_aux,
+                         aux_stride);
+            break;
+        case OP_RAP_CHALLENGE:
+            v = d_rap_challenges[nd.a];
+            break;
+        case OP_ALPHA_POW:
+            v = d_alpha_powers[nd.a];
+            break;
+        case OP_TABLE_OFFSET:
+            v = table_offset;
+            break;
+        case OP_ADD:
+            v = ext3::add(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+            break;
+        case OP_SUB:
+            v = ext3::sub(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+            break;
+        case OP_MUL:
+            v = ext3::mul(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
+            break;
+        case OP_NEG:
+            v = ext3::neg(vals[(uint64_t)nd.a * vstride]);
+            break;
+        case OP_EMBED:
+            // All-ext representation: the base operand is already {x,0,0}.
+            v = vals[(uint64_t)nd.a * vstride];
+            break;
+        default:
+            v = ext3::zero();
+            break;
+        }
+        vals[i * vstride] = v;
+    }
+}
+
 extern "C" __global__ void constraint_interp_kernel(
     // output: per-constraint eval matrix, constraint-major [num_roots * num_rows]
     Fe3 *__restrict__ d_evals,
@@ -125,52 +183,9 @@ extern "C" __global__ void constraint_interp_kernel(
     Fe3 table_offset = *d_table_offset;
 
     for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
-        // Forward pass: id `i` references only nodes `< i`.
-        for (uint64_t i = 0; i < num_nodes; i++) {
-            Node nd = load_node(d_nodes, i);
-            Fe3 v;
-            switch (nd.op) {
-            case OP_CONST_BASE:
-                v = ext3::make(d_base_consts[nd.a], 0, 0);
-                break;
-            case OP_CONST_EXT:
-                v = d_ext_consts[nd.a];
-                break;
-            case OP_VAR:
-                v = read_var(nd.a, nd.b, row, next_step, num_rows, d_main, main_stride, d_aux,
-                             aux_stride);
-                break;
-            case OP_RAP_CHALLENGE:
-                v = d_rap_challenges[nd.a];
-                break;
-            case OP_ALPHA_POW:
-                v = d_alpha_powers[nd.a];
-                break;
-            case OP_TABLE_OFFSET:
-                v = table_offset;
-                break;
-            case OP_ADD:
-                v = ext3::add(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_SUB:
-                v = ext3::sub(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_MUL:
-                v = ext3::mul(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_NEG:
-                v = ext3::neg(vals[(uint64_t)nd.a * vstride]);
-                break;
-            case OP_EMBED:
-                // All-ext representation: the base operand is already {x,0,0}.
-                v = vals[(uint64_t)nd.a * vstride];
-                break;
-            default:
-                v = ext3::zero();
-                break;
-            }
-            vals[i * vstride] = v;
-        }
+        eval_program_row(vals, vstride, d_nodes, num_nodes, d_base_consts, d_ext_consts,
+                         d_rap_challenges, d_alpha_powers, table_offset, row, next_step, num_rows,
+                         d_main, main_stride, d_aux, aux_stride);
 
         // Emit each constraint root.
         for (uint64_t c = 0; c < num_roots; c++) {
@@ -234,51 +249,9 @@ extern "C" __global__ void constraint_composition_kernel(
     Fe3 table_offset = *d_table_offset;
 
     for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
-        // Forward pass (identical to the interpreter kernel).
-        for (uint64_t i = 0; i < num_nodes; i++) {
-            Node nd = load_node(d_nodes, i);
-            Fe3 v;
-            switch (nd.op) {
-            case OP_CONST_BASE:
-                v = ext3::make(d_base_consts[nd.a], 0, 0);
-                break;
-            case OP_CONST_EXT:
-                v = d_ext_consts[nd.a];
-                break;
-            case OP_VAR:
-                v = read_var(nd.a, nd.b, row, next_step, num_rows, d_main, main_stride, d_aux,
-                             aux_stride);
-                break;
-            case OP_RAP_CHALLENGE:
-                v = d_rap_challenges[nd.a];
-                break;
-            case OP_ALPHA_POW:
-                v = d_alpha_powers[nd.a];
-                break;
-            case OP_TABLE_OFFSET:
-                v = table_offset;
-                break;
-            case OP_ADD:
-                v = ext3::add(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_SUB:
-                v = ext3::sub(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_MUL:
-                v = ext3::mul(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-                break;
-            case OP_NEG:
-                v = ext3::neg(vals[(uint64_t)nd.a * vstride]);
-                break;
-            case OP_EMBED:
-                v = vals[(uint64_t)nd.a * vstride];
-                break;
-            default:
-                v = ext3::zero();
-                break;
-            }
-            vals[i * vstride] = v;
-        }
+        eval_program_row(vals, vstride, d_nodes, num_nodes, d_base_consts, d_ext_consts,
+                         d_rap_challenges, d_alpha_powers, table_offset, row, next_step, num_rows,
+                         d_main, main_stride, d_aux, aux_stride);
 
         // Transition: z_inv * Σ_c beta_c * C_c.
         Fe3 sum = ext3::zero();

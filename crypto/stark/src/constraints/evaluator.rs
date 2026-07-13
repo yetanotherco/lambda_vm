@@ -315,13 +315,7 @@ where
         Field: 'static,
         FieldExtension: 'static,
     {
-        use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
-        use math::field::goldilocks::GoldilocksField;
-        use std::any::TypeId;
-
-        if TypeId::of::<Field>() != TypeId::of::<GoldilocksField>()
-            || TypeId::of::<FieldExtension>() != TypeId::of::<Degree3GoldilocksExtensionField>()
-        {
+        if !crate::gpu_lde::is_goldilocks_ext3_tower::<Field, FieldExtension>() {
             return None;
         }
         if crate::gpu_lde::gpu_composition_disabled() {
@@ -332,8 +326,7 @@ where
         }
         // The kernel's row math assumes Var offsets index a contiguous [0..n)
         // frame (offset·step). The VM uses [0, 1]; anything else → CPU.
-        let offsets = &air.context().transition_offsets;
-        if !offsets.iter().enumerate().all(|(i, &o)| o == i) {
+        if !crate::gpu_lde::offsets_are_contiguous(&air.context().transition_offsets) {
             return None;
         }
         let main = lde_trace.gpu_main()?;
