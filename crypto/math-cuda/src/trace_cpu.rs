@@ -57,6 +57,40 @@ pub fn gpu_build_cpu_trace(
     Ok(out)
 }
 
+/// Host-returning wrapper over [`gpu_build_cpu_trace`] for byte-parity tests:
+/// builds the row-major CPU table on device and copies it back on the same stream.
+pub fn gpu_build_cpu_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+    last_ts: u64,
+) -> Result<Vec<u64>> {
+    debug_assert_eq!(packed_ops.len(), n * CPU_OP_STRIDE);
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let ops_dev = if packed_ops.is_empty() {
+        stream.alloc_zeros::<u64>(CPU_OP_STRIDE)?
+    } else {
+        stream.clone_htod(packed_ops)?
+    };
+    let mut out = stream.alloc_zeros::<u64>(num_rows * CPU_NCOLS)?;
+
+    unsafe {
+        stream
+            .launch_builder(&be.trace_cpu_fill)
+            .arg(&ops_dev)
+            .arg(&(n as u64))
+            .arg(&(num_rows as u64))
+            .arg(&last_ts)
+            .arg(&mut out)
+            .launch(LaunchConfig::for_num_elems(num_rows as u32))?;
+    }
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
 /// MEMW_A table width (`prover::tables::memw_aligned::cols::NUM_COLUMNS`).
 pub const MEMW_ALIGNED_NCOLS: usize = 29;
 /// Packed MEMW_A input stride, u64 per op (must match `memw_aligned_fill` in `trace_cpu.cu`).

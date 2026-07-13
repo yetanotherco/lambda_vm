@@ -45,7 +45,7 @@ pub(crate) fn gpu_trace_disabled() -> bool {
 /// kernel consumes (stride `CPU_OP_STRIDE` u64/op). The kernel does the same
 /// bit-slicing as `cpu::generate_cpu_trace`, so this only copies fields — no
 /// per-column encoding on the host.
-fn pack_cpu_ops(chunk: &[CpuOperation]) -> Vec<u64> {
+pub(crate) fn pack_cpu_ops(chunk: &[CpuOperation]) -> Vec<u64> {
     let stride = math_cuda::trace_cpu::CPU_OP_STRIDE;
     let mut packed = vec![0u64; chunk.len() * stride];
     for (i, op) in chunk.iter().enumerate() {

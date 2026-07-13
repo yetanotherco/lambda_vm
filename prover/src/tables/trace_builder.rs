@@ -4539,6 +4539,103 @@ mod gpu_fill_tests {
 
     use super::*;
 
+    /// CPU-table device fill must be byte-identical to `cpu::generate_cpu_trace`.
+    /// The CPU kernel is the most intricate of the seven (word-delegate column
+    /// masking, `PC_DOUBLE_READ`/`PREV_PC_TIMESTAMP_BORROW`, and the `+4` padding
+    /// cadence with PC=1), so this guards it the same way its six siblings are
+    /// guarded. The fill is a pure function of the packed op fields, so the synthetic
+    /// ops need only be diverse (not a valid execution): word-delegate rows, x255 PC
+    /// reads (`pc_double_read`), `ts_lo < 3` rows (`prev_pc_timestamp_borrow`), x0
+    /// registers, and high-word values (DWordWL/DWordHL splits). `n = 300 < 512`
+    /// forces padding rows, exercising the `+4` cadence off `last_ts`. Skips cleanly
+    /// with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu_fill_matches_cpu() {
+        use crate::tables::types::{DecodeEntry, ShrunkDecode};
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_cpu_fill_matches_cpu: no CUDA backend");
+            return;
+        }
+        let mut ops = Vec::new();
+        for i in 0..300u64 {
+            let word = i % 5 == 0;
+            // rs1 cycles through x255 (PC register), x0, and normal registers so the
+            // pc_double_read and register-zero-suppression paths are both hit.
+            let rs1 = match i % 4 {
+                0 => 255u8,
+                1 => 0,
+                _ => (i % 31 + 1) as u8,
+            };
+            let fields = ShrunkDecode {
+                read_register1: i % 3 != 0,
+                read_register2: i % 2 == 0,
+                write_register: i % 3 == 0,
+                word_instr: word,
+                alu: i % 6 == 0,
+                add: i % 6 == 1,
+                sub: i % 6 == 2,
+                memory: i % 6 == 3,
+                branch: i % 6 == 4,
+                ecall: i % 6 == 5,
+                rs1,
+                rs2: (i % 32) as u8,
+                rd: ((i + 7) % 32) as u8,
+                half_instruction_length: if i % 2 == 0 { 1 } else { 2 },
+                alu_flags: (i & 0xFF) as u8,
+                mem_flags: ((i >> 1) & 0xFF) as u8,
+            };
+            // A few timestamps with ts_lo < 3 (0,1,2) trip prev_pc_timestamp_borrow;
+            // the rest are large and continue a +4 cadence.
+            let timestamp = match i {
+                0 => 0,
+                1 => 1,
+                2 => 2,
+                _ => 4 * i + 100,
+            };
+            // PC/imm/next_pc carry high words (>32 bits) to exercise the DWordWL split
+            // into PC_1/NEXT_PC_1/IMM_1.
+            let decode = DecodeEntry {
+                pc: 0x1000 + i * 4 + ((i % 3) << 33),
+                imm: i.wrapping_mul(0x9E37_79B9) | ((i % 4) << 40),
+                fields,
+            };
+            ops.push(CpuOperation {
+                decode,
+                timestamp,
+                next_pc: 0x2000 + i * 4 + ((i % 2) << 34),
+                rvd: i.wrapping_mul(0x1234_5678_9ABC),
+                rv1: i.wrapping_mul(0xDEAD_BEEF).rotate_left(13),
+                rv2: (i ^ 0xFFFF_0000_1111) << 3,
+                arg2: i.wrapping_add(0x7777_8888_9999),
+                res: i.wrapping_mul(0xABCD_1234_5678) ^ (i << 48),
+                branch_cond: i % 3 == 1,
+                ..Default::default()
+            });
+        }
+        let n = ops.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let last_ts = ops.last().map(|op| op.timestamp).unwrap_or(0);
+
+        let cpu_table = cpu::generate_cpu_trace(&ops);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, math_cuda::trace_cpu::CPU_NCOLS);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        let packed = crate::tables::gpu_trace::pack_cpu_ops(&ops);
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_cpu_trace_host(&packed, n, num_rows, last_ts)
+            .expect("device CPU build must run on a box with a CUDA backend");
+
+        assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::CPU_NCOLS);
+        assert_eq!(
+            gpu_u64, cpu_u64,
+            "device CPU table must be byte-identical to the CPU fill"
+        );
+    }
+
     /// MEMW_R (register fast-path) device fill must be byte-identical to the CPU
     /// `generate_memw_register_trace_from_rows`. The rows are the walked register
     /// rows; here we build synthetic `RegRow`s (read + write, varied values/old/ts)
@@ -4576,7 +4673,7 @@ mod gpu_fill_tests {
         assert_eq!(w, math_cuda::trace_cpu::MEMW_REGISTER_NCOLS);
         let cpu_u64: Vec<u64> = cpu_fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
 
         let mut reg_addr = Vec::new();
@@ -4662,7 +4759,7 @@ mod gpu_fill_tests {
         assert_eq!(width_cols, math_cuda::trace_cpu::MEMW_ALIGNED_NCOLS);
         let cpu_u64: Vec<u64> = cpu_fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
 
         let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MEMW_ALIGNED_STRIDE);
@@ -4710,7 +4807,7 @@ mod gpu_fill_tests {
         assert_eq!(w, math_cuda::trace_cpu::LOAD_NCOLS);
         let cpu_u64: Vec<u64> = fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
         let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::LOAD_STRIDE);
         for op in &ops {
@@ -4748,7 +4845,7 @@ mod gpu_fill_tests {
         assert_eq!(w, math_cuda::trace_cpu::STORE_NCOLS);
         let cpu_u64: Vec<u64> = fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
         let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::STORE_STRIDE);
         for op in &ops {
@@ -4821,7 +4918,7 @@ mod gpu_fill_tests {
         assert_eq!(w, math_cuda::trace_cpu::SHIFT_NCOLS);
         let cpu_u64: Vec<u64> = fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
         let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::SHIFT_STRIDE);
         for op in &ops {
@@ -4878,7 +4975,7 @@ mod gpu_fill_tests {
         assert_eq!(w, ncols);
         let cpu_u64: Vec<u64> = cpu_fe
             .iter()
-            .map(|e| unsafe { *(e.value() as *const _ as *const u64) })
+            .map(|e| unsafe { *(e.value() as *const u64) })
             .collect();
 
         // Dedup on the host exactly like `gpu_build_lt_tables`, then device-fill.
