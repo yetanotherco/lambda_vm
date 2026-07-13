@@ -3219,6 +3219,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memws = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_memw_tables(&memw_ops, max_rows.memw)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &memw_ops,
             max_rows.memw,
@@ -3438,6 +3457,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_branches = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_branch_tables(&branch_ops, max_rows.branch)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &branch_ops,
             max_rows.branch,
@@ -3536,6 +3574,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_cpu32s = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_cpu32_tables(&cpu32_ops, max_rows.cpu32)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,
@@ -5399,6 +5456,225 @@ mod gpu_fill_tests {
             real_rows(&gpu_u64),
             real_rows(&cpu_u64),
             "device DVRM rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// BRANCH device fill: a permutation-invariant lookup table (dedup + summed
+    /// multiplicity), so the row ORDER is non-deterministic. Validate as a MULTISET
+    /// — the real rows (μ>0) must match `generate_branch_trace`. Covers JALR (base =
+    /// register) vs PC-relative, wrapping add, odd offsets (so LSB masking differs
+    /// from the unmasked low byte), high address bits, and duplicates (μ>1). Skips
+    /// cleanly with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_branch_fill_matches_cpu_multiset() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_branch_fill_matches_cpu_multiset: no CUDA backend");
+            return;
+        }
+        let mut raw = Vec::new();
+        for i in 0..800u64 {
+            let pc = 0x1000u64.wrapping_add(i.wrapping_mul(4)) ^ (i << 34);
+            // Odd offsets so `next_pc` (LSB masked) differs from the unmasked low
+            // byte; high bits set to exercise the wrapping add.
+            let offset = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let register = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(7);
+            let jalr = i % 2 == 0;
+            let op = branch::BranchOperation::new(pc, offset, register, jalr);
+            raw.push(op.clone());
+            if i % 4 == 0 {
+                raw.push(op); // duplicate → μ=2
+            }
+        }
+
+        let ncols = math_cuda::trace_cpu::BRANCH_NCOLS;
+        let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+            let mut rows: Vec<Vec<u64>> = flat
+                .chunks(ncols)
+                .filter(|row| row[branch::cols::MU] > 0)
+                .map(|row| row.to_vec())
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let cpu_table = branch::generate_branch_trace(&raw);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, ncols);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        // Dedup on the host exactly like `gpu_build_branch_tables`, then device-fill.
+        let mut map: std::collections::HashMap<branch::BranchOperation, u64> = HashMap::new();
+        for op in &raw {
+            *map.entry(op.clone()).or_insert(0) += 1;
+        }
+        let unique: Vec<(branch::BranchOperation, u64)> = map.into_iter().collect();
+        let n = unique.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::BRANCH_STRIDE);
+        for (op, mult) in &unique {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_branch_op(op, *mult));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_branch_trace_host(&packed, n, num_rows)
+            .expect("device BRANCH build must run on a box with a CUDA backend");
+
+        assert_eq!(
+            real_rows(&gpu_u64),
+            real_rows(&cpu_u64),
+            "device BRANCH rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// CPU32 device fill must be byte-identical to `cpu32::generate_cpu32_trace`.
+    /// Per-row (μ=1, no dedup), so full byte parity holds. Covers signed/unsigned
+    /// (alu_flags bit 5), negative rv1/rv2/res (sign-extension into arg1/arg2/rvd),
+    /// imm-vs-rv2 operands, flag/register combinations, high words, and padding
+    /// (n=300 < 512). Skips cleanly with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_cpu32_fill_matches_cpu() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_cpu32_fill_matches_cpu: no CUDA backend");
+            return;
+        }
+        let mut ops = Vec::new();
+        for i in 0..300u64 {
+            let signed = i % 2 == 0;
+            // alu_flags: bit 5 = signed; low bits carry a varied opcode.
+            let alu_flags = ((i % 20) as u8) | if signed { 1 << 5 } else { 0 };
+            // Alternate imm-driven vs rv2-driven arg2 (decode assumption: one nonzero).
+            let use_imm = i % 3 == 0;
+            let rv2 = if use_imm {
+                0
+            } else {
+                i.wrapping_mul(0xDEAD_BEEF).rotate_left(9)
+            };
+            let imm = if use_imm {
+                i.wrapping_mul(0x9E37_79B9) | (i << 40)
+            } else {
+                0
+            };
+            ops.push(cpu32::Cpu32Operation {
+                timestamp: 4 * i + 8 + (i << 34),
+                pc: 0x1000 + i * 4 + ((i % 3) << 33),
+                rs1: (i % 32) as u8,
+                read_register1: i % 3 != 0,
+                rv1: i.wrapping_mul(0x1234_5678_9ABC) ^ (i << 31), // exercise bit 31
+                rs2: ((i + 5) % 32) as u8,
+                read_register2: !use_imm,
+                rv2,
+                imm,
+                res: i.wrapping_mul(0xABCD_1234) ^ (i << 31),
+                rd: ((i + 7) % 32) as u8,
+                write_register: i % 4 != 0,
+                alu: i % 5 != 0,
+                alu_flags,
+                add: i % 5 == 1,
+                sub: i % 5 == 2,
+                half_instruction_length: if i % 2 == 0 { 1 } else { 2 },
+            });
+        }
+        let n = ops.len();
+        let num_rows = n.next_power_of_two().max(4);
+
+        let cpu_table = cpu32::generate_cpu32_trace(&ops);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, math_cuda::trace_cpu::CPU32_NCOLS);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::CPU32_STRIDE);
+        for op in &ops {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_cpu32_op(op));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_cpu32_trace_host(&packed, n, num_rows)
+            .expect("device CPU32 build must run on a box with a CUDA backend");
+
+        assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::CPU32_NCOLS);
+        assert_eq!(
+            gpu_u64, cpu_u64,
+            "device CPU32 table must be byte-identical to the CPU fill"
+        );
+    }
+
+    /// MEMW (general/unaligned) device fill must be byte-identical to
+    /// `memw::generate_memw_trace`. Per-row (no dedup). Covers memory and register
+    /// accesses, widths 1/2/4/8, read/write, base addresses that straddle the 2^32
+    /// boundary (so `carry[i]` fires), distinct per-byte old_timestamps (the
+    /// split-timestamp path), and full-u32 value/old limbs (exercises both halves of
+    /// the 2×u32/u64 packing). Skips cleanly with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_memw_fill_matches_cpu() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_memw_fill_matches_cpu: no CUDA backend");
+            return;
+        }
+        let mut ops = Vec::new();
+        for i in 0..400u64 {
+            let width = [1u8, 2, 4, 8][(i % 4) as usize];
+            let is_read = i % 2 == 0;
+            let is_register = i % 7 == 0;
+            // Low word near 2^32 so `base_lo + (i+1)` overflows for some rows.
+            let base = (0x1_0000_0000u64 * (i % 3)) + (0xFFFF_FFF8u64 - (i % 16)) + i;
+            let value = [
+                (i as u32).wrapping_mul(2_654_435_761),
+                (i as u32) ^ 0xABCD_1234,
+                i as u32,
+                0xDEAD_0000 | (i as u32 & 0xFFFF),
+                7,
+                0,
+                (i as u32).wrapping_add(99),
+                (i as u32) & 0xFF,
+            ];
+            let old = [
+                (i as u32).wrapping_add(3),
+                (i as u32).wrapping_mul(17),
+                0,
+                (i as u32) ^ 0x0BAD_F00D,
+                (i as u32).wrapping_add(5),
+                (i as u32).wrapping_mul(23),
+                0,
+                (i as u32).wrapping_add(7),
+            ];
+            let ts = 4 * i + 100;
+            // Distinct per-byte old_timestamps (the unaligned split-timestamp path).
+            let mut old_ts = [0u64; 8];
+            for (j, o) in old_ts.iter_mut().enumerate() {
+                *o = (4 * i + 3 + j as u64) ^ ((j as u64) << 33);
+            }
+            ops.push(
+                memw::MemwOperation::new(is_register, base, value, ts, width, is_read)
+                    .with_old(old, old_ts),
+            );
+        }
+        let n = ops.len();
+        let num_rows = n.next_power_of_two().max(4);
+
+        let cpu_table = memw::generate_memw_trace(&ops);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, math_cuda::trace_cpu::MEMW_NCOLS);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MEMW_STRIDE);
+        for op in &ops {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_memw_op(op));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_memw_trace_host(&packed, n, num_rows)
+            .expect("device MEMW build must run on a box with a CUDA backend");
+
+        assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::MEMW_NCOLS);
+        assert_eq!(
+            gpu_u64, cpu_u64,
+            "device MEMW table must be byte-identical to the CPU fill"
         );
     }
 }

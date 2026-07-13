@@ -168,6 +168,18 @@ pub const MUL_STRIDE: usize = 5;
 /// host-deduplicated: one unique op + split (mu_q, mu_r) multiplicities per row.
 pub const DVRM_NCOLS: usize = 34;
 pub const DVRM_STRIDE: usize = 5;
+/// BRANCH table width / packed input stride (must match `branch_fill`). Input is
+/// host-deduplicated: one unique op + summed multiplicity per row.
+pub const BRANCH_NCOLS: usize = 14;
+pub const BRANCH_STRIDE: usize = 5;
+/// CPU32 table width / packed input stride (must match `cpu32_fill`). Per-row
+/// (μ=1, no dedup): one op per row.
+pub const CPU32_NCOLS: usize = 38;
+pub const CPU32_STRIDE: usize = 8;
+/// MEMW (general/unaligned) table width / packed input stride (must match
+/// `memw_fill`). Per-row (no dedup): one walked op per row.
+pub const MEMW_NCOLS: usize = 49;
+pub const MEMW_STRIDE: usize = 19;
 
 /// Shared interleaved fill on `stream`: upload `packed` (n × stride u64) and run
 /// `kernel(ops, n, num_rows, out)` into a zeroed row-major buffer. Returns the
@@ -224,6 +236,15 @@ fn mul_kernel(be: &Backend) -> &CudaFunction {
 }
 fn dvrm_kernel(be: &Backend) -> &CudaFunction {
     &be.dvrm_fill
+}
+fn branch_kernel(be: &Backend) -> &CudaFunction {
+    &be.branch_fill
+}
+fn cpu32_kernel(be: &Backend) -> &CudaFunction {
+    &be.cpu32_fill
+}
+fn memw_kernel(be: &Backend) -> &CudaFunction {
+    &be.memw_fill
 }
 
 /// Build one LT trace-table chunk on device from HOST-DEDUPLICATED ops (one unique
@@ -420,6 +441,138 @@ pub fn gpu_build_dvrm_trace_host(
         num_rows,
         DVRM_NCOLS,
         DVRM_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one BRANCH trace-table chunk on device from HOST-DEDUPLICATED ops (one
+/// unique op + summed multiplicity per row; see `branch_fill` in `trace_cpu.cu`).
+pub fn gpu_build_branch_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        branch_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BRANCH_NCOLS,
+        BRANCH_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning BRANCH build for multiset-equality tests.
+pub fn gpu_build_branch_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        branch_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BRANCH_NCOLS,
+        BRANCH_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one CPU32 trace-table chunk on device (per-row `*W` fill; see `cpu32_fill`
+/// in `trace_cpu.cu`).
+pub fn gpu_build_cpu32_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        cpu32_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        CPU32_NCOLS,
+        CPU32_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning CPU32 build for byte-parity tests.
+pub fn gpu_build_cpu32_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        cpu32_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        CPU32_NCOLS,
+        CPU32_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one MEMW (general/unaligned) trace-table chunk on device from walked ops
+/// (see `memw_fill` in `trace_cpu.cu`).
+pub fn gpu_build_memw_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        memw_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MEMW_NCOLS,
+        MEMW_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning MEMW (general) build for byte-parity tests.
+pub fn gpu_build_memw_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        memw_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MEMW_NCOLS,
+        MEMW_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;

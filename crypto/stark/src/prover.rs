@@ -866,23 +866,55 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
 
-        let mut main_data: Vec<FieldElement<Field>> = Vec::with_capacity(lde_size * total_cols);
-        main_data.extend_from_slice(trace_data);
+        // Preprocessed tables (`precomputed.is_some()`) commit two *host* subset
+        // Merkle trees (static columns + multiplicity columns), so they cannot use
+        // the device full-column Merkle fast paths above — but the LDE, the dominant
+        // cost, still runs on GPU here; only the subset Merkles stay on host. A
+        // non-preprocessed table that fell through to this path already declined the
+        // GPU above, so it stays on CPU. Same row-major LDE math either way, so the
+        // subset roots are identical (and the static root is re-checked below).
+        #[cfg(feature = "cuda")]
+        let gpu_lde: Option<Vec<FieldElement<Field>>> = if precomputed.is_some() {
+            let rows = if total_cols > 0 {
+                trace_data.len() / total_cols
+            } else {
+                0
+            };
+            crate::gpu_lde::try_lde_row_major_no_merkle::<Field, Field>(
+                trace_data,
+                rows,
+                total_cols,
+                domain.blowup_factor,
+                &twiddles.coset_weights,
+            )
+        } else {
+            None
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_lde: Option<Vec<FieldElement<Field>>> = None;
+
+        let main_data: Vec<FieldElement<Field>> = match gpu_lde {
+            Some(lde) => lde,
+            None => {
+                let mut cpu = Vec::with_capacity(lde_size * total_cols);
+                cpu.extend_from_slice(trace_data);
+                Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
+                    &mut cpu,
+                    total_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    &twiddles.two_half_inv,
+                    &twiddles.two_half_fwd,
+                )
+                .expect("row-major coset LDE expansion");
+                cpu
+            }
+        };
 
         #[cfg(feature = "disk-spill")]
         if storage_mode == StorageMode::Disk {
             trace.main_table.advise_drop_cache();
         }
-
-        Polynomial::<FieldElement<Field>>::coset_lde_full_expand_row_major::<Field>(
-            &mut main_data,
-            total_cols,
-            domain.blowup_factor,
-            &twiddles.coset_weights,
-            &twiddles.two_half_inv,
-            &twiddles.two_half_fwd,
-        )
-        .expect("row-major coset LDE expansion");
 
         #[cfg(feature = "instruments")]
         let main_lde_dur = t_sub.elapsed();

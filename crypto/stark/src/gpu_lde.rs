@@ -576,6 +576,63 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// GPU coset LDE with NO Merkle, for the **preprocessed-table** commit path
+/// (DECODE, BITWISE, PAGE, REGISTER, KECCAK_RC). LDE the row-major host trace on
+/// device and return the row-major LDE as `Vec<FieldElement<E>>`; the caller builds
+/// the two *subset* Merkle trees (static columns + multiplicity columns) on the
+/// host, because the device full-column Merkle cannot represent that split.
+///
+/// Returns `None` (→ caller LDEs on CPU) for non-Goldilocks fields, tables below
+/// the GPU size threshold (kernel launch overhead dominates — e.g. the 32-row
+/// KECCAK_RC), empty/mismatched input, or GPU failure. Unlike the device-resident
+/// seam there IS a valid CPU fallback here (the host trace is real), so the size
+/// threshold applies.
+pub(crate) fn try_lde_row_major_no_merkle<F, E>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+
+    let lde_u64 =
+        math_cuda::lde::coset_lde_row_major_no_merkle(raw, n, m, blowup_factor, &weights_u64)
+            .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
+    };
+    Some(lde_out)
+}
+
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.

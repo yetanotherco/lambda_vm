@@ -200,6 +200,9 @@ pub struct Backend {
     pub bytewise_fill: CudaFunction,
     pub mul_fill: CudaFunction,
     pub dvrm_fill: CudaFunction,
+    pub branch_fill: CudaFunction,
+    pub cpu32_fill: CudaFunction,
+    pub memw_fill: CudaFunction,
     pub memw_register_fill: CudaFunction,
 
     // Twiddle caches keyed by log_n.
@@ -403,6 +406,9 @@ impl Backend {
             bytewise_fill: trace_cpu.load_function("bytewise_fill")?,
             mul_fill: trace_cpu.load_function("mul_fill")?,
             dvrm_fill: trace_cpu.load_function("dvrm_fill")?,
+            branch_fill: trace_cpu.load_function("branch_fill")?,
+            cpu32_fill: trace_cpu.load_function("cpu32_fill")?,
+            memw_fill: trace_cpu.load_function("memw_fill")?,
             memw_register_fill: trace_cpu.load_function("memw_register_fill")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
