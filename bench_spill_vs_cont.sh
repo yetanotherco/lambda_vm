@@ -115,13 +115,17 @@ build() {
 }
 
 # --------------------------- METRIC HELPERS ----------------------------------
-# Parse a /usr/bin/time -v logfile -> prints "RSS_KB WALL_SEC EXIT"
+# Parse a /usr/bin/time -v logfile -> prints "RSS_KB<TAB>WALL"
 parse_time() {
   local f="$1"
   local rss wall
   rss="$(grep -m1 'Maximum resident set size' "$f" 2>/dev/null | grep -oE '[0-9]+' | tail -1)"
   wall="$(grep -m1 'Elapsed (wall clock)' "$f" 2>/dev/null | sed -E 's/.*: //')"
-  echo "${rss:-NA} ${wall:-NA}"
+  # TAB-separated so `record()` writes two distinct TSV columns (rss_kb, wall).
+  # `run_capped`'s unquoted `$metrics` word-splits on the tab too, so its display
+  # (rss=%s wall=%s) still gets two args. A space here would collapse both into one
+  # TSV field, shifting every column in RESULTS.md.
+  printf '%s\t%s\n' "${rss:-NA}" "${wall:-NA}"
 }
 
 # run_capped <tag> <env-assignments> <cmd...>
