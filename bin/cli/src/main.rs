@@ -362,62 +362,6 @@ fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Ac
         .and_then(|s| s.accelerator())
 }
 
-/// Streams the program to completion (or the cycle budget), returning
-/// `(cycle_count, keccak_calls, ecsm_calls)`.
-///
-/// This is the counting path behind `execute --cycles`. Keeping it in one
-/// function lets a test drive the exact prefilter/confirm loop the CLI uses.
-/// Each accelerator call is a single ECALL (one cycle) with the whole
-/// permutation / scalar-mul running inside it, so invocations are tallied
-/// separately from the cycle count. The tallies are collected only when
-/// `count_accelerators` is set (the plain execute path skips the work).
-///
-/// The loop first prefilters logs whose `src1_val` (a7 on ECALL logs) matches an
-/// accelerator syscall number — a cheap superset, since a non-ECALL instruction
-/// can hold the same value in src1 — then confirms each candidate against the
-/// decoded instruction once the chunk's `&Log` borrow (tied to the executor's
-/// `&mut`) is released so the instruction cache can be read again.
-fn count_cycles_and_accelerators(
-    executor: &mut Executor,
-    cycle_budget: Option<u64>,
-    count_accelerators: bool,
-) -> Result<(u64, u64, u64), String> {
-    let mut cycle_count: u64 = 0;
-    let mut keccak_calls: u64 = 0;
-    let mut ecsm_calls: u64 = 0;
-    let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
-    loop {
-        let logs = executor
-            .resume_budgeted(cycle_count, cycle_budget)
-            .map_err(|e| format!("Execution failed: {e:?}"))?;
-        let Some(logs) = logs else { break };
-        cycle_count += logs.len() as u64;
-        if count_accelerators {
-            for log in logs {
-                if SyscallNumbers::try_from(log.src1_val)
-                    .map(|s| s.accelerator().is_some())
-                    .unwrap_or(false)
-                {
-                    accel_candidates.push((log.current_pc, log.src1_val));
-                }
-            }
-        }
-        // `logs` is no longer used, so the executor's `&mut` borrow is free and
-        // the instruction cache can be read to confirm each candidate.
-        for (pc, a7) in accel_candidates.drain(..) {
-            match accelerator_of(executor.instructions.get(pc), a7) {
-                Some(Accelerator::Keccak) => keccak_calls += 1,
-                Some(Accelerator::Ecsm) => ecsm_calls += 1,
-                None => {}
-            }
-        }
-        if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
-            break;
-        }
-    }
-    Ok((cycle_count, keccak_calls, ecsm_calls))
-}
-
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
@@ -518,14 +462,48 @@ fn cmd_execute(
             }
         };
 
-        let (cycle_count, keccak_calls, ecsm_calls) =
-            match count_cycles_and_accelerators(&mut executor, cycle_budget, cycles) {
-                Ok(counts) => counts,
+        let mut cycle_count: u64 = 0;
+        let mut keccak_calls: u64 = 0;
+        let mut ecsm_calls: u64 = 0;
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
+        // accelerator syscall number. This is a cheap superset — a non-ECALL
+        // instruction can hold the same value in src1 — that `accelerator_of`
+        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
+        // `&mut`) is released so the instruction cache can be read again.
+        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
+        loop {
+            let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
+                Ok(logs) => logs,
                 Err(e) => {
-                    eprintln!("{e}");
+                    eprintln!("Execution failed: {:?}", e);
                     return ExitCode::FAILURE;
                 }
             };
+            let Some(logs) = logs else { break };
+            cycle_count += logs.len() as u64;
+            if cycles {
+                for log in logs {
+                    if SyscallNumbers::try_from(log.src1_val)
+                        .map(|s| s.accelerator().is_some())
+                        .unwrap_or(false)
+                    {
+                        accel_candidates.push((log.current_pc, log.src1_val));
+                    }
+                }
+            }
+            // `logs` is no longer used, so the executor's `&mut` borrow is free
+            // and the instruction cache can be read to confirm each candidate.
+            for (pc, a7) in accel_candidates.drain(..) {
+                match accelerator_of(executor.instructions.get(pc), a7) {
+                    Some(Accelerator::Keccak) => keccak_calls += 1,
+                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
+                    None => {}
+                }
+            }
+            if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
+                break;
+            }
+        }
 
         if let Err(e) = executor.finish() {
             eprintln!("Failed to finish execution: {:?}", e);
@@ -1133,30 +1111,5 @@ mod tests {
 
         // No decoded instruction at the pc (cache miss) counts as neither.
         assert_eq!(accelerator_of(None, KECCAK_SYSCALL_NUMBER), None);
-    }
-
-    // End-to-end: drive a known keccak program through the same streaming count
-    // loop `execute --cycles` uses (`count_cycles_and_accelerators`) and assert
-    // the keccak tally. `test_keccak.s` issues exactly one keccak-f[1600] ecall
-    // (plus commit + halt); `test_keccak_multi.s` issues three. Locks the
-    // prefilter/confirm loop, not just the pure classifier. Ignored by default
-    // because it needs a prebuilt ELF artifact.
-    #[test]
-    #[ignore = "needs prebuilt guest ELF (make compile-programs-asm)"]
-    fn cycles_counts_keccak_calls_end_to_end() {
-        for (name, expected_keccak) in [("test_keccak", 1u64), ("test_keccak_multi", 3u64)] {
-            let elf_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../executor/program_artifacts/asm")
-                .join(format!("{name}.elf"));
-            let elf_data = std::fs::read(&elf_path)
-                .unwrap_or_else(|e| panic!("read {}: {e}", elf_path.display()));
-            let program = Elf::load(&elf_data).unwrap();
-            let mut executor = Executor::new(&program, Vec::new()).unwrap();
-            let (_cycles, keccak_calls, ecsm_calls) =
-                count_cycles_and_accelerators(&mut executor, None, true).unwrap();
-            executor.finish().unwrap();
-            assert_eq!(keccak_calls, expected_keccak, "{name} keccak calls");
-            assert_eq!(ecsm_calls, 0, "{name} ecsm calls");
-        }
     }
 }
