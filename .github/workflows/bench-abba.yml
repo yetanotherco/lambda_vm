@@ -8,11 +8,10 @@ on:
   issue_comment:
     types: [created]
 
-# One ABBA run per PR; a re-trigger cancels the stale one. (The single self-hosted
-# bench runner serializes across PRs on its own.)
 concurrency:
-  group: bench-abba-${{ github.event.issue.number }}
-  cancel-in-progress: true
+  # See bench-verify.yml. The single self-hosted bench runner serializes across PRs.
+  group: ${{ startsWith(github.event.comment.body, '/bench-abba') && format('bench-abba-{0}', github.event.issue.number) || format('bench-abba-ignore-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 permissions:
   contents: read

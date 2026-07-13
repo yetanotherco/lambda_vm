@@ -3,18 +3,16 @@
 //! One row per `ECALL(-11)`. It reads `xG` and `k` from memory, witnesses `yG` and proves
 //! `yG² ≡ xG³ + b mod p` (via two byte-limb convolution relations with quotients `q0,q1`
 //! and 64-entry carry arrays `c0,c1`), enforces `0 < k < N` and `xR < p`, writes `xR` back,
-//! triggers EC_SCALAR to serve `k` bit-by-bit, and delegates the double-and-add to ECDAS over
-//! the `Ecdas`/`ServeK`/`Bit` buses.
+//! serves the scalar bits directly via the `Bit` bus, and delegates the double-and-add to ECDAS
+//! over the `Ecdas`/`Bit` buses.
 //!
 //! See `spec/src/ecsm.toml`. All multi-limb arithmetic uses 8-bit limbs; the witness is built
 //! by `ecsm::compute_witness`, which reproduces these exact recurrences.
 //!
 //! ## Padding
-//! Padding rows have `mu = 0`, all columns zero **except `q1`, which pads to `p`**. This makes
-//! both carry relations close on padding without gating the whole recurrence: the x² relation
-//! has no standalone constant (closes at all-zero), and the yG relation closes because the
-//! `p² − q1·p` offset cancels (`q1 = p`) and the curve constant `b` is multiplied by `µ` (so it
-//! drops when `µ = 0`). Only that single `µ·b` term is µ-gated. The range checks /
+//! Padding rows have `mu = 0`, all columns zero. The yG carry relation closes because both the
+//! `µ·p²` and `µ·b` terms vanish when `µ = 0`, leaving the trivial `0 = 0` recurrence. The x²
+//! relation has no standalone constant and also closes at all-zero. The range checks /
 //! virtual-carry checks remain µ-gated as before.
 
 use executor::vm::instruction::execution::ECSM_SYSCALL_NUMBER;
@@ -30,7 +28,7 @@ pub(crate) const CARRY_OFFSET_X2: i64 = 8160;
 pub(crate) const CARRY_OFFSET_YG: i64 = 16319;
 
 // =========================================================================
-// Column indices (~427 columns)
+// Column indices (667 columns; keep in sync with NUM_COLUMNS below)
 // =========================================================================
 
 pub mod cols {
@@ -45,27 +43,29 @@ pub mod cols {
 
     pub const XR: usize = 8; // U256BL (32)
     pub const YR: usize = 40; // U256BL (32)
-    pub const K: usize = 72; // U256BL (32)
-    pub const LEN_K: usize = 104; // Byte
-    pub const XG: usize = 105; // U256BL (32)
-    pub const YG: usize = 137; // U256BL (32)
-    pub const X2: usize = 169; // U256BL (32)
-    pub const Q0: usize = 201; // U256BL (32)
-    pub const C0: usize = 233; // BaseField[64]
-    pub const Q1: usize = 297; // Byte[33]
-    pub const C1: usize = 330; // BaseField[64]
-    pub const K_SUB_N: usize = 394; // U256HL (16 halfwords)
-    pub const XR_SUB_P: usize = 410; // U256HL (16 halfwords)
-    pub const MU: usize = 426;
+    pub const K: usize = 72; // Bit[256] — scalar bits, k[0] is LSB
+    pub const LEN_K: usize = 328; // Byte
+    pub const XG: usize = 329; // U256BL (32)
+    pub const YG: usize = 361; // U256BL (32)
+    pub const X2: usize = 393; // U256BL (32)
+    pub const Q0: usize = 425; // U256BL (32)
+    pub const C0: usize = 457; // BaseField[64]
+    pub const Q1: usize = 521; // Byte[33]
+    pub const C1: usize = 554; // BaseField[64]
+    pub const XG_SUB_P: usize = 618; // U256HL (16 halfwords)
+    pub const K_SUB_N: usize = 634; // U256HL (16 halfwords)
+    pub const XR_SUB_P: usize = 650; // U256HL (16 halfwords)
+    pub const MU: usize = 666;
 
-    pub const NUM_COLUMNS: usize = 427;
+    pub const NUM_COLUMNS: usize = 667;
 
     #[inline]
     pub const fn xr(i: usize) -> usize {
         XR + i
     }
+    /// Bit `i` of the scalar `k` (0 = LSB, 255 = MSB).
     #[inline]
-    pub const fn k(i: usize) -> usize {
+    pub const fn k_bit(i: usize) -> usize {
         K + i
     }
     #[inline]
@@ -95,6 +95,10 @@ pub mod cols {
     #[inline]
     pub const fn c1(i: usize) -> usize {
         C1 + i
+    }
+    #[inline]
+    pub const fn xg_sub_p(i: usize) -> usize {
+        XG_SUB_P + i
     }
     #[inline]
     pub const fn k_sub_n(i: usize) -> usize {
@@ -148,7 +152,7 @@ pub fn generate_ecsm_trace(
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -164,13 +168,17 @@ pub fn generate_ecsm_trace(
 
         table.set_bytes(row_idx, cols::XR, &w.x_r);
         table.set_bytes(row_idx, cols::YR, &w.y_r);
-        table.set_bytes(row_idx, cols::K, &w.k);
+        for b in 0..256 {
+            let bit = (w.k[b / 8] >> (b % 8)) & 1;
+            table.set_fe(row_idx, cols::k_bit(b), FE::from(bit as u64));
+        }
         table.set_u64(row_idx, cols::LEN_K, w.len_k as u64);
         table.set_bytes(row_idx, cols::XG, &w.x_g);
         table.set_bytes(row_idx, cols::YG, &w.y_g);
         table.set_bytes(row_idx, cols::X2, &w.x2);
         table.set_bytes(row_idx, cols::Q0, &w.q0);
         table.set_bytes(row_idx, cols::Q1, &w.q1);
+        write_halfwords(table, row_idx, cols::XG_SUB_P, &w.x_g_sub_p);
         write_halfwords(table, row_idx, cols::K_SUB_N, &w.k_sub_n);
         write_halfwords(table, row_idx, cols::XR_SUB_P, &w.x_r_sub_p);
 
@@ -182,13 +190,6 @@ pub fn generate_ecsm_trace(
         }
 
         table.set_fe(row_idx, cols::MU, FE::one());
-    }
-
-    // Padding rows (`mu = 0`) must carry `q1 = p` so the yG carry relation closes: the
-    // `p² − q1·p` offset cancels and the µ-gated `b` term drops. Bytes 0..31 hold p; byte 32
-    // stays 0 (a valid IS_BIT value).
-    for row_idx in n..num_rows {
-        table.set_bytes(row_idx, cols::Q1, &P_BYTES);
     }
 
     trace
@@ -274,6 +275,24 @@ pub fn point_coord_busvalues(col: usize) -> Vec<BusValue> {
     (0..32).map(|b| packed(col + b)).collect()
 }
 
+/// `byte_k[byte_idx]` as a MEMW bus value: linear combination of 8 bit columns
+/// `k_bit[8*byte_idx .. 8*byte_idx+7]` with coefficients 2^0..2^7.
+fn k_byte_busvalue(byte_idx: usize) -> BusValue {
+    BusValue::linear(
+        (0..8)
+            .map(|j| LinearTerm::Column {
+                coefficient: 1i64 << j,
+                column: cols::k_bit(8 * byte_idx + j),
+            })
+            .collect(),
+    )
+}
+
+/// One 8-byte MEMW dword chunk of k (bytes `8*dword_idx .. 8*dword_idx+7`).
+fn k_dword_busvalues(dword_idx: usize) -> [BusValue; 8] {
+    std::array::from_fn(|b| k_byte_busvalue(8 * dword_idx + b))
+}
+
 // =========================================================================
 // Bus interactions
 // =========================================================================
@@ -336,7 +355,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // read x12 -> addr_k (register read at ts).
+    let ts_lo_plus = |d: i64| {
+        BusValue::linear(vec![
+            LinearTerm::Column {
+                coefficient: 1,
+                column: cols::TIMESTAMP_0,
+            },
+            LinearTerm::Constant(d),
+        ])
+    };
+
+    // read x12 -> addr_k (register read at ts + 1).
     out.push(BusInteraction::sender(
         BusId::Memw,
         mu(),
@@ -345,13 +374,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 12),
             BusValue::constant(0),
-            ts_lo(),
+            ts_lo_plus(1),
             ts_hi(),
             1,
             0,
         ),
     ));
-    // read k: 4 doublewords at addr_k + 8i (ts).
+    // read k: 4 doublewords at addr_k + 8i (ts + 1).
     for i in 0..4 {
         let base_lo = BusValue::linear(vec![
             LinearTerm::Column {
@@ -364,11 +393,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             BusId::Memw,
             mu(),
             memw_read(
-                dword_bytes(cols::K, i),
+                k_dword_busvalues(i),
                 0,
                 base_lo,
                 packed(cols::ADDR_K_1),
-                ts_lo(),
+                ts_lo_plus(1),
                 ts_hi(),
                 0,
                 1,
@@ -376,16 +405,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // read x10 -> addr_xR (register read at ts + 1).
-    let ts_lo_plus = |d: i64| {
-        BusValue::linear(vec![
-            LinearTerm::Column {
-                coefficient: 1,
-                column: cols::TIMESTAMP_0,
-            },
-            LinearTerm::Constant(d),
-        ])
-    };
+    // read x10 -> addr_xR (register read at ts + 2, grouped with xR writes).
     out.push(BusInteraction::sender(
         BusId::Memw,
         mu(),
@@ -394,7 +414,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             1,
             BusValue::constant(2 * 10),
             BusValue::constant(0),
-            ts_lo_plus(1),
+            ts_lo_plus(2),
             ts_hi(),
             1,
             0,
@@ -436,7 +456,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     is_byte(cols::X2, 32, &mut out);
     is_byte(cols::Q0, 32, &mut out);
     is_byte(cols::YG, 32, &mut out);
-    is_byte(cols::Q1, 32, &mut out); // q1[0..31]; q1[32] is an IS_BIT constraint
+    is_byte(cols::Q1, 33, &mut out); // q1[0..=32] (all 33 bytes)
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
     // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.
@@ -467,6 +487,13 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         out.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu(),
+            vec![packed(cols::xg_sub_p(i))],
+        ));
+    }
+    for i in 0..16 {
+        out.push(BusInteraction::sender(
+            BusId::IsHalfword,
+            mu(),
             vec![packed(cols::k_sub_n(i))],
         ));
     }
@@ -478,16 +505,17 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // ZERO bus: assert k != 0 (sum of k's 32 bytes is nonzero).
+    // ZERO bus: assert k != 0 (sum of byte_k[0..31] is nonzero).
+    // byte_k[i] = Σ_{j=0}^{7} 2^j · k[8i+j], so Σ byte_k = Σ_{b=0}^{255} 2^(b%8) · k[b].
     out.push(BusInteraction::sender(
         BusId::Zero,
         mu(),
         vec![
             BusValue::linear(
-                (0..32)
-                    .map(|i| LinearTerm::Column {
-                        coefficient: 1,
-                        column: cols::k(i),
+                (0..256)
+                    .map(|b| LinearTerm::Column {
+                        coefficient: 1i64 << (b % 8),
+                        column: cols::k_bit(b),
                     })
                     .collect(),
             ),
@@ -496,19 +524,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ));
 
     // Delegation buses.
-    // SERVE_K send: [ts, addr_k, 31].
-    out.push(BusInteraction::sender(
-        BusId::ServeK,
-        mu(),
-        vec![
-            ts_lo(),
-            ts_hi(),
-            packed(cols::ADDR_K_0),
-            packed(cols::ADDR_K_1),
-            BusValue::constant(31),
-        ],
-    ));
-    // BIT sender: the MSB at position len_k.
+    // BIT receivers: receive Bit[ts, i] from ECDAS for each scalar bit i=0..255.
+    for i in 0..256 {
+        out.push(BusInteraction::receiver(
+            BusId::Bit,
+            Multiplicity::Column(cols::k_bit(i)),
+            vec![ts_lo(), ts_hi(), BusValue::constant(i as u64)],
+        ));
+    }
+    // BIT sender: the MSB at position len_k (always 1).
     out.push(BusInteraction::sender(
         BusId::Bit,
         mu(),
@@ -554,8 +578,9 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     out
 }
 
-/// Builds the ECDAS bus tuple `[ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32),
-/// round, op]`. Shared so the ECSM sender and the ECDAS receiver/sender pack it identically.
+/// Builds the ECDAS bus tuple `[id, ts_lo, ts_hi, accX(32), accY(32), genX(32), genY(32),
+/// round, op]`. `id` is the curve identifier (0 = secp256k1). Shared so the ECSM sender and
+/// the ECDAS receiver/sender pack it identically.
 #[allow(clippy::too_many_arguments)]
 pub fn ecdas_tuple(
     acc_x: usize,
@@ -567,7 +592,8 @@ pub fn ecdas_tuple(
     ts_lo: BusValue,
     ts_hi: BusValue,
 ) -> Vec<BusValue> {
-    let mut v = Vec::with_capacity(2 + 4 * 32 + 2);
+    let mut v = Vec::with_capacity(1 + 2 + 4 * 32 + 2);
+    v.push(BusValue::constant(0)); // id = 0 (secp256k1)
     v.push(ts_lo);
     v.push(ts_hi);
     v.extend(point_coord_busvalues(acc_x));
@@ -579,26 +605,36 @@ pub fn ecdas_tuple(
     v
 }
 
+// =========================================================================
+// Constraints
+// =========================================================================
+
 /// Which convolution relation a carry constraint enforces.
 #[derive(Clone, Copy)]
 pub enum Relation {
     /// `xG² − x2 − q0·p = 0`
     X2,
-    /// `yG² + p² − xG·x2 − b − q1·p = 0`
+    /// `yG² + µ·p² − xG·x2 − µ·b − q1·p = 0`
     Yg,
 }
 
-/// A range-check overflow addition: `p + xR_sub_p = xR + 2^256` (`k<N` / `xR<p`).
+/// The addition-overflow range checks (`xG < p`, `k < N`, `xR < p`), whose 8 word-carries
+/// `c` are virtual. Each `c_i = 2^-32·(addend0_i + addend1_i + c_{i-1} − sum_i)`. The addition
+/// must overflow `2^256` (carry-out `c_7 = 1`), which proves the strict inequality:
+/// `xG < p` is `p + xg_sub_p = xG + 2^256`; `k < N` is `N + k_sub_N = k + 2^256`;
+/// `xR < p` is `p + xR_sub_p = xR + 2^256`.
 #[derive(Clone, Copy)]
 pub enum OverflowKind {
+    XgLtP,
     KLtN,
     XrLtP,
 }
 
 impl OverflowKind {
-    /// The constant addend's 32-bit word `i` (`N` for `k<N`, `p` for `xR<p`).
+    /// The constant addend's 32-bit word `i` (`p` for `xG<p`/`xR<p`, `N` for `k<N`).
     fn const_word(self, i: usize) -> u64 {
         let bytes = match self {
+            OverflowKind::XgLtP => &P_BYTES,
             OverflowKind::KLtN => &N_BYTES,
             OverflowKind::XrLtP => &P_BYTES,
         };
@@ -608,19 +644,25 @@ impl OverflowKind {
         }
         w
     }
-    /// Column base of the witnessed halfword addend (`k_sub_N` / `xR_sub_p`).
+    /// Column base of the witnessed halfword addend (`xg_sub_p` / `k_sub_N` / `xR_sub_p`).
     fn addend_hl_base(self) -> usize {
         match self {
+            OverflowKind::XgLtP => cols::XG_SUB_P,
             OverflowKind::KLtN => cols::K_SUB_N,
             OverflowKind::XrLtP => cols::XR_SUB_P,
         }
     }
-    /// Column base of the byte sum (`k` / `xR`).
-    fn sum_bl_base(self) -> usize {
+    /// Column base of the sum.
+    fn sum_col_base(self) -> usize {
         match self {
+            OverflowKind::XgLtP => cols::XG,
             OverflowKind::KLtN => cols::K,
             OverflowKind::XrLtP => cols::XR,
         }
+    }
+    /// Whether the sum is stored as individual bits (k) rather than bytes (xG/xR).
+    fn sum_is_bits(self) -> bool {
+        matches!(self, OverflowKind::KLtN)
     }
 }
 
@@ -629,26 +671,30 @@ impl OverflowKind {
 // =========================================================================
 //
 // One body against the generic `ConstraintBuilder` serves the compiled prover
-// folder, the verifier folder and IR capture. Constraint indices 0..148:
+// folder, the verifier folder and IR capture. Constraint indices 0..413:
 //   0        : IS_BIT(MU)
-//   1..65    : ConvCarry(X2, 0..64)
-//   65       : ColIsZero(c0(63))
-//   66..130  : ConvCarry(Yg, 0..64)
-//   130      : ColIsZero(c1(63))
-//   131      : IS_BIT(q1(32))
-//   132..139 : CarryBit(KLtN, 0..7)
-//   139      : OverflowRequired(KLtN)
-//   140..147 : CarryBit(XrLtP, 0..7)
-//   147      : OverflowRequired(XrLtP)
+//   1..257   : IS_BIT(k[i]) for the 256 scalar bits
+//   257      : KBitsZeroOnPadding — (Σ k_bit[i])·(1−µ)
+//   258..322 : ConvCarry(X2, 0..64)
+//   322      : ColIsZero(c0(63))
+//   323..387 : ConvCarry(Yg, 0..64)
+//   387      : ColIsZero(c1(63))
+//   388      : IS_BIT(q1(32))
+//   389..396 : CarryBit(XgLtP, 0..7)
+//   396      : OverflowRequired(XgLtP)
+//   397..404 : CarryBit(KLtN, 0..7)
+//   404      : OverflowRequired(KLtN)
+//   405..412 : CarryBit(XrLtP, 0..7)
+//   412      : OverflowRequired(XrLtP)
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// ECSM transition constraints as a single-source [`ConstraintSet`] (148
+/// ECSM transition constraints as a single-source [`ConstraintSet`] (413
 /// total). No column configuration needed (the layout is fixed via `cols`).
 pub struct EcsmConstraints;
 
 impl EcsmConstraints {
-    /// Byte `m` of the base-point order `P` (zero beyond 32 bytes).
+    /// Byte `m` of the field prime `P` (zero beyond 32 bytes).
     fn p_byte_expr<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         m: usize,
@@ -692,16 +738,21 @@ impl EcsmConstraints {
                 s = s - byte(cols::X2, 32, i);
             }
             Relation::Yg => {
-                // Σ (yG_j·yG_{i-j} + P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − b_i
+                // Σ (yG_j·yG_{i-j} + µ·P_j·P_{i-j} − x2_j·xG_{i-j} − q1_j·P_{i-j}) − µ·b_i
+                // Both the p² offset and the curve constant b are µ-gated: they vanish on
+                // padding rows (µ=0), so all columns (including q1) can pad to zero.
+                // Factor µ out of the p² sum (µ·ΣP_j·P_{i-j}) as ECDAS `rq()` does, so µ
+                // is applied once per limb instead of once per term.
+                let mu = b.main(0, cols::MU);
+                let mut p2 = b.zero();
                 for j in 0..=i {
                     s = s + byte(cols::YG, 32, j) * byte(cols::YG, 32, i - j);
-                    s = s + Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j);
+                    p2 = p2 + Self::p_byte_expr(b, j) * Self::p_byte_expr(b, i - j);
                     s = s - byte(cols::X2, 32, j) * byte(cols::XG, 32, i - j);
                     s = s - byte(cols::Q1, 33, j) * Self::p_byte_expr(b, i - j);
                 }
+                s = s + mu.clone() * p2;
                 if i == 0 {
-                    // Only the curve constant `b` is µ-gated (µ·B); B_i = 0 for i ≥ 1.
-                    let mu = b.main(0, cols::MU);
                     let curve_b = b.const_base(B);
                     s = s - mu * curve_b;
                 }
@@ -730,24 +781,34 @@ impl EcsmConstraints {
         two_pow_8 * c_i - c_prev - Self::s_i(b, relation, i)
     }
 
-    /// The 8 word-carries of the `kind` addition.
+    /// The 8 word-carries of the `kind` addition. `k` is summed from its 256 individual
+    /// bit columns; `xG`/`xR` from their 32 byte columns.
     fn carry_chain<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         kind: OverflowKind,
     ) -> [B::Expr; 8] {
         let hl = kind.addend_hl_base();
-        let bl = kind.sum_bl_base();
+        let base = kind.sum_col_base();
         let mut c: [B::Expr; 8] = std::array::from_fn(|_| b.zero());
         let mut prev = b.zero();
         for (i, slot) in c.iter_mut().enumerate() {
             // addend1 word i (from halfwords): hl[2i] + 2^16·hl[2i+1]
             let shift_16 = b.const_base(1u64 << 16);
             let addend1 = b.main(0, hl + 2 * i) + b.main(0, hl + 2 * i + 1) * shift_16;
-            // sum word i (from bytes): Σ bl[4i+b]·2^{8b}
+            // sum word i: from individual bits (k) or bytes (xG/xR).
             let mut sum = b.zero();
-            for byte in 0..4 {
-                let shift = b.const_base(1u64 << (8 * byte));
-                sum = sum + b.main(0, bl + 4 * i + byte) * shift;
+            if kind.sum_is_bits() {
+                // k is stored as 256 individual bits; word i = bits 32i..32i+31.
+                for bit in 0..32 {
+                    let shift = b.const_base(1u64 << bit);
+                    sum = sum + b.main(0, base + 32 * i + bit) * shift;
+                }
+            } else {
+                // xG/xR stored as 32 bytes; word i = bytes 4i..4i+3.
+                for byte in 0..4 {
+                    let shift = b.const_base(1u64 << (8 * byte));
+                    sum = sum + b.main(0, base + 4 * i + byte) * shift;
+                }
             }
             let addend0 = b.const_base(kind.const_word(i));
             let inv = b.const_base(INV_SHIFT_32);
@@ -760,7 +821,7 @@ impl EcsmConstraints {
 }
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
-    // The k<N / xR<p carry-bit constraints (µ·c·(1−c)) are degree 3.
+    // The xG<p / k<N / xR<p carry-bit constraints (µ·c·(1−c)) are degree 3.
     fn max_degree(&self) -> usize {
         3
     }
@@ -772,6 +833,25 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(0, mu.clone() * (one - mu));
 
         let mut idx = 1;
+
+        // idx 1..257: IS_BIT(k[i]) for the 256 scalar bits: k·(1−k). (deg 2)
+        for i in 0..256 {
+            let k = b.main(0, cols::k_bit(i));
+            let one = b.one();
+            b.emit_base(idx, k.clone() * (one - k));
+            idx += 1;
+        }
+
+        // idx 257: KBitsZeroOnPadding: (Σ k_bit[i])·(1−µ). All scalar bits must be zero on
+        // padding rows (µ=0), else a prover could fire phantom `Bit` bus receives. (deg 2)
+        let mut k_sum = b.zero();
+        for i in 0..256 {
+            k_sum = k_sum + b.main(0, cols::k_bit(i));
+        }
+        let mu = b.main(0, cols::MU);
+        let one = b.one();
+        b.emit_base(idx, k_sum * (one - mu));
+        idx += 1;
 
         // X2 convolution: 64 carries (deg 2) + closing c0(63) (deg 1).
         for i in 0..64 {
@@ -793,14 +873,14 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
         b.emit_base(idx, c1_last);
         idx += 1;
 
-        // idx 131: IS_BIT(q1[32]): x·(1−x). (deg 2)
+        // idx 388: IS_BIT(q1[32]): x·(1−x). (deg 2)
         let q1_32 = b.main(0, cols::q1(32));
         let one = b.one();
         b.emit_base(idx, q1_32.clone() * (one - q1_32));
         idx += 1;
 
-        // k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
-        for kind in [OverflowKind::KLtN, OverflowKind::XrLtP] {
+        // xG < p, k < N and xR < p: 7 carry bits (deg 3) + overflow-required (deg 2) each.
+        for kind in [OverflowKind::XgLtP, OverflowKind::KLtN, OverflowKind::XrLtP] {
             let c = Self::carry_chain(b, kind);
             for ci in c.iter().take(7) {
                 // µ · c_i · (1 − c_i)
@@ -816,6 +896,6 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EcsmConstraints {
             idx += 1;
         }
 
-        debug_assert_eq!(idx, 148);
+        debug_assert_eq!(idx, 413);
     }
 }

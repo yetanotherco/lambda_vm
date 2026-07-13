@@ -24,7 +24,7 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -440,7 +440,7 @@ pub fn generate_cpu_trace(
     let n = operations.len();
     let num_rows = n.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );

@@ -19,7 +19,7 @@
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 
 // =========================================================================
 // Column indices for BYTEWISE table
@@ -107,7 +107,7 @@ pub fn generate_bytewise_trace(
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );

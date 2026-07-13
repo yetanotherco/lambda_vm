@@ -393,6 +393,10 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
+	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
+	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

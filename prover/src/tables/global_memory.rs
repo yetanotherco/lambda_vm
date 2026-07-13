@@ -123,7 +123,7 @@ pub fn generate_global_trace(
     );
 
     let num_rows = page_size; // One row per byte in the page
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut data = crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS);
 
     for offset in 0..page_size {
         let byte_addr = page_base + (offset as u64);

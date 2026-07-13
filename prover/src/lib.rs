@@ -52,9 +52,9 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_scalar_air,
-    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
+    create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
     create_register_air, create_shift_air, create_store_air,
 };
@@ -81,8 +81,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ec_scalar, ecdas.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, register, ecsm, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -266,7 +266,6 @@ pub(crate) struct VmAirs {
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
-    pub ec_scalar: VmAir,
     pub ecdas: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
@@ -292,7 +291,6 @@ impl VmAirs {
             (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
-            (self.ec_scalar.as_ref(), &mut traces.ec_scalar, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
@@ -367,7 +365,6 @@ impl VmAirs {
             self.keccak_rnd.as_ref(),
             self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
-            self.ec_scalar.as_ref(),
             self.ecdas.as_ref(),
             self.register.as_ref(),
         ];
@@ -525,7 +522,6 @@ impl VmAirs {
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
         ));
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
-        let ec_scalar: VmAir = Box::new(create_ec_scalar_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
@@ -632,7 +628,6 @@ impl VmAirs {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             register,
             pages,
