@@ -4599,8 +4599,14 @@ mod gpu_fill_tests {
         )
         .expect("device MEMW_R fill must run on a box with a CUDA backend");
 
-        assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::MEMW_REGISTER_NCOLS);
-        assert_eq!(gpu_u64, cpu_u64, "device MEMW_R fill must be byte-identical to the CPU fill");
+        assert_eq!(
+            gpu_u64.len(),
+            num_rows * math_cuda::trace_cpu::MEMW_REGISTER_NCOLS
+        );
+        assert_eq!(
+            gpu_u64, cpu_u64,
+            "device MEMW_R fill must be byte-identical to the CPU fill"
+        );
     }
 
     /// MEMW_A (aligned memory — the biggest remaining uploader) device fill must be
@@ -4712,7 +4718,10 @@ mod gpu_fill_tests {
         }
         let gpu = math_cuda::trace_cpu::gpu_build_load_trace_host(&packed, n, num_rows)
             .expect("device LOAD build must run on a box with a CUDA backend");
-        assert_eq!(gpu, cpu_u64, "device LOAD table must be byte-identical to the CPU fill");
+        assert_eq!(
+            gpu, cpu_u64,
+            "device LOAD table must be byte-identical to the CPU fill"
+        );
     }
 
     /// STORE device fill byte-parity (widths 1/2/4/8 via `bytes`, full-value
@@ -4747,7 +4756,10 @@ mod gpu_fill_tests {
         }
         let gpu = math_cuda::trace_cpu::gpu_build_store_trace_host(&packed, n, num_rows)
             .expect("device STORE build must run on a box with a CUDA backend");
-        assert_eq!(gpu, cpu_u64, "device STORE table must be byte-identical to the CPU fill");
+        assert_eq!(
+            gpu, cpu_u64,
+            "device STORE table must be byte-identical to the CPU fill"
+        );
     }
 
     /// SHIFT device fill byte-parity: the kernel recomputes the full aux
@@ -4794,7 +4806,13 @@ mod gpu_fill_tests {
         // Also a few large shift_amounts (high SHIFT_B1/H1/HIGH limbs) — real ops
         // carry the full rv2 on the ALU bus.
         for &sa in &[0x1_0000u64, 0xFFFF_FFFFu64, 0x1234_5678_9ABCu64, u64::MAX] {
-            ops.push(shift::ShiftOperation::new(0xDEAD_BEEF_CAFE_1234, sa, false, true, false));
+            ops.push(shift::ShiftOperation::new(
+                0xDEAD_BEEF_CAFE_1234,
+                sa,
+                false,
+                true,
+                false,
+            ));
         }
         let n = ops.len();
         let num_rows = n.next_power_of_two().max(4);
@@ -4811,7 +4829,10 @@ mod gpu_fill_tests {
         }
         let gpu = math_cuda::trace_cpu::gpu_build_shift_trace_host(&packed, n, num_rows)
             .expect("device SHIFT build must run on a box with a CUDA backend");
-        assert_eq!(gpu, cpu_u64, "device SHIFT table must be byte-identical to the CPU fill");
+        assert_eq!(
+            gpu, cpu_u64,
+            "device SHIFT table must be byte-identical to the CPU fill"
+        );
     }
 
     /// LT device fill: dedup rides the permutation-invariant ALU bus, so the row

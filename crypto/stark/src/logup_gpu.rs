@@ -487,7 +487,13 @@ where
         None => math_cuda::logup::ResidentMain::Host(&main_flat),
     };
     let ra = math_cuda::logup::logup_aux_resident(
-        main, trace_len, &md, &alpha_flat, z_arr, inv_n, &stream,
+        main,
+        trace_len,
+        &md,
+        &alpha_flat,
+        z_arr,
+        inv_n,
+        &stream,
     )
     .ok()?;
     crate::gpu_lde::GPU_LOGUP_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

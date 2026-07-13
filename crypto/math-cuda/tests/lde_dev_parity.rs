@@ -44,19 +44,19 @@ fn assert_dev_matches_host(log_n: u64, m: usize, blowup: usize, seed: u64) {
     let weights = coset_weights(n, coset_offset);
 
     // Host path: uploads `row_major` internally.
-    let (h_handle, h_lde) =
-        math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(&row_major, n, m, blowup, &weights)
-            .expect("host keep");
+    let (h_handle, h_lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
+        &row_major, n, m, blowup, &weights,
+    )
+    .expect("host keep");
 
     // Device path: pre-upload the SAME matrix, then run the device-input LDE.
     let be = backend().unwrap();
     let stream = be.next_stream();
     let dev = stream.clone_htod(&row_major).expect("upload matrix");
     stream.synchronize().expect("sync upload");
-    let (d_handle, d_lde) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_dev(
-        &dev, n, m, blowup, &weights,
-    )
-    .expect("dev keep");
+    let (d_handle, d_lde) =
+        math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep_dev(&dev, n, m, blowup, &weights)
+            .expect("dev keep");
 
     assert_eq!(
         h_handle.tree.as_ref().unwrap().root,

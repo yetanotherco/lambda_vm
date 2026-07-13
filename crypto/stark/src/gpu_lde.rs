@@ -564,7 +564,11 @@ where
     // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
     let lde_out: Vec<FieldElement<E>> = unsafe {
         let mut v = std::mem::ManuallyDrop::new(lde_u64);
-        Vec::from_raw_parts(v.as_mut_ptr() as *mut FieldElement<E>, v.len(), v.capacity())
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
     };
 
     let root = handle.tree.as_ref()?.root;

@@ -170,7 +170,13 @@ pub fn gpu_build_lt_trace(packed_ops: &[u64], n: usize, num_rows: usize) -> Resu
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, lt_kernel(be), packed_ops, n, num_rows, LT_NCOLS, LT_STRIDE,
+        &stream,
+        lt_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        LT_NCOLS,
+        LT_STRIDE,
     )?;
     stream.synchronize()?;
     Ok(out)
@@ -181,7 +187,13 @@ pub fn gpu_build_lt_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) ->
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, lt_kernel(be), packed_ops, n, num_rows, LT_NCOLS, LT_STRIDE,
+        &stream,
+        lt_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        LT_NCOLS,
+        LT_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;
@@ -190,22 +202,42 @@ pub fn gpu_build_lt_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) ->
 
 /// Build one SHIFT trace-table chunk on device (residency-ready row-major buffer).
 /// The kernel recomputes the shift aux from the packed inputs (see `trace_cpu.cu`).
-pub fn gpu_build_shift_trace(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<CudaSlice<u64>> {
+pub fn gpu_build_shift_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, shift_kernel(be), packed_ops, n, num_rows, SHIFT_NCOLS, SHIFT_STRIDE,
+        &stream,
+        shift_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        SHIFT_NCOLS,
+        SHIFT_STRIDE,
     )?;
     stream.synchronize()?;
     Ok(out)
 }
 
 /// Host-returning SHIFT build for byte-parity tests.
-pub fn gpu_build_shift_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<Vec<u64>> {
+pub fn gpu_build_shift_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, shift_kernel(be), packed_ops, n, num_rows, SHIFT_NCOLS, SHIFT_STRIDE,
+        &stream,
+        shift_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        SHIFT_NCOLS,
+        SHIFT_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;
@@ -213,22 +245,42 @@ pub fn gpu_build_shift_trace_host(packed_ops: &[u64], n: usize, num_rows: usize)
 }
 
 /// Build one LOAD trace-table chunk on device (residency-ready row-major buffer).
-pub fn gpu_build_load_trace(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<CudaSlice<u64>> {
+pub fn gpu_build_load_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, load_kernel(be), packed_ops, n, num_rows, LOAD_NCOLS, LOAD_STRIDE,
+        &stream,
+        load_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        LOAD_NCOLS,
+        LOAD_STRIDE,
     )?;
     stream.synchronize()?;
     Ok(out)
 }
 
 /// Host-returning LOAD build for byte-parity tests.
-pub fn gpu_build_load_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<Vec<u64>> {
+pub fn gpu_build_load_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, load_kernel(be), packed_ops, n, num_rows, LOAD_NCOLS, LOAD_STRIDE,
+        &stream,
+        load_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        LOAD_NCOLS,
+        LOAD_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;
@@ -236,22 +288,42 @@ pub fn gpu_build_load_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) 
 }
 
 /// Build one STORE trace-table chunk on device (residency-ready row-major buffer).
-pub fn gpu_build_store_trace(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<CudaSlice<u64>> {
+pub fn gpu_build_store_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, store_kernel(be), packed_ops, n, num_rows, STORE_NCOLS, STORE_STRIDE,
+        &stream,
+        store_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        STORE_NCOLS,
+        STORE_STRIDE,
     )?;
     stream.synchronize()?;
     Ok(out)
 }
 
 /// Host-returning STORE build for byte-parity tests.
-pub fn gpu_build_store_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<Vec<u64>> {
+pub fn gpu_build_store_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
     let out = build_interleaved_on(
-        &stream, store_kernel(be), packed_ops, n, num_rows, STORE_NCOLS, STORE_STRIDE,
+        &stream,
+        store_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        STORE_NCOLS,
+        STORE_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;
@@ -316,7 +388,9 @@ pub fn gpu_fill_memw_register(
 ) -> Result<CudaSlice<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
-    let buf = fill_memw_register_on(&stream, reg_addr, ts, value, is_read, old_value, old_ts, num_rows)?;
+    let buf = fill_memw_register_on(
+        &stream, reg_addr, ts, value, is_read, old_value, old_ts, num_rows,
+    )?;
     stream.synchronize()?;
     Ok(buf)
 }
@@ -334,7 +408,9 @@ pub fn gpu_fill_memw_register_host(
 ) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
-    let buf = fill_memw_register_on(&stream, reg_addr, ts, value, is_read, old_value, old_ts, num_rows)?;
+    let buf = fill_memw_register_on(
+        &stream, reg_addr, ts, value, is_read, old_value, old_ts, num_rows,
+    )?;
     let host = stream.clone_dtoh(&buf)?;
     stream.synchronize()?;
     Ok(host)

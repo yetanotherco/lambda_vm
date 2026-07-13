@@ -90,7 +90,9 @@ fn pack_cpu_ops(chunk: &[CpuOperation]) -> Vec<u64> {
 /// device buffer, the aux build reads the resident snapshot, queries gather from
 /// the device tree). Returns `None` if the GPU build fails, so the caller can
 /// fall back to the CPU generator.
-fn build_cpu_chunk(chunk: &[CpuOperation]) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+fn build_cpu_chunk(
+    chunk: &[CpuOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
     let n = chunk.len();
     let num_rows = n.next_power_of_two().max(4);
     let last_ts = chunk.last().map(|op| op.timestamp).unwrap_or(0);
@@ -293,12 +295,13 @@ pub(crate) fn pack_load_op(op: &LoadOperation) -> [u64; math_cuda::trace_cpu::LO
 
 /// Pack one `StoreOperation` into the `store_fill` stride (see `trace_cpu.cu`).
 pub(crate) fn pack_store_op(op: &StoreOperation) -> [u64; math_cuda::trace_cpu::STORE_STRIDE] {
-    let flags =
-        (op.write2 as u64) | ((op.write4 as u64) << 1) | ((op.write8 as u64) << 2);
+    let flags = (op.write2 as u64) | ((op.write4 as u64) << 1) | ((op.write8 as u64) << 2);
     [flags, op.base_address, op.timestamp, op.value]
 }
 
-fn build_load_chunk(chunk: &[LoadOperation]) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+fn build_load_chunk(
+    chunk: &[LoadOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
     let n = chunk.len();
     let num_rows = n.next_power_of_two().max(4);
     let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::LOAD_STRIDE);
@@ -381,7 +384,8 @@ pub(crate) fn gpu_build_store_tables(
 /// recomputes bit_shift/zbs/x/y/limb_shift/out, so only 3 u64/op upload.
 pub(crate) fn pack_shift_op(op: &ShiftOperation) -> [u64; math_cuda::trace_cpu::SHIFT_STRIDE] {
     let h = &op.in_halves;
-    let value = (h[0] as u64) | ((h[1] as u64) << 16) | ((h[2] as u64) << 32) | ((h[3] as u64) << 48);
+    let value =
+        (h[0] as u64) | ((h[1] as u64) << 16) | ((h[2] as u64) << 32) | ((h[3] as u64) << 48);
     let flags = (op.direction as u64) | ((op.signed as u64) << 1) | ((op.word_instr as u64) << 2);
     [value, op.shift_amount, flags]
 }
@@ -438,7 +442,9 @@ pub(crate) fn pack_lt_op(op: &LtOperation, mult: u64) -> [u64; math_cuda::trace_
 /// same per-chunk HashMap `generate_lt_trace` uses), then the unique ops + summed
 /// multiplicities are filled on device. LT rides the permutation-invariant ALU
 /// bus, so any row order is valid (validated by multiset/prove, not byte order).
-fn build_lt_chunk(chunk: &[LtOperation]) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+fn build_lt_chunk(
+    chunk: &[LtOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
     let mut map: HashMap<LtOperation, u64> = HashMap::new();
     for op in chunk {
         *map.entry(op.clone()).or_insert(0) += 1;

@@ -794,7 +794,11 @@ pub trait IsStarkProver<
                     Field,
                     BatchedMerkleTreeBackend<Field>,
                 >(
-                    dev, n, num_cols, domain.blowup_factor, &twiddles.coset_weights
+                    dev,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -844,9 +848,7 @@ pub trait IsStarkProver<
                 // This table's main matrix was uploaded host->device for the LDE.
                 // Counts the transfer the on-GPU trace generator will remove.
                 #[cfg(feature = "instruments")]
-                crate::instruments::accum_main_h2d(
-                    trace_slice.len() * std::mem::size_of::<u64>(),
-                );
+                crate::instruments::accum_main_h2d(trace_slice.len() * std::mem::size_of::<u64>());
                 return Ok((
                     TableCommit::plain(tree, root),
                     (main_data, num_cols),
