@@ -136,7 +136,8 @@ fn test_generate_page_trace_with_accesses() {
 #[test]
 fn test_bus_interactions() {
     let interactions = bus_interactions(0); // page_base = 0
-    assert_eq!(interactions.len(), 3); // C1+C2 (batched ARE_BYTES), C3, C4
+    // bench/page-drop-arebytes: ARE_BYTES (C1+C2) removed → only C3, C4 remain.
+    assert_eq!(interactions.len(), 2);
 }
 
 #[test]
@@ -144,7 +145,8 @@ fn test_bus_interactions_high_address() {
     // Test with high address like stack region
     let stack_page = STACK_TOP & !(DEFAULT_PAGE_SIZE as u64 - 1);
     let interactions = bus_interactions(stack_page);
-    assert_eq!(interactions.len(), 3);
+    // bench/page-drop-arebytes: ARE_BYTES (C1+C2) removed → only C3, C4 remain.
+    assert_eq!(interactions.len(), 2);
 }
 
 // =========================================================================

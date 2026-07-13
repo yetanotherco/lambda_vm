@@ -2107,6 +2107,9 @@ pub(crate) fn build_init_page_data<I: ImageSource>(image: &I) -> HashMap<u64, Ve
     init_page_data
 }
 
+// EXPERIMENT (bench/page-drop-arebytes): no longer called — PAGE's ARE_BYTES range
+// check was removed. Kept (dead) so the change is a trivial one-line revert.
+#[allow(dead_code)]
 fn collect_bitwise_from_page<I: ImageSource>(
     image: &I,
     memory_state: &MemoryState,
@@ -3050,7 +3053,7 @@ fn build_traces<I: ImageSource + Sync>(
     let dvrm_chunk = max_rows.dvrm;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
-    let mut collectors: Vec<Collector> = vec![
+    let collectors: Vec<Collector> = vec![
         Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
@@ -3078,13 +3081,11 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
-    if let Some(image) = initial_image
-        && !l2g_memory_bookend
-    {
-        collectors.push(Box::new(move |h| {
-            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
-        }));
-    }
+    // EXPERIMENT (bench/page-drop-arebytes): PAGE's per-row ARE_BYTES[init, fini] range
+    // check is removed on this branch (see `page::bus_interactions`), so its multiplicity
+    // must NOT be registered here or the AreBytes bus would over-count on the receiver
+    // side and fail to balance. The `collect_bitwise_from_page` collector is therefore
+    // no longer pushed. (`initial_image`/`l2g_memory_bookend` remain used elsewhere.)
 
     let mut base = bitwise::BitwiseHistogram::new();
 

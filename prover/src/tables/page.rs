@@ -459,21 +459,12 @@ pub fn bus_interactions(page_base: u64) -> Vec<BusInteraction> {
     let address_hi = BusValue::constant(page_base_hi);
 
     vec![
-        // PAGE-C1+C2: ARE_BYTES[init, fini] - range check both byte values in one interaction
-        BusInteraction::sender(
-            BusId::AreBytes,
-            Multiplicity::One,
-            vec![
-                BusValue::Packed {
-                    start_column: cols::INIT,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::FINI,
-                    packing: Packing::Direct,
-                },
-            ],
-        ),
+        // EXPERIMENT (bench/page-drop-arebytes): the PAGE-C1+C2 ARE_BYTES[init, fini]
+        // per-row range check has been REMOVED to mirror what continuation's
+        // global_memory table already omits, isolating that check's proving cost. The
+        // matching multiplicity registration in `collect_bitwise_from_page` is dropped
+        // in lockstep so the AreBytes bus still balances (honest proofs still verify).
+        // NOT sound for production — benchmark isolation only.
         // PAGE-C3: memory[0, address, 0, init] - receive initial memory token
         BusInteraction::receiver(
             BusId::Memory,
