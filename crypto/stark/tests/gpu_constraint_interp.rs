@@ -381,9 +381,11 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     let b_is_aux: Vec<bool> = b_defs.iter().map(|&(a, _)| a).collect();
     let b_value: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
     let b_beta: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
-    // b_z_inv laid out b*num_rows + row.
-    let b_z_inv: Vec<Fp> = (0..num_boundary * NUM_ROWS)
-        .map(|_| fp(rng.next_u64()))
+    // b_z_inv: one num_rows-length vector per boundary constraint (the
+    // per-constraint shape the evaluator hands over; device layout is still
+    // b*num_rows + row).
+    let b_z_inv: Vec<Vec<Fp>> = (0..num_boundary)
+        .map(|_| (0..NUM_ROWS).map(|_| fp(rng.next_u64())).collect())
         .collect();
 
     // Upload the LDE and build handles.
@@ -472,15 +474,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
 
         // Boundary terms read the current row (offset 0).
         let b_terms: Vec<(bool, usize, Fp3, Fp3, Fp)> = (0..num_boundary)
-            .map(|b| {
-                (
-                    b_is_aux[b],
-                    b_col[b],
-                    b_value[b],
-                    b_beta[b],
-                    b_z_inv[b * NUM_ROWS + r],
-                )
-            })
+            .map(|b| (b_is_aux[b], b_col[b], b_value[b], b_beta[b], b_z_inv[b][r]))
             .collect();
 
         let h_cpu = composition_oracle_row(

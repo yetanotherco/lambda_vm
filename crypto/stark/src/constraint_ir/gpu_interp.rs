@@ -63,6 +63,15 @@ unsafe fn base_slice_to_u64<F: IsField>(xs: &[FieldElement<F>]) -> Vec<u64> {
     raw.to_vec()
 }
 
+/// Borrowing sibling of [`base_slice_to_u64`]: the same reinterpret with no
+/// copy, for buffers that go straight to a device upload.
+///
+/// # Safety
+/// Same contract: the caller must have established `F == GoldilocksField`.
+unsafe fn base_slice_as_u64<F: IsField>(xs: &[FieldElement<F>]) -> &[u64] {
+    unsafe { std::slice::from_raw_parts(xs.as_ptr() as *const u64, xs.len()) }
+}
+
 /// Per-proof accumulation inputs (in `FieldElement` form) for
 /// [`try_eval_composition_gpu`], mirroring the CPU accumulation in
 /// `constraints::evaluator`.
@@ -79,8 +88,11 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     pub b_value: &'a [FieldElement<E>],
     /// Boundary coefficients β_b.
     pub b_beta: &'a [FieldElement<E>],
-    /// Boundary zerofier inverses (base field), laid out `b * num_rows + row`.
-    pub b_z_inv: &'a [FieldElement<F>],
+    /// Boundary zerofier inverses (base field): one `num_rows`-length vector
+    /// per boundary constraint, borrowed as-is from the evaluator — the device
+    /// layer uploads each slice into the flat `b * num_rows + row` device
+    /// buffer, so no flattened host copy is ever built.
+    pub b_z_inv: &'a [Vec<FieldElement<F>>],
 }
 
 /// The lowered device program plus the packed per-proof uniforms shared by both
@@ -177,7 +189,12 @@ where
     let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
     let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
     let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
-    let b_z_inv = unsafe { base_slice_to_u64(inputs.b_z_inv) };
+    let b_z_inv: Vec<&[u64]> = inputs
+        .b_z_inv
+        .iter()
+        // SAFETY: `F` is Goldilocks (established in `lower_and_pack`).
+        .map(|v| unsafe { base_slice_as_u64(v.as_slice()) })
+        .collect();
     let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
     let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
 

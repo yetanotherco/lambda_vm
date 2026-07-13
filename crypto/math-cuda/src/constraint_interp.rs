@@ -139,9 +139,11 @@ pub struct CompositionAccum<'a> {
     pub b_value: &'a [u64],
     /// Boundary combination coefficients β_b (`num_boundary * 3` u64, ext3).
     pub b_beta: &'a [u64],
-    /// Boundary zerofier inverses, base field (`num_boundary * num_rows` u64),
-    /// indexed `b * num_rows + row`.
-    pub b_z_inv: &'a [u64],
+    /// Boundary zerofier inverses, base field: one `num_rows`-length slice per
+    /// boundary constraint. Uploaded slice-by-slice into one device buffer
+    /// (kernel indexing `b * num_rows + row`), so the caller never materializes
+    /// a flattened host copy.
+    pub b_z_inv: &'a [&'a [u64]],
 }
 
 /// Evaluate the constraints AND fuse the composition accumulation on-device:
@@ -174,10 +176,10 @@ pub fn eval_composition_on_device(
     debug_assert_eq!(nodes.len(), 2 * num_nodes, "2 u64 per node");
     debug_assert_eq!(accum.beta_trans.len(), num_roots * 3, "β per root");
     let num_boundary = accum.b_col.len();
-    debug_assert_eq!(
-        accum.b_z_inv.len(),
-        num_boundary * num_rows,
-        "z_b_inv shape"
+    debug_assert_eq!(accum.b_z_inv.len(), num_boundary, "z_b_inv per boundary");
+    debug_assert!(
+        accum.b_z_inv.iter().all(|s| s.len() == num_rows),
+        "z_b_inv slice shape"
     );
     // The kernel indexes these by `num_boundary`; a caller mismatch would be an
     // OOB device read rather than a clean panic, so pin all boundary shapes.
@@ -210,7 +212,13 @@ pub fn eval_composition_on_device(
     let d_b_is_aux = stream.clone_htod(accum.b_is_aux)?;
     let d_b_value = stream.clone_htod(accum.b_value)?;
     let d_b_beta = stream.clone_htod(accum.b_beta)?;
-    let d_b_z_inv = stream.clone_htod(accum.b_z_inv)?;
+    // Per-slice upload straight from the caller's per-constraint vectors into
+    // the flat `b * num_rows + row` device layout — no flattened host copy.
+    let mut d_b_z_inv = stream.alloc_zeros::<u64>((num_boundary * num_rows).max(1))?;
+    for (b, slice) in accum.b_z_inv.iter().enumerate() {
+        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+        stream.memcpy_htod(*slice, &mut dst)?;
+    }
 
     let max_grid = MAX_THREADS / BLOCK_DIM;
     let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);

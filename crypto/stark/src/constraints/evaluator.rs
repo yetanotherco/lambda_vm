@@ -340,8 +340,6 @@ where
         let b_is_aux: Vec<bool> = bcs.iter().map(|c| c.is_aux).collect();
         let b_value: Vec<FieldElement<FieldExtension>> =
             bcs.iter().map(|c| c.value.clone()).collect();
-        let b_z_inv_flat: Vec<FieldElement<Field>> =
-            boundary_z_inv.iter().flatten().cloned().collect();
 
         let inputs = crate::constraint_ir::gpu_interp::CompositionInputs {
             beta_trans: transition_coefficients,
@@ -350,7 +348,9 @@ where
             b_is_aux: &b_is_aux,
             b_value: &b_value,
             b_beta: boundary_coefficients,
-            b_z_inv: &b_z_inv_flat,
+            // Per-constraint vectors as-is; the device layer uploads each slice
+            // directly (no flattened host copy of num_boundary × lde_size).
+            b_z_inv: boundary_z_inv,
         };
 
         let next_step = lde_trace.lde_step_size; // == blowup_factor (single-row steps)
