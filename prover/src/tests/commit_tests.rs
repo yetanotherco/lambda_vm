@@ -386,8 +386,10 @@ fn test_address_incr_overflow() {
 
 #[test]
 fn test_word_timestamp() {
-    // Timestamps are single 32-bit Words.
-    let ts: u64 = 0x0000_0064; // 100
+    // Timestamps are single 32-bit Words: exercise the top of the range (u32::MAX),
+    // where the 2^32-1 finalization sentinel has zero headroom, to confirm a full-width
+    // Word stores intact in the single TIMESTAMP column.
+    let ts: u64 = u32::MAX as u64; // 0xFFFF_FFFF
     let ops = vec![op(ts, 0, 0x5000, 1, true, false, 0xAB)];
     let trace = generate_commit_trace(&ops);
     let r0 = trace.main_table.get_row(0);

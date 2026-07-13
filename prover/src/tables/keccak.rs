@@ -219,7 +219,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
                 column: cols::addr(7),
             },
         ]);
-        let mut values = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(23);
         // old[0..7] = addr as WL + 6 zeros
         values.push(addr_lo.clone());
         values.push(addr_hi.clone());
@@ -363,7 +363,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     }
 
     // 7. MEMW interactions: 25 combined read+write per lane (per spec)
-    // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts[2], w2, w4, w8] = 24
+    // Format: [old[8], is_register, addr_lo32, addr_hi32, value[8], ts, w2, w4, w8] = 23
     // old = input_state (read), value = output_state (write)
     for lane_idx in 0..25 {
         let x = lane_idx % 5;
@@ -391,7 +391,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             },
         ]);
 
-        let mut values = Vec::with_capacity(24);
+        let mut values = Vec::with_capacity(23);
         // old[0..8] = input_state bytes (the value being read)
         for b in 0..8 {
             values.push(BusValue::Packed {

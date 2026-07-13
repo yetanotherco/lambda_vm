@@ -13,8 +13,8 @@
 //!
 //! ## Memory Tables
 //!
-//! - **MEMW**: Memory word read/write table (unaligned/split-timestamp path, 49 cols, 26 interactions)
-//! - **MEMW_A**: Memory word read/write table (aligned fast path, 29 cols, 20 interactions)
+//! - **MEMW**: Memory word read/write table (unaligned/split-timestamp path, 40 cols, 26 interactions)
+//! - **MEMW_A**: Memory word read/write table (aligned fast path, 27 cols, 20 interactions)
 //! - **LOAD**: Memory load with extension table
 //! - **PAGE**: Paged memory init/final table (one per used page)
 //! - **REGISTER**: Register init/final table for x0-x31, x254, and x255 word addresses
@@ -70,16 +70,16 @@ pub const STATIC_BLOWUP_FACTORS: &[u8] = &[2, 4, 8];
 ///
 /// | Table   | Main | Bus | Eff.width | Max rows |
 /// |---------|------|-----|-----------|----------|
-/// | MEMW    |  49  |  26 |    127    |  2^19    |
-/// | MEMW_A  |  29  |  20 |     89    |  2^19 *  |
+/// | MEMW    |  40  |  26 |    118    |  2^19    |
+/// | MEMW_A  |  27  |  20 |     87    |  2^19 *  |
 /// | CPU     |  74  |  40 |    194    |  2^19    |
 /// | DVRM    |  34  |  34 |    136    |  2^19    |
 /// | MUL     |  26  |  16 |     74    |  2^20    |
 /// | LT      |  15  |   9 |     42    |  2^20    |
 /// | SHIFT   |  27  |  15 |     72    |  2^20    |
-/// | LOAD    |  18  |   5 |     33    |  2^20    |
+/// | LOAD    |  17  |   5 |     32    |  2^20    |
 /// | BRANCH  |  14  |   6 |     32    |  2^20    |
-/// | MEMW_R  |  10  |   7 |     31    |  2^20    |
+/// | MEMW_R  |   9  |   7 |     30    |  2^20    |
 pub mod max_rows {
     pub const CPU: usize = 1 << 19; // 524,288   — eff. width 194
     pub const MEMW: usize = 1 << 19; // 524,288  — eff. width 127 (baseline)

@@ -47,6 +47,8 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod halt_tests;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod load_tests;

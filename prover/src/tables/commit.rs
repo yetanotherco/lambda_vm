@@ -415,7 +415,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
             ],
         ),
         // 13. MEMW read+write x10 (fd=1 → count) at ts (mult = first)
-        // CO24 format: [old[8], is_register, base_addr[2], value[8], ts[2], w2, w4, w8]
+        // CO24 format: [old[8], is_register, base_addr[2], value[8], ts, w2, w4, w8]
         // old = [1,0,...,0] (asserts x10=1=fd), value = [count_0, count_1, 0,...,0] (writes count)
         BusInteraction::sender(
             BusId::Memw,

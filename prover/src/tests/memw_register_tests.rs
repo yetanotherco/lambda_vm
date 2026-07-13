@@ -80,3 +80,53 @@ fn test_memw_register_trace_generation_write_op() {
     assert_eq!(*trace.get_main(0, cols::MU_READ), FE::from(0u64));
     assert_eq!(*trace.get_main(0, cols::MU_WRITE), FE::from(1u64));
 }
+
+// MEMW_R register-ordering soundness rests on the IS_HALFWORD lookup over
+// `timestamp - old_timestamp - 1`, valid iff the delta `timestamp - old_timestamp`
+// is in `[1, 2^16]` (i.e. the IS_HALF input is in `[0, 2^16-1]`). The trace stores
+// `timestamp` and `old_timestamp` directly, and the bus feeds their difference into
+// the lookup, so these tests pin the two ACCEPT boundaries by checking the stored
+// columns reproduce IS_HALF inputs of exactly 0 and 0xFFFF.
+//
+// The REJECT boundaries (delta = 0 and delta > 2^16) never reach MEMW_R in an honest
+// trace: the routing predicate `is_register_op` diverts them to MEMW_A, and its
+// boundary cases are covered in `trace_builder_tests::routing_tests`
+// (`test_is_register_op_delta_{zero,one,at_boundary,above_boundary}_*`). A forged
+// out-of-range row would then fail the IS_HALFWORD lookup at prove time.
+
+fn register_read_op(timestamp: u64, old_timestamp: u64) -> MemwOperation {
+    MemwOperation::new(true, 2, [42, 7, 0, 0, 0, 0, 0, 0], timestamp, 2, true).with_old(
+        [10, 3, 0, 0, 0, 0, 0, 0],
+        [old_timestamp, old_timestamp, 0, 0, 0, 0, 0, 0],
+    )
+}
+
+#[test]
+fn test_memw_register_is_half_accept_delta_one() {
+    // delta = 1 (minimum): IS_HALF input = timestamp - old_timestamp - 1 = 0.
+    let (old_ts, ts) = (100u64, 101u64);
+    let trace = generate_memw_register_trace(&[register_read_op(ts, old_ts)]);
+
+    assert_eq!(*trace.get_main(0, cols::TIMESTAMP), FE::from(ts));
+    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP), FE::from(old_ts));
+    assert_eq!(
+        ts - old_ts - 1,
+        0,
+        "IS_HALF input at the low accept boundary"
+    );
+}
+
+#[test]
+fn test_memw_register_is_half_accept_delta_max() {
+    // delta = 2^16 (maximum): IS_HALF input = 2^16 - 1 = 0xFFFF (top of the Half range).
+    let (old_ts, ts) = (100u64, 100u64 + (1 << 16));
+    let trace = generate_memw_register_trace(&[register_read_op(ts, old_ts)]);
+
+    assert_eq!(*trace.get_main(0, cols::TIMESTAMP), FE::from(ts));
+    assert_eq!(*trace.get_main(0, cols::OLD_TIMESTAMP), FE::from(old_ts));
+    assert_eq!(
+        ts - old_ts - 1,
+        0xFFFF,
+        "IS_HALF input at the high accept boundary"
+    );
+}
