@@ -44,6 +44,8 @@ pub mod ecdas_tests;
 pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_fill_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]

@@ -43,6 +43,33 @@ pub(crate) fn gpu_trace_disabled() -> bool {
     })
 }
 
+/// Shared GPU table-build dispatcher. Mirrors `chunk_and_generate`'s chunking
+/// (`ops.chunks(max_rows)`, with one empty chunk when there are no ops so the
+/// table still emits its padded minimum), builds each chunk on device via
+/// `build_chunk`, and collects the resident tables. Returns `None` when the
+/// kill-switch is set (`LAMBDA_VM_CPU_TRACE`) or any chunk fails to build, so the
+/// caller falls back to the CPU generator. Every `gpu_build_*_tables` entry point
+/// is a thin wrapper over this.
+fn gpu_build_tables<T>(
+    ops: &[T],
+    max_rows: usize,
+    build_chunk: impl Fn(&[T]) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>>,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let chunks: Vec<&[T]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        tables.push(build_chunk(chunk)?);
+    }
+    Some(tables)
+}
+
 // =============================================================================
 // CPU table (the first table built on device — see GPU-TRACEGEN-DESIGN-V2 §P1)
 // =============================================================================
@@ -121,19 +148,7 @@ pub(crate) fn gpu_build_cpu_trace_tables(
     cpu_ops: &[CpuOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[CpuOperation]> = if cpu_ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        cpu_ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_cpu_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(cpu_ops, max_rows, build_cpu_chunk)
 }
 
 // =============================================================================
@@ -192,19 +207,7 @@ pub(crate) fn gpu_build_memw_register_tables(
     rows: &[RegRow],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[RegRow]> = if rows.is_empty() {
-        vec![&[][..]]
-    } else {
-        rows.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_memw_register_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(rows, max_rows, build_memw_register_chunk)
 }
 
 // =============================================================================
@@ -265,19 +268,7 @@ pub(crate) fn gpu_build_memw_aligned_tables(
     ops: &[MemwOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[MemwOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_memw_aligned_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_memw_aligned_chunk)
 }
 
 // =============================================================================
@@ -328,19 +319,7 @@ pub(crate) fn gpu_build_load_tables(
     ops: &[LoadOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[LoadOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_load_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_load_chunk)
 }
 
 fn build_store_chunk(
@@ -366,19 +345,7 @@ pub(crate) fn gpu_build_store_tables(
     ops: &[StoreOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[StoreOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_store_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_store_chunk)
 }
 
 // =============================================================================
@@ -419,19 +386,7 @@ pub(crate) fn gpu_build_shift_tables(
     ops: &[ShiftOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[ShiftOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_shift_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_shift_chunk)
 }
 
 // =============================================================================
@@ -476,21 +431,8 @@ pub(crate) fn gpu_build_lt_tables(
     ops: &[LtOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
-    // independently (matching `generate_lt_trace` per chunk).
-    let chunks: Vec<&[LtOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_lt_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_lt_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_lt_chunk)
 }
 
 // =============================================================================
@@ -535,21 +477,8 @@ pub(crate) fn gpu_build_eq_tables(
     ops: &[EqOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
-    // independently (matching `generate_eq_trace` per chunk).
-    let chunks: Vec<&[EqOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_eq_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_eq_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_eq_chunk)
 }
 
 // =============================================================================
@@ -598,21 +527,8 @@ pub(crate) fn gpu_build_bytewise_tables(
     ops: &[BytewiseOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
-    // independently (matching `generate_bytewise_trace` per chunk).
-    let chunks: Vec<&[BytewiseOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_bytewise_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_bytewise_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_bytewise_chunk)
 }
 
 // =============================================================================
@@ -671,21 +587,8 @@ pub(crate) fn gpu_build_mul_tables(
     ops: &[(MulOperation, bool)],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW (op, wants_hi) pairs exactly like `chunk_and_generate`; each
-    // chunk dedups independently (matching `generate_mul_trace` per chunk).
-    let chunks: Vec<&[(MulOperation, bool)]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_mul_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_mul_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_mul_chunk)
 }
 
 // =============================================================================
@@ -744,21 +647,8 @@ pub(crate) fn gpu_build_dvrm_tables(
     ops: &[(DvrmOperation, bool)],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW (op, wants_remainder) pairs exactly like `chunk_and_generate`;
-    // each chunk dedups independently (matching `generate_dvrm_trace` per chunk).
-    let chunks: Vec<&[(DvrmOperation, bool)]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_dvrm_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_dvrm_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_dvrm_chunk)
 }
 
 // =============================================================================
@@ -809,21 +699,8 @@ pub(crate) fn gpu_build_branch_tables(
     ops: &[BranchOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
-    // independently (matching `generate_branch_trace` per chunk).
-    let chunks: Vec<&[BranchOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_branch_chunk(chunk)?);
-    }
-    Some(tables)
+    // Each chunk dedups independently (matching `generate_branch_trace` per chunk).
+    gpu_build_tables(ops, max_rows, build_branch_chunk)
 }
 
 // =============================================================================
@@ -883,19 +760,7 @@ pub(crate) fn gpu_build_cpu32_tables(
     ops: &[Cpu32Operation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[Cpu32Operation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_cpu32_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_cpu32_chunk)
 }
 
 // =============================================================================
@@ -958,17 +823,5 @@ pub(crate) fn gpu_build_memw_tables(
     ops: &[MemwOperation],
     max_rows: usize,
 ) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
-    if gpu_trace_disabled() {
-        return None;
-    }
-    let chunks: Vec<&[MemwOperation]> = if ops.is_empty() {
-        vec![&[][..]]
-    } else {
-        ops.chunks(max_rows).collect()
-    };
-    let mut tables = Vec::with_capacity(chunks.len());
-    for chunk in chunks {
-        tables.push(build_memw_chunk(chunk)?);
-    }
-    Some(tables)
+    gpu_build_tables(ops, max_rows, build_memw_chunk)
 }
