@@ -164,6 +164,11 @@ pub fn program_id_from_digest(
 /// order). Folding the roots in makes a supplied-root substitution yield a
 /// different id than an honest native recompute — the binding is that compare
 /// ([`check_attestation`]).
+///
+/// `decode_commitment` needs no length prefix: [`Commitment`] is a fixed-size
+/// `[u8; COMMITMENT_SIZE]`, so its boundary in the hash input is unambiguous.
+/// Pages are self-delimiting too (count-prefixed, each entry a fixed
+/// `u64` base + fixed-size `Commitment`).
 pub fn program_id(
     elf_bytes: &[u8],
     pc_start: u64,
@@ -261,6 +266,11 @@ pub fn expected_program_id(
 /// i.e. the inner proof was not for `trusted_elf_bytes` as the consumer knows
 /// it. The caller must also have verified the outer proof against the pinned
 /// `recursion-<preset>.elf` with `opts = preset.options()`.
+///
+/// This is the low-level primitive: it accepts any `opts`, including
+/// [`MIN_PROOF_OPTIONS`], and is meant for diagnostics/tests that need that
+/// escape hatch. Production consumers should go through
+/// [`check_attestation_for_preset`] instead, which refuses `Preset::Min`.
 pub fn check_attestation(
     committed: &[u8],
     trusted_elf_bytes: &[u8],
@@ -273,4 +283,27 @@ pub fn check_attestation(
         return Ok(None);
     }
     Ok(Some(inner_public_output.to_vec()))
+}
+
+/// [`check_attestation`] gated on [`Preset`] instead of a raw [`ProofOptions`],
+/// refusing `Preset::Min`: that preset (blowup=2, 1 query — [`MIN_PROOF_OPTIONS`])
+/// is intentionally insecure and exists only for cheap diagnostics. A real
+/// consumer pinning its trust to `recursion-min.elf` would accept a 1-query
+/// attestation as if it had 128-bit security. Diagnostics/benches that
+/// legitimately need `Preset::Min` call [`check_attestation`] directly with
+/// [`MIN_PROOF_OPTIONS`].
+pub fn check_attestation_for_preset(
+    committed: &[u8],
+    trusted_elf_bytes: &[u8],
+    preset: Preset,
+) -> Result<Option<Vec<u8>>, Error> {
+    if preset == Preset::Min {
+        return Err(Error::Recursion(
+            "Preset::Min (recursion-min.elf) is insecure (blowup=2, 1 query) and must not be \
+             used as a production consumer's trust gate; call check_attestation directly with \
+             MIN_PROOF_OPTIONS for diagnostics"
+                .to_string(),
+        ));
+    }
+    check_attestation(committed, trusted_elf_bytes, &preset.options())
 }
