@@ -240,6 +240,9 @@ PTX-ISA JIT version check, so a CUDA toolkit *newer* than the driver still loads
 requirement is that the toolkit knows the GPU's compute capability (a too-old toolkit fails loudly
 at `nvcc` build time). cudarc's host-side driver-API symbol set is likewise pinned to a safe floor
 (`cuda-12080`) in `crypto/math-cuda/Cargo.toml`, so no `CUDARC_CUDA_VERSION` env is needed either.
+That pin makes the GPU path require a driver of CUDA >= 12.8 (driver branch 570+ — any
+Blackwell-capable driver qualifies); on an older driver cudarc's eager symbol resolution aborts at
+CUDA init rather than falling back to CPU.
 These groups run automatically on a rented GPU in the merge queue via
 `.github/workflows/gpu-tests.yml` (which filters offers on `cuda_max_good`).
 

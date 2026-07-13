@@ -32,6 +32,8 @@ PROOF="/tmp/abba_gpu_proof.bin"
 
 ROOT="$(git rev-parse --show-toplevel)"
 cd "$ROOT"
+# shellcheck source=scripts/lib/bench_abba_common.sh
+. "$ROOT/scripts/lib/bench_abba_common.sh"
 command -v python3 >/dev/null 2>&1 || { echo "ERROR: python3 required." >&2; exit 1; }
 mkdir -p "$WORK"
 
@@ -45,21 +47,9 @@ ELF="$ROOT/$ELF_REL"
 INPUT="$ROOT/$INPUT_REL"
 
 if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$WORK/cli" ]; then
-  # CUDARC_PIN: compat shim for benching *pre-pin* checkouts. Newer trees pin
-  # cudarc's CUDA version permanently in crypto/math-cuda/Cargo.toml, so the
-  # `cuda-version-from-build-system` anchor is gone and this sed no-ops on them.
-  if [ -n "${CUDARC_PIN:-}" ]; then
-    if grep -q '"cuda-version-from-build-system"' crypto/math-cuda/Cargo.toml; then
-      sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
-        crypto/math-cuda/Cargo.toml
-      echo "    cudarc pinned to ${CUDARC_PIN}"
-    else
-      # Post-pin checkouts already hard-pin cudarc in Cargo.toml, so the anchor
-      # is gone and the sed would silently no-op. Warn rather than mislead.
-      echo "    WARNING: CUDARC_PIN=${CUDARC_PIN} ignored — cudarc is already" >&2
-      echo "             pinned in crypto/math-cuda/Cargo.toml (no build-system anchor to rewrite)." >&2
-    fi
-  fi
+  # CUDARC_PIN compat shim (no-op with a warning on post-pin checkouts) — see
+  # cudarc_pin_apply in scripts/lib/bench_abba_common.sh.
+  cudarc_pin_apply crypto/math-cuda/Cargo.toml
   echo "==> Building cli (features: $BENCH_FEATURES)"
   # Restore the tracked Cargo.toml whether the build succeeds or fails, so a
   # build error (set -e) can't leave the sed edit above in the working tree.
@@ -76,15 +66,11 @@ else
 fi
 
 run_prove() {  # $1 = 0|1 (disable-flag) -> proving time (s)
-  local out t
+  local out
   out="$(LAMBDA_VM_DISABLE_GPU_COMPOSITION="$1" "$WORK/cli" prove "$ELF" \
         --private-input "$INPUT" -o "$PROOF" --time 2>&1)"
   rm -f "$PROOF"
-  t="$(printf '%s\n' "$out" | grep -o 'Proving time: [0-9.]*' | awk '{print $3}')"
-  if [ -z "$t" ]; then
-    echo "ERROR: could not parse 'Proving time':" >&2; printf '%s\n' "$out" >&2; exit 1
-  fi
-  echo "$t"
+  extract_prove_time "$out"
 }
 
 # Warm-up (PTX load, pools, pinned alloc) so pair 1 isn't an outlier.
@@ -104,34 +90,6 @@ for i in $(seq 1 "$N_PAIRS"); do
     "$i" "$N_PAIRS" "$a" "$b" "$(awk "BEGIN{print ($a-$b)/$b*100}")"
 done
 
-python3 - "$WORK/pairs.csv" <<'PY'
-import sys, csv, math
-rows = list(csv.DictReader(open(sys.argv[1])))
-A = [float(r['a_time']) for r in rows]   # GPU composition ON
-B = [float(r['b_time']) for r in rows]   # GPU composition OFF (CPU)
-n = len(A)
-d = [(a - b) / b * 100.0 for a, b in zip(A, B)]
-mean = sum(d) / n
-var = sum((x - mean) ** 2 for x in d) / (n - 1) if n > 1 else 0.0
-sd = math.sqrt(var); se = sd / math.sqrt(n) if n else float('inf')
-TT = {1:12.706,2:4.303,3:3.182,4:2.776,5:2.571,6:2.447,7:2.365,8:2.306,9:2.262,
-      10:2.228,11:2.201,12:2.179,13:2.160,14:2.145,15:2.131,16:2.120,17:2.110,
-      18:2.101,19:2.093,20:2.086,25:2.060,30:2.042,40:2.021,50:2.009,60:2.000}
-df = n - 1
-tc = TT.get(df) or (1.96 if df > 120 else TT[min(TT, key=lambda k: abs(k - df))])
-lo, hi = mean - tc * se, mean + tc * se
-def median(xs):
-    s = sorted(xs); m = len(s)
-    return s[m // 2] if m % 2 else (s[m // 2 - 1] + s[m // 2]) / 2
-med = median(d)
-print("\n=== GPU-composition ABBA  (A=GPU ON, B=CPU; - = GPU faster) ===")
-print(f"  pairs: {n}   mean A (GPU): {sum(A)/n:.3f}s   mean B (CPU): {sum(B)/n:.3f}s")
-print(f"  paired-t  mean {mean:+.2f}%   sd {sd:.2f}%   se {se:.2f}%   95% CI [{lo:+.2f}%, {hi:+.2f}%]")
-print(f"  median    {med:+.2f}%")
-if hi < 0:
-    print(f"  => GPU path faster by ~{-mean:.2f}% (CI below 0)")
-elif lo > 0:
-    print(f"  => GPU path slower by ~{mean:.2f}% (CI above 0)")
-else:
-    print(f"  => inconclusive at n={n} (CI straddles 0); point ~{med:+.2f}%")
-PY
+# Shared paired analysis (paired-t + exact Wilcoxon + stability + verdict) —
+# same statistics as bench_abba.sh, by construction.
+abba_stats "$WORK/pairs.csv" "GPU" "CPU" "GPU-composition ABBA"
