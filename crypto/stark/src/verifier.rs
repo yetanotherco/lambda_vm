@@ -899,10 +899,16 @@ pub trait IsStarkVerifier<
                 return false;
             }
             // The archive is read in place without validation; reject an OOD
-            // table whose advertised dimensions disagree with its data length
-            // (or that has no rows) before any row access indexes into it.
+            // table whose advertised dimensions disagree with its data length,
+            // has no rows, or whose height isn't a whole number of AIR steps
+            // (which `into_frame` below only `debug_assert!`s, not checks) —
+            // all before any row access indexes into it.
             let trace_ood_evaluations = proof.trace_ood_evaluations();
-            if !trace_ood_evaluations.dimensions_consistent() || trace_ood_evaluations.height() == 0
+            if !trace_ood_evaluations.dimensions_consistent()
+                || trace_ood_evaluations.height() == 0
+                || !trace_ood_evaluations
+                    .height()
+                    .is_multiple_of(air.step_size())
             {
                 return false;
             }

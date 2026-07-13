@@ -19,6 +19,25 @@ use stark::proof::options::GoldilocksCubicProofOptions;
 const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
 const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
 
+/// Read a file into a buffer aligned for `rkyv::from_bytes`. A plain
+/// `Vec<u8>` from `std::fs::read` is align-1 by the type system even though
+/// the allocator happens to return well-aligned memory in practice — read
+/// straight into an `AlignedVec` instead of relying on that.
+fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
+    // SAFETY: `with_capacity(len)` guarantees at least `len` allocated bytes
+    // at `as_mut_ptr()`; `read_exact_at` below fully initializes them before
+    // `set_len` exposes them as valid `u8`s.
+    let buf = unsafe { std::slice::from_raw_parts_mut(aligned.as_mut_ptr(), len) };
+    file.read_exact_at(buf, 0)?;
+    unsafe { aligned.set_len(len) };
+    Ok(aligned)
+}
+
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
 /// thread-local caches — `epoch::advance()` just merges cached counters.
@@ -670,7 +689,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
     };
 
     eprintln!("Reading proof...");
-    let proof_bytes = match std::fs::read(&proof_path) {
+    let proof_bytes = match read_aligned_file(&proof_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to read proof file: {}", e);
@@ -838,7 +857,7 @@ fn cmd_verify_continuation(
     };
 
     eprintln!("Reading proof...");
-    let proof_bytes = match std::fs::read(&proof_path) {
+    let proof_bytes = match read_aligned_file(&proof_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to read proof file: {}", e);

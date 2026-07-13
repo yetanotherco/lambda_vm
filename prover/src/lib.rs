@@ -300,6 +300,10 @@ pub struct RecursionVerification<'a> {
 /// The archive is read **in place**: the STARK proof is verified straight from
 /// the blob with no deserialization and no per-field allocation. Only tiny
 /// metadata (table counts, page ranges, page commitments) is materialized.
+///
+/// `blob` is untrusted (prover-supplied) input, so the archive is
+/// bytecheck-validated (`rkyv::access`) before the zero-copy access — measured
+/// at ~0.26% of total guest cycles, cheap enough to not be worth skipping.
 pub fn verify_recursion_blob<'a>(
     blob: &'a [u8],
     proof_options: &ProofOptions,
@@ -327,15 +331,10 @@ pub fn verify_recursion_blob<'a>(
         &aligned_fallback
     };
 
-    // SAFETY: `archive` is RECURSION_INPUT_ALIGN-aligned (checked above). No
-    // structural validation is performed. On the host, callers must pass blobs
-    // produced by our own `encode_recursion_input`. In the recursion guest the
-    // blob is PROVER-SUPPLIED: a malformed archive makes the in-place reads
-    // hit arbitrary guest addresses, which the VM memory model defines (reads
-    // of unmapped cells return 0), so the outcome is garbage field elements
-    // that fail the cryptographic checks or an in-guest panic — verification
-    // failure either way, never a false accept.
-    let archived = unsafe { rkyv::access_unchecked::<ArchivedGuestInput>(archive) };
+    // `blob` is untrusted; validate before the zero-copy access.
+    let archived = rkyv::access::<ArchivedGuestInput, RkyvError>(archive).map_err(|e| {
+        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
+    })?;
 
     // Materialize only the small metadata; the proof stays in the buffer.
     let table_counts: TableCounts =
