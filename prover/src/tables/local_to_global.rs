@@ -72,11 +72,13 @@
 //!   not a self-cancel.
 //!
 //! Because the trace must be a power of two, each epoch needs
-//! `next_pow2(#touched) - #touched` such fillers, drawn from distinct live cells not
-//! touched that epoch (see [`append_bring_forward_fillers`]). This relies on
-//! `#total live cells ≥ next_pow2(#touched per epoch)`; the continuation prover
-//! sources fillers from the epoch's own touched pages (and genesis pages as a
-//! fallback) and fails closed if that pool is ever too small.
+//! `next_pow2(#touched) - #touched` such fillers, drawn from distinct cells not
+//! touched that epoch (see [`append_bring_forward_fillers`]). The continuation prover
+//! sources them from the epoch's own touched pages (and genesis-image pages as a
+//! fallback). The pool is quantized to whole pages — `#candidate pages ·
+//! DEFAULT_PAGE_SIZE` cells, NOT "all live cells" — and it fails closed if that pool
+//! is smaller than `next_pow2(#touched)`, reachable only for a large epoch over dense
+//! memory.
 
 use std::collections::{HashMap, HashSet};
 
@@ -253,9 +255,17 @@ pub struct FillerShortage {
 /// value (genesis default `0`, or the last fini), so the filler's init token matches
 /// that head.
 ///
-/// Returns `Err(FillerShortage)` if the pool cannot fill the table — i.e. the
-/// `#total live cells ≥ next_pow2(#touched per epoch)` assumption is violated for
-/// this epoch. The trace is left partially filled; the caller must abort.
+/// Returns `Err(FillerShortage)` if the pool cannot fill the table. The pool is
+/// quantized to whole pages, not "all live cells": `candidate_pages` supplies
+/// `candidate_pages.len() * DEFAULT_PAGE_SIZE` distinct addresses (every offset of
+/// each page, including never-written cells, which read as their genesis default),
+/// drawn from the epoch's touched pages plus the genesis-image pages the caller
+/// passes. Shortage fires when that page-quantized pool is smaller than
+/// `next_pow2(#touched this epoch)` — reachable only for an epoch touching more
+/// distinct addresses than its candidate pages can cover (a large epoch over dense
+/// memory). Fails closed: the trace is left partially filled and the caller must
+/// abort (a smaller epoch size avoids it). Note the pool does NOT include idle cells
+/// on pages that neither this epoch nor the genesis image reference.
 pub fn append_bring_forward_fillers(
     boundary: &mut Vec<CellBoundary>,
     provenance: &mut Provenance,
@@ -329,6 +339,15 @@ pub mod cols {
     pub const ADDRESS_LO: usize = 0;
     /// address_hi: 32-bit; matched on the Memory bus against MEMW.
     pub const ADDRESS_HI: usize = 1;
+
+    // The address columns are intentionally NOT range-checked in this table. On a
+    // touched row they are matched against MEMW on the Memory bus, which range-checks
+    // them itself. On a brought-forward filler row there is no MEMW partner, but the
+    // address is still pinned by exact-fingerprint matching on the GlobalMemory bus:
+    // the filler's init token must equal a genesis send whose address is a
+    // *preprocessed* `page_base + offset` (see `global_memory`), so an out-of-range or
+    // otherwise bogus filler address finds no matching sender and the proof dangles. A
+    // redundant range check would only add lookups (cost) without adding soundness.
 
     /// Init value: a single byte, like PAGE's `value`.
     pub const INIT_VALUE: usize = 2;
@@ -869,6 +888,34 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.needed, 4);
         assert_eq!(err.got, 3);
+    }
+
+    #[test]
+    fn test_append_fillers_dedups_duplicate_candidate_pages() {
+        // 3 touched cells on page 0 → one filler needed. Passing page 0 twice must not
+        // emit the same filler address twice: the `occupied` set skips any address
+        // already claimed (a touched cell or an already-drawn filler), so a duplicate
+        // candidate page is a no-op rather than a double-count (which would break the
+        // GlobalMemory bus balance).
+        let mut provenance = genesis_provenance([(10u64, 5u64)]);
+        let mut boundary = epoch_boundary(
+            &mut provenance,
+            epoch_label(0),
+            &[(10, 7, 3), (11, 8, 4), (12, 9, 5)],
+        );
+        append_bring_forward_fillers(&mut boundary, &mut provenance, &[0, 0], epoch_label(0))
+            .unwrap();
+        assert_eq!(
+            boundary.len(),
+            4,
+            "padded to a power of two with one filler"
+        );
+        let addresses: HashSet<u64> = boundary.iter().map(|b| b.address).collect();
+        assert_eq!(
+            addresses.len(),
+            boundary.len(),
+            "a duplicate candidate page must not produce duplicate filler addresses"
+        );
     }
 
     #[test]

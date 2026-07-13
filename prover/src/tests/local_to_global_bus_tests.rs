@@ -1239,6 +1239,58 @@ fn test_l2g_truncated_touched_chain_rejects_global_bus() {
     );
 }
 
+/// A filler's address is not range-checked in the L2G table; its correctness rests on
+/// exact-fingerprint matching on the GlobalMemory bus (the init token must equal a
+/// genesis send whose address is a preprocessed `page_base + offset`). This test pins
+/// that protection: forging a filler row's `ADDRESS_LO` still self-cancels on the
+/// epoch-local Memory bus (init and fini read the same address column), but on the
+/// GlobalMemory bus the forged address matches no genesis anchor, so its init-receive
+/// dangles and the honest genesis/program-end tokens for the real address dangle too.
+#[test]
+fn test_l2g_forged_filler_address_rejects_global_bus() {
+    // Epoch 0 touches 2 cells (a power of two, no filler). Epoch 1 touches 3 cells and
+    // is padded with one brought-forward filler (row 3) for an untouched cell.
+    let mut provenance = local_to_global::genesis_provenance([(10u64, 5u64)]);
+    let epoch0 = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(0),
+        &[(10, 7, 3), (20, 9, 4)],
+    );
+    let mut epoch1 = local_to_global::epoch_boundary(
+        &mut provenance,
+        local_to_global::epoch_label(1),
+        &[(10, 8, 10), (20, 5, 11), (30, 2, 12)],
+    );
+    local_to_global::append_bring_forward_fillers(
+        &mut epoch1,
+        &mut provenance,
+        &[0],
+        local_to_global::epoch_label(1),
+    )
+    .unwrap();
+    assert_eq!(epoch1.len(), 4, "epoch 1 padded with one filler");
+    let boundaries = vec![epoch0, epoch1];
+
+    // Honest baseline balances.
+    assert!(
+        prove_and_verify(&boundaries),
+        "baseline must verify before forgery"
+    );
+
+    // Forge the filler row (epoch 1, row 3) to point at a bogus, unanchored address.
+    let epoch0_trace = generate_local_to_global_trace(&boundaries[0]);
+    let mut epoch1_trace = generate_local_to_global_trace(&boundaries[1]);
+    epoch1_trace
+        .main_table
+        .set(3, local_to_global::cols::ADDRESS_LO, FE::from(0x9999u64));
+    let mut l2g_traces = vec![epoch0_trace, epoch1_trace];
+
+    assert!(
+        !prove_and_verify_global_with_traces(&boundaries, &mut l2g_traces),
+        "a filler at an unanchored address must dangle on the GlobalMemory bus"
+    );
+}
+
 /// A touched cell cannot be dropped from the L2G table without dangling its
 /// MEMW-chain tokens: the epoch-local Memory bus rejects. This is the property that
 /// replaces the old `MU`-gating — participation is no longer selectable, so omitting
