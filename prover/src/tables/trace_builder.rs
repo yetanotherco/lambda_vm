@@ -3382,6 +3382,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_muls = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_mul_tables(&mul_ops, max_rows.mul)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &mul_ops,
             max_rows.mul,
@@ -3391,6 +3410,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_dvrms = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_dvrm_tables(&dvrm_ops, max_rows.dvrm)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &dvrm_ops,
             max_rows.dvrm,
@@ -3412,6 +3450,25 @@ fn build_traces<I: ImageSource + Sync>(
     // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
     // contributes nothing to any bus.
     let gen_eqs = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_eq_tables(&eq_ops, max_rows.eq)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
@@ -3421,6 +3478,27 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_bytewises = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) = crate::tables::gpu_trace::gpu_build_bytewise_tables(
+                    &bytewise_ops,
+                    max_rows.bytewise,
+                )
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
@@ -4997,6 +5075,330 @@ mod gpu_fill_tests {
             real_rows(&gpu_u64),
             real_rows(&cpu_u64),
             "device LT rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// EQ device fill: like LT, dedup rides the permutation-invariant ALU bus, so
+    /// the row ORDER is non-deterministic (HashMap iteration). Validate as a
+    /// MULTISET — the real rows (μ>0), incl. summed multiplicities, must match the
+    /// CPU `generate_eq_trace`. Covers a==b and a!=b, invert, high words, and
+    /// duplicates (μ>1). Skips cleanly with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_eq_fill_matches_cpu_multiset() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_eq_fill_matches_cpu_multiset: no CUDA backend");
+            return;
+        }
+        // Raw ops with equal/unequal operands, high words, and deliberate duplicates.
+        let mut raw = Vec::new();
+        for i in 0..800u64 {
+            let a = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+            // Every 5th op has a == b to exercise the eq=1 path.
+            let b = if i % 5 == 0 {
+                a
+            } else {
+                i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(11)
+            };
+            let invert = i % 3 == 0;
+            let op = eq::EqOperation::new(a, b, invert);
+            raw.push(op.clone());
+            if i % 4 == 0 {
+                raw.push(op); // duplicate → multiplicity 2
+            }
+        }
+
+        let ncols = math_cuda::trace_cpu::EQ_NCOLS;
+        // Extract the real (μ>0) rows of a row-major u64 buffer as a sorted multiset.
+        let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+            let mut rows: Vec<Vec<u64>> = flat
+                .chunks(ncols)
+                .filter(|row| row[eq::cols::MU] > 0)
+                .map(|row| row.to_vec())
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let cpu_table = eq::generate_eq_trace(&raw);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, ncols);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        // Dedup on the host exactly like `gpu_build_eq_tables`, then device-fill.
+        let mut map: std::collections::HashMap<eq::EqOperation, u64> = HashMap::new();
+        for op in &raw {
+            *map.entry(op.clone()).or_insert(0) += 1;
+        }
+        let unique: Vec<(eq::EqOperation, u64)> = map.into_iter().collect();
+        let n = unique.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::EQ_STRIDE);
+        for (op, mult) in &unique {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_eq_op(op, *mult));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_eq_trace_host(&packed, n, num_rows)
+            .expect("device EQ build must run on a box with a CUDA backend");
+
+        assert_eq!(
+            real_rows(&gpu_u64),
+            real_rows(&cpu_u64),
+            "device EQ rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// BYTEWISE device fill: like LT/EQ, dedup rides the permutation-invariant ALU
+    /// bus, so the row ORDER is non-deterministic. Validate as a MULTISET — the real
+    /// rows (μ>0), incl. summed multiplicities, must match `generate_bytewise_trace`.
+    /// Covers AND/OR/XOR, full 64-bit operands, and duplicates (μ>1). Skips cleanly
+    /// with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_bytewise_fill_matches_cpu_multiset() {
+        use crate::tables::types::alu_op;
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_bytewise_fill_matches_cpu_multiset: no CUDA backend");
+            return;
+        }
+        // Raw ops cycling AND/OR/XOR, full-word operands, with deliberate duplicates.
+        let mut raw = Vec::new();
+        for i in 0..900u64 {
+            let a = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 33);
+            let b = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(19);
+            let op = [alu_op::AND, alu_op::OR, alu_op::XOR][(i % 3) as usize];
+            let bw = bytewise::BytewiseOperation::new(a, b, op);
+            raw.push(bw.clone());
+            if i % 4 == 0 {
+                raw.push(bw); // duplicate → multiplicity 2
+            }
+        }
+
+        let ncols = math_cuda::trace_cpu::BYTEWISE_NCOLS;
+        // Extract the real (μ>0) rows of a row-major u64 buffer as a sorted multiset.
+        let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+            let mut rows: Vec<Vec<u64>> = flat
+                .chunks(ncols)
+                .filter(|row| row[bytewise::cols::MU] > 0)
+                .map(|row| row.to_vec())
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let cpu_table = bytewise::generate_bytewise_trace(&raw);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, ncols);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        // Dedup on the host exactly like `gpu_build_bytewise_tables`, then device-fill.
+        let mut map: std::collections::HashMap<bytewise::BytewiseOperation, u64> = HashMap::new();
+        for op in &raw {
+            *map.entry(op.clone()).or_insert(0) += 1;
+        }
+        let unique: Vec<(bytewise::BytewiseOperation, u64)> = map.into_iter().collect();
+        let n = unique.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::BYTEWISE_STRIDE);
+        for (op, mult) in &unique {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_bytewise_op(op, *mult));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_bytewise_trace_host(&packed, n, num_rows)
+            .expect("device BYTEWISE build must run on a box with a CUDA backend");
+
+        assert_eq!(
+            real_rows(&gpu_u64),
+            real_rows(&cpu_u64),
+            "device BYTEWISE rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// MUL device fill: like the other ALU tables, dedup rides the
+    /// permutation-invariant ALU bus, so the row ORDER is non-deterministic.
+    /// Validate as a MULTISET — the real rows (mu_lo>0 or mu_hi>0), incl. the split
+    /// multiplicities, must match `generate_mul_trace`. Covers all four
+    /// signed/unsigned combos, negative operands, the 128-bit product + raw_product
+    /// convolution, and lo/hi (wants_hi) requests with duplicates. Skips cleanly
+    /// with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_mul_fill_matches_cpu_multiset() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_mul_fill_matches_cpu_multiset: no CUDA backend");
+            return;
+        }
+        // Raw (op, wants_hi) pairs: varied operands, all sign combos, both lo and hi
+        // requests, with deliberate duplicates so mu_lo/mu_hi accumulate.
+        let mut raw = Vec::new();
+        for i in 0..800u64 {
+            let lhs = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+            let rhs = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(23);
+            let lhs_signed = i % 2 == 0;
+            let rhs_signed = i % 3 == 0;
+            let op = mul::MulOperation::new(lhs, lhs_signed, rhs, rhs_signed);
+            raw.push((op.clone(), i % 2 == 0));
+            if i % 3 == 0 {
+                raw.push((op.clone(), true)); // extra hi request
+            }
+            if i % 5 == 0 {
+                raw.push((op, false)); // extra lo request (duplicate)
+            }
+        }
+        // Explicit sign edge cases: i64::MIN, -1, treated signed and unsigned.
+        for &(a, b) in &[
+            (0x8000_0000_0000_0000u64, 0xFFFF_FFFF_FFFF_FFFFu64),
+            (0xFFFF_FFFF_FFFF_FFFFu64, 0x8000_0000_0000_0000u64),
+        ] {
+            raw.push((mul::MulOperation::new(a, true, b, true), false));
+            raw.push((mul::MulOperation::new(a, false, b, false), true));
+        }
+
+        let ncols = math_cuda::trace_cpu::MUL_NCOLS;
+        // Real rows: mu_lo>0 or mu_hi>0.
+        let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+            let mut rows: Vec<Vec<u64>> = flat
+                .chunks(ncols)
+                .filter(|row| row[mul::cols::MU_LO] > 0 || row[mul::cols::MU_HI] > 0)
+                .map(|row| row.to_vec())
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let cpu_table = mul::generate_mul_trace(&raw);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, ncols);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        // Dedup on the host exactly like `gpu_build_mul_tables`, then device-fill.
+        let mut map: std::collections::HashMap<mul::MulOperation, (u64, u64)> = HashMap::new();
+        for (op, wants_hi) in &raw {
+            let e = map.entry(op.clone()).or_insert((0, 0));
+            if *wants_hi {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        let unique: Vec<(mul::MulOperation, (u64, u64))> = map.into_iter().collect();
+        let n = unique.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MUL_STRIDE);
+        for (op, (mu_lo, mu_hi)) in &unique {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_mul_op(op, *mu_lo, *mu_hi));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_mul_trace_host(&packed, n, num_rows)
+            .expect("device MUL build must run on a box with a CUDA backend");
+
+        assert_eq!(
+            real_rows(&gpu_u64),
+            real_rows(&cpu_u64),
+            "device MUL rows must match the CPU fill as a multiset"
+        );
+    }
+
+    /// DVRM device fill: like the other ALU tables, dedup rides the
+    /// permutation-invariant ALU bus, so the row ORDER is non-deterministic.
+    /// Validate as a MULTISET — the real rows (mu_q>0 or mu_r>0), incl. the split
+    /// multiplicities, must match `generate_dvrm_trace`. Covers signed/unsigned,
+    /// division-by-zero, the MIN/-1 signed overflow, negative operands, and
+    /// quotient/remainder (wants_remainder) requests with duplicates. Skips cleanly
+    /// with no GPU.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_dvrm_fill_matches_cpu_multiset() {
+        if math_cuda::device::backend().is_err() {
+            eprintln!("skipping gpu_dvrm_fill_matches_cpu_multiset: no CUDA backend");
+            return;
+        }
+        // Raw (op, wants_remainder) pairs: varied operands (incl. periodic d==0),
+        // both signednesses, q and r requests, with deliberate duplicates.
+        let mut raw = Vec::new();
+        for i in 0..800u64 {
+            let n = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+            let d = if i % 11 == 0 {
+                0
+            } else {
+                i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(29)
+            };
+            let signed = i % 2 == 0;
+            let op = dvrm::DvrmOperation::new(n, d, signed);
+            raw.push((op.clone(), i % 2 == 0));
+            if i % 3 == 0 {
+                raw.push((op.clone(), true)); // extra remainder request
+            }
+            if i % 5 == 0 {
+                raw.push((op, false)); // extra quotient request (duplicate)
+            }
+        }
+        // Explicit edge cases: signed overflow (MIN/-1), div-by-zero, MIN numerator,
+        // -1 denominator.
+        let min = 0x8000_0000_0000_0000u64;
+        let neg1 = 0xFFFF_FFFF_FFFF_FFFFu64;
+        for &(n, d, s) in &[
+            (min, neg1, true),     // signed overflow
+            (min, neg1, false),    // unsigned: /(2^64-1), no overflow
+            (123u64, 0u64, true),  // div-by-zero, signed
+            (123u64, 0u64, false), // div-by-zero, unsigned
+            (min, 7u64, true),     // negative numerator
+            (100u64, neg1, true),  // negative denominator (n != MIN)
+        ] {
+            raw.push((dvrm::DvrmOperation::new(n, d, s), false));
+            raw.push((dvrm::DvrmOperation::new(n, d, s), true));
+        }
+
+        let ncols = math_cuda::trace_cpu::DVRM_NCOLS;
+        // Real rows: mu_q>0 or mu_r>0.
+        let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+            let mut rows: Vec<Vec<u64>> = flat
+                .chunks(ncols)
+                .filter(|row| row[dvrm::cols::MU_Q] > 0 || row[dvrm::cols::MU_R] > 0)
+                .map(|row| row.to_vec())
+                .collect();
+            rows.sort();
+            rows
+        };
+
+        let cpu_table = dvrm::generate_dvrm_trace(&raw);
+        let (cpu_fe, w) = cpu_table.main_data_row_major();
+        assert_eq!(w, ncols);
+        let cpu_u64: Vec<u64> = cpu_fe
+            .iter()
+            .map(|e| unsafe { *(e.value() as *const u64) })
+            .collect();
+
+        // Dedup on the host exactly like `gpu_build_dvrm_tables`, then device-fill.
+        let mut map: std::collections::HashMap<dvrm::DvrmOperation, (u64, u64)> = HashMap::new();
+        for (op, wants_remainder) in &raw {
+            let e = map.entry(op.clone()).or_insert((0, 0));
+            if *wants_remainder {
+                e.1 += 1;
+            } else {
+                e.0 += 1;
+            }
+        }
+        let unique: Vec<(dvrm::DvrmOperation, (u64, u64))> = map.into_iter().collect();
+        let n = unique.len();
+        let num_rows = n.next_power_of_two().max(4);
+        let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::DVRM_STRIDE);
+        for (op, (mu_q, mu_r)) in &unique {
+            packed.extend_from_slice(&crate::tables::gpu_trace::pack_dvrm_op(op, *mu_q, *mu_r));
+        }
+        let gpu_u64 = math_cuda::trace_cpu::gpu_build_dvrm_trace_host(&packed, n, num_rows)
+            .expect("device DVRM build must run on a box with a CUDA backend");
+
+        assert_eq!(
+            real_rows(&gpu_u64),
+            real_rows(&cpu_u64),
+            "device DVRM rows must match the CPU fill as a multiset"
         );
     }
 }

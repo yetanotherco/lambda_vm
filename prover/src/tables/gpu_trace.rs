@@ -14,12 +14,16 @@ use stark::trace::TraceTable;
 
 use std::collections::HashMap;
 
+use super::bytewise::{self, BytewiseOperation};
 use super::cpu::{self, CpuOperation};
+use super::dvrm::{self, DvrmOperation};
+use super::eq::{self, EqOperation};
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::MemwOperation;
 use super::memw_aligned;
 use super::memw_register::{self, RegRow};
+use super::mul::{self, MulOperation};
 use super::shift::{self, ShiftOperation};
 use super::store::{self, StoreOperation};
 use super::types::{GoldilocksExtension, GoldilocksField};
@@ -483,6 +487,274 @@ pub(crate) fn gpu_build_lt_tables(
     let mut tables = Vec::with_capacity(chunks.len());
     for chunk in chunks {
         tables.push(build_lt_chunk(chunk)?);
+    }
+    Some(tables)
+}
+
+// =============================================================================
+// EQ (ALU dedup table): host per-chunk HashMap dedup → device fill (compute)
+// =============================================================================
+
+/// Pack one unique `EqOperation` + its multiplicity into the `eq_fill` stride.
+pub(crate) fn pack_eq_op(op: &EqOperation, mult: u64) -> [u64; math_cuda::trace_cpu::EQ_STRIDE] {
+    let flags = op.invert as u64;
+    [op.a, op.b, flags, mult]
+}
+
+/// Build one EQ trace-table chunk on device. Dedup happens HERE on the host (the
+/// same per-chunk HashMap `generate_eq_trace` uses), then the unique ops + summed
+/// multiplicities are filled on device. EQ rides the permutation-invariant ALU
+/// bus, so any row order is valid (validated by multiset/prove, not byte order).
+fn build_eq_chunk(
+    chunk: &[EqOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut map: HashMap<EqOperation, u64> = HashMap::new();
+    for op in chunk {
+        *map.entry(op.clone()).or_insert(0) += 1;
+    }
+    let unique: Vec<(EqOperation, u64)> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::EQ_STRIDE);
+    for (op, mult) in &unique {
+        packed.extend_from_slice(&pack_eq_op(op, *mult));
+    }
+    let dev = math_cuda::trace_cpu::gpu_build_eq_trace(&packed, n, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * eq::cols::NUM_COLUMNS),
+        eq::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(trace)
+}
+
+pub(crate) fn gpu_build_eq_tables(
+    ops: &[EqOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
+    // independently (matching `generate_eq_trace` per chunk).
+    let chunks: Vec<&[EqOperation]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        tables.push(build_eq_chunk(chunk)?);
+    }
+    Some(tables)
+}
+
+// =============================================================================
+// BYTEWISE (ALU dedup table): host per-chunk HashMap dedup → device fill (compute)
+// =============================================================================
+
+/// Pack one unique `BytewiseOperation` + its multiplicity into the `bytewise_fill`
+/// stride.
+pub(crate) fn pack_bytewise_op(
+    op: &BytewiseOperation,
+    mult: u64,
+) -> [u64; math_cuda::trace_cpu::BYTEWISE_STRIDE] {
+    [op.a, op.b, op.op as u64, mult]
+}
+
+/// Build one BYTEWISE trace-table chunk on device. Dedup happens HERE on the host
+/// (the same per-chunk HashMap `generate_bytewise_trace` uses), then the unique ops
+/// with summed multiplicities are filled on device. BYTEWISE rides the
+/// permutation-invariant ALU bus, so any row order is valid (validated by
+/// multiset/prove, not byte order).
+fn build_bytewise_chunk(
+    chunk: &[BytewiseOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut map: HashMap<BytewiseOperation, u64> = HashMap::new();
+    for op in chunk {
+        *map.entry(op.clone()).or_insert(0) += 1;
+    }
+    let unique: Vec<(BytewiseOperation, u64)> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::BYTEWISE_STRIDE);
+    for (op, mult) in &unique {
+        packed.extend_from_slice(&pack_bytewise_op(op, *mult));
+    }
+    let dev = math_cuda::trace_cpu::gpu_build_bytewise_trace(&packed, n, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * bytewise::cols::NUM_COLUMNS),
+        bytewise::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(trace)
+}
+
+pub(crate) fn gpu_build_bytewise_tables(
+    ops: &[BytewiseOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    // Chunk the RAW ops exactly like `chunk_and_generate`; each chunk dedups
+    // independently (matching `generate_bytewise_trace` per chunk).
+    let chunks: Vec<&[BytewiseOperation]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        tables.push(build_bytewise_chunk(chunk)?);
+    }
+    Some(tables)
+}
+
+// =============================================================================
+// MUL (ALU dedup table): host per-chunk HashMap dedup → device fill (128-bit
+// product + sign-extended convolution recomputed on device)
+// =============================================================================
+
+/// Pack one unique `MulOperation` + its split multiplicities into the `mul_fill`
+/// stride.
+pub(crate) fn pack_mul_op(
+    op: &MulOperation,
+    mu_lo: u64,
+    mu_hi: u64,
+) -> [u64; math_cuda::trace_cpu::MUL_STRIDE] {
+    let flags = (op.lhs_signed as u64) | ((op.rhs_signed as u64) << 1);
+    [op.lhs, op.rhs, flags, mu_lo, mu_hi]
+}
+
+/// Build one MUL trace-table chunk on device. Dedup happens HERE on the host (the
+/// same per-chunk HashMap `generate_mul_trace` uses, keyed by op with mu_lo/mu_hi
+/// accumulated from each `wants_hi`), then the unique ops + both multiplicities are
+/// filled on device (the kernel recomputes the 128-bit product and raw_products).
+/// MUL rides the permutation-invariant ALU bus, so any row order is valid
+/// (validated by multiset/prove, not byte order).
+fn build_mul_chunk(
+    chunk: &[(MulOperation, bool)],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    // (mu_lo, mu_hi) per unique op, matching `MulMultiplicities`.
+    let mut map: HashMap<MulOperation, (u64, u64)> = HashMap::new();
+    for (op, wants_hi) in chunk {
+        let e = map.entry(op.clone()).or_insert((0, 0));
+        if *wants_hi {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+    let unique: Vec<(MulOperation, (u64, u64))> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MUL_STRIDE);
+    for (op, (mu_lo, mu_hi)) in &unique {
+        packed.extend_from_slice(&pack_mul_op(op, *mu_lo, *mu_hi));
+    }
+    let dev = math_cuda::trace_cpu::gpu_build_mul_trace(&packed, n, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * mul::cols::NUM_COLUMNS),
+        mul::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(trace)
+}
+
+pub(crate) fn gpu_build_mul_tables(
+    ops: &[(MulOperation, bool)],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    // Chunk the RAW (op, wants_hi) pairs exactly like `chunk_and_generate`; each
+    // chunk dedups independently (matching `generate_mul_trace` per chunk).
+    let chunks: Vec<&[(MulOperation, bool)]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        tables.push(build_mul_chunk(chunk)?);
+    }
+    Some(tables)
+}
+
+// =============================================================================
+// DVRM (ALU dedup table): host per-chunk HashMap dedup → device fill (signed/
+// unsigned division & remainder + abs/sign aux recomputed on device)
+// =============================================================================
+
+/// Pack one unique `DvrmOperation` + its split multiplicities into the `dvrm_fill`
+/// stride.
+pub(crate) fn pack_dvrm_op(
+    op: &DvrmOperation,
+    mu_q: u64,
+    mu_r: u64,
+) -> [u64; math_cuda::trace_cpu::DVRM_STRIDE] {
+    let flags = op.signed as u64;
+    [op.n, op.d, flags, mu_q, mu_r]
+}
+
+/// Build one DVRM trace-table chunk on device. Dedup happens HERE on the host (the
+/// same per-chunk HashMap `generate_dvrm_trace` uses, keyed by op with mu_q/mu_r
+/// accumulated from each `wants_remainder`), then the unique ops + both
+/// multiplicities are filled on device (the kernel recomputes the quotient,
+/// remainder, and abs/sign aux). DVRM rides the permutation-invariant ALU bus, so
+/// any row order is valid (validated by multiset/prove, not byte order).
+fn build_dvrm_chunk(
+    chunk: &[(DvrmOperation, bool)],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    // (mu_q, mu_r) per unique op, matching `DvrmMultiplicities`.
+    let mut map: HashMap<DvrmOperation, (u64, u64)> = HashMap::new();
+    for (op, wants_remainder) in chunk {
+        let e = map.entry(op.clone()).or_insert((0, 0));
+        if *wants_remainder {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+    let unique: Vec<(DvrmOperation, (u64, u64))> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::DVRM_STRIDE);
+    for (op, (mu_q, mu_r)) in &unique {
+        packed.extend_from_slice(&pack_dvrm_op(op, *mu_q, *mu_r));
+    }
+    let dev = math_cuda::trace_cpu::gpu_build_dvrm_trace(&packed, n, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * dvrm::cols::NUM_COLUMNS),
+        dvrm::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(trace)
+}
+
+pub(crate) fn gpu_build_dvrm_tables(
+    ops: &[(DvrmOperation, bool)],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    // Chunk the RAW (op, wants_remainder) pairs exactly like `chunk_and_generate`;
+    // each chunk dedups independently (matching `generate_dvrm_trace` per chunk).
+    let chunks: Vec<&[(DvrmOperation, bool)]> = if ops.is_empty() {
+        vec![&[][..]]
+    } else {
+        ops.chunks(max_rows).collect()
+    };
+    let mut tables = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        tables.push(build_dvrm_chunk(chunk)?);
     }
     Some(tables)
 }
