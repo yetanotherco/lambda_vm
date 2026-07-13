@@ -17,33 +17,41 @@ fn nvcc_path() -> PathBuf {
 /// Query `nvidia-smi` for the local GPU's compute capability (e.g. "12.0"
 /// for Blackwell) and return a *real* arch (`sm_XX`) suitable for cubin
 /// (SASS) generation. Falls back to `sm_89` (Ada) when no GPU is visible or
-/// the query fails.
+/// the query fails, warning loudly because an arch-specific cubin built for
+/// the wrong GPU cannot load on the run host.
 fn detect_arch() -> String {
     const FALLBACK: &str = "sm_89";
+    detect_arch_from_smi().unwrap_or_else(|| {
+        println!(
+            "cargo:warning=math-cuda: could not detect a GPU via nvidia-smi — cubins target \
+             fallback {FALLBACK}; if the run host GPU differs, set CUDARC_NVCC_ARCH=sm_XX or \
+             rebuild on the run host."
+        );
+        FALLBACK.to_string()
+    })
+}
+
+/// Parse the compute capability out of `nvidia-smi` and format it as a real
+/// `sm_XX` arch. Returns `None` on every path where no capability can be read
+/// (nvidia-smi missing, command failed, or unparsable output) so the caller
+/// warns before falling back.
+fn detect_arch_from_smi() -> Option<String> {
     let output = match Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return FALLBACK.to_string(),
+        _ => return None,
     };
-    let line = match std::str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => return FALLBACK.to_string(),
-    };
+    let line = std::str::from_utf8(&output.stdout).ok()?;
     // First line, first comma-separated value (covers multi-GPU hosts).
-    let cap = match line.lines().next() {
-        Some(l) => l.split(',').next().unwrap_or("").trim(),
-        None => return FALLBACK.to_string(),
-    };
-    let (major, minor) = match cap.split_once('.') {
-        Some((m, n)) => (m.trim(), n.trim()),
-        None => return FALLBACK.to_string(),
-    };
+    let cap = line.lines().next()?.split(',').next().unwrap_or("").trim();
+    let (major, minor) = cap.split_once('.')?;
+    let (major, minor) = (major.trim(), minor.trim());
     if major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit()) {
-        format!("sm_{major}{minor}")
+        Some(format!("sm_{major}{minor}"))
     } else {
-        FALLBACK.to_string()
+        None
     }
 }
 
