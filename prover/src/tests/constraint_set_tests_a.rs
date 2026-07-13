@@ -1,6 +1,6 @@
 //! Folder-vs-capture-interpret regression tests for the single-source
 //! `ConstraintSet` table bodies (group A: dvrm, shift, mul, lt, load, ecsm,
-//! ecdas, ec_scalar).
+//! ecdas).
 //!
 //! Each table's single `eval` body is run three ways — the `ProverEvalFolder`
 //! (base), the `VerifierEvalFolder` (extension), and the `CaptureBuilder` → flat
@@ -241,19 +241,5 @@ mod ecdas {
     #[test]
     fn ecdas_constraint_set_folder_capture_agree() {
         check_set("ecdas", &EcdasConstraints, cols::NUM_COLUMNS);
-    }
-}
-
-// =============================================================================
-// ec_scalar.rs
-// =============================================================================
-
-mod ec_scalar {
-    use super::*;
-    use crate::tables::ec_scalar::{EcScalarConstraints, cols};
-
-    #[test]
-    fn ec_scalar_constraint_set_folder_capture_agree() {
-        check_set("ec_scalar", &EcScalarConstraints, cols::NUM_COLUMNS);
     }
 }

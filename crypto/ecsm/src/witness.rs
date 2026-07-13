@@ -38,6 +38,8 @@ pub struct EcsmWitness {
     pub q1: [u8; 33],
     /// carries for the `yG` relation
     pub c1: [i64; 64],
+    /// `(xG - p) mod 2^256`
+    pub x_g_sub_p: [u8; 32],
     /// `(k - N) mod 2^256`
     pub k_sub_n: [u8; 32],
     /// `(xR - p) mod 2^256`
@@ -314,6 +316,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     // --- scalar range data ---
     let len_k = crate::curve::msb_position(&k) as u8;
     let two_256 = BigUint::from(1u8) << 256u32;
+    let x_g_sub_p = to_le_32(&((&two_256 + &g.x) - p())); // xG < p
     let k_sub_n = to_le_32(&((&two_256 + &k) - n())); // k < N
 
     // --- double/add replay ---
@@ -336,6 +339,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
         c0,
         q1: q1_b,
         c1,
+        x_g_sub_p,
         k_sub_n,
         x_r_sub_p,
         len_k,
