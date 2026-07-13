@@ -4531,7 +4531,7 @@ impl Traces {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cuda"))]
 mod gpu_fill_tests {
     //! Byte-parity (and multiset, for order-independent LT) between each table's
     //! device fill and the CPU `generate_*_trace`, so the on-GPU trace tables are
