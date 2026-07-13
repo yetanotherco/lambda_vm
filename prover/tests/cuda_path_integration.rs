@@ -11,10 +11,29 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls, gpu_parts_lde_calls,
-    reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
+    gpu_deep_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls,
+    gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
+
+/// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
+/// yields a verifying proof. Guards both a silent CPU fallback (counter == 0)
+/// and a bad-`H` regression (fires but the proof fails verification).
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_composition_path_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_composition_calls() > 0,
+        "GPU composition path did not fire (tables below threshold or gate fell back to CPU)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (fused composition) failed verification"
+    );
+}
 
 /// The GPU LogUp aux-build path fires and still yields a verifying proof.
 #[test]
