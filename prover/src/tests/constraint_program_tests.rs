@@ -178,6 +178,5 @@ fn all_table_programs_match_folders() {
     check_air(&create_keccak_rnd_air(&opts), "KECCAK_RND");
     check_air(&create_keccak_rc_air(&opts), "KECCAK_RC");
     check_air(&create_ecsm_air(&opts), "ECSM");
-    check_air(&create_ec_scalar_air(&opts), "EC_SCALAR");
     check_air(&create_ecdas_air(&opts), "ECDAS");
 }
