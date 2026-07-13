@@ -1,13 +1,17 @@
 //! End-to-end naive recursion pipeline smoke tests: prove an inner program,
-//! hand `(VmProof, elf, decode_commitment, page_commitments)` to the in-VM
-//! verifier guest, then execute or prove the guest. Guest ELFs come from
-//! `make compile-recursion-elfs`. `ProofOptions` is fixed per preset at build
-//! time; `decode_commitment`/`page_commitments` are private input, precomputed
-//! host-side. Each pipeline also host-verifies the inner proof via full
-//! recompute (`None, None`) as a ground-truth check.
+//! build the guest's private-input blob with `recursion::encode_guest_input`,
+//! hand it to the in-VM verifier guest, then execute or prove the guest. Guest
+//! ELFs come from `make compile-recursion-elfs`. `ProofOptions` is fixed per
+//! preset at build time (`recursion::Preset`); `decode_commitment`/
+//! `page_commitments` are private input, precomputed host-side. Each pipeline
+//! host-verifies the inner proof via full recompute (`None, None`) as a
+//! ground-truth check, then runs the production consumer check
+//! (`recursion::check_attestation`) over the guest's committed attestation.
 
 use std::ops::ControlFlow;
 use std::path::PathBuf;
+
+use crate::recursion::{self, MIN_PROOF_OPTIONS, Preset};
 
 fn workspace_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -27,73 +31,16 @@ fn read_guest_elf(root: &std::path::Path, name: &str) -> Vec<u8> {
     })
 }
 
-/// Smallest possible inner proof (blowup=2, 1 query). Intentionally insecure —
-/// for the cheap diagnostics, not soundness. Matches the `recursion-min.elf`
-/// build's hardcoded `ProofOptions`.
-const MIN_PROOF_OPTIONS: stark::proof::options::ProofOptions =
-    stark::proof::options::ProofOptions {
-        blowup_factor: 2,
-        fri_number_of_queries: 1,
-        coset_offset: 3,
-        grinding_factor: 1,
-        fri_final_poly_log_degree: 7,
-    };
-
-/// DECODE/ELF-data-page commitments for `elf_bytes` under `opts` — what the
-/// guest receives via private input instead of recomputing in-VM.
-fn precomputed_commitments(
-    elf_bytes: &[u8],
-    opts: &stark::proof::options::ProofOptions,
-) -> (crate::Commitment, Vec<(u64, crate::Commitment)>) {
-    let elf = executor::elf::Elf::load(elf_bytes).expect("ELF load failed");
-    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
-        .expect("decode commitment_from_elf failed");
-    let page_commitments: Vec<(u64, crate::Commitment)> =
-        crate::tables::trace_builder::Traces::page_configs_from_elf(&elf)
-            .iter()
-            .filter(|c| c.init_values.is_some())
-            .map(|c| {
-                (
-                    c.page_base,
-                    crate::tables::page::compute_precomputed_commitment(c, opts),
-                )
-            })
-            .collect();
-    (decode_commitment, page_commitments)
-}
-
-/// The bytes the guest commits on success: `program_id(inner_elf,
-/// decode_commitment, page_commitments) || inner_public_output` — must match
-/// `main.rs` byte-for-byte.
-fn expected_committed_output(
-    inner_elf: &[u8],
-    decode_commitment: &crate::Commitment,
-    page_commitments: &[(u64, crate::Commitment)],
-    inner_public_output: &[u8],
-) -> Vec<u8> {
-    let mut out =
-        crate::statement::program_id_from_elf(inner_elf, decode_commitment, page_commitments)
-            .expect("program_id")
-            .to_vec();
-    out.extend_from_slice(inner_public_output);
-    out
-}
-
-/// Prove `inner_elf` under `opts`, precompute its DECODE/page commitments, and
-/// postcard-encode `(proof, elf, decode_commitment, page_commitments)` into
-/// the guest's private-input blob. Returns the proof, the blob, and the
-/// commitments (so callers can build `expected_committed_output`).
+/// Prove `inner_elf` under `opts` and build the guest's private-input blob via
+/// [`recursion::encode_guest_input`] (which precomputes the DECODE/page roots
+/// and postcard-encodes the [`recursion::GuestInput`] tuple). Returns the proof
+/// and the blob.
 fn prove_inner_and_encode_blob(
     tag: &str,
     inner_elf: &[u8],
     inner_input: &[u8],
     opts: &stark::proof::options::ProofOptions,
-) -> (
-    crate::VmProof,
-    Vec<u8>,
-    crate::Commitment,
-    Vec<(u64, crate::Commitment)>,
-) {
+) -> (crate::VmProof, Vec<u8>) {
     eprintln!(
         "[{tag}] proving inner (blowup={}, fri_queries={}) ...",
         opts.blowup_factor, opts.fri_number_of_queries
@@ -106,17 +53,10 @@ fn prove_inner_and_encode_blob(
     )
     .expect("inner prove should succeed");
 
-    let (decode_commitment, page_commitments) = precomputed_commitments(inner_elf, opts);
-
-    let blob = postcard::to_allocvec(&(
-        &inner_proof,
-        &inner_elf,
-        &decode_commitment,
-        &page_commitments,
-    ))
-    .expect("postcard encode failed");
+    let blob = recursion::encode_guest_input(&inner_proof, inner_elf, opts)
+        .expect("recursion::encode_guest_input failed");
     eprintln!("[{tag}] postcard blob: {} bytes", blob.len());
-    (inner_proof, blob, decode_commitment, page_commitments)
+    (inner_proof, blob)
 }
 
 /// Whether to also prove the guest's own execution after handing it the proof.
@@ -215,13 +155,12 @@ fn drive_executor(
     (total_cycles, start.elapsed())
 }
 
-/// Shared preamble: build the blob (an `empty` inner proof under `opts`), load
-/// the `recursion-<preset>.elf` verifier, and stand up an executor. Returns
-/// `(elf_bytes, program, executor)`.
+/// Shared preamble: build the blob (an `empty` inner proof under the preset's
+/// options), load the `recursion-<preset>.elf` verifier, and stand up an
+/// executor. Returns `(elf_bytes, program, executor)`.
 fn setup_guest_run(
     label: &str,
-    preset: &str,
-    opts: &stark::proof::options::ProofOptions,
+    preset: Preset,
 ) -> (
     Vec<u8>,
     executor::elf::Elf,
@@ -229,15 +168,17 @@ fn setup_guest_run(
 ) {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let guest_elf_bytes = read_guest_elf(&root, &format!("recursion-{preset}"));
+    let guest_elf_bytes = read_guest_elf(&root, preset.artifact_stem());
 
-    let (_inner_proof, blob, _decode_commitment, _page_commitments) =
-        prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], opts);
+    let (_inner_proof, blob) =
+        prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], &preset.options());
 
     let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
     assert_ne!(
-        program.entry_point, 0,
-        "recursion-{preset} ELF has entry_point=0 — build artifact is malformed"
+        program.entry_point,
+        0,
+        "recursion-{} ELF has entry_point=0 — build artifact is malformed",
+        preset.name()
     );
     let executor =
         executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
@@ -267,11 +208,6 @@ const STEP_LABELS: [&str; 7] = [
     "5. step 3: verify_fri",
     "6. step 4: verify_trace_and_composition_openings (+ wrap-up)",
 ];
-
-/// `blowup=8` (128-bit, multi-query) options for the `multiquery` variants.
-fn blowup8() -> stark::proof::options::ProofOptions {
-    crate::GoldilocksCubicProofOptions::with_blowup(8).expect("blowup=8 is always valid")
-}
 
 /// Short per-step tag for the function table, keyed by the same bucket index
 /// used in `STEP_LABELS`/`buckets`.
@@ -392,15 +328,11 @@ fn print_step_breakdown(buckets: &[u64; 7], total_cycles: u64) {
 /// per-step cycle breakdown (marker decode is cheap — one `InstructionCache`
 /// lookup per cycle), and a rough trace/LDE estimate; with `detailed`, also
 /// the top-25 functions table (needs a `pc_hist` HashMap, so gated).
-fn run_profile(
-    preset: &str,
-    progress_stride: usize,
-    opts: stark::proof::options::ProofOptions,
-    detailed: bool,
-) {
+fn run_profile(preset: Preset, progress_stride: usize, detailed: bool) {
     use std::collections::HashMap;
 
-    let (guest_elf_bytes, program, mut executor) = setup_guest_run("profile", preset, &opts);
+    let opts = preset.options();
+    let (guest_elf_bytes, program, mut executor) = setup_guest_run("profile", preset);
     let symbols = executor::elf::SymbolTable::parse(&guest_elf_bytes);
     let instructions = executor::vm::execution::InstructionCache::new(&program.data)
         .expect("instruction cache build failed");
@@ -411,7 +343,8 @@ fn run_profile(
     let unique = std::cell::Cell::new(0usize);
 
     eprintln!(
-        "[profile] executing recursion-{preset} guest ({}) ...",
+        "[profile] executing recursion-{} guest ({}) ...",
+        preset.name(),
         if detailed {
             "histogram + steps"
         } else {
@@ -457,7 +390,7 @@ fn run_profile(
     eprintln!("============================================================");
     eprintln!(
         "  RECURSION-{} GUEST PROFILE (blowup={}, {} queries)",
-        preset.to_uppercase(),
+        preset.name().to_uppercase(),
         opts.blowup_factor,
         opts.fri_number_of_queries,
     );
@@ -486,37 +419,29 @@ fn run_profile(
     eprintln!("============================================================");
 }
 
-/// Core pipeline: prove the inner program, run the guest (`recursion-<preset>.elf`)
-/// to `mode`, assert it committed `elf_digest(inner_elf) || decode_commitment ||
-/// page_commitments` (the in-VM verifier accepted the proof and attested what
-/// it verified).
+/// Core pipeline: prove the inner program under `preset.options()`, run the
+/// guest (`recursion-<preset>.elf`) to `mode`, then run the production consumer
+/// check — recompute the program id from the trusted inner ELF and compare it
+/// against the guest's committed attestation (`program_id || inner_public_output`)
+/// via [`recursion::check_attestation`]. A match means the in-VM verifier
+/// accepted the proof and the host-side identity binding holds.
 fn run_recursion_pipeline_with_options(
     label: &str,
     inner_elf_bytes: &[u8],
     inner_private_input: &[u8],
-    inner_proof_options: stark::proof::options::ProofOptions,
-    preset: &str,
+    preset: Preset,
     mode: OuterMode,
 ) {
     let root = workspace_root();
-    let recursion_elf_bytes = read_guest_elf(&root, &format!("recursion-{preset}"));
+    let recursion_elf_bytes = read_guest_elf(&root, preset.artifact_stem());
+    let opts = preset.options();
 
-    let (inner_proof, blob, decode_commitment, page_commitments) = prove_inner_and_encode_blob(
-        label,
-        inner_elf_bytes,
-        inner_private_input,
-        &inner_proof_options,
-    );
+    let (inner_proof, blob) =
+        prove_inner_and_encode_blob(label, inner_elf_bytes, inner_private_input, &opts);
 
     assert!(
-        crate::verify_with_options(
-            &inner_proof,
-            inner_elf_bytes,
-            &inner_proof_options,
-            None,
-            None
-        )
-        .expect("inner verify errored"),
+        crate::verify_with_options(&inner_proof, inner_elf_bytes, &opts, None, None)
+            .expect("inner verify errored"),
         "inner proof must verify on host"
     );
     assert!(
@@ -529,55 +454,50 @@ fn run_recursion_pipeline_with_options(
         OuterMode::Prove => prove_outer_and_commit(label, &recursion_elf_bytes, &blob),
     };
 
-    let expected = expected_committed_output(
-        inner_elf_bytes,
-        &decode_commitment,
-        &page_commitments,
-        &inner_proof.public_output,
-    );
+    // Production consumer path: recompute the id from the trusted inner ELF and
+    // compare against the guest's committed attestation (the real host-side
+    // binding). `Some(inner_public_output)` iff the recompute matches.
+    let inner_output = recursion::check_attestation(&committed, inner_elf_bytes, &opts)
+        .expect("check_attestation errored")
+        .expect(
+            "guest attestation must match the trusted inner ELF (program_id recompute+compare)",
+        );
     assert_eq!(
-        committed, expected,
-        "recursion guest must commit elf_digest||decode_commitment||page_commitments (in-VM verify accepted)"
+        inner_output, inner_proof.public_output,
+        "attested inner public output must equal the inner proof's public output"
     );
-    eprintln!("[{label}] guest committed the expected commitments: in-VM verify accepted ✓");
+    eprintln!("[{label}] guest attestation matched the trusted inner ELF (program_id recompute) ✓");
 }
 
-/// `run_recursion_pipeline_with_options` with `blowup=8` (the `empty`/`fibonacci` default).
+/// `run_recursion_pipeline_with_options` at `blowup=8` (the `empty`/`fibonacci`
+/// default), i.e. [`Preset::Blowup8`].
 fn run_recursion_pipeline(
     label: &str,
     inner_elf_bytes: &[u8],
     inner_private_input: &[u8],
     mode: OuterMode,
 ) {
-    let inner_proof_options = stark::proof::options::GoldilocksCubicProofOptions::with_blowup(8)
-        .expect("blowup=8 is always valid");
     run_recursion_pipeline_with_options(
         label,
         inner_elf_bytes,
         inner_private_input,
-        inner_proof_options,
-        "blowup8",
+        Preset::Blowup8,
         mode,
     );
 }
 
-/// Decode the blob on the host and verify — a cheap guard on the encode/decode
-/// contract without running the VM.
+/// Decode the blob on the host and mirror the guest's verify+attest, then run
+/// the consumer check — a cheap guard on the encode/decode/attest contract
+/// without running the VM.
 #[test]
 fn test_recursion_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let (_inner, blob, _decode_commitment, _page_commitments) =
+    let (_inner, blob) =
         prove_inner_and_encode_blob("roundtrip", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
     // Decode exactly as the guest does (built with the `min` feature).
-    type DecodedBlob = (
-        crate::VmProof,
-        Vec<u8>,
-        crate::Commitment,
-        Vec<(u64, crate::Commitment)>,
-    );
-    let decoded: Result<DecodedBlob, _> = postcard::from_bytes(&blob);
+    let decoded: Result<recursion::GuestInput, _> = postcard::from_bytes(&blob);
     let (vm_proof, inner_elf, decode_commitment, page_commitments) = match decoded {
         Ok(t) => t,
         Err(e) => panic!("[roundtrip] postcard DECODE failed (this is the guest panic): {e}"),
@@ -588,19 +508,33 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
         page_commitments.len(),
     );
 
-    match crate::verify_with_options(
+    // Mirror the guest exactly: verify_and_attest over the supplied roots.
+    let attestation = match recursion::verify_and_attest(
         &vm_proof,
         &inner_elf,
         &MIN_PROOF_OPTIONS,
-        Some(decode_commitment),
-        Some(&page_commitments),
+        decode_commitment,
+        &page_commitments,
     ) {
-        Ok(true) => eprintln!("[roundtrip] verify ok=true — guest path is sound"),
-        Ok(false) => panic!(
-            "[roundtrip] verify returned FALSE (guest hits assert!(ok)) — proof did not survive the postcard round-trip"
+        Ok(Some(a)) => {
+            eprintln!("[roundtrip] verify_and_attest accepted — guest path is sound");
+            a
+        }
+        Ok(None) => panic!(
+            "[roundtrip] verify_and_attest returned None (guest hits the failed-verification expect) — proof did not survive the postcard round-trip"
         ),
-        Err(e) => panic!("[roundtrip] verify ERRORED (guest hits .expect): {e:?}"),
-    }
+        Err(e) => panic!("[roundtrip] verify_and_attest ERRORED (guest hits .expect): {e:?}"),
+    };
+
+    // Consumer check: the committed attestation must bind to the trusted inner
+    // ELF and carry the inner proof's public output.
+    let output = recursion::check_attestation(&attestation, &inner_elf, &MIN_PROOF_OPTIONS)
+        .expect("check_attestation errored")
+        .expect("attestation must match the trusted inner ELF (program_id recompute+compare)");
+    assert_eq!(
+        output, vm_proof.public_output,
+        "attested public output must equal the inner proof's public output"
+    );
 }
 
 /// Corrupting a private-input commitment on an *honest* proof makes
@@ -612,12 +546,15 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 fn test_recursion_rejects_corrupted_commitment() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
-    let (vm_proof, _blob, mut decode_commitment, page_commitments) = prove_inner_and_encode_blob(
+    let (vm_proof, _blob) = prove_inner_and_encode_blob(
         "corrupt-commitment",
         &empty_elf_bytes,
         &[],
         &MIN_PROOF_OPTIONS,
     );
+    let (mut decode_commitment, page_commitments) =
+        recursion::precomputed_commitments(&empty_elf_bytes, &MIN_PROOF_OPTIONS)
+            .expect("precomputed_commitments failed");
     decode_commitment[0] ^= 0xFF;
 
     let ok = crate::verify_with_options(
@@ -660,8 +597,7 @@ fn test_recursion_execute_1query() {
         "recursion-exec-1query",
         &empty_elf_bytes,
         &[],
-        MIN_PROOF_OPTIONS,
-        "min",
+        Preset::Min,
         OuterMode::ExecuteOnly,
     );
 }
@@ -681,8 +617,7 @@ fn test_recursion_execute_1query() {
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_step_markers_observed_in_order() {
-    let (_bytes, program, mut executor) =
-        setup_guest_run("step-markers", "min", &MIN_PROOF_OPTIONS);
+    let (_bytes, program, mut executor) = setup_guest_run("step-markers", Preset::Min);
     let instructions = executor::vm::execution::InstructionCache::new(&program.data)
         .expect("instruction cache build failed");
 
@@ -773,8 +708,7 @@ fn test_recursion_prove_1query() {
         "recursion-prove-1query",
         &empty_elf_bytes,
         &[],
-        MIN_PROOF_OPTIONS,
-        "min",
+        Preset::Min,
         OuterMode::Prove,
     );
 }
@@ -787,7 +721,7 @@ fn test_dump_recursion_input() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
 
-    let (_inner_proof, blob, _decode_commitment, _page_commitments) =
+    let (_inner_proof, blob) =
         prove_inner_and_encode_blob("dump-input", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
 
     let path = "/tmp/recursion_input.bin";
@@ -799,28 +733,28 @@ fn test_dump_recursion_input() {
 #[test]
 #[ignore = "diagnostic: fast; recursion guest cycle count (1 query)"]
 fn test_recursion_cycles_1query() {
-    run_profile("min", 500, MIN_PROOF_OPTIONS, false);
+    run_profile(Preset::Min, 500, false);
 }
 
 /// Cycle count only at 128-bit security: more FRI queries → more verifier cycles.
 #[test]
 #[ignore = "diagnostic: fast; recursion guest cycle count (multi-query)"]
 fn test_recursion_cycles_multiquery() {
-    run_profile("blowup8", 500, blowup8(), false);
+    run_profile(Preset::Blowup8, 500, false);
 }
 
 /// Full profile (top-25 + per-step) of the 1-query run.
 #[test]
 #[ignore = "diagnostic: ~8 min; recursion guest histogram + steps (1 query)"]
 fn test_recursion_profile_1query() {
-    run_profile("min", 500, MIN_PROOF_OPTIONS, true);
+    run_profile(Preset::Min, 500, true);
 }
 
 /// Full profile at 128-bit security: weight shifts toward per-query FRI/Merkle.
 #[test]
 #[ignore = "diagnostic: heavy; recursion guest histogram + steps (multi-query)"]
 fn test_recursion_profile_multiquery() {
-    run_profile("blowup8", 500, blowup8(), true);
+    run_profile(Preset::Blowup8, 500, true);
 }
 
 /// Inner program: fibonacci(10).

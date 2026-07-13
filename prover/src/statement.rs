@@ -10,65 +10,21 @@
 //! every derived challenge differ and verification reject.
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
-use executor::elf::Elf;
 use sha3::{Digest, Keccak256};
 
 use crate::test_utils::E;
-use crate::{Commitment, RuntimePageRange, TableCounts};
+use crate::{RuntimePageRange, TableCounts};
 
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
 const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
 /// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
-/// into the transcript. Public so the recursion guest can commit to it directly.
-pub fn elf_digest(elf: &[u8]) -> [u8; 32] {
+/// into the transcript. The recursion attestation folds the same digest into
+/// `program_id` (see the `recursion` module), sharing one pass over the ELF.
+pub(crate) fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(elf);
     h.finalize().into()
-}
-
-/// Domain tag for [`program_id`].
-const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
-
-/// Canonical program identity: a fold of the full ELF digest, entry point, and
-/// the supplied DECODE / ELF-data-page roots (folded in ascending `page_base`
-/// order). Folding the roots in makes a supplied-root substitution yield a
-/// different id than an honest native recompute — the binding is that compare.
-pub fn program_id(
-    elf_bytes: &[u8],
-    pc_start: u64,
-    decode_commitment: &Commitment,
-    page_commitments: &[(u64, Commitment)],
-) -> [u8; 32] {
-    let mut pages = page_commitments.to_vec();
-    pages.sort_by_key(|(base, _)| *base);
-
-    let mut h = Keccak256::new();
-    h.update(PROGRAM_ID_TAG);
-    h.update(elf_digest(elf_bytes));
-    h.update(pc_start.to_le_bytes());
-    h.update(decode_commitment);
-    h.update((pages.len() as u64).to_le_bytes());
-    for (base, c) in &pages {
-        h.update(base.to_le_bytes());
-        h.update(c);
-    }
-    h.finalize().into()
-}
-
-/// [`program_id`] with `pc_start` taken from `elf_bytes`' entry point.
-pub fn program_id_from_elf(
-    elf_bytes: &[u8],
-    decode_commitment: &Commitment,
-    page_commitments: &[(u64, Commitment)],
-) -> Result<[u8; 32], crate::Error> {
-    let elf = Elf::load(elf_bytes).map_err(|e| crate::Error::ElfLoad(format!("{e}")))?;
-    Ok(program_id(
-        elf_bytes,
-        elf.entry_point,
-        decode_commitment,
-        page_commitments,
-    ))
 }
 
 /// Which statement is being bound. Selects the leading domain tag and whether an
@@ -94,6 +50,33 @@ pub(crate) fn absorb_statement(
     runtime_page_ranges: &[RuntimePageRange],
     fri_final_poly_log_degree: u8,
 ) {
+    absorb_statement_with_digest(
+        t,
+        kind,
+        &elf_digest(elf_bytes),
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        fri_final_poly_log_degree,
+    )
+}
+
+/// [`absorb_statement`] with the ELF digest precomputed. Callers that already
+/// hold the digest reuse it instead of a second full-ELF Keccak pass — the
+/// recursion attestation path shares one digest between the transcript absorb
+/// and the `program_id` fold (a full-ELF hash is expensive in-guest).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_statement_with_digest(
+    t: &mut impl IsTranscript<E>,
+    kind: StatementKind,
+    elf_digest: &[u8; 32],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
+) {
     // Leading domain tag — distinct per statement kind, so a monolithic proof and
     // a continuation epoch proof can never share a transcript prefix.
     let domain_tag = match kind {
@@ -103,7 +86,7 @@ pub(crate) fn absorb_statement(
     t.append_bytes(domain_tag);
 
     // ELF: fixed 32-byte digest — no length prefix needed.
-    t.append_bytes(&elf_digest(elf_bytes));
+    t.append_bytes(elf_digest);
 
     // public_output: variable length → length-prefix to prevent boundary collisions.
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());
