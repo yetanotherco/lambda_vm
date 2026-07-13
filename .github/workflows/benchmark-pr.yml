@@ -27,8 +27,9 @@ permissions:
   actions: read
 
 concurrency:
+  # Runner serializes; never cancel a running bench (group is already unique per run for comment/push events).
   group: benchmark-${{ github.head_ref || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   # Headline program: the ethrex guest ELF proven against a 20-transfer block
