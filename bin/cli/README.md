@@ -41,7 +41,7 @@ cargo run -p cli --release -- execute <PROGRAM.elf> [--private-input <FILE>] [--
 |---|---|
 | `--private-input <FILE>` | Pass private input bytes to the guest (read via `get_private_input()`). |
 | `--flamegraph <FILE>` | Generate folded-stack flamegraph output. See [Guest Program Flamegraphs](#guest-program-flamegraphs). |
-| `--cycles` | Count instructions during execution and print the dynamic instruction count. |
+| `--cycles` | Count instructions during execution and print the dynamic instruction count. Also reports `Keccak calls` / `Ecsm calls` (accelerator syscall invocations). Combined with `--flamegraph`, the accelerator lines are omitted (the flamegraph path exposes no per-log data). |
 
 ### Prove
 
