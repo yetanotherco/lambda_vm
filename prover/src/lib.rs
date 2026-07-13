@@ -20,7 +20,8 @@ mod debug_report;
 pub mod instruments;
 mod paged_mem;
 pub use stark::profile_markers;
-pub mod statement;
+pub mod recursion;
+mod statement;
 pub mod tables;
 pub mod test_utils;
 #[cfg(test)]
@@ -39,7 +40,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::{StatementKind, absorb_statement};
+use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -58,8 +59,10 @@ use crate::test_utils::{
     create_register_air, create_shift_air, create_store_air,
 };
 
-// Re-exported so downstream verifier guests (e.g. the in-VM recursion guest) can
-// name the proof-options type carried in their private input alongside `VmProof`.
+// Re-exported for downstream hosts and verifier guests (e.g. the in-VM
+// recursion guest): `Commitment` is carried in the guest's private input
+// (see `recursion::GuestInput`); the proof-options types name the parameters
+// fixed at guest build time (`recursion::Preset`).
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
@@ -199,6 +202,9 @@ pub enum Error {
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
+    /// Recursion host-side helper failed (guest-input encoding or
+    /// commitment recompute — see the `recursion` module).
+    Recursion(String),
 }
 
 impl fmt::Display for Error {
@@ -227,6 +233,7 @@ impl fmt::Display for Error {
                     "the program-terminating instruction must be in the final epoch"
                 )
             }
+            Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
         }
     }
 }
@@ -430,7 +437,7 @@ impl VmAirs {
     /// Supplied roots are used verbatim and NOT checked against `elf`. A wrong
     /// caller-constant root is rejected (mismatches the proof root or diverges
     /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
-    /// callers must bind identity externally (see `statement::program_id`).
+    /// callers must bind identity externally (see `recursion::check_attestation`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
@@ -1004,10 +1011,37 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// binary), a wrong value is rejected (it mismatches the proof's precomputed
 /// root or diverges Fiat-Shamir). If it is prover-supplied (e.g. the recursion
 /// guest's private input), a consistent mismatched root is NOT rejected here;
-/// the caller must bind identity externally (see `statement::program_id`).
+/// the caller must bind identity externally (the recursion pipeline commits
+/// `recursion::program_id` and the consumer checks it via
+/// `recursion::check_attestation`).
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
+    verify_prepared(
+        vm_proof,
+        &program,
+        &elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
+/// [`verify_with_options`] with the ELF already parsed and digested. Callers
+/// that need the parsed ELF or the digest for other purposes reuse them — the
+/// recursion attestation (`recursion::verify_and_attest`) shares one
+/// `Elf::load` and one full-ELF Keccak between verification and the
+/// `program_id` fold, which matters in-guest where both are expensive.
+pub(crate) fn verify_prepared(
+    vm_proof: &VmProof,
+    program: &Elf,
+    elf_digest: &[u8; 32],
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
@@ -1028,9 +1062,8 @@ pub fn verify_with_options(
         }
     }
 
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
+        program,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
     );
@@ -1050,7 +1083,7 @@ pub fn verify_with_options(
     }
 
     let airs = VmAirs::new(
-        &program,
+        program,
         proof_options,
         false,
         &page_configs,
@@ -1071,10 +1104,10 @@ pub fn verify_with_options(
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
-        elf_bytes,
+        elf_digest,
         &vm_proof.public_output,
         &vm_proof.table_counts,
         vm_proof.num_private_input_pages,
