@@ -93,6 +93,12 @@ an epoch. The cross-epoch chain is ordered by the **epoch number** (§3.3), so t
 GlobalMemory bus carries no timestamp at all (see §2 telescoping). `fini_timestamp`
 stays only because the epoch-local **Memory bus** needs it (matched against MEMW).
 
+Note: timestamps are single 32-bit `Word`s, so an epoch's largest real timestamp
+(`halt_timestamp + 4·num_padding_rows + 1`) must stay strictly below the `2^32-1`
+finalization sentinel — capping an epoch at roughly `2^30` cycles. This is enforced
+by the `epoch_size_log2 <= 28` bound in `prove_continuation` and, as a backstop for
+every proving path, by a trace-build guard that returns `Error::TimestampOverflow`.
+
 ### Cross-epoch telescoping
 
 For a cell touched in epochs 1, 2, 3, the GlobalMemory bus checks:

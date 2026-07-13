@@ -199,6 +199,9 @@ pub enum Error {
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
+    /// A real timestamp reached the `2^32-1` finalization sentinel: the run (or
+    /// epoch) is too long for the single-`Word` timestamp representation.
+    TimestampOverflow(String),
 }
 
 impl fmt::Display for Error {
@@ -227,6 +230,7 @@ impl fmt::Display for Error {
                     "the program-terminating instruction must be in the final epoch"
                 )
             }
+            Error::TimestampOverflow(msg) => write!(f, "timestamp overflow: {msg}"),
         }
     }
 }

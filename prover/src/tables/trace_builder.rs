@@ -2794,6 +2794,24 @@ fn collect_all_ops(
     }
 }
 
+/// Exclusive upper bound for a single-`Word` timestamp. Every real timestamp must
+/// stay strictly below the `2^32-1` HALT finalization sentinel (see `halt.rs`), so a
+/// value at or above this bound means the run/epoch is too long for the 32-bit
+/// timestamp representation.
+const TIMESTAMP_WORD_BOUND: u64 = u32::MAX as u64; // 2^32 - 1 (the finalization sentinel)
+
+/// Fails if `last_ts` reaches the `2^32-1` finalization sentinel. Always-on guard
+/// backing every proving path (monolithic and the final continuation epoch).
+pub(crate) fn check_timestamp_word_bound(last_ts: u64) -> Result<(), Error> {
+    if last_ts >= TIMESTAMP_WORD_BOUND {
+        return Err(Error::TimestampOverflow(format!(
+            "final timestamp {last_ts} reaches the 2^32-1 sentinel; the run is too long \
+             for single-Word timestamps (cap an epoch at ~2^30 cycles)"
+        )));
+    }
+    Ok(())
+}
+
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
 /// `initial_image` controls PAGE table generation: `Some(image)` generates real
@@ -2927,7 +2945,14 @@ fn build_traces<I: ImageSource + Sync>(
         // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
         // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
         // must match that last write to balance the memory argument.
-        register_state.write_pc(1, halt_op.timestamp + 4 * num_padding_rows as u64 + 1);
+        let last_pc_write_ts = halt_op.timestamp + 4 * num_padding_rows as u64 + 1;
+        // Timestamps are single 32-bit `Word`s: every real timestamp must stay below the
+        // `2^32-1` finalization sentinel or the memory argument cannot balance. This is the
+        // always-on guarantee (the `debug_assert!` in halt.rs is only a secondary check).
+        // It bounds the monolithic path and the final continuation epoch; intermediate
+        // epochs are bounded by the `epoch_size_log2 <= 28` check in `prove_continuation`.
+        check_timestamp_word_bound(last_pc_write_ts)?;
+        register_state.write_pc(1, last_pc_write_ts);
         (halt_op.timestamp, halt_op.next_pc)
     } else {
         (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)

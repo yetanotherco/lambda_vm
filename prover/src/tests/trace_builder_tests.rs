@@ -822,6 +822,33 @@ mod routing_tests {
     }
 }
 
+mod timestamp_bound_tests {
+    use crate::Error;
+    use crate::tables::trace_builder::check_timestamp_word_bound;
+
+    // Sentinel is 2^32-1 = u32::MAX; real timestamps must be strictly below it.
+    #[test]
+    fn test_timestamp_word_bound_accepts_below_sentinel() {
+        assert!(check_timestamp_word_bound(1_000).is_ok());
+        // 2^32-2, the largest allowed value (one below the sentinel).
+        assert!(check_timestamp_word_bound(u64::from(u32::MAX) - 1).is_ok());
+    }
+
+    #[test]
+    fn test_timestamp_word_bound_rejects_sentinel_and_above() {
+        // Exactly the 2^32-1 sentinel must be rejected.
+        assert!(matches!(
+            check_timestamp_word_bound(u64::from(u32::MAX)),
+            Err(Error::TimestampOverflow(_))
+        ));
+        // And anything above it.
+        assert!(matches!(
+            check_timestamp_word_bound(u64::from(u32::MAX) + 7),
+            Err(Error::TimestampOverflow(_))
+        ));
+    }
+}
+
 /// `from_image_and_logs` is a faithful generalization of `from_elf_and_logs`:
 /// fed the ELF-derived image, it must produce identical traces.
 #[test]

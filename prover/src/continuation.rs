@@ -768,6 +768,16 @@ pub fn prove_continuation(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
         ));
     }
+    // Timestamps are single 32-bit `Word`s (~4·cycle), so an epoch's real timestamps
+    // must stay below the 2^32-1 finalization sentinel. Capping at 2^28 cycles keeps
+    // the max timestamp (4·2^28 = 2^30) comfortably below the sentinel, leaving room
+    // for CPU padding and the +2 register-write offset.
+    if epoch_size_log2 > 28 {
+        return Err(Error::InvalidContinuationEpochSize(format!(
+            "epoch_size_log2 {epoch_size_log2} exceeds 28; 4·2^{epoch_size_log2} would \
+             approach the 2^32-1 timestamp sentinel"
+        )));
+    }
     let epoch_size = 1usize.checked_shl(epoch_size_log2).ok_or_else(|| {
         Error::InvalidContinuationEpochSize(format!(
             "epoch_size_log2 {epoch_size_log2} is too large for this platform"
@@ -1183,6 +1193,16 @@ mod tests {
     fn test_continuation_rejects_too_small_epoch_size_log2() {
         assert!(matches!(
             prove_continuation(&[], &[], 1, &ProofOptions::default_test_options()),
+            Err(Error::InvalidContinuationEpochSize(_))
+        ));
+    }
+
+    #[test]
+    fn test_continuation_rejects_too_large_epoch_size_log2() {
+        // epoch_size_log2 > 28 would push per-epoch timestamps toward the 2^32-1
+        // finalization sentinel; the bound is checked before any ELF work.
+        assert!(matches!(
+            prove_continuation(&[], &[], 29, &ProofOptions::default_test_options()),
             Err(Error::InvalidContinuationEpochSize(_))
         ));
     }
