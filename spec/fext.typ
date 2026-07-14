@@ -33,7 +33,7 @@ As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for
 We use the #load chip to load the three composing coefficients from registers A1-A3 (in little-endian),
 verify that all of them are in the correct range for a field element,
 and then write them as field elements into field-storage.
-We do this using #nr_variables variables spanning #nr_columns and #nr_interactions interactions.
+We do this using #nr_variables variables spanning #nr_columns columns and #nr_interactions interactions.
 
 == Variables
 
@@ -62,7 +62,7 @@ $X^3 = alpha X^2 + beta X + gamma$.
 
 == Variables
 
-We express this chip using #nr_variables variables spanning #nr_columns and #nr_interactions interactions.
+We express this chip using #nr_variables variables spanning #nr_columns columns and #nr_interactions interactions.
 
 #render_chip_variable_table(fmachip, config)
 
