@@ -332,25 +332,27 @@ echo
 echo "=== Recursion-guest cycle/accelerator comparison (deterministic, exact) ==="
 echo "   REF_B (baseline) $REF_B  ${SHA_B:0:10}  guest=$ELF_B"
 echo "   REF_A (PR)       $REF_A  ${SHA_A:0:10}  guest=$ELF_A"
-if [ "$ELF_A" != "$ELF_B" ]; then
-  echo "   note: the sides used different guest artifacts ($ELF_B vs $ELF_A). This is EXPECTED"
-  echo "         for a preset PR (e.g. main→recursion.elf vs PR→recursion-min.elf); both verify"
-  echo "         under the same min proof options, so it is a valid comparison, not a mismatch."
-fi
-echo "   preset=$PRESET   convention: - = PR fewer = better"
 echo
 echo "| Metric        | REF_B (baseline) | REF_A (PR) | Δ (A-B) |"
 echo "|---------------|------------------|------------|---------|"
-# Guest cycles are shown in MILLIONS (one decimal); the RAW block below carries the
-# exact integer counts for scripts. Keccak/Ecsm stay plain integer call counts.
+# Guest cycles are shown in MILLIONS (one decimal); the exact integer counts are in
+# the collapsed raw block below. Keccak/Ecsm stay plain integer call counts.
 printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
 printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
 printf '| Ecsm calls    | %s | %s | %s |\n' "$ECS_B" "$ECS_A" "$(sd "$ECS_A" "$ECS_B")"
+# Exact machine-parseable counts, collapsed so they don't clutter the PR comment (the
+# table above is rounded to millions; these are the exact integers). The blank lines
+# around the fence are required for GitHub to render the code block inside <details>.
 echo
-echo "=== RAW (machine-parseable) ==="
+echo "<details><summary>raw (exact integer counts)</summary>"
+echo
+echo '```'
 printf 'ref_b_sha=%s ref_b_elf=%s ref_b_cycles=%s ref_b_keccak=%s ref_b_ecsm=%s ref_b_execute_wall_s=%s\n' \
   "$SHA_B" "$ELF_B" "$CYC_B" "$KEC_B" "$ECS_B" "$WALL_B"
 printf 'ref_a_sha=%s ref_a_elf=%s ref_a_cycles=%s ref_a_keccak=%s ref_a_ecsm=%s ref_a_execute_wall_s=%s\n' \
   "$SHA_A" "$ELF_A" "$CYC_A" "$KEC_A" "$ECS_A" "$WALL_A"
 printf 'delta_cycles=%s delta_keccak=%s delta_ecsm=%s\n' \
   "$(( CYC_A - CYC_B ))" "$(( KEC_A - KEC_B ))" "$(( ECS_A - ECS_B ))"
+echo '```'
+echo
+echo "</details>"

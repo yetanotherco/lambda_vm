@@ -155,10 +155,6 @@ jobs:
               const rec = read('/tmp/recursion_result.txt') || tail(read('/tmp/recursion_out.txt'), 20);
               if (rec) {
                 body += rec + '\n';
-                body += '\n<sub>Deterministic in-VM verifier: one exact `execute --cycles` reading per ref ';
-                body += '(no ABBA needed). - = PR does fewer cycles/calls = better. keccak/ecsm are 0 when ';
-                body += 'the verifier uses Poseidon2. Each ref dumps its own input blob, so for a PR that ';
-                body += 'changes the proof format the delta reflects both guest-code and proof-structure changes.</sub>\n';
               } else {
                 body += '_No recursion comparison output was captured._\n';
               }
