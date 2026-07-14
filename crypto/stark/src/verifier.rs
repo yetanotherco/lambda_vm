@@ -1079,10 +1079,12 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let multi_proof = MultiProof {
-            proofs: vec![proof.clone()],
-        };
-        Self::multi_verify(&[air], &multi_proof, transcript, &FieldElement::zero())
+        Self::multi_verify_views(
+            &[air],
+            &[StarkProofView::Owned(proof)],
+            transcript,
+            &FieldElement::zero(),
+        )
     }
 
     /// Replays rounds 2, 3 and 4 of the protocol for a given proof, assuming round 1 has
