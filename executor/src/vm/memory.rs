@@ -65,6 +65,12 @@ pub struct Memory {
     /// onto the Commit bus by `index`), so this buffer is purely the
     /// executor's view used by `read_return_value` and CLI display.
     public_output: Vec<u8>,
+    /// Field-storage for the FEXT accelerator: the "arithmetic black box"
+    /// address space (memory domains 3/4/5 in the spec), isolated from RAM
+    /// `cells`. Each entry holds the three canonical Goldilocks coefficients
+    /// of one degree-3 extension-field element at that address; coefficient
+    /// `k` corresponds to memory domain `3 + k`.
+    field_storage: U64HashMap<[u64; 3]>,
 }
 
 impl Memory {
@@ -162,6 +168,18 @@ impl Memory {
             }
         }
         Ok(())
+    }
+
+    /// Load the three coefficients of the FEXT field-storage element at
+    /// `address`. Uninitialized cells read as zero (the extension-field zero).
+    pub fn field_load(&self, address: u64) -> [u64; 3] {
+        self.field_storage.get(&address).copied().unwrap_or([0; 3])
+    }
+
+    /// Store the three canonical coefficients of a FEXT field-storage element
+    /// at `address`.
+    pub fn field_store(&mut self, address: u64, value: [u64; 3]) {
+        self.field_storage.insert(address, value);
     }
 
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {

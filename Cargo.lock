@@ -1220,6 +1220,7 @@ version = "0.1.0"
 dependencies = [
  "ecsm",
  "ethrex-guest-program",
+ "math",
  "rkyv",
  "rustc-demangle",
  "serde",

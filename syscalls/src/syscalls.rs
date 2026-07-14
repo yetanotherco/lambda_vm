@@ -24,6 +24,14 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+/// Syscall number for the FEXT_LOAD accelerator (-20 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_LOAD_SYSCALL_NUMBER: usize = usize::MAX - 19;
+
+/// Syscall number for the FEXT_FMA accelerator (-21 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_FMA_SYSCALL_NUMBER: usize = usize::MAX - 20;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -153,6 +161,53 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Store a degree-3 Goldilocks extension element into field-storage at `addr`
+/// via the FEXT_LOAD accelerator. `coeffs` are the three coefficients in native
+/// form; each must be a canonical field element (`< p`). `addr` is a handle into
+/// the accelerator's separate field-storage address space (not RAM).
+pub fn fext_load(addr: u64, coeffs: &[u64; 3]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") addr,       // x10 = field-storage destination address
+            in("a1") coeffs[0],  // x11 = coefficient 0
+            in("a2") coeffs[1],  // x12 = coefficient 1
+            in("a3") coeffs[2],  // x13 = coefficient 2
+            in("a7") FEXT_LOAD_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Store a degree-3 Goldilocks extension element into field-storage at `addr`.
+pub fn fext_load(_addr: u64, _coeffs: &[u64; 3]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `out = a*b + c` over the native degree-3 Goldilocks extension via the
+/// FEXT_FMA accelerator. All arguments are field-storage handles (not RAM
+/// addresses); the result is written to `out_addr`.
+pub fn fext_fma(out_addr: u64, a_addr: u64, b_addr: u64, c_addr: u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") out_addr, // x10 = output field-storage address
+            in("a1") a_addr,   // x11 = address of a
+            in("a2") b_addr,   // x12 = address of b
+            in("a3") c_addr,   // x13 = address of c
+            in("a7") FEXT_FMA_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Compute `out = a*b + c` over the native degree-3 Goldilocks extension.
+pub fn fext_fma(_out_addr: u64, _a_addr: u64, _b_addr: u64, _c_addr: u64) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 
