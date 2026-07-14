@@ -34,6 +34,7 @@ pub mod ecsm;
 pub mod eq;
 pub mod fext_fma;
 pub mod fext_load;
+pub mod fext_page;
 pub mod global_memory;
 pub mod halt;
 pub mod keccak;

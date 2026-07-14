@@ -48,13 +48,45 @@ fn run_fma(memory: &mut Memory, out: u64, a: u64, b: u64, c: u64) {
     let mut pc = 0;
     let mut registers = Registers::default();
     registers.write(17, FEXT_FMA_SYSCALL_NUMBER).unwrap();
-    registers.write(10, out).unwrap();
-    registers.write(11, a).unwrap();
-    registers.write(12, b).unwrap();
-    registers.write(13, c).unwrap();
+    registers.write(10, a).unwrap();
+    registers.write(11, b).unwrap();
+    registers.write(12, c).unwrap();
+    registers.write(13, out).unwrap();
     Instruction::EcallEbreak
         .run(&mut pc, &mut registers, memory)
         .unwrap();
+}
+
+fn run_fma_result(out: u64, a: u64, b: u64, c: u64) -> Result<(), ExecutionError> {
+    let mut pc = 0;
+    let mut memory = Memory::default();
+    let mut registers = Registers::default();
+    registers.write(17, FEXT_FMA_SYSCALL_NUMBER).unwrap();
+    registers.write(10, a).unwrap();
+    registers.write(11, b).unwrap();
+    registers.write(12, c).unwrap();
+    registers.write(13, out).unwrap();
+    Instruction::EcallEbreak.run(&mut pc, &mut registers, &mut memory)?;
+    Ok(())
+}
+
+#[test]
+fn fext_fma_rejects_overlapping_addresses() {
+    // The single-timestamp design requires out/a/b/c pairwise distinct.
+    for (out, a, b, c) in [
+        (0x10, 0x10, 0x20, 0x30), // out == a
+        (0x40, 0x20, 0x20, 0x30), // a == b (squaring)
+        (0x40, 0x10, 0x20, 0x40), // out == c
+        (0x40, 0x10, 0x30, 0x30), // b == c
+    ] {
+        let err = run_fma_result(out, a, b, c).unwrap_err();
+        assert!(
+            matches!(err, ExecutionError::FextOperandOverlap),
+            "out={out:#x} a={a:#x} b={b:#x} c={c:#x} must be rejected"
+        );
+    }
+    // Pairwise-distinct addresses run fine.
+    run_fma_result(0x40, 0x10, 0x20, 0x30).expect("distinct addresses must run");
 }
 
 #[test]

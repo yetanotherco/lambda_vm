@@ -10,14 +10,17 @@
 //! These are the spec's general `x^3 = αx^2 + βx + γ` constraints specialized to
 //! the VM's native field (`α = β = 0`, `γ = 2`), which makes them degree 2.
 //!
-//! ## Bus interactions (this phase)
+//! ## Bus interactions
 //! - **Receiver** on `Ecall`: `[ts_lo, ts_hi, FEXT_FMA_lo32, FEXT_FMA_hi32]` (mult = μ).
-//! - **Sender** on `Memw` ×4: register reads of x10/x11/x12/x13 (out/a/b/c addresses).
+//! - **Sender** on `Memw` ×4: register reads of x10/x11/x12/x13 (out/a/b/c addrs).
+//! - **Memory** reads ×9: coefficient `d` of each of a/b/c from cell `(3+d, addr)`.
+//! - **Memory** writes ×3: output coefficient `d` to cell `(3+d, out_addr)`.
+//! - **Alu** ×12: `old_ts < ts` temporal ordering per field-storage access.
 //!
-//! The field-storage reads of `a,b,c` and the write of `output` (memory domains
-//! 3/4/5), plus the domain init/finalization, are added in the field-storage
-//! phase; until then the coefficient columns are free witness bound only by the
-//! arithmetic constraints.
+//! Field-storage rides the low-level `Memory` bus directly (single field-element
+//! value, free domain); the per-cell init/fini tokens come from `FEXT_PAGE`. The
+//! executor guarantees a/b/c/out addresses are pairwise distinct, so all accesses
+//! can share one timestamp.
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -26,11 +29,12 @@ use executor::vm::instruction::execution::FEXT_FMA_SYSCALL_NUMBER;
 
 use crate::constraints::templates::emit_is_bit;
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, zeroed_fe_vec};
+use super::types::{
+    BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
+};
 
 /// Column indices for the FEXT_FMA table.
 pub mod cols {
-    // Timestamp (DWordWL: 2 cols)
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
 
@@ -60,17 +64,43 @@ pub mod cols {
     pub const OUT1: usize = 20;
     pub const OUT2: usize = 21;
 
-    /// Multiplicity bit (1 for real rows, 0 for padding).
+    /// Multiplicity bit.
     pub const MU: usize = 22;
 
-    pub const NUM_COLUMNS: usize = 23;
+    // Old timestamps for the 9 reads, ordered (value a/b/c, coeff 0/1/2), each a
+    // DWordWL (2 cols): base 23..41.
+    pub const READ_OLD_TS: usize = 23;
+    // Old timestamp (DWordWL) + old value for the 3 output writes: base 41..50.
+    pub const WRITE_OLD: usize = 41;
+
+    pub const NUM_COLUMNS: usize = 50;
+
+    /// Low-limb column of the old timestamp for read `(v, d)` (v: 0=a,1=b,2=c).
+    pub const fn read_old_ts(v: usize, d: usize) -> usize {
+        READ_OLD_TS + (v * 3 + d) * 2
+    }
+    /// Low-limb column of the old timestamp for output write of coefficient `d`.
+    pub const fn write_old_ts(d: usize) -> usize {
+        WRITE_OLD + d * 3
+    }
+    /// Old-value column for the output write of coefficient `d`.
+    pub const fn write_old_val(d: usize) -> usize {
+        WRITE_OLD + d * 3 + 2
+    }
+    /// Base (low) address column of operand `v` (0=a,1=b,2=c).
+    pub const fn operand_addr(v: usize) -> usize {
+        A_ADDR_0 + v * 2
+    }
+    /// Coefficient `d` column of operand `v` (0=a,1=b,2=c).
+    pub const fn operand_coeff(v: usize, d: usize) -> usize {
+        A0 + v * 3 + d
+    }
 }
 
-/// FEXT_FMA syscall number split into the two 32-bit limbs the `Ecall` bus carries.
 const FMA_SYSCALL_LO: u64 = FEXT_FMA_SYSCALL_NUMBER & 0xFFFF_FFFF;
 const FMA_SYSCALL_HI: u64 = FEXT_FMA_SYSCALL_NUMBER >> 32;
 
-/// One FEXT_FMA invocation: `output = a*b + c`, with operand addresses.
+/// One FEXT_FMA invocation.
 #[derive(Debug, Clone)]
 pub struct FextFmaOperation {
     pub timestamp: u64,
@@ -78,17 +108,20 @@ pub struct FextFmaOperation {
     pub a_addr: u64,
     pub b_addr: u64,
     pub c_addr: u64,
-    /// Coefficients of `a`, `b`, `c` (canonical field elements).
     pub a: [u64; 3],
     pub b: [u64; 3],
     pub c: [u64; 3],
-    /// Result coefficients `a*b + c` (canonical).
     pub output: [u64; 3],
+    /// Last-write timestamp of each read cell, `[value a/b/c][coeff d]`.
+    pub read_old_ts: [[u64; 3]; 3],
+    /// Last-write timestamp of each output cell (coeff d).
+    pub write_old_ts: [u64; 3],
+    /// Prior value of each output cell (coeff d).
+    pub write_old_val: [u64; 3],
 }
 
 /// Generates the FEXT_FMA trace. One row per operation, padded to the next power
-/// of two (min 4). Padding rows are all-zero (`μ = 0`), which satisfies the
-/// arithmetic constraints (`0 = 0`) and `IS_BIT μ`.
+/// of two (min 4). Padding rows are all-zero (`μ = 0`).
 pub fn generate_fext_fma_trace(
     ops: &[FextFmaOperation],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
@@ -107,14 +140,16 @@ pub fn generate_fext_fma_trace(
         table.set_dword_wl(row, cols::B_ADDR_0, op.b_addr);
         table.set_dword_wl(row, cols::C_ADDR_0, op.c_addr);
 
-        for (i, base) in [cols::A0, cols::B0, cols::C0].into_iter().enumerate() {
-            let coeffs = [op.a, op.b, op.c][i];
-            for (k, &v) in coeffs.iter().enumerate() {
-                table.set_fe(row, base + k, FE::from(v));
+        for (v, coeffs) in [op.a, op.b, op.c].into_iter().enumerate() {
+            for (d, &val) in coeffs.iter().enumerate() {
+                table.set_fe(row, cols::operand_coeff(v, d), FE::from(val));
+                table.set_dword_wl(row, cols::read_old_ts(v, d), op.read_old_ts[v][d]);
             }
         }
-        for (k, &v) in op.output.iter().enumerate() {
-            table.set_fe(row, cols::OUT0 + k, FE::from(v));
+        for d in 0..3 {
+            table.set_fe(row, cols::OUT0 + d, FE::from(op.output[d]));
+            table.set_dword_wl(row, cols::write_old_ts(d), op.write_old_ts[d]);
+            table.set_fe(row, cols::write_old_val(d), FE::from(op.write_old_val[d]));
         }
 
         table.set_fe(row, cols::MU, FE::one());
@@ -123,49 +158,41 @@ pub fn generate_fext_fma_trace(
     trace
 }
 
-/// A single MEMW register-read interaction (24-element CO24 read: `old == value`,
-/// `is_register = 1`, `write2 = 1`). `reg` is the register index; the register
-/// file is byte-addressed ×2, so the base address is `2*reg`.
-fn memw_register_read(addr_lo: usize, addr_hi: usize, reg: u64) -> BusInteraction {
-    let addr = |col| BusValue::Packed {
+fn direct(col: usize) -> BusValue {
+    BusValue::Packed {
         start_column: col,
         packing: Packing::Direct,
-    };
-    let ts = |col| BusValue::Packed {
-        start_column: col,
-        packing: Packing::Direct,
-    };
+    }
+}
+
+/// A MEMW register-read interaction (24-element CO24 read; `is_register = 1`,
+/// `write2 = 1`).
+fn memw_register_read(lo: usize, hi: usize, reg: u64) -> BusInteraction {
     BusInteraction::sender(
         BusId::Memw,
         Multiplicity::Column(cols::MU),
         vec![
-            // old[0..7] = [addr_lo, addr_hi, 0, 0, 0, 0, 0, 0]
-            addr(addr_lo),
-            addr(addr_hi),
+            direct(lo),
+            direct(hi),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // is_register = 1
             BusValue::constant(1),
-            // base_address = [2*reg, 0]
             BusValue::constant(2 * reg),
             BusValue::constant(0),
-            // value[0..7] = same as old (read)
-            addr(addr_lo),
-            addr(addr_hi),
+            direct(lo),
+            direct(hi),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
             BusValue::constant(0),
-            // timestamp
-            ts(cols::TIMESTAMP_0),
-            ts(cols::TIMESTAMP_1),
-            // w2 = 1, w4 = 0, w8 = 0 (register = 2 words)
+            direct(cols::TIMESTAMP_0),
+            direct(cols::TIMESTAMP_1),
             BusValue::constant(1),
             BusValue::constant(0),
             BusValue::constant(0),
@@ -173,33 +200,115 @@ fn memw_register_read(addr_lo: usize, addr_hi: usize, reg: u64) -> BusInteractio
     )
 }
 
-/// Bus interactions for the FEXT_FMA table (this phase: `Ecall` receiver +
-/// 4 register reads). Field-storage `Memory` tokens are added later.
+/// `old_ts(DWordWL) < ts` on the unified ALU bus, asserting the result is 1.
+fn alu_lt_ts(old_ts_lo: usize) -> BusInteraction {
+    BusInteraction::sender(
+        BusId::Alu,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::Packed {
+                start_column: old_ts_lo,
+                packing: Packing::DWordWL,
+            },
+            BusValue::Packed {
+                start_column: cols::TIMESTAMP_0,
+                packing: Packing::DWordWL,
+            },
+            BusValue::constant(alu_op::LT as u64),
+            BusValue::constant(1),
+            BusValue::constant(0),
+        ],
+    )
+}
+
+/// The three interactions for one field-storage access at cell `(domain, addr)`.
+/// `old_val`/`new_val` are the value columns/exprs of the old and new tokens
+/// (equal for a read). `old_ts_lo` is the old-timestamp low column.
+fn field_access(
+    domain: u64,
+    addr_lo: usize,
+    addr_hi: usize,
+    old_ts_lo: usize,
+    old_val: BusValue,
+    new_val: BusValue,
+) -> [BusInteraction; 3] {
+    let consume = BusInteraction::sender(
+        BusId::Memory,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::constant(domain),
+            direct(addr_lo),
+            direct(addr_hi),
+            direct(old_ts_lo),
+            direct(old_ts_lo + 1),
+            old_val,
+        ],
+    );
+    let emit = BusInteraction::receiver(
+        BusId::Memory,
+        Multiplicity::Column(cols::MU),
+        vec![
+            BusValue::constant(domain),
+            direct(addr_lo),
+            direct(addr_hi),
+            direct(cols::TIMESTAMP_0),
+            direct(cols::TIMESTAMP_1),
+            new_val,
+        ],
+    );
+    [consume, emit, alu_lt_ts(old_ts_lo)]
+}
+
+/// Bus interactions: `Ecall` receiver + 4 register reads + 9 field reads +
+/// 3 field writes (3 interactions each).
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    vec![
-        // Receive the ECALL from the CPU, keyed by the FEXT_FMA syscall number.
+    let mut interactions = vec![
         BusInteraction::receiver(
             BusId::Ecall,
             Multiplicity::Column(cols::MU),
             vec![
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_0,
-                    packing: Packing::Direct,
-                },
-                BusValue::Packed {
-                    start_column: cols::TIMESTAMP_1,
-                    packing: Packing::Direct,
-                },
+                direct(cols::TIMESTAMP_0),
+                direct(cols::TIMESTAMP_1),
                 BusValue::constant(FMA_SYSCALL_LO),
                 BusValue::constant(FMA_SYSCALL_HI),
             ],
         ),
-        // Register reads: x10=out, x11=a, x12=b, x13=c.
-        memw_register_read(cols::OUT_ADDR_0, cols::OUT_ADDR_1, 10),
-        memw_register_read(cols::A_ADDR_0, cols::A_ADDR_1, 11),
-        memw_register_read(cols::B_ADDR_0, cols::B_ADDR_1, 12),
-        memw_register_read(cols::C_ADDR_0, cols::C_ADDR_1, 13),
-    ]
+        memw_register_read(cols::A_ADDR_0, cols::A_ADDR_1, 10),
+        memw_register_read(cols::B_ADDR_0, cols::B_ADDR_1, 11),
+        memw_register_read(cols::C_ADDR_0, cols::C_ADDR_1, 12),
+        memw_register_read(cols::OUT_ADDR_0, cols::OUT_ADDR_1, 13),
+    ];
+
+    // 9 reads: coefficient d of operand v from cell (3+d, operand_addr(v)).
+    // A read leaves the value unchanged, so old_val == new_val == coeff column.
+    for v in 0..3 {
+        let addr_lo = cols::operand_addr(v);
+        for d in 0..3 {
+            let val = direct(cols::operand_coeff(v, d));
+            interactions.extend(field_access(
+                3 + d as u64,
+                addr_lo,
+                addr_lo + 1,
+                cols::read_old_ts(v, d),
+                val.clone(),
+                val,
+            ));
+        }
+    }
+
+    // 3 writes: output coefficient d to cell (3+d, out_addr).
+    for d in 0..3 {
+        interactions.extend(field_access(
+            3 + d as u64,
+            cols::OUT_ADDR_0,
+            cols::OUT_ADDR_1,
+            cols::write_old_ts(d),
+            direct(cols::write_old_val(d)),
+            direct(cols::OUT0 + d),
+        ));
+    }
+
+    interactions
 }
 
 /// The FEXT_FMA constraints:

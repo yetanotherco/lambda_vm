@@ -191,15 +191,16 @@ pub fn fext_load(_addr: u64, _coeffs: &[u64; 3]) {
 #[cfg(target_arch = "riscv64")]
 /// Compute `out = a*b + c` over the native degree-3 Goldilocks extension via the
 /// FEXT_FMA accelerator. All arguments are field-storage handles (not RAM
-/// addresses); the result is written to `out_addr`.
-pub fn fext_fma(out_addr: u64, a_addr: u64, b_addr: u64, c_addr: u64) {
+/// addresses); the result is written to `out_addr`. Argument-to-register mapping
+/// follows the spec: a/b/c in A0/A1/A2, output in A3.
+pub fn fext_fma(a_addr: u64, b_addr: u64, c_addr: u64, out_addr: u64) {
     unsafe {
         asm!(
             "ecall",
-            in("a0") out_addr, // x10 = output field-storage address
-            in("a1") a_addr,   // x11 = address of a
-            in("a2") b_addr,   // x12 = address of b
-            in("a3") c_addr,   // x13 = address of c
+            in("a0") a_addr,   // x10 = address of a
+            in("a1") b_addr,   // x11 = address of b
+            in("a2") c_addr,   // x12 = address of c
+            in("a3") out_addr, // x13 = output field-storage address
             in("a7") FEXT_FMA_SYSCALL_NUMBER,
         )
     }
@@ -207,7 +208,7 @@ pub fn fext_fma(out_addr: u64, a_addr: u64, b_addr: u64, c_addr: u64) {
 
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `out = a*b + c` over the native degree-3 Goldilocks extension.
-pub fn fext_fma(_out_addr: u64, _a_addr: u64, _b_addr: u64, _c_addr: u64) {
+pub fn fext_fma(_a_addr: u64, _b_addr: u64, _c_addr: u64, _out_addr: u64) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

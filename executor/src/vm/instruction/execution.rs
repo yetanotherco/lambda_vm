@@ -124,8 +124,8 @@ fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
 /// Computes `a*b + c` over the native degree-3 Goldilocks extension
 /// `Fp[x]/(x^3 - 2)`, returning canonical coefficients. Inputs must already be
 /// canonical (`< p`). Matches `Degree3GoldilocksExtensionField::mul`, so the
-/// executor and the FEXT prover chip agree bit-for-bit.
-fn fext_fma(a: [u64; 3], b: [u64; 3], c: [u64; 3]) -> [u64; 3] {
+/// executor and the FEXT prover chip (and its trace builder) agree bit-for-bit.
+pub fn fext_fma(a: [u64; 3], b: [u64; 3], c: [u64; 3]) -> [u64; 3] {
     type Fp3 = FieldElement<Degree3GoldilocksExtensionField>;
     let to_fp3 = |x: [u64; 3]| {
         Fp3::from_raw([
@@ -518,12 +518,26 @@ impl Instruction {
                     }
                     SyscallNumbers::FextFma => {
                         // FEXT_FMA(-21): output = a*b + c over Fp[x]/(x^3-2).
-                        // x10 = output address, x11/x12/x13 = addresses of a/b/c,
-                        // all in field-storage.
-                        let out_addr = registers.read(10)?;
-                        let a_addr = registers.read(11)?;
-                        let b_addr = registers.read(12)?;
-                        let c_addr = registers.read(13)?;
+                        // Per spec: x10/x11/x12 = addresses of a/b/c, x13 = output
+                        // address, all in field-storage.
+                        let a_addr = registers.read(10)?;
+                        let b_addr = registers.read(11)?;
+                        let c_addr = registers.read(12)?;
+                        let out_addr = registers.read(13)?;
+                        // The chip uses a single timestamp for all field-storage
+                        // accesses, so the four cells must be pairwise distinct:
+                        // otherwise the same (domain, address) is touched twice at
+                        // one timestamp and the memory argument can't prove the
+                        // access chain. (This forbids in-place `out == a` and
+                        // squaring `a == b`.)
+                        let addrs = [out_addr, a_addr, b_addr, c_addr];
+                        for i in 0..addrs.len() {
+                            for j in (i + 1)..addrs.len() {
+                                if addrs[i] == addrs[j] {
+                                    return Err(ExecutionError::FextOperandOverlap);
+                                }
+                            }
+                        }
                         let a = memory.field_load(a_addr);
                         let b = memory.field_load(b_addr);
                         let c = memory.field_load(c_addr);
@@ -715,6 +729,8 @@ pub enum ExecutionError {
     Ecsm(#[from] ecsm::EcsmError),
     #[error("FEXT_LOAD coefficient is not a canonical field element: {0:#018x}")]
     FextCoefficientNotCanonical(u64),
+    #[error("FEXT_FMA operand/output addresses must be pairwise distinct")]
+    FextOperandOverlap,
 }
 
 // =============================================================================

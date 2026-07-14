@@ -45,6 +45,9 @@ fn op(a: [u64; 3], b: [u64; 3], c: [u64; 3]) -> FextFmaOperation {
         b,
         c,
         output: fma(a, b, c),
+        read_old_ts: [[0; 3]; 3],
+        write_old_ts: [0; 3],
+        write_old_val: [0; 3],
     }
 }
 
@@ -86,8 +89,9 @@ fn fext_fma_max_degree_is_two() {
 
 #[test]
 fn fext_fma_bus_interaction_count() {
-    // 1 Ecall receiver + 4 register reads.
-    assert_eq!(bus_interactions().len(), 5);
+    // 1 Ecall + 4 register reads + 9 field reads + 3 field writes, each
+    // field access = consume-old + emit-new + old_ts<ts = 1 + 4 + 27 + 9.
+    assert_eq!(bus_interactions().len(), 41);
 }
 
 #[test]

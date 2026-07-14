@@ -41,6 +41,8 @@ fn op(addr: u64, coeffs: [u64; 3]) -> FextLoadOperation {
         timestamp: 100,
         addr,
         coeffs,
+        old_ts: [0; 3],
+        old_val: [0; 3],
     }
 }
 
@@ -52,8 +54,9 @@ fn fext_load_constraint_count_is_one() {
 
 #[test]
 fn fext_load_bus_interaction_count() {
-    // 1 Ecall receiver + 4 register reads + 3 range checks.
-    assert_eq!(bus_interactions().len(), 8);
+    // 1 Ecall receiver + 4 register reads + 3 range checks + 3 field-storage
+    // writes × (consume-old, emit-new, old_ts<ts) = 1 + 4 + 3 + 9.
+    assert_eq!(bus_interactions().len(), 17);
 }
 
 #[test]
