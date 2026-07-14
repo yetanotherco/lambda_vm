@@ -333,8 +333,16 @@ mcycd() {
   }'
 }
 
+# Human label for the proof regime this preset measures, so a reader can't mistake the
+# single-query `min` number for the full 128-bit verifier cost. CI always passes `min`.
+case "$PRESET" in
+  min)     REGIME="single query (blowup=2, 1 query)" ;;
+  blowup8) REGIME="128-bit (blowup=8, multi-query)" ;;
+  *)       REGIME="$PRESET" ;;
+esac
+
 echo
-echo "=== Recursion-guest cycle/accelerator comparison (deterministic to ~±100k cycles) ==="
+echo "=== Recursion-guest cycle comparison — $REGIME — deterministic to ~±100k cycles ==="
 echo "   REF_B (baseline) $REF_B  ${SHA_B:0:10}  guest=$ELF_B"
 echo "   REF_A (PR)       $REF_A  ${SHA_A:0:10}  guest=$ELF_A"
 echo
