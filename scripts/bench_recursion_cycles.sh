@@ -332,7 +332,7 @@ mcycd() {
 }
 
 echo
-echo "=== Recursion-guest cycle/accelerator comparison (deterministic, exact) ==="
+echo "=== Recursion-guest cycle/accelerator comparison (deterministic to ~±100k cycles) ==="
 echo "   REF_B (baseline) $REF_B  ${SHA_B:0:10}  guest=$ELF_B"
 echo "   REF_A (PR)       $REF_A  ${SHA_A:0:10}  guest=$ELF_A"
 echo
@@ -342,6 +342,9 @@ echo "|---------------|------------------|------------|---------|"
 # the collapsed raw block below. Keccak stays a plain integer call count.
 printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
 printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
+# One terse reproducibility caveat; the blank line before it ends the markdown table.
+echo
+echo "note: cycles reproduce to ~±100k (build codegen + proof nondeterminism); treat sub-100k deltas as noise, not signal."
 # Exact machine-parseable counts, collapsed so they don't clutter the PR comment (the
 # table above is rounded to millions; these are the exact integers). The blank lines
 # around the fence are required for GitHub to render the code block inside <details>.
