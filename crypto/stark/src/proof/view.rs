@@ -14,7 +14,7 @@ use crate::proof::stark::{
     ArchivedDeepPolynomialOpening, ArchivedPolynomialOpenings, ArchivedStarkProof,
     DeepPolynomialOpening, PolynomialOpenings, StarkProof,
 };
-use crate::table::{ArchivedTable, Table};
+use crate::table::{ArchivedTable, Table, TableView};
 use math::field::element::{ArchivedFieldElement, FieldElement};
 use math::field::traits::{IsField, IsSubFieldOf};
 
@@ -257,22 +257,40 @@ where
     /// invariant `get_row` indexing relies on.
     pub fn dimensions_consistent(&self) -> bool {
         match self {
-            Self::Owned(t) => t
-                .width
-                .checked_mul(t.height)
-                .is_some_and(|n| n == t.row_major_data().len()),
+            Self::Owned(t) => t.dimensions_consistent(),
             Self::Archived(t) => t.dimensions_consistent(),
         }
     }
 
+    /// Build a [`Frame`] over this table. Only the small OOD frame is
+    /// materialized (bounded by `step_size × width`), never the whole proof.
+    /// Written once over the uniform `get_row`/`height` accessors so the owned
+    /// and archived paths cannot diverge.
     pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F>
     where
         F: IsSubFieldOf<F>,
     {
-        match self {
-            Self::Owned(t) => t.into_frame(main_trace_columns, step_size),
-            Self::Archived(t) => t.into_frame(main_trace_columns, step_size),
-        }
+        let height = self.height();
+        debug_assert!(height.is_multiple_of(step_size));
+        let steps = (0..height)
+            .step_by(step_size)
+            .map(|initial_row_idx| {
+                let end_row_idx = initial_row_idx + step_size;
+
+                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+
+                (initial_row_idx..end_row_idx).for_each(|row_idx| {
+                    let row = self.get_row(row_idx);
+                    step_main_data.push(row[..main_trace_columns].to_vec());
+                    step_aux_data.push(row[main_trace_columns..].to_vec());
+                });
+
+                TableView::new(step_main_data, step_aux_data)
+            })
+            .collect();
+
+        Frame::new(steps)
     }
 }
 
