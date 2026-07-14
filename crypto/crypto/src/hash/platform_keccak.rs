@@ -28,7 +28,9 @@ mod imp {
 
     impl FixedOutput for PlatformKeccak256 {
         fn finalize_into(self, out: &mut Output<Self>) {
-            self.0.finalize((&mut out[..]).try_into().unwrap());
+            let mut digest = [0u8; 32];
+            self.0.finalize(&mut digest);
+            out.copy_from_slice(&digest);
         }
     }
 
@@ -40,7 +42,9 @@ mod imp {
 
     impl FixedOutputReset for PlatformKeccak256 {
         fn finalize_into_reset(&mut self, out: &mut Output<Self>) {
-            core::mem::take(&mut self.0).finalize((&mut out[..]).try_into().unwrap());
+            let mut digest = [0u8; 32];
+            core::mem::take(&mut self.0).finalize(&mut digest);
+            out.copy_from_slice(&digest);
         }
     }
 }

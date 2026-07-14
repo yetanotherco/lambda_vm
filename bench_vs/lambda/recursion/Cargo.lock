@@ -409,13 +409,13 @@ name = "lambda-vm-prover"
 version = "0.1.0"
 dependencies = [
  "crypto",
+ "digest",
  "ecsm",
  "executor",
  "log",
  "math",
  "postcard",
  "serde",
- "sha3",
  "stark",
  "sysinfo",
 ]

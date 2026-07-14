@@ -11,8 +11,9 @@ members = [
 ]
 # Riscv-only bare-metal crate, path-dependent from crypto/crypto (target-gated),
 # ethrex-crypto, and guest programs. Without this exclude, Cargo auto-adopts it as
-# a member (nothing else claims it), so `cargo test` runs its unit tests on host,
-# which link against riscv-only symbols and abort.
+# an implicit member (nothing else claims it), and host workspace builds then fail:
+# it defines a `#[global_allocator]` plus `#[unsafe(no_mangle)]` entrypoints/syscalls
+# (and riscv `asm!`) that only assemble/link for `riscv64im-lambda-vm-elf`.
 exclude = ["syscalls"]
 
 resolver = "2"
