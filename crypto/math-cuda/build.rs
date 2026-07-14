@@ -16,18 +16,22 @@ fn nvcc_path() -> PathBuf {
 
 /// Query `nvidia-smi` for the local GPU's compute capability (e.g. "12.0"
 /// for Blackwell) and return a *real* arch (`sm_XX`) suitable for cubin
-/// (SASS) generation. Falls back to `sm_89` (Ada) when no GPU is visible or
-/// the query fails, warning loudly because an arch-specific cubin built for
-/// the wrong GPU cannot load on the run host.
+/// (SASS) generation. Hard-fails the build when no GPU is visible and the
+/// query fails: a cubin is arch-locked, so there is no safe default — any
+/// guess produces a binary that loads on exactly one GPU model and silently
+/// CPU-falls-back everywhere else. Failing here is loud and fixable (set
+/// `CUDARC_NVCC_ARCH` or build on the target host); a guess is neither.
+///
+/// This is only reached when `nvcc` is present but the arch can't be detected
+/// (a toolkit-installed host with no visible GPU). A host without `nvcc` takes
+/// the empty-stub path in `compile_kernel` and never calls this.
 fn detect_arch() -> String {
-    const FALLBACK: &str = "sm_89";
     detect_arch_from_smi().unwrap_or_else(|| {
-        println!(
-            "cargo:warning=math-cuda: could not detect a GPU via nvidia-smi — cubins target \
-             fallback {FALLBACK}; if the run host GPU differs, set CUDARC_NVCC_ARCH=sm_XX or \
-             rebuild on the run host."
-        );
-        FALLBACK.to_string()
+        panic!(
+            "math-cuda: nvcc is present but no GPU arch could be detected via nvidia-smi, \
+             and a cubin must target a concrete arch. Set CUDARC_NVCC_ARCH=sm_XX (e.g. sm_120 \
+             for RTX 5090, sm_86 for RTX 3090) or build on the target GPU host."
+        )
     })
 }
 
@@ -103,9 +107,10 @@ fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
     // `sm_120`). We build+run on the same GPU box in every flow and detect the
     // arch from that box's `nvidia-smi`, so this is exactly right. Override with
     // CUDARC_NVCC_ARCH (compute_XX / sm_XX / bare XX all accepted) to
-    // cross-compile for a different arch; fall back to sm_89 (Ada) when
-    // detection fails. If the toolkit is too old to know the GPU's arch, nvcc
-    // fails loudly here at build time (better than a silent runtime fallback).
+    // cross-compile for a different arch. If nvcc is present but no GPU is
+    // detectable and no override is given, `detect_arch` hard-fails rather than
+    // guessing an arch that would load on one GPU model and CPU-fall-back on
+    // every other.
     let arch = env::var("CUDARC_NVCC_ARCH")
         .map(|a| to_real_arch(&a))
         .unwrap_or_else(|_| detect_arch());
