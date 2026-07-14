@@ -21,6 +21,9 @@ math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 ecsm = { path = "../crypto/ecsm" }
 serde = { version = "1.0", features = ["derive"] }
+# The recursion guest-input blob codec (see `recursion::encode_guest_input`);
+# no_std+alloc, so the in-VM guest build (default-features = false) is fine.
+postcard = { version = "1.0", features = ["alloc"] }
 rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 log = "0.4"
@@ -30,13 +33,17 @@ sha3 = { version = "0.10.8", default-features = false }
 env_logger = "*"
 criterion = { version = "0.5", default-features = false }
 bincode = "1"
-postcard = { version = "1.0", features = ["alloc"] }
 tikv-jemallocator = "0.6"
 tikv-jemalloc-ctl = { version = "0.6", features = ["stats"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Enable stark's test-utils so cross-crate tests can reach
 # `compute_precomputed_commitment_for_testing`. Only active under cargo test/bench.
 stark = { path = "../crypto/stark", features = ["test-utils"] }
+# Device-resident LDE handles for the cuda-gated GPU constraint-interp parity
+# test (`tests/gpu_constraint_interp_real.rs`). Its build.rs stubs empty PTX when
+# nvcc is absent, so this compiles on CPU-only hosts too; the test itself is
+# `#[cfg(feature = "cuda")]` and only runs with a GPU.
+math-cuda = { path = "../crypto/math-cuda" }
 
 [[bench]]
 name = "vm_prover_benchmark"

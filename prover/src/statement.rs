@@ -19,7 +19,10 @@ use crate::{RuntimePageRange, TableCounts};
 /// Domain-separation tag. Bump the suffix (`_V2`, ...) on any encoding change.
 const DOMAIN_TAG: &[u8] = b"LAMBDAVM_STARK_STATEMENT_V3";
 
-fn elf_digest(elf: &[u8]) -> [u8; 32] {
+/// Canonical full-ELF identity digest — exactly what [`absorb_statement`] binds
+/// into the transcript. The recursion attestation folds the same digest into
+/// `program_id` (see the `recursion` module), sharing one pass over the ELF.
+pub(crate) fn elf_digest(elf: &[u8]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(elf);
     h.finalize().into()
@@ -48,6 +51,33 @@ pub(crate) fn absorb_statement(
     runtime_page_ranges: &[RuntimePageRange],
     fri_final_poly_log_degree: u8,
 ) {
+    absorb_statement_with_digest(
+        t,
+        kind,
+        &elf_digest(elf_bytes),
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        fri_final_poly_log_degree,
+    )
+}
+
+/// [`absorb_statement`] with the ELF digest precomputed. Callers that already
+/// hold the digest reuse it instead of a second full-ELF Keccak pass — the
+/// recursion attestation path shares one digest between the transcript absorb
+/// and the `program_id` fold (a full-ELF hash is expensive in-guest).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn absorb_statement_with_digest(
+    t: &mut impl IsTranscript<E>,
+    kind: StatementKind,
+    elf_digest: &[u8; 32],
+    public_output: &[u8],
+    table_counts: &TableCounts,
+    num_private_input_pages: usize,
+    runtime_page_ranges: &[RuntimePageRange],
+    fri_final_poly_log_degree: u8,
+) {
     // Leading domain tag — distinct per statement kind, so a monolithic proof and
     // a continuation epoch proof can never share a transcript prefix.
     let domain_tag = match kind {
@@ -57,7 +87,7 @@ pub(crate) fn absorb_statement(
     t.append_bytes(domain_tag);
 
     // ELF: fixed 32-byte digest — no length prefix needed.
-    t.append_bytes(&elf_digest(elf_bytes));
+    t.append_bytes(elf_digest);
 
     // public_output: variable length → length-prefix to prevent boundary collisions.
     t.append_bytes(&(public_output.len() as u64).to_le_bytes());

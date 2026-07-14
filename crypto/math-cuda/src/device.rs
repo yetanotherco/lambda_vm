@@ -98,6 +98,8 @@ const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
+const CONSTRAINT_INTERP_PTX: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/constraint_interp.ptx"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -165,6 +167,8 @@ pub struct Backend {
     pub barycentric_ext3_batched: CudaFunction,
     pub barycentric_base_batched_strided: CudaFunction,
     pub barycentric_ext3_batched_strided: CudaFunction,
+    pub gather_rows_base: CudaFunction,
+    pub gather_rows_ext3: CudaFunction,
 
     // deep.ptx
     pub deep_composition_ext3_row: CudaFunction,
@@ -187,6 +191,10 @@ pub struct Backend {
     pub logup_apply_offsets_add_ext3: CudaFunction,
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
+
+    // constraint_interp.ptx
+    pub constraint_interp_kernel: CudaFunction,
+    pub constraint_composition_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -291,6 +299,7 @@ impl Backend {
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
+        let constraint_interp = ctx.load_module(Ptx::from_src(CONSTRAINT_INTERP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -360,6 +369,8 @@ impl Backend {
                 .load_function("barycentric_base_batched_strided")?,
             barycentric_ext3_batched_strided: bary
                 .load_function("barycentric_ext3_batched_strided")?,
+            gather_rows_base: bary.load_function("gather_rows_base")?,
+            gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
@@ -378,6 +389,10 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            constraint_interp_kernel: constraint_interp
+                .load_function("constraint_interp_kernel")?,
+            constraint_composition_kernel: constraint_interp
+                .load_function("constraint_composition_kernel")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

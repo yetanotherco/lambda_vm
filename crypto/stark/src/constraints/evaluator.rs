@@ -182,7 +182,11 @@ where
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
         rap_challenges: &[FieldElement<FieldExtension>],
-    ) -> Vec<FieldElement<FieldExtension>> {
+    ) -> Vec<FieldElement<FieldExtension>>
+    where
+        Field: 'static,
+        FieldExtension: 'static,
+    {
         let boundary_constraints = &self.boundary_constraints;
         let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
         let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
@@ -207,6 +211,38 @@ where
                     evals
                 })
                 .collect::<Vec<Vec<FieldElement<Field>>>>();
+
+        let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
+
+        // GPU composition path: fuse H(row) = z_inv·Σβᵢ·Cᵢ + boundary on-device
+        // (no CPU trace read, no per-constraint matrix). Falls through to the CPU
+        // path below when the GPU LDE is absent, the field is not Goldilocks, the
+        // zerofier is non-uniform, or the transition offsets are non-contiguous.
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(h) = self.try_evaluate_composition_gpu(
+                air,
+                lde_trace,
+                rap_challenges,
+                transition_coefficients,
+                boundary_coefficients,
+                &zerofier_data,
+                &boundary_zerofiers_inverse_evaluations,
+            ) {
+                return h;
+            }
+        }
+
+        // Reaching here means the GPU composition path fell through to the CPU
+        // boundary + transition evaluation below, both of which read the host
+        // trace (`get_main`/`get_aux`, `RowFrame::from_lde`). Under the
+        // device-only gate that trace is empty, so a fall-through is a mis-gate
+        // or an unexpected GPU failure: hard-abort rather than read empty buffers.
+        #[cfg(feature = "cuda")]
+        assert!(
+            !lde_trace.host_trace_empty(),
+            "R2 composition fell back to the host trace, but it is device-only (empty)"
+        );
 
         // Fused boundary evaluation: compute (trace[col] - value) on-the-fly
         // instead of pre-computing all boundary_polys_evaluations.
@@ -237,8 +273,6 @@ where
             })
             .collect();
 
-        let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
-
         // Iterate over all LDE domain and compute the part of the composition polynomial
         // related to the transition constraints and add it to the already computed part of the
         // boundary constraints.
@@ -257,5 +291,104 @@ where
             offsets,
             &self.logup_table_offset,
         )
+    }
+
+    /// GPU composition path: produce `H(row)` on-device (transition + boundary
+    /// fused, no CPU trace read, no per-constraint matrix), returning `None` to
+    /// fall back to the CPU path when the GPU LDE is absent, the tower is not
+    /// Goldilocks/degree-3, the zerofier is non-uniform (end-exemptions), or the
+    /// transition offsets are non-contiguous. The result feeds the existing
+    /// decompose + composition commit exactly like the CPU `H` vector.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn try_evaluate_composition_gpu(
+        &self,
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        rap_challenges: &[FieldElement<FieldExtension>],
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+        zerofier_data: &ZerofierEvaluations<Field>,
+        boundary_z_inv: &[Vec<FieldElement<Field>>],
+    ) -> Option<Vec<FieldElement<FieldExtension>>>
+    where
+        Field: 'static,
+        FieldExtension: 'static,
+    {
+        if !crate::gpu_lde::is_goldilocks_ext3_tower::<Field, FieldExtension>() {
+            return None;
+        }
+        if crate::gpu_lde::gpu_composition_disabled() {
+            return None;
+        }
+        if !zerofier_data.is_uniform() {
+            return None;
+        }
+        // The kernel's row math assumes Var offsets index a contiguous [0..n)
+        // frame (offset·step). The VM uses [0, 1]; anything else → CPU.
+        if !crate::gpu_lde::offsets_are_contiguous(&air.context().transition_offsets) {
+            return None;
+        }
+        let main = lde_trace.gpu_main()?;
+        let aux = lde_trace.gpu_aux()?;
+
+        let prog = air.constraint_program();
+
+        // LogUp alpha powers, exactly as `evaluate_transitions` derives them.
+        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                compute_alpha_powers(
+                    &rap_challenges[LOGUP_CHALLENGE_ALPHA],
+                    air.max_bus_elements(),
+                )
+            } else {
+                Vec::new()
+            };
+
+        // Boundary spec (aligned with `boundary_coefficients` / `boundary_z_inv`).
+        let bcs = &self.boundary_constraints.constraints;
+        let b_col: Vec<usize> = bcs.iter().map(|c| c.col).collect();
+        let b_is_aux: Vec<bool> = bcs.iter().map(|c| c.is_aux).collect();
+        let b_value: Vec<FieldElement<FieldExtension>> =
+            bcs.iter().map(|c| c.value.clone()).collect();
+
+        let inputs = crate::constraint_ir::gpu_interp::CompositionInputs {
+            beta_trans: transition_coefficients,
+            z_inv: &zerofier_data.groups[0],
+            b_col: &b_col,
+            b_is_aux: &b_is_aux,
+            b_value: &b_value,
+            b_beta: boundary_coefficients,
+            // Per-constraint vectors as-is; the device layer uploads each slice
+            // directly (no flattened host copy of num_boundary × lde_size).
+            b_z_inv: boundary_z_inv,
+        };
+
+        let next_step = lde_trace.lde_step_size; // == blowup_factor (single-row steps)
+        let num_rows = lde_trace.num_rows();
+
+        let raw = crate::constraint_ir::gpu_interp::try_eval_composition_gpu(
+            prog,
+            main,
+            aux,
+            rap_challenges,
+            &logup_alpha_powers,
+            &self.logup_table_offset,
+            next_step,
+            num_rows,
+            &inputs,
+        )?;
+
+        // SAFETY: the TypeId gate established `FieldExtension ==
+        // Degree3GoldilocksExtensionField`, which is `#[repr(transparent)]` over
+        // `[u64; 3]`; `raw.len() == num_rows * 3`.
+        let h: Vec<FieldElement<FieldExtension>> = unsafe {
+            std::slice::from_raw_parts(
+                raw.as_ptr() as *const FieldElement<FieldExtension>,
+                raw.len() / 3,
+            )
+        }
+        .to_vec();
+        Some(h)
     }
 }

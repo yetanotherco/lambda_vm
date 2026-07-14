@@ -52,8 +52,17 @@ BENCH_ARTIFACTS := $(addprefix $(BENCH_ARTIFACTS_DIR)/, $(addsuffix .elf, $(BENC
 # rather than executor/programs/. The recursion guest is the in-VM STARK verifier.
 RECURSION_GUESTS_DIR=./bench_vs/lambda
 RECURSION_ARTIFACTS_DIR=./executor/program_artifacts/recursion
-RECURSION_GUESTS := empty fibonacci recursion
+RECURSION_GUESTS := empty fibonacci
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
+
+# The recursion verifier itself (bench_vs/lambda/recursion) requires picking
+# exactly one of its `min`/`blowup8` Cargo features at build time (fixes the
+# inner ProofOptions — see main.rs). Each preset builds its own distinctly
+# named [[bin]] (recursion-<preset>-bench) to its own artifact, via the
+# define/foreach/eval below rather than the generic %.elf pattern rule. The
+# distinct bin names also make the two `cp`s race-free under `make -j`.
+RECURSION_VERIFIER_PRESETS := min blowup8
+RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -142,13 +151,13 @@ compile-programs-rust: prepare-sysroot $(RUST_ARTIFACTS)
 
 compile-bench: prepare-sysroot $(BENCH_ARTIFACTS)
 
-# NOTE: the recursion smoke tests are #[ignore]d (not run by `make test` /
-# `test-executor`) because they're too slow for CI today; only `test-prover-all`
-# runs them. We still compile their guest ELFs on every build so they keep
-# compiling until the tests are fast enough to run in CI.
+# NOTE: the recursion smoke tests read these prebuilt guest ELFs. The fast ones
+# run on every `cargo test` (so `make test`, which depends on this target, needs
+# them); the slow ones stay #[ignore]d (only `test-prover-all` runs them). We
+# compile the guest ELFs on every build so the tests always have them ready.
 compile-programs: compile-programs-asm compile-programs-rust compile-bench compile-recursion-elfs
 
-compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS)
+compile-recursion-elfs: prepare-sysroot $(RECURSION_ARTIFACTS) $(RECURSION_VERIFIER_ARTIFACTS)
 
 $(RECURSION_ARTIFACTS_DIR):
 	mkdir -p $@
@@ -167,21 +176,23 @@ $(BENCH_ARTIFACTS_DIR):
 FORCE:
 
 # The guest .elf rules all share one canned recipe: the cargo build invocation is
-# identical across the rust, bench, and recursion guests. They differ only in the
-# source directory ($(1)) and the built-binary name suffix ($(2): empty when the
-# binary == crate name, `-bench` for the recursion suite, whose crates are named
-# <name>-bench). cargo owns the dep graph (see FORCE above), so the recipe always
-# runs and lets cargo decide what to actually rebuild.
+# identical across the rust, bench, and recursion guests. They differ in the
+# crate directory ($(1), the full path — callers interpolate $* themselves, so
+# a target's stem needn't match its crate dir name, e.g. the recursion-verifier
+# presets below), the built binary's filename ($(2)), and optional extra cargo
+# args ($(3), e.g. `--features min`). cargo owns the dep graph (see FORCE
+# above), so the recipe always runs and lets cargo decide what to rebuild.
 define build_guest_elf
-cd $(1)/$* && \
+cd $(1) && \
 	CARGO_TARGET_DIR=$(abspath $(SHARED_TARGET_DIR)) \
 	CFLAGS_riscv64im_lambda_vm_elf="$(SYSROOT_CFLAGS)" \
 	rustup run nightly-2026-02-01 cargo build --release \
 		--target $(RV64_TARGET_SPEC) \
 		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 		-Z build-std-features=compiler-builtins-mem \
-		-Z json-target-spec
-cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$*$(2) $@
+		-Z json-target-spec \
+		$(3)
+cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$(2) $@
 endef
 
 # Compile rust (64-bit)
@@ -191,18 +202,39 @@ endef
 # and fail to compile guest C dependencies). Order-only because prepare-sysroot is
 # .PHONY — a normal prereq would force a rebuild every time; its recipe is idempotent.
 $(RUST_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RUST_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(RUST_PROGRAMS_DIR),)
+	$(call build_guest_elf,$(RUST_PROGRAMS_DIR)/$*,$*)
 
 # Compile rust benches (64-bit)
 $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR),)
+	$(call build_guest_elf,$(BENCH_PROGRAMS_DIR)/$*,$*)
 
 # Recursion-suite guests (bench_vs/lambda/): the crate's binary is <name>-bench, so
 # copy <name>-bench -> <name>.elf. std-inclusive build-std covers both the no_std
 # inner guests and the std recursion verifier. Prover tests read these prebuilt
 # artifacts like every other program (see prover/src/tests/recursion_smoke_test.rs).
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
-	$(call build_guest_elf,$(RECURSION_GUESTS_DIR),-bench)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
+
+# The recursion verifier's `min`/`blowup8` presets: same crate dir, one
+# differently named [[bin]] per preset (recursion-<preset>-bench, gated on that
+# preset's Cargo feature) -> a differently named artifact. Generated per preset
+# from RECURSION_VERIFIER_PRESETS via define/foreach/eval rather than a pattern
+# rule (the stem "recursion-min" wouldn't match the crate dir "recursion") and
+# rather than copy-paste (the presets list is the single source of truth).
+# $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
+# survives the $(call ...) expansion and is expanded at recipe-run time (where
+# $@ is defined). Because the two bins have distinct filenames the post-build
+# `cp`s read different files, so the `make -j` cp race is gone structurally and
+# no `.NOTPARALLEL` is needed: cargo's target-dir lock already serializes the
+# compiles, and `.NOTPARALLEL` with prerequisites was wrong on every make
+# version anyway (it serializes the whole build on GNU make <= 4.3 — macOS ships
+# 3.81, ubuntu-latest 4.3 — and on >= 4.4 serializes only the listed targets'
+# own prerequisites, never the two ELF targets against each other).
+define recursion_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
+endef
+$(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
@@ -261,21 +293,25 @@ test: compile-programs
 
 # === Quick test shortcuts ===
 
-# Fast prover tests (skips ignored slow tests)
-test-fast:
+# Fast prover tests (skips ignored slow tests). Recursion smoke/PoC tests read
+# prebuilt guest ELFs, so build them first.
+test-fast: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -p stark -p executor -F stark/parallel
 
 # Prover tests only
-test-prover:
+test-prover: compile-recursion-elfs
 	cargo test -p lambda-vm-prover
 
-# Prover tests including slow ones. The recursion smoke tests (#[ignore]d) read
-# prebuilt guest ELFs from executor/program_artifacts/recursion/, so build them first.
+# Prover tests including slow ones. The recursion smoke tests read prebuilt
+# guest ELFs from executor/program_artifacts/recursion/ — the fast ones on every
+# run, the slow ones (still #[ignore]d) only under --include-ignored — so build
+# them first.
 test-prover-all: compile-recursion-elfs
 	cargo test -p lambda-vm-prover -- --include-ignored
 
-# Prover tests with debug-checks (shows bus balance report)
-test-prover-debug:
+# Prover tests with debug-checks (shows bus balance report). Also unfiltered, so
+# it runs the non-ignored recursion tests that read prebuilt guest ELFs.
+test-prover-debug: compile-recursion-elfs
 	cargo test -p lambda-vm-prover --features debug-checks -- --nocapture
 
 # Disk-spill tests (stark + prover). FORCE_DISK_SPILL is required by the prover tests.
@@ -305,7 +341,9 @@ test-cuda-fallback:
 # GPU + nvcc). The GPU CI counterpart of CPU CI's sharded prover tests. Single-threaded: the
 # GPU serializes proves and the dispatch counters are process-global. cuda on prover cascades
 # to stark; crypto/ecsm build without it (they have no GPU path).
-test-prover-cuda:
+# compile-recursion-elfs: this unfiltered run executes the non-ignored recursion
+# smoke tests, which read prebuilt guest ELFs; scripts/gpu_test.sh otherwise never builds them.
+test-prover-cuda: compile-recursion-elfs
 	cargo test --release -p lambda-vm-prover -p stark -p crypto -p ecsm \
 	    --features lambda-vm-prover/cuda -- --test-threads=1
 
@@ -355,6 +393,10 @@ lint:
 	cargo clippy --workspace --all-targets -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --no-default-features --features lambda-vm-prover/debug-checks -- -D warnings -A clippy::op_ref
 	cargo clippy --workspace --all-targets --features lambda-vm-prover/disk-spill -- -D warnings -A clippy::op_ref
+	# The cuda feature gates whole modules + cuda-only integration tests. build.rs emits empty
+	# cubin stubs when nvcc is absent, so this checks on a GPU-less host (CI lint runner, dev laptop)
+	# too — no GPU required. Catches cuda-gated breakage that the non-cuda passes above miss.
+	cargo clippy --workspace --all-targets --features lambda-vm-prover/cuda -- -D warnings -A clippy::op_ref
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel

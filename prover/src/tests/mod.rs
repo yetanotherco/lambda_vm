@@ -17,6 +17,8 @@ pub mod compute_commit_bus_offset_tests;
 #[cfg(test)]
 pub mod constraint_emit_tests;
 #[cfg(test)]
+pub mod constraint_program_device_tests;
+#[cfg(test)]
 pub mod constraint_program_tests;
 #[cfg(test)]
 pub mod constraint_set_tests_a;
@@ -68,6 +70,8 @@ pub mod page_tests;
 pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod recursion_smoke_test;
+#[cfg(test)]
+pub mod recursion_soundness_gap_poc;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]

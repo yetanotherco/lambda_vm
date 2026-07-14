@@ -1718,6 +1718,7 @@ dependencies = [
  "executor",
  "log",
  "math",
+ "math-cuda",
  "postcard",
  "rayon",
  "serde",
