@@ -30,6 +30,7 @@ For specific domains and domain separators, we use the following assignment.
 / RAM memory: $0$
 / Registers: $1$
 / Committed values: $2$
+/ (Extension) field values: $3$, $4$, $5$
 
 On a high level, we ensure memory consistency by an interacting system of
 reads and writes to a lookup argument, combined with an initialization and finalization scheme.
