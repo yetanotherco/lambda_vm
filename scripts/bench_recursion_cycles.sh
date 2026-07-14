@@ -5,7 +5,9 @@
 #
 # The recursion guest is the in-VM STARK verifier: it runs the verifier INSIDE the
 # VM. For a fixed (guest ELF, input blob) its cost is fully DETERMINISTIC, so a single
-# ref is one EXACT integer reading — no A/B/B/A interleaving needed. Note the two refs
+# ref is one EXACT integer reading — no A/B/B/A interleaving needed; but across runs
+# neither is held fixed (fresh guest build + a freshly-dumped nondeterministic proof
+# blob), so expect ~±100k cycles run-to-run. Note the two refs
 # do NOT share one blob: each ref dumps its OWN input blob from its own prover (via its
 # ignored dump test). So when a PR only changes guest code the delta is a clean
 # guest-cycle diff, but when a PR changes the prover / proof format the delta conflates
