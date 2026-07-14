@@ -1,6 +1,8 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
 
+use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use core::marker::PhantomData;
+use digest::Digest;
 use math::{
     field::{
         element::FieldElement,
@@ -9,7 +11,6 @@ use math::{
     traits::ByteConversion,
 };
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-use sha3::{Digest, Keccak256};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {
     hasher: Keccak256,
