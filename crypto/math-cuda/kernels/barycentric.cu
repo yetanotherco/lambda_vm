@@ -190,3 +190,45 @@ extern "C" __global__ void barycentric_ext3_batched_strided(
         out_ext3_int[col * 3 + 2] = sum.c;
     }
 }
+
+// Gather full rows from a device-resident base-field LDE (`buf[col*col_stride +
+// row]`). One block per gathered row, threads stride over columns. Output is
+// row-major `out[q*num_cols + col]` for gathered-row slot `q` — directly the
+// concatenation of `gather_main_row(rows[q])` for each q. `rows` are the LDE row
+// indices to gather (already the reversed query rows on the host side).
+extern "C" __global__ void gather_rows_base(
+    const uint64_t *__restrict__ columns,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    const uint32_t *__restrict__ rows,
+    uint64_t num_rows,
+    uint64_t *__restrict__ out
+) {
+    uint64_t q = blockIdx.x;
+    if (q >= num_rows) return;
+    uint64_t row = rows[q];
+    for (uint64_t col = threadIdx.x; col < num_cols; col += blockDim.x) {
+        out[q * num_cols + col] = columns[col * col_stride + row];
+    }
+}
+
+// Ext3 variant: M ext3 columns as 3M base slabs, `columns[(col*3+k)*col_stride +
+// row]`. Output interleaved ext3: `out[(q*num_cols + col)*3 + k]`.
+extern "C" __global__ void gather_rows_ext3(
+    const uint64_t *__restrict__ columns,
+    uint64_t col_stride,
+    uint64_t num_cols,
+    const uint32_t *__restrict__ rows,
+    uint64_t num_rows,
+    uint64_t *__restrict__ out
+) {
+    uint64_t q = blockIdx.x;
+    if (q >= num_rows) return;
+    uint64_t row = rows[q];
+    for (uint64_t col = threadIdx.x; col < num_cols; col += blockDim.x) {
+        uint64_t o = (q * num_cols + col) * 3;
+        out[o + 0] = columns[(col * 3 + 0) * col_stride + row];
+        out[o + 1] = columns[(col * 3 + 1) * col_stride + row];
+        out[o + 2] = columns[(col * 3 + 2) * col_stride + row];
+    }
+}

@@ -16,6 +16,8 @@
 //! The whole module is `#[cfg(feature = "cuda")]`; without the feature the
 //! caller only ever has the CPU interpreter.
 
+use std::any::TypeId;
+
 use math::field::element::FieldElement;
 use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as GoldilocksExtension;
 use math::field::goldilocks::GoldilocksField;
@@ -70,6 +72,39 @@ unsafe fn base_slice_to_u64<F: IsField>(xs: &[FieldElement<F>]) -> Vec<u64> {
 /// Same contract: the caller must have established `F == GoldilocksField`.
 unsafe fn base_slice_as_u64<F: IsField>(xs: &[FieldElement<F>]) -> &[u64] {
     unsafe { std::slice::from_raw_parts(xs.as_ptr() as *const u64, xs.len()) }
+}
+
+/// Lift raw base-field limbs (one canonical-Goldilocks `u64` per element, as
+/// produced by the device row-gather kernels) back into owned `FieldElement`s.
+/// Returns `None` unless `F == GoldilocksField`. The inverse of
+/// [`base_slice_to_u64`]; used to feed device-gathered LDE rows into the generic
+/// prover openings.
+pub fn base_u64_to_field<F: IsField + 'static>(raw: &[u64]) -> Option<Vec<FieldElement<F>>> {
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    // SAFETY: the gate established `F == GoldilocksField`, whose `FieldElement`
+    // is `#[repr(transparent)]` over `u64`; `raw` (a `*const u64`) is 8-aligned.
+    let fe =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const FieldElement<F>, raw.len()) };
+    Some(fe.to_vec())
+}
+
+/// Ext3 sibling of [`base_u64_to_field`]: `raw` holds `3` interleaved limbs per
+/// element (`[c0, c1, c2]`). Returns `None` unless `E` is the degree-3
+/// Goldilocks extension. Inverse of [`ext3_slice_to_u64`].
+pub fn ext3_u64_to_field<E: IsField + 'static>(raw: &[u64]) -> Option<Vec<FieldElement<E>>> {
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksExtension>() {
+        return None;
+    }
+    debug_assert_eq!(raw.len() % 3, 0, "ext3 limbs must come in triples");
+    // SAFETY: the gate established the degree-3 Goldilocks extension, whose
+    // `FieldElement` is `#[repr(transparent)]` over `[u64; 3]`; `raw` (a
+    // `*const u64`) is 8-aligned, matching `[u64; 3]`'s alignment.
+    let fe = unsafe {
+        std::slice::from_raw_parts(raw.as_ptr() as *const FieldElement<E>, raw.len() / 3)
+    };
+    Some(fe.to_vec())
 }
 
 /// Per-proof accumulation inputs (in `FieldElement` form) for
