@@ -1,9 +1,8 @@
-# bench_abba_common.sh — shared pieces of the ABBA prover benchmarks.
+# bench_abba_common.sh — the statistics + helpers behind the ABBA prover bench.
 #
-# Sourced by scripts/bench_abba.sh (two-ref: PR vs baseline binaries) and
-# scripts/bench_abba_gpu.sh (one binary, runtime GPU toggle). Both benches
-# parse the same cli output and MUST report identical statistics for the same
-# pairs.csv, so the parsing and the analysis live here exactly once.
+# Sourced by scripts/bench_abba.sh. The paired-t + exact-Wilcoxon analysis is a
+# large block; keeping it here lets the bench script stay focused on orchestration
+# (build the two refs, run the A/B/B/A loop) rather than statistics.
 #
 # Provides:
 #   extract_prove_time "<cli output>"   -> echoes the proving time (s) or dies
