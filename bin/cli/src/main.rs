@@ -29,12 +29,8 @@ fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>>
     let file = std::fs::File::open(path)?;
     let len = file.metadata()?.len() as usize;
     let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
-    // SAFETY: `with_capacity(len)` guarantees at least `len` allocated bytes
-    // at `as_mut_ptr()`; `read_exact_at` below fully initializes them before
-    // `set_len` exposes them as valid `u8`s.
-    let buf = unsafe { std::slice::from_raw_parts_mut(aligned.as_mut_ptr(), len) };
-    file.read_exact_at(buf, 0)?;
-    unsafe { aligned.set_len(len) };
+    aligned.resize(len, 0);
+    file.read_exact_at(&mut aligned, 0)?;
     Ok(aligned)
 }
 
