@@ -77,6 +77,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -90,6 +91,51 @@ pub fn gpu_extend_halves_calls() -> u64 {
 pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_logup_calls() -> u64 {
     GPU_LOGUP_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful GPU composition-poly (`H(row)`) dispatches — one per table whose
+/// round-2 constraint evaluation took the fused on-device path (a failed attempt
+/// or a gate miss falls back to the CPU accumulation and is not counted).
+pub(crate) static GPU_COMPOSITION_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_calls() -> u64 {
+    GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
+}
+
+/// Runtime override to force the GPU composition path off (→ CPU accumulation).
+/// An escape hatch, and the A/B toggle for benchmarking the path against the CPU
+/// baseline in one process (no rebuild). Default off (path enabled).
+static GPU_COMPOSITION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_gpu_composition_disabled(v: bool) {
+    GPU_COMPOSITION_DISABLED.store(v, Ordering::Relaxed);
+}
+pub(crate) fn gpu_composition_disabled() -> bool {
+    if GPU_COMPOSITION_DISABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Env fallback (cached), so an unmodified prove binary can A/B the path:
+    // `LAMBDA_VM_DISABLE_GPU_COMPOSITION=1`.
+    static ENV_DISABLED: OnceLock<bool> = OnceLock::new();
+    *ENV_DISABLED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_DISABLE_GPU_COMPOSITION")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// `true` when the field tower is concrete Goldilocks + its degree-3 extension —
+/// the only tower with a CUDA lowering. The one home of this check: every GPU
+/// dispatch gate calls it, so the tower test cannot drift between sites.
+pub(crate) fn is_goldilocks_ext3_tower<F: 'static, E: 'static>() -> bool {
+    TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>()
+}
+
+/// `true` when the transition offsets form the contiguous frame `[0, 1, ..]`
+/// the GPU kernels' row math assumes (a `Var` at offset `o` reads LDE row
+/// `row + o·next_step`). Shared by the composition dispatch and its gates.
+pub(crate) fn offsets_are_contiguous(offsets: &[usize]) -> bool {
+    offsets.iter().enumerate().all(|(i, &o)| o == i)
 }
 
 // ============================================================================

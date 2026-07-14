@@ -10,6 +10,8 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -124,7 +126,10 @@ enum Commands {
         #[arg(long)]
         cycle_budget: Option<u64>,
 
-        /// Print the dynamic instruction (cycle) count
+        /// Print the dynamic instruction (cycle) count, plus `Keccak calls` /
+        /// `Ecsm calls` (accelerator syscall invocations). The accelerator lines
+        /// are omitted when combined with --flamegraph (that path has no per-log
+        /// data).
         #[arg(long)]
         cycles: bool,
     },
@@ -339,6 +344,24 @@ struct FlamegraphCliOptions {
     checkpoint_cycles: Option<u64>,
 }
 
+/// Classifies one executed instruction as an accelerator syscall invocation.
+///
+/// Delegates to the executor's canonical `SyscallNumbers::accelerator()` so the
+/// CLI's counts equal the prover's chip-trigger counts by construction: the
+/// prover sets `ecall_keccak`/`ecall_ecsm` from `f.ecall && log.src1_val ==
+/// <SYSCALL_NUMBER>`. Here `f.ecall` is the instruction at the log's
+/// `current_pc` being `EcallEbreak`, and `src1_val` carries a7 (the syscall
+/// number) on ECALL logs. (`get_private_input` is a memory-mapped read, not a
+/// syscall, so it never reaches this path.)
+fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Accelerator> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    SyscallNumbers::try_from(src1_val)
+        .ok()
+        .and_then(|s| s.accelerator())
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
@@ -369,6 +392,12 @@ fn cmd_execute(
             return ExitCode::FAILURE;
         }
     };
+
+    // Accelerator invocation counts, tallied only in the plain streaming path
+    // below (the flamegraph path drives execution inside the executor and does
+    // not expose per-log data). `None` means "not counted", so the accel lines
+    // are omitted rather than printed as misleading zeros.
+    let mut accel_counts: Option<(u64, u64)> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -434,6 +463,14 @@ fn cmd_execute(
         };
 
         let mut cycle_count: u64 = 0;
+        let mut keccak_calls: u64 = 0;
+        let mut ecsm_calls: u64 = 0;
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
+        // accelerator syscall number. This is a cheap superset — a non-ECALL
+        // instruction can hold the same value in src1 — that `accelerator_of`
+        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
+        // `&mut`) is released so the instruction cache can be read again.
+        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
                 Ok(logs) => logs,
@@ -442,9 +479,26 @@ fn cmd_execute(
                     return ExitCode::FAILURE;
                 }
             };
-            match logs {
-                Some(logs) => cycle_count += logs.len() as u64,
-                None => break,
+            let Some(logs) = logs else { break };
+            cycle_count += logs.len() as u64;
+            if cycles {
+                for log in logs {
+                    if SyscallNumbers::try_from(log.src1_val)
+                        .map(|s| s.accelerator().is_some())
+                        .unwrap_or(false)
+                    {
+                        accel_candidates.push((log.current_pc, log.src1_val));
+                    }
+                }
+            }
+            // `logs` is no longer used, so the executor's `&mut` borrow is free
+            // and the instruction cache can be read to confirm each candidate.
+            for (pc, a7) in accel_candidates.drain(..) {
+                match accelerator_of(executor.instructions.get(pc), a7) {
+                    Some(Accelerator::Keccak) => keccak_calls += 1,
+                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
+                    None => {}
+                }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
                 break;
@@ -456,11 +510,18 @@ fn cmd_execute(
             return ExitCode::FAILURE;
         }
 
+        if cycles {
+            accel_counts = Some((keccak_calls, ecsm_calls));
+        }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
+        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
+            println!("Keccak calls: {}", keccak_calls);
+            println!("Ecsm calls: {}", ecsm_calls);
+        }
     }
 
     ExitCode::SUCCESS
@@ -1010,5 +1071,45 @@ mod tests {
     #[test]
     fn continuation_epoch_size_uses_exact_power_of_two() {
         assert_eq!(continuation_epoch_size(20).unwrap(), 1 << 20);
+    }
+
+    // `accelerator_of` must match the prover's `CpuOperation::from_log`: count an
+    // invocation only when the instruction is an ECALL AND a7 is the accelerator
+    // syscall number. Covers both accelerators, the non-accelerator syscalls, a
+    // non-ECALL whose src1 collides with an accelerator number, and a cache miss.
+    #[test]
+    fn accelerator_of_mirrors_prover_classification() {
+        use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
+
+        let ecall = Instruction::EcallEbreak;
+
+        assert_eq!(
+            accelerator_of(Some(&ecall), KECCAK_SYSCALL_NUMBER),
+            Some(Accelerator::Keccak)
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), ECSM_SYSCALL_NUMBER),
+            Some(Accelerator::Ecsm)
+        );
+
+        // Non-accelerator syscalls (Commit=64, Halt=93) count as neither.
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Commit as u64),
+            None
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Halt as u64),
+            None
+        );
+
+        // A non-ECALL instruction whose src1 happens to equal an accelerator a7
+        // must not count — this is the `f.ecall &&` guard the prover applies.
+        assert_eq!(
+            accelerator_of(Some(&Instruction::Fence), KECCAK_SYSCALL_NUMBER),
+            None
+        );
+
+        // No decoded instruction at the pc (cache miss) counts as neither.
+        assert_eq!(accelerator_of(None, KECCAK_SYSCALL_NUMBER), None);
     }
 }

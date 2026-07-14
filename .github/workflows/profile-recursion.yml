@@ -15,8 +15,9 @@ permissions:
   pull-requests: write
 
 concurrency:
-  group: profile-recursion-${{ github.event.issue.number || github.run_id }}
-  cancel-in-progress: true
+  # See bench-verify.yml. workflow_dispatch (no comment) falls to the unique run_id group.
+  group: ${{ startsWith(github.event.comment.body, '/profile_recursion') && format('profile-recursion-{0}', github.event.issue.number) || format('profile-recursion-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   # One job per configuration; they run in parallel and each uploads a Markdown
