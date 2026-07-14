@@ -37,6 +37,11 @@ tiny-keccak = { version = "2.0", features = ["keccak"] }
 # Enable stark's test-utils so cross-crate tests can reach
 # `compute_precomputed_commitment_for_testing`. Only active under cargo test/bench.
 stark = { path = "../crypto/stark", features = ["test-utils"] }
+# Device-resident LDE handles for the cuda-gated GPU constraint-interp parity
+# test (`tests/gpu_constraint_interp_real.rs`). Its build.rs stubs empty PTX when
+# nvcc is absent, so this compiles on CPU-only hosts too; the test itself is
+# `#[cfg(feature = "cuda")]` and only runs with a GPU.
+math-cuda = { path = "../crypto/math-cuda" }
 
 [[bench]]
 name = "vm_prover_benchmark"
