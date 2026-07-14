@@ -327,6 +327,15 @@ where
     pub(crate) num_rows: usize,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
+    /// Full-residency (Stage 3): when true the round-1 D2H was intentionally
+    /// skipped and `main_data`/`aux_data` are empty — every round reads the LDE
+    /// off the device instead. Any code path that would read the host trace must
+    /// hard-abort on this flag rather than index an empty buffer, so a mis-gate
+    /// or an unexpected GPU fallback fails loudly instead of producing a wrong
+    /// proof. Set by `build_round1` when the device-only gate kept this table's
+    /// round-1 LDE on the GPU.
+    #[cfg(feature = "cuda")]
+    pub(crate) host_trace_empty: bool,
     /// Per table GPU residency session: owns this table's device LDE buffers
     /// and bound stream. Threaded R1 to R4. Empty on the CPU path.
     #[cfg(feature = "cuda")]
@@ -459,6 +468,8 @@ where
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
+            host_trace_empty: false,
+            #[cfg(feature = "cuda")]
             gpu_session: GpuTableSession::new(),
         }
     }
@@ -494,6 +505,8 @@ where
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
+            host_trace_empty: false,
+            #[cfg(feature = "cuda")]
             gpu_session: GpuTableSession::new(),
         }
     }
@@ -509,6 +522,31 @@ where
     #[cfg(feature = "cuda")]
     pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
         self.gpu_session.aux_lde = Some(h);
+    }
+
+    /// Mark this table's host LDE trace as intentionally empty (Stage-3
+    /// device-only path): the round-1 D2H was skipped and every host-trace read
+    /// must hard-abort instead of indexing the empty buffers.
+    #[cfg(feature = "cuda")]
+    pub fn set_host_trace_empty(&mut self, empty: bool) {
+        self.host_trace_empty = empty;
+    }
+
+    /// Override the LDE row count. Needed on the device-only path: the host
+    /// buffers are empty, so `from_row_major` cannot infer `num_rows` from
+    /// `main_data.len()` — the caller supplies it from the device handle's
+    /// `lde_size` instead.
+    #[cfg(feature = "cuda")]
+    pub fn set_num_rows(&mut self, num_rows: usize) {
+        self.num_rows = num_rows;
+    }
+
+    /// Whether the host LDE trace was intentionally left empty (see
+    /// [`Self::set_host_trace_empty`]). Guards on every host-read fallback check
+    /// this before touching `main_data`/`aux_data`.
+    #[cfg(feature = "cuda")]
+    pub fn host_trace_empty(&self) -> bool {
+        self.host_trace_empty
     }
 
     #[cfg(feature = "cuda")]
@@ -742,6 +780,13 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
+            // Device-only tables have no host trace; a GPU fall-through here would
+            // read empty `main_data`. Hard-abort instead of a wrong OOD eval.
+            #[cfg(feature = "cuda")]
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R3 barycentric (main) fell back to the host trace, but it is device-only (empty)"
+            );
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
@@ -793,6 +838,13 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
+            // Device-only tables have no host trace; a GPU fall-through here would
+            // read empty `aux_data`. Hard-abort instead of a wrong OOD eval.
+            #[cfg(feature = "cuda")]
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R3 barycentric (aux) fell back to the host trace, but it is device-only (empty)"
+            );
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
