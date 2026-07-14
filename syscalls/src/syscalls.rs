@@ -82,14 +82,10 @@ pub fn commit(slice: &[u8]) {
 /// No ecall is performed — it's a plain memory read (ZisK-style).
 #[cfg(target_arch = "riscv64")]
 pub fn get_private_input() -> Vec<u8> {
-    // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
-    // execution. The 4-byte LE length prefix is always valid (written by the
-    // executor). The data pointer and length are within the memory-mapped region.
-    let len_ptr = PRIVATE_INPUT_START as *const u32;
-    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
-    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
-    let slice = unsafe { core::slice::from_raw_parts(data_ptr, len) };
-    slice.to_vec()
+    // Copy the borrowed private-input bytes into an owned `Vec`. The raw-pointer
+    // read (length prefix + data slice) and its single `unsafe` block live in
+    // `get_private_input_slice`, so the memory layout is defined in one place.
+    get_private_input_slice().to_vec()
 }
 
 #[cfg(not(target_arch = "riscv64"))]
