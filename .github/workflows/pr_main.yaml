@@ -330,6 +330,24 @@ jobs:
         run: |
           make compile-programs-rust
 
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
+
       - name: Install nextest
         uses: taiki-e/install-action@v2
         with:

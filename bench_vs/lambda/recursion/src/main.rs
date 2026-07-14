@@ -1,44 +1,69 @@
 //! Naive recursion guest: verifies an inner lambda-vm proof inside the VM.
 //!
-//! Private input layout (postcard-encoded):
-//!   `(VmProof, Vec<u8>, ProofOptions)`
-//! where the `Vec<u8>` holds the inner program's ELF bytes and `ProofOptions`
-//! specifies the parameters the inner prover used. Commits `[1]` on success.
+//! Private input (postcard): `lambda_vm_prover::recursion::GuestInput` — the
+//! inner proof, the inner program's ELF bytes, and its precomputed DECODE and
+//! ELF-data-page commitments, supplied instead of recomputed in-VM.
 //!
-//! Not `no_std` (std/alloc are available — `build-std` provides them, and the
-//! prover links as a normal std crate; its prove-side code is dead-code
-//! eliminated since we only call `verify`). Like every other allocating guest
-//! it is `#![no_main]` and uses the syscalls crate's global allocator (a large
-//! `TlsfHeap`), initialized first thing in `main` — `verify` allocates far more
-//! than the target's default heap provides.
+//! `ProofOptions` is fixed by the `min`/`blowup8` Cargo feature (a `Preset`),
+//! not private input — an attacker could otherwise pick trivially weak options
+//! and have the guest accept as if a real proof had been checked.
+//!
+//! On success commits `program_id || inner_public_output` via
+//! `recursion::verify_and_attest` (a single ELF parse and a single full-ELF
+//! Keccak, shared between the statement absorb and the `program_id` fold). The
+//! attestation is not self-enforcing: the binding is established by the
+//! consumer via `recursion::check_attestation` (a host-side recompute+compare),
+//! never in-guest.
+//!
+//! std (not `no_std`): `build-std` provides it, prove-side code is DCE'd.
+//! `#![no_main]`; inits the syscalls global allocator first thing in `main`.
 
 #![no_main]
 
-use lambda_vm_prover::{ProofOptions, VmProof};
+use lambda_vm_prover::recursion::{GuestInput, Preset};
+
+#[cfg(not(any(feature = "min", feature = "blowup8")))]
+compile_error!("select exactly one of the `min`/`blowup8` features");
+#[cfg(all(feature = "min", feature = "blowup8"))]
+compile_error!("select exactly one of the `min`/`blowup8` features");
+
+/// The build preset fixing the inner `ProofOptions` (see the module docs).
+#[cfg(feature = "min")]
+const PRESET: Preset = Preset::Min;
+#[cfg(feature = "blowup8")]
+const PRESET: Preset = Preset::Blowup8;
 
 #[unsafe(export_name = "main")]
 pub fn main() -> ! {
     lambda_vm_syscalls::allocator::init_allocator();
 
-    // Install panic handler to make sure any OOM is because verifying itself is
-    // expensive rather than panics causing stack unwinding, which itself is very
-    // expensive in the guest.
+    // Panic -> sys_panic; unwinding is very expensive in-guest.
     const PANIC_MSG: &str = "PANICKED";
     std::panic::set_hook(Box::new(|_| unsafe {
         lambda_vm_syscalls::syscalls::sys_panic(PANIC_MSG.as_ptr(), PANIC_MSG.len())
     }));
 
     let blob = lambda_vm_syscalls::syscalls::get_private_input();
-    let (vm_proof, inner_elf, options): (VmProof, Vec<u8>, ProofOptions) =
+    let (vm_proof, inner_elf, decode_commitment, page_commitments): GuestInput =
         postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
     lambda_vm_prover::profile_markers::step_marker::<
         { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
     >();
 
-    let ok = lambda_vm_prover::verify_with_options(&vm_proof, &inner_elf, &options, None, None)
-        .expect("verify errored");
-    assert!(ok, "inner proof failed verification");
-
-    lambda_vm_syscalls::syscalls::commit(&[1u8]);
+    // The guest's whole job: verify the inner proof against the supplied roots
+    // and, on success, produce `program_id || inner_public_output`. The id fold
+    // is what the consumer rebinds to a trusted ELF (`check_attestation`); it is
+    // not self-enforcing here.
+    let options = PRESET.options();
+    let attestation = lambda_vm_prover::recursion::verify_and_attest(
+        &vm_proof,
+        &inner_elf,
+        &options,
+        decode_commitment,
+        &page_commitments,
+    )
+    .expect("verify errored")
+    .expect("inner proof failed verification");
+    lambda_vm_syscalls::syscalls::commit(&attestation);
     lambda_vm_syscalls::syscalls::sys_halt();
 }

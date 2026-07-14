@@ -20,6 +20,7 @@ mod debug_report;
 pub mod instruments;
 mod paged_mem;
 pub use stark::profile_markers;
+pub mod recursion;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -33,14 +34,13 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::{StatementKind, absorb_statement};
+use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -59,8 +59,11 @@ use crate::test_utils::{
     create_register_air, create_shift_air, create_store_air,
 };
 
-// Re-exported so downstream verifier guests (e.g. the in-VM recursion guest) can
-// name the proof-options type carried in their private input alongside `VmProof`.
+// Re-exported for downstream hosts and verifier guests (e.g. the in-VM
+// recursion guest): `Commitment` is carried in the guest's private input
+// (see `recursion::GuestInput`); the proof-options types name the parameters
+// fixed at guest build time (`recursion::Preset`).
+pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
 
@@ -199,6 +202,9 @@ pub enum Error {
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
+    /// Recursion host-side helper failed (guest-input encoding or
+    /// commitment recompute — see the `recursion` module).
+    Recursion(String),
 }
 
 impl fmt::Display for Error {
@@ -227,6 +233,7 @@ impl fmt::Display for Error {
                     "the program-terminating instruction must be in the final epoch"
                 )
             }
+            Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
         }
     }
 }
@@ -414,36 +421,20 @@ impl VmAirs {
         refs
     }
 
-    /// Create all VM AIR instances. `minimal_bitwise` controls whether the full
-    /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
-    /// DECODE is always preprocessed.
+    /// Create all VM AIR instances. `minimal_bitwise` picks the minimal vs full
+    /// 2^20 bitwise preprocessed table. DECODE is always preprocessed.
+    /// `page_configs`/`table_counts` give the PAGE bases and split-table chunk
+    /// counts.
     ///
-    /// `page_configs` provides the page base addresses for creating PAGE AIRs.
-    /// `table_counts` specifies how many chunks for each split table.
+    /// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+    /// (skipping the FFT + Merkle build) for the DECODE root and any matching
+    /// ELF-data page (keyed by `page_base`); `None` or unmatched pages recompute
+    /// from the ELF. Zero-init pages always use the shared compile-time constant.
     ///
-    /// `decode_commitment` is an optional precomputed DECODE preprocessed
-    /// commitment. When `Some`, the supplied value is used directly and the
-    /// FFT + Merkle build is skipped — useful for callers who have already
-    /// computed the commitment offline and embedded it as a compile-time
-    /// constant (e.g. the recursion guest, where the in-VM recompute is too
-    /// expensive). When `None`, the commitment is computed from the ELF.
-    ///
-    /// `page_commitments` is an optional list of precomputed ELF-data-page
-    /// preprocessed commitments, keyed by `page_base`. For each ELF data page
-    /// the verifier constructs, if a matching `(page_base, commitment)` pair
-    /// is supplied, it is used directly and that page's FFT + Merkle build is
-    /// skipped. Pages not in the list — including all zero-init pages and
-    /// pages without a match — take the normal compute path (zero-init pages
-    /// hit a compile-time constant via
-    /// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-    /// from the ELF). When `None`, every ELF data page recomputes from
-    /// scratch.
-    ///
-    /// The trust anchor for both `decode_commitment` and `page_commitments`
-    /// is the caller's compiled binary — never accept prover-supplied bytes
-    /// here. A wrong value is rejected, never silently accepted: it either
-    /// mismatches the prover's committed precomputed root (an explicit
-    /// verifier check) or yields diverging Fiat-Shamir challenges.
+    /// Supplied roots are used verbatim and NOT checked against `elf`. A wrong
+    /// caller-constant root is rejected (mismatches the proof root or diverges
+    /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
+    /// callers must bind identity externally (see `recursion::check_attestation`).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
@@ -1003,31 +994,49 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
 ///
-/// `decode_commitment` is an optional precomputed DECODE preprocessed
-/// commitment. When `Some`, the supplied value is used directly and the
-/// in-verifier FFT + Merkle build for the DECODE preprocessed columns is
-/// skipped — useful for callers (e.g. the recursion guest) that embed the
-/// commitment as a compile-time constant to avoid the in-VM recompute
-/// cost. When `None`, the verifier computes the commitment from the ELF.
+/// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+/// (skipping the in-verifier FFT + Merkle build) for the DECODE root and any
+/// ELF-data page matching by `page_base`; `None` or unmatched pages recompute
+/// from the ELF, and zero-init pages always use the shared compile-time
+/// constant. Callers (e.g. the recursion guest) supply these to avoid the
+/// in-VM recompute cost.
 ///
-/// `page_commitments` is an optional list of precomputed ELF-data-page
-/// preprocessed commitments, keyed by `page_base`. For each ELF data page
-/// the verifier constructs, if a matching `(page_base, commitment)` pair is
-/// supplied, the FFT + Merkle build for that page is skipped. Pages without
-/// a match — including all zero-init pages — take the normal compute path
-/// (zero-init pages hit a compile-time constant via
-/// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-/// from the ELF). When `None`, every ELF data page recomputes from scratch.
-///
-/// Trust model: both `decode_commitment` and `page_commitments`, when
-/// supplied, must come from the caller's compiled binary (e.g. a
-/// `const [u8; 32]` and a `const [(u64, [u8; 32])]`), never from prover-
-/// supplied bytes. A wrong value is rejected, never silently accepted: it
-/// either mismatches the prover's committed precomputed root (an explicit
-/// verifier check) or yields diverging Fiat-Shamir challenges.
+/// Trust model: a supplied root is used verbatim — this function does NOT
+/// check it against `elf_bytes`. If it is a caller constant (from the compiled
+/// binary), a wrong value is rejected (it mismatches the proof's precomputed
+/// root or diverges Fiat-Shamir). If it is prover-supplied (e.g. the recursion
+/// guest's private input), a consistent mismatched root is NOT rejected here;
+/// the caller must bind identity externally (the recursion pipeline commits
+/// `recursion::program_id` and the consumer checks it via
+/// `recursion::check_attestation`).
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
+    verify_prepared(
+        vm_proof,
+        &program,
+        &elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
+/// [`verify_with_options`] with the ELF already parsed and digested. Callers
+/// that need the parsed ELF or the digest for other purposes reuse them — the
+/// recursion attestation (`recursion::verify_and_attest`) shares one
+/// `Elf::load` and one full-ELF Keccak between verification and the
+/// `program_id` fold, which matters in-guest where both are expensive.
+pub(crate) fn verify_prepared(
+    vm_proof: &VmProof,
+    program: &Elf,
+    elf_digest: &[u8; 32],
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
@@ -1048,9 +1057,8 @@ pub fn verify_with_options(
         }
     }
 
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
+        program,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
     );
@@ -1070,7 +1078,7 @@ pub fn verify_with_options(
     }
 
     let airs = VmAirs::new(
-        &program,
+        program,
         proof_options,
         false,
         &page_configs,
@@ -1091,10 +1099,10 @@ pub fn verify_with_options(
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
-        elf_bytes,
+        elf_digest,
         &vm_proof.public_output,
         &vm_proof.table_counts,
         vm_proof.num_private_input_pages,
