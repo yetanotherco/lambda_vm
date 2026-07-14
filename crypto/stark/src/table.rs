@@ -1,4 +1,3 @@
-use crate::frame::Frame;
 #[cfg(feature = "disk-spill")]
 use crypto::mmap_util::spill_slice_to_mmap;
 use math::field::{
@@ -236,36 +235,6 @@ where
         let start = row_idx * width;
         &self.row_major_data()[start..start + width]
     }
-
-    /// Build a [`Frame`] over this table, identical to [`Table::into_frame`].
-    /// Only the small OOD frame is materialized (bounded by `step_size × width`),
-    /// never the whole proof.
-    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F>
-    where
-        F: IsSubFieldOf<F>,
-    {
-        let height = self.height();
-        debug_assert!(height.is_multiple_of(step_size));
-        let steps = (0..height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
-    }
 }
 
 /// Cloning a spilled table copies its mmap bytes into a fresh heap `Vec`
@@ -409,6 +378,18 @@ impl<F: IsField> Table<F> {
         &self.data
     }
 
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. Owned counterpart to
+    /// `ArchivedTable::dimensions_consistent`, reading the length through
+    /// `row_major_data()` so a disk-spilled table (whose `data` Vec is emptied)
+    /// reports its true mmap-backed length.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width
+            .checked_mul(self.height)
+            .is_some_and(|n| n == self.row_major_data().len())
+    }
+
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -526,30 +507,6 @@ impl<F: IsField> Table<F> {
 
     #[cfg(all(feature = "disk-spill", not(unix)))]
     pub fn advise_drop_cache(&self) {}
-
-    /// Given a step size, converts the given table into a `Frame`.
-    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
-        debug_assert!(self.height.is_multiple_of(step_size));
-        let steps = (0..self.height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
-    }
 }
 
 /// A view of a contiguous subset of rows of a table.
