@@ -8,6 +8,14 @@ use crate::{
     config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
 };
 
+// The proof types below intentionally derive both serde and rkyv. rkyv is the
+// authoritative wire format (prover, CLI, recursion guest all use it); no
+// production path relies on serde. The serde derives are kept only for
+// `examples/examples_cli.rs` (bincode cross-version reference tool) and the
+// `serde_cbor` round-trip tests in `tests/prove_verify_roundtrip_tests.rs` and
+// `tests/bus_tests/completeness_tests.rs`. Do not add a production serde
+// dependency on these types.
+
 #[derive(
     Debug,
     Clone,
