@@ -313,13 +313,18 @@ WALL_A="$(getv "$RES_A" wall)"; ELF_A="$(getv "$RES_A" elf)"
 
 # signed integer delta (A - B); 0 prints bare, >0 gets a leading '+'
 sd() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '+%d' "$d"; else printf '%d' "$d"; fi; }
-# signed integer delta + percentage of baseline
-sdp() {
-  local a="$1" b="$2"
-  awk -v a="$a" -v b="$b" 'BEGIN{
+# A single guest-cycle count rendered in millions, one decimal, e.g. 5239.7M.
+mcyc() { awk -v v="$1" 'BEGIN{ printf("%.1fM", v/1e6); }'; }
+# Guest-cycle delta (A - B) in signed millions (one decimal) + percentage of baseline,
+# e.g. -5113.7M (-97.60%). Staying on awk's double path (no %d) is deliberate: it also
+# dodges mawk's 32-bit %d truncation, which otherwise saturated a multi-billion-cycle
+# delta to -2147483647 on the CI bench runner (gawk was fine, so it slipped local tests).
+mcycd() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
     d=a-b;
+    dm=d/1e6;
     pct=(b!=0)? d/b*100 : 0;
-    printf("%s%d (%s%.2f%%)", (d>=0?"+":""), d, (pct>=0?"+":""), pct);
+    printf("%s%.1fM (%s%.2f%%)", (dm>=0?"+":""), dm, (pct>=0?"+":""), pct);
   }'
 }
 
@@ -336,7 +341,9 @@ echo "   preset=$PRESET   convention: - = PR fewer = better"
 echo
 echo "| Metric        | REF_B (baseline) | REF_A (PR) | Δ (A-B) |"
 echo "|---------------|------------------|------------|---------|"
-printf '| Guest cycles  | %s | %s | %s |\n' "$CYC_B" "$CYC_A" "$(sdp "$CYC_A" "$CYC_B")"
+# Guest cycles are shown in MILLIONS (one decimal); the RAW block below carries the
+# exact integer counts for scripts. Keccak/Ecsm stay plain integer call counts.
+printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
 printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
 printf '| Ecsm calls    | %s | %s | %s |\n' "$ECS_B" "$ECS_A" "$(sd "$ECS_A" "$ECS_B")"
 echo

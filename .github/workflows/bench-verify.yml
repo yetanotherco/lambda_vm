@@ -46,7 +46,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⏳ **Verifier benchmark started** on the bench server (~4 min). The bench server is occupied until it finishes.'
+              body: '⏳ **Benchmark started** on the bench server. The verifier bench takes ~5 min; the recursion-guest cycle comparison then adds guest builds — a few minutes when cached, up to ~1h on a cold run. The bench server is occupied until it finishes.'
             });
 
       - name: Resolve PR head + pair count
