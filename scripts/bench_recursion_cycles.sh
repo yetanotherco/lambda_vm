@@ -5,19 +5,23 @@
 #
 # The recursion guest is the in-VM STARK verifier: it runs the verifier INSIDE the
 # VM. For a fixed (guest ELF, input blob) its cost is fully DETERMINISTIC, so a single
-# ref is one EXACT integer reading — no A/B/B/A interleaving needed. Note the two refs
+# ref is one EXACT integer reading — no A/B/B/A interleaving needed; but across runs
+# neither is held fixed (fresh guest build + a freshly-dumped nondeterministic proof
+# blob), so expect ~±100k cycles run-to-run. Note the two refs
 # do NOT share one blob: each ref dumps its OWN input blob from its own prover (via its
 # ignored dump test). So when a PR only changes guest code the delta is a clean
 # guest-cycle diff, but when a PR changes the prover / proof format the delta conflates
 # the guest-code change with the proof-structure change (a different blob) — read it as
 # "total verifier work for each side's own proof", not an isolated guest-code delta.
 #
-# For each ref we report three numbers, all read from one `execute --cycles` run of a
+# For each ref we report two numbers, both read from one `execute --cycles` run of a
 # single measuring CLI (MEASURE_CLI) built once from the checkout this script runs in:
 #   * Guest cycles  — retired instructions.
 #   * Keccak calls  — keccak-permutation accelerator ecalls (one cycle each, but each
-#                     runs a whole permutation invisibly, so it's the companion signal).
-#   * Ecsm calls    — elliptic-curve scalar-mul accelerator ecalls (same idea).
+#                     runs a whole permutation invisibly, so it's the companion signal;
+#                     currently 0 until the verifier is wired to the keccak syscall).
+# The CLI also prints an Ecsm (EC scalar-mul) count, but the STARK verifier does no
+# scalar-mul, so it is structurally 0 for a recursion proof — dropped as noise, not read.
 # MEASURE_CLI's executor counts ANY ref's guest ELF correctly (it just feeds the blob
 # as private input and reads the counters), so building it once is fine — indeed
 # preferable: the SAME counter reads both refs. In CI's issue_comment flow the checkout
@@ -142,16 +146,17 @@ else
   echo "==> Reusing cached MEASURE_CLI (${HEAD_SHA:0:10})"
 fi
 
-# Validate a result record (key=value lines on stdin): the four numeric keys must be
+# Validate a result record (key=value lines on stdin): the three numeric keys must be
 # present and integer, and elf must be non-empty. Exit 0 iff trustworthy. Used both to
 # vet a cached result before reuse and to guard the final table/RAW emit, so a
 # truncated/partial cache (e.g. a run killed mid-write) can never surface as bogus zeros.
+# (An older cache may also carry a legacy `ecsm=` line; it's simply ignored here.)
 valid_result() {
   awk -F= '
-    $1=="cycles" {c=$2} $1=="keccak" {k=$2} $1=="ecsm" {e=$2}
+    $1=="cycles" {c=$2} $1=="keccak" {k=$2}
     $1=="wall"   {w=$2} $1=="elf"    {f=$2}
     END {
-      if (c ~ /^[0-9]+$/ && k ~ /^[0-9]+$/ && e ~ /^[0-9]+$/ &&
+      if (c ~ /^[0-9]+$/ && k ~ /^[0-9]+$/ &&
           w ~ /^[0-9]+$/ && length(f) > 0) exit 0
       exit 1
     }'
@@ -264,23 +269,23 @@ measure_ref() {
   fi
   t1=$(date +%s); dt=$((t1 - t0))
 
-  local cyc kec ecs
+  local cyc kec
   cyc="$(printf '%s\n' "$out" | awk -F': ' '/^Cycles:/{print $2; exit}')"
   kec="$(printf '%s\n' "$out" | awk -F': ' '/^Keccak calls:/{print $2; exit}')"
-  ecs="$(printf '%s\n' "$out" | awk -F': ' '/^Ecsm calls:/{print $2; exit}')"
-  if [ -z "$cyc" ] || [ -z "$kec" ] || [ -z "$ecs" ]; then
-    echo "ERROR: [$role] could not parse Cycles/Keccak/Ecsm from MEASURE_CLI output for $ref ($sha8):" >&2
+  # The CLI also prints an "Ecsm calls:" line; we intentionally don't read it — it is
+  # structurally 0 for a recursion proof (no EC scalar-mul), so it's dropped as noise.
+  if [ -z "$cyc" ] || [ -z "$kec" ]; then
+    echo "ERROR: [$role] could not parse Cycles/Keccak from MEASURE_CLI output for $ref ($sha8):" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
-  echo "==> [$role] cycles=$cyc keccak=$kec ecsm=$ecs  (execute wall-time ${dt}s)" >&2
+  echo "==> [$role] cycles=$cyc keccak=$kec  (execute wall-time ${dt}s)" >&2
 
   # Write atomically (tmp + mv) so a run killed mid-write never leaves a half file that
   # a later run would trust and parse as zeros.
   {
     printf 'cycles=%s\n' "$cyc"
     printf 'keccak=%s\n' "$kec"
-    printf 'ecsm=%s\n' "$ecs"
     printf 'wall=%s\n' "$dt"
     printf 'elf=%s\n' "$(basename "$guest_elf")"
   } > "$result.tmp"
@@ -306,44 +311,63 @@ if ! printf '%s\n' "$RES_A" | valid_result; then
 fi
 
 getv() { printf '%s\n' "$1" | awk -F= -v k="$2" '$1==k{print $2; exit}'; }
-CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"; ECS_B="$(getv "$RES_B" ecsm)"
+CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"
 WALL_B="$(getv "$RES_B" wall)"; ELF_B="$(getv "$RES_B" elf)"
-CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"; ECS_A="$(getv "$RES_A" ecsm)"
+CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"
 WALL_A="$(getv "$RES_A" wall)"; ELF_A="$(getv "$RES_A" elf)"
 
 # signed integer delta (A - B); 0 prints bare, >0 gets a leading '+'
 sd() { local d=$(( $1 - $2 )); if [ "$d" -gt 0 ]; then printf '+%d' "$d"; else printf '%d' "$d"; fi; }
-# signed integer delta + percentage of baseline
-sdp() {
-  local a="$1" b="$2"
-  awk -v a="$a" -v b="$b" 'BEGIN{
+# A single guest-cycle count rendered in millions, one decimal, e.g. 5239.7M.
+mcyc() { awk -v v="$1" 'BEGIN{ printf("%.1fM", v/1e6); }'; }
+# Guest-cycle delta (A - B) in signed millions (one decimal) + percentage of baseline,
+# e.g. -5113.7M (-97.60%). Staying on awk's double path (no %d) is deliberate: it also
+# dodges mawk's 32-bit %d truncation, which otherwise saturated a multi-billion-cycle
+# delta to -2147483647 on the CI bench runner (gawk was fine, so it slipped local tests).
+mcycd() {
+  awk -v a="$1" -v b="$2" 'BEGIN{
     d=a-b;
+    dm=d/1e6;
     pct=(b!=0)? d/b*100 : 0;
-    printf("%s%d (%s%.2f%%)", (d>=0?"+":""), d, (pct>=0?"+":""), pct);
+    printf("%s%.1fM (%s%.2f%%)", (dm>=0?"+":""), dm, (pct>=0?"+":""), pct);
   }'
 }
 
+# Human label for the proof regime this preset measures, so a reader can't mistake the
+# single-query `min` number for the full 128-bit verifier cost. CI always passes `min`.
+case "$PRESET" in
+  min)     REGIME="single query (blowup=2, 1 query)" ;;
+  blowup8) REGIME="128-bit (blowup=8, multi-query)" ;;
+  *)       REGIME="$PRESET" ;;
+esac
+
 echo
-echo "=== Recursion-guest cycle/accelerator comparison (deterministic, exact) ==="
+echo "=== Recursion-guest cycle comparison — $REGIME — deterministic to ~±100k cycles ==="
 echo "   REF_B (baseline) $REF_B  ${SHA_B:0:10}  guest=$ELF_B"
 echo "   REF_A (PR)       $REF_A  ${SHA_A:0:10}  guest=$ELF_A"
-if [ "$ELF_A" != "$ELF_B" ]; then
-  echo "   note: the sides used different guest artifacts ($ELF_B vs $ELF_A). This is EXPECTED"
-  echo "         for a preset PR (e.g. main→recursion.elf vs PR→recursion-min.elf); both verify"
-  echo "         under the same min proof options, so it is a valid comparison, not a mismatch."
-fi
-echo "   preset=$PRESET   convention: - = PR fewer = better"
 echo
 echo "| Metric        | REF_B (baseline) | REF_A (PR) | Δ (A-B) |"
 echo "|---------------|------------------|------------|---------|"
-printf '| Guest cycles  | %s | %s | %s |\n' "$CYC_B" "$CYC_A" "$(sdp "$CYC_A" "$CYC_B")"
+# Guest cycles are shown in MILLIONS (one decimal); the exact integer counts are in
+# the collapsed raw block below. Keccak stays a plain integer call count.
+printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
 printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
-printf '| Ecsm calls    | %s | %s | %s |\n' "$ECS_B" "$ECS_A" "$(sd "$ECS_A" "$ECS_B")"
+# One terse reproducibility caveat; the blank line before it ends the markdown table.
 echo
-echo "=== RAW (machine-parseable) ==="
-printf 'ref_b_sha=%s ref_b_elf=%s ref_b_cycles=%s ref_b_keccak=%s ref_b_ecsm=%s ref_b_execute_wall_s=%s\n' \
-  "$SHA_B" "$ELF_B" "$CYC_B" "$KEC_B" "$ECS_B" "$WALL_B"
-printf 'ref_a_sha=%s ref_a_elf=%s ref_a_cycles=%s ref_a_keccak=%s ref_a_ecsm=%s ref_a_execute_wall_s=%s\n' \
-  "$SHA_A" "$ELF_A" "$CYC_A" "$KEC_A" "$ECS_A" "$WALL_A"
-printf 'delta_cycles=%s delta_keccak=%s delta_ecsm=%s\n' \
-  "$(( CYC_A - CYC_B ))" "$(( KEC_A - KEC_B ))" "$(( ECS_A - ECS_B ))"
+echo "note: cycles reproduce to ~±100k (build codegen + proof nondeterminism); treat sub-100k deltas as noise, not signal."
+# Exact machine-parseable counts, collapsed so they don't clutter the PR comment (the
+# table above is rounded to millions; these are the exact integers). The blank lines
+# around the fence are required for GitHub to render the code block inside <details>.
+echo
+echo "<details><summary>raw (exact integer counts)</summary>"
+echo
+echo '```'
+printf 'ref_b_sha=%s ref_b_elf=%s ref_b_cycles=%s ref_b_keccak=%s ref_b_execute_wall_s=%s\n' \
+  "$SHA_B" "$ELF_B" "$CYC_B" "$KEC_B" "$WALL_B"
+printf 'ref_a_sha=%s ref_a_elf=%s ref_a_cycles=%s ref_a_keccak=%s ref_a_execute_wall_s=%s\n' \
+  "$SHA_A" "$ELF_A" "$CYC_A" "$KEC_A" "$WALL_A"
+printf 'delta_cycles=%s delta_keccak=%s\n' \
+  "$(( CYC_A - CYC_B ))" "$(( KEC_A - KEC_B ))"
+echo '```'
+echo
+echo "</details>"
