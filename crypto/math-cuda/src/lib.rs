@@ -6,6 +6,7 @@
 //! pipelines or used by the parity test suite.
 
 pub mod barycentric;
+pub mod constraint_interp;
 pub mod deep;
 pub mod device;
 pub mod fri;

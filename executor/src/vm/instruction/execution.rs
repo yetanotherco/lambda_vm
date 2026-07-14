@@ -50,6 +50,29 @@ impl TryFrom<u64> for SyscallNumbers {
     }
 }
 
+/// A syscall that drives a specialized in-circuit accelerator chip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Accelerator {
+    Keccak,
+    Ecsm,
+}
+
+impl SyscallNumbers {
+    /// The accelerator this syscall drives, if any. Exhaustive `match self`:
+    /// adding a `SyscallNumbers` variant is a compile error here, so a new
+    /// accelerator can't be silently missed by counters that consume this.
+    pub fn accelerator(self) -> Option<Accelerator> {
+        match self {
+            SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::Print
+            | SyscallNumbers::Panic
+            | SyscallNumbers::Commit
+            | SyscallNumbers::Halt => None,
+        }
+    }
+}
+
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
 fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
     let mut out = [0u8; 32];
