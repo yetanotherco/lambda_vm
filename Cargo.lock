@@ -824,7 +824,6 @@ dependencies = [
 name = "lambda-vm-prover"
 version = "0.1.0"
 dependencies = [
- "bincode",
  "criterion 0.5.1",
  "crypto",
  "digest",
