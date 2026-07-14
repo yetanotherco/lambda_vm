@@ -12,12 +12,14 @@
 # the guest-code change with the proof-structure change (a different blob) — read it as
 # "total verifier work for each side's own proof", not an isolated guest-code delta.
 #
-# For each ref we report three numbers, all read from one `execute --cycles` run of a
+# For each ref we report two numbers, both read from one `execute --cycles` run of a
 # single measuring CLI (MEASURE_CLI) built once from the checkout this script runs in:
 #   * Guest cycles  — retired instructions.
 #   * Keccak calls  — keccak-permutation accelerator ecalls (one cycle each, but each
-#                     runs a whole permutation invisibly, so it's the companion signal).
-#   * Ecsm calls    — elliptic-curve scalar-mul accelerator ecalls (same idea).
+#                     runs a whole permutation invisibly, so it's the companion signal;
+#                     currently 0 until the verifier is wired to the keccak syscall).
+# The CLI also prints an Ecsm (EC scalar-mul) count, but the STARK verifier does no
+# scalar-mul, so it is structurally 0 for a recursion proof — dropped as noise, not read.
 # MEASURE_CLI's executor counts ANY ref's guest ELF correctly (it just feeds the blob
 # as private input and reads the counters), so building it once is fine — indeed
 # preferable: the SAME counter reads both refs. In CI's issue_comment flow the checkout
@@ -142,16 +144,17 @@ else
   echo "==> Reusing cached MEASURE_CLI (${HEAD_SHA:0:10})"
 fi
 
-# Validate a result record (key=value lines on stdin): the four numeric keys must be
+# Validate a result record (key=value lines on stdin): the three numeric keys must be
 # present and integer, and elf must be non-empty. Exit 0 iff trustworthy. Used both to
 # vet a cached result before reuse and to guard the final table/RAW emit, so a
 # truncated/partial cache (e.g. a run killed mid-write) can never surface as bogus zeros.
+# (An older cache may also carry a legacy `ecsm=` line; it's simply ignored here.)
 valid_result() {
   awk -F= '
-    $1=="cycles" {c=$2} $1=="keccak" {k=$2} $1=="ecsm" {e=$2}
+    $1=="cycles" {c=$2} $1=="keccak" {k=$2}
     $1=="wall"   {w=$2} $1=="elf"    {f=$2}
     END {
-      if (c ~ /^[0-9]+$/ && k ~ /^[0-9]+$/ && e ~ /^[0-9]+$/ &&
+      if (c ~ /^[0-9]+$/ && k ~ /^[0-9]+$/ &&
           w ~ /^[0-9]+$/ && length(f) > 0) exit 0
       exit 1
     }'
@@ -264,23 +267,23 @@ measure_ref() {
   fi
   t1=$(date +%s); dt=$((t1 - t0))
 
-  local cyc kec ecs
+  local cyc kec
   cyc="$(printf '%s\n' "$out" | awk -F': ' '/^Cycles:/{print $2; exit}')"
   kec="$(printf '%s\n' "$out" | awk -F': ' '/^Keccak calls:/{print $2; exit}')"
-  ecs="$(printf '%s\n' "$out" | awk -F': ' '/^Ecsm calls:/{print $2; exit}')"
-  if [ -z "$cyc" ] || [ -z "$kec" ] || [ -z "$ecs" ]; then
-    echo "ERROR: [$role] could not parse Cycles/Keccak/Ecsm from MEASURE_CLI output for $ref ($sha8):" >&2
+  # The CLI also prints an "Ecsm calls:" line; we intentionally don't read it — it is
+  # structurally 0 for a recursion proof (no EC scalar-mul), so it's dropped as noise.
+  if [ -z "$cyc" ] || [ -z "$kec" ]; then
+    echo "ERROR: [$role] could not parse Cycles/Keccak from MEASURE_CLI output for $ref ($sha8):" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi
-  echo "==> [$role] cycles=$cyc keccak=$kec ecsm=$ecs  (execute wall-time ${dt}s)" >&2
+  echo "==> [$role] cycles=$cyc keccak=$kec  (execute wall-time ${dt}s)" >&2
 
   # Write atomically (tmp + mv) so a run killed mid-write never leaves a half file that
   # a later run would trust and parse as zeros.
   {
     printf 'cycles=%s\n' "$cyc"
     printf 'keccak=%s\n' "$kec"
-    printf 'ecsm=%s\n' "$ecs"
     printf 'wall=%s\n' "$dt"
     printf 'elf=%s\n' "$(basename "$guest_elf")"
   } > "$result.tmp"
@@ -306,9 +309,9 @@ if ! printf '%s\n' "$RES_A" | valid_result; then
 fi
 
 getv() { printf '%s\n' "$1" | awk -F= -v k="$2" '$1==k{print $2; exit}'; }
-CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"; ECS_B="$(getv "$RES_B" ecsm)"
+CYC_B="$(getv "$RES_B" cycles)"; KEC_B="$(getv "$RES_B" keccak)"
 WALL_B="$(getv "$RES_B" wall)"; ELF_B="$(getv "$RES_B" elf)"
-CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"; ECS_A="$(getv "$RES_A" ecsm)"
+CYC_A="$(getv "$RES_A" cycles)"; KEC_A="$(getv "$RES_A" keccak)"
 WALL_A="$(getv "$RES_A" wall)"; ELF_A="$(getv "$RES_A" elf)"
 
 # signed integer delta (A - B); 0 prints bare, >0 gets a leading '+'
@@ -336,10 +339,9 @@ echo
 echo "| Metric        | REF_B (baseline) | REF_A (PR) | Δ (A-B) |"
 echo "|---------------|------------------|------------|---------|"
 # Guest cycles are shown in MILLIONS (one decimal); the exact integer counts are in
-# the collapsed raw block below. Keccak/Ecsm stay plain integer call counts.
+# the collapsed raw block below. Keccak stays a plain integer call count.
 printf '| Guest cycles  | %s | %s | %s |\n' "$(mcyc "$CYC_B")" "$(mcyc "$CYC_A")" "$(mcycd "$CYC_A" "$CYC_B")"
 printf '| Keccak calls  | %s | %s | %s |\n' "$KEC_B" "$KEC_A" "$(sd "$KEC_A" "$KEC_B")"
-printf '| Ecsm calls    | %s | %s | %s |\n' "$ECS_B" "$ECS_A" "$(sd "$ECS_A" "$ECS_B")"
 # Exact machine-parseable counts, collapsed so they don't clutter the PR comment (the
 # table above is rounded to millions; these are the exact integers). The blank lines
 # around the fence are required for GitHub to render the code block inside <details>.
@@ -347,12 +349,12 @@ echo
 echo "<details><summary>raw (exact integer counts)</summary>"
 echo
 echo '```'
-printf 'ref_b_sha=%s ref_b_elf=%s ref_b_cycles=%s ref_b_keccak=%s ref_b_ecsm=%s ref_b_execute_wall_s=%s\n' \
-  "$SHA_B" "$ELF_B" "$CYC_B" "$KEC_B" "$ECS_B" "$WALL_B"
-printf 'ref_a_sha=%s ref_a_elf=%s ref_a_cycles=%s ref_a_keccak=%s ref_a_ecsm=%s ref_a_execute_wall_s=%s\n' \
-  "$SHA_A" "$ELF_A" "$CYC_A" "$KEC_A" "$ECS_A" "$WALL_A"
-printf 'delta_cycles=%s delta_keccak=%s delta_ecsm=%s\n' \
-  "$(( CYC_A - CYC_B ))" "$(( KEC_A - KEC_B ))" "$(( ECS_A - ECS_B ))"
+printf 'ref_b_sha=%s ref_b_elf=%s ref_b_cycles=%s ref_b_keccak=%s ref_b_execute_wall_s=%s\n' \
+  "$SHA_B" "$ELF_B" "$CYC_B" "$KEC_B" "$WALL_B"
+printf 'ref_a_sha=%s ref_a_elf=%s ref_a_cycles=%s ref_a_keccak=%s ref_a_execute_wall_s=%s\n' \
+  "$SHA_A" "$ELF_A" "$CYC_A" "$KEC_A" "$WALL_A"
+printf 'delta_cycles=%s delta_keccak=%s\n' \
+  "$(( CYC_A - CYC_B ))" "$(( KEC_A - KEC_B ))"
 echo '```'
 echo
 echo "</details>"

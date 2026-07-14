@@ -26,7 +26,7 @@ jobs:
       startsWith(github.event.comment.body, '/bench-verify') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Job cap. The verifier bench is ~4 min and the recursion measurement itself ~1 min,
+    # Job cap. The verifier bench is ~5-6 min and the recursion measurement itself ~1 min,
     # but on a cold runner the recursion BUILDS dominate: MEASURE_CLI (release cli) once,
     # plus PER REF a guest build (~10-20 min) and a prover-test build for the blob dump.
     # All cached in /tmp for later runs, and build-std / the host cargo target are shared
