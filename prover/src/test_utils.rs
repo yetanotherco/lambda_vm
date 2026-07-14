@@ -73,6 +73,9 @@ use crate::tables::fext_load::{
 use crate::tables::fext_page::{
     FextPageConstraints, bus_interactions as fext_page_bus_interactions, cols as fext_page_cols,
 };
+use crate::tables::fext_store::{
+    FextStoreConstraints, bus_interactions as fext_store_bus_interactions, cols as fext_store_cols,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
@@ -978,6 +981,18 @@ pub fn create_fext_fma_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextFm
         1,
         FextFmaConstraints,
         "FEXT_FMA",
+    )
+}
+
+/// Create FEXT_STORE AIR.
+pub fn create_fext_store_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextStoreConstraints> {
+    build_air(
+        fext_store_cols::NUM_COLUMNS,
+        fext_store_bus_interactions(),
+        proof_options,
+        1,
+        FextStoreConstraints,
+        "FEXT_STORE",
     )
 }
 

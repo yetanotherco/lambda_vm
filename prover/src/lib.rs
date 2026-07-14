@@ -54,8 +54,8 @@ use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
     create_ecsm_air, create_eq_air, create_fext_fma_air, create_fext_load_air,
-    create_fext_page_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
-    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_fext_page_air, create_fext_store_air, create_halt_air, create_keccak_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
     create_register_air, create_shift_air, create_store_air,
 };
@@ -79,8 +79,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas, fext_load, fext_fma, fext_page.
-pub const FIXED_TABLE_COUNT: usize = 13;
+/// keccak_rc, register, ecsm, ecdas, fext_load, fext_fma, fext_store, fext_page.
+pub const FIXED_TABLE_COUNT: usize = 14;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -263,6 +263,7 @@ pub(crate) struct VmAirs {
     pub ecdas: VmAir,
     pub fext_load: VmAir,
     pub fext_fma: VmAir,
+    pub fext_store: VmAir,
     pub fext_page: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
@@ -291,6 +292,7 @@ impl VmAirs {
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
             (self.fext_load.as_ref(), &mut traces.fext_load, &()),
             (self.fext_fma.as_ref(), &mut traces.fext_fma, &()),
+            (self.fext_store.as_ref(), &mut traces.fext_store, &()),
             (self.fext_page.as_ref(), &mut traces.fext_page, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
@@ -368,6 +370,7 @@ impl VmAirs {
             self.ecdas.as_ref(),
             self.fext_load.as_ref(),
             self.fext_fma.as_ref(),
+            self.fext_store.as_ref(),
             self.fext_page.as_ref(),
             self.register.as_ref(),
         ];
@@ -544,6 +547,7 @@ impl VmAirs {
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
         let fext_load: VmAir = Box::new(create_fext_load_air(proof_options));
         let fext_fma: VmAir = Box::new(create_fext_fma_air(proof_options));
+        let fext_store: VmAir = Box::new(create_fext_store_air(proof_options));
         let fext_page: VmAir = Box::new(create_fext_page_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
@@ -653,6 +657,7 @@ impl VmAirs {
             ecdas,
             fext_load,
             fext_fma,
+            fext_store,
             fext_page,
             register,
             pages,

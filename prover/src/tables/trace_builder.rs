@@ -53,6 +53,7 @@ use super::eq;
 use super::fext_fma;
 use super::fext_load;
 use super::fext_page;
+use super::fext_store;
 use super::halt;
 use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
@@ -555,6 +556,7 @@ fn collect_ops_from_cpu(
     Vec<ecdas::EcdasOperation>,
     Vec<fext_load::FextLoadOperation>,
     Vec<fext_fma::FextFmaOperation>,
+    Vec<fext_store::FextStoreOperation>,
 ) {
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
@@ -568,6 +570,7 @@ fn collect_ops_from_cpu(
     let mut ecdas_ops = Vec::new();
     let mut fext_load_ops = Vec::new();
     let mut fext_fma_ops = Vec::new();
+    let mut fext_store_ops = Vec::new();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -674,6 +677,11 @@ fn collect_ops_from_cpu(
             memw.extend_ops(memw_ops);
             fext_fma_ops.push(fma_op);
         }
+        if op.ecall_fext_store {
+            let (memw_ops, store_op) = collect_fext_store_ops(op, register_state, field_state);
+            memw.extend_ops(memw_ops);
+            fext_store_ops.push(store_op);
+        }
 
         // --- ALU chip dispatch (no state tracking) ---
         // Word (`*W`) instructions are delegated to CPU32 (which itself drives
@@ -732,6 +740,7 @@ fn collect_ops_from_cpu(
         ecdas_ops,
         fext_load_ops,
         fext_fma_ops,
+        fext_store_ops,
     )
 }
 
@@ -1123,6 +1132,65 @@ fn collect_fext_fma_ops(
             read_old_ts,
             write_old_ts,
             write_old_val,
+        },
+    )
+}
+
+/// Collects the register read (x10) + register writes (a1/a2/a3) + the FEXT_STORE
+/// operation. Reads 3 field-storage cells (re-emitting each token at `t`) and
+/// writes their coefficients back to registers.
+fn collect_fext_store_ops(
+    op: &CpuOperation,
+    register_state: &mut RegisterState,
+    field_state: &mut FieldStorageState,
+) -> (Vec<MemwOperation>, fext_store::FextStoreOperation) {
+    let t = op.timestamp;
+    let src_addr = register_state.read(10).0;
+
+    let mut memw_ops = Vec::with_capacity(4);
+    // Register read x10 (source address) at t.
+    {
+        let (val, old_ts) = register_state.read(10);
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 10, value, t, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(10, val, t);
+    }
+
+    // Read the 3 field cells (a read re-emits the token at t).
+    let mut coeffs = [0u64; 3];
+    let mut old_ts = [0u64; 3];
+    for d in 0..3 {
+        let domain = 3 + d as u64;
+        let (value, ts) = field_state.read(domain, src_addr);
+        coeffs[d] = value;
+        old_ts[d] = ts;
+        field_state.write(domain, src_addr, value, t);
+    }
+
+    // Write the coefficients back to registers a1/a2/a3 (x11/x12/x13).
+    for (d, &coeff) in coeffs.iter().enumerate() {
+        let reg = 11 + d as u8;
+        let (old_val, old_reg_ts) = register_state.read(reg);
+        let new_value = pack_register_value(coeff);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * reg as u64, new_value, t, 2, false).with_old(
+                pack_register_value(old_val),
+                [old_reg_ts, old_reg_ts, 0, 0, 0, 0, 0, 0],
+            ),
+        );
+        register_state.write(reg, coeff, t);
+    }
+
+    (
+        memw_ops,
+        fext_store::FextStoreOperation {
+            timestamp: t,
+            src_addr,
+            coeffs,
+            old_ts,
         },
     )
 }
@@ -1692,6 +1760,19 @@ fn collect_lt_from_fext_fma(ops: &[fext_fma::FextFmaOperation]) -> Vec<LtOperati
         }
         for d in 0..3 {
             lt_ops.push(LtOperation::new(op.write_old_ts[d], op.timestamp, false));
+        }
+    }
+    lt_ops
+}
+
+/// LT provider rows for the FEXT_STORE chip's ALU lookups: `old_ts < ts` for each
+/// of the 3 field reads. (The register read/write LT checks are handled by the
+/// shared MEMW machinery.)
+fn collect_lt_from_fext_store(ops: &[fext_store::FextStoreOperation]) -> Vec<LtOperation> {
+    let mut lt_ops = Vec::with_capacity(ops.len() * 3);
+    for op in ops {
+        for d in 0..3 {
+            lt_ops.push(LtOperation::new(op.old_ts[d], op.timestamp, false));
         }
     }
     lt_ops
@@ -2947,6 +3028,9 @@ pub struct Traces {
     /// FEXT_FMA table (one row per FEXT_FMA ecall)
     pub fext_fma: TraceTable<GoldilocksField, GoldilocksExtension>,
 
+    /// FEXT_STORE table (one row per FEXT_STORE ecall)
+    pub fext_store: TraceTable<GoldilocksField, GoldilocksExtension>,
+
     /// FEXT_PAGE bookend table (one row per touched field-storage cell)
     pub fext_page: TraceTable<GoldilocksField, GoldilocksExtension>,
 
@@ -2995,6 +3079,7 @@ struct CollectedOps {
     // Field-extension accelerator chips.
     fext_load_ops: Vec<fext_load::FextLoadOperation>,
     fext_fma_ops: Vec<fext_fma::FextFmaOperation>,
+    fext_store_ops: Vec<fext_store::FextStoreOperation>,
     fext_page_ops: Vec<fext_page::FextPageOperation>,
 }
 
@@ -3052,6 +3137,7 @@ fn collect_all_ops(
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     fext_load_ops: Vec<fext_load::FextLoadOperation>,
     fext_fma_ops: Vec<fext_fma::FextFmaOperation>,
+    fext_store_ops: Vec<fext_store::FextStoreOperation>,
     fext_page_ops: Vec<fext_page::FextPageOperation>,
     register_state: &mut RegisterState,
     is_final: bool,
@@ -3197,6 +3283,7 @@ fn collect_all_ops(
         ecdas_ops,
         fext_load_ops,
         fext_fma_ops,
+        fext_store_ops,
         fext_page_ops,
     }
 }
@@ -3243,6 +3330,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecdas_ops,
         fext_load_ops,
         fext_fma_ops,
+        fext_store_ops,
         fext_page_ops,
     } = ops;
 
@@ -3253,6 +3341,7 @@ fn build_traces<I: ImageSource + Sync>(
     lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
     lt_ops.extend(collect_lt_from_fext_load(&fext_load_ops));
     lt_ops.extend(collect_lt_from_fext_fma(&fext_fma_ops));
+    lt_ops.extend(collect_lt_from_fext_store(&fext_store_ops));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3610,6 +3699,7 @@ fn build_traces<I: ImageSource + Sync>(
     // FEXT accelerator traces (empty/all-padding when unused).
     let gen_fext_load = || fext_load::generate_fext_load_trace(&fext_load_ops);
     let gen_fext_fma = || fext_fma::generate_fext_fma_trace(&fext_fma_ops);
+    let gen_fext_store = || fext_store::generate_fext_store_trace(&fext_store_ops);
     let gen_fext_page = || fext_page::generate_fext_page_trace(&fext_page_ops);
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
@@ -3624,6 +3714,7 @@ fn build_traces<I: ImageSource + Sync>(
         (None, None, None, None);
     let (mut ecsm_slot, mut ecdas_slot) = (None, None);
     let (mut fext_load_slot, mut fext_fma_slot, mut fext_page_slot) = (None, None, None);
+    let mut fext_store_slot = None;
 
     #[cfg(feature = "disk-spill")]
     let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
@@ -3667,6 +3758,7 @@ fn build_traces<I: ImageSource + Sync>(
             spawn_into!(ecdas_slot, gen_ecdas);
             spawn_into!(fext_load_slot, gen_fext_load);
             spawn_into!(fext_fma_slot, gen_fext_fma);
+            spawn_into!(fext_store_slot, gen_fext_store);
             spawn_into!(fext_page_slot, gen_fext_page);
         });
     } else {
@@ -3697,6 +3789,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecdas_slot = Some(gen_ecdas());
         fext_load_slot = Some(gen_fext_load());
         fext_fma_slot = Some(gen_fext_fma());
+        fext_store_slot = Some(gen_fext_store());
         fext_page_slot = Some(gen_fext_page());
     }
 
@@ -3734,6 +3827,7 @@ fn build_traces<I: ImageSource + Sync>(
     let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
     let fext_load_trace = fext_load_slot.expect(PHASE5_RAN);
     let fext_fma_trace = fext_fma_slot.expect(PHASE5_RAN);
+    let fext_store_trace = fext_store_slot.expect(PHASE5_RAN);
     let fext_page_trace = fext_page_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
@@ -3804,6 +3898,7 @@ fn build_traces<I: ImageSource + Sync>(
         ecdas: ecdas_trace,
         fext_load: fext_load_trace,
         fext_fma: fext_fma_trace,
+        fext_store: fext_store_trace,
         fext_page: fext_page_trace,
         memw_registers,
         local_to_global,
@@ -4069,6 +4164,7 @@ impl Traces {
         use super::fext_fma::cols::NUM_COLUMNS as FEXT_FMA_COLS;
         use super::fext_load::cols::NUM_COLUMNS as FEXT_LOAD_COLS;
         use super::fext_page::cols::NUM_COLUMNS as FEXT_PAGE_COLS;
+        use super::fext_store::cols::NUM_COLUMNS as FEXT_STORE_COLS;
         use super::halt::cols::NUM_COLUMNS as HALT_COLS;
         use super::keccak::cols::NUM_COLUMNS as KECCAK_COLS;
         use super::keccak_rc::NUM_PRECOMPUTED_COLS as KECCAK_RC_PRECOMPUTED;
@@ -4110,6 +4206,7 @@ impl Traces {
             ecdas,
             fext_load,
             fext_fma,
+            fext_store,
             fext_page,
             memw_registers,
             eqs,
@@ -4180,6 +4277,7 @@ impl Traces {
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total += (fext_load.num_rows() * FEXT_LOAD_COLS) as u64;
         total += (fext_fma.num_rows() * FEXT_FMA_COLS) as u64;
+        total += (fext_store.num_rows() * FEXT_STORE_COLS) as u64;
         total += (fext_page.num_rows() * FEXT_PAGE_COLS) as u64;
         total
     }
@@ -4224,6 +4322,7 @@ impl Traces {
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
         let n_fext_load = aux_cols(super::fext_load::bus_interactions().len());
         let n_fext_fma = aux_cols(super::fext_fma::bus_interactions().len());
+        let n_fext_store = aux_cols(super::fext_store::bus_interactions().len());
         let n_fext_page = aux_cols(super::fext_page::bus_interactions().len());
 
         let Traces {
@@ -4249,6 +4348,7 @@ impl Traces {
             ecdas,
             fext_load,
             fext_fma,
+            fext_store,
             fext_page,
             memw_registers,
             eqs,
@@ -4319,6 +4419,7 @@ impl Traces {
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total += (fext_load.num_rows() * n_fext_load) as u64;
         total += (fext_fma.num_rows() * n_fext_fma) as u64;
+        total += (fext_store.num_rows() * n_fext_store) as u64;
         total += (fext_page.num_rows() * n_fext_page) as u64;
         total
     }
@@ -4545,6 +4646,7 @@ impl Traces {
             ecdas_ops,
             fext_load_ops,
             fext_fma_ops,
+            fext_store_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &mut memory_state,
@@ -4570,6 +4672,7 @@ impl Traces {
             ecdas_ops,
             fext_load_ops,
             fext_fma_ops,
+            fext_store_ops,
             field_state.into_page_ops(),
             &mut register_state,
             is_final,
@@ -4633,6 +4736,7 @@ impl Traces {
             ecdas_ops,
             fext_load_ops,
             fext_fma_ops,
+            fext_store_ops,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &mut memory_state,
@@ -4654,6 +4758,7 @@ impl Traces {
             ecdas_ops,
             fext_load_ops,
             fext_fma_ops,
+            fext_store_ops,
             field_state.into_page_ops(),
             &mut register_state,
             true,

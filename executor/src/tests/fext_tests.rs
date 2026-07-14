@@ -3,7 +3,7 @@
 
 use crate::vm::instruction::decoding::Instruction;
 use crate::vm::instruction::execution::{
-    ExecutionError, FEXT_FMA_SYSCALL_NUMBER, FEXT_LOAD_SYSCALL_NUMBER,
+    ExecutionError, FEXT_FMA_SYSCALL_NUMBER, FEXT_LOAD_SYSCALL_NUMBER, FEXT_STORE_SYSCALL_NUMBER,
 };
 use crate::vm::memory::Memory;
 use crate::vm::registers::Registers;
@@ -87,6 +87,40 @@ fn fext_fma_rejects_overlapping_addresses() {
     }
     // Pairwise-distinct addresses run fine.
     run_fma_result(0x40, 0x10, 0x20, 0x30).expect("distinct addresses must run");
+}
+
+fn run_store(memory: &mut Memory, src_addr: u64) -> [u64; 3] {
+    let mut pc = 0;
+    let mut registers = Registers::default();
+    registers.write(17, FEXT_STORE_SYSCALL_NUMBER).unwrap();
+    registers.write(10, src_addr).unwrap();
+    Instruction::EcallEbreak
+        .run(&mut pc, &mut registers, memory)
+        .unwrap();
+    [
+        registers.read(11).unwrap(),
+        registers.read(12).unwrap(),
+        registers.read(13).unwrap(),
+    ]
+}
+
+#[test]
+fn fext_store_reads_back_loaded_value() {
+    let mut memory = Memory::default();
+    run_load(&mut memory, 0x100, [11, 22, 33]).unwrap();
+    assert_eq!(run_store(&mut memory, 0x100), [11, 22, 33]);
+}
+
+#[test]
+fn fext_store_then_reload_roundtrips_fma() {
+    // LOAD a,b,c → FMA → STORE result back to registers → equals reference.
+    let mut memory = Memory::default();
+    let (a, b, c) = ([1, 2, 3], [4, 5, 6], [7, 8, 9]);
+    run_load(&mut memory, 0x10, a).unwrap();
+    run_load(&mut memory, 0x20, b).unwrap();
+    run_load(&mut memory, 0x30, c).unwrap();
+    run_fma(&mut memory, 0x40, 0x10, 0x20, 0x30);
+    assert_eq!(run_store(&mut memory, 0x40), reference_fma(a, b, c));
 }
 
 #[test]

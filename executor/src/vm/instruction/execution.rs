@@ -23,6 +23,8 @@ pub enum SyscallNumbers {
     FextLoad = 95,
     // Placeholder discriminant. The actual syscall value is FEXT_FMA_SYSCALL_NUMBER.
     FextFma = 96,
+    // Placeholder discriminant. The actual syscall value is FEXT_STORE_SYSCALL_NUMBER.
+    FextStore = 97,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -48,6 +50,11 @@ pub const FEXT_LOAD_SYSCALL_NUMBER: u64 = u64::MAX - 19;
 /// on the `Ecall` bus as `[2^32 - 21, 2^32 - 1]`.
 pub const FEXT_FMA_SYSCALL_NUMBER: u64 = u64::MAX - 20;
 
+/// Syscall number for `FEXT_STORE` (ECALL `-22`): read a degree-3 extension
+/// element from field-storage and write its three coefficients to RAM (the
+/// read-back companion to FEXT_LOAD). Unsigned it is `u64::MAX - 21`.
+pub const FEXT_STORE_SYSCALL_NUMBER: u64 = u64::MAX - 21;
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -64,6 +71,7 @@ impl TryFrom<u64> for SyscallNumbers {
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
             v if v == FEXT_LOAD_SYSCALL_NUMBER => Ok(SyscallNumbers::FextLoad),
             v if v == FEXT_FMA_SYSCALL_NUMBER => Ok(SyscallNumbers::FextFma),
+            v if v == FEXT_STORE_SYSCALL_NUMBER => Ok(SyscallNumbers::FextStore),
             _ => Err(()),
         }
     }
@@ -76,6 +84,7 @@ pub enum Accelerator {
     Ecsm,
     FextLoad,
     FextFma,
+    FextStore,
 }
 
 impl SyscallNumbers {
@@ -88,6 +97,7 @@ impl SyscallNumbers {
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::FextLoad => Some(Accelerator::FextLoad),
             SyscallNumbers::FextFma => Some(Accelerator::FextFma),
+            SyscallNumbers::FextStore => Some(Accelerator::FextStore),
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -544,6 +554,18 @@ impl Instruction {
                         memory.field_store(out_addr, fext_fma(a, b, c));
                         src2_val = a_addr;
                         dst_val = b_addr;
+                    }
+                    SyscallNumbers::FextStore => {
+                        // FEXT_STORE(-22): read a degree-3 extension element from
+                        // field-storage (a0 = source address) and write its three
+                        // coefficients back to registers a1/a2/a3 (the read-back
+                        // companion to FEXT_LOAD, which reads coeffs from a1/a2/a3).
+                        let src_addr = registers.read(10)?;
+                        let coeffs = memory.field_load(src_addr);
+                        registers.write(11, coeffs[0])?;
+                        registers.write(12, coeffs[1])?;
+                        registers.write(13, coeffs[2])?;
+                        src2_val = src_addr;
                     }
                     SyscallNumbers::Halt => {
                         // halt

@@ -375,8 +375,8 @@ fn test_prove_elfs_arith_8() {
 
 /// End-to-end FEXT accelerator test: FEXT_LOAD a/b/c into field-storage, then
 /// FEXT_FMA out = a*b + c over the native degree-3 Goldilocks extension. Proves
-/// and verifies the full VM (exercises the FEXT_LOAD/FEXT_FMA chips + FEXT_PAGE
-/// bookend + their Memory/Alu/Ecall/Memw bus interactions balancing).
+/// and verifies the full VM (exercises the FEXT_LOAD/FEXT_FMA/FEXT_STORE chips +
+/// FEXT_PAGE bookend + their Memory/Alu/Ecall/Memw bus interactions balancing).
 #[test]
 fn test_prove_elfs_fext() {
     let (elf, logs, instructions) = run_asm_elf("test_fext");

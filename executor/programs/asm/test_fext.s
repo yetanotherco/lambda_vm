@@ -35,6 +35,12 @@ main:
 	li	a7, -21
 	ecall
 
+	# FEXT_STORE: read result (addr 4) back into registers a1/a2/a3.
+	# a0 = field-storage source address, a7 = -22.
+	li	a0, 4
+	li	a7, -22
+	ecall
+
 	# Halt.
 	li	a0, 0
 	li	a7, 93

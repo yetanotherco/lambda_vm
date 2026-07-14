@@ -32,6 +32,10 @@ const FEXT_LOAD_SYSCALL_NUMBER: usize = usize::MAX - 19;
 #[cfg(target_arch = "riscv64")]
 const FEXT_FMA_SYSCALL_NUMBER: usize = usize::MAX - 20;
 
+/// Syscall number for the FEXT_STORE accelerator (-22 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_STORE_SYSCALL_NUMBER: usize = usize::MAX - 21;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -209,6 +213,31 @@ pub fn fext_fma(a_addr: u64, b_addr: u64, c_addr: u64, out_addr: u64) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `out = a*b + c` over the native degree-3 Goldilocks extension.
 pub fn fext_fma(_a_addr: u64, _b_addr: u64, _c_addr: u64, _out_addr: u64) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Read the degree-3 extension element at field-storage address `src_addr` and
+/// return its three coefficients (native u64 form) in registers a1/a2/a3. The
+/// read-back companion to [`fext_load`] (which reads coeffs from a1/a2/a3).
+pub fn fext_store(src_addr: u64) -> [u64; 3] {
+    let (c0, c1, c2): (u64, u64, u64);
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") src_addr,   // x10 = field-storage source address
+            out("a1") c0,        // x11 = coefficient 0 (output)
+            out("a2") c1,        // x12 = coefficient 1 (output)
+            out("a3") c2,        // x13 = coefficient 2 (output)
+            in("a7") FEXT_STORE_SYSCALL_NUMBER,
+        )
+    }
+    [c0, c1, c2]
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Read a degree-3 extension element from field-storage into registers.
+pub fn fext_store(_src_addr: u64) -> [u64; 3] {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

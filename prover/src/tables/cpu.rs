@@ -192,6 +192,8 @@ pub struct CpuOperation {
     pub ecall_fext_load: bool,
     /// Whether this ECALL is a FEXT_FMA syscall.
     pub ecall_fext_fma: bool,
+    /// Whether this ECALL is a FEXT_STORE syscall.
+    pub ecall_fext_store: bool,
 }
 
 impl CpuOperation {
@@ -245,6 +247,8 @@ impl CpuOperation {
             && log.src1_val == executor::vm::instruction::execution::FEXT_LOAD_SYSCALL_NUMBER;
         let ecall_fext_fma = f.ecall
             && log.src1_val == executor::vm::instruction::execution::FEXT_FMA_SYSCALL_NUMBER;
+        let ecall_fext_store = f.ecall
+            && log.src1_val == executor::vm::instruction::execution::FEXT_STORE_SYSCALL_NUMBER;
 
         // Word instructions are fully handled by CPU32; the main CPU row is a
         // delegate that only advances the PC and sends the CPU32 lookup. We still
@@ -365,6 +369,7 @@ impl CpuOperation {
             ecall_ecsm,
             ecall_fext_load,
             ecall_fext_fma,
+            ecall_fext_store,
         }
     }
 
