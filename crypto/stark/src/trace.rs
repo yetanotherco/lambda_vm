@@ -45,7 +45,40 @@ where
     /// LDE did not run for this table.
     #[cfg(feature = "cuda")]
     pub(crate) main_trace_dev: Option<ResidentMainTrace>,
+    /// Device-born main trace produced by the on-GPU trace generator, row-major
+    /// `[row*num_main_columns + col]`, `num_rows * num_main_columns` u64s. When
+    /// present, `commit_main_trace` feeds the LDE from this buffer directly
+    /// (device-to-device, no host upload). None on the CPU trace-gen path.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_input_dev: Option<DeviceMainInput>,
 }
+
+/// Device-born main trace (row-major `[row*num_main_columns + col]`) produced by
+/// the on-GPU trace generator, feeding `commit_main_trace` directly. GPU-only and
+/// transient; excluded from logical trace equality and opaque in `Debug`,
+/// matching `ResidentMainTrace`.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct DeviceMainInput {
+    pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+}
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for DeviceMainInput {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceMainInput").finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PartialEq for DeviceMainInput {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for DeviceMainInput {}
 
 /// Device-resident trace-domain main columns (column-major `[col*rows + row]`),
 /// retained from the R1 main LDE for the aux fingerprint kernel. GPU-only and
@@ -105,6 +138,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_input_dev: None,
         }
     }
 
@@ -133,6 +168,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_input_dev: None,
         }
     }
 
@@ -154,6 +191,8 @@ where
             resident_aux_ok: true,
             #[cfg(feature = "cuda")]
             main_trace_dev: None,
+            #[cfg(feature = "cuda")]
+            main_input_dev: None,
         }
     }
 
@@ -211,6 +250,32 @@ where
     #[cfg(feature = "cuda")]
     pub fn clear_main_trace_dev(&mut self) {
         self.main_trace_dev = None;
+    }
+
+    /// Attach a device-born main trace (row-major `[row*num_main_columns + col]`,
+    /// `num_rows * num_main_columns` u64s) from the on-GPU trace generator, so
+    /// `commit_main_trace` feeds the LDE from it directly (no host upload).
+    #[cfg(feature = "cuda")]
+    pub fn set_main_input_dev(&mut self, buf: std::sync::Arc<math_cuda::CudaSlice<u64>>) {
+        self.main_input_dev = Some(DeviceMainInput { buf });
+    }
+
+    /// The device-born main trace buffer, if the on-GPU trace generator produced
+    /// one for this table.
+    #[cfg(feature = "cuda")]
+    pub fn main_input_dev(&self) -> Option<&math_cuda::CudaSlice<u64>> {
+        self.main_input_dev.as_ref().map(|b| b.buf.as_ref())
+    }
+
+    /// Drop the device-born main input buffer. It is only read by `commit_main_trace`
+    /// (the D2D source for the LDE); once the main commit is done nothing else uses
+    /// it, so freeing it after Round-1 Phase A reclaims the main-trace-sized device
+    /// buffers (≈ the whole main trace) before the aux LDE / DEEP / FRI VRAM peak —
+    /// without this the on-GPU trace generator holds them to end-of-proof and large
+    /// blocks (e.g. ethrex 10-tx) OOM where the CPU-trace (stream-and-free) path fits.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_input_dev(&mut self) {
+        self.main_input_dev = None;
     }
 
     pub fn num_steps(&self) -> usize {

@@ -238,6 +238,14 @@ static AUX_FINGERPRINT_US: AtomicU64 = AtomicU64::new(0);
 static AUX_INVERT_US: AtomicU64 = AtomicU64::new(0);
 static AUX_TERM_US: AtomicU64 = AtomicU64::new(0);
 static AUX_ACCUM_US: AtomicU64 = AtomicU64::new(0);
+// GPU trace-generation transfer accounting (the bytes we aim to eliminate).
+// `MAIN_H2D_BYTES` sums every host->device upload of a main-trace matrix in
+// `commit_main_trace`; `MAIN_DEV_BUILDS` counts tables that instead fed the LDE
+// from an already-device-resident buffer (no upload) — 0 until the on-GPU
+// trace generator lands, then the target is "all main tables".
+static MAIN_H2D_BYTES: AtomicU64 = AtomicU64::new(0);
+static MAIN_H2D_CALLS: AtomicU64 = AtomicU64::new(0);
+static MAIN_DEV_BUILDS: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TIMING_DATA: RefCell<Option<MultiProveTiming>> = const { RefCell::new(None) };
@@ -281,6 +289,27 @@ pub fn accum_aux_accumulate(d: Duration) {
     AUX_ACCUM_US.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
 }
 
+/// Record a host->device upload of a main-trace matrix (`bytes`) at the LDE
+/// commit boundary — the transfer the on-GPU trace generator removes.
+pub fn accum_main_h2d(bytes: usize) {
+    MAIN_H2D_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+    MAIN_H2D_CALLS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Record a main table whose LDE input was already device-resident (no upload).
+pub fn accum_main_dev_build() {
+    MAIN_DEV_BUILDS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// `(uploaded_bytes, upload_calls, device_resident_builds)` since the last reset.
+pub fn take_main_transfer() -> (u64, u64, u64) {
+    (
+        MAIN_H2D_BYTES.swap(0, Ordering::Relaxed),
+        MAIN_H2D_CALLS.swap(0, Ordering::Relaxed),
+        MAIN_DEV_BUILDS.swap(0, Ordering::Relaxed),
+    )
+}
+
 pub fn take_r1_sub() -> Round1SubOps {
     Round1SubOps {
         main_lde: Duration::from_micros(R1_MAIN_LDE_US.swap(0, Ordering::Relaxed)),
@@ -311,6 +340,9 @@ pub fn reset_all() {
     AUX_INVERT_US.store(0, Ordering::Relaxed);
     AUX_TERM_US.store(0, Ordering::Relaxed);
     AUX_ACCUM_US.store(0, Ordering::Relaxed);
+    MAIN_H2D_BYTES.store(0, Ordering::Relaxed);
+    MAIN_H2D_CALLS.store(0, Ordering::Relaxed);
+    MAIN_DEV_BUILDS.store(0, Ordering::Relaxed);
     TIMING_DATA.with(|cell| {
         cell.borrow_mut().take();
     });

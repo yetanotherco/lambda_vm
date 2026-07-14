@@ -431,7 +431,15 @@ where
     {
         return None;
     }
-    if trace_len < GPU_LOGUP_MIN_ROWS || main_cols.is_empty() || interactions.is_empty() {
+    // The `trace_len < GPU_LOGUP_MIN_ROWS` decline is a host-side heuristic (small
+    // tables are cheaper on the CPU aux path). It must NOT apply when the main is
+    // device-resident (`main_dev.is_some()`): that table's host trace is a zeroed
+    // placeholder, so a CPU fallback would build the aux from zeros → LogUp bus
+    // imbalance. Device-resident tables always build the aux on-device here.
+    if (trace_len < GPU_LOGUP_MIN_ROWS && main_dev.is_none())
+        || main_cols.is_empty()
+        || interactions.is_empty()
+    {
         return None;
     }
     if std::env::var_os("LAMBDA_VM_NO_GPU_LOGUP").is_some() {

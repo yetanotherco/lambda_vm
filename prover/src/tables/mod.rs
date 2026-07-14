@@ -33,6 +33,8 @@ pub mod ecdas;
 pub mod ecsm;
 pub mod eq;
 pub mod global_memory;
+#[cfg(feature = "cuda")]
+pub mod gpu_trace;
 pub mod halt;
 pub mod keccak;
 pub mod keccak_rc;

@@ -98,6 +98,7 @@ const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
 const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
+const TRACE_CPU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_cpu.ptx"));
 const CONSTRAINT_INTERP_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/constraint_interp.ptx"));
 
@@ -190,6 +191,14 @@ pub struct Backend {
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
 
+    // On-GPU trace generation.
+    pub trace_cpu_fill: CudaFunction,
+    pub memw_aligned_fill: CudaFunction,
+    pub load_fill: CudaFunction,
+    pub store_fill: CudaFunction,
+    pub shift_fill: CudaFunction,
+    pub lt_fill: CudaFunction,
+    pub memw_register_fill: CudaFunction,
     // constraint_interp.ptx
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
@@ -297,6 +306,7 @@ impl Backend {
         let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
+        let trace_cpu = ctx.load_module(Ptx::from_src(TRACE_CPU_PTX))?;
         let constraint_interp = ctx.load_module(Ptx::from_src(CONSTRAINT_INTERP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
@@ -385,6 +395,13 @@ impl Backend {
             logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
             logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
             logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            trace_cpu_fill: trace_cpu.load_function("trace_cpu_fill")?,
+            memw_aligned_fill: trace_cpu.load_function("memw_aligned_fill")?,
+            load_fill: trace_cpu.load_function("load_fill")?,
+            store_fill: trace_cpu.load_function("store_fill")?,
+            shift_fill: trace_cpu.load_function("shift_fill")?,
+            lt_fill: trace_cpu.load_function("lt_fill")?,
+            memw_register_fill: trace_cpu.load_function("memw_register_fill")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp

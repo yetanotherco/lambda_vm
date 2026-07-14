@@ -3187,6 +3187,29 @@ fn build_traces<I: ImageSource + Sync>(
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
     let gen_cpus = || {
+        // On-GPU CPU-table build (cuda, kill-switch off): the matrix is born
+        // resident on device and feeds the LDE with no host upload. Falls back
+        // to the CPU generator otherwise. Disk-spill needs the host matrix to
+        // spill, so it always uses the CPU path.
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_cpu_trace_tables(cpu_ops_ref, max_rows.cpu)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             cpu_ops_ref,
             max_rows.cpu,
@@ -3205,6 +3228,31 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_aligneds = || {
+        // On-GPU MEMW_A build (cuda, kill-switch off): the biggest remaining
+        // uploader (~2M rows on ethrex). Fill columns on device from the walked
+        // ops and leave the matrix resident (only the compact packed ops upload).
+        // Falls back to the CPU fill otherwise (and for disk-spill).
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) = crate::tables::gpu_trace::gpu_build_memw_aligned_tables(
+                    &memw_aligned_ops,
+                    max_rows.memw_aligned,
+                )
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &memw_aligned_ops,
             max_rows.memw_aligned,
@@ -3214,6 +3262,31 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memw_registers = || {
+        // On-GPU MEMW_R build (cuda, kill-switch off): fill the columns on device
+        // from the walked RegRows and leave the matrix resident so it feeds the LDE
+        // with no full-column upload. Falls back to the CPU fill otherwise (and for
+        // disk-spill, which needs the host matrix to spill).
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) = crate::tables::gpu_trace::gpu_build_memw_register_tables(
+                    &memw_register_rows,
+                    max_rows.memw_register,
+                )
+            {
+                return Ok(tables);
+            }
+        }
         // Direct-to-column fill from compact RegRows — the register fast path never
         // materializes a `Vec<MemwOperation>`.
         chunk_and_generate(
@@ -3225,6 +3298,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_loads = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_load_tables(&load_ops, max_rows.load)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &load_ops,
             max_rows.load,
@@ -3234,6 +3326,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_lts = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_lt_tables(&lt_ops, max_rows.lt)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &lt_ops,
             max_rows.lt,
@@ -3243,6 +3354,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_shifts = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_shift_tables(&shift_ops, max_rows.shift)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &shift_ops,
             max_rows.shift,
@@ -3300,6 +3430,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_stores = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_store_tables(&store_ops, max_rows.store)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<store::StoreOperation>(
             &store_ops,
             max_rows.store,

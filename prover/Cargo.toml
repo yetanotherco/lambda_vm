@@ -7,7 +7,7 @@ license.workspace = true
 [features]
 default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
-cuda = ["stark/cuda"]
+cuda = ["stark/cuda", "dep:math-cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
@@ -20,6 +20,7 @@ crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 ecsm = { path = "../crypto/ecsm" }
+math-cuda = { path = "../crypto/math-cuda", optional = true }
 serde = { version = "1.0", features = ["derive"] }
 rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }

@@ -84,12 +84,15 @@ pub fn batch_inverse_ext3_dev(
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
-    // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
-    // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
-    // and leave a tail uninverted. Reachable on LDE size 2^23+ × multi-
-    // eval-point R4. Returning Err lets the dispatcher's Err(_) => None
-    // route the caller to the CPU `inplace_batch_inverse` fallback.
-    if n > u32::MAX as usize / BLOCK_SIZE as usize {
+    // Runtime guard (not debug_assert): `n` must fit in u32 so neither `n as u32`
+    // below nor the kernel's flat index truncates. The block count
+    // `n.div_ceil(BLOCK_SIZE)` is well within CUDA's grid.x bound (2^31-1) for any
+    // such `n` — grid.x is NOT the 65535 cap that applies to grid.y/z, so the old
+    // `u32::MAX / BLOCK_SIZE` bound was 256× too strict and spuriously declined
+    // legitimate launches (e.g. logup batch-invert of 18 interactions × 2^20 rows
+    // = ~18.9M), silently routing to a wrong fallback. Returning Err lets the
+    // dispatcher's Err(_) => None route the caller to the CPU fallback.
+    if n > u32::MAX as usize {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));
@@ -182,10 +185,11 @@ pub fn compute_and_invert_denoms_ext3_dev(
     let total = k_scalars
         .checked_mul(n)
         .expect("compute_and_invert_denoms_ext3_dev: k_scalars * n overflow");
-    // See `batch_inverse_ext3_dev` for the rationale: runtime Err, not
-    // debug_assert, so release builds also route past the silent-truncation
-    // hazard via the caller's CPU fallback.
-    if total > u32::MAX as usize / BLOCK_SIZE as usize {
+    // See `batch_inverse_ext3_dev` for the rationale: guard on `u32::MAX` (the
+    // cast/index bound), NOT `u32::MAX / BLOCK_SIZE` (which is the grid.y/z cap, not
+    // grid.x, and 256× too strict). Runtime Err, not debug_assert, so release
+    // builds route past the truncation hazard via the caller's CPU fallback.
+    if total > u32::MAX as usize {
         return Err(cudarc::driver::DriverError(
             cudarc::driver::sys::CUresult::CUDA_ERROR_INVALID_VALUE,
         ));

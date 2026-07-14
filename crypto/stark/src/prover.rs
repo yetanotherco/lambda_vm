@@ -777,6 +777,46 @@ pub trait IsStarkProver<
         // Fused GPU path (cuda only): row-major NTT — single H2D from the
         // already-row-major trace, no column extraction, no transpose.
         // Falls back to CPU if GPU path returns None.
+        // Device-born main trace (on-GPU trace generator): feed the LDE from the
+        // resident buffer directly — no host upload. Falls through to the host
+        // path if the handle is absent or the GPU path declines.
+        #[cfg(feature = "cuda")]
+        if precomputed.is_none()
+            && let Some(dev) = trace.main_input_dev()
+        {
+            let num_cols = trace.num_main_columns;
+            let n = trace.num_rows();
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            if let Some((tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_leaf_and_tree_row_major_keep_dev::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(
+                    dev,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
+            {
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
+                // No host->device upload happened for this table.
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_main_dev_build();
+                let root = tree.root;
+                return Ok((
+                    TableCommit::plain(tree, root),
+                    (main_data, num_cols),
+                    Some(handle),
+                ));
+            }
+        }
+
+        // Fused GPU host path (cuda only): row-major NTT — single H2D from the
+        // already-row-major trace, no column extraction, no transpose.
         #[cfg(feature = "cuda")]
         if precomputed.is_none() {
             let (trace_slice, num_cols) = trace.main_data_row_major();
@@ -805,6 +845,10 @@ pub trait IsStarkProver<
                 let root = tree.root;
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
+                // This table's main matrix was uploaded host->device for the LDE.
+                // Counts the transfer the on-GPU trace generator will remove.
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_main_h2d(trace_slice.len() * std::mem::size_of::<u64>());
                 return Ok((
                     TableCommit::plain(tree, root),
                     (main_data, num_cols),
@@ -2189,6 +2233,16 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         if let Some(s) = crate::instruments::snap("After main commits") {
             heap_snaps.push(s);
+        }
+
+        // Free the device-born main input buffers now that every main trace is
+        // committed. They are only the D2D source for `commit_main_trace`; the
+        // resident LDE handle (`main_gpu_handles`) carries what R2-4 needs. Holding
+        // them through the aux/DEEP/FRI VRAM peak makes large blocks OOM where the
+        // CPU-trace stream-and-free path fits.
+        #[cfg(feature = "cuda")]
+        for (_, trace, _) in air_trace_pairs.iter_mut() {
+            trace.clear_main_input_dev();
         }
 
         // =====================================================================

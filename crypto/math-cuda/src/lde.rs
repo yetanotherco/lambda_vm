@@ -583,6 +583,40 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     Ok((handle, lde_out))
 }
 
+/// Like [`coset_lde_row_major_with_merkle_tree_keep`] but the input is an
+/// already-resident device buffer (`n * m` base-field elements, row-major
+/// `[row*m + col]`). No PCIe upload: the buffer is copied device-to-device into
+/// the LDE scratch. Used by the on-GPU trace generator so a device-born main
+/// trace feeds the LDE without a host round-trip. Retains the trace-domain
+/// column-major snapshot exactly like the host keep path, so the resident LogUp
+/// aux fingerprint (#762) still works unchanged.
+pub fn coset_lde_row_major_with_merkle_tree_keep_dev(
+    input_dev: &CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
+        InnerInput::Dev(input_dev),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        "coset_lde_row_major_dev lde_size",
+        true,
+    )?;
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((handle, lde_out))
+}
+
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
 ///
 /// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is
