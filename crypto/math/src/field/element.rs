@@ -970,10 +970,44 @@ const _: () = {
 //
 // Restricted to `target_endian = "little"` (the lambda-vm guest target). On a
 // big-endian host these would be wrong, so they simply don't exist there.
+// `IsField` is a public trait, so an arbitrary `F::BaseType: Archive` gives no
+// guarantee that `Archived` shares size/align/layout with the base type —
+// only rkyv's own primitive archived forms (and types built from them) do.
+// `NativeArchived` is sealed to just those, so the views below are only
+// callable for base types this crate has vetted.
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u32 {}
+    impl Sealed for u64 {}
+    impl<F: super::IsField> Sealed for super::FieldElement<F> where F::BaseType: super::NativeArchived {}
+    impl<T: super::NativeArchived, const N: usize> Sealed for [T; N] {}
+}
+
+/// See the module note above: implemented only for base types whose rkyv
+/// `Archived` form is bit-identical to the native type on little-endian
+/// targets (same size, same alignment, same byte layout).
+///
+/// # Safety
+/// Implementors must guarantee `Self` and `Self::Archived` have identical
+/// size and layout, and `Self`'s alignment is at least `Self::Archived`'s,
+/// under `target_endian = "little"`.
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+pub unsafe trait NativeArchived: rkyv::Archive + sealed::Sealed {}
+
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl NativeArchived for u32 {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl NativeArchived for u64 {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl<F: IsField> NativeArchived for FieldElement<F> where F::BaseType: NativeArchived {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl<T: NativeArchived, const N: usize> NativeArchived for [T; N] {}
+
 #[cfg(all(feature = "rkyv", target_endian = "little"))]
 impl<F: IsField> ArchivedFieldElement<F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: NativeArchived,
 {
     /// Reinterpret this archived element as a native [`FieldElement`] (no copy).
     ///

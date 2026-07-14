@@ -27,14 +27,14 @@ pub(crate) fn evals<G: IsField>(
     v: &rkyv::vec::ArchivedVec<ArchivedFieldElement<G>>,
 ) -> &[FieldElement<G>]
 where
-    G::BaseType: rkyv::Archive,
+    G::BaseType: math::field::element::NativeArchived,
 {
     ArchivedFieldElement::slice_as_native(v.as_slice())
 }
 
 pub enum PolynomialOpeningsView<'a, F: IsField>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     Owned(&'a PolynomialOpenings<F>),
     Archived(&'a ArchivedPolynomialOpenings<F>),
@@ -45,17 +45,20 @@ where
 // would add a spurious `F: Clone`/`F: Copy` bound.
 impl<'a, F: IsField> Clone for PolynomialOpeningsView<'a, F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<'a, F: IsField> Copy for PolynomialOpeningsView<'a, F> where F::BaseType: rkyv::Archive {}
+impl<'a, F: IsField> Copy for PolynomialOpeningsView<'a, F> where
+    F::BaseType: math::field::element::NativeArchived
+{
+}
 
 impl<'a, F: IsField> PolynomialOpeningsView<'a, F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     pub fn merkle_path(&self) -> &'a [Commitment] {
         match self {
@@ -81,8 +84,8 @@ where
 
 pub enum DeepPolynomialOpeningView<'a, F: IsSubFieldOf<E>, E: IsField>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
 {
     Owned(&'a DeepPolynomialOpening<F, E>),
     Archived(&'a ArchivedDeepPolynomialOpening<F, E>),
@@ -90,8 +93,8 @@ where
 
 impl<'a, F: IsSubFieldOf<E>, E: IsField> Clone for DeepPolynomialOpeningView<'a, F, E>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
 {
     fn clone(&self) -> Self {
         *self
@@ -99,15 +102,15 @@ where
 }
 impl<'a, F: IsSubFieldOf<E>, E: IsField> Copy for DeepPolynomialOpeningView<'a, F, E>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
 {
 }
 
 impl<'a, F: IsSubFieldOf<E>, E: IsField> DeepPolynomialOpeningView<'a, F, E>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
 {
     pub fn composition_poly(&self) -> PolynomialOpeningsView<'a, E> {
         match self {
@@ -152,7 +155,7 @@ where
 
 pub enum FriDecommitmentView<'a, E: IsField>
 where
-    E::BaseType: rkyv::Archive,
+    E::BaseType: math::field::element::NativeArchived,
 {
     Owned(&'a FriDecommitment<E>),
     Archived(&'a ArchivedFriDecommitment<E>),
@@ -160,17 +163,20 @@ where
 
 impl<'a, E: IsField> Clone for FriDecommitmentView<'a, E>
 where
-    E::BaseType: rkyv::Archive,
+    E::BaseType: math::field::element::NativeArchived,
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<'a, E: IsField> Copy for FriDecommitmentView<'a, E> where E::BaseType: rkyv::Archive {}
+impl<'a, E: IsField> Copy for FriDecommitmentView<'a, E> where
+    E::BaseType: math::field::element::NativeArchived
+{
+}
 
 impl<'a, E: IsField> FriDecommitmentView<'a, E>
 where
-    E::BaseType: rkyv::Archive,
+    E::BaseType: math::field::element::NativeArchived,
 {
     pub fn layers_auth_paths_len(&self) -> usize {
         match self {
@@ -196,7 +202,7 @@ where
 
 pub enum StarkTableView<'a, F: IsField>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     Owned(&'a Table<F>),
     Archived(&'a ArchivedTable<F>),
@@ -204,17 +210,20 @@ where
 
 impl<'a, F: IsField> Clone for StarkTableView<'a, F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl<'a, F: IsField> Copy for StarkTableView<'a, F> where F::BaseType: rkyv::Archive {}
+impl<'a, F: IsField> Copy for StarkTableView<'a, F> where
+    F::BaseType: math::field::element::NativeArchived
+{
+}
 
 impl<'a, F: IsField> StarkTableView<'a, F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     pub fn width(&self) -> usize {
         match self {
@@ -269,8 +278,8 @@ where
 
 pub enum StarkProofView<'a, F: IsSubFieldOf<E>, E: IsField, PI>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
@@ -280,8 +289,8 @@ where
 
 impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Clone for StarkProofView<'a, F, E, PI>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
@@ -291,8 +300,8 @@ where
 }
 impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Copy for StarkProofView<'a, F, E, PI>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
@@ -300,8 +309,8 @@ where
 
 impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> StarkProofView<'a, F, E, PI>
 where
-    F::BaseType: rkyv::Archive,
-    E::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {

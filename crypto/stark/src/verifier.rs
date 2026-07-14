@@ -49,8 +49,8 @@ impl<
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 where
-    Field::BaseType: rkyv::Archive,
-    FieldExtension::BaseType: rkyv::Archive,
+    Field::BaseType: math::field::element::NativeArchived,
+    FieldExtension::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive + Clone,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
@@ -104,8 +104,8 @@ pub trait IsStarkVerifier<
     FieldExtension: Send + Sync + IsField,
     PI,
 > where
-    Field::BaseType: rkyv::Archive,
-    FieldExtension::BaseType: rkyv::Archive,
+    Field::BaseType: math::field::element::NativeArchived,
+    FieldExtension::BaseType: math::field::element::NativeArchived,
     PI: rkyv::Archive + Clone,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
@@ -410,7 +410,7 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<E>: AsBytes + Sync + Send,
         E: IsField,
-        E::BaseType: rkyv::Archive,
+        E::BaseType: math::field::element::NativeArchived,
         Field: IsSubFieldOf<E>,
     {
         let mut value = opening.evaluations().to_vec();

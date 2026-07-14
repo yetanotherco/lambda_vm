@@ -200,7 +200,7 @@ pub use archived_table::ArchivedTable;
 #[cfg(target_endian = "little")]
 impl<F: IsField> ArchivedTable<F>
 where
-    F::BaseType: rkyv::Archive,
+    F::BaseType: math::field::element::NativeArchived,
 {
     #[inline]
     pub fn width(&self) -> usize {
