@@ -3219,6 +3219,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_memws = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_memw_tables(&memw_ops, max_rows.memw)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &memw_ops,
             max_rows.memw,
@@ -3382,6 +3401,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_muls = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_mul_tables(&mul_ops, max_rows.mul)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &mul_ops,
             max_rows.mul,
@@ -3391,6 +3429,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_dvrms = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_dvrm_tables(&dvrm_ops, max_rows.dvrm)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &dvrm_ops,
             max_rows.dvrm,
@@ -3400,6 +3457,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_branches = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_branch_tables(&branch_ops, max_rows.branch)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate(
             &branch_ops,
             max_rows.branch,
@@ -3412,6 +3488,25 @@ fn build_traces<I: ImageSource + Sync>(
     // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
     // contributes nothing to any bus.
     let gen_eqs = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_eq_tables(&eq_ops, max_rows.eq)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<eq::EqOperation>(
             &eq_ops,
             max_rows.eq,
@@ -3421,6 +3516,27 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_bytewises = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) = crate::tables::gpu_trace::gpu_build_bytewise_tables(
+                    &bytewise_ops,
+                    max_rows.bytewise,
+                )
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<bytewise::BytewiseOperation>(
             &bytewise_ops,
             max_rows.bytewise,
@@ -3458,6 +3574,25 @@ fn build_traces<I: ImageSource + Sync>(
         )
     };
     let gen_cpu32s = || {
+        #[cfg(feature = "cuda")]
+        {
+            let use_gpu = {
+                #[cfg(feature = "disk-spill")]
+                {
+                    storage_mode != StorageMode::Disk
+                }
+                #[cfg(not(feature = "disk-spill"))]
+                {
+                    true
+                }
+            };
+            if use_gpu
+                && let Some(tables) =
+                    crate::tables::gpu_trace::gpu_build_cpu32_tables(&cpu32_ops, max_rows.cpu32)
+            {
+                return Ok(tables);
+            }
+        }
         chunk_and_generate::<cpu32::Cpu32Operation>(
             &cpu32_ops,
             max_rows.cpu32,

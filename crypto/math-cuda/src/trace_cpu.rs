@@ -152,6 +152,34 @@ pub const SHIFT_STRIDE: usize = 3;
 /// host-deduplicated: one unique op + summed multiplicity per row.
 pub const LT_NCOLS: usize = 17;
 pub const LT_STRIDE: usize = 4;
+/// EQ table width / packed input stride (must match `eq_fill`). Like LT, input is
+/// host-deduplicated: one unique op + summed multiplicity per row.
+pub const EQ_NCOLS: usize = 12;
+pub const EQ_STRIDE: usize = 4;
+/// BYTEWISE table width / packed input stride (must match `bytewise_fill`). Like
+/// LT, input is host-deduplicated: one unique op + summed multiplicity per row.
+pub const BYTEWISE_NCOLS: usize = 26;
+pub const BYTEWISE_STRIDE: usize = 4;
+/// MUL table width / packed input stride (must match `mul_fill`). Input is
+/// host-deduplicated: one unique op + split (mu_lo, mu_hi) multiplicities per row.
+pub const MUL_NCOLS: usize = 26;
+pub const MUL_STRIDE: usize = 5;
+/// DVRM table width / packed input stride (must match `dvrm_fill`). Input is
+/// host-deduplicated: one unique op + split (mu_q, mu_r) multiplicities per row.
+pub const DVRM_NCOLS: usize = 34;
+pub const DVRM_STRIDE: usize = 5;
+/// BRANCH table width / packed input stride (must match `branch_fill`). Input is
+/// host-deduplicated: one unique op + summed multiplicity per row.
+pub const BRANCH_NCOLS: usize = 14;
+pub const BRANCH_STRIDE: usize = 5;
+/// CPU32 table width / packed input stride (must match `cpu32_fill`). Per-row
+/// (μ=1, no dedup): one op per row.
+pub const CPU32_NCOLS: usize = 38;
+pub const CPU32_STRIDE: usize = 8;
+/// MEMW (general/unaligned) table width / packed input stride (must match
+/// `memw_fill`). Per-row (no dedup): one walked op per row.
+pub const MEMW_NCOLS: usize = 49;
+pub const MEMW_STRIDE: usize = 19;
 
 /// Shared interleaved fill on `stream`: upload `packed` (n × stride u64) and run
 /// `kernel(ops, n, num_rows, out)` into a zeroed row-major buffer. Returns the
@@ -197,6 +225,27 @@ fn shift_kernel(be: &Backend) -> &CudaFunction {
 fn lt_kernel(be: &Backend) -> &CudaFunction {
     &be.lt_fill
 }
+fn eq_kernel(be: &Backend) -> &CudaFunction {
+    &be.eq_fill
+}
+fn bytewise_kernel(be: &Backend) -> &CudaFunction {
+    &be.bytewise_fill
+}
+fn mul_kernel(be: &Backend) -> &CudaFunction {
+    &be.mul_fill
+}
+fn dvrm_kernel(be: &Backend) -> &CudaFunction {
+    &be.dvrm_fill
+}
+fn branch_kernel(be: &Backend) -> &CudaFunction {
+    &be.branch_fill
+}
+fn cpu32_kernel(be: &Backend) -> &CudaFunction {
+    &be.cpu32_fill
+}
+fn memw_kernel(be: &Backend) -> &CudaFunction {
+    &be.memw_fill
+}
 
 /// Build one LT trace-table chunk on device from HOST-DEDUPLICATED ops (one unique
 /// op + summed multiplicity per row; see `lt_fill` in `trace_cpu.cu`).
@@ -228,6 +277,302 @@ pub fn gpu_build_lt_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) ->
         num_rows,
         LT_NCOLS,
         LT_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one EQ trace-table chunk on device from HOST-DEDUPLICATED ops (one unique
+/// op + summed multiplicity per row; see `eq_fill` in `trace_cpu.cu`).
+pub fn gpu_build_eq_trace(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        eq_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        EQ_NCOLS,
+        EQ_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning EQ build for multiset-equality tests.
+pub fn gpu_build_eq_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        eq_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        EQ_NCOLS,
+        EQ_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one BYTEWISE trace-table chunk on device from HOST-DEDUPLICATED ops (one
+/// unique op + summed multiplicity per row; see `bytewise_fill` in `trace_cpu.cu`).
+pub fn gpu_build_bytewise_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        bytewise_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BYTEWISE_NCOLS,
+        BYTEWISE_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning BYTEWISE build for multiset-equality tests.
+pub fn gpu_build_bytewise_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        bytewise_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BYTEWISE_NCOLS,
+        BYTEWISE_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one MUL trace-table chunk on device from HOST-DEDUPLICATED ops (one unique
+/// op + split mu_lo/mu_hi multiplicities per row; see `mul_fill` in `trace_cpu.cu`).
+pub fn gpu_build_mul_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        mul_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MUL_NCOLS,
+        MUL_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning MUL build for multiset-equality tests.
+pub fn gpu_build_mul_trace_host(packed_ops: &[u64], n: usize, num_rows: usize) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        mul_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MUL_NCOLS,
+        MUL_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one DVRM trace-table chunk on device from HOST-DEDUPLICATED ops (one unique
+/// op + split mu_q/mu_r multiplicities per row; see `dvrm_fill` in `trace_cpu.cu`).
+pub fn gpu_build_dvrm_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        dvrm_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        DVRM_NCOLS,
+        DVRM_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning DVRM build for multiset-equality tests.
+pub fn gpu_build_dvrm_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        dvrm_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        DVRM_NCOLS,
+        DVRM_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one BRANCH trace-table chunk on device from HOST-DEDUPLICATED ops (one
+/// unique op + summed multiplicity per row; see `branch_fill` in `trace_cpu.cu`).
+pub fn gpu_build_branch_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        branch_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BRANCH_NCOLS,
+        BRANCH_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning BRANCH build for multiset-equality tests.
+pub fn gpu_build_branch_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        branch_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        BRANCH_NCOLS,
+        BRANCH_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one CPU32 trace-table chunk on device (per-row `*W` fill; see `cpu32_fill`
+/// in `trace_cpu.cu`).
+pub fn gpu_build_cpu32_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        cpu32_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        CPU32_NCOLS,
+        CPU32_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning CPU32 build for byte-parity tests.
+pub fn gpu_build_cpu32_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        cpu32_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        CPU32_NCOLS,
+        CPU32_STRIDE,
+    )?;
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Build one MEMW (general/unaligned) trace-table chunk on device from walked ops
+/// (see `memw_fill` in `trace_cpu.cu`).
+pub fn gpu_build_memw_trace(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        memw_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MEMW_NCOLS,
+        MEMW_STRIDE,
+    )?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
+/// Host-returning MEMW (general) build for byte-parity tests.
+pub fn gpu_build_memw_trace_host(
+    packed_ops: &[u64],
+    n: usize,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let out = build_interleaved_on(
+        &stream,
+        memw_kernel(be),
+        packed_ops,
+        n,
+        num_rows,
+        MEMW_NCOLS,
+        MEMW_STRIDE,
     )?;
     let host = stream.clone_dtoh(&out)?;
     stream.synchronize()?;

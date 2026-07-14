@@ -9,7 +9,10 @@ use std::collections::HashMap;
 
 use crate::tables::cpu::CpuOperation;
 use crate::tables::memw::MemwOperation;
-use crate::tables::{cpu, load, lt, memw_aligned, memw_register, shift, store};
+use crate::tables::{
+    branch, bytewise, cpu, cpu32, dvrm, eq, load, lt, memw, memw_aligned, memw_register, mul,
+    shift, store,
+};
 
 /// CPU-table device fill must be byte-identical to `cpu::generate_cpu_trace`.
 /// The CPU kernel is the most intricate of the seven (word-delegate column
@@ -461,5 +464,541 @@ fn gpu_lt_fill_matches_cpu_multiset() {
         real_rows(&gpu_u64),
         real_rows(&cpu_u64),
         "device LT rows must match the CPU fill as a multiset"
+    );
+}
+
+/// EQ device fill: like LT, dedup rides the permutation-invariant ALU bus, so
+/// the row ORDER is non-deterministic (HashMap iteration). Validate as a
+/// MULTISET — the real rows (μ>0), incl. summed multiplicities, must match the
+/// CPU `generate_eq_trace`. Covers a==b and a!=b, invert, high words, and
+/// duplicates (μ>1). Skips cleanly with no GPU.
+#[test]
+fn gpu_eq_fill_matches_cpu_multiset() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_eq_fill_matches_cpu_multiset: no CUDA backend");
+        return;
+    }
+    // Raw ops with equal/unequal operands, high words, and deliberate duplicates.
+    let mut raw = Vec::new();
+    for i in 0..800u64 {
+        let a = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+        // Every 5th op has a == b to exercise the eq=1 path.
+        let b = if i % 5 == 0 {
+            a
+        } else {
+            i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(11)
+        };
+        let invert = i % 3 == 0;
+        let op = eq::EqOperation::new(a, b, invert);
+        raw.push(op.clone());
+        if i % 4 == 0 {
+            raw.push(op); // duplicate → multiplicity 2
+        }
+    }
+
+    let ncols = math_cuda::trace_cpu::EQ_NCOLS;
+    // Extract the real (μ>0) rows of a row-major u64 buffer as a sorted multiset.
+    let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+        let mut rows: Vec<Vec<u64>> = flat
+            .chunks(ncols)
+            .filter(|row| row[eq::cols::MU] > 0)
+            .map(|row| row.to_vec())
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let cpu_table = eq::generate_eq_trace(&raw);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, ncols);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    // Dedup on the host exactly like `gpu_build_eq_tables`, then device-fill.
+    let mut map: std::collections::HashMap<eq::EqOperation, u64> = HashMap::new();
+    for op in &raw {
+        *map.entry(op.clone()).or_insert(0) += 1;
+    }
+    let unique: Vec<(eq::EqOperation, u64)> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::EQ_STRIDE);
+    for (op, mult) in &unique {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_eq_op(op, *mult));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_eq_trace_host(&packed, n, num_rows)
+        .expect("device EQ build must run on a box with a CUDA backend");
+
+    assert_eq!(
+        real_rows(&gpu_u64),
+        real_rows(&cpu_u64),
+        "device EQ rows must match the CPU fill as a multiset"
+    );
+}
+
+/// BYTEWISE device fill: like LT/EQ, dedup rides the permutation-invariant ALU
+/// bus, so the row ORDER is non-deterministic. Validate as a MULTISET — the real
+/// rows (μ>0), incl. summed multiplicities, must match `generate_bytewise_trace`.
+/// Covers AND/OR/XOR, full 64-bit operands, and duplicates (μ>1). Skips cleanly
+/// with no GPU.
+#[test]
+fn gpu_bytewise_fill_matches_cpu_multiset() {
+    use crate::tables::types::alu_op;
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_bytewise_fill_matches_cpu_multiset: no CUDA backend");
+        return;
+    }
+    // Raw ops cycling AND/OR/XOR, full-word operands, with deliberate duplicates.
+    let mut raw = Vec::new();
+    for i in 0..900u64 {
+        let a = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 33);
+        let b = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(19);
+        let op = [alu_op::AND, alu_op::OR, alu_op::XOR][(i % 3) as usize];
+        let bw = bytewise::BytewiseOperation::new(a, b, op);
+        raw.push(bw.clone());
+        if i % 4 == 0 {
+            raw.push(bw); // duplicate → multiplicity 2
+        }
+    }
+
+    let ncols = math_cuda::trace_cpu::BYTEWISE_NCOLS;
+    // Extract the real (μ>0) rows of a row-major u64 buffer as a sorted multiset.
+    let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+        let mut rows: Vec<Vec<u64>> = flat
+            .chunks(ncols)
+            .filter(|row| row[bytewise::cols::MU] > 0)
+            .map(|row| row.to_vec())
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let cpu_table = bytewise::generate_bytewise_trace(&raw);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, ncols);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    // Dedup on the host exactly like `gpu_build_bytewise_tables`, then device-fill.
+    let mut map: std::collections::HashMap<bytewise::BytewiseOperation, u64> = HashMap::new();
+    for op in &raw {
+        *map.entry(op.clone()).or_insert(0) += 1;
+    }
+    let unique: Vec<(bytewise::BytewiseOperation, u64)> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::BYTEWISE_STRIDE);
+    for (op, mult) in &unique {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_bytewise_op(op, *mult));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_bytewise_trace_host(&packed, n, num_rows)
+        .expect("device BYTEWISE build must run on a box with a CUDA backend");
+
+    assert_eq!(
+        real_rows(&gpu_u64),
+        real_rows(&cpu_u64),
+        "device BYTEWISE rows must match the CPU fill as a multiset"
+    );
+}
+
+/// MUL device fill: like the other ALU tables, dedup rides the
+/// permutation-invariant ALU bus, so the row ORDER is non-deterministic.
+/// Validate as a MULTISET — the real rows (mu_lo>0 or mu_hi>0), incl. the split
+/// multiplicities, must match `generate_mul_trace`. Covers all four
+/// signed/unsigned combos, negative operands, the 128-bit product + raw_product
+/// convolution, and lo/hi (wants_hi) requests with duplicates. Skips cleanly
+/// with no GPU.
+#[test]
+fn gpu_mul_fill_matches_cpu_multiset() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_mul_fill_matches_cpu_multiset: no CUDA backend");
+        return;
+    }
+    // Raw (op, wants_hi) pairs: varied operands, all sign combos, both lo and hi
+    // requests, with deliberate duplicates so mu_lo/mu_hi accumulate.
+    let mut raw = Vec::new();
+    for i in 0..800u64 {
+        let lhs = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+        let rhs = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(23);
+        let lhs_signed = i % 2 == 0;
+        let rhs_signed = i % 3 == 0;
+        let op = mul::MulOperation::new(lhs, lhs_signed, rhs, rhs_signed);
+        raw.push((op.clone(), i % 2 == 0));
+        if i % 3 == 0 {
+            raw.push((op.clone(), true)); // extra hi request
+        }
+        if i % 5 == 0 {
+            raw.push((op, false)); // extra lo request (duplicate)
+        }
+    }
+    // Explicit sign edge cases: i64::MIN, -1, treated signed and unsigned.
+    for &(a, b) in &[
+        (0x8000_0000_0000_0000u64, 0xFFFF_FFFF_FFFF_FFFFu64),
+        (0xFFFF_FFFF_FFFF_FFFFu64, 0x8000_0000_0000_0000u64),
+    ] {
+        raw.push((mul::MulOperation::new(a, true, b, true), false));
+        raw.push((mul::MulOperation::new(a, false, b, false), true));
+    }
+
+    let ncols = math_cuda::trace_cpu::MUL_NCOLS;
+    // Real rows: mu_lo>0 or mu_hi>0.
+    let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+        let mut rows: Vec<Vec<u64>> = flat
+            .chunks(ncols)
+            .filter(|row| row[mul::cols::MU_LO] > 0 || row[mul::cols::MU_HI] > 0)
+            .map(|row| row.to_vec())
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let cpu_table = mul::generate_mul_trace(&raw);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, ncols);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    // Dedup on the host exactly like `gpu_build_mul_tables`, then device-fill.
+    let mut map: std::collections::HashMap<mul::MulOperation, (u64, u64)> = HashMap::new();
+    for (op, wants_hi) in &raw {
+        let e = map.entry(op.clone()).or_insert((0, 0));
+        if *wants_hi {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+    let unique: Vec<(mul::MulOperation, (u64, u64))> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MUL_STRIDE);
+    for (op, (mu_lo, mu_hi)) in &unique {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_mul_op(op, *mu_lo, *mu_hi));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_mul_trace_host(&packed, n, num_rows)
+        .expect("device MUL build must run on a box with a CUDA backend");
+
+    assert_eq!(
+        real_rows(&gpu_u64),
+        real_rows(&cpu_u64),
+        "device MUL rows must match the CPU fill as a multiset"
+    );
+}
+
+/// DVRM device fill: like the other ALU tables, dedup rides the
+/// permutation-invariant ALU bus, so the row ORDER is non-deterministic.
+/// Validate as a MULTISET — the real rows (mu_q>0 or mu_r>0), incl. the split
+/// multiplicities, must match `generate_dvrm_trace`. Covers signed/unsigned,
+/// division-by-zero, the MIN/-1 signed overflow, negative operands, and
+/// quotient/remainder (wants_remainder) requests with duplicates. Skips cleanly
+/// with no GPU.
+#[test]
+fn gpu_dvrm_fill_matches_cpu_multiset() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_dvrm_fill_matches_cpu_multiset: no CUDA backend");
+        return;
+    }
+    // Raw (op, wants_remainder) pairs: varied operands (incl. periodic d==0),
+    // both signednesses, q and r requests, with deliberate duplicates.
+    let mut raw = Vec::new();
+    for i in 0..800u64 {
+        let n = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ (i << 40);
+        let d = if i % 11 == 0 {
+            0
+        } else {
+            i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(29)
+        };
+        let signed = i % 2 == 0;
+        let op = dvrm::DvrmOperation::new(n, d, signed);
+        raw.push((op.clone(), i % 2 == 0));
+        if i % 3 == 0 {
+            raw.push((op.clone(), true)); // extra remainder request
+        }
+        if i % 5 == 0 {
+            raw.push((op, false)); // extra quotient request (duplicate)
+        }
+    }
+    // Explicit edge cases: signed overflow (MIN/-1), div-by-zero, MIN numerator,
+    // -1 denominator.
+    let min = 0x8000_0000_0000_0000u64;
+    let neg1 = 0xFFFF_FFFF_FFFF_FFFFu64;
+    for &(n, d, s) in &[
+        (min, neg1, true),     // signed overflow
+        (min, neg1, false),    // unsigned: /(2^64-1), no overflow
+        (123u64, 0u64, true),  // div-by-zero, signed
+        (123u64, 0u64, false), // div-by-zero, unsigned
+        (min, 7u64, true),     // negative numerator
+        (100u64, neg1, true),  // negative denominator (n != MIN)
+    ] {
+        raw.push((dvrm::DvrmOperation::new(n, d, s), false));
+        raw.push((dvrm::DvrmOperation::new(n, d, s), true));
+    }
+
+    let ncols = math_cuda::trace_cpu::DVRM_NCOLS;
+    // Real rows: mu_q>0 or mu_r>0.
+    let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+        let mut rows: Vec<Vec<u64>> = flat
+            .chunks(ncols)
+            .filter(|row| row[dvrm::cols::MU_Q] > 0 || row[dvrm::cols::MU_R] > 0)
+            .map(|row| row.to_vec())
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let cpu_table = dvrm::generate_dvrm_trace(&raw);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, ncols);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    // Dedup on the host exactly like `gpu_build_dvrm_tables`, then device-fill.
+    let mut map: std::collections::HashMap<dvrm::DvrmOperation, (u64, u64)> = HashMap::new();
+    for (op, wants_remainder) in &raw {
+        let e = map.entry(op.clone()).or_insert((0, 0));
+        if *wants_remainder {
+            e.1 += 1;
+        } else {
+            e.0 += 1;
+        }
+    }
+    let unique: Vec<(dvrm::DvrmOperation, (u64, u64))> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::DVRM_STRIDE);
+    for (op, (mu_q, mu_r)) in &unique {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_dvrm_op(op, *mu_q, *mu_r));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_dvrm_trace_host(&packed, n, num_rows)
+        .expect("device DVRM build must run on a box with a CUDA backend");
+
+    assert_eq!(
+        real_rows(&gpu_u64),
+        real_rows(&cpu_u64),
+        "device DVRM rows must match the CPU fill as a multiset"
+    );
+}
+
+/// BRANCH device fill: a permutation-invariant lookup table (dedup + summed
+/// multiplicity), so the row ORDER is non-deterministic. Validate as a MULTISET
+/// — the real rows (μ>0) must match `generate_branch_trace`. Covers JALR (base =
+/// register) vs PC-relative, wrapping add, odd offsets (so LSB masking differs
+/// from the unmasked low byte), high address bits, and duplicates (μ>1). Skips
+/// cleanly with no GPU.
+#[test]
+fn gpu_branch_fill_matches_cpu_multiset() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_branch_fill_matches_cpu_multiset: no CUDA backend");
+        return;
+    }
+    let mut raw = Vec::new();
+    for i in 0..800u64 {
+        let pc = 0x1000u64.wrapping_add(i.wrapping_mul(4)) ^ (i << 34);
+        // Odd offsets so `next_pc` (LSB masked) differs from the unmasked low
+        // byte; high bits set to exercise the wrapping add.
+        let offset = i.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let register = i.wrapping_mul(0x1234_5678_9ABC_DEF1).rotate_left(7);
+        let jalr = i % 2 == 0;
+        let op = branch::BranchOperation::new(pc, offset, register, jalr);
+        raw.push(op.clone());
+        if i % 4 == 0 {
+            raw.push(op); // duplicate → μ=2
+        }
+    }
+
+    let ncols = math_cuda::trace_cpu::BRANCH_NCOLS;
+    let real_rows = |flat: &[u64]| -> Vec<Vec<u64>> {
+        let mut rows: Vec<Vec<u64>> = flat
+            .chunks(ncols)
+            .filter(|row| row[branch::cols::MU] > 0)
+            .map(|row| row.to_vec())
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let cpu_table = branch::generate_branch_trace(&raw);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, ncols);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    // Dedup on the host exactly like `gpu_build_branch_tables`, then device-fill.
+    let mut map: std::collections::HashMap<branch::BranchOperation, u64> = HashMap::new();
+    for op in &raw {
+        *map.entry(op.clone()).or_insert(0) += 1;
+    }
+    let unique: Vec<(branch::BranchOperation, u64)> = map.into_iter().collect();
+    let n = unique.len();
+    let num_rows = n.next_power_of_two().max(4);
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::BRANCH_STRIDE);
+    for (op, mult) in &unique {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_branch_op(op, *mult));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_branch_trace_host(&packed, n, num_rows)
+        .expect("device BRANCH build must run on a box with a CUDA backend");
+
+    assert_eq!(
+        real_rows(&gpu_u64),
+        real_rows(&cpu_u64),
+        "device BRANCH rows must match the CPU fill as a multiset"
+    );
+}
+
+/// CPU32 device fill must be byte-identical to `cpu32::generate_cpu32_trace`.
+/// Per-row (μ=1, no dedup), so full byte parity holds. Covers signed/unsigned
+/// (alu_flags bit 5), negative rv1/rv2/res (sign-extension into arg1/arg2/rvd),
+/// imm-vs-rv2 operands, flag/register combinations, high words, and padding
+/// (n=300 < 512). Skips cleanly with no GPU.
+#[test]
+fn gpu_cpu32_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_cpu32_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let mut ops = Vec::new();
+    for i in 0..300u64 {
+        let signed = i % 2 == 0;
+        // alu_flags: bit 5 = signed; low bits carry a varied opcode.
+        let alu_flags = ((i % 20) as u8) | if signed { 1 << 5 } else { 0 };
+        // Alternate imm-driven vs rv2-driven arg2 (decode assumption: one nonzero).
+        let use_imm = i % 3 == 0;
+        let rv2 = if use_imm {
+            0
+        } else {
+            i.wrapping_mul(0xDEAD_BEEF).rotate_left(9)
+        };
+        let imm = if use_imm {
+            i.wrapping_mul(0x9E37_79B9) | (i << 40)
+        } else {
+            0
+        };
+        ops.push(cpu32::Cpu32Operation {
+            timestamp: 4 * i + 8 + (i << 34),
+            pc: 0x1000 + i * 4 + ((i % 3) << 33),
+            rs1: (i % 32) as u8,
+            read_register1: i % 3 != 0,
+            rv1: i.wrapping_mul(0x1234_5678_9ABC) ^ (i << 31), // exercise bit 31
+            rs2: ((i + 5) % 32) as u8,
+            read_register2: !use_imm,
+            rv2,
+            imm,
+            res: i.wrapping_mul(0xABCD_1234) ^ (i << 31),
+            rd: ((i + 7) % 32) as u8,
+            write_register: i % 4 != 0,
+            alu: i % 5 != 0,
+            alu_flags,
+            add: i % 5 == 1,
+            sub: i % 5 == 2,
+            half_instruction_length: if i % 2 == 0 { 1 } else { 2 },
+        });
+    }
+    let n = ops.len();
+    let num_rows = n.next_power_of_two().max(4);
+
+    let cpu_table = cpu32::generate_cpu32_trace(&ops);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, math_cuda::trace_cpu::CPU32_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::CPU32_STRIDE);
+    for op in &ops {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_cpu32_op(op));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_cpu32_trace_host(&packed, n, num_rows)
+        .expect("device CPU32 build must run on a box with a CUDA backend");
+
+    assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::CPU32_NCOLS);
+    assert_eq!(
+        gpu_u64, cpu_u64,
+        "device CPU32 table must be byte-identical to the CPU fill"
+    );
+}
+
+/// MEMW (general/unaligned) device fill must be byte-identical to
+/// `memw::generate_memw_trace`. Per-row (no dedup). Covers memory and register
+/// accesses, widths 1/2/4/8, read/write, base addresses that straddle the 2^32
+/// boundary (so `carry[i]` fires), distinct per-byte old_timestamps (the
+/// split-timestamp path), and full-u32 value/old limbs (exercises both halves of
+/// the 2×u32/u64 packing). Skips cleanly with no GPU.
+#[test]
+fn gpu_memw_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_memw_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let mut ops = Vec::new();
+    for i in 0..400u64 {
+        let width = [1u8, 2, 4, 8][(i % 4) as usize];
+        let is_read = i % 2 == 0;
+        let is_register = i % 7 == 0;
+        // Low word near 2^32 so `base_lo + (i+1)` overflows for some rows.
+        let base = (0x1_0000_0000u64 * (i % 3)) + (0xFFFF_FFF8u64 - (i % 16)) + i;
+        let value = [
+            (i as u32).wrapping_mul(2_654_435_761),
+            (i as u32) ^ 0xABCD_1234,
+            i as u32,
+            0xDEAD_0000 | (i as u32 & 0xFFFF),
+            7,
+            0,
+            (i as u32).wrapping_add(99),
+            (i as u32) & 0xFF,
+        ];
+        let old = [
+            (i as u32).wrapping_add(3),
+            (i as u32).wrapping_mul(17),
+            0,
+            (i as u32) ^ 0x0BAD_F00D,
+            (i as u32).wrapping_add(5),
+            (i as u32).wrapping_mul(23),
+            0,
+            (i as u32).wrapping_add(7),
+        ];
+        let ts = 4 * i + 100;
+        // Distinct per-byte old_timestamps (the unaligned split-timestamp path).
+        let mut old_ts = [0u64; 8];
+        for (j, o) in old_ts.iter_mut().enumerate() {
+            *o = (4 * i + 3 + j as u64) ^ ((j as u64) << 33);
+        }
+        ops.push(
+            memw::MemwOperation::new(is_register, base, value, ts, width, is_read)
+                .with_old(old, old_ts),
+        );
+    }
+    let n = ops.len();
+    let num_rows = n.next_power_of_two().max(4);
+
+    let cpu_table = memw::generate_memw_trace(&ops);
+    let (cpu_fe, w) = cpu_table.main_data_row_major();
+    assert_eq!(w, math_cuda::trace_cpu::MEMW_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut packed = Vec::with_capacity(n * math_cuda::trace_cpu::MEMW_STRIDE);
+    for op in &ops {
+        packed.extend_from_slice(&crate::tables::gpu_trace::pack_memw_op(op));
+    }
+    let gpu_u64 = math_cuda::trace_cpu::gpu_build_memw_trace_host(&packed, n, num_rows)
+        .expect("device MEMW build must run on a box with a CUDA backend");
+
+    assert_eq!(gpu_u64.len(), num_rows * math_cuda::trace_cpu::MEMW_NCOLS);
+    assert_eq!(
+        gpu_u64, cpu_u64,
+        "device MEMW table must be byte-identical to the CPU fill"
     );
 }

@@ -617,6 +617,75 @@ pub fn coset_lde_row_major_with_merkle_tree_keep_dev(
     Ok((handle, lde_out))
 }
 
+/// Row-major coset LDE ONLY — no Merkle, no column-major transpose. Returns the
+/// row-major LDE `[row*total_cols + col]` (`lde_size * total_cols` u64s), i.e. the
+/// exact buffer the CPU `Polynomial::coset_lde_full_expand_row_major` produces.
+///
+/// Used by the **preprocessed-table** commit path: those tables commit two *subset*
+/// Merkle trees (static columns + multiplicity columns) that the device
+/// full-column Merkle cannot represent, so the Merkle stays on the host — but the
+/// LDE (the dominant cost) still runs on GPU. Same LDE math as
+/// [`coset_lde_row_major_inner`] (single H2D → iNTT → coset → NTT → single D2H),
+/// only the commit/transpose steps are dropped.
+pub fn coset_lde_row_major_no_merkle(
+    row_major: &[u64],
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<Vec<u64>> {
+    assert_eq!(row_major.len(), n * total_cols);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_no_merkle lde_size");
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = total_cols as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // Zero-padded lde_size*total_cols buffer; first n*total_cols rows carry data.
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
+    stream.memcpy_htod(row_major, &mut buf.slice_mut(0..n * total_cols))?;
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    // iNTT → coset weights (incl. 1/N) → forward NTT at lde_size. Identical to the
+    // committed device path's expansion, so the row-major output is bit-identical.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        cols_u64,
+    )?;
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        cols_u64,
+    )?;
+
+    let out = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
 ///
 /// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is

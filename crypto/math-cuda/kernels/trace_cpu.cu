@@ -467,6 +467,489 @@ extern "C" __global__ void lt_fill(const uint64_t *ops, uint64_t n,
     out[base + 16] = mult;                // MU
 }
 
+// On-GPU EQ trace fill (12 cols). Mirrors the per-row compute of
+// `prover/src/tables/eq.rs::generate_eq_trace`. Dedup is done on the HOST (the
+// same per-chunk HashMap the CPU uses); this kernel receives already-unique ops
+// with their summed multiplicity, one per row, and recomputes diff/eq/res.
+// Order-independent (LogUp ALU bus) → validated by multiset/prove, not byte order.
+// Padding rows (r >= n) stay all-zero.
+//
+// Packed stride EQ_STRIDE: [0]=a [1]=b [2]=flags (bit0 invert) [3]=multiplicity.
+#define EQ_NCOLS 12u
+#define EQ_STRIDE 4u
+
+extern "C" __global__ void eq_fill(const uint64_t *ops, uint64_t n,
+                                   uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * EQ_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * EQ_STRIDE;
+    uint64_t a = op[0];
+    uint64_t b = op[1];
+    uint64_t fl = op[2];
+    uint64_t mult = op[3];
+    uint64_t invert = fl & 1u;
+
+    uint64_t eq = (a == b) ? 1u : 0u;
+    uint64_t res = eq ^ invert;
+    uint64_t diff = a - b; // wrapping
+
+    out[base + 0] = a & 0xFFFFFFFFu;        // A_0 (DWordWL lo)
+    out[base + 1] = a >> 32;                // A_1 (DWordWL hi)
+    out[base + 2] = b & 0xFFFFFFFFu;        // B_0
+    out[base + 3] = b >> 32;                // B_1
+    out[base + 4] = invert;                 // INVERT
+    out[base + 5] = res;                    // RES = eq ^ invert
+    out[base + 6] = diff & 0xFFFFu;         // DIFF_0 (DWordHL halves)
+    out[base + 7] = (diff >> 16) & 0xFFFFu; // DIFF_1
+    out[base + 8] = (diff >> 32) & 0xFFFFu; // DIFF_2
+    out[base + 9] = (diff >> 48) & 0xFFFFu; // DIFF_3
+    out[base + 10] = eq;                    // EQ = (a == b)
+    out[base + 11] = mult;                  // MU
+}
+
+// On-GPU BYTEWISE trace fill (26 cols). Mirrors the per-row compute of
+// `prover/src/tables/bytewise.rs::generate_bytewise_trace`. Dedup is done on the
+// HOST (the same per-chunk HashMap the CPU uses); this kernel receives unique ops
+// + summed multiplicity, one per row, and recomputes res = a AND/OR/XOR b, then
+// byte-splits a/b/res (DWordBL). Order-independent (LogUp ALU bus) → validated by
+// multiset/prove, not byte order. Padding rows (r >= n) stay all-zero.
+//
+// Packed stride BYTEWISE_STRIDE: [0]=a [1]=b [2]=op (alu_op: 0 AND, 1 OR, 2 XOR)
+//   [3]=multiplicity.
+#define BYTEWISE_NCOLS 26u
+#define BYTEWISE_STRIDE 4u
+
+extern "C" __global__ void bytewise_fill(const uint64_t *ops, uint64_t n,
+                                         uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * BYTEWISE_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * BYTEWISE_STRIDE;
+    uint64_t a = op[0];
+    uint64_t b = op[1];
+    uint64_t opc = op[2];
+    uint64_t mult = op[3];
+
+    // op: 0 AND, 1 OR, 2 XOR (only these reach BYTEWISE).
+    uint64_t res = (opc == 0u) ? (a & b) : (opc == 1u) ? (a | b) : (a ^ b);
+
+    for (int i = 0; i < 8; ++i) {
+        out[base + 0 + i] = (a >> (i * 8)) & 0xFFu;    // A[0..8]  (DWordBL)
+        out[base + 8 + i] = (b >> (i * 8)) & 0xFFu;    // B[0..8]
+        out[base + 17 + i] = (res >> (i * 8)) & 0xFFu; // RES[0..8]
+    }
+    out[base + 16] = opc;  // OP
+    out[base + 25] = mult; // MU
+}
+
+// On-GPU MUL trace fill (26 cols). Mirrors the per-row compute of
+// `prover/src/tables/mul.rs::generate_mul_trace` — the full 128-bit signed/unsigned
+// product plus the sign-extended convolution `raw_product[0..4]`. Dedup is done on
+// the HOST (the same per-chunk HashMap the CPU uses, keyed by op with split
+// mu_lo/mu_hi from `wants_hi`); this kernel receives unique ops + both
+// multiplicities, one per row. Order-independent (LogUp ALU bus) → validated by
+// multiset/prove, not byte order. Padding rows (r >= n) stay all-zero.
+//
+// Packed stride MUL_STRIDE: [0]=lhs [1]=rhs [2]=flags (bit0 lhs_signed, bit1
+//   rhs_signed) [3]=mu_lo [4]=mu_hi.
+#define MUL_NCOLS 26u
+#define MUL_STRIDE 5u
+
+extern "C" __global__ void mul_fill(const uint64_t *ops, uint64_t n,
+                                    uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * MUL_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * MUL_STRIDE;
+    uint64_t lhs = op[0];
+    uint64_t rhs = op[1];
+    uint64_t fl = op[2];
+    uint64_t mu_lo = op[3];
+    uint64_t mu_hi = op[4];
+    uint64_t lhs_signed = fl & 1u;
+    uint64_t rhs_signed = (fl >> 1) & 1u;
+
+    // Full 128-bit product. Signed operands sign-extend (int64 -> int128);
+    // unsigned zero-extend (uint64 -> int128, value-preserving since < 2^64).
+    __int128 a = lhs_signed ? (__int128)(int64_t)lhs : (__int128)lhs;
+    __int128 b = rhs_signed ? (__int128)(int64_t)rhs : (__int128)rhs;
+    __int128 product = a * b; // wrapping
+    uint64_t lo = (uint64_t)product;
+    uint64_t hi = (uint64_t)((unsigned __int128)product >> 64);
+
+    uint64_t lhs_is_neg = (lhs_signed && ((int64_t)lhs < 0)) ? 1u : 0u;
+    uint64_t rhs_is_neg = (rhs_signed && ((int64_t)rhs < 0)) ? 1u : 0u;
+
+    // Sign-extended halfword arrays: [0..4] = halfwords, [4..8] = 0xFFFF*is_neg.
+    uint64_t lfill = lhs_is_neg ? 0xFFFFull : 0ull;
+    uint64_t rfill = rhs_is_neg ? 0xFFFFull : 0ull;
+    uint64_t lhs_ext[8];
+    uint64_t rhs_ext[8];
+    for (int j = 0; j < 4; ++j) {
+        lhs_ext[j] = (lhs >> (16 * j)) & 0xFFFFu;
+        rhs_ext[j] = (rhs >> (16 * j)) & 0xFFFFu;
+    }
+    for (int j = 4; j < 8; ++j) {
+        lhs_ext[j] = lfill;
+        rhs_ext[j] = rfill;
+    }
+
+    // raw_product[i] = Σ_k 2^(16k) Σ_j lhs_ext[j]*rhs_ext[idx-j], idx = 2i+k.
+    uint64_t raw[4];
+    for (int i = 0; i < 4; ++i) {
+        unsigned __int128 sum = 0;
+        for (int k = 0; k <= 1; ++k) {
+            int idx = 2 * i + k;
+            if (idx < 8) {
+                for (int j = 0; j <= idx; ++j) {
+                    if (j < 8 && (idx - j) < 8) {
+                        unsigned __int128 term =
+                            (unsigned __int128)lhs_ext[j] * (unsigned __int128)rhs_ext[idx - j];
+                        sum += term << (16 * k);
+                    }
+                }
+            }
+        }
+        raw[i] = (uint64_t)sum;
+    }
+
+    for (int j = 0; j < 4; ++j) {
+        out[base + 0 + j] = (lhs >> (16 * j)) & 0xFFFFu;  // LHS_0..3 (DWordHL)
+        out[base + 5 + j] = (rhs >> (16 * j)) & 0xFFFFu;  // RHS_0..3
+        out[base + 10 + j] = (lo >> (16 * j)) & 0xFFFFu;  // LO_0..3
+        out[base + 14 + j] = (hi >> (16 * j)) & 0xFFFFu;  // HI_0..3
+    }
+    out[base + 4] = lhs_signed;   // LHS_SIGNED
+    out[base + 9] = rhs_signed;   // RHS_SIGNED
+    out[base + 18] = lhs_is_neg;  // LHS_IS_NEGATIVE
+    out[base + 19] = rhs_is_neg;  // RHS_IS_NEGATIVE
+    out[base + 20] = raw[0];      // RAW_PRODUCT_0..3
+    out[base + 21] = raw[1];
+    out[base + 22] = raw[2];
+    out[base + 23] = raw[3];
+    out[base + 24] = mu_lo;       // MU_LO
+    out[base + 25] = mu_hi;       // MU_HI
+}
+
+// On-GPU DVRM trace fill (34 cols). Mirrors the per-row compute of
+// `prover/src/tables/dvrm.rs::generate_dvrm_trace` — RISC-V signed/unsigned
+// division & remainder with the div-by-zero and MIN/-1 overflow special cases,
+// plus the abs/sign aux columns and n_sub_r. Dedup is done on the HOST (per-chunk
+// HashMap keyed by op with split mu_q/mu_r from `wants_remainder`); this kernel
+// receives unique ops + both multiplicities, one per row. Order-independent
+// (LogUp ALU bus) → validated by multiset/prove, not byte order. Padding rows
+// (r >= n) stay all-zero.
+//
+// Packed stride DVRM_STRIDE: [0]=n [1]=d [2]=flags (bit0 signed) [3]=mu_q [4]=mu_r.
+#define DVRM_NCOLS 34u
+#define DVRM_STRIDE 5u
+
+extern "C" __global__ void dvrm_fill(const uint64_t *ops, uint64_t n_ops,
+                                     uint64_t num_rows, uint64_t *out) {
+    uint64_t ri = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (ri >= num_rows)
+        return;
+    uint64_t base = ri * DVRM_NCOLS;
+    if (ri >= n_ops)
+        return;
+
+    const uint64_t *op = ops + ri * DVRM_STRIDE;
+    uint64_t n = op[0];
+    uint64_t d = op[1];
+    uint64_t fl = op[2];
+    uint64_t mu_q = op[3];
+    uint64_t mu_r = op[4];
+    uint64_t is_signed = fl & 1u;
+
+    uint64_t div_by_zero = (d == 0ull) ? 1u : 0u;
+    uint64_t overflow =
+        (is_signed && n == 0x8000000000000000ull && d == 0xFFFFFFFFFFFFFFFFull) ? 1u : 0u;
+
+    // Branch order matches the Rust: div-by-zero and overflow are handled before
+    // the divide, so the signed path never hits INT64_MIN / -1 (UB) or /0.
+    uint64_t q, rem;
+    if (div_by_zero) {
+        q = 0xFFFFFFFFFFFFFFFFull;
+        rem = n;
+    } else if (overflow) {
+        q = n; // i64::MIN
+        rem = 0ull;
+    } else if (is_signed) {
+        int64_t ni = (int64_t)n;
+        int64_t di = (int64_t)d;
+        q = (uint64_t)(ni / di);  // truncates toward zero, == wrapping_div
+        rem = (uint64_t)(ni % di); // == wrapping_rem (sign follows dividend)
+    } else {
+        q = n / d;
+        rem = n % d;
+    }
+
+    uint64_t sign_n = (is_signed && (n >> 63)) ? 1u : 0u;
+    uint64_t sign_d = (is_signed && (d >> 63)) ? 1u : 0u;
+    uint64_t sign_q = (is_signed && !overflow) ? 1u : 0u;
+    uint64_t sign_r = (is_signed && (rem >> 63)) ? 1u : 0u;
+    uint64_t n_sub_r = n - rem; // wrapping
+    uint64_t sign_n_sub_r = (is_signed && (n_sub_r >> 63)) ? 1u : 0u;
+
+    // abs(x) for a two's-complement negative is 0 - x (mod 2^64); correct for
+    // i64::MIN too (matches Rust `unsigned_abs`). Non-negative passes through.
+    uint64_t abs_r = sign_r ? (0ull - rem) : rem;
+    uint64_t abs_d = sign_d ? (0ull - d) : d;
+
+    for (int j = 0; j < 4; ++j) {
+        out[base + 0 + j] = (n >> (16 * j)) & 0xFFFFu;        // N_0..3 (DWordHL)
+        out[base + 4 + j] = (d >> (16 * j)) & 0xFFFFu;        // D_0..3
+        out[base + 9 + j] = (q >> (16 * j)) & 0xFFFFu;        // Q_0..3
+        out[base + 13 + j] = (rem >> (16 * j)) & 0xFFFFu;     // R_0..3
+        out[base + 23 + j] = (n_sub_r >> (16 * j)) & 0xFFFFu; // N_SUB_R_0..3
+    }
+    out[base + 8] = is_signed;            // SIGNED
+    out[base + 17] = div_by_zero;         // DIV_BY_ZERO
+    out[base + 18] = overflow;            // OVERFLOW
+    out[base + 19] = abs_r & 0xFFFFFFFFu; // ABS_R_0 (DWordWL)
+    out[base + 20] = abs_r >> 32;         // ABS_R_1
+    out[base + 21] = abs_d & 0xFFFFFFFFu; // ABS_D_0
+    out[base + 22] = abs_d >> 32;         // ABS_D_1
+    out[base + 27] = sign_n_sub_r;        // SIGN_N_SUB_R
+    out[base + 28] = sign_n;              // SIGN_N
+    out[base + 29] = sign_d;              // SIGN_D
+    out[base + 30] = sign_q;              // SIGN_Q
+    out[base + 31] = sign_r;              // SIGN_R
+    out[base + 32] = mu_q;                // MU_Q
+    out[base + 33] = mu_r;                // MU_R
+}
+
+// On-GPU BRANCH trace fill (14 cols). Mirrors the per-row compute of
+// `prover/src/tables/branch.rs::generate_branch_trace`: next_pc = (base + offset)
+// & ~1, where base = jalr ? register : pc, split into 3 high halfwords + 2 low
+// bytes (LSB masked) plus the unmasked low byte. Dedup is done on the HOST (the
+// same per-chunk HashMap the CPU uses); this kernel receives unique ops + summed
+// multiplicity, one per row. Order-independent (LogUp lookup bus) → validated by
+// multiset/prove, not byte order. Padding rows (r >= n) stay all-zero.
+//
+// Packed stride BRANCH_STRIDE: [0]=pc [1]=offset [2]=register [3]=flags (bit0
+//   jalr) [4]=multiplicity.
+#define BRANCH_NCOLS 14u
+#define BRANCH_STRIDE 5u
+
+extern "C" __global__ void branch_fill(const uint64_t *ops, uint64_t n,
+                                       uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * BRANCH_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * BRANCH_STRIDE;
+    uint64_t pc = op[0];
+    uint64_t offset = op[1];
+    uint64_t reg = op[2];
+    uint64_t fl = op[3];
+    uint64_t mult = op[4];
+    uint64_t jalr = fl & 1u;
+
+    uint64_t b = jalr ? reg : pc;
+    uint64_t unmasked = b + offset; // wrapping
+    uint64_t next_pc = unmasked & ~1ull;
+
+    out[base + 0] = pc & 0xFFFFFFFFu;            // PC_0 (DWordWL)
+    out[base + 1] = pc >> 32;                    // PC_1
+    out[base + 2] = offset & 0xFFFFFFFFu;        // OFFSET_0
+    out[base + 3] = offset >> 32;                // OFFSET_1
+    out[base + 4] = reg & 0xFFFFFFFFu;           // REGISTER_0
+    out[base + 5] = reg >> 32;                   // REGISTER_1
+    out[base + 6] = jalr;                        // JALR
+    out[base + 7] = (next_pc >> 16) & 0xFFFFu;   // NEXT_PC_HIGH_0 (halves)
+    out[base + 8] = (next_pc >> 32) & 0xFFFFu;   // NEXT_PC_HIGH_1
+    out[base + 9] = (next_pc >> 48) & 0xFFFFu;   // NEXT_PC_HIGH_2
+    out[base + 10] = next_pc & 0xFFu;            // NEXT_PC_LOW_0 (masked LSB)
+    out[base + 11] = (next_pc >> 8) & 0xFFu;     // NEXT_PC_LOW_1
+    out[base + 12] = unmasked & 0xFFu;           // UNMASKED_LOW_BYTE
+    out[base + 13] = mult;                       // MU
+}
+
+// On-GPU CPU32 trace fill (38 cols). Mirrors the per-row compute of
+// `prover/src/tables/cpu32.rs::{generate_cpu32_trace, compute_aux}` — the delegated
+// `*W` (32-bit word) instructions. Sign/zero-extends rv1/rv2 to arg1/arg2 and
+// sign-extends the 32-bit result to rvd, per RV64 `*W` semantics. Per-row (μ=1, no
+// dedup) → byte-identical to the CPU fill. Padding rows (r >= n) stay all-zero.
+//
+// Packed stride CPU32_STRIDE: [0]=timestamp [1]=pc [2]=rv1 [3]=rv2 [4]=imm [5]=res
+//   [6]=flags (bit0 read_register1, bit1 read_register2, bit2 write_register,
+//   bit3 alu, bit4 add, bit5 sub) [7]=bytes (b0 rs1, b1 rs2, b2 rd, b3 alu_flags,
+//   b4 half_instruction_length).
+#define CPU32_NCOLS 38u
+#define CPU32_STRIDE 8u
+
+extern "C" __global__ void cpu32_fill(const uint64_t *ops, uint64_t n,
+                                      uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * CPU32_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * CPU32_STRIDE;
+    uint64_t ts = op[0];
+    uint64_t pc = op[1];
+    uint64_t rv1 = op[2];
+    uint64_t rv2 = op[3];
+    uint64_t imm = op[4];
+    uint64_t res = op[5];
+    uint64_t fl = op[6];
+    uint64_t by = op[7];
+
+    uint64_t rr1 = fl & 1u;
+    uint64_t rr2 = (fl >> 1) & 1u;
+    uint64_t wr = (fl >> 2) & 1u;
+    uint64_t alu = (fl >> 3) & 1u;
+    uint64_t add = (fl >> 4) & 1u;
+    uint64_t sub = (fl >> 5) & 1u;
+
+    uint64_t rs1 = by & 0xFFu;
+    uint64_t rs2 = (by >> 8) & 0xFFu;
+    uint64_t rd = (by >> 16) & 0xFFu;
+    uint64_t aluf = (by >> 24) & 0xFFu;
+    uint64_t hil = (by >> 32) & 0xFFu;
+
+    // signed = alu_flags bit 5 (ALU_FLAGS_SIGNED). rv1/rv2 sign bits are gated by
+    // `signed`; the result is always sign-extended for *W.
+    uint64_t is_signed = (aluf >> 5) & 1u;
+    uint64_t rv1_sign = (is_signed && ((rv1 >> 31) & 1u)) ? 1u : 0u;
+    uint64_t rv2_sign = (is_signed && ((rv2 >> 31) & 1u)) ? 1u : 0u;
+    uint64_t res_sign = ((res >> 31) & 1u) ? 1u : 0u;
+
+    uint64_t arg1_hi = rv1_sign ? 0xFFFFFFFFull : 0ull;
+    uint64_t arg1 = (rv1 & 0xFFFFFFFFull) | (arg1_hi << 32);
+
+    // By the decoding assumption exactly one of rv2 / imm is nonzero, so the
+    // per-word sums do not overflow; the masks mirror the Rust exactly regardless.
+    uint64_t arg2_lo = (rv2 & 0xFFFFFFFFull) + (imm & 0xFFFFFFFFull);
+    uint64_t arg2_hi = (rv2_sign ? 0xFFFFFFFFull : 0ull) + (imm >> 32);
+    uint64_t arg2 = (arg2_lo & 0xFFFFFFFFull) | (arg2_hi << 32);
+
+    uint64_t rvd_hi = res_sign ? 0xFFFFFFFFull : 0ull;
+    uint64_t rvd = (res & 0xFFFFFFFFull) | (rvd_hi << 32);
+
+    out[base + 0] = ts & 0xFFFFFFFFu;           // TIMESTAMP_0 (DWordWL)
+    out[base + 1] = ts >> 32;                   // TIMESTAMP_1
+    out[base + 2] = pc & 0xFFFFFFFFu;           // PC_0
+    out[base + 3] = pc >> 32;                   // PC_1
+    out[base + 4] = rs1;                        // RS1
+    out[base + 5] = rr1;                        // READ_REGISTER1
+    out[base + 6] = rv1 & 0xFFFFu;              // RV1_0 (DWordWHH: half)
+    out[base + 7] = (rv1 >> 16) & 0xFFFFu;      // RV1_1 (half)
+    out[base + 8] = (rv1 >> 32) & 0xFFFFFFFFu;  // RV1_2 (word)
+    out[base + 9] = rv1_sign;                   // RV1_SIGN
+    out[base + 10] = arg1 & 0xFFFFFFFFu;        // ARG1_0 (DWordWL)
+    out[base + 11] = arg1 >> 32;                // ARG1_1
+    out[base + 12] = rs2;                       // RS2
+    out[base + 13] = rr2;                       // READ_REGISTER2
+    out[base + 14] = rv2 & 0xFFFFu;             // RV2_0
+    out[base + 15] = (rv2 >> 16) & 0xFFFFu;     // RV2_1
+    out[base + 16] = (rv2 >> 32) & 0xFFFFFFFFu; // RV2_2
+    out[base + 17] = rv2_sign;                  // RV2_SIGN
+    out[base + 18] = imm & 0xFFFFFFFFu;         // IMM_0
+    out[base + 19] = imm >> 32;                 // IMM_1
+    out[base + 20] = arg2 & 0xFFFFFFFFu;        // ARG2_0
+    out[base + 21] = arg2 >> 32;                // ARG2_1
+    out[base + 22] = res & 0xFFFFu;             // RES_0 (DWordHL: 4 halves)
+    out[base + 23] = (res >> 16) & 0xFFFFu;     // RES_1
+    out[base + 24] = (res >> 32) & 0xFFFFu;     // RES_2
+    out[base + 25] = (res >> 48) & 0xFFFFu;     // RES_3
+    out[base + 26] = res_sign;                  // RES_SIGN
+    out[base + 27] = rd;                        // RD
+    out[base + 28] = wr;                        // WRITE_REGISTER
+    out[base + 29] = rvd & 0xFFFFFFFFu;         // RVD_0
+    out[base + 30] = rvd >> 32;                 // RVD_1
+    out[base + 31] = alu;                       // ALU
+    out[base + 32] = aluf;                      // ALU_FLAGS
+    out[base + 33] = add;                       // ADD
+    out[base + 34] = sub;                       // SUB
+    out[base + 35] = hil;                       // HALF_INSTRUCTION_LENGTH
+    out[base + 36] = is_signed;                 // SIGNED
+    out[base + 37] = 1u;                        // MU (active row)
+}
+
+// On-GPU MEMW (general / unaligned / split-timestamp) trace fill (49 cols). Mirrors
+// `prover/src/tables/memw.rs::generate_memw_trace`. The op is already walked
+// (old/old_timestamp filled), so this is bit-slicing + the carry[i] aux
+// (base_addr_lo + (i+1) >= 2^32). Per-row (no dedup) → byte-identical to the CPU
+// fill. Padding rows (r >= n) stay all-zero.
+//
+// Packed stride MEMW_STRIDE: [0]=flags (bit0 is_register, bit1 is_read, bits8..16
+//   width) [1]=base_address [2]=timestamp [3..7]=value[0..8] packed 2×u32/u64
+//   [7..11]=old[0..8] packed 2×u32/u64 [11..19]=old_timestamp[0..8].
+#define MEMW_NCOLS 49u
+#define MEMW_STRIDE 19u
+
+extern "C" __global__ void memw_fill(const uint64_t *ops, uint64_t n,
+                                     uint64_t num_rows, uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * MEMW_NCOLS;
+    if (r >= n)
+        return;
+
+    const uint64_t *op = ops + r * MEMW_STRIDE;
+    uint64_t fl = op[0];
+    uint64_t is_register = fl & 1u;
+    uint64_t is_read = (fl >> 1) & 1u;
+    uint64_t width = (fl >> 8) & 0xFFu;
+    uint64_t addr = op[1];
+    uint64_t ts = op[2];
+
+    out[base + 0] = is_register;                // IS_REGISTER
+    out[base + 1] = addr & 0xFFFFFFFFu;         // BASE_ADDRESS_0 (DWordWL)
+    out[base + 2] = addr >> 32;                 // BASE_ADDRESS_1
+    // VALUE[0..8] at cols 3..11 (each column holds one full value limb).
+    for (int i = 0; i < 4; ++i) {
+        uint64_t p = op[3 + i];
+        out[base + 3 + 2 * i] = p & 0xFFFFFFFFu;
+        out[base + 3 + 2 * i + 1] = p >> 32;
+    }
+    out[base + 11] = ts & 0xFFFFFFFFu;          // TIMESTAMP_0
+    out[base + 12] = ts >> 32;                  // TIMESTAMP_1
+    out[base + 13] = (width == 2u) ? 1u : 0u;   // WRITE2
+    out[base + 14] = (width == 4u) ? 1u : 0u;   // WRITE4
+    out[base + 15] = (width == 8u) ? 1u : 0u;   // WRITE8
+    // OLD[0..8] at cols 16..24.
+    for (int i = 0; i < 4; ++i) {
+        uint64_t p = op[7 + i];
+        out[base + 16 + 2 * i] = p & 0xFFFFFFFFu;
+        out[base + 16 + 2 * i + 1] = p >> 32;
+    }
+    // CARRY[0..7] at cols 24..31: carry when adding (i+1) to base_address low word.
+    uint64_t base_lo = addr & 0xFFFFFFFFu;
+    for (int i = 0; i < 7; ++i) {
+        out[base + 24 + i] = (base_lo + (uint64_t)(i + 1) >= (1ull << 32)) ? 1u : 0u;
+    }
+    // OLD_TIMESTAMP[i] as DWordWL at cols 31 + 2i (8 timestamps → cols 31..47).
+    for (int i = 0; i < 8; ++i) {
+        uint64_t ot = op[11 + i];
+        out[base + 31 + 2 * i] = ot & 0xFFFFFFFFu;
+        out[base + 31 + 2 * i + 1] = ot >> 32;
+    }
+    out[base + 47] = is_read;                   // MU_READ
+    out[base + 48] = 1u - is_read;              // MU_WRITE
+}
+
 // On-GPU MEMW_R (register fast-path) fill: write the 10 MEMW_R columns ROW-MAJOR
 // from the host-walked rows. One thread per row (row_index is the identity for
 // the fill-from-walked-rows path). Columns mirror
