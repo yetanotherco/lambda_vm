@@ -11,7 +11,7 @@
 
 use crypto::fiat_shamir::is_transcript::IsTranscript;
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
-use sha3::Digest;
+use digest::Digest;
 
 use crate::test_utils::E;
 use crate::{RuntimePageRange, TableCounts};

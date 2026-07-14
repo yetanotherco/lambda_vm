@@ -24,8 +24,9 @@
 //! [`Preset`]). A consumer must pin that outer ELF too, or a 1-query `min`
 //! attestation is indistinguishable from a 128-bit `blowup8` one.
 
+use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
+use digest::Digest;
 use executor::elf::Elf;
-use sha3::{Digest, Keccak256};
 
 use crate::statement::elf_digest;
 use crate::tables::trace_builder::Traces;
