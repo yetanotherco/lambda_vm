@@ -4313,6 +4313,12 @@ pub trait IsStarkProver<
 
         // (6) Build the L2G aux (LogUp) trace with the shared challenges, then
         // commit it to its own tree.
+        // `commit_aux_trace` below reads the aux columns from the HOST trace, so
+        // the GPU-resident aux build — which keeps them device-only and leaves
+        // the host trace empty — must be disabled for this lane (it would
+        // otherwise commit a zero aux table against the real bus contribution).
+        #[cfg(feature = "cuda")]
+        l2g_trace.set_resident_aux_ok(false);
         let l2g_bus = l2g_air.build_auxiliary_trace(l2g_trace, &lookup_challenges);
         let (l2g_aux_commit, l2g_aux_lde) = Self::commit_aux_trace(
             l2g_trace,
