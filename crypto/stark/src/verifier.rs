@@ -929,8 +929,7 @@ pub trait IsStarkVerifier<
             h_sum_sym += h_i_upsilon_sym * gamma;
         }
         let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
-        let h_terms_sym =
-            (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
+        let h_terms_sym = (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
 
         Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
     }
