@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
-test-rust test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
+test-rust test-ethrex test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
@@ -261,6 +261,11 @@ test-asm: compile-programs-asm
 
 test-rust: compile-programs-rust
 	cargo test -p executor --test rust
+
+# ethrex host-reference tests live in the detached `tooling/ethrex-tests`
+# workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
+test-ethrex: compile-programs-rust
+	cd tooling/ethrex-tests && cargo test --release -- --include-ignored
 
 test-flamegraph:
 	cargo test -p executor --test flamegraph
