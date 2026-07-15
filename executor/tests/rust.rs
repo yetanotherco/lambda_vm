@@ -232,6 +232,82 @@ fn test_keccak() {
 }
 
 #[test]
+fn test_keccak_precompile() {
+    use tiny_keccak::Hasher;
+
+    fn keccak256(input: &[u8]) -> [u8; 32] {
+        let mut output = [0u8; 32];
+        let mut hasher = tiny_keccak::Keccak::v256();
+        hasher.update(input);
+        hasher.finalize(&mut output);
+        output
+    }
+
+    // Known-answer vectors for the `keccak_permute`-ecall-backed sponge
+    // (`lambda_vm_syscalls::keccak::keccak256`), computed with the trusted
+    // `tiny_keccak` crate. Covers empty input, one rate block (136 bytes)
+    // minus one byte, exactly one rate block, and a multi-block input —
+    // the sponge's padding edge cases. Inputs must match
+    // `executor/programs/rust/keccak_precompile/src/main.rs` exactly.
+    const RATE_BYTES: usize = 136;
+    let multi_block_input: Vec<u8> = (0..2 * RATE_BYTES + 17).map(|i| i as u8).collect();
+
+    let expected: Vec<u8> = [
+        keccak256(b""),
+        keccak256(b"abc"),
+        keccak256(&[0x5a; RATE_BYTES - 1]),
+        keccak256(&[0x3c; RATE_BYTES]),
+        keccak256(&multi_block_input),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak_precompile.elf",
+        expected,
+        vec![],
+    );
+}
+
+#[test]
+fn test_keccak_transcript_pattern() {
+    use tiny_keccak::Hasher;
+
+    fn keccak256(chunks: &[&[u8]]) -> [u8; 32] {
+        let mut output = [0u8; 32];
+        let mut hasher = tiny_keccak::Keccak::v256();
+        for chunk in chunks {
+            hasher.update(chunk);
+        }
+        hasher.finalize(&mut output);
+        output
+    }
+
+    // Reference values for `executor/programs/rust/keccak_transcript_pattern`,
+    // which drives `PlatformKeccak256` the same way `DefaultTranscript::sample`
+    // does: several small, non-rate-aligned `update()`s per round, interleaved
+    // with `finalize_reset()`, each round reseeded with the reversed prior
+    // digest. Covers the cross-call sponge buffering that a one-shot hash of a
+    // whole slice can't reach.
+    let digest1 = keccak256(&[&[0xaa; 5], &[0xbb; 40], &[0xcc; 17], &[0xdd; 100]]);
+    let mut reversed1 = digest1;
+    reversed1.reverse();
+    let digest2 = keccak256(&[&reversed1, &[0xee; 3], &[0xff; 130]]);
+    let mut reversed2 = digest2;
+    reversed2.reverse();
+    let digest3 = keccak256(&[&reversed2]);
+
+    let expected: Vec<u8> = [digest1, digest2, digest3].into_iter().flatten().collect();
+
+    run_program_and_check_public_output(
+        "./program_artifacts/rust/keccak_transcript_pattern.elf",
+        expected,
+        vec![],
+    );
+}
+
+#[test]
 fn test_stdin_read_panics() {
     let result = run_program_without_expect("./program_artifacts/rust/stdin_read.elf", vec![]);
     assert!(result.is_err());

@@ -25,6 +25,7 @@ const DELIMITER: u8 = 0x01;
 const FINAL_PAD_BIT: u8 = 0x80;
 
 /// Incremental Keccak-256 hasher.
+#[derive(Clone)]
 pub struct Keccak256 {
     state: [u64; 25],
     buf: [u8; RATE_BYTES],

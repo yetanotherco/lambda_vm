@@ -1,6 +1,8 @@
 const EI_NIDENT: usize = 16;
 // Section header types
 const SHT_SYMTAB: u32 = 2;
+// Section is loaded into memory at runtime (excludes .debug_* et al.)
+const SHF_ALLOC: u64 = 0x2;
 // Symbol types (lower 4 bits of st_info)
 const STT_FUNC: u8 = 2;
 // Section header size for 64-bit ELF
@@ -409,11 +411,14 @@ impl SymbolTable {
             return Ok(Self::default());
         }
 
-        // Find .symtab section
+        // Find .symtab, and record which sections are SHF_ALLOC (loaded at
+        // runtime) — debug sections reuse .text addresses for local labels.
         let mut symtab_offset = 0usize;
         let mut symtab_size = 0usize;
         let mut strtab_index = 0u32;
+        let mut section_is_alloc = vec![false; sh_num];
 
+        #[allow(clippy::needless_range_loop)] // `i` also drives the offset arithmetic below
         for i in 0..sh_num {
             let offset = sh_offset
                 .checked_add(i.checked_mul(sh_entsize).ok_or(ElfError::InvalidProgram)?)
@@ -429,8 +434,15 @@ impl SymbolTable {
                     .try_into()
                     .map_err(|_| ElfError::Casting)?,
             );
+            // sh_flags is at offset 8
+            let sh_flags = u64::from_le_bytes(
+                input[offset + 8..offset + 16]
+                    .try_into()
+                    .map_err(|_| ElfError::Casting)?,
+            );
+            section_is_alloc[i] = sh_flags & SHF_ALLOC != 0;
 
-            if sh_type == SHT_SYMTAB {
+            if sh_type == SHT_SYMTAB && symtab_offset == 0 {
                 // sh_offset at offset 24, sh_size at offset 32, sh_link at offset 40
                 symtab_offset = u64::from_le_bytes(
                     input[offset + 24..offset + 32]
@@ -447,7 +459,6 @@ impl SymbolTable {
                         .try_into()
                         .map_err(|_| ElfError::Casting)?,
                 );
-                break;
             }
         }
 
@@ -508,6 +519,11 @@ impl SymbolTable {
                     .map_err(|_| ElfError::Casting)?,
             ) as usize;
             let st_info = input[sym_offset + 4];
+            let st_shndx = u16::from_le_bytes(
+                input[sym_offset + 6..sym_offset + 8]
+                    .try_into()
+                    .map_err(|_| ElfError::Casting)?,
+            ) as usize;
             let st_value = u64::from_le_bytes(
                 input[sym_offset + 8..sym_offset + 16]
                     .try_into()
@@ -518,6 +534,13 @@ impl SymbolTable {
                     .try_into()
                     .map_err(|_| ElfError::Casting)?,
             );
+
+            // Reject symbols outside a loaded (SHF_ALLOC) section: debug
+            // sections carry local labels (e.g. `.L0`) that reuse a real
+            // .text address as a debug-info anchor, not a function boundary.
+            if !section_is_alloc.get(st_shndx).copied().unwrap_or(false) {
+                continue;
+            }
 
             // Check if this is a function (STT_FUNC) or a NOTYPE symbol (common in ASM programs)
             // Filter out other types like STT_OBJECT, STT_SECTION, etc.
@@ -551,8 +574,9 @@ impl SymbolTable {
 
             let name = String::from_utf8_lossy(&input[name_offset..name_end]).to_string();
 
-            // Filter out special symbols (mapping symbols like $x, $d, $t)
-            if !name.is_empty() && !name.starts_with('$') {
+            // Filter out mapping symbols ($x, $d, $t) and compiler-local
+            // labels (.L0, .LBB3_2, ...) reused across unrelated addresses.
+            if !name.is_empty() && !name.starts_with('$') && !name.starts_with('.') {
                 functions.push(FunctionSymbol {
                     name,
                     address: st_value,

@@ -5,7 +5,7 @@
 # NEGATIVE numbers are improvements (PR faster/smaller); positive = regression.
 #
 # Usage: scripts/bench_verify.sh REF_A [REF_B=origin/main] [N_PAIRS=20]
-#   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~4 min).
+#   REF_A/REF_B  refs to compare (A = PR side); N_PAIRS even, default 20 (~5-6 min).
 #   Env: REBUILD=1 forces rebuild + re-prove; BENCH_FEATURES=<list> (default: jemalloc-stats).
 #        PROVE_PER_SIDE=auto|1|0 (default auto): 1 = each side proves+verifies its
 #        own proof (required when REF_A changes the proof format); 0 = force one

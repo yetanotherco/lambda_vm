@@ -53,6 +53,8 @@ use super::proof::stark::{
 };
 use super::trace::TraceTable;
 use super::traits::AIR;
+#[cfg(feature = "cuda")]
+use crypto::merkle_tree::proof::Proof;
 
 pub use crate::commitment::{keccak_leaves_bit_reversed, keccak_leaves_row_pair_bit_reversed};
 
@@ -266,6 +268,27 @@ where
     ) -> Round1<Field, FieldExtension> {
         let (main_data, num_main_cols) = lde.main;
         let (aux_data, num_aux_cols) = lde.aux;
+
+        // Stage-3 device-only detection, inferred from the ACTUAL buffer state
+        // (not the gate's intent): a table whose round-1 D2H was skipped has an
+        // empty host buffer where it should have data. Using the real state is a
+        // safety property — if the `device_only` gate held but the GPU keep path
+        // fell back to CPU, the buffer is populated and this stays false, so the
+        // proof runs on the host trace as normal. A mixed state (one buffer
+        // empty, the other full) is treated as device-only so any host read
+        // hard-aborts rather than indexing an empty buffer.
+        #[cfg(feature = "cuda")]
+        let main_empty = num_main_cols > 0 && main_data.is_empty();
+        #[cfg(feature = "cuda")]
+        let host_trace_empty =
+            main_empty || (num_aux_cols > 0 && aux_data.is_empty() && lde.gpu_aux.is_some());
+        #[cfg(feature = "cuda")]
+        let device_num_rows = lde
+            .gpu_main
+            .as_ref()
+            .map(|h| h.lde_size)
+            .or_else(|| lde.gpu_aux.as_ref().map(|h| h.lde_size));
+
         #[allow(unused_mut)]
         let mut lde_trace = LDETraceTable::from_row_major(
             main_data,
@@ -277,6 +300,20 @@ where
         );
         #[cfg(feature = "cuda")]
         {
+            if host_trace_empty {
+                // Recover the LDE row count from the resident device handle
+                // whenever any host buffer is empty. `from_row_major` derives
+                // `num_rows` from `main_data` (or `aux_data` when there are no
+                // main columns); if that buffer was skipped it reads 0, so we
+                // overwrite from the handle's `lde_size` (the true row count).
+                // Idempotent when `from_row_major` already got it right, and it
+                // covers the aux-only (`num_main_cols == 0`) device-only case
+                // that a `main_empty`-only guard missed.
+                if let Some(n) = device_num_rows {
+                    lde_trace.set_num_rows(n);
+                }
+                lde_trace.set_host_trace_empty(true);
+            }
             if let Some(h) = lde.gpu_main {
                 lde_trace.set_gpu_main(h);
             }
@@ -455,6 +492,11 @@ where
     /// below threshold, or any CPU fallback).
     #[cfg(feature = "cuda")]
     pub(crate) gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
+    /// The composition Merkle tree kept resident on device (when the R2 GPU tree
+    /// path ran), so R4 openings gather paths on device instead of walking a host
+    /// tree. `None` on the CPU fallback (host tree fully resident).
+    #[cfg(feature = "cuda")]
+    pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -783,6 +825,42 @@ pub trait IsStarkProver<
         MixedMmcs::<Field>::commit(&mats)
     }
 
+    /// Stage-3 device-only gate for one table (see
+    /// [`crate::gpu_lde::device_only_gate`]). Derived purely from the AIR +
+    /// domain so the round-1 main-commit and aux-commit closures compute the
+    /// identical value and skip both host D2Hs consistently — the per-table
+    /// `host_trace_empty` flag covers both the main and aux buffers, so they
+    /// must be left empty together.
+    #[cfg(feature = "cuda")]
+    fn device_only_for(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        domain: &Domain<Field>,
+    ) -> bool {
+        // Preconditions the downstream GPU paths require that the numeric gate
+        // below does not capture. A table missing either would pass the gate,
+        // skip its host D2H, then hard-abort in round 2:
+        //  - R2 composition unconditionally needs a device aux handle
+        //    (`gpu_aux()?`), so the table must declare an aux trace.
+        //  - The composition path needs a uniform zerofier with ≥1 group. An
+        //    empty constraint set makes `all(end_exemptions == 0)` vacuously
+        //    true here but `is_uniform()` false downstream (0 groups).
+        if !air.has_aux_trace() || air.constraints_meta().is_empty() {
+            return false;
+        }
+        let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
+        let n = domain.interpolation_domain_size;
+        let offsets_contiguous =
+            crate::gpu_lde::offsets_are_contiguous(&air.context().transition_offsets);
+        let zerofier_uniform = air.constraints_meta().iter().all(|m| m.end_exemptions == 0);
+        crate::gpu_lde::device_only_gate::<Field, FieldExtension>(
+            lde_size,
+            n,
+            air.is_preprocessed(),
+            offsets_contiguous,
+            zerofier_uniform,
+        )
+    }
+
     /// Compute the main-trace LDE and commit. Returns a `TableCommit` along
     /// with the owned LDE columns (consumed later in Phase D) and (under
     /// cuda) the optional device LDE buffer kept alive for downstream rounds
@@ -797,6 +875,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
+        #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainCommitTuple<Field>, ProvingError>
     where
@@ -829,6 +908,7 @@ pub trait IsStarkProver<
                     num_cols,
                     domain.blowup_factor,
                     &twiddles.coset_weights,
+                    !device_only,
                 )
             {
                 #[cfg(feature = "instruments")]
@@ -836,6 +916,13 @@ pub trait IsStarkProver<
                 let root = tree.root;
                 #[cfg(feature = "instruments")]
                 crate::instruments::accum_r1_main(main_lde_dur, std::time::Duration::ZERO);
+                // Count a device-only main commit only once the GPU keep path
+                // actually fired (handle produced + host trace intentionally
+                // empty), so the counter reflects real residency, not the gate.
+                if device_only {
+                    crate::gpu_lde::GPU_DEVICE_ONLY_CALLS
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 return Ok((
                     TableCommit::plain(tree, root),
                     (main_data, num_cols),
@@ -1315,30 +1402,36 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
         // GPU fast path for the comp-poly Merkle commit: row-pair Keccak
         // leaves + device-side inner tree, both wrapping the host eval Vecs.
-        // `try_build_comp_poly_tree_gpu` returns `(host_tree, dev_tree)`; this batched
-        // comp-poly path only needs the host tree (the device tree is an unused GPU
-        // optimization here), so drop it to keep `gpu_tree` the same `Option<BatchedMerkleTree>`
-        // as the non-cuda binding and share the commit `match` below.
+        // GPU path keeps the composition tree resident on device (no whole tree
+        // copy) and returns a root only host tree. The device tree is threaded
+        // to R4 in `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
-        let gpu_tree = crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-            FieldExtension,
-            BatchedMerkleTreeBackend<FieldExtension>,
-        >(&lde_composition_poly_parts_evaluations)
-        .map(|(host_tree, _dev_tree)| host_tree);
+        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
+            match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                FieldExtension,
+                BatchedMerkleTreeBackend<FieldExtension>,
+            >(&lde_composition_poly_parts_evaluations)
+            {
+                Some((host_tree, dev_tree)) => {
+                    let root = host_tree.root;
+                    (host_tree, root, Some(dev_tree))
+                }
+                None => {
+                    let (tree, root) = crate::commitment::commit_bit_reversed(
+                        &lde_composition_poly_parts_evaluations,
+                        crate::commitment::ROWS_PER_LEAF,
+                    )
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                    (tree, root, None)
+                }
+            };
         #[cfg(not(feature = "cuda"))]
-        let gpu_tree: Option<BatchedMerkleTree<FieldExtension>> = None;
-
-        let (composition_poly_merkle_tree, composition_poly_root) = match gpu_tree {
-            Some(tree) => {
-                let root = tree.root;
-                (tree, root)
-            }
-            None => crate::commitment::commit_bit_reversed(
+        let (composition_poly_merkle_tree, composition_poly_root) =
+            crate::commitment::commit_bit_reversed(
                 &lde_composition_poly_parts_evaluations,
                 crate::commitment::ROWS_PER_LEAF,
             )
-            .ok_or(ProvingError::EmptyCommitment)?,
-        };
+            .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -1351,6 +1444,8 @@ pub trait IsStarkProver<
             composition_poly_root,
             #[cfg(feature = "cuda")]
             gpu_composition_parts,
+            #[cfg(feature = "cuda")]
+            gpu_composition_tree,
         })
     }
 
@@ -1667,6 +1762,16 @@ pub trait IsStarkProver<
             }
         }
 
+        // Reaching here means both GPU DEEP arms fell through to the host loop
+        // below (which reads `get_main`/`get_aux`). Under the device-only gate
+        // the host trace is empty, so a fall-through is a mis-gate or an
+        // unexpected GPU failure: hard-abort rather than read empty buffers.
+        #[cfg(feature = "cuda")]
+        assert!(
+            !lde_trace.host_trace_empty(),
+            "R4 DEEP composition fell back to the host trace, but it is device-only (empty)"
+        );
+
         // OOD column compression (Plonky3-style): precompute one value per eval point,
         //   ood_compressed_k = Σ_j gamma[j][k] * ood[j][k].
         // The per-LDE-point trace column sums are NOT precomputed — they are fused
@@ -1773,6 +1878,45 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Like [`Self::open_composition_poly`] but uses a Merkle proof already
+    /// gathered from the resident device composition tree
+    /// ([`crate::gpu_lde::gather_proofs_dev`]) instead of walking a host tree.
+    /// Row-pair leaf: one proof at position `index` authenticates both rows.
+    #[cfg(feature = "cuda")]
+    fn open_composition_poly_with_proof(
+        proof: Proof<Commitment>,
+        lde_composition_poly_evaluations: &[Vec<FieldElement<FieldExtension>>],
+        index: usize,
+    ) -> PolynomialOpenings<FieldExtension>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
+        let lde_composition_poly_parts_evaluation: Vec<_> = lde_composition_poly_evaluations
+            .iter()
+            .flat_map(|part| {
+                vec![
+                    part[reverse_index(index * 2, part.len() as u64)].clone(),
+                    part[reverse_index(index * 2 + 1, part.len() as u64)].clone(),
+                ]
+            })
+            .collect();
+
+        PolynomialOpenings {
+            proof,
+            evaluations: lde_composition_poly_parts_evaluation
+                .clone()
+                .into_iter()
+                .step_by(2)
+                .collect(),
+            evaluations_sym: lde_composition_poly_parts_evaluation
+                .into_iter()
+                .skip(1)
+                .step_by(2)
+                .collect(),
+        }
+    }
+
     /// Computes values and validity proofs of the evaluations of trace polynomials at
     /// the FRI query challenge `challenge` and its symmetric counterpart. The caller
     /// supplies a `gather` closure that pulls the row data from the column-major LDE
@@ -1801,6 +1945,163 @@ pub trait IsStarkProver<
         }
     }
 
+    /// Like [`Self::open_polys_with`], but uses a Merkle proof already gathered
+    /// from the resident device tree (see [`crate::gpu_lde::gather_proofs_dev`])
+    /// instead of walking a host tree. Row-pair leaf: one proof at position
+    /// `challenge` authenticates both the queried row and its symmetric
+    /// counterpart. Evaluations still come from the host LDE columns via `gather`.
+    #[cfg(feature = "cuda")]
+    fn open_polys_with_proofs<C, G>(
+        domain: &Domain<Field>,
+        proof: Proof<Commitment>,
+        challenge: usize,
+        gather: G,
+    ) -> PolynomialOpenings<C>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
+    {
+        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        PolynomialOpenings {
+            proof,
+            evaluations: gather(reverse_index(challenge * 2, domain_size)),
+            evaluations_sym: gather(reverse_index(challenge * 2 + 1, domain_size)),
+        }
+    }
+
+    /// Build a [`PolynomialOpenings`] from a device Merkle proof and a pair of
+    /// row-value vectors already gathered off the resident device LDE — the
+    /// fully device-sourced counterpart of [`Self::open_polys_with_proofs`],
+    /// which still reads its evaluations from the host LDE.
+    #[cfg(feature = "cuda")]
+    fn open_polys_from_values<C: IsField>(
+        proof: Proof<Commitment>,
+        evaluations: Vec<FieldElement<C>>,
+        evaluations_sym: Vec<FieldElement<C>>,
+    ) -> PolynomialOpenings<C> {
+        PolynomialOpenings {
+            proof,
+            evaluations,
+            evaluations_sym,
+        }
+    }
+
+    /// Slice out query `qi`'s even/odd row (each `ncols` field elements) from the
+    /// row-major device gather `[even(q0), odd(q0), even(q1), odd(q1), ...]`.
+    #[cfg(feature = "cuda")]
+    fn device_row_pair<C: IsField>(
+        vals: &[FieldElement<C>],
+        qi: usize,
+        ncols: usize,
+    ) -> (Vec<FieldElement<C>>, Vec<FieldElement<C>>) {
+        let even = vals[(2 * qi) * ncols..(2 * qi + 1) * ncols].to_vec();
+        let odd = vals[(2 * qi + 1) * ncols..(2 * qi + 2) * ncols].to_vec();
+        (even, odd)
+    }
+
+    /// Gather every query's row-pair off a device-resident LDE (a small D2H of
+    /// only the queried rows), lifting the raw limbs to field elements via
+    /// `convert`. Returns `None` (→ the host arms of the openings) when the
+    /// gather fails or the tower is not Goldilocks; a gather failure is fatal
+    /// only under device-only, where no host copy exists to fall back to. Bumps
+    /// the opening-gather counter exactly when values are produced, so the
+    /// counter reflects the device path actually serving the openings. One body
+    /// for the main and aux arms — `what` only labels the messages.
+    #[cfg(feature = "cuda")]
+    fn gather_query_rows_device<C: IsField>(
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        what: &str,
+        gather: impl FnOnce(&std::sync::Arc<math_cuda::CudaStream>) -> math_cuda::Result<Vec<u64>>,
+        convert: impl FnOnce(&[u64]) -> Option<Vec<FieldElement<C>>>,
+    ) -> Option<Vec<FieldElement<C>>> {
+        let stream = lde_trace
+            .bound_stream()
+            .expect("bound stream for device-resident row gather");
+        let raw = match gather(&stream) {
+            Ok(v) => v,
+            Err(e) => {
+                assert!(
+                    !lde_trace.host_trace_empty(),
+                    "device {what}-row gather failed and the trace is device-only \
+                     (no host fallback): {e:?}"
+                );
+                return None;
+            }
+        };
+        let vals = convert(&raw);
+        if vals.is_some() {
+            crate::gpu_lde::GPU_OPENING_GATHER_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        vals
+    }
+
+    /// One query's trace-poly opening with the device-resident fast paths:
+    /// device Merkle proof + device-gathered values when both are present, the
+    /// device proof with a host gather when only the tree is resident, and the
+    /// full host walk otherwise. One body for the main and aux arms, so the
+    /// device↔host cross-check and the R4 `host_trace_empty` hard-abort guards
+    /// exist exactly once.
+    #[cfg(feature = "cuda")]
+    #[allow(clippy::too_many_arguments)]
+    fn open_trace_polys_device<C, G>(
+        domain: &Domain<Field>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        dev_proofs: Option<&Vec<Proof<Commitment>>>,
+        dev_values: Option<&Vec<FieldElement<C>>>,
+        tree: &BatchedMerkleTree<C>,
+        qi: usize,
+        challenge: usize,
+        ncols: usize,
+        what: &str,
+        gather: G,
+    ) -> PolynomialOpenings<C>
+    where
+        C: IsField,
+        FieldElement<C>: AsBytes + Sync + Send,
+        G: Fn(usize) -> Vec<FieldElement<C>>,
+    {
+        let Some(proofs) = dev_proofs else {
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R4 {what} opening fell back to the host tree, but it is device-only (empty)"
+            );
+            return Self::open_polys_with(domain, tree, challenge, gather);
+        };
+        let proof = proofs[qi].clone();
+        let Some(dev_vals) = dev_values else {
+            // Device tree resident but the value gather is absent: reading the
+            // host gather is invalid under device-only.
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R4 {what} opening fell back to the host gather, but it is device-only (empty)"
+            );
+            return Self::open_polys_with_proofs(domain, proof, challenge, gather);
+        };
+        let (even, odd) = Self::device_row_pair(dev_vals, qi, ncols);
+        // Cross-check the device gather against the host LDE. Skipped under
+        // device-only (host trace empty): the gather was proven bit-identical
+        // while the host copy was resident, and there is nothing to check
+        // against.
+        if !lde_trace.host_trace_empty() {
+            let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+            let r_even = reverse_index(challenge * 2, domain_size);
+            let r_odd = reverse_index(challenge * 2 + 1, domain_size);
+            assert_eq!(
+                even,
+                gather(r_even),
+                "device {what}-row gather mismatch (even), query {qi}"
+            );
+            assert_eq!(
+                odd,
+                gather(r_odd),
+                "device {what}-row gather mismatch (odd), query {qi}"
+            );
+        }
+        Self::open_polys_from_values(proof, even, odd)
+    }
+
     /// Open the deep composition polynomial on a list of indexes and their symmetric elements.
     fn open_deep_composition_poly(
         domain: &Domain<Field>,
@@ -1820,7 +2121,133 @@ pub trait IsStarkProver<
         let num_precomputed_cols = main_commit.num_precomputed_cols;
         let total_cols = lde_trace.num_main_cols();
 
-        for index in indexes_to_open.iter() {
+        // Row-pair LDE positions for every query, `[even(q0), odd(q0), ...]`.
+        // Each query opens the leaf at `challenge`, which pairs LDE rows
+        // `reverse_index(2·challenge)` (the queried point) and
+        // `reverse_index(2·challenge+1)` (its symmetric `-x` point).
+        #[cfg(feature = "cuda")]
+        let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        #[cfg(feature = "cuda")]
+        let query_rows: Vec<u32> = indexes_to_open
+            .iter()
+            .flat_map(|&c| {
+                [
+                    reverse_index(c * 2, domain_size) as u32,
+                    reverse_index(c * 2 + 1, domain_size) as u32,
+                ]
+            })
+            .collect();
+
+        // R4 trace proofs from the resident device trees, gathered in one batch
+        // over all query positions instead of walking the host trees (byte
+        // identical to the host proofs, guarded by the `merkle_gather` test).
+        // `*_dev_proofs` is `Some` exactly when the tree is device resident (so
+        // the host tree is a root only placeholder). In that case the gather
+        // must succeed: there is no host tree to fall back to, so a gather error
+        // is a hard abort. When the tree is not device resident the value is
+        // `None` and the openings below walk the full host tree.
+        #[cfg(feature = "cuda")]
+        let main_dev_proofs: Option<Vec<Proof<Commitment>>> = if is_preprocessed {
+            None
+        } else {
+            lde_trace
+                .gpu_main()
+                .and_then(|h| h.tree.as_ref())
+                .map(|tree| {
+                    let stream = lde_trace
+                        .bound_stream()
+                        .expect("bound stream for device-resident main-tree opening");
+                    // Row-pair leaves: one proof per query at position `challenge`.
+                    crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream).expect(
+                        "device main-tree gather failed; resident tree has no host fallback",
+                    )
+                })
+        };
+
+        // Same for the aux trace tree, when it is device resident.
+        #[cfg(feature = "cuda")]
+        let aux_dev_proofs: Option<Vec<Proof<Commitment>>> = round_1_result
+            .aux
+            .as_ref()
+            .and_then(|_aux| lde_trace.gpu_aux().and_then(|h| h.tree.as_ref()))
+            .map(|tree| {
+                let stream = lde_trace
+                    .bound_stream()
+                    .expect("bound stream for device-resident aux-tree opening");
+                // Row-pair leaves: one proof per query at position `challenge`.
+                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream)
+                    .expect("device aux-tree gather failed; resident tree has no host fallback")
+            });
+
+        // Composition tree: openings open a single position `index` (row pair
+        // leaf), so gather one proof per query challenge from the device tree.
+        #[cfg(feature = "cuda")]
+        let comp_dev_proofs: Option<Vec<Proof<Commitment>>> =
+            round_2_result.gpu_composition_tree.as_ref().map(|tree| {
+                let stream = lde_trace
+                    .bound_stream()
+                    .expect("bound stream for device-resident composition-tree opening");
+                crate::gpu_lde::gather_proofs_dev(tree, indexes_to_open, &stream).expect(
+                    "device composition-tree gather failed; resident tree has no host fallback",
+                )
+            });
+
+        // Full-residency Stage 2: gather each query's row-pair straight off the
+        // resident device LDE (a small D2H of only the queried rows), instead of
+        // indexing the full host LDE trace. The host trace is still resident this
+        // stage and every device row is cross-checked against it in the loop
+        // below; Stage 3 drops the host copy once this path is proven. `None`
+        // when the LDE is not device resident or the tower is not Goldilocks (→
+        // host gather). Row-major: `q`-th row's columns at `[q*ncols ..]`.
+        // Gate the value gathers on the corresponding device-tree proofs so the
+        // two device arms stay aligned (`*_dev_proofs.is_some() ⇔
+        // *_dev_values.is_some()` on the Goldilocks path) and we never gather
+        // rows for a tree that is not device resident.
+        #[cfg(feature = "cuda")]
+        let main_dev_values: Option<Vec<FieldElement<Field>>> =
+            main_dev_proofs.as_ref().and_then(|_| {
+                lde_trace.gpu_main().and_then(|h| {
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "main",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_base_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| crate::constraint_ir::gpu_interp::base_u64_to_field::<Field>(raw),
+                    )
+                })
+            });
+
+        #[cfg(feature = "cuda")]
+        let aux_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
+            aux_dev_proofs.as_ref().and_then(|_| {
+                lde_trace.gpu_aux().and_then(|h| {
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "aux",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_ext3_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| {
+                            crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(
+                                raw,
+                            )
+                        },
+                    )
+                })
+            });
+
+        for (qi, index) in indexes_to_open.iter().enumerate() {
+            #[cfg(not(feature = "cuda"))]
+            let _ = qi;
             // For preprocessed tables, open the main split (multiplicities only);
             // for normal tables, open all main columns.
             let main_trace_opening = if is_preprocessed {
@@ -1828,9 +2255,27 @@ pub trait IsStarkProver<
                     lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                 })
             } else {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
-                    lde_trace.gather_main_row(row)
-                })
+                #[cfg(feature = "cuda")]
+                {
+                    Self::open_trace_polys_device(
+                        domain,
+                        lde_trace,
+                        main_dev_proofs.as_ref(),
+                        main_dev_values.as_ref(),
+                        &main_commit.tree,
+                        qi,
+                        *index,
+                        total_cols,
+                        "main",
+                        |row| lde_trace.gather_main_row(row),
+                    )
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                        lde_trace.gather_main_row(row)
+                    })
+                }
             };
 
             // For preprocessed tables, also open the precomputed-columns tree.
@@ -1840,16 +2285,55 @@ pub trait IsStarkProver<
                 })
             });
 
-            let composition_openings = Self::open_composition_poly(
-                &round_2_result.composition_poly_merkle_tree,
-                &round_2_result.lde_composition_poly_evaluations,
-                *index,
-            );
+            let composition_openings = {
+                #[cfg(feature = "cuda")]
+                {
+                    if let Some(proofs) = &comp_dev_proofs {
+                        Self::open_composition_poly_with_proof(
+                            proofs[qi].clone(),
+                            &round_2_result.lde_composition_poly_evaluations,
+                            *index,
+                        )
+                    } else {
+                        Self::open_composition_poly(
+                            &round_2_result.composition_poly_merkle_tree,
+                            &round_2_result.lde_composition_poly_evaluations,
+                            *index,
+                        )
+                    }
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_composition_poly(
+                        &round_2_result.composition_poly_merkle_tree,
+                        &round_2_result.lde_composition_poly_evaluations,
+                        *index,
+                    )
+                }
+            };
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
-                Self::open_polys_with(domain, &aux.tree, *index, |row| {
-                    lde_trace.gather_aux_row(row)
-                })
+                #[cfg(feature = "cuda")]
+                {
+                    Self::open_trace_polys_device(
+                        domain,
+                        lde_trace,
+                        aux_dev_proofs.as_ref(),
+                        aux_dev_values.as_ref(),
+                        &aux.tree,
+                        qi,
+                        *index,
+                        lde_trace.num_aux_cols(),
+                        "aux",
+                        |row| lde_trace.gather_aux_row(row),
+                    )
+                }
+                #[cfg(not(feature = "cuda"))]
+                {
+                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                        lde_trace.gather_aux_row(row)
+                    })
+                }
             });
 
             openings.push(DeepPolynomialOpening {
@@ -2013,6 +2497,11 @@ pub trait IsStarkProver<
                         domain,
                         twiddles,
                         precomputed,
+                        // The batched MMCS below is built from the host LDE
+                        // copies, so the R1 device-only D2H skip is never valid
+                        // on this path.
+                        #[cfg(feature = "cuda")]
+                        false,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     )
@@ -2209,7 +2698,12 @@ pub trait IsStarkProver<
                                     FieldExtension,
                                     BatchedMerkleTreeBackend<FieldExtension>,
                                 >(
-                                    ra, domain.blowup_factor, &twiddles.coset_weights
+                                    ra,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
+                                    // The batched MMCS and DEEP codewords read
+                                    // the host LDE, so it must be retained.
+                                    true,
                                 )
                                 .ok_or_else(|| {
                                     ProvingError::Fft(
@@ -2251,6 +2745,9 @@ pub trait IsStarkProver<
                                     num_cols,
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
+                                    // The batched MMCS and DEEP codewords read
+                                    // the host LDE, so it must be retained.
+                                    true,
                                 )
                             {
                                 #[cfg(feature = "instruments")]
@@ -2794,11 +3291,19 @@ pub trait IsStarkProver<
                     let precomputed = air
                         .is_preprocessed()
                         .then(|| (air.precomputed_commitment(), air.num_precomputed_columns()));
+
+                    // Stage-3 device-only gate: when it holds, `commit_main_trace`
+                    // keeps the R1 LDE device-resident and skips the host D2H.
+                    #[cfg(feature = "cuda")]
+                    let device_only = Self::device_only_for(*air, domain);
+
                     Self::commit_main_trace(
                         *trace,
                         domain,
                         twiddles,
                         precomputed,
+                        #[cfg(feature = "cuda")]
+                        device_only,
                         #[cfg(feature = "disk-spill")]
                         storage_mode,
                     )
@@ -3002,6 +3507,12 @@ pub trait IsStarkProver<
                     if air.has_aux_trace() {
                         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
 
+                        // Same gate as the main commit (Phase A): skip the aux
+                        // host D2H when device-only, so both buffers are left
+                        // empty together for this table.
+                        #[cfg(feature = "cuda")]
+                        let device_only = Self::device_only_for(*air, domain);
+
                         // Resident GPU path: aux columns already on device (from
                         // the resident LogUp aux build) — LDE straight from device
                         // memory, no upload, no host column extraction. When the
@@ -3018,7 +3529,10 @@ pub trait IsStarkProver<
                                     FieldExtension,
                                     BatchedMerkleTreeBackend<FieldExtension>,
                                 >(
-                                    ra, domain.blowup_factor, &twiddles.coset_weights
+                                    ra,
+                                    domain.blowup_factor,
+                                    &twiddles.coset_weights,
+                                    !device_only,
                                 )
                                 .ok_or_else(|| {
                                     ProvingError::Fft(
@@ -3060,6 +3574,7 @@ pub trait IsStarkProver<
                                     num_cols,
                                     domain.blowup_factor,
                                     &twiddles.coset_weights,
+                                    !device_only,
                                 )
                             {
                                 #[cfg(feature = "instruments")]
@@ -3761,6 +4276,9 @@ pub trait IsStarkProver<
             &l2g_domain,
             &l2g_tw,
             None,
+            // L2G openings read the host LDE, so the device-only D2H skip is
+            // never valid on this lane.
+            false,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )?;
