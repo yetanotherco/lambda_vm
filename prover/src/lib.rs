@@ -196,6 +196,10 @@ pub enum Error {
     InvalidContinuationEpochSize(String),
     /// Continuation proof construction hit an internal invariant failure.
     ContinuationInvariant(String),
+    /// A continuation epoch touches too large a fraction of total memory to pad its
+    /// local-to-global table to a power of two with brought-forward filler rows
+    /// (`#total live cells < next_pow2(#touched this epoch)`).
+    ContinuationFillerShortage(String),
     /// Continuation bundle is structurally malformed (fails validation before
     /// any proof is checked).
     MalformedContinuationBundle(String),
@@ -223,6 +227,9 @@ impl fmt::Display for Error {
             }
             Error::ContinuationInvariant(msg) => {
                 write!(f, "continuation invariant failed: {msg}")
+            }
+            Error::ContinuationFillerShortage(msg) => {
+                write!(f, "continuation local-to-global filler shortage: {msg}")
             }
             Error::MalformedContinuationBundle(msg) => {
                 write!(f, "malformed continuation bundle: {msg}")
