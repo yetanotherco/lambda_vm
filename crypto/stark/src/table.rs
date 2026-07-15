@@ -235,6 +235,40 @@ where
         let start = row_idx * width;
         &self.row_major_data()[start..start + width]
     }
+
+    /// Build a [`Frame`](crate::frame::Frame) over this archived table. Only the
+    /// small OOD frame is materialized (bounded by `step_size × width`), never
+    /// the whole proof. Reads through the uniform `get_row`/`height` accessors.
+    pub fn into_frame(
+        &self,
+        main_trace_columns: usize,
+        step_size: usize,
+    ) -> crate::frame::Frame<F, F>
+    where
+        F: IsSubFieldOf<F>,
+    {
+        let height = self.height();
+        debug_assert!(height.is_multiple_of(step_size));
+        let steps = (0..height)
+            .step_by(step_size)
+            .map(|initial_row_idx| {
+                let end_row_idx = initial_row_idx + step_size;
+
+                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
+
+                (initial_row_idx..end_row_idx).for_each(|row_idx| {
+                    let row = self.get_row(row_idx);
+                    step_main_data.push(row[..main_trace_columns].to_vec());
+                    step_aux_data.push(row[main_trace_columns..].to_vec());
+                });
+
+                TableView::new(step_main_data, step_aux_data)
+            })
+            .collect();
+
+        crate::frame::Frame::new(steps)
+    }
 }
 
 /// Cloning a spilled table copies its mmap bytes into a fresh heap `Vec`
