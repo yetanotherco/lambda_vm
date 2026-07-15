@@ -49,8 +49,12 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // For preprocessed tables: commitment to precomputed columns only.
     // Verifier checks this matches the hardcoded commitment from AIR.
     pub lde_trace_precomputed_merkle_root: Option<Commitment>,
-    // tⱼ(zgᵏ)
+    // tⱼ(zgᵏ) for the current-row block (offset 0): every trace column at z.
     pub trace_ood_evaluations: Table<E>,
+    // tⱼ(zgᵏ) for the next-row block(s) (offset >= 1), pruned to only the columns
+    // a transition constraint reads at the next row (the AIR transition window).
+    // Empty (width 0) when the AIR reads no next-row columns.
+    pub trace_ood_next_evaluations: Table<E>,
     // Commitments to Hᵢ
     pub composition_poly_root: Commitment,
     // Hᵢ(z^N)
