@@ -170,3 +170,100 @@ fn fork_isolation() {
 
     assert_eq!(fork_a.sample(), fork_a_fresh.sample());
 }
+
+#[test]
+fn sample_bits_values_are_in_range() {
+    let mut t = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x11, 0x22, 0x33]);
+    let bits = 24;
+    for _ in 0..200 {
+        let v = t.sample_bits(bits);
+        assert!(v < (1u64 << bits), "sample_bits({bits}) out of range: {v}");
+    }
+}
+
+#[test]
+fn sample_bits_is_deterministic_across_clones() {
+    let base = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0xAB; 8]);
+    let mut a = base.clone();
+    let mut b = base.clone();
+    let seq_a: Vec<u64> = (0..50).map(|_| a.sample_bits(21)).collect();
+    let seq_b: Vec<u64> = (0..50).map(|_| b.sample_bits(21)).collect();
+    assert_eq!(
+        seq_a, seq_b,
+        "identical transcript state must yield identical query bits (prover/verifier agreement)"
+    );
+}
+
+#[test]
+fn sample_bits_covers_full_small_range() {
+    let mut t = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x42]);
+    let bits = 3; // range [0, 8)
+    let mut seen = [false; 8];
+    for _ in 0..500 {
+        seen[t.sample_bits(bits) as usize] = true;
+    }
+    assert!(
+        seen.iter().all(|&s| s),
+        "sample_bits(3) should reach all 8 values (unbiased masking)"
+    );
+}
+
+#[test]
+fn absorbing_clears_sample_bits_reservoir() {
+    // No absorb between two samples: the second reuses buffered bytes, no new squeeze.
+    let mut t = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x09]);
+    let _ = t.sample_bits(24);
+    let mid = t.keccak_squeezes();
+    let _ = t.sample_bits(24);
+    assert_eq!(
+        t.keccak_squeezes(),
+        mid,
+        "a second sample_bits should reuse the reservoir (no extra Keccak squeeze)"
+    );
+
+    // Absorb between: the reservoir is invalidated and the next sample re-squeezes.
+    let mut t = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x09]);
+    let _ = t.sample_bits(24);
+    t.append_bytes(&[0xEE]);
+    let mid = t.keccak_squeezes();
+    let _ = t.sample_bits(24);
+    assert_eq!(
+        t.keccak_squeezes(),
+        mid + 1,
+        "an absorb must clear the reservoir, forcing a fresh squeeze so bits stay bound to it"
+    );
+}
+
+#[test]
+fn sample_bits_amortizes_keccak_squeezes() {
+    let num_queries = 80usize;
+    let bits = 24usize; // 3 bytes per query
+
+    // New path: sample_bits from the shared reservoir.
+    let mut t_bits = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x01, 0x02]);
+    let before = t_bits.keccak_squeezes();
+    for _ in 0..num_queries {
+        let _ = t_bits.sample_bits(bits);
+    }
+    let bits_squeezes = t_bits.keccak_squeezes() - before;
+
+    // Old path: one sample_u64 (= one Keccak squeeze) per query.
+    let mut t_u64 = DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[0x01, 0x02]);
+    let before = t_u64.keccak_squeezes();
+    for _ in 0..num_queries {
+        let _ = t_u64.sample_u64(1u64 << bits);
+    }
+    let u64_squeezes = t_u64.keccak_squeezes() - before;
+
+    // 80 queries * 3 bytes = 240 bytes -> ceil(240 / 32) = 8 squeezes.
+    let expected = (num_queries * bits.div_ceil(8)).div_ceil(32);
+    assert_eq!(bits_squeezes, expected, "reservoir squeeze count");
+    assert_eq!(
+        u64_squeezes, num_queries,
+        "sample_u64 does one squeeze per query"
+    );
+    assert!(
+        bits_squeezes * 8 <= u64_squeezes,
+        "sample_bits should cut query-phase Keccak permutations ~10x: {bits_squeezes} vs {u64_squeezes}"
+    );
+}

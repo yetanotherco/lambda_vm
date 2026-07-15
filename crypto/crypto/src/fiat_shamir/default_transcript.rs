@@ -14,6 +14,20 @@ use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {
     hasher: Keccak256,
+    /// Byte reservoir feeding [`IsTranscript::sample_bits`]: bytes squeezed
+    /// from the sponge that have not been consumed yet. A single 32-byte
+    /// squeeze serves many small index samples — FRI query indices need only
+    /// `log2(domain)` bits each — instead of one Keccak permutation per index.
+    /// Cleared on every absorb so sampled bits stay bound to the full prior
+    /// transcript (mirrors Plonky3's `HashChallenger`, which clears its output
+    /// buffer on `observe`).
+    sample_buffer: Vec<u8>,
+    /// Number of bytes at the front of `sample_buffer` already consumed.
+    sample_cursor: usize,
+    /// Count of Keccak squeezes performed (`sample()` calls). A cheap profiling
+    /// counter for the verifier's Keccak-permutation budget — the FRI query
+    /// phase dominates it, which is exactly what `sample_bits` amortizes.
+    keccak_squeezes: usize,
     phantom: PhantomData<F>,
 }
 
@@ -21,6 +35,9 @@ impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
     fn clone(&self) -> Self {
         Self {
             hasher: self.hasher.clone(),
+            sample_buffer: self.sample_buffer.clone(),
+            sample_cursor: self.sample_cursor,
+            keccak_squeezes: self.keccak_squeezes,
             phantom: PhantomData,
         }
     }
@@ -34,6 +51,9 @@ where
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
             hasher: Keccak256::new(),
+            sample_buffer: Vec::new(),
+            sample_cursor: 0,
+            keccak_squeezes: 0,
             phantom: PhantomData,
         };
         res.append_bytes(data);
@@ -44,7 +64,34 @@ where
         let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
         result_hash.reverse();
         self.hasher.update(result_hash);
+        self.keccak_squeezes += 1;
         result_hash
+    }
+
+    /// Number of Keccak squeezes (`sample()` calls) performed so far. The FRI
+    /// query phase dominates the verifier's Keccak cost; `sample_bits`
+    /// amortizes one squeeze across many query indices, so this counter drops
+    /// by roughly `256 / bits` on that phase.
+    pub fn keccak_squeezes(&self) -> usize {
+        self.keccak_squeezes
+    }
+
+    /// Pull `n` fresh reservoir bytes (`n <= 8`) as a big-endian integer,
+    /// refilling from the sponge in 32-byte squeezes when drained. Big-endian
+    /// assembly matches the existing `sample_u64` byte convention.
+    fn next_reservoir_bytes(&mut self, n: usize) -> u64 {
+        let mut acc: u64 = 0;
+        for _ in 0..n {
+            if self.sample_cursor == self.sample_buffer.len() {
+                let block = self.sample();
+                self.sample_buffer.clear();
+                self.sample_buffer.extend_from_slice(&block);
+                self.sample_cursor = 0;
+            }
+            acc = (acc << 8) | self.sample_buffer[self.sample_cursor] as u64;
+            self.sample_cursor += 1;
+        }
+        acc
     }
 }
 
@@ -65,6 +112,11 @@ where
 {
     fn append_bytes(&mut self, new_bytes: &[u8]) {
         self.hasher.update(new_bytes);
+        // Absorbing new data invalidates any leftover squeezed bits: a later
+        // `sample_bits` must reflect everything absorbed so far. `append_field_element`
+        // routes through here, so field-element absorbs clear the reservoir too.
+        self.sample_buffer.clear();
+        self.sample_cursor = 0;
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
@@ -89,6 +141,18 @@ where
                 return candidate % upper_bound;
             }
         }
+    }
+
+    fn sample_bits(&mut self, bits: usize) -> u64 {
+        assert!(
+            (1..64).contains(&bits),
+            "sample_bits: bits must be in 1..=63"
+        );
+        // Power-of-two range: masking is exactly uniform, so no rejection is
+        // needed. Draw the fewest whole bytes covering `bits` from the shared
+        // reservoir and keep the low `bits`.
+        let raw = self.next_reservoir_bytes(bits.div_ceil(8));
+        raw & ((1u64 << bits) - 1)
     }
 }
 
