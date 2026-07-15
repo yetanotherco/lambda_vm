@@ -21,16 +21,14 @@ const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
 
 /// Read a file into a buffer aligned for `rkyv::from_bytes`. A plain
 /// `Vec<u8>` from `std::fs::read` is align-1 by the type system even though
-/// the allocator happens to return well-aligned memory in practice — read
-/// straight into an `AlignedVec` instead of relying on that.
+/// the allocator happens to return well-aligned memory in practice — copy
+/// into an `AlignedVec` instead of relying on that. Uses the cross-platform
+/// `std::fs::read`; the previous `read_exact_at` was unix-only, and casting
+/// the u64 file length to `usize` truncated on 32-bit hosts.
 fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>> {
-    use std::os::unix::fs::FileExt;
-
-    let file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len() as usize;
-    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
-    aligned.resize(len, 0);
-    file.read_exact_at(&mut aligned, 0)?;
+    let bytes = std::fs::read(path)?;
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(bytes.len());
+    aligned.extend_from_slice(&bytes);
     Ok(aligned)
 }
 

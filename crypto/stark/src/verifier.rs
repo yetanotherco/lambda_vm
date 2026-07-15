@@ -900,15 +900,20 @@ pub trait IsStarkVerifier<
             }
             // The archive is read in place without validation; reject an OOD
             // table whose advertised dimensions disagree with its data length,
-            // has no rows, or whose height isn't a whole number of AIR steps
-            // (which `into_frame` below only `debug_assert!`s, not checks) —
-            // all before any row access indexes into it.
+            // has no rows, whose height isn't a whole number of AIR steps
+            // (which `into_frame` below only `debug_assert!`s, not checks), or
+            // whose width disagrees with the AIR's main+aux column count — a
+            // too-narrow row would make the boundary/transition column indexing
+            // in `step_2` read past the row slice and panic. All checks run
+            // before any row access indexes into the table.
             let trace_ood_evaluations = proof.trace_ood_evaluations();
             if !trace_ood_evaluations.dimensions_consistent()
                 || trace_ood_evaluations.height() == 0
                 || !trace_ood_evaluations
                     .height()
                     .is_multiple_of(air.step_size())
+                || trace_ood_evaluations.width()
+                    != air.trace_layout().0 + air.num_auxiliary_rap_columns()
             {
                 return false;
             }
@@ -1148,9 +1153,15 @@ pub trait IsStarkVerifier<
         // Column-major append (matches `Table::columns()` order) reading the
         // rows in place, without materializing transposed columns.
         let ood = proof.trace_ood_evaluations();
-        for col_idx in 0..ood.width() {
-            for row_idx in 0..ood.height() {
-                transcript.append_field_element(&ood.get_row(row_idx)[col_idx]);
+        // Shape validated up front (dimensions_consistent + width/height), so
+        // index the row-major backing directly instead of recomputing a row
+        // slice per element as `get_row` would.
+        let ood_width = ood.width();
+        let ood_height = ood.height();
+        let ood_data = ood.row_major_data();
+        for col_idx in 0..ood_width {
+            for row_idx in 0..ood_height {
+                transcript.append_field_element(&ood_data[row_idx * ood_width + col_idx]);
             }
         }
         // <<<< Receive value: Hᵢ(z^N)
