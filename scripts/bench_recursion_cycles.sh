@@ -18,8 +18,8 @@
 # single measuring CLI (MEASURE_CLI) built once from the checkout this script runs in:
 #   * Guest cycles  — retired instructions.
 #   * Keccak calls  — keccak-permutation accelerator ecalls (one cycle each, but each
-#                     runs a whole permutation invisibly, so it's the companion signal;
-#                     currently 0 until the verifier is wired to the keccak syscall).
+#                     runs a whole permutation invisibly, so it's the companion signal:
+#                     the verifier's Merkle/transcript hashing rides on this syscall).
 # The CLI also prints an Ecsm (EC scalar-mul) count, but the STARK verifier does no
 # scalar-mul, so it is structurally 0 for a recursion proof — dropped as noise, not read.
 # MEASURE_CLI's executor counts ANY ref's guest ELF correctly (it just feeds the blob
@@ -35,14 +35,22 @@
 # Usage: scripts/bench_recursion_cycles.sh REF_A [REF_B=origin/main] [PRESET=min]
 #   REF_A    ref/SHA to evaluate (the PR side).
 #   REF_B    baseline ref/SHA (default origin/main).
-#   PRESET   recursion-verifier preset (default min). Per ref the tool prefers
-#            recursion-<PRESET>.elf and falls back to recursion.elf (older refs / main
-#            build a single unnamed recursion guest). It is EXPECTED and correct for the
-#            two sides to use DIFFERENT artifacts — e.g. main→recursion.elf while a
-#            preset PR→recursion-min.elf — because both are verified under the SAME min
-#            proof options (the dump test pins MIN_PROOF_OPTIONS). The printed per-ref
-#            `guest=<artifact>` labels show which each side used; a differing name is the
-#            expected comparison, not a mismatch.
+#   PRESET   recursion-verifier preset (default min): min = blowup=2, 1 query
+#            (cheap diagnostic regime); blowup2 = blowup=2, 219 queries (the
+#            realistic base-layer proof shape at 128-bit — production pipelines
+#            prove the base at low blowup and wrap at high blowup); blowup4 =
+#            blowup=4, 110 queries (the other realistic base-layer point);
+#            blowup8 = blowup=8, 73 queries. The preset picks BOTH the guest ELF
+#            (recursion-<PRESET>.elf, falling back to recursion.elf on older refs
+#            that build a single unnamed min guest) AND the inner-proof options of
+#            the dumped blob (exported as RECURSION_DUMP_PRESET to the dump test).
+#            Refs predating the preset-aware dump test always dump min options, so
+#            only PRESET=min is measurable for them — the script fails loudly
+#            up front rather than let the guest reject the blob in-VM. It is
+#            EXPECTED and correct for the two sides to use DIFFERENT artifact
+#            names (e.g. main→recursion.elf vs PR→recursion-min.elf) — both are
+#            verified under the SAME preset options. The printed per-ref
+#            `guest=<artifact>` labels show which each side used.
 #   Env:
 #     REBUILD=1            force rebuild of MEASURE_CLI and re-run of every ref
 #                          (guest build + blob dump + measurement); ignore caches.
@@ -104,8 +112,8 @@ prune_worktree_cache() {
     echo "==> Pruning old ref worktree $wt (keeping newest $PRUNE_KEEP)" >&2
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin \
-          "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}".log \
-          "$WORK"/measure_"${s8}".err
+          "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
+          "$WORK"/measure_"${s8}"*.err
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
@@ -229,22 +237,29 @@ measure_ref() {
   fi
   echo "==> [$role] guest ELF: $(basename "$guest_elf")" >&2
 
-  # 2c. Generate this ref's own input blob via its ignored dump test.
+  # 2c. Generate this ref's own input blob via its ignored dump test, under this
+  # preset's options (RECURSION_DUMP_PRESET). Refs predating the preset-aware dump
+  # test always prove the min options; feeding that blob to a non-min guest would
+  # only fail in-VM verification much later, so refuse loudly up front instead.
   if ! grep -rq "fn test_dump_recursion_input" "$wt/prover/src/tests/" 2>/dev/null; then
     echo "ERROR: [$role] ref $ref ($sha8) has no 'test_dump_recursion_input' — cannot generate its input blob." >&2
     exit 1
   fi
-  echo "==> [$role] dumping recursion input blob (cargo test test_dump_recursion_input) ..." >&2
+  if [ "$PRESET" != "min" ] && ! grep -rq "RECURSION_DUMP_PRESET" "$wt/prover/src/tests/" 2>/dev/null; then
+    echo "ERROR: [$role] ref $ref ($sha8) predates the preset-aware dump test (no RECURSION_DUMP_PRESET) — only PRESET=min is measurable for it." >&2
+    exit 1
+  fi
+  echo "==> [$role] dumping recursion input blob (cargo test test_dump_recursion_input, preset=$PRESET) ..." >&2
   rm -f /tmp/recursion_input.bin
-  local dlog="$WORK/dump_${sha8}.log"
+  local dlog="$WORK/dump_${sha8}_${PRESET}.log"
   if [ -n "${HOST_TARGET_DIR:-}" ]; then
-    if ! ( cd "$wt" && CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo test -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
+    if ! ( cd "$wt" && RECURSION_DUMP_PRESET="$PRESET" CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
       echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
       tail -40 "$dlog" >&2
       exit 1
     fi
   else
-    if ! ( cd "$wt" && cargo test -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
+    if ! ( cd "$wt" && RECURSION_DUMP_PRESET="$PRESET" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
       echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
       tail -40 "$dlog" >&2
       exit 1
@@ -262,9 +277,9 @@ measure_ref() {
   echo "==> [$role] measuring: $MEASURE_CLI execute $(basename "$guest_elf") --private-input <blob> --cycles" >&2
   local t0 t1 dt out
   t0=$(date +%s)
-  if ! out="$("$MEASURE_CLI" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}.err")"; then
+  if ! out="$("$MEASURE_CLI" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}_${PRESET}.err")"; then
     echo "ERROR: [$role] MEASURE_CLI execute failed for $ref ($sha8). Tail of stderr:" >&2
-    tail -20 "$WORK/measure_${sha8}.err" >&2
+    tail -20 "$WORK/measure_${sha8}_${PRESET}.err" >&2
     exit 1
   fi
   t1=$(date +%s); dt=$((t1 - t0))
@@ -334,10 +349,13 @@ mcycd() {
 }
 
 # Human label for the proof regime this preset measures, so a reader can't mistake the
-# single-query `min` number for the full 128-bit verifier cost. CI always passes `min`.
+# single-query `min` number for the full 128-bit verifier cost. CI passes `min` plus
+# the full-query regimes `blowup2`/`blowup4` (see .github/workflows/bench-verify.yml).
 case "$PRESET" in
   min)     REGIME="single query (blowup=2, 1 query)" ;;
-  blowup8) REGIME="128-bit (blowup=8, multi-query)" ;;
+  blowup2) REGIME="128-bit (blowup=2, 219 queries — realistic base-layer)" ;;
+  blowup4) REGIME="128-bit (blowup=4, 110 queries — realistic base-layer)" ;;
+  blowup8) REGIME="128-bit (blowup=8, 73 queries)" ;;
   *)       REGIME="$PRESET" ;;
 esac
 

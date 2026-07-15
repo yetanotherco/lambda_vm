@@ -537,6 +537,81 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
     );
 }
 
+/// Continuation flavor of the roundtrip guard: prove the empty program via
+/// continuations (tiny epochs so the bundle is genuinely multi-epoch), encode
+/// the [`recursion::ContinuationGuestInput`] blob, decode it exactly as the
+/// `continuation`-feature guest does, and mirror its
+/// `verify_continuation_and_attest` call — a cheap host-side check of the
+/// encode/decode/verify/attest contract without running the VM.
+#[test]
+fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
+    let root = workspace_root();
+    let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
+    let inner_input = 10u64.to_le_bytes();
+
+    let bundle = crate::continuation::prove_continuation(
+        &fib_elf_bytes,
+        &inner_input,
+        4,
+        &MIN_PROOF_OPTIONS,
+    )
+    .expect("continuation prove should succeed");
+    assert!(
+        bundle.num_epochs() > 1,
+        "epoch=2^4 must split fibonacci(10) into multiple epochs for this test to bite"
+    );
+    // Ground truth: the trustless recompute path must accept the bundle.
+    let expected_output =
+        crate::continuation::verify_continuation(&fib_elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
+            .expect("verify_continuation errored")
+            .expect("bundle must verify with recomputed roots");
+    let blob =
+        recursion::encode_continuation_guest_input(&bundle, &fib_elf_bytes, &MIN_PROOF_OPTIONS)
+            .expect("encode_continuation_guest_input failed");
+
+    // Decode exactly as the guest does (built with `continuation` + `min`).
+    let (decoded_bundle, inner_elf, decode_commitment, page_commitments): recursion::ContinuationGuestInput =
+        postcard::from_bytes(&blob).expect("postcard decode of ContinuationGuestInput failed");
+    eprintln!(
+        "[cont-roundtrip] decode ok: {} epochs, elf {} bytes, {} page genesis roots",
+        decoded_bundle.num_epochs(),
+        inner_elf.len(),
+        page_commitments.len(),
+    );
+
+    let attestation = recursion::verify_continuation_and_attest(
+        &decoded_bundle,
+        &inner_elf,
+        &MIN_PROOF_OPTIONS,
+        decode_commitment,
+        &page_commitments,
+    )
+    .expect("verify_continuation_and_attest errored")
+    .expect("continuation proof did not survive the postcard round-trip");
+
+    // Consumer re-bind: recompute the roots from the bundle + trusted ELF and
+    // compare ids (the continuation analog of check_attestation).
+    let (expected_decode, expected_pages) =
+        crate::continuation::continuation_precomputed_commitments(
+            &inner_elf,
+            &decoded_bundle,
+            &MIN_PROOF_OPTIONS,
+        )
+        .expect("continuation_precomputed_commitments errored");
+    let expected_id = recursion::program_id_from_elf(&inner_elf, &expected_decode, &expected_pages)
+        .expect("program_id_from_elf errored");
+    let (id, output) = recursion::split_attestation(&attestation).expect("attestation too short");
+    assert_eq!(
+        id, expected_id,
+        "attested id must match the honest recompute"
+    );
+    assert_eq!(
+        output,
+        &expected_output[..],
+        "supplied-roots output must match the recompute path's output"
+    );
+}
+
 /// Corrupting a private-input commitment on an *honest* proof makes
 /// verification fail (`Ok(false)`). Necessary but not sufficient alone — a
 /// custom prover can supply consistent mismatched roots (see
@@ -714,19 +789,93 @@ fn test_recursion_prove_1query() {
 }
 
 /// Dump the guest's private-input blob to `/tmp/recursion_input.bin` for the
-/// CLI's `execute --flamegraph`.
+/// CLI's `execute --flamegraph` and `scripts/bench_recursion_cycles.sh`.
+///
+/// Env knobs:
+/// * `RECURSION_DUMP_PRESET` (`min`|`blowup2`|`blowup4`|`blowup8`, default
+///   `min`) — the [`Preset`] whose options the inner proof is generated under;
+///   must match the `recursion-<preset>.elf` the blob will be fed to, or the
+///   guest rejects the proof.
+/// * `RECURSION_DUMP_INNER_ELF` (path, default the `empty` guest) — the inner
+///   program to prove, for realistic trace heights (e.g. the ethrex guest).
+/// * `RECURSION_DUMP_INNER_INPUT` (path, default none) — the inner program's
+///   private input (e.g. an ethrex-fixtures block).
+/// * `RECURSION_DUMP_EPOCH_LOG2` (int, default unset = monolithic) — prove the
+///   inner via continuations with `2^n`-cycle epochs (memory-bounded prover)
+///   and encode a [`recursion::ContinuationGuestInput`] blob instead; feed it
+///   to `recursion-cont-<preset>.elf`, not the monolithic guest.
 #[test]
 #[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
 fn test_dump_recursion_input() {
     let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
 
-    let (_inner_proof, blob) =
-        prove_inner_and_encode_blob("dump-input", &empty_elf_bytes, &[], &MIN_PROOF_OPTIONS);
+    let preset_name = std::env::var("RECURSION_DUMP_PRESET").unwrap_or_else(|_| "min".to_string());
+    let preset = Preset::ALL
+        .into_iter()
+        .find(|p| p.name() == preset_name)
+        .unwrap_or_else(|| {
+            panic!(
+                "unknown RECURSION_DUMP_PRESET '{preset_name}' (expected min|blowup2|blowup4|blowup8)"
+            )
+        });
+
+    let (inner_elf_bytes, inner_label) = match std::env::var("RECURSION_DUMP_INNER_ELF") {
+        Ok(p) => (
+            std::fs::read(&p).unwrap_or_else(|e| panic!("read RECURSION_DUMP_INNER_ELF {p}: {e}")),
+            p,
+        ),
+        Err(_) => (read_guest_elf(&root, "empty"), "empty".to_string()),
+    };
+    let inner_input = match std::env::var("RECURSION_DUMP_INNER_INPUT") {
+        Ok(p) => {
+            std::fs::read(&p).unwrap_or_else(|e| panic!("read RECURSION_DUMP_INNER_INPUT {p}: {e}"))
+        }
+        Err(_) => Vec::new(),
+    };
+
+    let blob = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
+        Ok(s) => {
+            let epoch_log2: u32 = s
+                .parse()
+                .unwrap_or_else(|e| panic!("bad RECURSION_DUMP_EPOCH_LOG2 '{s}': {e}"));
+            let opts = preset.options();
+            eprintln!(
+                "[dump-input] proving inner continuation (blowup={}, fri_queries={}, epoch=2^{epoch_log2}) ...",
+                opts.blowup_factor, opts.fri_number_of_queries
+            );
+            let bundle = crate::continuation::prove_continuation(
+                &inner_elf_bytes,
+                &inner_input,
+                epoch_log2,
+                &opts,
+            )
+            .expect("inner continuation prove should succeed");
+            eprintln!("[dump-input] continuation epochs: {}", bundle.num_epochs());
+            recursion::encode_continuation_guest_input(&bundle, &inner_elf_bytes, &opts)
+                .expect("recursion::encode_continuation_guest_input failed")
+        }
+        Err(_) => {
+            let (_inner_proof, blob) = prove_inner_and_encode_blob(
+                "dump-input",
+                &inner_elf_bytes,
+                &inner_input,
+                &preset.options(),
+            );
+            blob
+        }
+    };
+    assert!(
+        blob.len() <= executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
+        "recursion input exceeds MAX_PRIVATE_INPUT_SIZE"
+    );
 
     let path = "/tmp/recursion_input.bin";
     std::fs::write(path, &blob).expect("write blob");
-    eprintln!("[dump-input] wrote {} bytes to {path}", blob.len());
+    eprintln!(
+        "[dump-input] preset={} inner={inner_label} wrote {} bytes to {path}",
+        preset.name(),
+        blob.len()
+    );
 }
 
 /// Cycle count only of the recursion guest verifying a 1-query inner proof.
@@ -741,6 +890,22 @@ fn test_recursion_cycles_1query() {
 #[ignore = "diagnostic: fast; recursion guest cycle count (multi-query)"]
 fn test_recursion_cycles_multiquery() {
     run_profile(Preset::Blowup8, 500, false);
+}
+
+/// Cycle count only at 128-bit security with the realistic base-layer shape:
+/// blowup=2 yields ~0.49 bits/query, so the full 219-query FRI dominates.
+#[test]
+#[ignore = "diagnostic: recursion guest cycle count (blowup=2, 219 queries)"]
+fn test_recursion_cycles_blowup2() {
+    run_profile(Preset::Blowup2, 500, false);
+}
+
+/// Cycle count only at 128-bit security, blowup=4 (110 queries) — the other
+/// realistic base-layer point.
+#[test]
+#[ignore = "diagnostic: recursion guest cycle count (blowup=4, 110 queries)"]
+fn test_recursion_cycles_blowup4() {
+    run_profile(Preset::Blowup4, 500, false);
 }
 
 /// Full profile (top-25 + per-step) of the 1-query run.

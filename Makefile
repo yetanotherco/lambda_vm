@@ -56,13 +56,18 @@ RECURSION_GUESTS := empty fibonacci
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # The recursion verifier itself (bench_vs/lambda/recursion) requires picking
-# exactly one of its `min`/`blowup8` Cargo features at build time (fixes the
-# inner ProofOptions — see main.rs). Each preset builds its own distinctly
-# named [[bin]] (recursion-<preset>-bench) to its own artifact, via the
+# exactly one of its preset Cargo features at build time (fixes the inner
+# ProofOptions — see main.rs). Each preset builds its own distinctly named
+# [[bin]] (recursion-<preset>-bench) to its own artifact, via the
 # define/foreach/eval below rather than the generic %.elf pattern rule. The
-# distinct bin names also make the two `cp`s race-free under `make -j`.
-RECURSION_VERIFIER_PRESETS := min blowup8
-RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS)))
+# distinct bin names also make the per-preset `cp`s race-free under `make -j`.
+RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
+# Continuation-verifying variants (the guest's `continuation` feature): verify a
+# multi-epoch ContinuationProof bundle instead of a monolithic VmProof. Kept to
+# the presets the recursion benchmarks actually measure.
+RECURSION_CONT_PRESETS := min blowup2 blowup4
+RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -215,7 +220,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
 
-# The recursion verifier's `min`/`blowup8` presets: same crate dir, one
+# The recursion verifier's presets (RECURSION_VERIFIER_PRESETS): same crate dir, one
 # differently named [[bin]] per preset (recursion-<preset>-bench, gated on that
 # preset's Cargo feature) -> a differently named artifact. Generated per preset
 # from RECURSION_VERIFIER_PRESETS via define/foreach/eval rather than a pattern
@@ -235,6 +240,14 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSI
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
+
+# Continuation variants: same crate, `continuation` feature on top of the preset
+# feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
+define recursion_cont_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+endef
+$(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

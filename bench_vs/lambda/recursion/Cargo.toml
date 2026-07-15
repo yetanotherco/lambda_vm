@@ -9,25 +9,56 @@ edition = "2024"
 # Exactly one selects the fixed ProofOptions (see main.rs) — hardcoded, not
 # private input, so a malicious input can't downgrade the security level.
 # Cargo features are additive by design, so the compile_error! mutual-exclusion
-# guard in main.rs is the loud failure that stops a mislabeled artifact if both
+# guard in main.rs is the loud failure that stops a mislabeled artifact if two
 # ever get enabled at once (e.g. under `--all-features`). The crate must stay a
 # standalone `[workspace]` (not a root-workspace member) so root-level feature
-# unification can never turn both on.
+# unification can never turn two on.
 min = []
+blowup2 = []
+blowup4 = []
 blowup8 = []
+# Orthogonal to the presets: verify a ContinuationProof bundle (multi-epoch,
+# memory-bounded inner prove) instead of a monolithic VmProof. Selects the
+# `recursion-cont-<preset>-bench` bins below.
+continuation = []
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
-# clobbering. Both use src/main.rs; required-features gates each to its preset.
+# clobbering. All use src/main.rs; required-features gates each to its preset.
 [[bin]]
 name = "recursion-min-bench"
 path = "src/main.rs"
 required-features = ["min"]
 
 [[bin]]
+name = "recursion-blowup2-bench"
+path = "src/main.rs"
+required-features = ["blowup2"]
+
+[[bin]]
+name = "recursion-blowup4-bench"
+path = "src/main.rs"
+required-features = ["blowup4"]
+
+[[bin]]
 name = "recursion-blowup8-bench"
 path = "src/main.rs"
 required-features = ["blowup8"]
+
+[[bin]]
+name = "recursion-cont-min-bench"
+path = "src/main.rs"
+required-features = ["continuation", "min"]
+
+[[bin]]
+name = "recursion-cont-blowup2-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2"]
+
+[[bin]]
+name = "recursion-cont-blowup4-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4"]
 
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [

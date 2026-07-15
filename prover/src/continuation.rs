@@ -212,6 +212,7 @@ fn l2g_memory_air(
 fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
+    preprocessed: Option<Commitment>,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let air = AirWithBuses::new(
         global_memory::cols::NUM_COLUMNS,
@@ -225,11 +226,17 @@ fn global_memory_air(
     if config.is_private_input {
         return air;
     }
-    let commitment = if config.init_values.is_some() {
-        page::compute_precomputed_commitment(config, opts)
-    } else {
-        page::zero_init_preprocessed_commitment(opts)
-    };
+    // `preprocessed` lets a caller skip the genesis recompute (an FFT + Merkle
+    // pass per page) by supplying the root — the recursion guest's in-VM path,
+    // where the binding comes from the attestation fold instead (see
+    // `recursion::verify_continuation_and_attest`). `None` = recompute here.
+    let commitment = preprocessed.unwrap_or_else(|| {
+        if config.init_values.is_some() {
+            page::compute_precomputed_commitment(config, opts)
+        } else {
+            page::zero_init_preprocessed_commitment(opts)
+        }
+    });
     air.with_preprocessed(commitment, global_memory::NUM_PREPROCESSED_COLS)
 }
 
@@ -404,6 +411,7 @@ impl ContinuationProof {
 /// INIT = `register_init` and FINI = `reg_fini`. Continuation epochs
 /// use the L2G bookend, so PAGE is skipped and `page_configs` is empty. The
 /// epoch-local L2G air is built separately by the caller (it needs the `label`).
+#[allow(clippy::too_many_arguments)]
 fn build_epoch_airs(
     elf: &Elf,
     opts: &ProofOptions,
@@ -412,6 +420,7 @@ fn build_epoch_airs(
     register_init: &[u32],
     reg_fini: &[u32],
     is_final: bool,
+    decode_commitment: Option<Commitment>,
 ) -> VmAirs {
     // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
     // final register file is a verifier-known public value bound by the REG-C2
@@ -427,7 +436,7 @@ fn build_epoch_airs(
         false,
         page_configs,
         table_counts,
-        None,
+        decode_commitment,
         is_final,
         None,
         None,
@@ -480,6 +489,7 @@ fn prove_epoch(
         start.register_init,
         &reg_fini,
         is_final,
+        None,
     );
 
     let label = start.label;
@@ -536,6 +546,7 @@ fn prove_epoch(
 /// continuation epochs, so the AIRs are built with no page configs (the bundle does
 /// not get to supply any). Returns `true` iff the proof verifies and its committed
 /// L2G root matches the claimed one.
+#[allow(clippy::too_many_arguments)]
 fn verify_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
@@ -544,6 +555,7 @@ fn verify_epoch(
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
 ) -> bool {
     // Reject degenerate table counts (mirrors the monolithic verifier).
     if epoch.table_counts.validate().is_err() {
@@ -571,6 +583,7 @@ fn verify_epoch(
         register_init,
         &epoch.reg_fini,
         is_final,
+        decode_commitment,
     );
     let l2g_air = l2g_memory_air(opts, label);
     let mut refs = airs.air_refs();
@@ -670,7 +683,7 @@ fn prove_global(
         .collect();
     let gm_airs: Vec<_> = gm_configs
         .iter()
-        .map(|config| global_memory_air(opts, config))
+        .map(|config| global_memory_air(opts, config, None))
         .collect();
 
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
@@ -697,6 +710,7 @@ fn prove_global(
     .map_err(|e| Error::Prover(format!("{e:?}")))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_global(
     num_epochs: usize,
     page_bases: &[u64],
@@ -705,6 +719,7 @@ fn verify_global(
     elf_bytes: &[u8],
     num_private_input_pages: usize,
     opts: &ProofOptions,
+    page_genesis_commitments: Option<&[(u64, Commitment)]>,
 ) -> bool {
     // One L2G air per epoch, each with its own 1-based `fini_epoch` constant —
     // must match the order/labels the global proof committed in `prove_global`.
@@ -719,10 +734,29 @@ fn verify_global(
     // recomputes their genesis from the ELF; the GlobalMemory bus enforces them. A
     // wrong `num_private_input_pages` flips a touched page's preprocessed mode, so the
     // rebuilt AIR no longer matches the committed trace and `multi_verify` rejects.
+    //
+    // `page_genesis_commitments` (the recursion guest's supplied roots) skips the
+    // per-data-page recompute; a supplied root shifts the genesis binding to the
+    // attestation fold + consumer recompute, exactly like the monolithic guest's
+    // `page_commitments`. Zero-init pages always share one commitment, computed
+    // once here rather than per touched page.
     let gm_configs = global_memory_configs(page_bases, elf, num_private_input_pages);
+    let supplied: HashMap<u64, Commitment> = page_genesis_commitments
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    let zero_init_root = page::zero_init_preprocessed_commitment(opts);
     let gm_airs: Vec<_> = gm_configs
         .iter()
-        .map(|config| global_memory_air(opts, config))
+        .map(|config| {
+            let preprocessed = if config.is_private_input {
+                None
+            } else if config.init_values.is_some() {
+                supplied.get(&config.page_base).copied()
+            } else {
+                Some(zero_init_root)
+            };
+            global_memory_air(opts, config, preprocessed)
+        })
         .collect();
 
     let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
@@ -925,6 +959,25 @@ pub fn verify_continuation(
     bundle: &ContinuationProof,
     opts: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
+    verify_continuation_with_roots(elf_bytes, bundle, opts, None, None)
+}
+
+/// [`verify_continuation`] with caller-supplied ELF-derived roots: the DECODE
+/// preprocessed root (shared by every epoch) and the global-memory genesis
+/// roots for touched data pages. Supplied roots are used VERBATIM — they are
+/// NOT bound to `elf_bytes` here, exactly like `verify_with_options`' supplied
+/// roots on the monolithic path. The recursion guest supplies them via private
+/// input to skip the in-VM FFT + Merkle recomputes; on success it folds them
+/// into the attestation's `program_id`, and the consumer's recompute+compare
+/// ([`crate::recursion::check_attestation`]) is what restores the binding.
+/// `None` = recompute from the ELF (the trustless host path).
+pub fn verify_continuation_with_roots(
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+    opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_genesis_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<Option<Vec<u8>>, Error> {
     // Bound the claimed private-input page count before using it to size/allocate AIRs
     // (mirrors `verify_with_options`). The count is also bound into the global proof's
     // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
@@ -974,6 +1027,7 @@ pub fn verify_continuation(
             is_final,
             label,
             opts,
+            decode_commitment,
         ) {
             return Ok(None);
         }
@@ -1019,6 +1073,7 @@ pub fn verify_continuation(
         elf_bytes,
         bundle.num_private_input_pages,
         opts,
+        page_genesis_commitments,
     ) {
         return Ok(None);
     }
@@ -1029,6 +1084,28 @@ pub fn verify_continuation(
     }
 
     Ok(Some(public_output))
+}
+
+/// Precompute the ELF-derived roots [`verify_continuation_with_roots`] accepts:
+/// the DECODE preprocessed root and one genesis root per touched non-private
+/// data page (the same set `verify_global` would rebuild from the ELF). These
+/// are what the host packs into the continuation recursion guest's private
+/// input, and what a consumer recomputes to re-bind the guest's attestation.
+pub fn continuation_precomputed_commitments(
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+    opts: &ProofOptions,
+) -> Result<(Commitment, Vec<(u64, Commitment)>), Error> {
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    let page_bases = canonical_page_bases(&bundle.touched_page_bases);
+    let page_commitments = global_memory_configs(&page_bases, &elf, bundle.num_private_input_pages)
+        .iter()
+        .filter(|c| !c.is_private_input && c.init_values.is_some())
+        .map(|c| (c.page_base, page::compute_precomputed_commitment(c, opts)))
+        .collect();
+    Ok((decode_commitment, page_commitments))
 }
 
 /// Convenience wrapper: prove then verify in one call (the original integrated API).
@@ -1502,9 +1579,9 @@ mod tests {
         let page_size = page::DEFAULT_PAGE_SIZE;
         let max = page::max_private_input_pages();
 
-        // (64 MiB + 4-byte prefix) / 256 KiB page = 257 pages (256 full data pages plus
+        // (512 MiB + 4-byte prefix) / 256 KiB page = 2049 pages (2048 full data pages plus
         // the one page the length prefix spills into). Pinned so a size/page change is caught.
-        assert_eq!(max, 257);
+        assert_eq!(max, 2049);
 
         // No slack: an honest MAX-size input needs the whole last page (the bound is not
         // padded), and never overflows into an extra one.

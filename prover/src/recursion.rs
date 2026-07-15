@@ -20,9 +20,9 @@
 //!
 //! [`program_id`] deliberately does not fold the `ProofOptions`: the security
 //! level is pinned by which verifier guest the outer proof is checked against
-//! (`recursion-min.elf` vs `recursion-blowup8.elf`, fixed at build time — see
-//! [`Preset`]). A consumer must pin that outer ELF too, or a 1-query `min`
-//! attestation is indistinguishable from a 128-bit `blowup8` one.
+//! (`recursion-min.elf` vs `recursion-blowup2.elf`/`recursion-blowup8.elf`,
+//! fixed at build time — see [`Preset`]). A consumer must pin that outer ELF
+//! too, or a 1-query `min` attestation is indistinguishable from a 128-bit one.
 
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
@@ -52,15 +52,37 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
 pub enum Preset {
     /// Blowup=2, 1 query ([`MIN_PROOF_OPTIONS`]) — insecure, diagnostics only.
     Min,
-    /// Blowup=8, multi-query — 128-bit security.
+    /// Blowup=2, full 128-bit query count (219 queries at 20 grinding bits) —
+    /// the realistic base-layer shape: production pipelines prove the base
+    /// proof at low blowup (2/4) and reserve high blowup for the final wrap.
+    Blowup2,
+    /// Blowup=4, 110 queries — the other realistic base-layer point (e.g.
+    /// Zisk's compressor layer): 2× the prover LDE of blowup=2 for half the
+    /// queries to verify.
+    Blowup4,
+    /// Blowup=8, multi-query (73 queries) — 128-bit security at final-wrap-style
+    /// parameters: more prover work per row, far fewer queries to verify.
     Blowup8,
 }
 
 impl Preset {
+    /// Every preset, for name→preset lookups (e.g. the blob-dump test's
+    /// `RECURSION_DUMP_PRESET`). Keep in sync with the enum.
+    pub const ALL: [Preset; 4] = [
+        Preset::Min,
+        Preset::Blowup2,
+        Preset::Blowup4,
+        Preset::Blowup8,
+    ];
+
     /// The fixed `ProofOptions` this preset's guest verifies with.
     pub fn options(&self) -> ProofOptions {
         match self {
             Preset::Min => MIN_PROOF_OPTIONS,
+            Preset::Blowup2 => crate::GoldilocksCubicProofOptions::with_blowup(2)
+                .expect("blowup=2 is always valid"),
+            Preset::Blowup4 => crate::GoldilocksCubicProofOptions::with_blowup(4)
+                .expect("blowup=4 is always valid"),
             Preset::Blowup8 => crate::GoldilocksCubicProofOptions::with_blowup(8)
                 .expect("blowup=8 is always valid"),
         }
@@ -71,6 +93,8 @@ impl Preset {
     pub fn artifact_stem(&self) -> &'static str {
         match self {
             Preset::Min => "recursion-min",
+            Preset::Blowup2 => "recursion-blowup2",
+            Preset::Blowup4 => "recursion-blowup4",
             Preset::Blowup8 => "recursion-blowup8",
         }
     }
@@ -79,6 +103,8 @@ impl Preset {
     pub fn name(&self) -> &'static str {
         match self {
             Preset::Min => "min",
+            Preset::Blowup2 => "blowup2",
+            Preset::Blowup4 => "blowup4",
             Preset::Blowup8 => "blowup8",
         }
     }
@@ -130,6 +156,32 @@ pub fn encode_guest_input(
         &page_commitments,
     ))
     .map_err(|e| Error::Recursion(format!("postcard encode: {e}")))
+}
+
+/// The continuation guest's private-input layout (the `continuation` guest
+/// feature): `(continuation bundle, inner ELF bytes, DECODE root, touched
+/// data-page genesis roots)`. Mirrors [`GuestInput`] with the monolithic proof
+/// replaced by the bundle and the PAGE roots replaced by the global-memory
+/// genesis roots (see [`crate::continuation::continuation_precomputed_commitments`]).
+pub type ContinuationGuestInput = (
+    crate::continuation::ContinuationProof,
+    Vec<u8>,
+    Commitment,
+    Vec<(u64, Commitment)>,
+);
+
+/// Build the continuation guest's private-input blob for `bundle` of
+/// `inner_elf`: precomputes the roots and postcard-encodes the
+/// [`ContinuationGuestInput`] tuple.
+pub fn encode_continuation_guest_input(
+    bundle: &crate::continuation::ContinuationProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) =
+        crate::continuation::continuation_precomputed_commitments(inner_elf, bundle, opts)?;
+    postcard::to_allocvec(&(bundle, inner_elf, &decode_commitment, &page_commitments))
+        .map_err(|e| Error::Recursion(format!("postcard encode: {e}")))
 }
 
 /// Domain tag for [`program_id`].
@@ -236,6 +288,37 @@ pub fn verify_and_attest(
     );
     let mut attestation = id.to_vec();
     attestation.extend_from_slice(&vm_proof.public_output);
+    Ok(Some(attestation))
+}
+
+/// [`verify_and_attest`] for a continuation bundle (the `continuation` guest
+/// feature): verify every epoch + the global memory proof against the supplied
+/// roots, then attest `program_id(elf, roots) || public_output`. The fold uses
+/// the same [`program_id`] as the monolithic path but over the continuation's
+/// root set (DECODE + touched data-page genesis roots), so a consumer re-binds
+/// with [`crate::continuation::continuation_precomputed_commitments`] over the
+/// bundle it holds — the touched-page set is bundle-dependent, unlike the
+/// monolithic path's ELF-only page set.
+pub fn verify_continuation_and_attest(
+    bundle: &crate::continuation::ContinuationProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Commitment,
+    page_commitments: &[(u64, Commitment)],
+) -> Result<Option<Vec<u8>>, Error> {
+    let Some(public_output) = crate::continuation::verify_continuation_with_roots(
+        elf_bytes,
+        bundle,
+        proof_options,
+        Some(decode_commitment),
+        Some(page_commitments),
+    )?
+    else {
+        return Ok(None);
+    };
+    let id = program_id_from_elf(elf_bytes, &decode_commitment, page_commitments)?;
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&public_output);
     Ok(Some(attestation))
 }
 

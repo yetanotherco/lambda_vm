@@ -4,9 +4,10 @@
 //! inner proof, the inner program's ELF bytes, and its precomputed DECODE and
 //! ELF-data-page commitments, supplied instead of recomputed in-VM.
 //!
-//! `ProofOptions` is fixed by the `min`/`blowup8` Cargo feature (a `Preset`),
-//! not private input — an attacker could otherwise pick trivially weak options
-//! and have the guest accept as if a real proof had been checked.
+//! `ProofOptions` is fixed by exactly one preset Cargo feature
+//! (`min`/`blowup2`/`blowup4`/`blowup8` — a `Preset`), not private input — an
+//! attacker could otherwise pick trivially weak options and have the guest
+//! accept as if a real proof had been checked.
 //!
 //! On success commits `program_id || inner_public_output` via
 //! `recursion::verify_and_attest` (a single ELF parse and a single full-ELF
@@ -20,16 +21,34 @@
 
 #![no_main]
 
-use lambda_vm_prover::recursion::{GuestInput, Preset};
+#[cfg(not(feature = "continuation"))]
+use lambda_vm_prover::recursion::GuestInput;
+use lambda_vm_prover::recursion::Preset;
 
-#[cfg(not(any(feature = "min", feature = "blowup8")))]
-compile_error!("select exactly one of the `min`/`blowup8` features");
-#[cfg(all(feature = "min", feature = "blowup8"))]
-compile_error!("select exactly one of the `min`/`blowup8` features");
+#[cfg(not(any(
+    feature = "min",
+    feature = "blowup2",
+    feature = "blowup4",
+    feature = "blowup8"
+)))]
+compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` features");
+#[cfg(any(
+    all(feature = "min", feature = "blowup2"),
+    all(feature = "min", feature = "blowup4"),
+    all(feature = "min", feature = "blowup8"),
+    all(feature = "blowup2", feature = "blowup4"),
+    all(feature = "blowup2", feature = "blowup8"),
+    all(feature = "blowup4", feature = "blowup8"),
+))]
+compile_error!("select exactly one of the `min`/`blowup2`/`blowup4`/`blowup8` features");
 
 /// The build preset fixing the inner `ProofOptions` (see the module docs).
 #[cfg(feature = "min")]
 const PRESET: Preset = Preset::Min;
+#[cfg(feature = "blowup2")]
+const PRESET: Preset = Preset::Blowup2;
+#[cfg(feature = "blowup4")]
+const PRESET: Preset = Preset::Blowup4;
 #[cfg(feature = "blowup8")]
 const PRESET: Preset = Preset::Blowup8;
 
@@ -44,26 +63,50 @@ pub fn main() -> ! {
     }));
 
     let blob = lambda_vm_syscalls::syscalls::get_private_input();
-    let (vm_proof, inner_elf, decode_commitment, page_commitments): GuestInput =
-        postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
-    lambda_vm_prover::profile_markers::step_marker::<
-        { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
-    >();
 
     // The guest's whole job: verify the inner proof against the supplied roots
     // and, on success, produce `program_id || inner_public_output`. The id fold
     // is what the consumer rebinds to a trusted ELF (`check_attestation`); it is
-    // not self-enforcing here.
+    // not self-enforcing here. The `continuation` feature swaps the monolithic
+    // VmProof for a multi-epoch ContinuationProof bundle; same trust model.
     let options = PRESET.options();
-    let attestation = lambda_vm_prover::recursion::verify_and_attest(
-        &vm_proof,
-        &inner_elf,
-        &options,
-        decode_commitment,
-        &page_commitments,
-    )
-    .expect("verify errored")
-    .expect("inner proof failed verification");
+
+    #[cfg(not(feature = "continuation"))]
+    let attestation = {
+        let (vm_proof, inner_elf, decode_commitment, page_commitments): GuestInput =
+            postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
+        lambda_vm_prover::profile_markers::step_marker::<
+            { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
+        >();
+        lambda_vm_prover::recursion::verify_and_attest(
+            &vm_proof,
+            &inner_elf,
+            &options,
+            decode_commitment,
+            &page_commitments,
+        )
+        .expect("verify errored")
+        .expect("inner proof failed verification")
+    };
+
+    #[cfg(feature = "continuation")]
+    let attestation = {
+        let (bundle, inner_elf, decode_commitment, page_commitments): lambda_vm_prover::recursion::ContinuationGuestInput =
+            postcard::from_bytes(&blob).expect("failed to deserialize recursion input");
+        lambda_vm_prover::profile_markers::step_marker::<
+            { lambda_vm_prover::profile_markers::STEP_DECODE_DONE },
+        >();
+        lambda_vm_prover::recursion::verify_continuation_and_attest(
+            &bundle,
+            &inner_elf,
+            &options,
+            decode_commitment,
+            &page_commitments,
+        )
+        .expect("verify errored")
+        .expect("inner continuation proof failed verification")
+    };
+
     lambda_vm_syscalls::syscalls::commit(&attestation);
     lambda_vm_syscalls::syscalls::sys_halt();
 }
