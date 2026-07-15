@@ -627,15 +627,15 @@ fn cmd_prove(
     };
     let mut writer = BufWriter::new(file);
 
-    let bytes = match bincode::serialize(&proof) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to serialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if let Err(e) = writer.write_all(&bytes) {
+    // Stream the proof straight into the writer instead of `bincode::serialize`
+    // into an intermediate `Vec<u8>`: that buffer holds a full serialized copy of
+    // the proof while `proof` is still alive (~2x the proof in RAM). `serialize_into`
+    // keeps the write peak at ~1x.
+    if let Err(e) = bincode::serialize_into(&mut writer, &proof) {
+        eprintln!("Failed to serialize proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = writer.flush() {
         eprintln!("Failed to write proof: {}", e);
         return ExitCode::FAILURE;
     }
@@ -799,14 +799,16 @@ fn cmd_prove_continuation(
         }
     };
     let mut writer = BufWriter::new(file);
-    let bytes = match bincode::serialize(&bundle) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("Failed to serialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Err(e) = writer.write_all(&bytes) {
+    // Stream the bundle straight into the writer instead of `bincode::serialize`
+    // into an intermediate `Vec<u8>`: that buffer holds a full serialized copy of
+    // the proof while `bundle` is still alive (~2x the bundle in RAM). For large
+    // continuation bundles (many epochs) that doubling becomes the memory peak — it
+    // dominates the per-epoch working set. `serialize_into` keeps the write peak at ~1x.
+    if let Err(e) = bincode::serialize_into(&mut writer, &bundle) {
+        eprintln!("Failed to serialize proof: {}", e);
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = writer.flush() {
         eprintln!("Failed to write proof: {}", e);
         return ExitCode::FAILURE;
     }
