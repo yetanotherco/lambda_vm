@@ -16,7 +16,7 @@ use crate::{
     },
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::proof::verify_merkle_path;
+use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -413,9 +413,18 @@ pub trait IsStarkVerifier<
         E::BaseType: math::field::element::NativeArchived,
         Field: IsSubFieldOf<E>,
     {
-        let mut value = opening.evaluations().to_vec();
-        value.extend_from_slice(opening.evaluations_sym());
-        verify_merkle_path::<BatchedMerkleTreeBackend<E>>(opening.merkle_path(), root, iota, &value)
+        // Two-slice leaf hash: the committed leaf is `evaluations ‖ evaluations_sym`,
+        // hashed without allocating the concatenation (see `hash_data_from_slices`).
+        let leaf_hash = BatchedMerkleTreeBackend::<E>::hash_data_from_slices(
+            opening.evaluations(),
+            opening.evaluations_sym(),
+        );
+        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<E>>(
+            opening.merkle_path(),
+            root,
+            iota,
+            leaf_hash,
+        )
     }
 
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
@@ -475,14 +484,17 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         let composition_poly = deep_poly_openings.composition_poly();
-        let mut value = composition_poly.evaluations().to_vec();
-        value.extend_from_slice(composition_poly.evaluations_sym());
+        // Two-slice leaf hash of `evaluations ‖ evaluations_sym`, no concat alloc.
+        let leaf_hash = BatchedMerkleTreeBackend::<FieldExtension>::hash_data_from_slices(
+            composition_poly.evaluations(),
+            composition_poly.evaluations_sym(),
+        );
 
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<FieldExtension>>(
             composition_poly.merkle_path(),
             composition_poly_merkle_root,
             *iota,
-            &value,
+            leaf_hash,
         )
     }
 
@@ -667,12 +679,15 @@ pub trait IsStarkVerifier<
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
 
-            // Base-field portion: precomputed columns FIRST, then main trace columns.
-            let mut lde_base: Vec<FieldElement<Field>> = Vec::new();
-            if let Some(p) = opening.precomputed_trace_polys() {
-                lde_base.extend_from_slice(p.evaluations());
-            }
-            lde_base.extend_from_slice(opening.main_trace_polys().evaluations());
+            // Base-field portion as two borrowed slices in commit order —
+            // precomputed columns FIRST, then main trace columns. The callee
+            // resolves a base column via `base_at`, so there is no per-query
+            // concat allocation.
+            let lde_precomputed: &[FieldElement<Field>] = opening
+                .precomputed_trace_polys()
+                .map(|p| p.evaluations())
+                .unwrap_or(&[]);
+            let lde_main = opening.main_trace_polys().evaluations();
 
             let lde_aux: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys()
@@ -685,17 +700,18 @@ pub trait IsStarkVerifier<
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &lde_base,
+                lde_precomputed,
+                lde_main,
                 lde_aux,
                 opening.composition_poly().evaluations(),
             )?);
 
             // Mirror for the symmetric query point.
-            let mut lde_base_sym: Vec<FieldElement<Field>> = Vec::new();
-            if let Some(p) = opening.precomputed_trace_polys() {
-                lde_base_sym.extend_from_slice(p.evaluations_sym());
-            }
-            lde_base_sym.extend_from_slice(opening.main_trace_polys().evaluations_sym());
+            let lde_precomputed_sym: &[FieldElement<Field>] = opening
+                .precomputed_trace_polys()
+                .map(|p| p.evaluations_sym())
+                .unwrap_or(&[]);
+            let lde_main_sym = opening.main_trace_polys().evaluations_sym();
 
             let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
                 .aux_trace_polys()
@@ -708,7 +724,8 @@ pub trait IsStarkVerifier<
                 &evaluation_point,
                 primitive_root,
                 challenges,
-                &lde_base_sym,
+                lde_precomputed_sym,
+                lde_main_sym,
                 lde_aux_sym,
                 opening.composition_poly().evaluations_sym(),
             )?);
@@ -716,12 +733,14 @@ pub trait IsStarkVerifier<
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
     }
 
-    fn reconstruct_deep_composition_poly_evaluation(
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_deep_composition_poly_evaluation<'b>(
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
-        lde_trace_base_evaluations: &[FieldElement<Field>],
+        lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
+        lde_trace_main_evaluations: &'b [FieldElement<Field>],
         lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
     ) -> Option<FieldElement<FieldExtension>> {
@@ -733,13 +752,24 @@ pub trait IsStarkVerifier<
         let ood_data = trace_ood_evaluations.row_major_data();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
+        // Base columns are supplied as two slices (precomputed ‖ main) that the
+        // prover concatenated in this order; `num_base` is their combined width
+        // and `base_at` indexes into them as if concatenated, without allocating.
+        let num_precomputed = lde_trace_precomputed_evaluations.len();
+        let num_base = num_precomputed + lde_trace_main_evaluations.len();
+        let base_at = move |col: usize| -> &'b FieldElement<Field> {
+            if col < num_precomputed {
+                &lde_trace_precomputed_evaluations[col]
+            } else {
+                &lde_trace_main_evaluations[col - num_precomputed]
+            }
+        };
+
         // Runtime guard: a malformed proof may supply opening evaluations whose
         // column count does not match the OOD table width, or whose composition
         // poly parts count does not match the proof's `composition_poly_parts_ood_evaluation`.
         // Without these checks the indexing below would panic in release builds.
-        if lde_trace_base_evaluations.len() + lde_trace_aux_evaluations.len()
-            != ood_evaluations_table_width
-        {
+        if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width {
             return None;
         }
         if trace_term_coeffs.is_empty()
@@ -758,7 +788,6 @@ pub trait IsStarkVerifier<
         // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
         FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
 
-        let num_base = lde_trace_base_evaluations.len();
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
@@ -768,7 +797,7 @@ pub trait IsStarkVerifier<
                         let ood_val = &ood_data[row_idx * ood_evaluations_table_width + col_idx];
                         // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
                         let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            &lde_trace_base_evaluations[col_idx] - ood_val
+                            base_at(col_idx) - ood_val
                         } else {
                             &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
                         };
@@ -900,12 +929,26 @@ pub trait IsStarkVerifier<
             }
             // The archive is read in place without validation; reject an OOD
             // table whose advertised dimensions disagree with its data length,
-            // has no rows, or whose height isn't a whole number of AIR steps
-            // (which `into_frame` below only `debug_assert!`s, not checks) —
-            // all before any row access indexes into it.
+            // has no rows, whose width doesn't match the AIR's column layout, or
+            // whose height isn't a whole number of AIR steps (which `into_frame`
+            // below only `debug_assert!`s, not checks) — all before any row
+            // access indexes into it.
+            //
+            // The width check is load-bearing and prevents two distinct faults:
+            // (a) the AIR-derived column index `main_trace_width + c.col` in
+            //     `step_2_verify_claimed_composition_polynomial` indexing past a
+            //     too-narrow OOD row (a release-mode out-of-bounds panic), and
+            // (b) a width-0 table, whose `width * height == 0 == data.len()`
+            //     satisfies `dimensions_consistent()` for an arbitrary advertised
+            //     height and would otherwise slip through this guard entirely.
+            // An honest proof always commits exactly `main_trace_width + num_aux`
+            // OOD columns (the same quantities `column_idx` and the `checked_sub`
+            // boundary use), so exact equality never rejects a valid proof.
             let trace_ood_evaluations = proof.trace_ood_evaluations();
+            let expected_ood_width = air.trace_layout().0 + air.num_auxiliary_rap_columns();
             if !trace_ood_evaluations.dimensions_consistent()
                 || trace_ood_evaluations.height() == 0
+                || trace_ood_evaluations.width() != expected_ood_width
                 || !trace_ood_evaluations
                     .height()
                     .is_multiple_of(air.step_size())
