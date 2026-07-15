@@ -15,6 +15,7 @@ use crate::examples::multi_table_lookup::{
 };
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
+use crate::table::Table;
 use crate::test_utils::multi_prove_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
@@ -824,6 +825,82 @@ fn test_tampered_acc_ood_evaluation() {
             &FieldElement::zero(),
         ),
         "Proof with corrupted acc OOD evaluation must be rejected"
+    );
+}
+
+/// A proof whose OOD trace-evaluation table has the wrong shape is rejected.
+///
+/// The table's dimensions are a public function of the AIR (transition offsets
+/// x step_size rows, main+aux columns), so the verifier derives the expected
+/// shape from AIR metadata and refuses any proof whose table does not match --
+/// a malicious prover cannot reshape it (e.g. drop a column) to dodge a check.
+#[test_log::test]
+fn test_malformed_ood_table_shape_rejected() {
+    // Same valid trace as `test_tampered_acc_ood_evaluation`: CPU sends (5,3,8).
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Drop one column from the ADD table's OOD evaluations while keeping the
+    // table internally consistent (data length matches the new width), so the
+    // rejection is the AIR-shape guard, not an out-of-bounds panic.
+    let add_proof = &mut multi_proof.proofs[1];
+    let old = &add_proof.trace_ood_evaluations;
+    assert!(old.width >= 1, "OOD table must have at least one column");
+    let new_width = old.width - 1;
+    let mut new_data = Vec::with_capacity(new_width * old.height);
+    for row in 0..old.height {
+        let full = old.get_row(row);
+        new_data.extend_from_slice(&full[..new_width]);
+    }
+    add_proof.trace_ood_evaluations = Table::new(new_data, new_width);
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Proof with a wrong-shaped OOD table must be rejected"
     );
 }
 

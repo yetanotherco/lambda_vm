@@ -107,6 +107,21 @@ pub trait IsStarkVerifier<
             { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
         >();
         let trace_length = proof.trace_length;
+
+        // Soundness: the OOD trace-evaluation table's shape is a public function
+        // of the AIR, never of the (prover-controlled) proof. Reject any proof
+        // whose table is not exactly the expected size, so a malicious prover
+        // cannot reshape it — e.g. drop a column to dodge a constraint check, or
+        // mis-size it and desync the frame reconstruction below. Every later use
+        // of the table derives its shape from the AIR, not from the proof.
+        let expected_ood_width = air.trace_layout().0 + air.num_auxiliary_rap_columns();
+        let expected_ood_height = air.context().transition_offsets.len() * air.step_size();
+        if proof.trace_ood_evaluations.width != expected_ood_width
+            || proof.trace_ood_evaluations.height != expected_ood_height
+        {
+            return false;
+        }
+
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
             &challenges.rap_challenges,
@@ -167,8 +182,9 @@ pub trait IsStarkVerifier<
                 .map(|((num, den), beta)| num * den * beta)
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
-        let num_main_trace_columns =
-            proof.trace_ood_evaluations.width - air.num_auxiliary_rap_columns();
+        // Shape is AIR-derived (validated against the proof above), so use the
+        // AIR's main width directly rather than trusting the proof dimensions.
+        let num_main_trace_columns = main_trace_width;
 
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
