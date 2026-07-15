@@ -5,6 +5,30 @@ name = "recursion-bench"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Exactly one selects the fixed ProofOptions (see main.rs) — hardcoded, not
+# private input, so a malicious input can't downgrade the security level.
+# Cargo features are additive by design, so the compile_error! mutual-exclusion
+# guard in main.rs is the loud failure that stops a mislabeled artifact if both
+# ever get enabled at once (e.g. under `--all-features`). The crate must stay a
+# standalone `[workspace]` (not a root-workspace member) so root-level feature
+# unification can never turn both on.
+min = []
+blowup8 = []
+
+# One distinctly named binary per preset (selected by its feature) so a parallel
+# `make -j` builds them to different filenames — structurally race-free, no cp
+# clobbering. Both use src/main.rs; required-features gates each to its preset.
+[[bin]]
+name = "recursion-min-bench"
+path = "src/main.rs"
+required-features = ["min"]
+
+[[bin]]
+name = "recursion-blowup8-bench"
+path = "src/main.rs"
+required-features = ["blowup8"]
+
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [
     "profile-markers",
