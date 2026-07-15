@@ -469,3 +469,72 @@ where
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Field-coverage guards.
+//
+// Each view above mirrors a proof struct field-by-field, but nothing in the
+// type system links a struct field to a view accessor: a field added to one of
+// these structs would compile with no accessor, and the verifier — which reads
+// proof data only through the views — would silently ignore it. That is a
+// soundness gap.
+//
+// These functions never run. They exhaustively destructure each backing struct
+// *without* `..`, so adding a field turns the omission into a compile error
+// (E0027, "pattern does not mention field ...") pointing right here. When one
+// stops compiling, add the matching view accessor above, then bind the new
+// field below to acknowledge it is covered.
+//
+// This enforces accessor *presence*, not arm symmetry: an accessor whose Owned
+// and Archived arms read different (same-typed) fields still type-checks and is
+// only caught by a behavioral test.
+#[allow(dead_code)]
+fn assert_stark_proof_view_is_exhaustive<F: IsSubFieldOf<E>, E: IsField, PI>(
+    p: &StarkProof<F, E, PI>,
+) {
+    let StarkProof {
+        trace_length: _,
+        lde_trace_main_merkle_root: _,
+        lde_trace_aux_merkle_root: _,
+        lde_trace_precomputed_merkle_root: _,
+        trace_ood_evaluations: _,
+        composition_poly_root: _,
+        composition_poly_parts_ood_evaluation: _,
+        fri_layers_merkle_roots: _,
+        fri_final_poly_coeffs: _,
+        query_list: _,
+        deep_poly_openings: _,
+        nonce: _,
+        bus_public_inputs: _,
+        public_inputs: _,
+    } = p;
+}
+
+#[allow(dead_code)]
+fn assert_polynomial_openings_view_is_exhaustive<F: IsField>(p: &PolynomialOpenings<F>) {
+    let PolynomialOpenings {
+        proof: _,
+        evaluations: _,
+        evaluations_sym: _,
+    } = p;
+}
+
+#[allow(dead_code)]
+fn assert_deep_polynomial_opening_view_is_exhaustive<F: IsSubFieldOf<E>, E: IsField>(
+    p: &DeepPolynomialOpening<F, E>,
+) {
+    let DeepPolynomialOpening {
+        composition_poly: _,
+        main_trace_polys: _,
+        precomputed_trace_polys: _,
+        aux_trace_polys: _,
+    } = p;
+}
+
+#[allow(dead_code)]
+fn assert_fri_decommitment_view_is_exhaustive<F: IsField>(p: &FriDecommitment<F>) {
+    let FriDecommitment {
+        layers_auth_paths: _,
+        layers_evaluations_sym: _,
+    } = p;
+}
