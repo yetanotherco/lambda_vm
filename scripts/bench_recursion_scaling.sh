@@ -22,6 +22,8 @@
 #                                    when missing.
 #     PRESETS="blowup2 blowup4 min"  verifier presets, most important first.
 #     EPOCH_LOG2=21                  inner continuation epoch size (log2 cycles).
+#     DUMP_FEATURES=""               extra cargo features for the proving dump,
+#                                    e.g. DUMP_FEATURES=cuda on a GPU box.
 #
 # Prereqs (the script fails fast on each):
 #   cargo build --release -p cli
@@ -76,7 +78,7 @@ for P in $PRESETS; do
     DLOG="$WORK/dump_${N}tx_${P}.log"
     if ! ( RECURSION_DUMP_PRESET="$P" RECURSION_DUMP_EPOCH_LOG2="$EPOCH_LOG2" \
            RECURSION_DUMP_INNER_ELF="$PWD/$ETHREX" RECURSION_DUMP_INNER_INPUT="$PWD/$FIX" \
-           cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) \
+           cargo test --release -p lambda-vm-prover ${DUMP_FEATURES:+--features "$DUMP_FEATURES"} --lib test_dump_recursion_input -- --ignored --nocapture ) \
            >"$DLOG" 2>&1 || [ ! -f /tmp/recursion_input.bin ]; then
       echo "txs=$N preset=$P inner_cycles=$ic DUMP_FAILED" >> "$RESULTS"
       echo "ERROR: [${P}/${N}tx] dump failed; tail of $DLOG:" >&2
