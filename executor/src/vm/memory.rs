@@ -42,10 +42,16 @@ pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
 pub const MAX_PUBLIC_OUTPUT_TOTAL_SIZE: u64 = 1024 * 1024;
-/// Maximum size of the private input memory region (in bytes). 64 MiB so that a
-/// whole `VmProof` can be passed as private input to a verifier guest (naive
-/// recursion).
-pub const MAX_PRIVATE_INPUT_SIZE: u64 = 64 * 1024 * 1024;
+/// Maximum size of the private input memory region (in bytes). Sized so that a
+/// whole `VmProof` — or a multi-epoch `ContinuationProof` bundle — can be
+/// passed as private input to a verifier guest (naive recursion): at
+/// production options (blowup=2, 219 FRI queries) real proofs are large —
+/// ethrex with 20 transfers proves to ~231 MiB monolithic, and a continuation
+/// bundle carries one such proof per epoch — so 512 MiB with the guest ELF and
+/// encoding overhead riding along. Nothing else is mapped above
+/// `PRIVATE_INPUT_START_INDEX` until the stack at the top of the address
+/// space, so growing this region is layout-safe.
+pub const MAX_PRIVATE_INPUT_SIZE: u64 = 512 * 1024 * 1024;
 /// Fixed high address where private input is mapped. Guest programs can read
 /// directly from this address (ZisK-style memory-mapped input).
 /// Layout: 4-byte LE length prefix at `PRIVATE_INPUT_START_INDEX`, then data at +4.

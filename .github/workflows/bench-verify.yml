@@ -92,9 +92,12 @@ jobs:
           scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
           sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
 
-      # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main).
-      # The measurement is one exact `execute --cycles` reading per ref (~1 min total, no
-      # ABBA). Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli) once, plus
+      # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main),
+      # in three regimes: `min` (blowup=2, 1 query — cheap diagnostic floor) plus the
+      # realistic full-query base-layer points `blowup2` (219 queries) and `blowup4`
+      # (110 queries). Each measurement is one exact `execute --cycles` reading per ref
+      # (no ABBA; the full-query executes are ~1-2 min each).
+      # Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli) once, plus
       # per ref a guest build (~10-20 min) and a prover-test build for the blob dump; the
       # GUEST_TARGET_DIR / HOST_TARGET_DIR below share build-std and the host cargo target
       # across the two ref worktrees so the second ref is much cheaper (and per-worktree
@@ -122,6 +125,19 @@ jobs:
           set -o pipefail
           scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main min 2>&1 | tee /tmp/recursion_out.txt
           sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out.txt > /tmp/recursion_result.txt
+          # Full-query regimes: the realistic base-layer proofs (the single-query `min`
+          # regime above is a diagnostic floor, not the real verifier cost). Guest builds
+          # and worktrees are already cached from the min run, so each adds only a blob
+          # dump (a full-query prove of the empty inner program, seconds) and one
+          # ~1-2 min execute per ref. Tolerated failure (else-note): refs predating the
+          # preset-aware dump test can only measure `min`; the min table above still posts.
+          for preset in blowup2 blowup4; do
+            if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "/tmp/recursion_out_${preset}.txt"; then
+              { echo; sed -n '/=== Recursion-guest cycle/,$p' "/tmp/recursion_out_${preset}.txt"; } >> /tmp/recursion_result.txt
+            else
+              { echo; echo "_(${preset} full-query regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
+            fi
+          done
 
       - name: Post result
         if: always()
