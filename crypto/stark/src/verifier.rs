@@ -9,10 +9,11 @@ pub use crate::proof::view::PiDeserializer;
 use crate::{
     config::Commitment,
     domain::new_verifier_domain,
+    fri::fri_decommit::ArchivedFriDecommitment,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedStarkProof, MultiProof},
-    proof::view::{
-        DeepPolynomialOpeningView, FriDecommitmentView, PolynomialOpeningsView, StarkProofView,
+    proof::stark::{
+        ArchivedDeepPolynomialOpening, ArchivedMultiProof, ArchivedPolynomialOpenings,
+        ArchivedStarkProof, MultiProof,
     },
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
@@ -29,6 +30,11 @@ use math::{
     },
     traits::AsBytes,
 };
+use rkyv::api::high::{HighSerializer, HighValidator};
+use rkyv::bytecheck::CheckBytes;
+use rkyv::rancor::Error as RkyvError;
+use rkyv::ser::allocator::ArenaHandle;
+use rkyv::util::AlignedVec;
 use std::collections::HashMap;
 use std::marker::PhantomData;
 #[cfg(feature = "instruments")]
@@ -92,13 +98,12 @@ compile_error!("the zero-copy STARK verifier requires a little-endian target");
 /// The functionality of a STARK verifier providing methods to run the STARK Verify protocol
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 ///
-/// Every method below takes proof data through a [`StarkProofView`] (and its
-/// nested `*View` types), a borrowed view implemented once for a real owned
-/// [`StarkProof`] and once for an rkyv-archived proof read in place. This is
-/// the single verification implementation: [`Self::multi_verify`] (owned) and
-/// [`Self::multi_verify_archived`] (archived, used by the recursion guest)
-/// are thin entry points that build the matching view and share every
-/// downstream check — no serialization, no duplicated logic.
+/// There is a single proof representation: the rkyv archive. Every method below
+/// reads proof data straight from `&ArchivedStarkProof` (and its nested
+/// `Archived*` types) in place. [`Self::multi_verify_archived`] is the single
+/// verification implementation; the owned entry points [`Self::multi_verify`]
+/// and [`Self::verify`] serialize the proof to rkyv first and funnel into it,
+/// so there is no duplicated verification logic.
 pub trait IsStarkVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
     FieldExtension: Send + Sync + IsField,
@@ -125,7 +130,7 @@ pub trait IsStarkVerifier<
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -299,7 +304,7 @@ pub trait IsStarkVerifier<
     /// FRI decommitments are valid and correspond to the Deep composition polynomial.
     fn step_3_verify_fri(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
@@ -402,7 +407,7 @@ pub trait IsStarkVerifier<
     /// so one Merkle path authenticates both `evaluations` (the row) and
     /// `evaluations_sym` (its symmetric). Same layout used for trace and composition.
     fn verify_opening_pair<E>(
-        opening: PolynomialOpeningsView<'_, E>,
+        opening: &ArchivedPolynomialOpenings<E>,
         root: &Commitment,
         iota: usize,
     ) -> bool
@@ -421,8 +426,8 @@ pub trait IsStarkVerifier<
     /// Verify opening Open(tⱼ(D_LDE), 𝜐) and Open(tⱼ(D_LDE), -𝜐) for all trace polynomials tⱼ,
     /// where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_trace_openings(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
-        deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
+        deep_poly_openings: &ArchivedDeepPolynomialOpening<Field, FieldExtension>,
         iota: usize,
     ) -> bool
     where
@@ -466,7 +471,7 @@ pub trait IsStarkVerifier<
     /// Verify opening Open(Hᵢ(D_LDE), 𝜐) and Open(Hᵢ(D_LDE), -𝜐) for all parts Hᵢof the composition
     /// polynomial, where 𝜐 and -𝜐 are the elements corresponding to the index challenge `iota`.
     fn verify_composition_poly_opening(
-        deep_poly_openings: DeepPolynomialOpeningView<'_, Field, FieldExtension>,
+        deep_poly_openings: &ArchivedDeepPolynomialOpening<Field, FieldExtension>,
         composition_poly_merkle_root: &Commitment,
         iota: &usize,
     ) -> bool
@@ -490,7 +495,7 @@ pub trait IsStarkVerifier<
     /// parts at the domain elements and their symmetric counterparts corresponding to all the FRI query
     /// index challenges.
     fn step_4_verify_trace_and_composition_openings(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         challenges: &Challenges<FieldExtension>,
     ) -> bool
     where
@@ -548,10 +553,10 @@ pub trait IsStarkVerifier<
     /// `deep_composition_evaluation_sym`: precomputed value of p₀(-𝜐), where p₀ is the deep composition polynomial.
     #[allow(clippy::too_many_arguments)]
     fn verify_query_and_sym_openings(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         zetas: &[FieldElement<FieldExtension>],
         iota: usize,
-        fri_decommitment: FriDecommitmentView<'_, FieldExtension>,
+        fri_decommitment: &ArchivedFriDecommitment<FieldExtension>,
         evaluation_point_inv: FieldElement<Field>,
         deep_composition_evaluation: &FieldElement<FieldExtension>,
         deep_composition_evaluation_sym: &FieldElement<FieldExtension>,
@@ -640,7 +645,7 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -717,7 +722,7 @@ pub trait IsStarkVerifier<
     }
 
     fn reconstruct_deep_composition_poly_evaluation(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
@@ -818,6 +823,11 @@ pub trait IsStarkVerifier<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     /// The AIRs must be in the same order as the proofs in the MultiProof.
+    /// Owned entry point: serialize the proof to an aligned rkyv buffer and
+    /// verify it in place. `to_bytes` yields 16-aligned bytes, so the archived
+    /// access below needs no misalignment fallback. The serialized bytes are
+    /// byte-identical to what the prover writes, so verification accepts/rejects
+    /// exactly as verifying the owned proof would.
     fn multi_verify(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         multi_proof: &MultiProof<Field, FieldExtension, PI>,
@@ -827,38 +837,37 @@ pub trait IsStarkVerifier<
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        MultiProof<Field, FieldExtension, PI>:
+            for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        ArchivedMultiProof<Field, FieldExtension, PI>:
+            rkyv::Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> = multi_proof
-            .proofs
-            .iter()
-            .map(StarkProofView::Owned)
-            .collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
+        let bytes = match rkyv::to_bytes::<RkyvError>(multi_proof) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let archived = match rkyv::access::<ArchivedMultiProof<Field, FieldExtension, PI>, RkyvError>(
+            &bytes,
+        ) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        Self::multi_verify_archived(
+            airs,
+            archived.proofs.as_slice(),
+            transcript,
+            expected_bus_balance,
+        )
     }
 
-    /// Verifies one or more rkyv-archived STARK proofs read **in place** from
-    /// their archive buffer — no proof deserialization, no per-field allocation.
+    /// The single verification implementation: verifies one or more STARK proofs
+    /// read **in place** from their rkyv archive — no proof deserialization, no
+    /// per-field allocation. Owned callers reach it through [`Self::multi_verify`]
+    /// / [`Self::verify`] (which serialize first); the recursion guest and the
+    /// VM verifier pass their already-archived proofs straight in.
     fn multi_verify_archived(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
         proofs: &[ArchivedStarkProof<Field, FieldExtension, PI>],
-        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
-        expected_bus_balance: &FieldElement<FieldExtension>,
-    ) -> bool
-    where
-        FieldElement<Field>: AsBytes + Sync + Send,
-        FieldElement<FieldExtension>: AsBytes + Sync + Send,
-    {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> =
-            proofs.iter().map(StarkProofView::Archived).collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
-    }
-
-    /// The single verification implementation, shared by [`Self::multi_verify`]
-    /// (owned) and [`Self::multi_verify_archived`] (archived), operating on
-    /// proof views rather than either's concrete type.
-    fn multi_verify_views(
-        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        proofs: &[StarkProofView<Field, FieldExtension, PI>],
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
@@ -885,7 +894,6 @@ pub trait IsStarkVerifier<
         // trust the prover). For normal tables, use the commitment from the proof.
 
         for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
             // Soundness: the number of composition-poly parts is fixed by the AIR's
             // degree bound, NOT chosen by the prover. Deriving it from the proof would
             // let a malicious prover inflate the part count, widening the composition
@@ -966,7 +974,6 @@ pub trait IsStarkVerifier<
         // the only cross-table validation.
 
         for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
             if air.has_trace_interaction() && !proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
@@ -989,7 +996,6 @@ pub trait IsStarkVerifier<
         // the prover's forking and makes per-table verification independent.
 
         for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
             // Must match prover: fork with domain separator for multi-table,
             // use original transcript directly for single-table.
             let num_tables = airs.len();
@@ -1069,7 +1075,10 @@ pub trait IsStarkVerifier<
     }
 
     /// Verify a single STARK proof.
-    /// This is equivalent to calling `multi_verify` with a single-element slice.
+    ///
+    /// Owned entry point: serializes the proof to an aligned rkyv buffer (no
+    /// deep proof clone) and verifies it in place, equivalent to calling
+    /// `multi_verify` with a single-element slice.
     fn verify(
         proof: &StarkProof<Field, FieldExtension, PI>,
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -1078,10 +1087,24 @@ pub trait IsStarkVerifier<
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        StarkProof<Field, FieldExtension, PI>:
+            for<'a> rkyv::Serialize<HighSerializer<AlignedVec, ArenaHandle<'a>, RkyvError>>,
+        ArchivedStarkProof<Field, FieldExtension, PI>:
+            rkyv::Portable + for<'a> CheckBytes<HighValidator<'a, RkyvError>>,
     {
-        Self::multi_verify_views(
+        let bytes = match rkyv::to_bytes::<RkyvError>(proof) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let archived = match rkyv::access::<ArchivedStarkProof<Field, FieldExtension, PI>, RkyvError>(
+            &bytes,
+        ) {
+            Ok(a) => a,
+            Err(_) => return false,
+        };
+        Self::multi_verify_archived(
             &[air],
-            &[StarkProofView::Owned(proof)],
+            core::slice::from_ref(archived),
             transcript,
             &FieldElement::zero(),
         )
@@ -1091,7 +1114,7 @@ pub trait IsStarkVerifier<
     /// already been replayed and the RAP challenges are known.
     fn replay_rounds_after_round_1(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
@@ -1246,7 +1269,7 @@ pub trait IsStarkVerifier<
     /// Verifies a single table after round 1 has been replayed.
     fn verify_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        proof: &ArchivedStarkProof<Field, FieldExtension, PI>,
         public_inputs: &PI,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,

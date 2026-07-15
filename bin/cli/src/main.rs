@@ -13,7 +13,6 @@ static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
-use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
@@ -693,10 +692,14 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
 
-    let proof: VmProof = match rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&proof_bytes) {
-        Ok(p) => p,
+    // Zero-copy: the proof bytes are already in a 16-aligned buffer, so access
+    // the archived `VmProof` in place (bytecheck-validated) and verify straight
+    // from it — no full-proof deserialization.
+    let archived = match rkyv::access::<prover::ArchivedVmProof, rkyv::rancor::Error>(&proof_bytes)
+    {
+        Ok(a) => a,
         Err(e) => {
-            eprintln!("Failed to deserialize proof: {}", e);
+            eprintln!("Failed to read proof: {}", e);
             return ExitCode::FAILURE;
         }
     };
@@ -710,7 +713,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
             return ExitCode::FAILURE;
         }
     };
-    let result = prover::verify_with_options(&proof, &elf_data, &opts, None, None);
+    let result = prover::verify_archived_with_options(archived, &elf_data, &opts, None, None);
     let verify_elapsed = start.elapsed();
     let result = match result {
         Ok(valid) => valid,

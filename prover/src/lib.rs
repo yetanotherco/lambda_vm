@@ -65,8 +65,7 @@ use crate::test_utils::{
 // fixed at guest build time (`recursion::Preset`).
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
-use stark::proof::stark::MultiProof;
-use stark::proof::view::StarkProofView;
+use stark::proof::stark::{ArchivedMultiProof, ArchivedStarkProof, MultiProof};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
@@ -372,16 +371,10 @@ pub fn verify_recursion_blob<'a>(
     let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let elf_digest = statement::elf_digest(inner_elf);
 
-    let views: Vec<StarkProofView<F, E, ()>> = archived
-        .vm_proof
-        .proof
-        .proofs
-        .as_slice()
-        .iter()
-        .map(StarkProofView::Archived)
-        .collect();
+    // The archived STARK sub-proofs are fed straight into the verifier — read
+    // in place from the blob, no wrapper, no copy (guest path stays zero-copy).
     let ok = verify_proof_parts(
-        &views,
+        archived.vm_proof.proof.proofs.as_slice(),
         &table_counts,
         &runtime_page_ranges,
         num_private_input_pages,
@@ -957,12 +950,11 @@ pub(crate) fn compute_expected_commit_bus_balance(
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
-/// View counterpart of [`replay_transcript_phase_a`]: replays Phase A over a
-/// proof view (owned or archived-in-place), with no `MultiProof`
-/// deserialization required either way.
-pub(crate) fn replay_transcript_phase_a_view(
+/// Archived counterpart of [`replay_transcript_phase_a`]: replays Phase A over
+/// rkyv-archived proofs read in place, with no `MultiProof` deserialization.
+pub(crate) fn replay_transcript_phase_a_archived(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: &[ArchivedStarkProof<F, E, ()>],
     transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
     for (air, proof) in airs.iter().zip(proofs) {
@@ -976,16 +968,16 @@ pub(crate) fn replay_transcript_phase_a_view(
     (z, alpha)
 }
 
-/// View counterpart of [`compute_expected_commit_bus_balance`]: operates on a
-/// proof view slice (owned or archived-in-place).
-pub(crate) fn compute_expected_commit_bus_balance_view(
+/// Archived counterpart of [`compute_expected_commit_bus_balance`]: operates on
+/// rkyv-archived proofs read in place.
+pub(crate) fn compute_expected_commit_bus_balance_archived(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: &[ArchivedStarkProof<F, E, ()>],
     public_output_bytes: &[u8],
     start_index: u64,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
+    let (z, alpha) = replay_transcript_phase_a_archived(airs, proofs, transcript);
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
@@ -1300,15 +1292,17 @@ pub(crate) fn verify_prepared(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
-    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
-        .proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
+    // Serialize the owned proof to an aligned rkyv buffer and verify it in
+    // place, funneling into the same archived verifier the recursion guest and
+    // CLI use. `to_bytes` yields byte-identical bytes to what the prover writes,
+    // so this accepts/rejects exactly as an owned verify would.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&vm_proof.proof)
+        .map_err(|e| Error::Execution(format!("rkyv serialize proof failed: {e}")))?;
+    let archived = rkyv::access::<ArchivedMultiProof<F, E, ()>, rkyv::rancor::Error>(&bytes)
+        .map_err(|e| Error::Execution(format!("rkyv access proof failed: {e}")))?;
 
     verify_proof_parts(
-        &views,
+        archived.proofs.as_slice(),
         &vm_proof.table_counts,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
@@ -1321,15 +1315,56 @@ pub(crate) fn verify_prepared(
     )
 }
 
+/// Zero-copy counterpart to [`verify_with_options`]: verifies straight from an
+/// rkyv-archived [`VmProof`] read in place by the caller (e.g. via
+/// `rkyv::access` over an aligned buffer), with no full proof deserialization.
+/// Only the small metadata (table counts, page ranges) is materialized; the
+/// STARK proof stays in the caller's buffer. Used by the CLI `verify` command.
+pub fn verify_archived_with_options(
+    archived: &ArchivedVmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
+
+    // Materialize only the small metadata; the proof stays archived in place.
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: Vec<RuntimePageRange> =
+        rkyv::deserialize::<Vec<RuntimePageRange>, RkyvError>(&archived.runtime_page_ranges)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    let num_private_input_pages = archived.num_private_input_pages.to_native() as usize;
+    let public_output: &[u8] = archived.public_output.as_slice();
+
+    verify_proof_parts(
+        archived.proof.proofs.as_slice(),
+        &table_counts,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        &program,
+        &elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
 /// The single VM-proof verification implementation, given the proof's
-/// metadata fields plus an already-parsed ELF and its digest. Both
-/// [`verify_prepared`] (owned proof) and [`verify_recursion_blob`] (guest
-/// blob, zero-copy) funnel here, passing a [`StarkProofView`] slice over
-/// their respective (owned or archived) proof data — no serialization, no
+/// metadata fields plus an already-parsed ELF and its digest. All callers —
+/// [`verify_prepared`] / [`verify_archived_with_options`] (host) and
+/// [`verify_recursion_blob`] (guest blob) — funnel here with a slice of
+/// rkyv-archived STARK sub-proofs read in place: no per-field allocation, no
 /// duplicated verification logic, and no repeated `Elf::load`/digest.
 #[allow(clippy::too_many_arguments)]
 fn verify_proof_parts(
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: &[ArchivedStarkProof<F, E, ()>],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     num_private_input_pages: usize,
@@ -1411,7 +1446,7 @@ fn verify_proof_parts(
     // independently of the multi_verify transcript, but both must start from
     // the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
-    let expected_bus_balance = match compute_expected_commit_bus_balance_view(
+    let expected_bus_balance = match compute_expected_commit_bus_balance_archived(
         &air_refs,
         proofs,
         public_output,
@@ -1426,7 +1461,7 @@ fn verify_proof_parts(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(Verifier::multi_verify_views(
+    Ok(Verifier::multi_verify_archived(
         &air_refs,
         proofs,
         &mut transcript,
