@@ -1458,8 +1458,16 @@ pub trait IsStarkProver<
         let gamma = transcript.sample_field_element();
 
         let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
-        let num_terms_trace =
-            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let num_eval_points = air.context().transition_offsets.len() * air.step_size();
+        let next_row_cols = air.trace_ood_next_row_columns();
+        // g·z pruning: only the current-row block (all columns) plus the masked
+        // next-row columns get an opening / DEEP coefficient.
+        let num_terms_trace = crate::ood::num_surviving_trace_openings(
+            air.context().trace_columns,
+            num_eval_points,
+            air.step_size(),
+            next_row_cols.len(),
+        );
 
         // <<<< Receive challenges: 𝛾, 𝛾'
         let mut deep_composition_coefficients: Vec<_> =
@@ -1467,12 +1475,19 @@ pub trait IsStarkProver<
                 .take(n_terms_composition_poly + num_terms_trace)
                 .collect();
 
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+        let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
-            .map(|chunk| chunk.to_vec())
             .collect();
+        // Rectangular W×num_eval_points grid with the sampled powers at surviving
+        // positions and zeros at pruned next-row positions, so the DEEP loop
+        // below (and the GPU path) stay unchanged — zero-coefficient terms vanish.
+        let trace_term_coeffs = crate::ood::build_pruned_trace_term_coeffs(
+            &trace_term_powers,
+            air.context().trace_columns,
+            num_eval_points,
+            air.step_size(),
+            &next_row_cols,
+        );
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
@@ -3103,11 +3118,21 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let round_3_dur = t_r3.elapsed();
 
-        // >>>> Send values: tⱼ(zgᵏ)
-        let trace_ood_evaluations_columns = round_3_result.trace_ood_evaluations.columns();
-        for col in trace_ood_evaluations_columns.iter() {
-            for elem in col.iter() {
-                transcript.append_field_element(elem);
+        // >>>> Send values: tⱼ(zgᵏ). g·z pruning: split the full OOD table into
+        // the current-row block (all columns) and the pruned next-row block
+        // (masked columns only), and absorb only the surviving values — the
+        // verifier absorbs the identical two blocks in the same order.
+        let ood_next_row_cols = air.trace_ood_next_row_columns();
+        let (ood_block0, ood_block1) = crate::ood::split_ood_blocks(
+            &round_3_result.trace_ood_evaluations,
+            air.step_size(),
+            &ood_next_row_cols,
+        );
+        for block in [&ood_block0, &ood_block1] {
+            for col in block.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
             }
         }
 
@@ -3161,8 +3186,9 @@ pub trait IsStarkProver<
             lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
             // For preprocessed tables: commitment to precomputed columns only
             lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
-            // tⱼ(zgᵏ)
-            trace_ood_evaluations: round_3_result.trace_ood_evaluations,
+            // tⱼ(zgᵏ): current-row block + pruned next-row block.
+            trace_ood_evaluations: ood_block0,
+            trace_ood_next_evaluations: ood_block1,
             // [H₁] and [H₂]
             composition_poly_root: round_2_result.composition_poly_root,
             // Hᵢ(z^N)

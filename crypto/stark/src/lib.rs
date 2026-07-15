@@ -23,6 +23,7 @@ pub mod instruments;
 #[cfg(feature = "cuda")]
 pub mod logup_gpu;
 pub mod lookup;
+pub mod ood;
 pub(crate) mod par;
 pub mod profile_markers;
 pub mod proof;

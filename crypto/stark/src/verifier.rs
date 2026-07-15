@@ -11,6 +11,7 @@ use crate::{
     domain::new_verifier_domain,
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
+    table::Table,
 };
 use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
 #[cfg(not(feature = "test_fiat_shamir"))]
@@ -108,19 +109,40 @@ pub trait IsStarkVerifier<
         >();
         let trace_length = proof.trace_length;
 
-        // Soundness: the OOD trace-evaluation table's shape is a public function
-        // of the AIR, never of the (prover-controlled) proof. Reject any proof
-        // whose table is not exactly the expected size, so a malicious prover
-        // cannot reshape it — e.g. drop a column to dodge a constraint check, or
-        // mis-size it and desync the frame reconstruction below. Every later use
-        // of the table derives its shape from the AIR, not from the proof.
+        // Soundness (I3): both OOD blocks' shapes are a public function of the
+        // AIR, never of the (prover-controlled) proof. The current-row block
+        // opens every column over `step_size` rows; the next-row block opens only
+        // the transition-window columns over the remaining rows (and is empty
+        // when there are none). Reject any mismatch before using either block, so
+        // a malicious prover cannot reshape them to dodge a check or desync the
+        // frame reconstruction below.
         let expected_ood_width = air.trace_layout().0 + air.num_auxiliary_rap_columns();
-        let expected_ood_height = air.context().transition_offsets.len() * air.step_size();
+        let step_size = air.step_size();
+        let num_eval_points = air.context().transition_offsets.len() * step_size;
+        let next_row_cols = air.trace_ood_next_row_columns();
+        let expected_next_width = next_row_cols.len();
+        let expected_next_height = if expected_next_width == 0 {
+            0
+        } else {
+            num_eval_points - step_size
+        };
         if proof.trace_ood_evaluations.width != expected_ood_width
-            || proof.trace_ood_evaluations.height != expected_ood_height
+            || proof.trace_ood_evaluations.height != step_size
+            || proof.trace_ood_next_evaluations.width != expected_next_width
+            || proof.trace_ood_next_evaluations.height != expected_next_height
         {
             return false;
         }
+
+        // Reconstruct the full current+next-row OOD grid (surviving values placed,
+        // pruned next-row entries zero -- those are never read by any constraint).
+        let ood_full = crate::ood::reconstruct_ood_full(
+            &proof.trace_ood_evaluations,
+            &proof.trace_ood_next_evaluations,
+            num_eval_points,
+            step_size,
+            &next_row_cols,
+        );
 
         let boundary_constraints = air.boundary_constraints(
             &proof.public_inputs,
@@ -207,8 +229,9 @@ pub trait IsStarkVerifier<
             None => FieldElement::zero(),
         };
 
-        let ood_frame =
-            (proof.trace_ood_evaluations).into_frame(num_main_trace_columns, air.step_size());
+        // Frame from the reconstructed full grid: the next-row step reads only
+        // its transition-window columns; the zero-filled remainder is never read.
+        let ood_frame = ood_full.into_frame(num_main_trace_columns, step_size);
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
@@ -285,9 +308,27 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
+        // g·z pruning: rebuild the full OOD grid from the two proof blocks so
+        // the DEEP reconstruction can skip pruned next-row openings.
+        let step_size = air.step_size();
+        let num_eval_points = air.context().transition_offsets.len() * step_size;
+        let next_row_cols = air.trace_ood_next_row_columns();
+        let ood_full = crate::ood::reconstruct_ood_full(
+            &proof.trace_ood_evaluations,
+            &proof.trace_ood_next_evaluations,
+            num_eval_points,
+            step_size,
+            &next_row_cols,
+        );
+        let next_row_flags = crate::ood::next_row_col_flags(ood_full.width, &next_row_cols);
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
-                challenges, domain, proof,
+                challenges,
+                domain,
+                proof,
+                &ood_full,
+                &next_row_flags,
+                step_size,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -626,10 +667,14 @@ pub trait IsStarkVerifier<
         openings_ok & terminal_ok
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluations_for_all_queries(
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
         proof: &StarkProof<Field, FieldExtension, PI>,
+        ood_full: &Table<FieldExtension>,
+        next_row_flags: &[bool],
+        step_size: usize,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -678,6 +723,9 @@ pub trait IsStarkVerifier<
                 &lde_base,
                 lde_aux,
                 &opening.composition_poly.evaluations,
+                ood_full,
+                next_row_flags,
+                step_size,
             )?);
 
             // Mirror for the symmetric query point.
@@ -702,11 +750,15 @@ pub trait IsStarkVerifier<
                 &lde_base_sym,
                 lde_aux_sym,
                 &opening.composition_poly.evaluations_sym,
+                ood_full,
+                next_row_flags,
+                step_size,
             )?);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluation(
         proof: &StarkProof<Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
@@ -715,9 +767,12 @@ pub trait IsStarkVerifier<
         lde_trace_base_evaluations: &[FieldElement<Field>],
         lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
+        ood_full: &Table<FieldExtension>,
+        next_row_flags: &[bool],
+        step_size: usize,
     ) -> Option<FieldElement<FieldExtension>> {
-        let ood_evaluations_table_height = proof.trace_ood_evaluations.height;
-        let ood_evaluations_table_width = proof.trace_ood_evaluations.width;
+        let ood_evaluations_table_height = ood_full.height;
+        let ood_evaluations_table_width = ood_full.width;
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
         // Runtime guard: a malformed proof may supply opening evaluations whose
@@ -749,10 +804,18 @@ pub trait IsStarkVerifier<
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
+                let opened_next_row = next_row_flags[col_idx];
                 let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
                     FieldElement::zero(),
                     |trace_t, (row_idx, coeff)| {
-                        let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
+                        // g·z pruning: the next-row block opens only transition-
+                        // window columns. Skip every other next-row opening — its
+                        // coefficient is zero, so the term is vacuous, and skipping
+                        // it is where the verifier/recursion cycle saving lands.
+                        if row_idx >= step_size && !opened_next_row {
+                            return trace_t;
+                        }
+                        let ood_val = &ood_full.get_row(row_idx)[col_idx];
                         // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
                         let diff: FieldElement<FieldExtension> = if col_idx < num_base {
                             &lde_trace_base_evaluations[col_idx] - ood_val
@@ -1063,11 +1126,16 @@ pub trait IsStarkVerifier<
             &domain.coset_offset,
         );
 
-        // <<<< Receive values: tⱼ(zgᵏ)
-        let trace_ood_evaluations_columns = proof.trace_ood_evaluations.columns();
-        for col in trace_ood_evaluations_columns.iter() {
-            for elem in col.iter() {
-                transcript.append_field_element(elem);
+        // <<<< Receive values: tⱼ(zgᵏ). Absorb the two pruned OOD blocks in the
+        // same order the prover sent them (current-row block, then next-row block).
+        for block in [
+            &proof.trace_ood_evaluations,
+            &proof.trace_ood_next_evaluations,
+        ] {
+            for col in block.columns().iter() {
+                for elem in col.iter() {
+                    transcript.append_field_element(elem);
+                }
             }
         }
         // <<<< Receive value: Hᵢ(z^N)
@@ -1080,8 +1148,15 @@ pub trait IsStarkVerifier<
         // ===================================
 
         let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation.len();
-        let num_terms_trace =
-            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        let num_eval_points = air.context().transition_offsets.len() * air.step_size();
+        let next_row_cols = air.trace_ood_next_row_columns();
+        // Must match the prover's g·z pruning exactly (same AIR metadata).
+        let num_terms_trace = crate::ood::num_surviving_trace_openings(
+            air.context().trace_columns,
+            num_eval_points,
+            air.step_size(),
+            next_row_cols.len(),
+        );
         let gamma = transcript.sample_field_element();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
@@ -1090,12 +1165,16 @@ pub trait IsStarkVerifier<
                 .take(num_terms_composition_poly + num_terms_trace)
                 .collect();
 
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+        let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
-            .map(|chunk| chunk.to_vec())
             .collect();
+        let trace_term_coeffs = crate::ood::build_pruned_trace_term_coeffs(
+            &trace_term_powers,
+            air.context().trace_columns,
+            num_eval_points,
+            air.step_size(),
+            &next_row_cols,
+        );
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;

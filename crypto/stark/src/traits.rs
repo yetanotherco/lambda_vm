@@ -207,10 +207,16 @@ pub trait AIR: Send + Sync {
     /// never taken from the (prover-controlled) proof.
     ///
     /// Indices are into the concatenated `[main | aux]` column space and must be
-    /// strictly less than `trace_layout().0 + trace_layout().1`. The default is
-    /// empty: a single-row transition window with no next-row reads.
+    /// strictly less than `trace_layout().0 + trace_layout().1`.
+    ///
+    /// The default is **conservative**: every column is opened at the next row,
+    /// i.e. no pruning, matching the pre-pruning behaviour. An AIR that reads the
+    /// next row therefore stays correct without overriding. Override with the
+    /// exact read set only when you know which columns a transition constraint
+    /// references at offset 1 — returning too small a set is a soundness bug.
     fn trace_ood_next_row_columns(&self) -> Vec<usize> {
-        Vec::new()
+        let (main, aux) = self.trace_layout();
+        (0..main + aux).collect()
     }
 
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
