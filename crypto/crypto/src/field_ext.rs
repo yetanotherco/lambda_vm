@@ -103,3 +103,41 @@ mod imp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Fp3Fma;
+    use math::field::element::FieldElement;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Fp3F;
+    use math::field::goldilocks::GoldilocksElement;
+
+    type Fp3 = FieldElement<Fp3F>;
+
+    fn e(x: [u64; 3]) -> Fp3 {
+        Fp3::from_raw([
+            GoldilocksElement::from(x[0]),
+            GoldilocksElement::from(x[1]),
+            GoldilocksElement::from(x[2]),
+        ])
+    }
+
+    /// `fma`/`ext_mul` must equal the plain field arithmetic they replace. On
+    /// host this exercises the software default (which also runs for every
+    /// non-Fp3 field); the guest FEXT impl is covered by the executor's
+    /// `fext_fma` tests and the recursion prove/verify E2E.
+    #[test]
+    fn fma_and_ext_mul_match_field_arithmetic() {
+        let cases = [
+            ([1u64, 2, 3], [4u64, 5, 6], [7u64, 8, 9]),
+            ([0, 0, 0], [9, 9, 9], [1, 2, 3]),
+            ([u64::MAX - 1, 0, 5], [2, 3, 4], [0, 0, 0]),
+            ([10, 20, 30], [10, 20, 30], [5, 5, 5]),
+            ([123456789, 987654321, 555], [1, 0, 0], [0, 1, 0]),
+        ];
+        for (a, b, c) in cases {
+            let (a, b, c) = (e(a), e(b), e(c));
+            assert_eq!(Fp3F::fma(&a, &b, &c), &a * &b + &c);
+            assert_eq!(Fp3F::ext_mul(&a, &b), &a * &b);
+        }
+    }
+}
