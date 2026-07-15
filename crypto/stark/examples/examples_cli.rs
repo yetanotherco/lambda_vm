@@ -6,7 +6,8 @@
 //!   examples_cli prove  <example-name> -o <proof.bin>
 //!   examples_cli verify <example-name> <proof.bin>
 //!
-//! Proofs are bincode-serialized, mirroring `bin/cli`'s VM-proof format.
+//! Proofs are bincode-serialized (this example's own format); `bin/cli`'s
+//! VM-proof format is now rkyv, so this no longer mirrors it.
 //! Trace sizes and public inputs mirror the existing stark tests
 //! (`src/tests/air_tests.rs`, `src/tests/small_trace_tests.rs`,
 //! `src/tests/bus_tests/completeness_tests.rs`) so a proof produced by one

@@ -124,7 +124,15 @@ pub struct MixedMmcs<E: IsField> {
 
 /// The opening of ALL matrices at one query index, authenticated by a single
 /// shared Merkle path.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct MixedOpening<E: IsField> {
     /// The one authentication path covering every matrix's row at the query.
