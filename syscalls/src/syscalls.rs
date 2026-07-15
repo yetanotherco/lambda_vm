@@ -8,6 +8,15 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
+/// Maximum private-input length the guest will read, in bytes (64 MiB).
+/// The host caps stored input at this size in `Memory::store_private_inputs`,
+/// so an honest length prefix is always `<=` this bound; a larger value can only
+/// come from a malformed or forged prefix. The reader clamps to this cap so a
+/// bogus length can never make the guest fabricate an arbitrarily long slice.
+/// Must match `executor::vm::memory::MAX_PRIVATE_INPUT_SIZE`.
+#[cfg(target_arch = "riscv64")]
+const MAX_PRIVATE_INPUT_SIZE: usize = 64 * 1024 * 1024;
+
 #[cfg(target_arch = "riscv64")]
 pub enum SyscallNumbers {
     Print = 1,
@@ -104,7 +113,12 @@ pub fn get_private_input_slice() -> &'static [u8] {
     // for the `'static` lifetime of the guest's single-threaded execution
     // region, which stays mapped and unmodified for the whole execution.
     let len_ptr = PRIVATE_INPUT_START as *const u32;
-    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
+    // Clamp the prover-written length prefix to `MAX_PRIVATE_INPUT_SIZE`. An
+    // honest prefix (written by the host, which caps stored input at this size)
+    // is always within bound, so clamping never changes behavior for real
+    // inputs — it only bounds the slice length when a malformed or forged prefix
+    // claims more, keeping the read deterministic.
+    let len = (unsafe { core::ptr::read_volatile(len_ptr) } as usize).min(MAX_PRIVATE_INPUT_SIZE);
     let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
     unsafe { core::slice::from_raw_parts(data_ptr, len) }
 }
