@@ -12,7 +12,9 @@ use crate::{
     lookup::{LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
     proof::stark::{DeepPolynomialOpening, MultiProof, PolynomialOpenings},
 };
-use crypto::{fiat_shamir::is_transcript::IsStarkTranscript, merkle_tree::proof::Proof};
+use crypto::{
+    fiat_shamir::is_transcript::IsStarkTranscript, field_ext::Fp3Fma, merkle_tree::proof::Proof,
+};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -33,7 +35,7 @@ use std::time::Instant;
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > {
     phantom: PhantomData<(Field, FieldExtension, PI)>,
@@ -41,7 +43,7 @@ pub struct Verifier<
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    FieldExtension: IsField + Send + Sync + Fp3Fma,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 {
@@ -79,7 +81,7 @@ pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<
 /// https://lambdaclass.github.io/lambdaworks/starks/protocol.html
 pub trait IsStarkVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 >
 {
@@ -743,8 +745,9 @@ pub trait IsStarkVerifier<
                         } else {
                             &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
                         };
-                        let poly_evaluation = diff * &denoms_trace[row_idx];
-                        trace_t + &poly_evaluation * coeff
+                        let poly_evaluation =
+                            FieldExtension::ext_mul(&diff, &denoms_trace[row_idx]);
+                        FieldExtension::fma(&poly_evaluation, coeff, &trace_t)
                     },
                 );
                 trace_terms + trace_i
@@ -761,8 +764,8 @@ pub trait IsStarkVerifier<
             // parts than the proof header advertises.
             let h_i_zpower = proof.composition_poly_parts_ood_evaluation.get(j)?;
             let gamma = challenges.gammas.get(j)?;
-            let h_i_term = (h_i_upsilon - h_i_zpower) * gamma;
-            h_terms += h_i_term;
+            let diff = h_i_upsilon - h_i_zpower;
+            h_terms = FieldExtension::fma(&diff, gamma, &h_terms);
         }
         h_terms *= denom_composition;
 
