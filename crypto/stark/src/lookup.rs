@@ -1003,6 +1003,19 @@ where
         self.trace_layout
     }
 
+    fn trace_ood_next_row_columns(&self) -> Vec<usize> {
+        // The only transition constraint that reads the next row is the circular
+        // LogUp accumulator, and after forward accumulation it reads only the
+        // accumulated column there (all committed terms and absorbed operands
+        // read the current row). Its full-width index is the main width plus the
+        // accumulated column's aux index. No interactions => no next-row reads.
+        if self.auxiliary_trace_build_data.interactions.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.trace_layout.0 + self.logup.acc_column_idx]
+        }
+    }
+
     fn has_trace_interaction(&self) -> bool {
         !self.auxiliary_trace_build_data.interactions.is_empty()
     }

@@ -904,6 +904,29 @@ fn test_malformed_ood_table_shape_rejected() {
     );
 }
 
+/// The transition window (`trace_ood_next_row_columns`) of a LogUp table is
+/// exactly the accumulator column — the sole column read at the next row after
+/// forward accumulation — expressed as a full-width `[main | aux]` index.
+#[test_log::test]
+fn test_trace_ood_next_row_columns_is_accumulator_only() {
+    let proof_options = ProofOptions::default_test_options();
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let (main, aux) = add_air.trace_layout();
+
+    // All ADD interactions are absorbed, so the single aux column is the
+    // accumulator; its full-width index is `main + (aux - 1)`.
+    let next = add_air.trace_ood_next_row_columns();
+    assert_eq!(next, vec![main + (aux - 1)]);
+
+    // Every returned index addresses a real column within the concatenated width.
+    for &c in &next {
+        assert!(
+            c < main + aux,
+            "next-row column {c} out of width {main}+{aux}"
+        );
+    }
+}
+
 // =============================================================================
 // Invalid bus public inputs
 // =============================================================================
