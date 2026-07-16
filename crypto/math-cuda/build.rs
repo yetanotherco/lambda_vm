@@ -15,38 +15,64 @@ fn nvcc_path() -> PathBuf {
 }
 
 /// Query `nvidia-smi` for the local GPU's compute capability (e.g. "12.0"
-/// for Blackwell). Returns a `compute_XX` target on success, falling back
-/// to `compute_89` (Ada) when no GPU is visible or the query fails.
+/// for Blackwell) and return a *real* arch (`sm_XX`) suitable for cubin
+/// (SASS) generation. Hard-fails the build when no GPU is visible and the
+/// query fails: a cubin is arch-locked, so there is no safe default — any
+/// guess produces a binary that loads on exactly one GPU model and silently
+/// CPU-falls-back everywhere else. Failing here is loud and fixable (set
+/// `CUDARC_NVCC_ARCH` or build on the target host); a guess is neither.
+///
+/// This is only reached when `nvcc` is present but the arch can't be detected
+/// (a toolkit-installed host with no visible GPU). A host without `nvcc` takes
+/// the empty-stub path in `compile_kernel` and never calls this.
 fn detect_arch() -> String {
-    const FALLBACK: &str = "compute_89";
+    detect_arch_from_smi().unwrap_or_else(|| {
+        panic!(
+            "math-cuda: nvcc is present but no GPU arch could be detected via nvidia-smi, \
+             and a cubin must target a concrete arch. Set CUDARC_NVCC_ARCH=sm_XX (e.g. sm_120 \
+             for RTX 5090, sm_86 for RTX 3090) or build on the target GPU host."
+        )
+    })
+}
+
+/// Parse the compute capability out of `nvidia-smi` and format it as a real
+/// `sm_XX` arch. Returns `None` on every path where no capability can be read
+/// (nvidia-smi missing, command failed, or unparsable output) so the caller
+/// warns before falling back.
+fn detect_arch_from_smi() -> Option<String> {
     let output = match Command::new("nvidia-smi")
         .args(["--query-gpu=compute_cap", "--format=csv,noheader"])
         .output()
     {
         Ok(o) if o.status.success() => o,
-        _ => return FALLBACK.to_string(),
+        _ => return None,
     };
-    let line = match std::str::from_utf8(&output.stdout) {
-        Ok(s) => s,
-        Err(_) => return FALLBACK.to_string(),
-    };
+    let line = std::str::from_utf8(&output.stdout).ok()?;
     // First line, first comma-separated value (covers multi-GPU hosts).
-    let cap = match line.lines().next() {
-        Some(l) => l.split(',').next().unwrap_or("").trim(),
-        None => return FALLBACK.to_string(),
-    };
-    let (major, minor) = match cap.split_once('.') {
-        Some((m, n)) => (m.trim(), n.trim()),
-        None => return FALLBACK.to_string(),
-    };
+    let cap = line.lines().next()?.split(',').next().unwrap_or("").trim();
+    let (major, minor) = cap.split_once('.')?;
+    let (major, minor) = (major.trim(), minor.trim());
     if major.chars().all(|c| c.is_ascii_digit()) && minor.chars().all(|c| c.is_ascii_digit()) {
-        format!("compute_{major}{minor}")
+        Some(format!("sm_{major}{minor}"))
     } else {
-        FALLBACK.to_string()
+        None
     }
 }
 
-fn compile_ptx(src: &str, out_name: &str, have_nvcc: bool) {
+/// Normalize a user-supplied `CUDARC_NVCC_ARCH` override to a *real* arch
+/// (`sm_XX`). cubin (SASS) generation rejects the *virtual* `compute_XX`
+/// form, but we accept it (and a bare `XX`) for backwards compatibility.
+fn to_real_arch(arch: &str) -> String {
+    if let Some(n) = arch.strip_prefix("compute_") {
+        format!("sm_{n}")
+    } else if arch.starts_with("sm_") {
+        arch.to_string()
+    } else {
+        format!("sm_{arch}")
+    }
+}
+
+fn compile_kernel(src: &str, out_name: &str, have_nvcc: bool) {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let src_path = manifest_dir.join("kernels").join(src);
@@ -57,30 +83,40 @@ fn compile_ptx(src: &str, out_name: &str, have_nvcc: bool) {
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDARC_NVCC_ARCH");
 
-    // When nvcc is missing from PATH, emit an empty PTX stub so the crate
-    // still compiles. include_str! in src/device.rs needs the file to exist
-    // at build time. Any runtime kernel call panics in cudarc when loading
-    // the empty module. We can't run GPU code without nvcc on the build
-    // host anyway.
+    // When nvcc is missing from PATH, emit an empty cubin stub so the crate
+    // still compiles. include_bytes! in src/device.rs needs the file to exist
+    // at build time. Any runtime kernel call fails to load the empty module and
+    // the caller falls back to CPU. We can't run GPU code without nvcc on the
+    // build host anyway.
     if !have_nvcc {
-        fs::write(&out_path, "").expect("failed to write empty PTX stub");
+        fs::write(&out_path, "").expect("failed to write empty cubin stub");
         return;
     }
 
-    // Emit PTX for a virtual architecture; the CUDA driver JIT-compiles it for the
-    // actual GPU at load time. Override with CUDARC_NVCC_ARCH to pin a specific
-    // compute capability. If unset, try `nvidia-smi` to match the host GPU
-    // (avoids JIT failures like nvcc-13.0 PTX rejected on Blackwell drivers);
-    // fall back to compute_89 (Ada) when detection fails.
+    // AOT-compile each kernel to a native cubin (SASS) for the host GPU's real
+    // arch, NOT to PTX. This sidesteps the driver's PTX-ISA JIT version check:
+    // a toolkit's PTX ISA is fixed by its CUDA version (e.g. CUDA 13.1 emits PTX
+    // .version 9.1), and a driver older than that toolkit rejects the module at
+    // load with CUDA_ERROR_UNSUPPORTED_PTX_VERSION -> every kernel silently
+    // falls back to CPU. A cubin carries pre-compiled SASS for a real arch, so
+    // the driver loads it directly as long as it supports that GPU (which the
+    // driver installed for that GPU always does) — regardless of the toolkit's
+    // CUDA version. See README "GPU Tests".
     //
-    // NOTE: this `-arch` only sets the *virtual arch*, not the PTX ISA version, which is
-    // fixed by this nvcc's CUDA toolkit. The runtime driver must support that toolkit's CUDA
-    // version or it rejects the PTX with CUDA_ERROR_UNSUPPORTED_PTX_VERSION — i.e. the box's
-    // driver CUDA must be >= the build toolkit's CUDA. See README "GPU Tests".
-    let arch = env::var("CUDARC_NVCC_ARCH").unwrap_or_else(|_| detect_arch());
+    // Trade-off: a cubin is arch-specific (an `sm_120` cubin runs only on
+    // `sm_120`). We build+run on the same GPU box in every flow and detect the
+    // arch from that box's `nvidia-smi`, so this is exactly right. Override with
+    // CUDARC_NVCC_ARCH (compute_XX / sm_XX / bare XX all accepted) to
+    // cross-compile for a different arch. If nvcc is present but no GPU is
+    // detectable and no override is given, `detect_arch` hard-fails rather than
+    // guessing an arch that would load on one GPU model and CPU-fall-back on
+    // every other.
+    let arch = env::var("CUDARC_NVCC_ARCH")
+        .map(|a| to_real_arch(&a))
+        .unwrap_or_else(|_| detect_arch());
 
     let status = Command::new(nvcc_path())
-        .args(["--ptx", "-O3", "-std=c++17", "-arch", &arch, "-o"])
+        .args(["--cubin", "-O3", "-std=c++17", "-arch", &arch, "-o"])
         .arg(&out_path)
         .arg(&src_path)
         .status()
@@ -107,19 +143,19 @@ fn main() {
         .unwrap_or(false);
     if !have_nvcc {
         println!(
-            "cargo:warning=math-cuda: nvcc not found at {} — emitting empty PTX stubs. \
-             Runtime GPU calls will panic. Install CUDA and rebuild for a working backend.",
+            "cargo:warning=math-cuda: nvcc not found at {} — emitting empty cubin stubs. \
+             Runtime GPU calls fall back to CPU. Install CUDA and rebuild for a working backend.",
             nvcc_path().display()
         );
     }
 
-    compile_ptx("arith.cu", "arith.ptx", have_nvcc);
-    compile_ptx("ntt.cu", "ntt.ptx", have_nvcc);
-    compile_ptx("keccak.cu", "keccak.ptx", have_nvcc);
-    compile_ptx("barycentric.cu", "barycentric.ptx", have_nvcc);
-    compile_ptx("deep.cu", "deep.ptx", have_nvcc);
-    compile_ptx("fri.cu", "fri.ptx", have_nvcc);
-    compile_ptx("inverse.cu", "inverse.ptx", have_nvcc);
-    compile_ptx("logup.cu", "logup.ptx", have_nvcc);
-    compile_ptx("constraint_interp.cu", "constraint_interp.ptx", have_nvcc);
+    compile_kernel("arith.cu", "arith.cubin", have_nvcc);
+    compile_kernel("ntt.cu", "ntt.cubin", have_nvcc);
+    compile_kernel("keccak.cu", "keccak.cubin", have_nvcc);
+    compile_kernel("barycentric.cu", "barycentric.cubin", have_nvcc);
+    compile_kernel("deep.cu", "deep.cubin", have_nvcc);
+    compile_kernel("fri.cu", "fri.cubin", have_nvcc);
+    compile_kernel("inverse.cu", "inverse.cubin", have_nvcc);
+    compile_kernel("logup.cu", "logup.cubin", have_nvcc);
+    compile_kernel("constraint_interp.cu", "constraint_interp.cubin", have_nvcc);
 }

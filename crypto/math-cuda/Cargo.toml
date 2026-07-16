@@ -6,12 +6,26 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+# cudarc CUDA version is PINNED to `cuda-12080` (CUDA 12.8) — do NOT restore
+# `cuda-version-from-build-system` + `fallback-latest`. Rationale:
+#   * That auto-detect binds the newest symbol set the *build toolkit* knows
+#     (e.g. a CUDA 13.1 toolkit pulls in `cuDevSmResourceSplit`, gated behind
+#     `cuda-13010`/`cuda-13020`). cudarc eagerly resolves those symbols at CUDA
+#     init; a driver that predates them (e.g. 580.x = CUDA 13.0 max) has no such
+#     export, so the `dynamic-loading` resolver `.expect()`s and PANICS.
+#   * This crate's cudarc surface is entirely CUDA-11-era
+#     (CudaContext/CudaFunction/CudaSlice/CudaStream/LaunchConfig/PushKernelArg/
+#     DriverError/Ptx — no green contexts). The 12.8 symbol set is a strict
+#     subset every >=12.8 driver exports, so pinning it resolves cleanly on any
+#     supported driver and a *newer* driver loses nothing we use.
+#   * This replaces the fragile per-script `sed` pin in scripts/gpu_test.sh.
+# To move the floor (e.g. to use a newer driver-API symbol), bump this one
+# feature deliberately — see crypto/math-cuda/build.rs and README "GPU Tests".
 cudarc = { version = "0.19", default-features = false, features = [
     "driver",
     "nvrtc",
     "std",
-    "cuda-version-from-build-system",
-    "fallback-latest",
+    "cuda-12080",
     "dynamic-loading",
 ] }
 math = { path = "../math" }
