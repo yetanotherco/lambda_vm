@@ -3337,6 +3337,19 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
 ) -> Result<Traces, Error> {
+    // Interim soundness guard: field-storage is NOT carried across continuation
+    // epochs (RAM and registers are, but `field_state` resets to default each
+    // epoch), so a FEXT value written in one epoch would read back as zero in the
+    // next — an unsound reset. Reject any FEXT accelerator use under continuation
+    // until L2G field-storage carry lands (monolithic proving is unaffected, as it
+    // carries field-storage within the single proof via the FEXT_PAGE bookend).
+    if l2g_memory_bookend
+        && (!ops.fext_load_ops.is_empty()
+            || !ops.fext_fma_ops.is_empty()
+            || !ops.fext_store_ops.is_empty())
+    {
+        return Err(Error::FextInContinuation);
+    }
     let CollectedOps {
         cpu_ops,
         memw_ops,

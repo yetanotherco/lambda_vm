@@ -3381,6 +3381,36 @@ fn test_continuation_pipeline_end_to_end() {
     );
 }
 
+/// FEXT accelerator ecalls under continuation (`l2g_memory_bookend = true`) are
+/// rejected: field-storage is not carried across epochs, so a written value would
+/// read back as zero in the next epoch. The guard must fire before any trace is built.
+#[test]
+fn fext_rejected_under_continuation() {
+    use crate::tables::register;
+    use crate::tables::trace_builder::build_initial_image;
+
+    let (elf, logs, _instructions) = run_asm_elf("test_fext");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let result = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &logs,
+        &MaxRowsConfig::default(),
+        &[],
+        true,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+    match result {
+        Err(crate::Error::FextInContinuation) => {}
+        Err(e) => panic!("expected FextInContinuation, got a different error: {e}"),
+        Ok(_) => panic!("expected FextInContinuation, but trace building succeeded"),
+    }
+}
+
 /// A continuation epoch built with `l2g_memory_bookend = true` proves and verifies:
 /// PAGE no longer bookends the touched RAM bytes (they self-cancel), and the
 /// local-to-global table provides their `Memory`-bus init/fini instead. The epoch

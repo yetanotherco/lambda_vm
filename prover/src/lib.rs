@@ -203,6 +203,12 @@ pub enum Error {
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
+    /// A FEXT (field-extension) accelerator ecall was used under continuation.
+    /// Field-storage is not carried across epochs yet (only RAM and registers
+    /// are), so a value written in one epoch would read back as zero in the
+    /// next — an unsound reset. Rejected until L2G field-storage carry lands;
+    /// prove monolithically in the meantime.
+    FextInContinuation,
     /// Recursion host-side helper failed (guest-input encoding or
     /// commitment recompute — see the `recursion` module).
     Recursion(String),
@@ -232,6 +238,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "the program-terminating instruction must be in the final epoch"
+                )
+            }
+            Error::FextInContinuation => {
+                write!(
+                    f,
+                    "FEXT accelerator ecalls are not supported under continuation \
+                     (field-storage is not carried across epochs); prove monolithically"
                 )
             }
             Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
