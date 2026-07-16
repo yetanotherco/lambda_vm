@@ -2346,7 +2346,7 @@ mod logup_single_source_tests {
     //! (verifier) — all bit-for-bit.
     //!
     //! Coverage: the accumulated constraint's 1-absorbed AND 2-absorbed branches
-    //! (the latter reads `aux(1, ·)` next-row cells), the batched-term
+    //! (the latter folds two absorbed interactions, degree 3), the batched-term
     //! constraint, and every [`Packing`] variant's fingerprint contribution.
     use super::*;
     use crate::constraint_ir::{eval_program, eval_program_verifier};
@@ -2432,11 +2432,11 @@ mod logup_single_source_tests {
         let n_fe = Fp3::from(n_rows as u64);
         for i in 0..n_rows {
             let mut row_sum = Fp3::zero();
-            for c in 0..n_term_cols {
-                row_sum = row_sum + &term_columns[c][i];
+            for col in &term_columns {
+                row_sum = row_sum + &col[i];
             }
-            let acc_i = trace.get_aux(i, acc_col_idx).clone();
-            let acc_next = trace.get_aux((i + 1) % n_rows, acc_col_idx).clone();
+            let acc_i = *trace.get_aux(i, acc_col_idx);
+            let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
             let lhs = (acc_next - acc_i) * &n_fe;
             let rhs = row_sum * &n_fe - &l;
             assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");

@@ -157,7 +157,7 @@ pub trait IsStarkVerifier<
         let expected_next_height = if expected_next_width == 0 {
             0
         } else {
-            num_eval_points - step_size
+            num_eval_points.saturating_sub(step_size)
         };
         let ood_current = proof.trace_ood_evaluations();
         let ood_next = proof.trace_ood_next_evaluations();

@@ -1,11 +1,12 @@
 //! Shared, prover = verifier-identical helpers for out-of-domain (OOD) trace
 //! opening pruning.
 //!
-//! The frame OOD table has `num_offsets * step_size` rows (offsets `[0, 1]`,
-//! offset-major: the first `step_size` rows are the current-row block, the rest
-//! are next-row blocks) and one column per trace column. Only the columns a
-//! transition constraint actually reads at the next row — the AIR's transition
-//! window, [`crate::traits::AIR::trace_ood_next_row_columns`] — need to be
+//! The frame OOD table has `num_offsets * step_size` rows (offset-major: the
+//! first `step_size` rows are offset 0's current-row block, and every later
+//! offset contributes a `step_size`-row next-row block) and one column per
+//! trace column. Only the columns a transition constraint actually reads at the
+//! next row — the AIR's transition window,
+//! [`crate::traits::AIR::trace_ood_next_row_columns`] — need to be
 //! opened in the next-row block(s). Every other next-row entry is redundant and
 //! is pruned from the proof.
 //!
@@ -48,6 +49,12 @@ pub fn num_surviving_trace_openings(
 /// evaluation over the full grid therefore yields the identical polynomial as
 /// summing only the survivors — which is what lets the prover keep its
 /// (GPU-friendly) rectangular DEEP unchanged.
+///
+/// Precondition: `powers.len() == num_surviving_trace_openings(num_total_cols,
+/// num_eval_points, step_size, next_row_cols.len())` for the same layout args —
+/// every power binds to exactly one surviving position and every surviving
+/// position consumes exactly one power. Both operands are AIR-metadata-derived
+/// (invariant I3), so this holds for every real AIR; a debug build checks it.
 ///
 /// Assignment order (mirrored exactly by [`num_surviving_trace_openings`]):
 ///   1. current-row block — for every column `j`, rows `0..step_size`;
@@ -226,7 +233,14 @@ mod tests {
         let full = Table::new(vec![fe(10), fe(11), fe(20), fe(21)], 2);
         let (b0, b1) = split_ood_blocks(&full, 1, &[]);
         assert_eq!(b1.width, 0);
-        let recon = reconstruct_ood_full(b0.row_major_data(), b0.width, b1.row_major_data(), 2, 1, &[]);
+        let recon = reconstruct_ood_full(
+            b0.row_major_data(),
+            b0.width,
+            b1.row_major_data(),
+            2,
+            1,
+            &[],
+        );
         assert_eq!(recon.get_row(0), full.get_row(0));
         assert_eq!(recon.get_row(1), &[Fe::zero(), Fe::zero()]);
     }
