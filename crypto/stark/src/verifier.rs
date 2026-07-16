@@ -952,9 +952,14 @@ pub trait IsStarkVerifier<
         if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width {
             return None;
         }
-        if trace_term_coeffs.is_empty()
-            || trace_term_coeffs.len() * trace_term_coeffs[0].len()
-                != ood_evaluations_table_height * ood_evaluations_table_width
+        // trace_term_coeffs is the verifier-built [ood_width][ood_height] γ grid.
+        // Verify its exact shape so the row-major indexing in the trace-term sum
+        // below cannot panic on a malformed grid — defense in depth; an honest
+        // proof always matches, since the verifier itself built this grid.
+        if trace_term_coeffs.len() != ood_evaluations_table_width
+            || trace_term_coeffs
+                .iter()
+                .any(|coeff_col| coeff_col.len() != ood_evaluations_table_height)
         {
             return None;
         }
@@ -963,33 +968,34 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let trace_term = (0..ood_evaluations_table_width)
-            .zip(&challenges.trace_term_coeffs)
-            .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
-                let opened_next_row = next_row_flags[col_idx];
-                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
-                    FieldElement::zero(),
-                    |trace_t, (row_idx, coeff)| {
-                        // g·z pruning: the next-row block opens only transition-
-                        // window columns. Skip every other next-row opening — its
-                        // coefficient is zero, so the term is vacuous, and skipping
-                        // it is where the verifier/recursion cycle saving lands.
-                        if row_idx >= step_size && !opened_next_row {
-                            return trace_t;
-                        }
-                        let ood_val = &ood_data[row_idx * ood_evaluations_table_width + col_idx];
-                        // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
-                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            base_at(col_idx) - ood_val
-                        } else {
-                            &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
-                        };
-                        let poly_evaluation = diff * &inv_trace_denominators[row_idx];
-                        trace_t + &poly_evaluation * coeff
-                    },
-                );
-                trace_terms + trace_i
-            });
+        // DEEP trace term at this query point x:
+        //   Σ_row  inv_den[row] · Σ_col (t_col(x) − ood[row][col]) · γ_{col,row}
+        // The denominator 1/(x − z·gʳᵒʷ) is shared by every column of a row, so
+        // factor it out of the column sum — one extension multiply per row instead
+        // of one per (col,row) element, ~halving the trace-term extension muls.
+        let mut trace_term = FieldElement::<FieldExtension>::zero();
+        for row_idx in 0..ood_evaluations_table_height {
+            let is_next_row = row_idx >= step_size;
+            let row_offset = row_idx * ood_evaluations_table_width;
+            let mut row_sum = FieldElement::<FieldExtension>::zero();
+            for col_idx in 0..ood_evaluations_table_width {
+                // g·z pruning: the next-row block opens only transition-window
+                // columns; every other next-row coefficient is zero, so skip it —
+                // this is where the verifier/recursion cycle saving lands.
+                if is_next_row && !next_row_flags[col_idx] {
+                    continue;
+                }
+                let ood_val = &ood_data[row_offset + col_idx];
+                // Stay in base when we can: F: IsSubFieldOf<E> gives F − E → E.
+                let diff: FieldElement<FieldExtension> = if col_idx < num_base {
+                    base_at(col_idx) - ood_val
+                } else {
+                    &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
+                };
+                row_sum += diff * &trace_term_coeffs[col_idx][row_idx];
+            }
+            trace_term += row_sum * &inv_trace_denominators[row_idx];
+        }
 
         let composition_parts_ood = proof.composition_poly_parts_ood_evaluation();
         let mut h_terms = FieldElement::zero();
