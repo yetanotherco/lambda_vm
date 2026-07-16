@@ -1710,14 +1710,12 @@ pub trait IsStarkVerifier<
             lde_trace_main_merkle_root: [0u8; 32],
             lde_trace_aux_merkle_root: None,
             lde_trace_precomputed_merkle_root: table.precomputed_root,
+            // Split OOD (g·z pruning): current-row block + pruned next-row block,
+            // the same shape the non-batched `StarkProof` carries. The batched
+            // verifier reconstructs the full grid from these two exactly as
+            // `verify_rounds_2_to_4` does.
             trace_ood_evaluations: table.trace_ood_evaluations.clone(),
-            // The batched proof carries the full (unpruned) OOD grid in
-            // `trace_ood_evaluations`; the batched verifier reconstructs the DEEP
-            // and transition frame directly from that grid (passing it as
-            // `ood_full`), so the split next-row block is unused here. An empty
-            // table keeps the synthetic `StarkProof` well-formed without
-            // duplicating data the batched path never reads.
-            trace_ood_next_evaluations: Table::new(Vec::new(), 0),
+            trace_ood_next_evaluations: table.trace_ood_next_evaluations.clone(),
             composition_poly_root: [0u8; 32],
             composition_poly_parts_ood_evaluation: table
                 .composition_poly_parts_ood_evaluation
@@ -1810,6 +1808,32 @@ pub trait IsStarkVerifier<
             {
                 return None;
             }
+            // Both OOD blocks' shapes are a public function of the AIR (invariant
+            // I3), never the prover's. Reject any table whose current/next-row
+            // block disagrees BEFORE Round 3 absorbs them and before the round-4
+            // frame/DEEP reconstruction indexes into them. Mirrors the non-batched
+            // `ood_blocks_well_formed`, but the current-row width is checked against
+            // `context().trace_columns` (the physical OOD width = main + aux, the
+            // same figure `OodLayout.num_total_cols` and the DEEP trace-term grid
+            // use) rather than `trace_layout().0 + num_aux`: the batched lane
+            // includes step-packed AIRs (e.g. BitFlags) whose `trace_layout().0` is
+            // a logical, not physical, column count. The width check is load-bearing
+            // (a wrong width desyncs the frame/grid reconstruction and would make
+            // `compute_query_invariant_deep_terms` reject a valid proof, or let a
+            // too-narrow row index out of bounds). All owned tables here, but
+            // `dimensions_consistent` still rejects a mis-deserialized one.
+            let layout = Self::ood_layout(*air);
+            let ood_current = &t.trace_ood_evaluations;
+            let ood_next = &t.trace_ood_next_evaluations;
+            if !ood_current.dimensions_consistent()
+                || ood_current.width != air.context().trace_columns
+                || ood_current.height != layout.step_size()
+                || !ood_next.dimensions_consistent()
+                || ood_next.width != layout.expected_next_width()
+                || ood_next.height != layout.expected_next_height()
+            {
+                return None;
+            }
             if air.is_preprocessed() {
                 let expected = air.precomputed_commitment();
                 match t.precomputed_root {
@@ -1887,9 +1911,13 @@ pub trait IsStarkVerifier<
             &domains[tallest].coset_offset,
         );
         for t in &proof.per_table {
-            for col in t.trace_ood_evaluations.columns().iter() {
-                for elem in col.iter() {
-                    transcript.append_field_element(elem);
+            // g·z pruning: absorb the current-row block then the pruned next-row
+            // block, each column-major, in the exact order the prover sent them.
+            for block in [&t.trace_ood_evaluations, &t.trace_ood_next_evaluations] {
+                for col in block.columns().iter() {
+                    for elem in col.iter() {
+                        transcript.append_field_element(elem);
+                    }
                 }
             }
             for elem in t.composition_poly_parts_ood_evaluation.iter() {
@@ -1939,26 +1967,34 @@ pub trait IsStarkVerifier<
         } = mid;
         let num_tables = airs.len();
 
+        // Per-table pruned-OOD layout (AIR-derived, never proof-derived — I3),
+        // built once and shared by the round-4 challenge replay, the full-grid
+        // reconstruction, step 2, the query-invariant hoist, and the per-query
+        // DEEP reconstruction. Mirrors the single `layout` the non-batched
+        // `verify_rounds_2_to_4` threads through those sites.
+        let layouts: Vec<crate::ood::OodLayout> =
+            airs.iter().map(|air| Self::ood_layout(*air)).collect();
+
         // ===== Round 4: shared gamma, per-table DEEP coeffs, batched FRI challenges. =====
         let gamma = transcript.sample_field_element();
         let mut trace_term_coeffs_all: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
             Vec::with_capacity(num_tables);
         let mut gammas_all: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_tables);
-        for (air, t) in airs.iter().zip(&proof.per_table) {
+        for (i, t) in proof.per_table.iter().enumerate() {
             let num_terms_comp = t.composition_poly_parts_ood_evaluation.len();
-            let num_terms_trace = air.context().transition_offsets.len()
-                * air.step_size()
-                * air.context().trace_columns;
+            // g·z pruning: draw only the surviving trace-term powers (current-row
+            // block all columns + next-row block masked columns) and scatter them
+            // into the rectangular W×num_eval_points grid with zeros at pruned
+            // positions — identical to the prover's `build_trace_term_coeffs` and
+            // the non-batched round-4 replay.
+            let layout = &layouts[i];
+            let num_terms_trace = layout.num_surviving();
             let mut coeffs: Vec<_> =
                 core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
                     .take(num_terms_comp + num_terms_trace)
                     .collect();
-            let trace_term_coeffs: Vec<_> = coeffs
-                .drain(..num_terms_trace)
-                .collect::<Vec<_>>()
-                .chunks(air.context().transition_offsets.len() * air.step_size())
-                .map(|c| c.to_vec())
-                .collect();
+            let trace_term_powers: Vec<_> = coeffs.drain(..num_terms_trace).collect();
+            let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
             trace_term_coeffs_all.push(trace_term_coeffs);
             gammas_all.push(coeffs);
         }
@@ -2014,11 +2050,25 @@ pub trait IsStarkVerifier<
             })
             .collect();
 
+        // The full current+next-row OOD grid, reconstructed once per table from
+        // the two pruned proof blocks and shared by step 2, the query-invariant
+        // hoist, and the per-query DEEP reconstruction — exactly as
+        // `verify_rounds_2_to_4` reconstructs it once and threads it through.
+        // Pruned next-row entries are zero: no constraint reads them and DEEP
+        // skips them.
+        let ood_fulls: Vec<Table<FieldExtension>> = (0..num_tables)
+            .map(|i| {
+                let current = &synth_proofs[i].trace_ood_evaluations;
+                let next = &synth_proofs[i].trace_ood_next_evaluations;
+                layouts[i].reconstruct_full(
+                    current.row_major_data(),
+                    current.width,
+                    next.row_major_data(),
+                )
+            })
+            .collect();
+
         // ===== Step 2 (claimed composition polynomial) per table. =====
-        // The batched proof carries the full (unpruned) OOD grid in each table's
-        // `trace_ood_evaluations`, so `ood_full` is that grid directly (no
-        // current/next split to reconstruct); `step_size` splits it into the
-        // transition frame exactly as the non-batched path does.
         for i in 0..num_tables {
             if !Self::step_2_verify_claimed_composition_polynomial(
                 airs[i],
@@ -2026,8 +2076,8 @@ pub trait IsStarkVerifier<
                 &synth_proofs[i].public_inputs,
                 &domains[i],
                 &table_challenges[i],
-                &synth_proofs[i].trace_ood_evaluations,
-                airs[i].step_size(),
+                &ood_fulls[i],
+                layouts[i].step_size(),
             ) {
                 return false;
             }
@@ -2080,22 +2130,20 @@ pub trait IsStarkVerifier<
 
         // Per-table DEEP query-invariant terms, hoisted out of the query loop
         // (#826): the OOD/gamma sums depend only on each table's challenges and
-        // full OOD grid, not on the query point. The batched proof commits the
-        // FULL (unpruned) OOD grid and full-width trace-term coefficients, so
-        // `next_row_cols` is every column (no g·z pruning) and `step_size` is the
-        // table's — the reconstruction then sums the whole grid, matching the
-        // batched prover's DEEP codeword exactly.
-        let next_row_cols_all: Vec<Vec<usize>> = (0..num_tables)
-            .map(|i| (0..synth_proofs[i].trace_ood_evaluations.width).collect())
-            .collect();
+        // reconstructed OOD grid, not on the query point. g·z pruning: the
+        // transition-window columns (`layouts[i].next_row_cols()`) are the only
+        // next-row openings that survive, derived from the AIR (never the proof),
+        // and the pruned-away next-row terms are skipped — the same reconstruction
+        // the non-batched path performs and the batched prover's DEEP codeword
+        // committed.
         let mut query_invariant_terms_all = Vec::with_capacity(num_tables);
         for i in 0..num_tables {
             let terms = match Self::compute_query_invariant_deep_terms(
                 &table_challenges[i],
                 StarkProofView::Owned(&synth_proofs[i]),
-                &synth_proofs[i].trace_ood_evaluations,
-                &next_row_cols_all[i],
-                airs[i].step_size(),
+                &ood_fulls[i],
+                layouts[i].next_row_cols(),
+                layouts[i].step_size(),
             ) {
                 Some(t) => t,
                 None => return false,
@@ -2205,8 +2253,8 @@ pub trait IsStarkVerifier<
                     prim_root,
                     &table_challenges[i],
                     &query_invariant_terms_all[i],
-                    &next_row_cols_all[i],
-                    airs[i].step_size(),
+                    layouts[i].next_row_cols(),
+                    layouts[i].step_size(),
                     precomp_p,
                     &main_op.evaluations,
                     aux_p,

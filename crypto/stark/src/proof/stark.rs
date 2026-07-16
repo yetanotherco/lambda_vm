@@ -169,8 +169,14 @@ pub struct BatchedQueryOpening<F: IsSubFieldOf<E>, E: IsField> {
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct BatchedTableData<E: IsField, PI> {
     pub trace_length: usize,
-    /// tⱼ(z gᵏ)
+    /// tⱼ(z gᵏ), current-row block: the `step_size` current-row openings for
+    /// every trace column (g·z pruning, mirrors [`StarkProof::trace_ood_evaluations`]).
     pub trace_ood_evaluations: Table<E>,
+    /// tⱼ(z gᵏ), pruned next-row block: only the transition-window columns
+    /// (`AIR::trace_ood_next_row_columns`, derived statically by both sides), for
+    /// the next-row offsets. Empty when the AIR reads no next-row column. Mirrors
+    /// [`StarkProof::trace_ood_next_evaluations`].
+    pub trace_ood_next_evaluations: Table<E>,
     /// Hᵢ(z^N)
     pub composition_poly_parts_ood_evaluation: Vec<FieldElement<E>>,
     /// Hardcoded precomputed-columns commitment (preprocessed tables); the

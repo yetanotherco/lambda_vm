@@ -3084,10 +3084,18 @@ pub trait IsStarkProver<
                 &round2s[idx],
                 &z,
             );
-            // >>>> Send values: t_j(z g^k)
-            for col in round_3_result.trace_ood_evaluations.columns().iter() {
-                for elem in col.iter() {
-                    transcript.append_field_element(elem);
+            // >>>> Send values: t_j(z g^k). g·z pruning: split the full OOD table
+            // into the current-row block (all columns) and the pruned next-row
+            // block (transition-window columns only), and absorb only the
+            // surviving values in that order — the verifier absorbs the identical
+            // two blocks. Mirrors the non-batched round-3 absorption exactly.
+            let (ood_block0, ood_block1) =
+                Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+            for block in [&ood_block0, &ood_block1] {
+                for col in block.columns().iter() {
+                    for elem in col.iter() {
+                        transcript.append_field_element(elem);
+                    }
                 }
             }
             // >>>> Send values: H_i(z^N)
@@ -4043,18 +4051,20 @@ pub trait IsStarkProver<
         FieldElement<FieldExtension>: AsBytes,
     {
         let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
-        let num_terms_trace =
-            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        // g·z pruning: only the current-row block (all columns) plus the masked
+        // next-row columns get a DEEP coefficient — identical to the non-batched
+        // round 4. The DEEP compute below keeps its rectangular W×num_eval_points
+        // grid with zeros at pruned positions, so those terms vanish.
+        let layout = Self::ood_layout(air);
+        let num_terms_trace = layout.num_surviving();
         let mut deep_composition_coefficients: Vec<_> =
             core::iter::successors(Some(FieldElement::one()), |x| Some(x * gamma))
                 .take(n_terms_composition_poly + num_terms_trace)
                 .collect();
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+        let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
-            .map(|chunk| chunk.to_vec())
             .collect();
+        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
         let gammas = deep_composition_coefficients;
         let mut deep_evals = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
@@ -4224,12 +4234,17 @@ pub trait IsStarkProver<
             });
         }
 
-        // Per-table data (canonical epoch order).
+        // Per-table data (canonical epoch order). g·z pruning: carry the split
+        // OOD (current-row block + pruned next-row block), the same shape the
+        // non-batched proof stores and the verifier reconstructs from.
         let mut per_table = Vec::with_capacity(num_airs);
         for idx in 0..num_airs {
+            let (ood_block0, ood_block1) = Self::ood_layout(air_trace_pairs[idx].0)
+                .split_full(&round3s[idx].trace_ood_evaluations);
             per_table.push(BatchedTableData {
                 trace_length: domains[idx].interpolation_domain_size,
-                trace_ood_evaluations: round3s[idx].trace_ood_evaluations.clone(),
+                trace_ood_evaluations: ood_block0,
+                trace_ood_next_evaluations: ood_block1,
                 composition_poly_parts_ood_evaluation: round3s[idx]
                     .composition_poly_parts_ood_evaluation
                     .clone(),

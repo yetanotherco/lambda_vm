@@ -20,6 +20,7 @@ use crate::examples::multi_table_lookup::{
 };
 use crate::proof::options::ProofOptions;
 use crate::proof::stark::BatchedMultiProof;
+use crate::table::Table;
 use crate::test_utils::multi_prove_batched_ram;
 use crate::trace::TraceTable;
 use crate::traits::AIR;
@@ -165,6 +166,50 @@ fn batched_rejects_tampered_layer_evaluation_sym() {
 fn batched_rejects_tampered_composition_ood() {
     let mut proof = valid_padding_proof();
     proof.per_table[1].composition_poly_parts_ood_evaluation[0] += FieldElement::<E>::one();
+    assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
+}
+
+/// Tampering a current-row trace-OOD value (the g·z-split current block) desyncs the
+/// shared transcript replay / step-2 composition claim → rejected.
+#[test_log::test]
+fn batched_rejects_tampered_trace_ood_current() {
+    let mut proof = valid_padding_proof();
+    let orig = &proof.per_table[0].trace_ood_evaluations;
+    let mut data = orig.row_major_data().to_vec();
+    data[0] += FieldElement::<E>::one();
+    proof.per_table[0].trace_ood_evaluations = Table::new(data, orig.width);
+    assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
+}
+
+/// Shape guard (I3): the current-row OOD block width is the physical trace width
+/// (main + aux), fixed by the AIR. A too-narrow block is rejected before any row
+/// access, mirroring the non-batched `ood_blocks_well_formed` guard.
+#[test_log::test]
+fn batched_rejects_malformed_current_row_ood_block() {
+    let mut proof = valid_padding_proof();
+    let orig = &proof.per_table[0].trace_ood_evaluations;
+    let (w, h) = (orig.width, orig.height);
+    assert!(w >= 2, "the CPU table has more than one trace column");
+    // Drop the last column: width w-1, same row count.
+    let mut data = Vec::with_capacity((w - 1) * h);
+    for r in 0..h {
+        data.extend_from_slice(&orig.get_row(r)[..w - 1]);
+    }
+    proof.per_table[0].trace_ood_evaluations = Table::new(data, w - 1);
+    assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
+}
+
+/// Shape guard (I3): the pruned next-row OOD block width is the transition window
+/// (here the LogUp accumulator, width 1). Emptying it — a prover trying to drop the
+/// surviving next-row opening — is rejected on shape before Round 3 absorbs it.
+#[test_log::test]
+fn batched_rejects_malformed_next_row_ood_block() {
+    let mut proof = valid_padding_proof();
+    assert!(
+        proof.per_table[0].trace_ood_next_evaluations.width >= 1,
+        "bus tables open the accumulator column at the next row"
+    );
+    proof.per_table[0].trace_ood_next_evaluations = Table::new(Vec::new(), 0);
     assert!(!batched_verify(&proof, FieldElement::<E>::zero()));
 }
 
