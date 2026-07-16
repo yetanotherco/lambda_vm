@@ -872,26 +872,6 @@ impl VmAirs {
 // Bus Balance Target: Verifier-Computed COMMIT Output Bus
 // =============================================================================
 
-/// Replay the prover's Phase A (main trace commitments) to recover the shared
-/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
-/// trace commitments in the same order as the prover, then samples two
-/// challenge elements.
-pub(crate) fn replay_transcript_phase_a(
-    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    multi_proof: &MultiProof<F, E, ()>,
-    transcript: &mut DefaultTranscript<E>,
-) -> (FieldElement<E>, FieldElement<E>) {
-    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-        if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
-        }
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-    }
-    let z: FieldElement<E> = transcript.sample_field_element();
-    let alpha: FieldElement<E> = transcript.sample_field_element();
-    (z, alpha)
-}
-
 /// Compute the bus balance offset for the COMMIT[index, value] bus.
 ///
 /// For each public output byte at index `i` with value `v`:
@@ -941,25 +921,9 @@ pub(crate) fn compute_commit_bus_offset(
     )
 }
 
-/// Compute the expected COMMIT bus balance for a `MultiProof`.
-///
-/// Replays Phase A of the transcript to recover (z, alpha), then computes
-/// the offset from the given public output bytes. Call this after `multi_prove`
-/// and before `multi_verify`.
-pub(crate) fn compute_expected_commit_bus_balance(
-    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proof: &MultiProof<F, E, ()>,
-    public_output_bytes: &[u8],
-    start_index: u64,
-    transcript: &mut DefaultTranscript<E>,
-) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
-    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
-}
-
-/// View counterpart of [`replay_transcript_phase_a`]: replays Phase A over a
-/// proof view (owned or archived-in-place), with no `MultiProof`
-/// deserialization required either way.
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
+/// — no `MultiProof` deserialization required either way.
 pub(crate) fn replay_transcript_phase_a_view(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: &[StarkProofView<F, E, ()>],
@@ -1008,6 +972,20 @@ pub(crate) fn verify_l2g_commitment_binding(
             .iter()
             .enumerate()
             .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
+}
+
+/// View counterpart of [`verify_l2g_commitment_binding`]: reads each global
+/// sub-table's committed root directly off a proof view (owned or
+/// archived-in-place), with no `MultiProof` deserialization either way.
+pub(crate) fn verify_l2g_commitment_binding_views(
+    epoch_l2g_roots: &[Commitment],
+    final_proof_views: &[StarkProofView<F, E, ()>],
+) -> bool {
+    final_proof_views.len() >= epoch_l2g_roots.len()
+        && epoch_l2g_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| *final_proof_views[i].lde_trace_main_merkle_root() == *root)
 }
 
 // =============================================================================

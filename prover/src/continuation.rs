@@ -55,6 +55,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstra
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
+use stark::proof::view::StarkProofView;
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
@@ -69,7 +70,8 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
+    compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding,
+    verify_l2g_commitment_binding_views,
 };
 
 type F = GoldilocksField;
@@ -576,19 +578,27 @@ fn prove_epoch(
     })
 }
 
-/// Verify one epoch using ONLY the [`EpochProof`] bundle plus the verifier-derived
-/// `register_init` (epoch 0: from the ELF; epoch i>0: from the previous epoch's
-/// `reg_fini`), `is_final`, and `label`. Rebuilds the AIRs and transcript
-/// from the bundle's statement values and indexes commits from the carried x254
-/// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is skipped for
-/// continuation epochs, so the AIRs are built with no page configs (the bundle does
-/// not get to supply any). Returns `true` iff the proof verifies and its committed
-/// L2G root matches the claimed one.
+/// Verify one epoch using ONLY the epoch's public statement fields plus the
+/// verifier-derived `register_init` (epoch 0: from the ELF; epoch i>0: from
+/// the previous epoch's `reg_fini`), `is_final`, and `label`. Rebuilds the
+/// AIRs and transcript from the bundle's statement values and indexes commits
+/// from the carried x254 (`register_init[X254_INDEX]`), never from the
+/// prover's memory. PAGE is skipped for continuation epochs, so the AIRs are
+/// built with no page configs (the bundle does not get to supply any). Returns
+/// `true` iff the proof verifies and its committed L2G root matches the
+/// claimed one.
+///
+/// `proof_views` is zero-copy either way: owned or archived (see the two callers).
 #[allow(clippy::too_many_arguments)]
 fn verify_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
-    epoch: &EpochProof,
+    proof_views: &[StarkProofView<F, E, ()>],
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    reg_fini: &[u32],
+    claimed_l2g_root: Commitment,
+    public_output: &[u8],
     register_init: &[u32],
     is_final: bool,
     label: u64,
@@ -596,7 +606,7 @@ fn verify_epoch(
     decode_commitment: Option<Commitment>,
 ) -> bool {
     // Reject degenerate table counts (mirrors the monolithic verifier).
-    if epoch.table_counts.validate().is_err() {
+    if table_counts.validate().is_err() {
         return false;
     }
 
@@ -608,8 +618,8 @@ fn verify_epoch(
     } else {
         FIXED_TABLE_COUNT - 1
     };
-    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != epoch.proof.proofs.len() {
+    let expected_proof_count = table_counts.total() + fixed_tables + 1;
+    if expected_proof_count != proof_views.len() {
         return false;
     }
 
@@ -617,9 +627,9 @@ fn verify_epoch(
         elf,
         opts,
         &[],
-        &epoch.table_counts,
+        table_counts,
         register_init,
-        &epoch.reg_fini,
+        reg_fini,
         is_final,
         decode_commitment,
     );
@@ -630,9 +640,9 @@ fn verify_epoch(
     let seed = || {
         epoch_transcript(
             elf_bytes,
-            &epoch.public_output,
-            &epoch.table_counts,
-            &epoch.runtime_page_ranges,
+            public_output,
+            table_counts,
+            runtime_page_ranges,
             label,
             opts.fri_final_poly_log_degree,
         )
@@ -645,10 +655,10 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
-    let expected = match compute_expected_commit_bus_balance(
+    let expected = match compute_expected_commit_bus_balance_view(
         &refs,
-        &epoch.proof,
-        &epoch.public_output,
+        proof_views,
+        public_output,
         commit_start_index,
         &mut seed(),
     ) {
@@ -656,18 +666,13 @@ fn verify_epoch(
         None => return false,
     };
 
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
+    if !Verifier::multi_verify_views(&refs, proof_views, &mut seed(), &expected) {
         return false;
     }
 
     // The claimed L2G root must be the one this proof actually committed (it is what
     // verify_l2g_commitment_binding later ties to the global proof).
-    epoch
-        .proof
-        .proofs
-        .last()
-        .map(|p| p.lde_trace_main_merkle_root)
-        == Some(epoch.l2g_root)
+    proof_views.last().map(|p| *p.lde_trace_main_merkle_root()) == Some(claimed_l2g_root)
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -752,7 +757,7 @@ fn prove_global(
 fn verify_global(
     num_epochs: usize,
     page_bases: &[u64],
-    proof: &MultiProof<F, E, ()>,
+    proof_views: &[StarkProofView<F, E, ()>],
     elf: &Elf,
     elf_bytes: &[u8],
     num_private_input_pages: usize,
@@ -821,9 +826,9 @@ fn verify_global(
         refs.push(air as AirRef);
     }
 
-    Verifier::multi_verify(
+    Verifier::multi_verify_views(
         &refs,
-        proof,
+        proof_views,
         &mut global_transcript(
             elf_bytes,
             num_epochs,
@@ -1076,10 +1081,21 @@ pub fn verify_continuation_with_roots(
         let is_final = index == n - 1;
         let label = local_to_global::epoch_label(index as u64);
 
+        let proof_views: Vec<StarkProofView<F, E, ()>> = epoch
+            .proof
+            .proofs
+            .iter()
+            .map(StarkProofView::Owned)
+            .collect();
         if !verify_epoch(
             &elf,
             elf_bytes,
-            epoch,
+            &proof_views,
+            &epoch.table_counts,
+            &epoch.runtime_page_ranges,
+            &epoch.reg_fini,
+            epoch.l2g_root,
+            &epoch.public_output,
             &register_init,
             is_final,
             label,
@@ -1122,10 +1138,16 @@ pub fn verify_continuation_with_roots(
             "touched_page_bases contains a non-page-aligned entry".to_string(),
         ));
     }
+    let global_proof_views: Vec<StarkProofView<F, E, ()>> = bundle
+        .global
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
     if !verify_global(
         n,
         &page_bases,
-        &bundle.global,
+        &global_proof_views,
         &elf,
         elf_bytes,
         bundle.num_private_input_pages,
@@ -1137,6 +1159,138 @@ pub fn verify_continuation_with_roots(
 
     // Each epoch's committed L2G table is the same one the global proof used.
     if !verify_l2g_commitment_binding(&epoch_roots, &bundle.global) {
+        return Ok(None);
+    }
+
+    Ok(Some(public_output))
+}
+
+/// [`verify_continuation_with_roots`]'s zero-copy counterpart, for the
+/// recursion `continuation` guest: reads every per-epoch/global proof in
+/// place via [`StarkProofView::Archived`] instead of deserializing an owned
+/// [`MultiProof`]. Only small per-epoch metadata is materialized. Roots are
+/// always supplied here (the guest never recomputes from the ELF in-VM).
+pub(crate) fn verify_continuation_archived(
+    archived: &ArchivedContinuationProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    decode_commitment: Commitment,
+    page_genesis_commitments: &[(u64, Commitment)],
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let max_private_input_pages = page::max_private_input_pages();
+    let num_private_input_pages = archived.num_private_input_pages.to_native() as usize;
+    if num_private_input_pages > max_private_input_pages {
+        return Err(Error::InvalidTableCounts(format!(
+            "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_private_input_pages})",
+        )));
+    }
+
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+
+    let n = archived.epochs.len();
+    if n == 0 {
+        return Ok(None);
+    }
+
+    if archived
+        .epochs
+        .iter()
+        .any(|e| e.reg_fini.len() != register::NUM_REGISTER_ADDRESSES)
+    {
+        return Ok(None);
+    }
+
+    let mut register_init = register::register_init_from_entry_point(elf.entry_point);
+    let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
+    let mut public_output: Vec<u8> = Vec::new();
+
+    for (index, epoch) in archived.epochs.iter().enumerate() {
+        let is_final = index == n - 1;
+        let label = local_to_global::epoch_label(index as u64);
+
+        let table_counts: TableCounts =
+            rkyv::deserialize::<TableCounts, RkyvError>(&epoch.table_counts).map_err(|e| {
+                Error::Execution(format!("rkyv deserialize table_counts failed: {e}"))
+            })?;
+        let runtime_page_ranges: Vec<RuntimePageRange> = rkyv::deserialize::<
+            Vec<RuntimePageRange>,
+            RkyvError,
+        >(&epoch.runtime_page_ranges)
+        .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+        let reg_fini: Vec<u32> = rkyv::deserialize::<Vec<u32>, RkyvError>(&epoch.reg_fini)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize reg_fini failed: {e}")))?;
+        let l2g_root: Commitment = epoch.l2g_root;
+        let epoch_public_output: &[u8] = epoch.public_output.as_slice();
+
+        let proof_views: Vec<StarkProofView<F, E, ()>> = epoch
+            .proof
+            .proofs
+            .as_slice()
+            .iter()
+            .map(StarkProofView::Archived)
+            .collect();
+
+        if !verify_epoch(
+            &elf,
+            elf_bytes,
+            &proof_views,
+            &table_counts,
+            &runtime_page_ranges,
+            &reg_fini,
+            l2g_root,
+            epoch_public_output,
+            &register_init,
+            is_final,
+            label,
+            opts,
+            Some(decode_commitment),
+        ) {
+            return Ok(None);
+        }
+
+        epoch_roots.push(l2g_root);
+        public_output.extend_from_slice(epoch_public_output);
+        register_init = reg_fini;
+    }
+
+    let touched_page_bases: Vec<u64> = archived
+        .touched_page_bases
+        .iter()
+        .map(|v| v.to_native())
+        .collect();
+    let page_bases = canonical_page_bases(&touched_page_bases);
+    if page_bases
+        .iter()
+        .any(|&b| b != page::page_base_for_address(b))
+    {
+        return Err(Error::MalformedContinuationBundle(
+            "touched_page_bases contains a non-page-aligned entry".to_string(),
+        ));
+    }
+
+    let global_proof_views: Vec<StarkProofView<F, E, ()>> = archived
+        .global
+        .proofs
+        .as_slice()
+        .iter()
+        .map(StarkProofView::Archived)
+        .collect();
+    if !verify_global(
+        n,
+        &page_bases,
+        &global_proof_views,
+        &elf,
+        elf_bytes,
+        num_private_input_pages,
+        opts,
+        Some(page_genesis_commitments),
+    ) {
+        return Ok(None);
+    }
+
+    if !verify_l2g_commitment_binding_views(&epoch_roots, &global_proof_views) {
         return Ok(None);
     }
 
