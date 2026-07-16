@@ -1438,6 +1438,23 @@ pub trait IsStarkProver<
         }
     }
 
+    /// The pruned-OOD layout for this AIR — the single place in the prover that
+    /// reads the shape metadata (`trace_columns`, `step_size`, the
+    /// transition-offset count, and the next-row column set). The round-3 block
+    /// split and the round-4 DEEP-coefficient assignment both derive from the
+    /// returned [`crate::ood::OodLayout`], which the verifier rebuilds identically
+    /// (invariant I3).
+    fn ood_layout(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    ) -> crate::ood::OodLayout {
+        crate::ood::OodLayout::new(
+            air.context().trace_columns,
+            air.context().transition_offsets.len() * air.step_size(),
+            air.step_size(),
+            air.trace_ood_next_row_columns(),
+        )
+    }
+
     /// Returns the result of the fourth round of the STARK Prove protocol.
     fn round_4_compute_and_run_fri_on_the_deep_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
@@ -1458,16 +1475,10 @@ pub trait IsStarkProver<
         let gamma = transcript.sample_field_element();
 
         let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
-        let num_eval_points = air.context().transition_offsets.len() * air.step_size();
-        let next_row_cols = air.trace_ood_next_row_columns();
         // g·z pruning: only the current-row block (all columns) plus the masked
         // next-row columns get an opening / DEEP coefficient.
-        let num_terms_trace = crate::ood::num_surviving_trace_openings(
-            air.context().trace_columns,
-            num_eval_points,
-            air.step_size(),
-            next_row_cols.len(),
-        );
+        let layout = Self::ood_layout(air);
+        let num_terms_trace = layout.num_surviving();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
         let mut deep_composition_coefficients: Vec<_> =
@@ -1481,13 +1492,7 @@ pub trait IsStarkProver<
         // Rectangular W×num_eval_points grid with the sampled powers at surviving
         // positions and zeros at pruned next-row positions, so the DEEP loop
         // below (and the GPU path) stay unchanged — zero-coefficient terms vanish.
-        let trace_term_coeffs = crate::ood::build_pruned_trace_term_coeffs(
-            &trace_term_powers,
-            air.context().trace_columns,
-            num_eval_points,
-            air.step_size(),
-            &next_row_cols,
-        );
+        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
@@ -3122,12 +3127,8 @@ pub trait IsStarkProver<
         // the current-row block (all columns) and the pruned next-row block
         // (masked columns only), and absorb only the surviving values — the
         // verifier absorbs the identical two blocks in the same order.
-        let ood_next_row_cols = air.trace_ood_next_row_columns();
-        let (ood_block0, ood_block1) = crate::ood::split_ood_blocks(
-            &round_3_result.trace_ood_evaluations,
-            air.step_size(),
-            &ood_next_row_cols,
-        );
+        let (ood_block0, ood_block1) =
+            Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
         for block in [&ood_block0, &ood_block1] {
             for col in block.columns().iter() {
                 for elem in col.iter() {
