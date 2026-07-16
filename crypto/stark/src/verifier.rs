@@ -196,6 +196,7 @@ pub trait IsStarkVerifier<
             && next.height() == expected_next_height
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
@@ -209,6 +210,10 @@ pub trait IsStarkVerifier<
         // split below.
         ood_full: &Table<FieldExtension>,
         step_size: usize,
+        // Powers of the shared LogUp α challenge, precomputed once by the caller to
+        // the global-max bus width across all tables (α is sampled once and shared),
+        // then sliced here to this table's width — no per-table recompute or alloc.
+        shared_alpha_powers: &[FieldElement<FieldExtension>],
     ) -> bool {
         crate::profile_markers::step_marker::<
             { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
@@ -293,14 +298,14 @@ pub trait IsStarkVerifier<
             None => return false,
         };
 
-        let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
+        // Slice this table's prefix out of the caller's shared α-power vector. When
+        // the proof carries LogUp challenges, `shared_alpha_powers.len()` is the
+        // global-max bus width, so `air.max_bus_elements()` is always in range.
+        let logup_alpha_powers: &[FieldElement<FieldExtension>] =
             if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(
-                    &challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA],
-                    air.max_bus_elements(),
-                )
+                &shared_alpha_powers[..air.max_bus_elements()]
             } else {
-                Vec::new()
+                &[]
             };
 
         let logup_table_offset = match proof.bus_table_contribution() {
@@ -322,7 +327,7 @@ pub trait IsStarkVerifier<
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
-            &logup_alpha_powers,
+            logup_alpha_powers,
             &logup_table_offset,
         );
         let transition_ood_frame_evaluations =
@@ -1287,6 +1292,26 @@ pub trait IsStarkVerifier<
             Vec::new()
         };
 
+        // The LogUp α challenge is shared by every table (sampled once, above), and
+        // the α-powers each table needs are just `[1, α, α², …]` truncated to its bus
+        // width. Compute the sequence ONCE to the global-max width here; each table's
+        // step_2 slices the prefix it needs instead of recomputing the powers and
+        // reallocating a vector per table.
+        let shared_alpha_powers: Vec<FieldElement<FieldExtension>> =
+            if lookup_challenges.len() > LOGUP_CHALLENGE_ALPHA {
+                let global_max_bus_elements = airs
+                    .iter()
+                    .map(|air| air.max_bus_elements())
+                    .max()
+                    .unwrap_or(0);
+                compute_alpha_powers(
+                    &lookup_challenges[LOGUP_CHALLENGE_ALPHA],
+                    global_max_bus_elements,
+                )
+            } else {
+                Vec::new()
+            };
+
         // =====================================================================
         // Validate bus_public_inputs presence against AIR layout
         // =====================================================================
@@ -1352,6 +1377,7 @@ pub trait IsStarkVerifier<
                 &public_inputs,
                 &mut table_transcript,
                 lookup_challenges.clone(),
+                &shared_alpha_powers,
             ) {
                 error!(
                     "Table {} failed verify_rounds_2_to_4 (num_constraints={}, trace_cols={})",
@@ -1586,6 +1612,8 @@ pub trait IsStarkVerifier<
         public_inputs: &PI,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        // Shared LogUp α-powers (global-max bus width), passed through to step_2.
+        shared_alpha_powers: &[FieldElement<FieldExtension>],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1674,6 +1702,7 @@ pub trait IsStarkVerifier<
             &challenges,
             &ood_full,
             layout.step_size(),
+            shared_alpha_powers,
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
