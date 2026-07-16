@@ -1769,13 +1769,42 @@ fn collect_lt_from_fext_fma(ops: &[fext_fma::FextFmaOperation]) -> Vec<LtOperati
 /// of the 3 field reads. (The register read/write LT checks are handled by the
 /// shared MEMW machinery.)
 fn collect_lt_from_fext_store(ops: &[fext_store::FextStoreOperation]) -> Vec<LtOperation> {
-    let mut lt_ops = Vec::with_capacity(ops.len() * 3);
+    let mut lt_ops = Vec::with_capacity(ops.len() * 6);
     for op in ops {
         for d in 0..3 {
+            // coeff < p (read-back canonicality) + old_ts < ts (temporal order).
+            lt_ops.push(LtOperation::new(
+                op.coeffs[d],
+                math::field::goldilocks::GOLDILOCKS_PRIME,
+                false,
+            ));
             lt_ops.push(LtOperation::new(op.old_ts[d], op.timestamp, false));
         }
     }
     lt_ops
+}
+
+/// BITWISE `IsHalfword` provider rows for the FEXT_STORE chip: each read-back
+/// coefficient's two 32-bit words are split into 16-bit halves that the chip
+/// range-checks (12 per op).
+fn collect_bitwise_from_fext_store(
+    ops: &[fext_store::FextStoreOperation],
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 12);
+    for op in ops {
+        for d in 0..3 {
+            for word in [op.coeffs[d] & 0xFFFF_FFFF, op.coeffs[d] >> 32] {
+                for hv in [word & 0xFFFF, (word >> 16) & 0xFFFF] {
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::IsHalf,
+                        (hv & 0xFF) as u8,
+                        (hv >> 8) as u8,
+                    ));
+                }
+            }
+        }
+    }
+    bitwise_ops
 }
 
 /// Checks whether a MEMW operation qualifies for the aligned fast path (MEMW_A).
@@ -3410,6 +3439,7 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_fext_store(&fext_store_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image

@@ -17,16 +17,17 @@ fn op(coeffs: [u64; 3]) -> FextStoreOperation {
 }
 
 #[test]
-fn fext_store_constraint_count_is_one() {
-    // Only IS_BIT(μ).
-    assert_eq!(FextStoreConstraints.meta().len(), 1);
+fn fext_store_constraint_count() {
+    // IS_BIT(μ) + 6 word-recompose constraints (one per coefficient word).
+    assert_eq!(FextStoreConstraints.meta().len(), 7);
 }
 
 #[test]
 fn fext_store_bus_interaction_count() {
     // 1 Ecall + 1 register read (x10) + 3 field reads (consume + emit + old_ts<ts
-    // = 3 each) + 3 register writes (a1/a2/a3) = 1 + 1 + 9 + 3.
-    assert_eq!(bus_interactions().len(), 14);
+    // = 3 each) + 3 register writes + 12 IsHalfword + 3 coeff<p
+    // = 1 + 1 + 9 + 3 + 12 + 3.
+    assert_eq!(bus_interactions().len(), 29);
 }
 
 #[test]
