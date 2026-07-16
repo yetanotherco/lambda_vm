@@ -72,13 +72,6 @@ fn check_goldilocks_stream_bytes(v: u64) {
     );
 }
 
-#[test]
-fn goldilocks_stream_bytes_matches_as_bytes_and_to_bytes_be_edge_cases() {
-    for v in EDGE_VALUES {
-        check_goldilocks_stream_bytes(v);
-    }
-}
-
 fn check_ext3_stream_bytes(t: [u64; 3]) {
     let e = fp3(t);
     let s = streamed(&e);
@@ -89,14 +82,6 @@ fn check_ext3_stream_bytes(t: [u64; 3]) {
         ByteConversion::to_bytes_be(&e),
         "stream != to_bytes_be (t={t:?})"
     );
-}
-
-#[test]
-fn ext3_stream_bytes_matches_as_bytes_and_to_bytes_be_edge_cases() {
-    for v in EDGE_VALUES {
-        check_ext3_stream_bytes([v, v, v]);
-        check_ext3_stream_bytes([v, 0, 1]);
-    }
 }
 
 fn check_ext3_stream_bytes_gpu_kernel_contract(t: [u64; 3]) {
@@ -119,14 +104,6 @@ fn check_ext3_stream_bytes_gpu_kernel_contract(t: [u64; 3]) {
     assert_eq!(streamed(&e), buf, "ext3 stream != write_bytes_be (t={t:?})");
 }
 
-#[test]
-fn ext3_stream_bytes_matches_gpu_kernel_contract_edge_cases() {
-    for v in EDGE_VALUES {
-        check_ext3_stream_bytes_gpu_kernel_contract([v, v, v]);
-        check_ext3_stream_bytes_gpu_kernel_contract([v, 0, 1]);
-    }
-}
-
 /// The default `stream_bytes` body forwards to `as_bytes`; a type that does not
 /// override it must still round-trip identically.
 struct Unoverridden(Vec<u8>);
@@ -142,7 +119,14 @@ fn check_default_stream_bytes_impl(bytes: Vec<u8>) {
 }
 
 #[test]
-fn default_stream_bytes_impl_matches_as_bytes_edge_cases() {
+fn edge_cases() {
+    for v in EDGE_VALUES {
+        check_goldilocks_stream_bytes(v);
+        check_ext3_stream_bytes([v, v, v]);
+        check_ext3_stream_bytes([v, 0, 1]);
+        check_ext3_stream_bytes_gpu_kernel_contract([v, v, v]);
+        check_ext3_stream_bytes_gpu_kernel_contract([v, 0, 1]);
+    }
     for bytes in [vec![], vec![0u8], vec![1, 2, 3, 4, 5], vec![0xff; 64]] {
         check_default_stream_bytes_impl(bytes);
     }
