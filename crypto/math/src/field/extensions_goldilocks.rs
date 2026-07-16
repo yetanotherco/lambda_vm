@@ -568,16 +568,14 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
 
         for coeff in &mut coeffs {
             loop {
-                rng.fill(&mut sample);
-                let int_sample = u64::from_be_bytes(sample);
-                if int_sample < GOLDILOCKS_PRIME {
-                    *coeff = FpE::from(int_sample);
+                let candidate = next_u64();
+                if candidate < GOLDILOCKS_PRIME {
+                    *coeff = FpE::from(candidate);
                     break;
                 }
             }
