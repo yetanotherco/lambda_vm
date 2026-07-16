@@ -8,7 +8,7 @@ use stark::constraints::builder::ConstraintSet;
 
 #[test]
 fn fext_page_constraint_and_bus_counts() {
-    assert_eq!(FextPageConstraints.meta().len(), 1); // IS_BIT(μ)
+    assert_eq!(FextPageConstraints.meta().len(), 2); // IS_BIT(μ) + domain ∈ {3,4,5}
     assert_eq!(bus_interactions().len(), 2); // init receiver + fini sender
 }
 
@@ -38,8 +38,9 @@ fn fext_page_trace_layout_and_padding() {
     assert_eq!(*t.get(0, cols::MU), FE::one());
     assert_eq!(*t.get(1, cols::DOMAIN), FE::from(5u64));
 
-    // Padding rows have μ = 0.
+    // Padding rows have μ = 0 and a valid domain (3) so the domain constraint holds.
     for row in 2..4 {
         assert_eq!(*t.get(row, cols::MU), FE::zero());
+        assert_eq!(*t.get(row, cols::DOMAIN), FE::from(3u64));
     }
 }

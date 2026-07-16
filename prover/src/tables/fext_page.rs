@@ -68,6 +68,12 @@ pub fn generate_fext_page_trace(
         table.set_fe(row, cols::MU, FE::one());
     }
 
+    // Padding rows carry a valid domain (3) so the ungated domain constraint
+    // holds on every row; μ = 0 keeps them out of the bus.
+    for row in ops.len()..num_rows {
+        table.set_fe(row, cols::DOMAIN, FE::from(3u64));
+    }
+
     trace
 }
 
@@ -111,11 +117,26 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     ]
 }
 
-/// FEXT_PAGE constraints: idx 0 is `IS_BIT(μ)`.
+/// FEXT_PAGE constraints: idx 0 is `IS_BIT(μ)`, idx 1 pins the domain to
+/// `{3, 4, 5}` (the field-storage coefficient domains).
 pub struct FextPageConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextPageConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         emit_is_bit(b, 0, cols::MU, None);
+
+        // Domain ∈ {3, 4, 5}: `(D - 3)(D - 4)(D - 5) = 0`. The domain feeds the
+        // shared Memory bus, so leaving it a free witness would let a prover forge
+        // tokens in another domain's chain (e.g. domain 0 = RAM). Ungated (degree
+        // 3, within budget); padding rows carry domain 3 so it holds everywhere.
+        let d = b.main(0, cols::DOMAIN);
+        let three = b.const_base(3);
+        let four = b.const_base(4);
+        let five = b.const_base(5);
+        b.emit_base(1, (d.clone() - three) * (d.clone() - four) * (d - five));
+    }
+
+    fn max_degree(&self) -> usize {
+        3
     }
 }
