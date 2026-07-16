@@ -28,7 +28,7 @@ pub struct ExecutionResult {
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
-const CHUNK_SIZE: usize = 100_000;
+pub(crate) const CHUNK_SIZE: usize = 100_000;
 
 /// Result of executing one continuation epoch: the logs produced during the
 /// epoch and the VM state at the epoch boundary. The boundary state is the
@@ -69,6 +69,22 @@ impl Executor {
     /// Resume execution and return next logs. Returns None when program is finished.
     pub fn resume(&mut self) -> Result<Option<&[Log]>, ExecutorError> {
         self.resume_with_limit(CHUNK_SIZE)
+    }
+
+    /// Resume execution for the next chunk, capping it so `total_cycles`
+    /// never overshoots `cycle_budget`: a full `CHUNK_SIZE` normally, or just
+    /// the cycles still owed for the final chunk. `cycle_budget` of `None`
+    /// always runs a full chunk. Centralizes the cap math so the flamegraph
+    /// and plain execute drive loops can't drift apart on it.
+    pub fn resume_budgeted(
+        &mut self,
+        total_cycles: u64,
+        cycle_budget: Option<u64>,
+    ) -> Result<Option<&[Log]>, ExecutorError> {
+        let limit = cycle_budget
+            .map(|budget| ((budget - total_cycles) as usize).min(CHUNK_SIZE))
+            .unwrap_or(CHUNK_SIZE);
+        self.resume_with_limit(limit)
     }
 
     /// Current program counter (0 once the program has halted).
@@ -184,6 +200,7 @@ fn load_program(segments: &[crate::elf::Segment], memory: &mut Memory) -> Result
     Ok(())
 }
 
+#[derive(Clone)]
 pub struct InstructionSegment {
     base_addr: u64,
     instructions: Vec<Instruction>,
@@ -195,6 +212,7 @@ impl InstructionSegment {
     }
 }
 
+#[derive(Clone)]
 pub struct InstructionCache {
     segments: Vec<InstructionSegment>,
 }

@@ -57,9 +57,6 @@ use crate::tables::decode::{bus_interactions as decode_bus_interactions, cols as
 use crate::tables::dvrm::{
     DvrmConstraints, bus_interactions as dvrm_bus_interactions, cols as dvrm_cols,
 };
-use crate::tables::ec_scalar::{
-    EcScalarConstraints, bus_interactions as ec_scalar_bus_interactions, cols as ec_scalar_cols,
-};
 use crate::tables::ecdas::{
     EcdasConstraints, bus_interactions as ecdas_bus_interactions, cols as ecdas_cols,
 };
@@ -936,18 +933,6 @@ pub fn create_ecsm_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcsmConstr
         1,
         EcsmConstraints,
         "ECSM",
-    )
-}
-
-/// Create EC_SCALAR AIR (serves the scalar bit-by-bit to ECDAS).
-pub fn create_ec_scalar_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcScalarConstraints> {
-    build_air(
-        ec_scalar_cols::NUM_COLUMNS,
-        ec_scalar_bus_interactions(),
-        proof_options,
-        1,
-        EcScalarConstraints,
-        "EC_SCALAR",
     )
 }
 

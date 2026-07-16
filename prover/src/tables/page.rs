@@ -246,7 +246,7 @@ pub fn generate_page_trace(
 
     let num_rows = page_size; // One row per byte in the page
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -358,8 +358,8 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     //   bytes loaded from the binary. Either way the column is fully determined
     //   before execution, so the verifier can check it against a preprocessed
     //   commitment instead of including it in the main trace.
-    let mut offset_col = vec![FE::zero(); num_rows];
-    let mut init_col = vec![FE::zero(); num_rows];
+    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
 
     for i in 0..page_size {
         offset_col[i] = FE::from(i as u64);

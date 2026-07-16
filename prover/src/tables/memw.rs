@@ -35,7 +35,7 @@ use stark::trace::TraceTable;
 
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::constraints::templates::emit_is_bit;
 
 /// Maximum number of rows per MEMW table chunk.
@@ -105,17 +105,22 @@ pub struct MemwOperation {
     pub is_register: bool,
     /// Base address (64-bit)
     pub base_address: u64,
-    /// Values to write (8 bytes)
-    pub value: [u64; 8],
+    /// Values to write. Each element is one memory byte (0-255) or, for register
+    /// accesses, a 32-bit half of the register word — both fit in u32, so this is
+    /// `[u32; 8]` rather than `[u64; 8]` to halve the struct's footprint (the walk
+    /// materializes tens of millions of these; it is memory-bandwidth-bound).
+    pub value: [u32; 8],
     /// Timestamp of this access
     pub timestamp: u64,
     /// Access width: 1, 2, 4, or 8 bytes
     pub width: u8,
     /// Whether this is a read (true) or write (false)
     pub is_read: bool,
-    /// Previous values at the addresses (filled by memory model)
-    pub old: [u64; 8],
-    /// Previous timestamps at the addresses (filled by memory model)
+    /// Previous values at the addresses (filled by memory model). Same element
+    /// domain as `value` (byte or 32-bit register half) → `[u32; 8]`.
+    pub old: [u32; 8],
+    /// Previous timestamps at the addresses (filled by memory model). Timestamps
+    /// can reach u64::MAX (HALT), so these stay `[u64; 8]`.
     pub old_timestamp: [u64; 8],
 }
 
@@ -124,7 +129,7 @@ impl MemwOperation {
     pub fn new(
         is_register: bool,
         base_address: u64,
-        value: [u64; 8],
+        value: [u32; 8],
         timestamp: u64,
         width: u8,
         is_read: bool,
@@ -142,7 +147,7 @@ impl MemwOperation {
     }
 
     /// Set the old values (from memory model).
-    pub fn with_old(mut self, old: [u64; 8], old_timestamp: [u64; 8]) -> Self {
+    pub fn with_old(mut self, old: [u32; 8], old_timestamp: [u64; 8]) -> Self {
         self.old = old;
         self.old_timestamp = old_timestamp;
         self
@@ -173,7 +178,7 @@ pub fn generate_memw_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -189,7 +194,7 @@ pub fn generate_memw_trace(
 
         // value[8]
         for i in 0..8 {
-            table.set_u64(row_idx, cols::VALUE[i], op.value[i]);
+            table.set_u64(row_idx, cols::VALUE[i], op.value[i] as u64);
         }
 
         // timestamp as Word (1 column)
@@ -203,7 +208,7 @@ pub fn generate_memw_trace(
 
         // Output: old[8]
         for i in 0..8 {
-            table.set_u64(row_idx, cols::OLD[i], op.old[i]);
+            table.set_u64(row_idx, cols::OLD[i], op.old[i] as u64);
         }
 
         // Auxiliary: carry[7]

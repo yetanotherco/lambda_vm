@@ -7,8 +7,9 @@
 //! and `next_op`. When `next_op = 1` it consumes the scalar bit at `round` on the `Bit`
 //! bus (an add follows). ECSM seeds and drains the bus; interior rows telescope.
 //!
-//! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set the quotients
-//! to `r` and `op = 0`, which makes every relation hold with zero carries.
+//! See `spec/src/ecdas.toml`. Constraints are **unconditional**; padding rows set quotients
+//! to 0 and `op = 1`. The `R·P` term in the λ, xR, and yR relations is gated with `μ`, so it
+//! vanishes on padding rows (μ=0) and all relations hold with zero carries.
 
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
@@ -25,12 +26,11 @@ pub(crate) const CARRY_OFFSET_XR: i64 = 8161;
 pub(crate) const CARRY_OFFSET_YR: i64 = 16320;
 
 // =========================================================================
-// Column indices (~521 columns)
+// Column indices (~520 columns)
 // =========================================================================
 
 pub mod cols {
-    /// timestamp: Word (1 column)
-    pub const TIMESTAMP: usize = 0;
+    pub const TIMESTAMP: usize = 0; // timestamp: Word (1 column)
     pub const XG: usize = 1; // U256BL (32)
     pub const YG: usize = 33;
     pub const XA: usize = 65;
@@ -94,7 +94,7 @@ pub fn generate_ecdas_trace(
     let n = ops.len();
     let num_rows = n.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -128,12 +128,10 @@ pub fn generate_ecdas_trace(
         table.set_fe(row_idx, cols::MU, FE::one());
     }
 
-    // Padding rows: q0 = q1 = q2 = r, op = 0, everything else 0. This makes every
-    // (unconditional) convolution relation hold with zero carries.
+    // Padding rows: q0 = q1 = q2 = 0, op = 1 (add), everything else 0. The μ-gated R·P
+    // term vanishes (μ=0), so all convolution relations hold with zero carries.
     for row_idx in n..num_rows {
-        table.set_bytes(row_idx, cols::Q0, &R_BYTES);
-        table.set_bytes(row_idx, cols::Q1, &R_BYTES);
-        table.set_bytes(row_idx, cols::Q2, &R_BYTES);
+        table.set_byte(row_idx, cols::OP, 1);
     }
 
     trace
@@ -155,7 +153,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let ts = || packed(cols::TIMESTAMP);
     let mut out = Vec::new();
 
-    // Receive [ts, xA, yA, xG, yG, round, op].
+    // Receive [id, ts, xA, yA, xG, yG, round, op].
     out.push(BusInteraction::receiver(
         BusId::Ecdas,
         mu(),
@@ -219,7 +217,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         vec![ts(), packed(cols::ROUND)],
     ));
 
-    // Send the updated accumulator: [ts, xR, yR, xG, yG, round - 1 + next_op, next_op].
+    // Send the updated accumulator: [id, ts, xR, yR, xG, yG, round - 1 + next_op, next_op].
     out.push(BusInteraction::sender(
         BusId::Ecdas,
         mu(),
@@ -311,20 +309,24 @@ impl EcdasConstraints {
         }
     }
 
-    /// The r·P − q·P convolution term `Σ_{j=0..=i} (r_byte(j) − q[j])·p_byte(i−j)`
-    /// (shared structure across all three relations).
+    /// The `μ·R·P − q·P` convolution term
+    /// `μ·Σ_{j=0..=i} r_byte(j)·p_byte(i−j) − Σ_{j=0..=i} q[j]·p_byte(i−j)`
+    /// (shared structure across all three relations). R and P are constants, so
+    /// `μ·R·P` is degree 1. The `μ`-gate makes the term vanish on padding rows
+    /// (`μ=0`, `q=0`), keeping all relations at zero carries.
     fn rq<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         b: &B,
         i: usize,
         qbase: usize,
     ) -> B::Expr {
-        let mut s = b.zero();
+        let mu = b.main(0, cols::MU);
+        let mut r_p = b.zero();
+        let mut q_p = b.zero();
         for j in 0..=i {
-            let term = (Self::r_byte_expr(b, j) - Self::byte_at(b, qbase, 33, j))
-                * Self::p_byte_expr(b, i - j);
-            s = s + term;
+            r_p = r_p + Self::r_byte_expr(b, j) * Self::p_byte_expr(b, i - j);
+            q_p = q_p + Self::byte_at(b, qbase, 33, j) * Self::p_byte_expr(b, i - j);
         }
-        s
+        mu * r_p - q_p
     }
 
     /// `S_i` for `relation` at limb `i`.

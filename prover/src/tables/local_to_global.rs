@@ -265,7 +265,7 @@ pub fn generate_local_to_global_trace(
     boundaries: &[CellBoundary],
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = boundaries.len().next_power_of_two().max(1);
-    let mut data = vec![FE::zero(); num_rows * cols::NUM_COLUMNS];
+    let mut data = crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS);
 
     for (row, b) in boundaries.iter().enumerate() {
         let base = row * cols::NUM_COLUMNS;

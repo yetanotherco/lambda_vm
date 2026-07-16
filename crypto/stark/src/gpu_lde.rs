@@ -77,6 +77,9 @@ pub fn reset_all_gpu_call_counters() {
     GPU_FRI_CALLS.store(0, Ordering::Relaxed);
     GPU_BATCH_INVERT_CALLS.store(0, Ordering::Relaxed);
     GPU_LOGUP_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
+    GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
+    GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -90,6 +93,136 @@ pub fn gpu_extend_halves_calls() -> u64 {
 pub(crate) static GPU_LOGUP_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_logup_calls() -> u64 {
     GPU_LOGUP_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful GPU composition-poly (`H(row)`) dispatches — one per table whose
+/// round-2 constraint evaluation took the fused on-device path (a failed attempt
+/// or a gate miss falls back to the CPU accumulation and is not counted).
+pub(crate) static GPU_COMPOSITION_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_calls() -> u64 {
+    GPU_COMPOSITION_CALLS.load(Ordering::Relaxed)
+}
+
+/// Successful device-resident-LDE opening-value gathers in
+/// `open_deep_composition_poly` — one per main/aux trace whose R4 query rows
+/// were read straight off the device LDE instead of the host trace (a
+/// non-resident tree or non-Goldilocks tower falls back to the host gather and
+/// is not counted). Guards against a silent regression where Stage-2 openings
+/// quietly revert to the host path.
+pub(crate) static GPU_OPENING_GATHER_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_opening_gather_calls() -> u64 {
+    GPU_OPENING_GATHER_CALLS.load(Ordering::Relaxed)
+}
+
+/// Tables whose round-1 LDE was kept device-only (host trace D2H skipped) — the
+/// Stage-3 full-residency win. Incremented once per main trace that took the
+/// `device_only` path. Zero means every table kept its host copy (gate never
+/// engaged), so a residency regression drops this to 0 while proofs still
+/// verify.
+pub(crate) static GPU_DEVICE_ONLY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_device_only_calls() -> u64 {
+    GPU_DEVICE_ONLY_CALLS.load(Ordering::Relaxed)
+}
+
+/// Runtime override to force the GPU composition path off (→ CPU accumulation).
+/// An escape hatch, and the A/B toggle for benchmarking the path against the CPU
+/// baseline in one process (no rebuild). Default off (path enabled).
+static GPU_COMPOSITION_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_gpu_composition_disabled(v: bool) {
+    GPU_COMPOSITION_DISABLED.store(v, Ordering::Relaxed);
+}
+pub(crate) fn gpu_composition_disabled() -> bool {
+    if GPU_COMPOSITION_DISABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Env fallback (cached), so an unmodified prove binary can A/B the path:
+    // `LAMBDA_VM_DISABLE_GPU_COMPOSITION=1`.
+    static ENV_DISABLED: OnceLock<bool> = OnceLock::new();
+    *ENV_DISABLED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_DISABLE_GPU_COMPOSITION")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Runtime override to force the Stage-3 device-only path off (keeps the round-1
+/// host D2H). Independent of the composition toggle, so the residency win can be
+/// A/B-benched with the GPU composition path left on. Default off (path enabled).
+static DEVICE_ONLY_DISABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+pub fn set_device_only_disabled(v: bool) {
+    DEVICE_ONLY_DISABLED.store(v, Ordering::Relaxed);
+}
+pub(crate) fn device_only_disabled() -> bool {
+    if DEVICE_ONLY_DISABLED.load(Ordering::Relaxed) {
+        return true;
+    }
+    // Env fallback (cached): `LAMBDA_VM_DISABLE_DEVICE_ONLY=1`.
+    static ENV_DISABLED: OnceLock<bool> = OnceLock::new();
+    *ENV_DISABLED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_DISABLE_DEVICE_ONLY")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// Stage-3 device-only gate: `true` when a table's round-1 LDE can be left
+/// device-resident (host D2H skipped) because every downstream round is
+/// guaranteed to take its GPU path. A strict AND of all preconditions that
+/// imply the R2 composition, R3 barycentric, R4 DEEP, and R4 opening GPU paths
+/// all fire and read the device LDE. The per-round `host_trace_empty`
+/// hard-abort guards are the safety net: if any precondition is nonetheless
+/// violated at runtime (mis-gate or transient GPU error), the prove aborts
+/// loudly rather than reading the empty host trace.
+///
+/// `zerofier_uniform` must be the R1-derived conservative form (all constraints
+/// share `end_exemptions == 0`), which implies `ZerofierEvaluations::is_uniform`
+/// (a single cyclic group) — the condition the GPU composition kernel needs.
+///
+/// LOCKSTEP: this gate must IMPLY the runtime dispatch checks in
+/// `ConstraintEvaluator::try_evaluate_composition_gpu` (plus the R3/R4 device
+/// arms). A fallback condition added to a dispatch without a mirror here turns
+/// every gate-true table into a hard-abort — loud, but an avoidable crash.
+pub(crate) fn device_only_gate<F, E>(
+    lde_size: usize,
+    n: usize,
+    is_preprocessed: bool,
+    offsets_contiguous: bool,
+    zerofier_uniform: bool,
+) -> bool
+where
+    F: 'static,
+    E: 'static,
+{
+    // debug-checks reconstruct the LDE from the host trace — keep it resident.
+    if cfg!(feature = "debug-checks") {
+        return false;
+    }
+    is_goldilocks_ext3_tower::<F, E>()
+        && !device_only_disabled()
+        && !gpu_composition_disabled()
+        && lde_size.is_power_of_two()
+        && lde_size >= gpu_lde_threshold()
+        && n >= gpu_bary_threshold()
+        && !is_preprocessed
+        && offsets_contiguous
+        && zerofier_uniform
+}
+
+/// `true` when the field tower is concrete Goldilocks + its degree-3 extension —
+/// the only tower with a CUDA lowering. The one home of this check: every GPU
+/// dispatch gate calls it, so the tower test cannot drift between sites.
+pub(crate) fn is_goldilocks_ext3_tower<F: 'static, E: 'static>() -> bool {
+    TypeId::of::<F>() == TypeId::of::<GoldilocksField>()
+        && TypeId::of::<E>() == TypeId::of::<Degree3GoldilocksExtensionField>()
+}
+
+/// `true` when the transition offsets form the contiguous frame `[0, 1, ..]`
+/// the GPU kernels' row math assumes (a `Var` at offset `o` reads LDE row
+/// `row + o·next_step`). Shared by the composition dispatch and its gates.
+pub(crate) fn offsets_are_contiguous(offsets: &[usize]) -> bool {
+    offsets.iter().enumerate().all(|(i, &o)| o == i)
 }
 
 // ============================================================================
@@ -450,6 +583,7 @@ pub(crate) fn try_expand_leaf_and_tree_row_major_keep<F, E, B>(
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
+    retain_host_lde: bool,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeBase,
@@ -482,12 +616,14 @@ where
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
+    // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     let (handle, lde_u64) = math_cuda::lde::coset_lde_row_major_with_merkle_tree_keep(
         raw,
         n,
         m,
         blowup_factor,
         &weights_u64,
+        retain_host_lde,
     )
     .ok()?;
 
@@ -517,6 +653,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep<F, E, B>(
     m: usize,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
+    retain_host_lde: bool,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeExt3,
@@ -551,12 +688,14 @@ where
     GPU_MERKLE_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
 
     // The keep path keeps the Merkle tree resident on device (in `handle.tree`).
+    // `retain_host_lde=false` additionally skips the row-major D2H (device-only).
     let (handle, lde_u64) = math_cuda::lde::coset_lde_ext3_row_major_with_merkle_tree_keep(
         raw,
         n,
         m,
         blowup_factor,
         &weights_u64,
+        retain_host_lde,
     )
     .ok()?;
 
@@ -1118,6 +1257,7 @@ pub(crate) fn try_expand_leaf_and_tree_ext3_row_major_keep_dev<F, E, B>(
     ra: &math_cuda::logup::ResidentAux,
     blowup_factor: usize,
     weights: &[FieldElement<F>],
+    retain_host_lde: bool,
 ) -> Option<(
     MerkleTree<B>,
     math_cuda::lde::GpuLdeExt3,
@@ -1145,6 +1285,7 @@ where
         ra.num_aux_cols,
         blowup_factor,
         &weights_u64,
+        retain_host_lde,
     )
     .ok()?;
 

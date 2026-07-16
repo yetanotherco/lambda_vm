@@ -583,7 +583,7 @@ fresh agents) of the register/x254 chain, the L2G root binding, and
 completeness-by-enumeration found no false-accept: each forgery is caught by a
 Merkle/hash collision, a bus imbalance, or a Fiat-Shamir divergence.
 
-The bundle derives serde and round-trips through `bincode` (exactly like a
+The bundle derives rkyv and round-trips through `rkyv` (exactly like a
 monolithic `VmProof`); the CLI drives it via `prove --continuations` (writes the
 bundle) and `verify --continuations` (checks bundle + ELF only). `prove` picks the
 epoch size from `--epoch-size-log2 N` (`N=20` means 1,048,576 cycles), defaulting
@@ -606,7 +606,7 @@ recursion/aggregation layer (deferred).
   (§3.5), **private-input genesis not bundled/recomputed** (§3.6), **cross-epoch registers**
   (§6), the **commit index x254** across epochs (§6), the **Fiat-Shamir statement
   binding** (§7), and the **standalone split prover/verifier** (§8) — bundle serialized
-  with `bincode` and driven from the CLI (`prove`/`verify --continuations`).
+  with `rkyv` and driven from the CLI (`prove`/`verify --continuations`).
 - **The committed code implements Design X** (`MU` gates every L2G interaction),
   which is the sound design. Design Y was implemented briefly, then found unsound
   (§4, the chain-truncation attack) and **reverted**. Do not re-introduce the

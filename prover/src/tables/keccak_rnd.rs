@@ -244,7 +244,7 @@ pub fn generate_keccak_rnd_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let n_rows = (ops.len() * 24).next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); n_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(n_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );

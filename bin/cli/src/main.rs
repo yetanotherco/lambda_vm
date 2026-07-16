@@ -2,7 +2,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -10,16 +10,29 @@ use clap::{Parser, Subcommand, ValueHint};
 
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
-use executor::{
-    elf::{Elf, SymbolTable},
-    flamegraph::FlamegraphGenerator,
-    vm::execution::Executor,
-};
+use executor::vm::instruction::decoding::Instruction;
+use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
+use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
 
 const DEFAULT_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 20;
 const MIN_CONTINUATION_EPOCH_SIZE_LOG2: u32 = 18;
+
+/// Read a file into a buffer aligned for `rkyv::from_bytes`. A plain
+/// `Vec<u8>` from `std::fs::read` is align-1 by the type system even though
+/// the allocator happens to return well-aligned memory in practice — read
+/// straight into an `AlignedVec` instead of relying on that.
+fn read_aligned_file(path: &Path) -> std::io::Result<rkyv::util::AlignedVec<16>> {
+    use std::os::unix::fs::FileExt;
+
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len() as usize;
+    let mut aligned = rkyv::util::AlignedVec::<16>::with_capacity(len);
+    aligned.resize(len, 0);
+    file.read_exact_at(&mut aligned, 0)?;
+    Ok(aligned)
+}
 
 /// Polls jemalloc `stats.allocated` every 10ms from a background thread,
 /// tracking the high-water mark. Near-zero overhead because jemalloc uses
@@ -112,7 +125,26 @@ enum Commands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         flamegraph: Option<PathBuf>,
 
-        /// Print the dynamic instruction (cycle) count
+        /// Key the folded stacks by raw hex address instead of resolving
+        /// through the ELF symtab (pairs with scripts/enrich_flamegraph.py).
+        /// Only meaningful with --flamegraph.
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_raw: bool,
+
+        /// Checkpoint the flamegraph's folded output to --flamegraph every N
+        /// cycles, so a killed run still leaves usable (partial) output on
+        /// disk. Only meaningful with --flamegraph.
+        #[arg(long, requires = "flamegraph")]
+        flamegraph_checkpoint_cycles: Option<u64>,
+
+        /// Stop execution early once at least this many cycles have run.
+        #[arg(long)]
+        cycle_budget: Option<u64>,
+
+        /// Print the dynamic instruction (cycle) count, plus `Keccak calls` /
+        /// `Ecsm calls` (accelerator syscall invocations). The accelerator lines
+        /// are omitted when combined with --flamegraph (that path has no per-log
+        /// data).
         #[arg(long)]
         cycles: bool,
     },
@@ -207,8 +239,21 @@ fn main() -> ExitCode {
             elf,
             private_input,
             flamegraph,
+            flamegraph_raw,
+            flamegraph_checkpoint_cycles,
+            cycle_budget,
             cycles,
-        } => cmd_execute(elf, private_input, flamegraph, cycles),
+        } => cmd_execute(
+            elf,
+            private_input,
+            FlamegraphCliOptions {
+                path: flamegraph,
+                raw: flamegraph_raw,
+                checkpoint_cycles: flamegraph_checkpoint_cycles,
+            },
+            cycle_budget,
+            cycles,
+        ),
         Commands::Prove {
             elf,
             output,
@@ -272,10 +317,71 @@ fn count_cycles(elf_data: &[u8], private_inputs: &[u8]) -> Result<u64, String> {
         .map_err(|e| format!("Execution failed during cycle count: {e:?}"))
 }
 
+/// Write the flamegraph's current (possibly partial) folded output to
+/// `output_path`, replacing any previous contents. Used both for the final
+/// write and for periodic checkpoints during a long run.
+///
+/// Writes to a `tempfile` in the same directory, flushes it, then persists
+/// (renames) it over `output_path` — the whole file is replaced atomically,
+/// so a kill mid-write can never leave `output_path` empty or torn (the
+/// previous good checkpoint stays put until the new one is fully on disk).
+fn write_flamegraph_checkpoint(
+    output_path: &PathBuf,
+    generator: &FlamegraphGenerator,
+    raw: bool,
+) -> Result<(), String> {
+    let dir = output_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = tempfile::NamedTempFile::new_in(dir)
+        .map_err(|e| format!("Failed to create temp output file: {e}"))?;
+
+    let mut writer = BufWriter::new(tmp.as_file());
+    let result = if raw {
+        generator.write_folded_raw(&mut writer)
+    } else {
+        generator.write_folded(&mut writer)
+    };
+    result.map_err(|e| format!("Failed to write flamegraph output: {e:?}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("Failed to flush flamegraph output: {e}"))?;
+    drop(writer);
+
+    tmp.persist(output_path)
+        .map_err(|e| format!("Failed to replace {output_path:?} with temp output: {e}"))?;
+    Ok(())
+}
+
+/// Flamegraph-related flags grouped so `cmd_execute` doesn't need a flat
+/// 8-argument signature.
+struct FlamegraphCliOptions {
+    path: Option<PathBuf>,
+    raw: bool,
+    checkpoint_cycles: Option<u64>,
+}
+
+/// Classifies one executed instruction as an accelerator syscall invocation.
+///
+/// Delegates to the executor's canonical `SyscallNumbers::accelerator()` so the
+/// CLI's counts equal the prover's chip-trigger counts by construction: the
+/// prover sets `ecall_keccak`/`ecall_ecsm` from `f.ecall && log.src1_val ==
+/// <SYSCALL_NUMBER>`. Here `f.ecall` is the instruction at the log's
+/// `current_pc` being `EcallEbreak`, and `src1_val` carries a7 (the syscall
+/// number) on ECALL logs. (`get_private_input` is a memory-mapped read, not a
+/// syscall, so it never reaches this path.)
+fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Accelerator> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    SyscallNumbers::try_from(src1_val)
+        .ok()
+        .and_then(|s| s.accelerator())
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
-    flamegraph_path: Option<PathBuf>,
+    flamegraph: FlamegraphCliOptions,
+    cycle_budget: Option<u64>,
     cycles: bool,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
@@ -302,74 +408,135 @@ fn cmd_execute(
         }
     };
 
-    let mut executor = match Executor::new(&program, private_inputs) {
-        Ok(e) => e,
-        Err(e) => {
-            eprintln!("Failed to create executor: {:?}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    // Accelerator invocation counts, tallied only in the plain streaming path
+    // below (the flamegraph path drives execution inside the executor and does
+    // not expose per-log data). `None` means "not counted", so the accel lines
+    // are omitted rather than printed as misleading zeros.
+    let mut accel_counts: Option<(u64, u64)> = None;
 
-    // Set up flamegraph generator if requested
-    let mut generator = flamegraph_path.as_ref().map(|_| {
-        let symbols = SymbolTable::parse(&elf_data);
-        FlamegraphGenerator::new(symbols, program.entry_point)
-    });
+    let cycle_count = if let Some(ref output_path) = flamegraph.path {
+        // Shared execute+flamegraph path (executor::flamegraph) instead of
+        // hand-rolling the SymbolTable/Executor/drive-loop wiring here.
+        let mut next_checkpoint = flamegraph.checkpoint_cycles;
+        let result = executor::flamegraph::run_with_flamegraph(
+            &elf_data,
+            &program,
+            private_inputs,
+            cycle_budget,
+            |total_cycles, generator| {
+                let Some(threshold) = next_checkpoint else {
+                    return;
+                };
+                if total_cycles < threshold {
+                    return;
+                }
+                if let Err(e) = write_flamegraph_checkpoint(output_path, generator, flamegraph.raw)
+                {
+                    eprintln!("Warning: flamegraph checkpoint failed: {e}");
+                }
+                next_checkpoint = flamegraph.checkpoint_cycles.map(|step| threshold + step);
+            },
+        );
 
-    // Execute in chunks, counting cycles and (if requested) feeding the flamegraph.
-    let mut cycle_count: u64 = 0;
-    loop {
-        let logs = match executor.resume() {
-            Ok(logs) => logs,
+        let (generator, result) = result;
+        let total_cycles = match result {
+            Ok(total_cycles) => total_cycles,
             Err(e) => {
                 eprintln!("Execution failed: {:?}", e);
-                return ExitCode::FAILURE;
-            }
-        };
-        match logs {
-            Some(logs) => {
-                cycle_count += logs.len() as u64;
-                if let Some(ref mut fg) = generator {
-                    let logs: Vec<_> = logs.to_vec();
-                    if let Err(e) = fg.process_logs(&logs, &executor.instructions) {
-                        eprintln!("Failed to process logs for flamegraph: {:?}", e);
-                        return ExitCode::FAILURE;
-                    }
+                // Best-effort: persist whatever the generator accumulated
+                // before the fault instead of discarding it outright.
+                match write_flamegraph_checkpoint(output_path, &generator, flamegraph.raw) {
+                    Ok(()) => eprintln!(
+                        "Partial flamegraph written to {:?} ({} instructions)",
+                        output_path,
+                        generator.total_instructions()
+                    ),
+                    Err(e) => eprintln!("Warning: failed to write partial flamegraph: {e}"),
                 }
-            }
-            None => break,
-        }
-    }
-
-    if let Err(e) = executor.finish() {
-        eprintln!("Failed to finish execution: {:?}", e);
-        return ExitCode::FAILURE;
-    }
-
-    // Write flamegraph output if requested
-    if let (Some(output_path), Some(generator)) = (flamegraph_path, generator) {
-        let file = match File::create(&output_path) {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("Failed to create flamegraph output file: {}", e);
                 return ExitCode::FAILURE;
             }
         };
-        let mut writer = BufWriter::new(file);
-        if let Err(e) = generator.write_folded(&mut writer) {
-            eprintln!("Failed to write flamegraph output: {:?}", e);
+
+        if let Err(e) = write_flamegraph_checkpoint(output_path, &generator, flamegraph.raw) {
+            eprintln!("{e}");
             return ExitCode::FAILURE;
         }
-
         eprintln!(
             "Flamegraph written to {:?} ({} instructions)",
             output_path,
             generator.total_instructions()
         );
-    }
+
+        total_cycles
+    } else {
+        let mut executor = match Executor::new(&program, private_inputs) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("Failed to create executor: {:?}", e);
+                return ExitCode::FAILURE;
+            }
+        };
+
+        let mut cycle_count: u64 = 0;
+        let mut keccak_calls: u64 = 0;
+        let mut ecsm_calls: u64 = 0;
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
+        // accelerator syscall number. This is a cheap superset — a non-ECALL
+        // instruction can hold the same value in src1 — that `accelerator_of`
+        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
+        // `&mut`) is released so the instruction cache can be read again.
+        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
+        loop {
+            let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
+                Ok(logs) => logs,
+                Err(e) => {
+                    eprintln!("Execution failed: {:?}", e);
+                    return ExitCode::FAILURE;
+                }
+            };
+            let Some(logs) = logs else { break };
+            cycle_count += logs.len() as u64;
+            if cycles {
+                for log in logs {
+                    if SyscallNumbers::try_from(log.src1_val)
+                        .map(|s| s.accelerator().is_some())
+                        .unwrap_or(false)
+                    {
+                        accel_candidates.push((log.current_pc, log.src1_val));
+                    }
+                }
+            }
+            // `logs` is no longer used, so the executor's `&mut` borrow is free
+            // and the instruction cache can be read to confirm each candidate.
+            for (pc, a7) in accel_candidates.drain(..) {
+                match accelerator_of(executor.instructions.get(pc), a7) {
+                    Some(Accelerator::Keccak) => keccak_calls += 1,
+                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
+                    None => {}
+                }
+            }
+            if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
+                break;
+            }
+        }
+
+        if let Err(e) = executor.finish() {
+            eprintln!("Failed to finish execution: {:?}", e);
+            return ExitCode::FAILURE;
+        }
+
+        if cycles {
+            accel_counts = Some((keccak_calls, ecsm_calls));
+        }
+        cycle_count
+    };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
+        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
+            println!("Keccak calls: {}", keccak_calls);
+            println!("Ecsm calls: {}", ecsm_calls);
+        }
     }
 
     ExitCode::SUCCESS
@@ -475,7 +642,7 @@ fn cmd_prove(
     };
     let mut writer = BufWriter::new(file);
 
-    let bytes = match bincode::serialize(&proof) {
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&proof) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to serialize proof: {}", e);
@@ -518,7 +685,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
     };
 
     eprintln!("Reading proof...");
-    let proof_bytes = match std::fs::read(&proof_path) {
+    let proof_bytes = match read_aligned_file(&proof_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to read proof file: {}", e);
@@ -526,7 +693,7 @@ fn cmd_verify(proof_path: PathBuf, elf_path: PathBuf, blowup: u8, time: bool) ->
         }
     };
 
-    let proof: VmProof = match bincode::deserialize(&proof_bytes) {
+    let proof: VmProof = match rkyv::from_bytes::<VmProof, rkyv::rancor::Error>(&proof_bytes) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to deserialize proof: {}", e);
@@ -647,7 +814,7 @@ fn cmd_prove_continuation(
         }
     };
     let mut writer = BufWriter::new(file);
-    let bytes = match bincode::serialize(&bundle) {
+    let bytes = match rkyv::to_bytes::<rkyv::rancor::Error>(&bundle) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to serialize proof: {}", e);
@@ -686,20 +853,23 @@ fn cmd_verify_continuation(
     };
 
     eprintln!("Reading proof...");
-    let proof_bytes = match std::fs::read(&proof_path) {
+    let proof_bytes = match read_aligned_file(&proof_path) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("Failed to read proof file: {}", e);
             return ExitCode::FAILURE;
         }
     };
-    let bundle: prover::continuation::ContinuationProof = match bincode::deserialize(&proof_bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("Failed to deserialize proof: {}", e);
-            return ExitCode::FAILURE;
-        }
-    };
+    let bundle: prover::continuation::ContinuationProof =
+        match rkyv::from_bytes::<prover::continuation::ContinuationProof, rkyv::rancor::Error>(
+            &proof_bytes,
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("Failed to deserialize proof: {}", e);
+                return ExitCode::FAILURE;
+            }
+        };
 
     let opts = match GoldilocksCubicProofOptions::with_blowup(blowup) {
         Ok(opts) => opts,
@@ -919,5 +1089,45 @@ mod tests {
     #[test]
     fn continuation_epoch_size_uses_exact_power_of_two() {
         assert_eq!(continuation_epoch_size(20).unwrap(), 1 << 20);
+    }
+
+    // `accelerator_of` must match the prover's `CpuOperation::from_log`: count an
+    // invocation only when the instruction is an ECALL AND a7 is the accelerator
+    // syscall number. Covers both accelerators, the non-accelerator syscalls, a
+    // non-ECALL whose src1 collides with an accelerator number, and a cache miss.
+    #[test]
+    fn accelerator_of_mirrors_prover_classification() {
+        use executor::vm::instruction::execution::{ECSM_SYSCALL_NUMBER, KECCAK_SYSCALL_NUMBER};
+
+        let ecall = Instruction::EcallEbreak;
+
+        assert_eq!(
+            accelerator_of(Some(&ecall), KECCAK_SYSCALL_NUMBER),
+            Some(Accelerator::Keccak)
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), ECSM_SYSCALL_NUMBER),
+            Some(Accelerator::Ecsm)
+        );
+
+        // Non-accelerator syscalls (Commit=64, Halt=93) count as neither.
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Commit as u64),
+            None
+        );
+        assert_eq!(
+            accelerator_of(Some(&ecall), SyscallNumbers::Halt as u64),
+            None
+        );
+
+        // A non-ECALL instruction whose src1 happens to equal an accelerator a7
+        // must not count — this is the `f.ecall &&` guard the prover applies.
+        assert_eq!(
+            accelerator_of(Some(&Instruction::Fence), KECCAK_SYSCALL_NUMBER),
+            None
+        );
+
+        // No decoded instruction at the pc (cache miss) counts as neither.
+        assert_eq!(accelerator_of(None, KECCAK_SYSCALL_NUMBER), None);
     }
 }

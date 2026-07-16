@@ -29,7 +29,6 @@ pub mod cpu;
 pub mod cpu32;
 pub mod decode;
 pub mod dvrm;
-pub mod ec_scalar;
 pub mod ecdas;
 pub mod ecsm;
 pub mod eq;

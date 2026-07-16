@@ -217,7 +217,7 @@ pub fn generate_register_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -278,8 +278,8 @@ pub fn compute_precomputed_commitment(options: &ProofOptions, init: &[u32]) -> C
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
 
-    let mut offset_col = vec![FE::zero(); num_rows];
-    let mut init_col = vec![FE::zero(); num_rows];
+    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
 
     for i in 0..NUM_REGISTER_ADDRESSES {
         offset_col[i] = FE::from(addr_list[i]);
@@ -305,9 +305,9 @@ pub fn compute_precomputed_commitment_with_fini(
     let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
     let addr_list = register_word_address_list();
 
-    let mut offset_col = vec![FE::zero(); num_rows];
-    let mut init_col = vec![FE::zero(); num_rows];
-    let mut fini_col = vec![FE::zero(); num_rows];
+    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut fini_col = crate::tables::types::zeroed_fe_vec(num_rows);
 
     for i in 0..NUM_REGISTER_ADDRESSES {
         offset_col[i] = FE::from(addr_list[i]);

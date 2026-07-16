@@ -10,8 +10,9 @@ permissions:
   contents: read
 
 concurrency:
+  # Never cancel an in-flight nightly bench; the single bench runner serializes.
   group: bench-vs-nightly-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   bench-vs:
