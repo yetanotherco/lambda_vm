@@ -358,14 +358,13 @@ jobs:
           # the build through the CUDA prover path. NOTE: requires this PR's bench_abba.sh change
           # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
           # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
-          # binaries (PTX is compiled for the detected arch); never trust a cached binary.
-          # CUDARC_PIN: pin cudarc to a fixed CUDA version (cuda-12080 = CUDA 12.8, matching the
-          # cuda_max_good>=12.8 offer floor) and drop fallback-latest, so cudarc binds a known
-          # symbol set instead of its newest. With fallback-latest cudarc requested a symbol the
-          # box's driver doesn't export (e.g. cuDevSmResourceSplit) -> runtime panic. This is the
-          # too-new end of the same compatibility window that MIN_DRIVER>=580 guards at the
-          # too-old end (older drivers lack cuCtxGetDevice_v2 and the GPU path falls back to CPU).
-          # nvidia-smi is logged for diagnosing driver issues.
+          # binaries (cubin is compiled for the detected arch); never trust a cached binary.
+          # CUDARC_PIN: compat shim for pre-pin baseline shas. cudarc's CUDA version is now pinned
+          # permanently in crypto/math-cuda/Cargo.toml (cuda-12080), so this no-ops on shas that
+          # carry the pin and only rewrites older baselines (where fallback-latest could request a
+          # symbol the box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
+          # MIN_DRIVER>=580 still guards the too-old end (older drivers lack cuCtxGetDevice_v2 and
+          # the GPU path falls back to CPU). nvidia-smi is logged for diagnosing driver issues.
           REMOTE="set -e; cd /workspace/lambda_vm; \
             command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
             nvidia-smi || true; \

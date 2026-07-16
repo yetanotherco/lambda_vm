@@ -1,13 +1,13 @@
 //! Host and guest API for the naive (single-step) recursion pipeline.
 //!
 //! The recursion verifier guest (`bench_vs/lambda/recursion`) verifies an
-//! inner lambda-vm proof in-VM. Its private input ([`GuestInput`], built
-//! host-side by [`encode_guest_input`]) carries the inner program's
+//! inner lambda-vm proof in-VM. Its private input (a [`crate::GuestInput`],
+//! built host-side by [`encode_guest_input`]) carries the inner program's
 //! precomputed DECODE/ELF-data-page roots so the guest skips the in-VM
 //! FFT + Merkle rebuild. `verify_with_options` uses supplied roots verbatim —
 //! it does NOT bind them to the inner ELF — so on success the guest commits
 //! an attestation that folds them into the identity instead:
-//! `program_id || inner_public_output` (see [`verify_and_attest`]).
+//! `program_id || inner_public_output` (see [`verify_and_attest_blob`]).
 //!
 //! Trust model: the attestation is NOT self-enforcing. A consumer of the
 //! outer proof MUST recompute the id from the inner ELF it trusts and
@@ -84,11 +84,6 @@ impl Preset {
     }
 }
 
-/// The guest's private-input layout, postcard-encoded by
-/// [`encode_guest_input`] and decoded verbatim by the guest:
-/// `(inner proof, inner ELF bytes, DECODE root, ELF-data-page roots)`.
-pub type GuestInput = (VmProof, Vec<u8>, Commitment, Vec<(u64, Commitment)>);
-
 /// Precompute the DECODE and ELF-data-page preprocessed roots for `elf_bytes`
 /// under `opts` — the values the guest receives via private input instead of
 /// recomputing in-VM, and the values [`expected_program_id`] recomputes
@@ -116,20 +111,20 @@ pub fn precomputed_commitments(
 }
 
 /// Build the guest's private-input blob for `inner_proof` of `inner_elf`:
-/// precomputes the roots and postcard-encodes the [`GuestInput`] tuple.
+/// precomputes the roots and rkyv-encodes a [`crate::GuestInput`] (see
+/// [`crate::encode_recursion_input`]).
 pub fn encode_guest_input(
     inner_proof: &VmProof,
     inner_elf: &[u8],
     opts: &ProofOptions,
 ) -> Result<Vec<u8>, Error> {
     let (decode_commitment, page_commitments) = precomputed_commitments(inner_elf, opts)?;
-    postcard::to_allocvec(&(
-        inner_proof,
-        inner_elf,
-        &decode_commitment,
-        &page_commitments,
-    ))
-    .map_err(|e| Error::Recursion(format!("postcard encode: {e}")))
+    crate::encode_recursion_input(&crate::GuestInput {
+        vm_proof: inner_proof.clone(),
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    })
 }
 
 /// Domain tag for [`program_id`].
@@ -137,7 +132,7 @@ const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
 
 /// [`program_id`] from a precomputed ELF digest and entry point — the guest
 /// path, sharing one full-ELF Keccak pass with the verify-side statement
-/// absorb (see [`verify_and_attest`]).
+/// absorb (see [`verify_and_attest_blob`]).
 pub fn program_id_from_digest(
     elf_digest: &[u8; 32],
     pc_start: u64,
@@ -199,43 +194,32 @@ pub fn program_id_from_elf(
     ))
 }
 
-/// Verify an inner proof against supplied roots and, on success, produce the
-/// attestation bytes the recursion guest commits:
+/// Verify the guest's private-input blob ([`encode_guest_input`]) in place and,
+/// on success, produce the attestation bytes the recursion guest commits:
 /// `program_id(elf, roots) || inner_public_output`. `Ok(None)` means the
 /// proof did not verify. This is the guest's whole job in one call; it does a
-/// single `Elf::load` and a single full-ELF Keccak, shared between the
-/// statement absorb and the `program_id` fold.
+/// single `Elf::load` and a single full-ELF Keccak (inside
+/// [`crate::verify_recursion_blob`]), shared between the statement absorb and
+/// the `program_id` fold — no deserialization pass over the inner proof.
 ///
 /// The attestation binds identity only for a consumer that recomputes the id
 /// from a trusted ELF ([`check_attestation`]) — see the module docs.
-pub fn verify_and_attest(
-    vm_proof: &VmProof,
-    elf_bytes: &[u8],
+pub fn verify_and_attest_blob(
+    blob: &[u8],
     proof_options: &ProofOptions,
-    decode_commitment: Commitment,
-    page_commitments: &[(u64, Commitment)],
 ) -> Result<Option<Vec<u8>>, Error> {
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
-    let digest = elf_digest(elf_bytes);
-    let ok = crate::verify_prepared(
-        vm_proof,
-        &program,
-        &digest,
-        proof_options,
-        Some(decode_commitment),
-        Some(page_commitments),
-    )?;
-    if !ok {
+    let verification = crate::verify_recursion_blob(blob, proof_options)?;
+    if !verification.ok {
         return Ok(None);
     }
     let id = program_id_from_digest(
-        &digest,
-        program.entry_point,
-        &decode_commitment,
-        page_commitments,
+        &verification.elf_digest,
+        verification.entry_point,
+        &verification.decode_commitment,
+        &verification.page_commitments,
     );
     let mut attestation = id.to_vec();
-    attestation.extend_from_slice(&vm_proof.public_output);
+    attestation.extend_from_slice(verification.public_output);
     Ok(Some(attestation))
 }
 

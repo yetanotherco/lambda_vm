@@ -488,6 +488,11 @@ impl AsBytes for FieldElement<GoldilocksField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         ByteConversion::to_bytes_be(self)
     }
+
+    #[inline(always)]
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        sink(&self.canonical_u64().to_be_bytes());
+    }
 }
 
 // Implement IsPrimeField for the native Goldilocks
