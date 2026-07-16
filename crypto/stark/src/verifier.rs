@@ -678,9 +678,20 @@ pub trait IsStarkVerifier<
         let ood_data = trace_ood_evaluations.row_major_data();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
-        if trace_term_coeffs.is_empty()
-            || trace_term_coeffs.len() * trace_term_coeffs[0].len()
-                != ood_evaluations_table_height * ood_evaluations_table_width
+        // Check the exact shape the code relies on rather than the product of
+        // the dimensions: this function and
+        // `reconstruct_deep_composition_poly_evaluation_pair` both
+        // direct-index `trace_term_coeffs[col][row]` for every `col < width`,
+        // `row < height`, and a product check accepts shapes that transpose
+        // those bounds. Checking the shape here keeps their panic-freedom
+        // local, rather than resting on #815's OOD-table guard in
+        // `multi_verify_views` plus the unasserted `trace_columns ==
+        // trace_layout.0 + trace_layout.1` convention. Runs once per proof and
+        // is integer compares only — no per-query cost.
+        if trace_term_coeffs.len() != ood_evaluations_table_width
+            || trace_term_coeffs
+                .iter()
+                .any(|coeff_col| coeff_col.len() != ood_evaluations_table_height)
         {
             return None;
         }
