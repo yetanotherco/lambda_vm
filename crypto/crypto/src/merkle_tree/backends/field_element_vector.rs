@@ -39,8 +39,8 @@ where
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input[0].as_bytes());
-        hasher.update(input[1].as_bytes());
+        input[0].stream_bytes(&mut |b| hasher.update(b));
+        input[1].stream_bytes(&mut |b| hasher.update(b));
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -102,7 +102,7 @@ where
     pub fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
         for element in a.iter().chain(b.iter()) {
-            hasher.update(element.as_bytes());
+            element.stream_bytes(&mut |bytes| hasher.update(bytes));
         }
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
