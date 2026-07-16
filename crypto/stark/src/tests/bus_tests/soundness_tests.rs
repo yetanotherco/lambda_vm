@@ -904,6 +904,155 @@ fn test_malformed_ood_table_shape_rejected() {
     );
 }
 
+/// A next-row (g·z) OOD block whose advertised dimensions disagree with its
+/// backing data must be rejected, not panic. Unlike the current-row block
+/// (`test_malformed_ood_table_shape_rejected`), the next-row block is absorbed
+/// into the transcript via `get_row` in Round 3 BEFORE step_2's own shape guard
+/// runs, so without a pre-absorption guard a lying shape is an out-of-bounds
+/// slice panic rather than a `false` verdict. Owned path.
+#[test_log::test]
+fn test_malformed_ood_next_block_shape_rejected_owned() {
+    // Same valid trace as `test_malformed_ood_table_shape_rejected`.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Forge the ADD table's next-row OOD block to advertise a far larger shape
+    // than its data backs (the canonical hostile archive: width/height huge, one
+    // data element). `get_row` would slice `data[0..width]` out of bounds during
+    // Round-3 absorption; the Phase A guard must reject before that.
+    let add_proof = &mut multi_proof.proofs[1];
+    assert!(
+        add_proof.trace_ood_next_evaluations.width >= 1,
+        "next-row OOD block must open at least one column for this to be an OOB test"
+    );
+    add_proof.trace_ood_next_evaluations.width = 1000;
+    add_proof.trace_ood_next_evaluations.height = 1000;
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Proof with a lying next-row OOD block shape must be rejected, not panic"
+    );
+}
+
+/// The same attack through the rkyv-archived, read-in-place path — the real
+/// attack surface, since the recursion guest verifies archived proofs.
+/// `ArchivedTable::get_row` is the same unchecked slice, and rkyv's bytecheck
+/// does NOT enforce `width * height == data.len()`, so a forged archive reaches
+/// absorption. The Phase A guard must reject it; it must never panic.
+#[test_log::test]
+fn test_malformed_ood_next_block_shape_rejected_archived() {
+    // Same valid trace as the owned variant above.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Forge before serialization: rkyv archives `data` (by its real length),
+    // `width`, and `height` as independent fields, so a width/height that
+    // disagree with the data survive `to_bytes` and surface on the archived
+    // table exactly as a hostile prover would craft them.
+    multi_proof.proofs[1].trace_ood_next_evaluations.width = 1000;
+    multi_proof.proofs[1].trace_ood_next_evaluations.height = 1000;
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&multi_proof).unwrap();
+    let archived = rkyv::access::<
+        crate::proof::stark::ArchivedMultiProof<F, E, ()>,
+        rkyv::rancor::Error,
+    >(&bytes)
+    .unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify_archived(
+            &airs,
+            &archived.proofs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Archived proof with a lying next-row OOD block shape must be rejected, not panic"
+    );
+}
+
 /// The transition window (`trace_ood_next_row_columns`) of a LogUp table is
 /// exactly the accumulator column — the sole column read at the next row after
 /// forward accumulation — expressed as a full-width `[main | aux]` index.

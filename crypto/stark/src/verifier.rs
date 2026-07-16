@@ -1045,6 +1045,32 @@ pub trait IsStarkVerifier<
             {
                 return false;
             }
+            // The next-row (g·z) OOD block, unlike block0 above, has no other
+            // pre-absorption guard: Round 3 absorbs it into the transcript
+            // through `get_row` -- an unchecked `data[start..start + width]`
+            // slice -- BEFORE step_2's own shape check runs, so a hostile archive
+            // whose advertised width/height disagree with its data length would
+            // panic (out-of-bounds) during absorption instead of being rejected
+            // as a false proof. Validate its shape here, from AIR metadata only,
+            // mirroring step_2 exactly: width is the transition-window column
+            // count and height the next-row row count (both 0 when the AIR reads
+            // no next-row columns). `dimensions_consistent()` closes the
+            // `width * height != data.len()` gap that rkyv's bytecheck leaves open.
+            let step_size = air.step_size();
+            let num_eval_points = air.context().transition_offsets.len() * step_size;
+            let expected_next_width = air.trace_ood_next_row_columns().len();
+            let expected_next_height = if expected_next_width == 0 {
+                0
+            } else {
+                num_eval_points.saturating_sub(step_size)
+            };
+            let trace_ood_next_evaluations = proof.trace_ood_next_evaluations();
+            if trace_ood_next_evaluations.width() != expected_next_width
+                || trace_ood_next_evaluations.height() != expected_next_height
+                || !trace_ood_next_evaluations.dimensions_consistent()
+            {
+                return false;
+            }
             if air.is_preprocessed() {
                 // Preprocessed table: VERIFY precomputed commitment matches hardcoded.
                 // This is the critical soundness check - ensures prover used correct precomputed values.
