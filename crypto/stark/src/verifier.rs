@@ -125,6 +125,42 @@ pub trait IsStarkVerifier<
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
+    /// Soundness (I3): both OOD blocks' shapes are a public function of the AIR,
+    /// never of the (prover-controlled) proof. The current-row block opens every
+    /// column over `step_size` rows; the next-row block opens only the
+    /// transition-window columns over the remaining rows, and is empty when the
+    /// AIR reads none.
+    ///
+    /// Must run before Round 3, which absorbs the next-row block through
+    /// `get_row` — an unchecked `data[start..start + width]` slice. A hostile
+    /// archive whose advertised dims disagree with its data length would panic
+    /// there rather than be rejected as a false proof; `dimensions_consistent()`
+    /// closes that gap, which rkyv's bytecheck leaves open.
+    fn ood_blocks_well_formed(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+    ) -> bool {
+        let step_size = air.step_size();
+        let num_eval_points = air.context().transition_offsets.len() * step_size;
+        let expected_next_width = air.trace_ood_next_row_columns().len();
+        let expected_next_height = if expected_next_width == 0 {
+            0
+        } else {
+            num_eval_points.saturating_sub(step_size)
+        };
+        let current = proof.trace_ood_evaluations();
+        let next = proof.trace_ood_next_evaluations();
+
+        // `height == step_size` also rejects a height-0 current block: every AIR
+        // reports `step_size >= 1`.
+        current.dimensions_consistent()
+            && current.width() == air.trace_layout().0 + air.num_auxiliary_rap_columns()
+            && current.height() == step_size
+            && next.dimensions_consistent()
+            && next.width() == expected_next_width
+            && next.height() == expected_next_height
+    }
+
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
@@ -142,33 +178,17 @@ pub trait IsStarkVerifier<
             .bus_table_contribution()
             .map(BusPublicInputs::from_contribution);
 
-        // Soundness (I3): both OOD blocks' shapes are a public function of the
-        // AIR, never of the (prover-controlled) proof. The current-row block
-        // opens every column over `step_size` rows; the next-row block opens only
-        // the transition-window columns over the remaining rows (and is empty
-        // when there are none). Reject any mismatch (including an archive whose
-        // advertised dims disagree with its data length) before using either
-        // block, so a malicious prover cannot reshape them to dodge a check or
-        // desync the frame reconstruction below.
+        // Reject either OOD block whose shape disagrees with the AIR before
+        // reading it, so a malicious prover cannot reshape them to dodge a check
+        // or desync the frame reconstruction below.
+        if !Self::ood_blocks_well_formed(air, proof) {
+            return false;
+        }
         let step_size = air.step_size();
         let num_eval_points = air.context().transition_offsets.len() * step_size;
         let next_row_cols = air.trace_ood_next_row_columns();
-        let expected_next_width = next_row_cols.len();
-        let expected_next_height = if expected_next_width == 0 {
-            0
-        } else {
-            num_eval_points.saturating_sub(step_size)
-        };
         let ood_current = proof.trace_ood_evaluations();
         let ood_next = proof.trace_ood_next_evaluations();
-        if ood_current.height() != step_size
-            || !ood_current.dimensions_consistent()
-            || ood_next.width() != expected_next_width
-            || ood_next.height() != expected_next_height
-            || !ood_next.dimensions_consistent()
-        {
-            return false;
-        }
 
         // Reconstruct the full current+next-row OOD grid (surviving values placed,
         // pruned next-row entries zero -- those are never read by any constraint).
@@ -1017,32 +1037,15 @@ pub trait IsStarkVerifier<
             {
                 return false;
             }
-            // The archive is read in place without validation; reject an OOD
-            // table whose advertised dimensions disagree with its data length,
-            // has no rows, whose width doesn't match the AIR's column layout, or
-            // whose height isn't a whole number of AIR steps (which `into_frame`
-            // below only `debug_assert!`s, not checks) — all before any row
-            // access indexes into it.
-            //
-            // The width check is load-bearing and prevents two distinct faults:
-            // (a) the AIR-derived column index `main_trace_width + c.col` in
-            //     `step_2_verify_claimed_composition_polynomial` indexing past a
-            //     too-narrow OOD row (a release-mode out-of-bounds panic), and
-            // (b) a width-0 table, whose `width * height == 0 == data.len()`
-            //     satisfies `dimensions_consistent()` for an arbitrary advertised
-            //     height and would otherwise slip through this guard entirely.
-            // An honest proof always commits exactly `main_trace_width + num_aux`
-            // OOD columns (the same quantities `column_idx` and the `checked_sub`
-            // boundary use), so exact equality never rejects a valid proof.
-            let trace_ood_evaluations = proof.trace_ood_evaluations();
-            let expected_ood_width = air.trace_layout().0 + air.num_auxiliary_rap_columns();
-            if !trace_ood_evaluations.dimensions_consistent()
-                || trace_ood_evaluations.height() == 0
-                || trace_ood_evaluations.width() != expected_ood_width
-                || !trace_ood_evaluations
-                    .height()
-                    .is_multiple_of(air.step_size())
-            {
+            // The archive is read in place without validation, so both OOD blocks
+            // must be shape-checked here — before Round 3 absorbs the next-row
+            // block and before any row access indexes into either. The width check
+            // is load-bearing: it stops the AIR-derived column index
+            // `main_trace_width + c.col` in `step_2_verify_claimed_composition_polynomial`
+            // from indexing past a too-narrow OOD row, and it rejects a width-0
+            // table, whose `width * height == 0 == data.len()` would otherwise
+            // satisfy `dimensions_consistent()` for any advertised height.
+            if !Self::ood_blocks_well_formed(*air, proof) {
                 return false;
             }
             if air.is_preprocessed() {
