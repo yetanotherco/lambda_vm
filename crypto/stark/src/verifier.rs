@@ -289,25 +289,52 @@ pub trait IsStarkVerifier<
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
 
-        let mut denominators =
-            vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
-        air.constraints_meta().iter().for_each(|m| {
-            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
-                m,
-                &challenges.z,
-                &domain.trace_primitive_root,
-                trace_length,
-            );
-        });
+        // Every transition constraint's zerofier at z is 1/(zᴺ − 1) times an
+        // end-exemptions correction ∏(z − rᵢ) that depends only on the
+        // constraint's `end_exemptions`. 1/(zᴺ − 1) is shared by all of them, so
+        // compute it once, group the constraints by `end_exemptions` (a tiny set —
+        // almost always just {0}), accumulate Σ βᵢ·evalᵢ per group, then factor the
+        // shared inverse and each group's correction out of the sum. Replaces the
+        // previous per-constraint zᴺ power + extension inversion.
+        let inv_zerofier_denominator =
+            match (-FieldElement::<Field>::one() + challenges.z.pow(trace_length)).inv() {
+                Ok(inv) => inv,
+                // z lands on the trace domain (zᴺ = 1); an honest off-domain z never
+                // does. Reject rather than divide by zero.
+                Err(_) => return false,
+            };
 
-        let transition_c_i_evaluations_sum = itertools::izip!(
-            transition_ood_frame_evaluations,
-            &challenges.transition_coeffs,
-            denominators
-        )
-        .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-            acc + beta * eval * &denominator
-        });
+        // Σ βᵢ·evalᵢ bucketed by end_exemptions. `constraints_meta` has one entry per
+        // active transition constraint; a constraint absent from it contributed a
+        // zero denominator before and is likewise skipped here.
+        let mut grouped_numerator_sums: Vec<(usize, FieldElement<FieldExtension>)> = Vec::new();
+        for m in air.constraints_meta() {
+            let term = &challenges.transition_coeffs[m.constraint_idx]
+                * &transition_ood_frame_evaluations[m.constraint_idx];
+            match grouped_numerator_sums
+                .iter_mut()
+                .find(|(exemptions, _)| *exemptions == m.end_exemptions)
+            {
+                Some((_, acc)) => *acc += term,
+                None => grouped_numerator_sums.push((m.end_exemptions, term)),
+            }
+        }
+
+        let transition_c_i_evaluations_sum = grouped_numerator_sums
+            .into_iter()
+            .fold(
+                FieldElement::zero(),
+                |acc, (end_exemptions, numerator_sum)| {
+                    let correction = crate::constraints::zerofier::end_exemptions_correction(
+                        end_exemptions,
+                        &challenges.z,
+                        &domain.trace_primitive_root,
+                        trace_length,
+                    );
+                    acc + correction * numerator_sum
+                },
+            )
+            * inv_zerofier_denominator;
 
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
@@ -739,17 +766,51 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
-        let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
-
-        // Build the base-field LDE evaluations as concatenated slice (precomputed + main)
-        // without lifting to the extension field. The helper now subtracts directly via
-        // the F: IsSubFieldOf<E> Sub impl, so we avoid a per-query base->extension lift.
         let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
             .expect("verifier domain root_order is a valid power of two");
 
-        for (i, iota) in challenges.iotas.iter().enumerate() {
+        // Each query's DEEP terms divide by (evaluation_point − z·gᵏ) for the OOD
+        // rows and by (evaluation_point − z^parts) for the composition part. The
+        // z·gᵏ row points and z^parts are query-independent, so build them once and
+        // then collect every query point's denominators (primary + symmetric) into
+        // one vector and run a SINGLE batch inverse for the whole proof — instead of
+        // the previous two tiny per-query inversions (2·num_queries of them).
+        let ood_height = ood_full.height;
+        let mut z_row_points = Vec::with_capacity(ood_height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_height {
+            z_row_points.push(current_z.clone());
+            current_z = primitive_root * &current_z;
+        }
+        let number_of_parts = proof.composition_poly_parts_ood_evaluation().len();
+        let z_pow_parts = challenges.z.pow(number_of_parts);
+
+        // Layout per query point: `ood_height` trace denominators then 1 composition
+        // denominator; points ordered [q0 primary, q0 sym, q1 primary, q1 sym, …].
+        let stride = ood_height + 1;
+        let mut denominators = Vec::with_capacity(2 * num_queries * stride);
+        for iota in challenges.iotas.iter() {
+            for is_sym in [false, true] {
+                let evaluation_point =
+                    Self::query_challenge_to_evaluation_point(*iota, is_sym, domain);
+                for z_row_point in &z_row_points {
+                    denominators.push(&evaluation_point - z_row_point);
+                }
+                denominators.push(&evaluation_point - &z_pow_parts);
+            }
+        }
+        // One inversion for the whole proof's DEEP denominators. Fails closed if any
+        // evaluation point lands on an OOD point (malformed proof) — same rejection
+        // the previous per-query inversions gave.
+        FieldElement::inplace_batch_inverse(&mut denominators).ok()?;
+
+        let mut deep_poly_evaluations = Vec::with_capacity(num_queries);
+        let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
+
+        for (i, _iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
+            let primary_base = 2 * i * stride;
+            let sym_base = primary_base + stride;
 
             // Base-field portion as two borrowed slices in commit order —
             // precomputed columns FIRST, then main trace columns. The callee
@@ -766,11 +827,8 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
             deep_poly_evaluations.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
-                primitive_root,
                 challenges,
                 lde_precomputed,
                 lde_main,
@@ -779,6 +837,8 @@ pub trait IsStarkVerifier<
                 ood_full,
                 next_row_flags,
                 step_size,
+                &denominators[primary_base..primary_base + ood_height],
+                &denominators[primary_base + ood_height],
             )?);
 
             // Mirror for the symmetric query point.
@@ -793,11 +853,8 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations_sym())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, true, domain);
             deep_poly_evaluations_sym.push(Self::reconstruct_deep_composition_poly_evaluation(
                 proof,
-                &evaluation_point,
-                primitive_root,
                 challenges,
                 lde_precomputed_sym,
                 lde_main_sym,
@@ -806,6 +863,8 @@ pub trait IsStarkVerifier<
                 ood_full,
                 next_row_flags,
                 step_size,
+                &denominators[sym_base..sym_base + ood_height],
+                &denominators[sym_base + ood_height],
             )?);
         }
         Some((deep_poly_evaluations, deep_poly_evaluations_sym))
@@ -814,8 +873,6 @@ pub trait IsStarkVerifier<
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluation<'b>(
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
-        evaluation_point: &FieldElement<Field>,
-        primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
         lde_trace_main_evaluations: &'b [FieldElement<Field>],
@@ -824,6 +881,11 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_flags: &[bool],
         step_size: usize,
+        // Pre-inverted 1/(evaluation_point − z·gᵏ) for each OOD row, and
+        // 1/(evaluation_point − z^parts) for the composition part. The caller
+        // computes these for every query point in one shared batch inverse.
+        inv_trace_denominators: &[FieldElement<FieldExtension>],
+        inv_composition_denominator: &FieldElement<FieldExtension>,
     ) -> Option<FieldElement<FieldExtension>> {
         // g·z pruning: read from the reconstructed full grid (current-row block
         // plus the scattered next-row window, zeros elsewhere), not from
@@ -860,15 +922,10 @@ pub trait IsStarkVerifier<
         {
             return None;
         }
-
-        let mut denoms_trace = Vec::with_capacity(ood_evaluations_table_height);
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms_trace.push(evaluation_point - &current_z);
-            current_z = primitive_root * &current_z;
+        // One pre-inverted trace denominator per OOD row (built by the caller).
+        if inv_trace_denominators.len() != ood_evaluations_table_height {
+            return None;
         }
-        // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
-        FieldElement::inplace_batch_inverse(&mut denoms_trace).ok()?;
 
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
@@ -891,7 +948,7 @@ pub trait IsStarkVerifier<
                         } else {
                             &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
                         };
-                        let poly_evaluation = diff * &denoms_trace[row_idx];
+                        let poly_evaluation = diff * &inv_trace_denominators[row_idx];
                         trace_t + &poly_evaluation * coeff
                     },
                 );
@@ -899,11 +956,6 @@ pub trait IsStarkVerifier<
             });
 
         let composition_parts_ood = proof.composition_poly_parts_ood_evaluation();
-        let number_of_parts = lde_composition_poly_parts_evaluation.len();
-        let z_pow = &challenges.z.pow(number_of_parts);
-
-        // A malformed proof can make evaluation_point == z^N, reject.
-        let denom_composition = (evaluation_point - z_pow).inv().ok()?;
         let mut h_terms = FieldElement::zero();
         for (j, h_i_upsilon) in lde_composition_poly_parts_evaluation.iter().enumerate() {
             // Bounds-check via `.get(j)?`: a malformed opening may have more
@@ -913,7 +965,7 @@ pub trait IsStarkVerifier<
             let h_i_term = (h_i_upsilon - h_i_zpower) * gamma;
             h_terms += h_i_term;
         }
-        h_terms *= denom_composition;
+        h_terms *= inv_composition_denominator;
 
         Some(trace_term + h_terms)
     }

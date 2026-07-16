@@ -115,8 +115,43 @@ pub fn zerofier_evaluations_on_extended_domain<F: IsFFTField>(
         .collect()
 }
 
+/// The end-exemptions correction `∏(z − rᵢ)` at `z`, where `rᵢ` are the roots for a
+/// constraint skipping its last `end_exemptions` rows (`1` when there are none).
+///
+/// This is the only per-constraint-varying factor of the transition zerofier at
+/// `z`: the full inverse zerofier is `1/(zᴺ − 1)` × this. Exposed separately so a
+/// caller evaluating many constraints at the same `z` computes `1/(zᴺ − 1)` once
+/// and this once per distinct `end_exemptions`, rather than a fresh `zᴺ` power and
+/// extension inversion per constraint (see the verifier's OOD zerofier sum).
+pub fn end_exemptions_correction<F, E>(
+    end_exemptions: usize,
+    z: &FieldElement<E>,
+    trace_primitive_root: &FieldElement<F>,
+    trace_length: usize,
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    if end_exemptions == 0 {
+        return FieldElement::<E>::one();
+    }
+    // Roots are gᴺ⁻¹, g²⁽ᴺ⁻¹⁾, … (walking backward from the last row by
+    // g⁻¹ = gᴺ⁻¹). Written `-(rᵢ - z)` so the field ops only go subfield −
+    // superfield (`rᵢ ∈ F`, `z ∈ E`), matching `end_exemptions_roots`.
+    let decrement = trace_primitive_root.pow(trace_length - 1);
+    let mut current = decrement.clone();
+    let mut acc = FieldElement::<E>::one();
+    for _ in 0..end_exemptions {
+        acc *= -(current.clone() - z.clone());
+        current = &current * &decrement;
+    }
+    acc
+}
+
 /// Evaluation of the constraint's zerofier at some point `z`, which may be in
-/// a field extension.
+/// a field extension. Equal to `1/(zᴺ − 1)` ×
+/// [`end_exemptions_correction`]`(meta.end_exemptions, …)`.
 pub fn evaluate_zerofier<F, E>(
     meta: &ConstraintMeta,
     z: &FieldElement<E>,
@@ -127,12 +162,8 @@ where
     F: IsSubFieldOf<E>,
     E: IsField,
 {
-    let roots = end_exemptions_roots(meta, trace_primitive_root, trace_length);
-    // Factor `z - rᵢ` written as `-(rᵢ - z)`: the field ops only go
-    // subfield − superfield, and `rᵢ ∈ F`, `z ∈ E`.
-    let end_exemptions_eval = roots.iter().fold(FieldElement::<E>::one(), |acc, root| {
-        acc * -(root.clone() - z.clone())
-    });
+    let end_exemptions_eval =
+        end_exemptions_correction(meta.end_exemptions, z, trace_primitive_root, trace_length);
 
     // 1/(z^N − 1), times the end-exemptions correction.
     (-FieldElement::<F>::one() + z.pow(trace_length))
