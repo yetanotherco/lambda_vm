@@ -860,7 +860,7 @@ pub trait IsStarkVerifier<
             return None;
         }
         if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
-            || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
+            || num_base_sym + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
         {
             return None;
         }
