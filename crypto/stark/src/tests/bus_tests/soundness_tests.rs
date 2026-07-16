@@ -13,6 +13,10 @@ use math::field::{
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
+use crate::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+    NullBoundaryConstraintBuilder, Packing,
+};
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
 use crate::table::Table;
@@ -925,6 +929,129 @@ fn test_trace_ood_next_row_columns_is_accumulator_only() {
             "next-row column {c} out of width {main}+{aux}"
         );
     }
+}
+
+/// Cross-check an AIR's *declared* OOD transition window
+/// ([`AIR::trace_ood_next_row_columns`]) against the next-row read set
+/// *derived* from its captured constraint IR.
+///
+/// The window declaration is load-bearing for soundness: the verifier opens
+/// every trace column at `z`, but prunes the `g·z` (next-row) opening down to
+/// exactly the declared columns and reconstructs ZERO for every other column at
+/// the next row (see [`crate::ood`]). So a transition constraint that reads a
+/// next-row column the declaration omits is fed zero there — a silent
+/// soundness/completeness bug. The declaration is hand-synced to the LogUp
+/// accumulator and ignores the wrapped constraint set, so nothing but a test
+/// catches drift (the `debug_assert`s that would are compiled out under the
+/// `--release` test profile this repo uses).
+///
+/// Asserts, from the read set derived by
+/// [`crate::constraint_ir::ConstraintProgram::next_row_trace_reads`]:
+/// * `derived ⊆ declared` — the critical, soundness direction, checked for
+///   every AIR: a derived column missing from the declaration is the bug above.
+/// * exact equality when `exact` — every `AirWithBuses` should declare
+///   *precisely* the accumulator column (or nothing, with no interactions);
+///   over-declaration only bloats the proof, but for these AIRs the window is
+///   exactly known, so drift in either direction is a defect.
+fn assert_ood_window_matches_ir(
+    air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    exact: bool,
+    label: &str,
+) {
+    let (main, aux) = air.trace_layout();
+
+    let mut declared = air.trace_ood_next_row_columns();
+    declared.sort_unstable();
+    declared.dedup();
+
+    // Derive the true next-row read set from the captured constraint program,
+    // which runs the wrapped constraint set AND the LogUp emission through one
+    // CaptureBuilder — so any next-row read a base constraint makes is included.
+    let derived = air.constraint_program().next_row_trace_reads(main);
+
+    for &c in &derived {
+        assert!(
+            c < main + aux,
+            "[{label}] derived next-row column {c} out of concatenated width {main}+{aux}"
+        );
+        assert!(
+            declared.contains(&c),
+            "[{label}] a transition constraint reads full-width column {c} at the next row, but \
+             it is absent from trace_ood_next_row_columns() = {declared:?}; the verifier prunes \
+             that g·z opening to ZERO — soundness bug"
+        );
+    }
+
+    if exact {
+        assert_eq!(
+            derived, declared,
+            "[{label}] declared next-row window {declared:?} is not exactly the IR-derived read \
+             set {derived:?}: over-declaration bloats every g·z opening"
+        );
+    }
+}
+
+/// Generic counterpart to the hardcoded single-AIR expectation above: for every
+/// `AirWithBuses` in the crate's examples, the declared OOD transition window
+/// equals the next-row read set derived from its captured constraint IR. Covers
+/// the structural shapes `split_interactions` can produce — 1 absorbed, 2
+/// absorbed, and a committed batched pair — so the hand-synced declaration is
+/// validated against the real IR rather than a copy of itself.
+#[test_log::test]
+fn test_trace_ood_next_row_window_matches_captured_ir() {
+    let opts = ProofOptions::default_test_options();
+
+    // The multi-table lookup example AIRs the bus tests exercise:
+    // CPU sends on two buses (2 absorbed interactions, 0 committed pairs);
+    // ADD / MUL each receive on one bus (1 absorbed interaction).
+    assert_ood_window_matches_ir(&new_cpu_air_with_lookup(&opts), true, "CPU");
+    assert_ood_window_matches_ir(&new_add_air_with_lookup(&opts), true, "ADD");
+    assert_ood_window_matches_ir(&new_mul_air_with_lookup(&opts), true, "MUL");
+
+    // A committed-pair layout: 3 interactions split into 1 batched pair + 1
+    // absorbed. The batched-term constraint reads only the current row, so the
+    // next-row window is still exactly the accumulator column — a case the three
+    // example AIRs (0 committed pairs) do not reach.
+    let committed = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
+        6,
+        AuxiliaryTraceBuildData {
+            interactions: vec![
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(0),
+                    Packing::Direct.columns(&[1]),
+                ),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(2),
+                    Packing::Direct.columns(&[3]),
+                ),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(4),
+                    Packing::Direct.columns(&[5]),
+                ),
+            ],
+        },
+        &opts,
+        1,
+        EmptyConstraints,
+    );
+    assert_ood_window_matches_ir(&committed, true, "committed_pair");
+
+    // A bus-less AIR: no interactions => no LogUp accumulator => an empty
+    // next-row window, derived and declared alike.
+    let busless = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
+        3,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &opts,
+        1,
+        EmptyConstraints,
+    );
+    assert!(busless.trace_ood_next_row_columns().is_empty());
+    assert_ood_window_matches_ir(&busless, true, "busless");
 }
 
 /// The g·z pruning actually shrinks the proof: a LogUp table opens every column
