@@ -49,6 +49,18 @@ use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 /// Default page size in bytes (256KB).
 pub const DEFAULT_PAGE_SIZE: usize = 1 << 18;
 
+/// `page_base` is always a multiple of `DEFAULT_PAGE_SIZE`, which is a power of
+/// two — so a page is identified just as cheaply by its shifted page NUMBER,
+/// with no low always-zero bits to waste hash entropy on.
+const _: () = assert!(DEFAULT_PAGE_SIZE.is_power_of_two());
+pub(crate) const PAGE_SIZE_LOG2: u32 = DEFAULT_PAGE_SIZE.trailing_zeros();
+
+/// Shift a page-aligned address down to its page number.
+pub(crate) fn page_number(page_base: u64) -> u64 {
+    debug_assert_eq!(page_base % DEFAULT_PAGE_SIZE as u64, 0, "not page-aligned");
+    page_base >> PAGE_SIZE_LOG2
+}
+
 /// Stack top address (where SP starts). Re-exported from executor.
 pub use executor::vm::registers::STACK_TOP;
 
