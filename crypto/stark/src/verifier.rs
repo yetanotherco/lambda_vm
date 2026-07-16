@@ -92,6 +92,9 @@ where
 {
     /// `ood_row_sum[row] = sum_col trace_term_coeffs[col][row] * ood(row, col)`.
     ood_row_sum: Vec<FieldElement<FieldExtension>>,
+    /// `proof.trace_ood_evaluations().width()`, checked against the
+    /// `trace_term_coeffs` shape below.
+    ood_width: usize,
     /// Derived from `proof.composition_poly_parts_ood_evaluation().len()`.
     number_of_parts: usize,
     /// `challenges.z.pow(number_of_parts)`.
@@ -724,6 +727,7 @@ pub trait IsStarkVerifier<
 
         Some(QueryInvariantDeepTerms {
             ood_row_sum,
+            ood_width: ood_evaluations_table_width,
             number_of_parts,
             z_pow,
             h_sum_zpow,
@@ -761,53 +765,17 @@ pub trait IsStarkVerifier<
         let query_invariant_terms = Self::compute_query_invariant_deep_terms(challenges, proof)?;
 
         for (i, iota) in challenges.iotas.iter().enumerate() {
-            let opening = proof.deep_poly_opening(i);
-
-            // Base-field portion as two borrowed slices in commit order —
-            // precomputed columns FIRST, then main trace columns. The callee
-            // resolves a base column via `base_at`, so there is no per-query
-            // concat allocation.
-            let lde_precomputed: &[FieldElement<Field>] = opening
-                .precomputed_trace_polys()
-                .map(|p| p.evaluations())
-                .unwrap_or(&[]);
-            let lde_main = opening.main_trace_polys().evaluations();
-
-            let lde_aux: &[FieldElement<FieldExtension>] = opening
-                .aux_trace_polys()
-                .map(|a| a.evaluations())
-                .unwrap_or(&[]);
-
-            let lde_precomputed_sym: &[FieldElement<Field>] = opening
-                .precomputed_trace_polys()
-                .map(|p| p.evaluations_sym())
-                .unwrap_or(&[]);
-            let lde_main_sym = opening.main_trace_polys().evaluations_sym();
-
-            let lde_aux_sym: &[FieldElement<FieldExtension>] = opening
-                .aux_trace_polys()
-                .map(|a| a.evaluations_sym())
-                .unwrap_or(&[]);
-
             let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
             let evaluation_point_sym =
                 Self::query_challenge_to_evaluation_point(*iota, true, domain);
             let (evaluation, evaluation_sym) =
                 Self::reconstruct_deep_composition_poly_evaluation_pair(
-                    proof,
+                    proof.deep_poly_opening(i),
                     &evaluation_point,
                     &evaluation_point_sym,
                     primitive_root,
                     challenges,
                     &query_invariant_terms,
-                    lde_precomputed,
-                    lde_main,
-                    lde_aux,
-                    opening.composition_poly().evaluations(),
-                    lde_precomputed_sym,
-                    lde_main_sym,
-                    lde_aux_sym,
-                    opening.composition_poly().evaluations_sym(),
                 )?;
             deep_poly_evaluations.push(evaluation);
             deep_poly_evaluations_sym.push(evaluation_sym);
@@ -821,25 +789,43 @@ pub trait IsStarkVerifier<
     /// isolates `coeff*ood` (identical for both points, hoisted into
     /// `query_invariant_terms`) from `coeff*lde` (per-point), so both points
     /// share the OOD walk and a single batch-inverse for their denominators.
-    #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluation_pair<'b>(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        opening: DeepPolynomialOpeningView<'b, Field, FieldExtension>,
         evaluation_point: &FieldElement<Field>,
         evaluation_point_sym: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
-        lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
-        lde_trace_main_evaluations: &'b [FieldElement<Field>],
-        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
-        lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
-        lde_trace_precomputed_evaluations_sym: &'b [FieldElement<Field>],
-        lde_trace_main_evaluations_sym: &'b [FieldElement<Field>],
-        lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
-        lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
     ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
+        // Base-field portion as two borrowed slices in commit order —
+        // precomputed columns FIRST, then main trace columns. A base column is
+        // resolved via `base_at` below, so there is no per-query concat
+        // allocation.
+        let lde_trace_precomputed_evaluations: &'b [FieldElement<Field>] = opening
+            .precomputed_trace_polys()
+            .map(|p| p.evaluations())
+            .unwrap_or(&[]);
+        let lde_trace_main_evaluations = opening.main_trace_polys().evaluations();
+        let lde_trace_aux_evaluations: &[FieldElement<FieldExtension>] = opening
+            .aux_trace_polys()
+            .map(|a| a.evaluations())
+            .unwrap_or(&[]);
+        let lde_composition_poly_parts_evaluation = opening.composition_poly().evaluations();
+
+        let lde_trace_precomputed_evaluations_sym: &'b [FieldElement<Field>] = opening
+            .precomputed_trace_polys()
+            .map(|p| p.evaluations_sym())
+            .unwrap_or(&[]);
+        let lde_trace_main_evaluations_sym = opening.main_trace_polys().evaluations_sym();
+        let lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>] = opening
+            .aux_trace_polys()
+            .map(|a| a.evaluations_sym())
+            .unwrap_or(&[]);
+        let lde_composition_poly_parts_evaluation_sym =
+            opening.composition_poly().evaluations_sym();
+
         let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
-        let ood_evaluations_table_width = proof.trace_ood_evaluations().width();
+        let ood_evaluations_table_width = query_invariant_terms.ood_width;
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
         // Base columns are supplied as two slices (precomputed ‖ main) that the
