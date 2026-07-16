@@ -1504,9 +1504,9 @@ mod tests {
         let page_size = page::DEFAULT_PAGE_SIZE;
         let max = page::max_private_input_pages();
 
-        // (64 MiB + 4-byte prefix) / 256 KiB page = 257 pages (256 full data pages plus
+        // (512 MiB + 4-byte prefix) / 256 KiB page = 2049 pages (2048 full data pages plus
         // the one page the length prefix spills into). Pinned so a size/page change is caught.
-        assert_eq!(max, 257);
+        assert_eq!(max, 2049);
 
         // No slack: an honest MAX-size input needs the whole last page (the bound is not
         // padded), and never overflows into an extra one.

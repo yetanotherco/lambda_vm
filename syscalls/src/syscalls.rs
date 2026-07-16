@@ -8,14 +8,14 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
-/// Maximum private-input length the guest will read, in bytes (64 MiB).
+/// Maximum private-input length the guest will read, in bytes (512 MiB).
 /// The host caps stored input at this size in `Memory::store_private_inputs`,
 /// so an honest length prefix is always `<=` this bound; a larger value can only
 /// come from a malformed or forged prefix. The reader clamps to this cap so a
 /// bogus length can never make the guest fabricate an arbitrarily long slice.
 /// Must match `executor::vm::memory::MAX_PRIVATE_INPUT_SIZE`.
 #[cfg(target_arch = "riscv64")]
-const MAX_PRIVATE_INPUT_SIZE: usize = 64 * 1024 * 1024;
+const MAX_PRIVATE_INPUT_SIZE: usize = 512 * 1024 * 1024;
 
 #[cfg(target_arch = "riscv64")]
 pub enum SyscallNumbers {
