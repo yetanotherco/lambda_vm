@@ -11,10 +11,11 @@ use crate::{
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, Prover},
-    tests::trace_test_helpers::make_valid_simple_proof,
+    tests::trace_test_helpers::{make_valid_logup_proof, make_valid_simple_proof},
     traits::AIR,
     verifier::{IsStarkVerifier, Verifier},
 };
+use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
 
 type Felt = FieldElement<GoldilocksField>;
 
@@ -379,6 +380,112 @@ fn test_verify_rejects_opening_column_count_mismatch() {
             &mut DefaultTranscript::<GoldilocksField>::new(&[])
         ),
         "Verifier must reject when an opening's column count does not match the OOD table width"
+    );
+}
+
+/// A malformed proof whose symmetric opening splits its columns between the
+/// base and auxiliary segments differently from the regular opening, while
+/// keeping the same total column count.
+///
+/// `reconstruct_deep_composition_poly_evaluation_pair` bounds its base-column
+/// branch by the REGULAR `num_base` but resolves the symmetric column through
+/// `base_at_sym`, which indexes the SYMMETRIC slices. The
+/// `num_base != num_base_sym` guard is the only thing standing between this
+/// proof and an out-of-bounds index panic in release builds, and it runs in
+/// step 3 — before step 4's Merkle openings could reject the tampering.
+///
+/// The total width is deliberately preserved (one column moved from the
+/// symmetric main trace to the symmetric aux trace) so that the width guards
+/// cannot fire: only the base/aux split guard can reject this.
+#[test_log::test]
+fn test_verify_rejects_asymmetric_base_aux_split() {
+    let (air, mut proof) = make_valid_logup_proof();
+
+    // Sanity: the unmodified proof must verify first.
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[])
+        ),
+        "precondition: valid LogUp proof must verify"
+    );
+
+    let opening = proof
+        .deep_poly_openings
+        .first_mut()
+        .expect("test precondition: a valid proof has at least one deep poly opening");
+    let aux = opening
+        .aux_trace_polys
+        .as_mut()
+        .expect("test precondition: the LogUp RAP has an auxiliary trace segment");
+
+    // Move one column from the symmetric main trace into the symmetric aux
+    // trace: `num_base_sym` drops by one while `num_base_sym + aux_sym.len()`
+    // still equals the OOD table width.
+    let moved = opening
+        .main_trace_polys
+        .evaluations_sym
+        .pop()
+        .expect("test precondition: the main trace opening has at least one column");
+    aux.evaluations_sym.push(moved.to_extension());
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[])
+        ),
+        "Verifier must reject when the regular and symmetric base-column counts disagree"
+    );
+}
+
+/// A malformed proof whose symmetric composition-poly opening is shorter than
+/// the proof-level `number_of_parts`.
+///
+/// The composition loop in `reconstruct_deep_composition_poly_evaluation_pair`
+/// is bounded by `number_of_parts` (derived from
+/// `composition_poly_parts_ood_evaluation`) and indexes both the regular and
+/// symmetric per-query slices with it, so a short symmetric slice would index
+/// out of bounds and panic in release builds. The length guard is the sole
+/// protection and runs before step 4's Merkle openings.
+///
+/// Uses the LogUp RAP (`composition_poly_degree_bound == 2 * trace_length`) so
+/// the multi-part loop is exercised rather than the degenerate one-part case.
+#[test_log::test]
+fn test_verify_rejects_truncated_symmetric_composition_opening() {
+    let (air, mut proof) = make_valid_logup_proof();
+
+    // Sanity: the unmodified proof must verify first.
+    assert!(
+        Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[])
+        ),
+        "precondition: valid LogUp proof must verify"
+    );
+    assert!(
+        proof.composition_poly_parts_ood_evaluation.len() > 1,
+        "test precondition: the LogUp RAP must have more than one composition part, \
+         so the multi-part loop is covered"
+    );
+
+    // Drop one symmetric part so the per-query opening is shorter than the
+    // proof-level part count the loop is bounded by.
+    proof.deep_poly_openings[0]
+        .composition_poly
+        .evaluations_sym
+        .pop()
+        .expect("test precondition: the composition opening has at least one part");
+
+    assert!(
+        !Verifier::verify(
+            &proof,
+            &air,
+            &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[])
+        ),
+        "Verifier must reject when a symmetric composition opening is shorter than number_of_parts"
     );
 }
 

@@ -1,3 +1,6 @@
+use crate::examples::read_only_memory_logup::{
+    LogReadOnlyPublicInputs, LogReadOnlyRAP, read_only_logup_trace,
+};
 use crate::examples::simple_addition::{
     SimpleAdditionAIR, SimpleAdditionPublicInputs, simple_addition_trace,
 };
@@ -10,6 +13,7 @@ use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use itertools::Itertools;
 use math::field::{
     element::FieldElement,
+    extensions_goldilocks::Degree3GoldilocksExtensionField,
     goldilocks::GoldilocksField,
     traits::{IsField, IsSubFieldOf},
 };
@@ -43,6 +47,52 @@ pub fn make_valid_simple_proof() -> (
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
     .unwrap();
+    (air, proof)
+}
+
+/// Builds a valid 8-row `LogReadOnlyRAP` proof. Unlike
+/// [`make_valid_simple_proof`], this AIR has both auxiliary trace columns
+/// (`trace_layout() == (5, 1)`) and more than one composition part
+/// (`composition_poly_degree_bound() == 2 * trace_length`), which the deep
+/// composition rejection tests in `small_trace_tests` need in order to reach
+/// the base/aux split and the multi-part composition loop.
+pub type LogupProof = crate::proof::stark::StarkProof<
+    GoldilocksField,
+    Degree3GoldilocksExtensionField,
+    LogReadOnlyPublicInputs<GoldilocksField>,
+>;
+
+pub fn make_valid_logup_proof() -> (
+    LogReadOnlyRAP<GoldilocksField, Degree3GoldilocksExtensionField>,
+    LogupProof,
+) {
+    let address_col: Vec<FieldElement<GoldilocksField>> = [3u64, 2, 2, 3, 4, 5, 1, 3]
+        .iter()
+        .map(|a| (*a).into())
+        .collect();
+    let value_col: Vec<FieldElement<GoldilocksField>> = [30u64, 20, 20, 30, 40, 50, 10, 30]
+        .iter()
+        .map(|v| (*v).into())
+        .collect();
+
+    let pub_inputs = LogReadOnlyPublicInputs {
+        a0: FieldElement::from(3u64),
+        v0: FieldElement::from(30u64),
+        a_sorted_0: FieldElement::from(1u64),
+        v_sorted_0: FieldElement::from(10u64),
+        m0: FieldElement::from(1u64),
+    };
+    let mut trace = read_only_logup_trace(address_col, value_col);
+    let proof_options = ProofOptions::default_test_options();
+    let air =
+        LogReadOnlyRAP::<GoldilocksField, Degree3GoldilocksExtensionField>::new(&proof_options);
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<Degree3GoldilocksExtensionField>::new(&[]),
+    )
+    .expect("prover must succeed on the LogUp read-only-memory RAP");
     (air, proof)
 }
 
