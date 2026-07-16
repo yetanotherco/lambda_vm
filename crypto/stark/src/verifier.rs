@@ -141,6 +141,22 @@ pub trait IsStarkVerifier<
             .collect::<Vec<usize>>()
     }
 
+    /// The pruned-OOD layout for this AIR — the single place in the verifier that
+    /// reads the shape metadata (`trace_columns`, `step_size`, the
+    /// transition-offset count, and the next-row column set). Everything that used
+    /// to recompute these values now derives them from the returned
+    /// [`crate::ood::OodLayout`]. Pure AIR metadata, never a proof dimension.
+    fn ood_layout(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    ) -> crate::ood::OodLayout {
+        crate::ood::OodLayout::new(
+            air.context().trace_columns,
+            air.context().transition_offsets.len() * air.step_size(),
+            air.step_size(),
+            air.trace_ood_next_row_columns(),
+        )
+    }
+
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
@@ -186,6 +202,13 @@ pub trait IsStarkVerifier<
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        // The full current+next-row OOD grid, shape-checked and reconstructed once
+        // by the caller (after `ood_blocks_well_formed`) and shared with
+        // `step_3_verify_fri`. Its pruned next-row entries are zero — those are
+        // never read by any constraint. `step_size` accompanies it for the frame
+        // split below.
+        ood_full: &Table<FieldExtension>,
+        step_size: usize,
     ) -> bool {
         crate::profile_markers::step_marker::<
             { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
@@ -196,29 +219,6 @@ pub trait IsStarkVerifier<
         let bus_public_inputs = proof
             .bus_table_contribution()
             .map(BusPublicInputs::from_contribution);
-
-        // Reject either OOD block whose shape disagrees with the AIR before
-        // reading it, so a malicious prover cannot reshape them to dodge a check
-        // or desync the frame reconstruction below.
-        if !Self::ood_blocks_well_formed(air, proof) {
-            return false;
-        }
-        let step_size = air.step_size();
-        let num_eval_points = air.context().transition_offsets.len() * step_size;
-        let next_row_cols = air.trace_ood_next_row_columns();
-        let ood_current = proof.trace_ood_evaluations();
-        let ood_next = proof.trace_ood_next_evaluations();
-
-        // Reconstruct the full current+next-row OOD grid (surviving values placed,
-        // pruned next-row entries zero -- those are never read by any constraint).
-        let ood_full = crate::ood::reconstruct_ood_full(
-            ood_current.row_major_data(),
-            ood_current.width(),
-            ood_next.row_major_data(),
-            num_eval_points,
-            step_size,
-            &next_row_cols,
-        );
 
         let boundary_constraints = air.boundary_constraints(
             public_inputs,
@@ -318,7 +318,7 @@ pub trait IsStarkVerifier<
         // its transition-window columns; the zero-filled remainder is never read.
         // `into_frame` lives on the borrowed table view, so wrap the owned grid.
         let ood_frame =
-            StarkTableView::Owned(&ood_full).into_frame(num_main_trace_columns, step_size);
+            StarkTableView::Owned(ood_full).into_frame(num_main_trace_columns, step_size);
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
@@ -389,33 +389,25 @@ pub trait IsStarkVerifier<
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        // g·z pruning: the full OOD grid (reconstructed once by the caller and
+        // shared with `step_2`) plus the transition-window column indices, so the
+        // DEEP reconstruction can skip pruned next-row openings.
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
-        // g·z pruning: rebuild the full OOD grid from the two proof blocks so
-        // the DEEP reconstruction can skip pruned next-row openings.
-        let step_size = air.step_size();
-        let num_eval_points = air.context().transition_offsets.len() * step_size;
-        let next_row_cols = air.trace_ood_next_row_columns();
-        let ood_current = proof.trace_ood_evaluations();
-        let ood_full = crate::ood::reconstruct_ood_full(
-            ood_current.row_major_data(),
-            ood_current.width(),
-            proof.trace_ood_next_evaluations().row_major_data(),
-            num_eval_points,
-            step_size,
-            &next_row_cols,
-        );
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges,
                 domain,
                 proof,
-                &ood_full,
-                &next_row_cols,
+                ood_full,
+                next_row_cols,
                 step_size,
             ) {
                 Some(pair) => pair,
@@ -1368,6 +1360,7 @@ pub trait IsStarkVerifier<
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        layout: &crate::ood::OodLayout,
     ) -> Challenges<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -1442,17 +1435,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation().len();
-        let num_eval_points = air.context().transition_offsets.len() * air.step_size();
-        let next_row_cols = air.trace_ood_next_row_columns();
         // Must match the prover's g·z pruning exactly (same AIR metadata): the
         // current-row block opens every column, the next-row block only the
         // transition-window columns.
-        let num_terms_trace = crate::ood::num_surviving_trace_openings(
-            air.context().trace_columns,
-            num_eval_points,
-            air.step_size(),
-            next_row_cols.len(),
-        );
+        let num_terms_trace = layout.num_surviving();
         let gamma = transcript.sample_field_element();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
@@ -1464,13 +1450,7 @@ pub trait IsStarkVerifier<
         let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
             .collect();
-        let trace_term_coeffs = crate::ood::build_pruned_trace_term_coeffs(
-            &trace_term_powers,
-            air.context().trace_columns,
-            num_eval_points,
-            air.step_size(),
-            &next_row_cols,
-        );
+        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
@@ -1552,6 +1532,12 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // The pruned-OOD layout, read from the AIR once and shared by the round-4
+        // challenge replay, the block-shape guard, the single grid reconstruction,
+        // and both verify steps below — one reconstruction instead of the previous
+        // two, and no chance of the sites drifting apart.
+        let layout = Self::ood_layout(air);
+
         #[cfg(feature = "instruments")]
         println!("- Started step 1: Recover challenges");
         #[cfg(feature = "instruments")]
@@ -1564,6 +1550,7 @@ pub trait IsStarkVerifier<
             &domain,
             transcript,
             rap_challenges,
+            &layout,
         );
 
         // verify grinding
@@ -1590,12 +1577,37 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer2 = Instant::now();
 
+        // Reject either OOD block whose shape disagrees with the AIR before
+        // reconstructing or using it, so a malicious prover cannot reshape them
+        // to dodge a check or desync the frame reconstruction. This guard used to
+        // run at the top of `step_2`; `step_3` silently relied on it. Now it runs
+        // once here, before both steps, and the full grid is reconstructed once
+        // and shared with them (one reconstruction instead of two). The Phase A
+        // loop in `multi_verify_views` runs the same guard even earlier, before
+        // Round 3 absorbs the next-row block.
+        if !Self::ood_blocks_well_formed(air, proof) {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Composition Polynomial verification failed");
+            return false;
+        }
+        let ood_current = proof.trace_ood_evaluations();
+        let ood_next = proof.trace_ood_next_evaluations();
+        // Full current+next-row OOD grid (surviving values placed, pruned next-row
+        // entries zero — those are never read by any constraint).
+        let ood_full = layout.reconstruct_full(
+            ood_current.row_major_data(),
+            ood_current.width(),
+            ood_next.row_major_data(),
+        );
+
         if !Self::step_2_verify_claimed_composition_polynomial(
             air,
             proof,
             public_inputs,
             &domain,
             &challenges,
+            &ood_full,
+            layout.step_size(),
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
@@ -1611,7 +1623,15 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer3 = Instant::now();
 
-        if !Self::step_3_verify_fri(air, proof, &domain, &challenges) {
+        if !Self::step_3_verify_fri(
+            air,
+            proof,
+            &domain,
+            &challenges,
+            &ood_full,
+            layout.next_row_cols(),
+            layout.step_size(),
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;

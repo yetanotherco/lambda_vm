@@ -182,6 +182,135 @@ pub fn reconstruct_ood_full<E: IsField>(
     Table::new(data, width)
 }
 
+/// The pruned-OOD trace-opening layout, derived once from public AIR shape
+/// metadata and shared by every site that used to recompute it. Every field is
+/// a pure function of the AIR (`trace_columns`, `step_size`, the
+/// transition-offset count, and the next-row column set), so the prover and the
+/// verifier build the identical layout without trusting any proof dimension
+/// (invariant I3). This struct only bundles those values and forwards to the
+/// free functions above; it adds no new arithmetic.
+///
+/// It stays decoupled from the `AIR` trait: callers that have an AIR in scope
+/// read the four raw values once (see the `ood_layout` helpers in the verifier
+/// and prover) and pass them to [`OodLayout::new`].
+#[derive(Clone, Debug)]
+pub struct OodLayout {
+    /// Total trace columns (`main + aux`), i.e. the full current-row block width.
+    num_total_cols: usize,
+    /// Rows in the full OOD grid: `num_transition_offsets * step_size`.
+    num_eval_points: usize,
+    /// Rows per offset block.
+    step_size: usize,
+    /// Full-width column indices opened at the next row (the transition window).
+    next_row_cols: Vec<usize>,
+}
+
+impl OodLayout {
+    /// Build from raw AIR-metadata values. `num_eval_points` is
+    /// `num_transition_offsets * step_size`; keeping it a plain argument lets the
+    /// single AIR-reading expression live in the verifier/prover, not here.
+    pub fn new(
+        num_total_cols: usize,
+        num_eval_points: usize,
+        step_size: usize,
+        next_row_cols: Vec<usize>,
+    ) -> Self {
+        Self {
+            num_total_cols,
+            num_eval_points,
+            step_size,
+            next_row_cols,
+        }
+    }
+
+    /// Rows per offset block.
+    pub fn step_size(&self) -> usize {
+        self.step_size
+    }
+
+    /// Full-width column indices opened at the next row (the transition window),
+    /// in the order the DEEP reconstruction sums them.
+    pub fn next_row_cols(&self) -> &[usize] {
+        &self.next_row_cols
+    }
+
+    /// Width of the pruned next-row proof block: one column per transition-window
+    /// column (the current-row block always keeps every column).
+    pub fn expected_next_width(&self) -> usize {
+        self.next_row_cols.len()
+    }
+
+    /// Height of the pruned next-row proof block: the non-current rows, or 0 when
+    /// the AIR reads no next-row column (then the block is empty).
+    pub fn expected_next_height(&self) -> usize {
+        if self.next_row_cols.is_empty() {
+            0
+        } else {
+            self.num_eval_points.saturating_sub(self.step_size)
+        }
+    }
+
+    /// Number of surviving trace openings under g·z pruning; see
+    /// [`num_surviving_trace_openings`].
+    pub fn num_surviving(&self) -> usize {
+        num_surviving_trace_openings(
+            self.num_total_cols,
+            self.num_eval_points,
+            self.step_size,
+            self.next_row_cols.len(),
+        )
+    }
+
+    /// Per-column next-row open flags for a table of `grid_width` columns; see
+    /// [`next_row_col_flags`]. The width is that of the table being indexed — the
+    /// reconstructed OOD grid, whose width is the current-row block's width — and
+    /// need not equal `num_total_cols`; the free function ignores any next-row
+    /// index that falls outside `grid_width`.
+    pub fn flags(&self, grid_width: usize) -> Vec<bool> {
+        next_row_col_flags(grid_width, &self.next_row_cols)
+    }
+
+    /// Build the rectangular DEEP trace-term coefficient grid; see
+    /// [`build_pruned_trace_term_coeffs`].
+    pub fn build_trace_term_coeffs<E: IsField>(
+        &self,
+        powers: &[FieldElement<E>],
+    ) -> Vec<Vec<FieldElement<E>>> {
+        build_pruned_trace_term_coeffs(
+            powers,
+            self.num_total_cols,
+            self.num_eval_points,
+            self.step_size,
+            &self.next_row_cols,
+        )
+    }
+
+    /// Split a full prover OOD table into the two pruned proof blocks; see
+    /// [`split_ood_blocks`].
+    pub fn split_full<E: IsField>(&self, full: &Table<E>) -> (Table<E>, Table<E>) {
+        split_ood_blocks(full, self.step_size, &self.next_row_cols)
+    }
+
+    /// Rebuild the full OOD grid from the two pruned proof blocks; see
+    /// [`reconstruct_ood_full`]. `current_width` is the (proof-supplied)
+    /// current-row block width and becomes the reconstructed grid's width.
+    pub fn reconstruct_full<E: IsField>(
+        &self,
+        current_block: &[FieldElement<E>],
+        current_width: usize,
+        next_block: &[FieldElement<E>],
+    ) -> Table<E> {
+        reconstruct_ood_full(
+            current_block,
+            current_width,
+            next_block,
+            self.num_eval_points,
+            self.step_size,
+            &self.next_row_cols,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -281,5 +410,50 @@ mod tests {
         assert_ne!(coeffs[1][1], Fe::zero()); // masked column, next row
         assert_eq!(coeffs[0][1], Fe::zero()); // pruned
         assert_eq!(coeffs[2][1], Fe::zero()); // pruned
+    }
+
+    #[test]
+    fn ood_layout_delegates_to_free_functions() {
+        // W=3 cols, num_eval_points=2 (step_size 1, 2 offsets), next-row mask {1}.
+        let layout = OodLayout::new(3, 2, 1, vec![1]);
+
+        assert_eq!(layout.step_size(), 1);
+        assert_eq!(layout.expected_next_width(), 1);
+        assert_eq!(layout.expected_next_height(), 1);
+        assert_eq!(
+            layout.num_surviving(),
+            num_surviving_trace_openings(3, 2, 1, 1)
+        );
+
+        // Empty next-row mask => empty next-row block.
+        let empty = OodLayout::new(3, 2, 1, vec![]);
+        assert_eq!(empty.expected_next_width(), 0);
+        assert_eq!(empty.expected_next_height(), 0);
+
+        // flags(), build_trace_term_coeffs(), split_full() and reconstruct_full()
+        // must be bit-identical to the free functions they forward to.
+        assert_eq!(layout.flags(3), next_row_col_flags(3, &[1]));
+        let powers: Vec<Fe> = (1..=4).map(fe).collect();
+        assert_eq!(
+            layout.build_trace_term_coeffs(&powers),
+            build_pruned_trace_term_coeffs(&powers, 3, 2, 1, &[1])
+        );
+
+        let full = Table::new(vec![fe(10), fe(11), fe(12), fe(20), fe(21), fe(22)], 3);
+        let (lb0, lb1) = layout.split_full(&full);
+        let (fb0, fb1) = split_ood_blocks(&full, 1, &[1]);
+        assert_eq!(lb0.row_major_data(), fb0.row_major_data());
+        assert_eq!(lb1.row_major_data(), fb1.row_major_data());
+
+        let recon = layout.reconstruct_full(lb0.row_major_data(), lb0.width, lb1.row_major_data());
+        let free_recon = reconstruct_ood_full(
+            fb0.row_major_data(),
+            fb0.width,
+            fb1.row_major_data(),
+            2,
+            1,
+            &[1],
+        );
+        assert_eq!(recon.row_major_data(), free_recon.row_major_data());
     }
 }
