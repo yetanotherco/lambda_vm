@@ -287,7 +287,8 @@ jobs:
             ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid ref: '$REF'"; exit 1 ;;
           esac
           # Check out the ref under test on the box, then run the CUDA test groups.
-          # gpu_test.sh owns the CUDARC_PIN / SYSROOT_DIR defaults — don't duplicate them here.
+          # gpu_test.sh owns the SYSROOT_DIR default — don't duplicate it here. (cudarc's CUDA
+          # version is pinned in crypto/math-cuda/Cargo.toml, so no CUDARC_PIN is needed.)
           REMOTE="set -e; cd /workspace/lambda_vm; \
             git fetch --force origin '$REF'; \
             git checkout -f FETCH_HEAD; \

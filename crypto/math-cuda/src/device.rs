@@ -90,16 +90,21 @@ impl Drop for PinnedStaging {
     }
 }
 
-const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
-const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
-const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
-const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
-const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
-const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
-const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
-const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
-const CONSTRAINT_INTERP_PTX: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/constraint_interp.ptx"));
+// Kernels are AOT-compiled to native cubin (SASS) by build.rs, embedded here,
+// and loaded via `Ptx::from_binary` (cubin bytes -> cuModuleLoadData). This
+// avoids the PTX-ISA/driver-version JIT check — see build.rs `compile_kernel`.
+// An empty slice (nvcc-less stub build) fails to load at runtime and the caller
+// falls back to CPU.
+const ARITH_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arith.cubin"));
+const NTT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
+const KECCAK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keccak.cubin"));
+const BARY_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/barycentric.cubin"));
+const DEEP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deep.cubin"));
+const FRI_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fri.cubin"));
+const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.cubin"));
+const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
+const CONSTRAINT_INTERP_CUBIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -125,7 +130,7 @@ pub struct Backend {
     /// [`detect_vram_budget_bytes`].
     vram_budget_bytes: u64,
 
-    // arith.ptx
+    // arith.cubin
     pub vector_add_u64: CudaFunction,
     pub gl_add: CudaFunction,
     pub gl_sub: CudaFunction,
@@ -135,7 +140,7 @@ pub struct Backend {
     pub ext3_add: CudaFunction,
     pub ext3_sub: CudaFunction,
 
-    // ntt.ptx
+    // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
@@ -152,7 +157,7 @@ pub struct Backend {
     pub pointwise_mul_row_major: CudaFunction,
     pub matrix_transpose_strided: CudaFunction,
 
-    // keccak.ptx
+    // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
@@ -162,7 +167,7 @@ pub struct Backend {
     pub keccak_merkle_level: CudaFunction,
     pub merkle_gather_paths: CudaFunction,
 
-    // barycentric.ptx
+    // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
     pub barycentric_ext3_batched: CudaFunction,
     pub barycentric_base_batched_strided: CudaFunction,
@@ -170,14 +175,14 @@ pub struct Backend {
     pub gather_rows_base: CudaFunction,
     pub gather_rows_ext3: CudaFunction,
 
-    // deep.ptx
+    // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
 
-    // fri.ptx
+    // fri.cubin
     pub fri_fold_ext3: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
-    // inverse.ptx
+    // inverse.cubin
     pub compute_denoms_ext3: CudaFunction,
     pub block_inclusive_scan_fwd_ext3: CudaFunction,
     pub apply_block_offsets_fwd_ext3: CudaFunction,
@@ -192,7 +197,7 @@ pub struct Backend {
     pub logup_finalize_accum_ext3: CudaFunction,
     pub logup_assemble_aux_ext3: CudaFunction,
 
-    // constraint_interp.ptx
+    // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
 
@@ -291,15 +296,16 @@ impl Backend {
         // we keep the current behaviour.
         retain_default_mempool(&ctx);
 
-        let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
-        let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
-        let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
-        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
-        let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
-        let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
-        let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
-        let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
-        let constraint_interp = ctx.load_module(Ptx::from_src(CONSTRAINT_INTERP_PTX))?;
+        let arith = ctx.load_module(Ptx::from_binary(ARITH_CUBIN.to_vec()))?;
+        let ntt = ctx.load_module(Ptx::from_binary(NTT_CUBIN.to_vec()))?;
+        let keccak = ctx.load_module(Ptx::from_binary(KECCAK_CUBIN.to_vec()))?;
+        let bary = ctx.load_module(Ptx::from_binary(BARY_CUBIN.to_vec()))?;
+        let deep = ctx.load_module(Ptx::from_binary(DEEP_CUBIN.to_vec()))?;
+        let fri = ctx.load_module(Ptx::from_binary(FRI_CUBIN.to_vec()))?;
+        let inverse = ctx.load_module(Ptx::from_binary(INVERSE_CUBIN.to_vec()))?;
+        let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
+        let constraint_interp =
+            ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -504,7 +510,26 @@ pub fn backend() -> Result<&'static Backend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let b = Backend::init()?;
+    let b = match Backend::init() {
+        Ok(b) => b,
+        Err(e) => {
+            // Backend init failing means every GPU entry point silently falls
+            // back to CPU. That is expected on a GPU-less host, but it also
+            // fires when the AOT cubins won't load — most often a build-host vs
+            // run-host GPU-arch mismatch (cubins are compiled for the detected
+            // `sm_XX`) or an empty nvcc-less stub. Warn once so the fallback is
+            // never silent: rebuild on the run host, or set `CUDARC_NVCC_ARCH`.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "math-cuda: GPU backend unavailable ({e}) — running on CPU. \
+                     If a GPU is present this is likely a kernel-cubin arch mismatch; \
+                     rebuild on the run host or set CUDARC_NVCC_ARCH to its sm_XX."
+                );
+            });
+            return Err(e);
+        }
+    };
     let _ = BACKEND.set(b);
     Ok(BACKEND.get().expect("backend just initialised"))
 }
