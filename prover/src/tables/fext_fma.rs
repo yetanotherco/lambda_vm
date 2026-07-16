@@ -12,7 +12,7 @@
 //!
 //! ## Bus interactions
 //! - **Receiver** on `Ecall`: `[ts_lo, ts_hi, FEXT_FMA_lo32, FEXT_FMA_hi32]` (mult = μ).
-//! - **Sender** on `Memw` ×4: register reads of x10/x11/x12/x13 (out/a/b/c addrs).
+//! - **Sender** on `Memw` ×4: register reads of x10/x11/x12/x13 (a/b/c/out addrs).
 //! - **Memory** reads ×9: coefficient `d` of each of a/b/c from cell `(3+d, addr)`.
 //! - **Memory** writes ×3: output coefficient `d` to cell `(3+d, out_addr)`.
 //! - **Alu** ×12: `old_ts < ts` temporal ordering per field-storage access.
@@ -38,7 +38,7 @@ pub mod cols {
     pub const TIMESTAMP_0: usize = 0;
     pub const TIMESTAMP_1: usize = 1;
 
-    // Operand addresses (each DWordWL). Registers: x10=out, x11=a, x12=b, x13=c.
+    // Operand addresses (each DWordWL). Registers: x10=a, x11=b, x12=c, x13=out.
     pub const OUT_ADDR_0: usize = 2;
     pub const OUT_ADDR_1: usize = 3;
     pub const A_ADDR_0: usize = 4;

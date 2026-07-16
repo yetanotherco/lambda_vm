@@ -14,12 +14,10 @@
 # group failed, which fails the workflow job and blocks the merge.
 #
 # Env:
-#   CUDARC_PIN   cudarc CUDA-version feature to pin (default cuda-12080). See the sed below.
 #   SYSROOT_DIR  rv64 sysroot (default /opt/lambda-vm-sysroot, provisioned by the template).
 
 set -euo pipefail
 
-CUDARC_PIN="${CUDARC_PIN:-cuda-12080}"
 export SYSROOT_DIR="${SYSROOT_DIR:-/opt/lambda-vm-sysroot}"
 
 log() { printf '\n=== %s ===\n' "$*"; }
@@ -37,26 +35,9 @@ nvcc --version | tail -n 2
 nvidia-smi
 nvidia-smi --query-gpu=name,driver_version,compute_cap --format=csv,noheader
 
-# --- Pin cudarc so it binds a fixed driver-symbol set --------------------------
-# crypto/math-cuda/Cargo.toml uses `cuda-version-from-build-system` + `fallback-latest`;
-# when detection falls back to "latest", cudarc requests symbols some boxes' driver doesn't
-# export (e.g. cuDevSmResourceSplit / cuCtxGetDevice_v2) -> runtime panic. Pinning to a fixed,
-# conservative CUDA version binds a known driver-symbol set instead. (This is cudarc's
-# host-side driver-API floor — independent of the PTX/driver version the offer filter targets.)
-log "pinning cudarc to $CUDARC_PIN"
-# Guard the sed anchors: if math-cuda's cudarc features are ever renamed/reformatted, a silent
-# no-op here would bring the fallback-latest driver-symbol panic back with a confusing signature.
-for anchor in '"cuda-version-from-build-system"' '"fallback-latest"'; do
-    grep -qF "$anchor" crypto/math-cuda/Cargo.toml \
-        || { echo "ERROR: sed anchor $anchor not found in crypto/math-cuda/Cargo.toml — update this script's cudarc pin" >&2; exit 1; }
-done
-# Restore the tracked file on exit so a manual run on a dev box doesn't leave the tree dirty
-# (CI doesn't need this — the workflow re-checks-out before every run — but it's harmless there).
-CUDARC_TOML_BACKUP="$(mktemp)"
-cp crypto/math-cuda/Cargo.toml "$CUDARC_TOML_BACKUP"
-trap 'cp "$CUDARC_TOML_BACKUP" crypto/math-cuda/Cargo.toml; rm -f "$CUDARC_TOML_BACKUP"' EXIT
-sed -i "s/\"cuda-version-from-build-system\"/\"${CUDARC_PIN}\"/; /\"fallback-latest\"/d" \
-    crypto/math-cuda/Cargo.toml
+# cudarc's CUDA-version pin now lives permanently in crypto/math-cuda/Cargo.toml
+# (feature `cuda-12080`), so this script no longer patches the manifest. Kernels
+# are AOT-compiled to cubin by build.rs, so no PTX/driver-version juggling either.
 
 # --- Build the guest ELFs the tests prove ---------------------------------------
 # math-cuda parity needs none; cuda_path_integration / cuda_fallback prove an asm ELF; the

@@ -1769,13 +1769,79 @@ fn collect_lt_from_fext_fma(ops: &[fext_fma::FextFmaOperation]) -> Vec<LtOperati
 /// of the 3 field reads. (The register read/write LT checks are handled by the
 /// shared MEMW machinery.)
 fn collect_lt_from_fext_store(ops: &[fext_store::FextStoreOperation]) -> Vec<LtOperation> {
-    let mut lt_ops = Vec::with_capacity(ops.len() * 3);
+    let mut lt_ops = Vec::with_capacity(ops.len() * 6);
     for op in ops {
         for d in 0..3 {
+            // coeff < p (read-back canonicality) + old_ts < ts (temporal order).
+            lt_ops.push(LtOperation::new(
+                op.coeffs[d],
+                math::field::goldilocks::GOLDILOCKS_PRIME,
+                false,
+            ));
             lt_ops.push(LtOperation::new(op.old_ts[d], op.timestamp, false));
         }
     }
     lt_ops
+}
+
+/// BITWISE `IsHalfword` provider rows for the FEXT_STORE chip: each read-back
+/// coefficient's two 32-bit words are split into 16-bit halves that the chip
+/// range-checks (12 per op).
+fn collect_bitwise_from_fext_store(
+    ops: &[fext_store::FextStoreOperation],
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 12);
+    for op in ops {
+        for d in 0..3 {
+            for word in [op.coeffs[d] & 0xFFFF_FFFF, op.coeffs[d] >> 32] {
+                for hv in [word & 0xFFFF, (word >> 16) & 0xFFFF] {
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::IsHalf,
+                        (hv & 0xFF) as u8,
+                        (hv >> 8) as u8,
+                    ));
+                }
+            }
+        }
+    }
+    bitwise_ops
+}
+
+/// ALU `LT` provider rows for the FEXT_PAGE uniqueness argument: for each
+/// same-domain adjacent pair (in the sorted `(domain, addr)` order the table
+/// emits), the chip proves `addr[i] < addr[i+1]`. Sorting here MUST match
+/// [`fext_page::generate_fext_page_trace`] so the sent and provided lookups line
+/// up.
+fn collect_lt_from_fext_page(ops: &[fext_page::FextPageOperation]) -> Vec<LtOperation> {
+    let mut sorted = ops.to_vec();
+    sorted.sort_by_key(|o| (o.domain, o.addr));
+    let mut lt_ops = Vec::new();
+    for pair in sorted.windows(2) {
+        if pair[0].domain == pair[1].domain {
+            lt_ops.push(LtOperation::new(pair[0].addr, pair[1].addr, false));
+        }
+    }
+    lt_ops
+}
+
+/// BITWISE `IsHalfword` provider rows for the FEXT_PAGE uniqueness argument: each
+/// touched cell's 64-bit address is split into two 32-bit limbs and then 16-bit
+/// halves that the chip range-checks (4 per op), pinning the addr limbs so the
+/// `addr <` ALU lookup is sound.
+fn collect_bitwise_from_fext_page(ops: &[fext_page::FextPageOperation]) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::with_capacity(ops.len() * 4);
+    for op in ops {
+        for word in [op.addr & 0xFFFF_FFFF, op.addr >> 32] {
+            for hv in [word & 0xFFFF, (word >> 16) & 0xFFFF] {
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (hv & 0xFF) as u8,
+                    (hv >> 8) as u8,
+                ));
+            }
+        }
+    }
+    bitwise_ops
 }
 
 /// Checks whether a MEMW operation qualifies for the aligned fast path (MEMW_A).
@@ -3308,6 +3374,19 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
 ) -> Result<Traces, Error> {
+    // Interim soundness guard: field-storage is NOT carried across continuation
+    // epochs (RAM and registers are, but `field_state` resets to default each
+    // epoch), so a FEXT value written in one epoch would read back as zero in the
+    // next — an unsound reset. Reject any FEXT accelerator use under continuation
+    // until L2G field-storage carry lands (monolithic proving is unaffected, as it
+    // carries field-storage within the single proof via the FEXT_PAGE bookend).
+    if l2g_memory_bookend
+        && (!ops.fext_load_ops.is_empty()
+            || !ops.fext_fma_ops.is_empty()
+            || !ops.fext_store_ops.is_empty())
+    {
+        return Err(Error::FextInContinuation);
+    }
     let CollectedOps {
         cpu_ops,
         memw_ops,
@@ -3342,6 +3421,7 @@ fn build_traces<I: ImageSource + Sync>(
     lt_ops.extend(collect_lt_from_fext_load(&fext_load_ops));
     lt_ops.extend(collect_lt_from_fext_fma(&fext_fma_ops));
     lt_ops.extend(collect_lt_from_fext_store(&fext_store_ops));
+    lt_ops.extend(collect_lt_from_fext_page(&fext_page_ops));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3410,6 +3490,8 @@ fn build_traces<I: ImageSource + Sync>(
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_fext_store(&fext_store_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_fext_page(&fext_page_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
     if let Some(image) = initial_image

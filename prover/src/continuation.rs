@@ -67,6 +67,10 @@ use crate::tables::register;
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
+use crate::test_utils::{
+    create_fext_fma_air_forbidden, create_fext_load_air_forbidden, create_fext_page_air_forbidden,
+    create_fext_store_air_forbidden,
+};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
     compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
@@ -341,7 +345,7 @@ struct EpochStart<'a> {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
-#[derive(serde::Serialize, serde::Deserialize)]
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
@@ -377,8 +381,8 @@ struct EpochProof {
 /// AIR-count checks, so a wrong value is rejected; the count is also bound-checked up front.
 ///
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
-/// serde, so it round-trips through `bincode` exactly like a monolithic `VmProof`.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// rkyv, so it round-trips exactly like a monolithic `VmProof`.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
@@ -421,7 +425,7 @@ fn build_epoch_airs(
         register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     ));
-    VmAirs::new(
+    let mut airs = VmAirs::new(
         elf,
         opts,
         false,
@@ -432,7 +436,17 @@ fn build_epoch_airs(
         None,
         None,
         register_preprocessed,
-    )
+    );
+    // Continuation disallows the FEXT accelerator: field-storage is not carried
+    // across epochs, so a value written in one epoch would read back as zero in
+    // the next. Force the four FEXT tables empty (μ = 0) at the AIR level so the
+    // *verifier* rejects any continuation proof that uses them — the prover-side
+    // guard in `build_traces` does not bind a malicious prover.
+    airs.fext_load = Box::new(create_fext_load_air_forbidden(opts));
+    airs.fext_fma = Box::new(create_fext_fma_air_forbidden(opts));
+    airs.fext_store = Box::new(create_fext_store_air_forbidden(opts));
+    airs.fext_page = Box::new(create_fext_page_air_forbidden(opts));
+    airs
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -1202,17 +1216,18 @@ mod tests {
         assert_eq!(out.as_deref(), Some(&[0xAA, 0xBB, 0xCC, 0xDD][..]));
     }
 
-    // A bundle survives a bincode round-trip and still verifies to the same output —
+    // A bundle survives an rkyv round-trip and still verifies to the same output —
     // the serialization path the CLI's `prove`/`verify --continuations` relies on.
     #[test]
-    fn test_continuation_bincode_roundtrip() {
+    fn test_continuation_rkyv_roundtrip() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_commit_split");
         let bundle =
             prove_continuation(&elf_bytes, &[], 4, &ProofOptions::default_test_options()).unwrap();
 
-        let bytes = bincode::serialize(&bundle).unwrap();
-        let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
+        let restored: ContinuationProof =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
 
         let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
             .unwrap();
@@ -1339,11 +1354,12 @@ mod tests {
             "a program that reads private input must have a private-input page in the global proof"
         );
 
-        // The serialized bundle must carry no raw private bytes: it survives a bincode
+        // The serialized bundle must carry no raw private bytes: it survives an rkyv
         // round-trip and still verifies using ONLY the bundle + ELF (no private input
         // is passed to `verify_continuation`).
-        let bytes = bincode::serialize(&bundle).unwrap();
-        let restored: ContinuationProof = bincode::deserialize(&bytes).unwrap();
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&bundle).unwrap();
+        let restored: ContinuationProof =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
         let out = verify_continuation(&elf_bytes, &restored, &ProofOptions::default_test_options())
             .unwrap();
         assert_eq!(
