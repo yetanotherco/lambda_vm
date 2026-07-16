@@ -850,3 +850,182 @@ impl<'de, F: IsPrimeField> Deserialize<'de> for FieldElement<F> {
         deserializer.deserialize_struct("FieldElement", FIELDS, FieldElementVisitor(PhantomData))
     }
 }
+
+// ============================================================================
+// rkyv zero-copy (de)serialization
+// ============================================================================
+//
+// `FieldElement<F>` is `#[repr(transparent)]` over `F::BaseType`. Its archived
+// form is a local `#[repr(transparent)]` newtype wrapping the archived form of
+// `F::BaseType` (e.g. archived `u64` for Goldilocks, `[ArchivedFieldElement; 3]`
+// for the cubic extension). Keeping it a LOCAL type (rather than reusing
+// `<F::BaseType as Archive>::Archived` directly) is what lets us implement
+// `Deserialize` without colliding with rkyv's blanket impls — while the
+// transparent repr keeps the archived bytes identical to the base type, so the
+// recursion verifier still reads field elements straight from the proof buffer.
+
+/// Archived form of [`FieldElement<F>`]; see the module note above.
+#[cfg(feature = "rkyv")]
+#[repr(transparent)]
+pub struct ArchivedFieldElement<F: IsField>
+where
+    F::BaseType: rkyv::Archive,
+{
+    value: <F::BaseType as rkyv::Archive>::Archived,
+}
+
+#[cfg(feature = "rkyv")]
+const _: () = {
+    use rkyv::{Archive, Deserialize, Place, Portable, Serialize};
+
+    // SAFETY: `ArchivedFieldElement<F>` is `#[repr(transparent)]` over the base
+    // type's archived form, which is itself `Portable` (required by `Archive`).
+    // A transparent wrapper over a `Portable` type is position-independent and
+    // valid for the same byte patterns, so it is `Portable` too.
+    unsafe impl<F> Portable for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: Portable,
+    {
+    }
+
+    impl<F> Archive for FieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+    {
+        type Archived = ArchivedFieldElement<F>;
+        type Resolver = <F::BaseType as Archive>::Resolver;
+
+        #[inline]
+        fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+            // `ArchivedFieldElement` is `#[repr(transparent)]` over the base
+            // type's archived form, so resolving into the inner field resolves
+            // the whole newtype.
+            let inner = unsafe { out.cast_unchecked::<<F::BaseType as Archive>::Archived>() };
+            self.value.resolve(resolver, inner);
+        }
+    }
+
+    impl<F, S> Serialize<S> for FieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Serialize<S>,
+        S: rkyv::rancor::Fallible + ?Sized,
+    {
+        #[inline]
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            self.value.serialize(serializer)
+        }
+    }
+
+    impl<F, D> Deserialize<FieldElement<F>, D> for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: Deserialize<F::BaseType, D>,
+        D: rkyv::rancor::Fallible + ?Sized,
+    {
+        #[inline]
+        fn deserialize(&self, deserializer: &mut D) -> Result<FieldElement<F>, D::Error> {
+            Ok(FieldElement {
+                value: self.value.deserialize(deserializer)?,
+            })
+        }
+    }
+
+    // SAFETY: `#[repr(transparent)]` over the inner archived value, so checking
+    // the inner type's bytes checks the whole newtype.
+    unsafe impl<F, C> rkyv::bytecheck::CheckBytes<C> for ArchivedFieldElement<F>
+    where
+        F: IsField,
+        F::BaseType: Archive,
+        <F::BaseType as Archive>::Archived: rkyv::bytecheck::CheckBytes<C>,
+        C: rkyv::rancor::Fallible + ?Sized,
+    {
+        unsafe fn check_bytes(value: *const Self, context: &mut C) -> Result<(), C::Error> {
+            unsafe {
+                <<F::BaseType as Archive>::Archived as rkyv::bytecheck::CheckBytes<C>>::check_bytes(
+                    value as *const <F::BaseType as Archive>::Archived,
+                    context,
+                )
+            }
+        }
+    }
+};
+
+// ----------------------------------------------------------------------------
+// Zero-copy native views (little-endian only)
+// ----------------------------------------------------------------------------
+//
+// rkyv archives integers as `rend::*_le` types, which are `#[repr(C, align(N))]`
+// and bit-identical to the native little-endian primitive. `FieldElement<F>` is
+// `#[repr(transparent)]` over `F::BaseType` and `ArchivedFieldElement<F>` is
+// `#[repr(transparent)]` over `<F::BaseType as Archive>::Archived`. So on a
+// little-endian target the two types share size, alignment, and bit layout —
+// an archived field element *is* a native field element. These views let the
+// verifier read field elements straight out of the proof buffer with no copy
+// and no allocation.
+//
+// Restricted to `target_endian = "little"` (the lambda-vm guest target). On a
+// big-endian host these would be wrong, so they simply don't exist there.
+// `IsField` is a public trait, so an arbitrary `F::BaseType: Archive` gives no
+// guarantee that `Archived` shares size/align/layout with the base type —
+// only rkyv's own primitive archived forms (and types built from them) do.
+// `NativeArchived` is sealed to just those, so the views below are only
+// callable for base types this crate has vetted.
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for u32 {}
+    impl Sealed for u64 {}
+    impl<F: super::IsField> Sealed for super::FieldElement<F> where F::BaseType: super::NativeArchived {}
+    impl<T: super::NativeArchived, const N: usize> Sealed for [T; N] {}
+}
+
+/// See the module note above: implemented only for base types whose rkyv
+/// `Archived` form is bit-identical to the native type on little-endian
+/// targets (same size, same alignment, same byte layout).
+///
+/// # Safety
+/// Implementors must guarantee `Self` and `Self::Archived` have identical
+/// size and layout, and `Self`'s alignment is at least `Self::Archived`'s,
+/// under `target_endian = "little"`.
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+pub unsafe trait NativeArchived: rkyv::Archive + sealed::Sealed {}
+
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl NativeArchived for u32 {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl NativeArchived for u64 {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl<F: IsField> NativeArchived for FieldElement<F> where F::BaseType: NativeArchived {}
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+unsafe impl<T: NativeArchived, const N: usize> NativeArchived for [T; N] {}
+
+#[cfg(all(feature = "rkyv", target_endian = "little"))]
+impl<F: IsField> ArchivedFieldElement<F>
+where
+    F::BaseType: NativeArchived,
+{
+    /// Reinterpret this archived element as a native [`FieldElement`] (no copy).
+    ///
+    /// Sound on little-endian: see the module note above.
+    #[inline]
+    pub fn as_native(&self) -> &FieldElement<F> {
+        // SAFETY: identical size/align/bit-layout on little-endian.
+        unsafe { &*(self as *const Self as *const FieldElement<F>) }
+    }
+
+    /// Reinterpret a slice of archived elements as a slice of native
+    /// [`FieldElement`]s (no copy, no allocation).
+    #[inline]
+    pub fn slice_as_native(slice: &[Self]) -> &[FieldElement<F>] {
+        // SAFETY: element-wise identical layout on little-endian, so the slice
+        // (same length, same element stride) reinterprets directly.
+        unsafe {
+            core::slice::from_raw_parts(slice.as_ptr() as *const FieldElement<F>, slice.len())
+        }
+    }
+}

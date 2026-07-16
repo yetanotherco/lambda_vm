@@ -981,12 +981,29 @@ fn test_gz_pruning_reduces_next_row_openings() {
         "next-row OOD block must be pruned below the full width"
     );
 
-    // The pruned proof still verifies.
+    // The pruned proof still verifies (owned path).
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
     assert!(Verifier::multi_verify(
         &airs,
         &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    ));
+
+    // ...and through the rkyv-archived, read-in-place path — the same path the
+    // recursion guest uses. This exercises the new `trace_ood_next_evaluations`
+    // field's archival and the `StarkTableView::Archived` reads of the pruned
+    // next-row block, which the owned path above does not cover.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&multi_proof).unwrap();
+    let archived = rkyv::access::<
+        crate::proof::stark::ArchivedMultiProof<F, E, ()>,
+        rkyv::rancor::Error,
+    >(&bytes)
+    .unwrap();
+    assert!(Verifier::multi_verify_archived(
+        &airs,
+        &archived.proofs,
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     ));

@@ -61,17 +61,18 @@ use crate::test_utils::{
 
 // Re-exported for downstream hosts and verifier guests (e.g. the in-VM
 // recursion guest): `Commitment` is carried in the guest's private input
-// (see `recursion::GuestInput`); the proof-options types name the parameters
+// (see `GuestInput`); the proof-options types name the parameters
 // fixed at guest build time (`recursion::Preset`).
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
+use stark::proof::view::StarkProofView;
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
 /// Represents `count` contiguous pages starting at `base`, used for
 /// runtime-allocated memory (stack, heap) not covered by ELF segments.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RuntimePageRange {
     /// Base address of the first page (4KB-aligned).
     pub base: u64,
@@ -86,7 +87,7 @@ pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
@@ -158,7 +159,7 @@ impl TableCounts {
 
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
@@ -175,6 +176,232 @@ pub struct VmProof {
     /// These pages are NOT preprocessed — the verifier reconstructs them
     /// as non-preprocessed tables starting at `PRIVATE_INPUT_START_INDEX`.
     pub num_private_input_pages: usize,
+}
+
+/// The private-input bundle the recursion verifier guest consumes: an inner
+/// proof plus the DECODE/ELF-data-page commitments supplied instead of
+/// recomputed in-VM (see `bench_vs/lambda/recursion`), and the inner ELF bytes
+/// needed to reconstruct the AIRs and (via `statement::program_id_from_elf`)
+/// bind the supplied roots to a program identity.
+///
+/// Archived as one rkyv blob so the guest reads every field straight from the
+/// input buffer with no deserialization pass.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GuestInput {
+    pub vm_proof: VmProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+// ============================================================================
+// Recursion-input wire format: aligning magic prefix + rkyv archive
+// ============================================================================
+//
+// The guest reads the archive in place with naturally-aligned loads (archived
+// field elements are 8-aligned; we require 16 for headroom), and the executor
+// traps unaligned doubleword loads. The executor maps the private input as
+// `[u32 len][payload...]` with the payload at `PRIVATE_INPUT_START + 4`, which
+// is only 4-aligned. A fixed prefix pads the payload so the archive that
+// follows lands 16-aligned, and doubles as a magic + version tag the guest
+// validates before the unsafe access.
+
+/// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
+pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
+
+/// Wire-format version of the recursion input blob.
+pub const RECURSION_INPUT_VERSION: u32 = 1;
+
+/// Required alignment (bytes) of the archive's first byte in guest memory.
+pub const RECURSION_INPUT_ALIGN: usize = 16;
+
+/// Aligning prefix length: `magic(4) + version(4) + reserved(4) = 12` bytes,
+/// chosen so the archive starts 16-aligned given the executor's
+/// `PRIVATE_INPUT_START + 4` payload base. Asserted below.
+pub const RECURSION_INPUT_PREFIX_LEN: usize = 12;
+
+const _: () = {
+    let payload_base = (executor::vm::memory::PRIVATE_INPUT_START_INDEX as usize) + 4;
+    let pad =
+        (RECURSION_INPUT_ALIGN - (payload_base % RECURSION_INPUT_ALIGN)) % RECURSION_INPUT_ALIGN;
+    assert!(
+        RECURSION_INPUT_PREFIX_LEN == pad,
+        "prefix length must align the archive to RECURSION_INPUT_ALIGN given the private-input payload base",
+    );
+    assert!(
+        (payload_base + RECURSION_INPUT_PREFIX_LEN).is_multiple_of(RECURSION_INPUT_ALIGN),
+        "archive must start at a RECURSION_INPUT_ALIGN-aligned guest address",
+    );
+};
+
+/// Encode a [`GuestInput`] into the on-wire blob: a 12-byte
+/// `magic + version + reserved` prefix followed by the rkyv archive. The prefix
+/// both aligns the archive in guest memory (so in-place reads don't trap) and
+/// tags the format/version so the guest can validate before the unsafe access.
+pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
+/// Validate the wire prefix and return the archive bytes (zero-copy slice).
+/// Returns `None` if the magic or version doesn't match — the caller should
+/// halt cleanly rather than proceed into an `access_unchecked`.
+pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
+    if blob.len() < RECURSION_INPUT_PREFIX_LEN {
+        return None;
+    }
+    if blob[0..4] != RECURSION_INPUT_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+    if version != RECURSION_INPUT_VERSION {
+        return None;
+    }
+    Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
+}
+
+/// Result of a recursion-blob verification: the verdict plus the inner
+/// proof's committed public output (zero-copy from the blob), which the
+/// recursion guest folds into `program_id(...) ‖ public_output`.
+pub struct RecursionVerification<'a> {
+    /// Whether the inner proof verified.
+    pub ok: bool,
+    /// The inner proof's committed public output (zero-copy from the blob).
+    pub public_output: &'a [u8],
+    /// The inner ELF bytes (zero-copy from the blob).
+    pub inner_elf: &'a [u8],
+    /// The DECODE commitment supplied for the inner proof (zero-copy from the blob).
+    pub decode_commitment: Commitment,
+    /// The ELF-data-page commitments supplied for the inner proof (materialized —
+    /// small, bounded by the ELF's data-page count).
+    pub page_commitments: Vec<(u64, Commitment)>,
+    /// Full-ELF Keccak digest of `inner_elf`, computed once here — callers
+    /// folding a `program_id` (e.g. `recursion::verify_and_attest_blob`) reuse
+    /// it instead of re-hashing the whole ELF.
+    pub elf_digest: [u8; 32],
+    /// `inner_elf`'s entry point, from the same [`Elf::load`] used to verify —
+    /// callers folding a `program_id` reuse it instead of re-parsing the ELF.
+    pub entry_point: u64,
+}
+
+/// Verify a recursion-input blob produced by [`encode_recursion_input`].
+///
+/// `proof_options` is caller-supplied (never taken from the blob — an attacker
+/// could otherwise pick trivially weak options and have the guest accept as if
+/// a real proof had been checked; see `bench_vs/lambda/recursion`).
+///
+/// The archive is read **in place**: the STARK proof is verified straight from
+/// the blob with no deserialization and no per-field allocation. Only tiny
+/// metadata (table counts, page ranges, page commitments) is materialized.
+///
+/// `blob` is untrusted (prover-supplied) input, so the archive is
+/// bytecheck-validated (`rkyv::access`) before the zero-copy access — measured
+/// at ~0.26% of total guest cycles, cheap enough to not be worth skipping.
+pub fn verify_recursion_blob<'a>(
+    blob: &'a [u8],
+    proof_options: &ProofOptions,
+) -> Result<RecursionVerification<'a>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    // Validate + strip the aligning magic/version prefix. In the guest the
+    // returned slice starts at the 16-aligned archive base (the prefix exists
+    // precisely so the archive lands aligned at
+    // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
+    // loads do not trap.
+    let archive_bytes = recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+
+    // A host caller's buffer carries no alignment guarantee (`Vec<u8>` is
+    // align-1) — in-place access there would be UB. Fall back to one aligned
+    // copy when the base is misaligned; the guest path is aligned by
+    // construction and stays zero-copy.
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] = if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN)
+    {
+        archive_bytes
+    } else {
+        aligned_fallback.extend_from_slice(archive_bytes);
+        &aligned_fallback
+    };
+
+    // `blob` is untrusted; validate before the zero-copy access.
+    let archived = rkyv::access::<ArchivedGuestInput, RkyvError>(archive).map_err(|e| {
+        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
+    })?;
+
+    // Materialize only the small metadata; the proof stays in the buffer.
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.vm_proof.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: Vec<RuntimePageRange> = rkyv::deserialize::<
+        Vec<RuntimePageRange>,
+        RkyvError,
+    >(&archived.vm_proof.runtime_page_ranges)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let num_private_input_pages = archived.vm_proof.num_private_input_pages.to_native() as usize;
+    // Bytes read straight from the archived buffer (zero-copy).
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+    let public_output: &[u8] = archived.vm_proof.public_output.as_slice();
+    let decode_commitment: Commitment = archived.decode_commitment;
+
+    // Rebase the returned slices onto the caller's buffer: `archive` may be
+    // the aligned fallback copy, whose lifetime ends with this call. Same
+    // bytes at the same offsets in both buffers.
+    let rebase = |s: &[u8]| -> &'a [u8] {
+        let offset = s.as_ptr() as usize - archive.as_ptr() as usize;
+        &archive_bytes[offset..offset + s.len()]
+    };
+    let inner_elf_rebased = rebase(inner_elf);
+    let public_output_rebased = rebase(public_output);
+
+    // Single `Elf::load` and single full-ELF Keccak, shared between the
+    // statement absorb below and any `program_id` fold the caller does
+    // (`recursion::verify_and_attest_blob`) — see `RecursionVerification`.
+    let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(inner_elf);
+
+    let views: Vec<StarkProofView<F, E, ()>> = archived
+        .vm_proof
+        .proof
+        .proofs
+        .as_slice()
+        .iter()
+        .map(StarkProofView::Archived)
+        .collect();
+    let ok = verify_proof_parts(
+        &views,
+        &table_counts,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        &program,
+        &elf_digest,
+        proof_options,
+        Some(decode_commitment),
+        Some(&page_commitments),
+    )?;
+
+    Ok(RecursionVerification {
+        ok,
+        public_output: public_output_rebased,
+        inner_elf: inner_elf_rebased,
+        decode_commitment,
+        page_commitments,
+        elf_digest,
+        entry_point: program.entry_point,
+    })
 }
 
 /// Error type for the prover crate.
@@ -730,6 +957,38 @@ pub(crate) fn compute_expected_commit_bus_balance(
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
+/// View counterpart of [`replay_transcript_phase_a`]: replays Phase A over a
+/// proof view (owned or archived-in-place), with no `MultiProof`
+/// deserialization required either way.
+pub(crate) fn replay_transcript_phase_a_view(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: &[StarkProofView<F, E, ()>],
+    transcript: &mut DefaultTranscript<E>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    for (air, proof) in airs.iter().zip(proofs) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+        transcript.append_bytes(proof.lde_trace_main_merkle_root());
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// View counterpart of [`compute_expected_commit_bus_balance`]: operates on a
+/// proof view slice (owned or archived-in-place).
+pub(crate) fn compute_expected_commit_bus_balance_view(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: &[StarkProofView<F, E, ()>],
+    public_output_bytes: &[u8],
+    start_index: u64,
+    transcript: &mut DefaultTranscript<E>,
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
 /// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
 ///
 /// The final proof commits one local-to-global sub-table per epoch as its first
@@ -1030,7 +1289,7 @@ pub fn verify_with_options(
 
 /// [`verify_with_options`] with the ELF already parsed and digested. Callers
 /// that need the parsed ELF or the digest for other purposes reuse them — the
-/// recursion attestation (`recursion::verify_and_attest`) shares one
+/// recursion attestation (`recursion::verify_and_attest_blob`) shares one
 /// `Elf::load` and one full-ELF Keccak between verification and the
 /// `program_id` fold, which matters in-guest where both are expensive.
 pub(crate) fn verify_prepared(
@@ -1041,39 +1300,77 @@ pub(crate) fn verify_prepared(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
+    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
+        .proof
+        .proofs
+        .iter()
+        .map(StarkProofView::Owned)
+        .collect();
+
+    verify_proof_parts(
+        &views,
+        &vm_proof.table_counts,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+        &vm_proof.public_output,
+        program,
+        elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
+/// The single VM-proof verification implementation, given the proof's
+/// metadata fields plus an already-parsed ELF and its digest. Both
+/// [`verify_prepared`] (owned proof) and [`verify_recursion_blob`] (guest
+/// blob, zero-copy) funnel here, passing a [`StarkProofView`] slice over
+/// their respective (owned or archived) proof data — no serialization, no
+/// duplicated verification logic, and no repeated `Elf::load`/digest.
+#[allow(clippy::too_many_arguments)]
+fn verify_proof_parts(
+    proofs: &[StarkProofView<F, E, ()>],
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    num_private_input_pages: usize,
+    public_output: &[u8],
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
-    vm_proof.table_counts.validate()?;
+    table_counts.validate()?;
 
     // Bound num_private_input_pages before allocating PageConfigs — the tight honest
     // max, shared with the continuation verifier (see `page::max_private_input_pages`).
     {
         let max_pages = crate::tables::page::max_private_input_pages();
-        if vm_proof.num_private_input_pages > max_pages {
+        if num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
-                "num_private_input_pages ({}) exceeds max ({max_pages})",
-                vm_proof.num_private_input_pages,
+                "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",
             )));
         }
     }
 
     let page_configs = Traces::page_configs_from_elf_and_runtime(
         program,
-        &vm_proof.runtime_page_ranges,
-        vm_proof.num_private_input_pages,
+        runtime_page_ranges,
+        num_private_input_pages,
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
-    let expected_proof_count =
-        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected_proof_count != vm_proof.proof.proofs.len() {
+    let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    if expected_proof_count != proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
-            vm_proof.table_counts.total(),
+            table_counts.total(),
             page_configs.len(),
             expected_proof_count,
-            vm_proof.proof.proofs.len(),
+            proofs.len(),
         )));
     }
 
@@ -1082,7 +1379,7 @@ pub(crate) fn verify_prepared(
         proof_options,
         false,
         &page_configs,
-        &vm_proof.table_counts,
+        table_counts,
         decode_commitment,
         true,
         None,
@@ -1090,7 +1387,7 @@ pub(crate) fn verify_prepared(
         None,
     );
 
-    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // Recompute the COMMIT output bus offset from the public output.
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
@@ -1103,10 +1400,10 @@ pub(crate) fn verify_prepared(
         &mut transcript,
         StatementKind::Monolithic,
         elf_digest,
-        &vm_proof.public_output,
-        &vm_proof.table_counts,
-        vm_proof.num_private_input_pages,
-        &vm_proof.runtime_page_ranges,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
         proof_options.fri_final_poly_log_degree,
     );
 
@@ -1114,10 +1411,10 @@ pub(crate) fn verify_prepared(
     // independently of the multi_verify transcript, but both must start from
     // the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
-    let expected_bus_balance = match compute_expected_commit_bus_balance(
+    let expected_bus_balance = match compute_expected_commit_bus_balance_view(
         &air_refs,
-        &vm_proof.proof,
-        &vm_proof.public_output,
+        proofs,
+        public_output,
         // Monolithic proof: commits are indexed from 0.
         0,
         &mut transcript_for_replay,
@@ -1129,9 +1426,9 @@ pub(crate) fn verify_prepared(
     stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
     );
 
-    Ok(Verifier::multi_verify(
+    Ok(Verifier::multi_verify_views(
         &air_refs,
-        &vm_proof.proof,
+        proofs,
         &mut transcript,
         &expected_bus_balance,
     ))

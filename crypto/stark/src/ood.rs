@@ -118,34 +118,50 @@ pub fn split_ood_blocks<E: IsField>(
     (block0, block1)
 }
 
-/// Rebuild the full `num_eval_points x num_total_cols` OOD table from the two
-/// pruned proof blocks. Current-row rows come straight from `block0`; each
-/// next-row row scatters the masked values from `block1` into their columns and
-/// leaves every other column zero. Those zero entries are never read — no
-/// transition constraint references a pruned column at the next row, and DEEP
-/// skips them — so the reconstruction is exact where it matters.
+/// Rebuild the full `num_eval_points x width` OOD table from the two pruned
+/// proof blocks, given as row-major slices (a [`Table`]'s `row_major_data()` or a
+/// [`crate::proof::view::StarkTableView`]'s, so this stays decoupled from owned
+/// vs. rkyv-archived proofs). Current-row rows come straight from `current_block`;
+/// each next-row row scatters the masked values from `next_block` into their
+/// columns and leaves every other column zero. Those zero entries are never read
+/// — no transition constraint references a pruned column at the next row, and
+/// DEEP skips them — so the reconstruction is exact where it matters.
+///
+/// Reads are bounds-checked (`.get`): a malformed archive whose advertised
+/// dimensions disagree with its data length yields a zero-filled grid rather than
+/// a panic, and fails the downstream consistency checks instead.
 pub fn reconstruct_ood_full<E: IsField>(
-    block0: &Table<E>,
-    block1: &Table<E>,
+    current_block: &[FieldElement<E>],
+    width: usize,
+    next_block: &[FieldElement<E>],
     num_eval_points: usize,
     step_size: usize,
     next_row_cols: &[usize],
 ) -> Table<E> {
-    let w = block0.width;
-    let mut data = Vec::with_capacity(num_eval_points * w);
+    let mask_width = next_row_cols.len();
+    let mut data = Vec::with_capacity(num_eval_points * width);
 
     for r in 0..step_size {
-        data.extend_from_slice(block0.get_row(r));
+        for c in 0..width {
+            data.push(
+                current_block
+                    .get(r * width + c)
+                    .cloned()
+                    .unwrap_or_else(FieldElement::<E>::zero),
+            );
+        }
     }
 
     for r in step_size..num_eval_points {
-        let has_next = block1.width > 0 && (r - step_size) < block1.height;
-        for c in 0..w {
+        let next_row = r - step_size;
+        for c in 0..width {
             let mut val = FieldElement::<E>::zero();
-            if has_next {
+            if mask_width > 0 {
                 for (m, &mc) in next_row_cols.iter().enumerate() {
                     if mc == c {
-                        val = block1.get_row(r - step_size)[m].clone();
+                        if let Some(v) = next_block.get(next_row * mask_width + m) {
+                            val = v.clone();
+                        }
                         break;
                     }
                 }
@@ -154,7 +170,7 @@ pub fn reconstruct_ood_full<E: IsField>(
         }
     }
 
-    Table::new(data, w)
+    Table::new(data, width)
 }
 
 #[cfg(test)]
@@ -191,7 +207,14 @@ mod tests {
         assert_eq!((b1.width, b1.height), (1, 1));
         assert_eq!(b1.get_row(0)[0], fe(21)); // full[1][1]
 
-        let recon = reconstruct_ood_full(&b0, &b1, 2, step_size, &next_row_cols);
+        let recon = reconstruct_ood_full(
+            b0.row_major_data(),
+            b0.width,
+            b1.row_major_data(),
+            2,
+            step_size,
+            &next_row_cols,
+        );
         assert_eq!(recon.get_row(0), full.get_row(0)); // current row is exact
         assert_eq!(recon.get_row(1)[1], fe(21)); // survivor placed
         assert_eq!(recon.get_row(1)[0], Fe::zero()); // pruned -> zero
@@ -203,7 +226,7 @@ mod tests {
         let full = Table::new(vec![fe(10), fe(11), fe(20), fe(21)], 2);
         let (b0, b1) = split_ood_blocks(&full, 1, &[]);
         assert_eq!(b1.width, 0);
-        let recon = reconstruct_ood_full(&b0, &b1, 2, 1, &[]);
+        let recon = reconstruct_ood_full(b0.row_major_data(), b0.width, b1.row_major_data(), 2, 1, &[]);
         assert_eq!(recon.get_row(0), full.get_row(0));
         assert_eq!(recon.get_row(1), &[Fe::zero(), Fe::zero()]);
     }

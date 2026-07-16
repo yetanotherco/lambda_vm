@@ -8,7 +8,23 @@ use crate::{
     config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
 };
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+// The proof types below intentionally derive both serde and rkyv. rkyv is the
+// authoritative wire format (prover, CLI, recursion guest all use it); no
+// production path relies on serde. The serde derives are kept only for
+// `examples/examples_cli.rs` (bincode cross-version reference tool) and the
+// `serde_cbor` round-trip tests in `tests/prove_verify_roundtrip_tests.rs` and
+// `tests/bus_tests/completeness_tests.rs`. Do not add a production serde
+// dependency on these types.
+
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 /// Opening of a bit-reversed, row-paired commitment at one FRI query.
 ///
@@ -22,7 +38,15 @@ pub struct PolynomialOpenings<F: IsField> {
     pub evaluations_sym: Vec<FieldElement<F>>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
     pub composition_poly: PolynomialOpenings<E>,
@@ -35,7 +59,15 @@ pub struct DeepPolynomialOpening<F: IsSubFieldOf<E>, E: IsField> {
 
 pub type DeepPolynomialOpenings<F, E> = Vec<DeepPolynomialOpening<F, E>>;
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     // Length of the execution trace
@@ -82,7 +114,15 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 /// A collection of STARK proofs for multiple AIRs.
 /// Used for multi-table proving where tables are linked via bus (LogUp).
 /// Returned by `Prover::multi_prove` and verified by `Verifier::multi_verify`.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
