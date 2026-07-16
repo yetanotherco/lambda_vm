@@ -5,6 +5,10 @@
 The `ethrex_*.bin` files are rkyv-serialized `ethrex_guest_program::l1::ProgramInput`
 values consumed by the ethrex guest (`executor/programs/rust/ethrex`).
 
+The native-reference tests live in `tooling/ethrex-tests` (a detached
+workspace: ethrex pins rkyv `unaligned`, which must not feature-unify with the
+main workspace's aligned proof format).
+
 The ethrex guest, the native test reference, and the fixture generator are all
 pinned to the same ethrex revision (the open LambdaVM-backend PR branch, until it
 merges to `main`):
