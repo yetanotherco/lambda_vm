@@ -152,3 +152,16 @@ fn fext_fma_trace_shape() {
         assert_eq!(*trace.main_table.get(row, cols::MU), FE::zero());
     }
 }
+
+#[test]
+fn fext_fma_literal_fp3_vectors() {
+    // Hand-computed against the basis {1, w, w²} with w³ = 2, anchoring the Fp3
+    // reduction independently of the field implementation (the constraint tests
+    // above reuse the same `fma` helper, so a literal is a distinct check).
+    assert_eq!(fma([0, 1, 0], [0, 1, 0], [0, 0, 0]), [0, 0, 1]); // w · w = w²
+    assert_eq!(fma([0, 0, 1], [0, 1, 0], [0, 0, 0]), [2, 0, 0]); // w² · w = w³ = 2
+    assert_eq!(fma([0, 0, 1], [0, 0, 1], [0, 0, 0]), [0, 2, 0]); // w² · w² = w⁴ = 2w
+    assert_eq!(fma([1, 1, 0], [1, 1, 0], [0, 0, 0]), [1, 2, 1]); // (1 + w)² = 1 + 2w + w²
+    assert_eq!(fma([1, 1, 1], [0, 1, 0], [0, 0, 0]), [2, 1, 1]); // (1 + w + w²)·w = 2 + w + w²
+    assert_eq!(fma([0, 1, 0], [0, 1, 0], [5, 0, 0]), [5, 0, 1]); // w · w + 5
+}
