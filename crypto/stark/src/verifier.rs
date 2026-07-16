@@ -752,8 +752,9 @@ pub trait IsStarkVerifier<
         let mut deep_poly_evaluations_sym = Vec::with_capacity(num_queries);
 
         // Build the base-field LDE evaluations as concatenated slice (precomputed + main)
-        // without lifting to the extension field. The helper now subtracts directly via
-        // the F: IsSubFieldOf<E> Sub impl, so we avoid a per-query base->extension lift.
+        // without lifting to the extension field. The helper multiplies each base column
+        // straight into its extension-field coefficient via the F: IsSubFieldOf<E> Mul
+        // impl, so we avoid a per-query base->extension lift.
         let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
             .expect("verifier domain root_order is a valid power of two");
 
@@ -816,9 +817,9 @@ pub trait IsStarkVerifier<
 
     /// Reconstructs the deep composition polynomial evaluation at a query's
     /// point and its symmetric counterpart together. Rewriting the per-element
-    /// trace term `coeff*(base-ood)*denom` as `denom*(coeff*base - coeff*ood)`
+    /// trace term `coeff*(lde-ood)*denom` as `denom*(coeff*lde - coeff*ood)`
     /// isolates `coeff*ood` (identical for both points, hoisted into
-    /// `query_invariant_terms`) from `coeff*base` (per-point), so both points
+    /// `query_invariant_terms`) from `coeff*lde` (per-point), so both points
     /// share the OOD walk and a single batch-inverse for their denominators.
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluation_pair<'b>(
@@ -897,22 +898,22 @@ pub trait IsStarkVerifier<
         let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
         for row_idx in 0..ood_evaluations_table_height {
             let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
-            let mut base_row_sum = FieldElement::<FieldExtension>::zero();
-            let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
+            let mut lde_row_sum = FieldElement::<FieldExtension>::zero();
+            let mut lde_row_sum_sym = FieldElement::<FieldExtension>::zero();
             for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
                 let coeff = &coeff_col[row_idx];
                 if col_idx < num_base {
                     // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
-                    base_row_sum += base_at(col_idx) * coeff;
-                    base_row_sum_sym += base_at_sym(col_idx) * coeff;
+                    lde_row_sum += base_at(col_idx) * coeff;
+                    lde_row_sum_sym += base_at_sym(col_idx) * coeff;
                 } else {
                     let aux_idx = col_idx - num_base;
-                    base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                    base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                    lde_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
+                    lde_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
                 }
             }
-            trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
-            trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
+            trace_term += &denoms_trace[row_idx] * &(&lde_row_sum - ood_row_sum);
+            trace_term_sym += &denoms_trace_sym[row_idx] * &(&lde_row_sum_sym - ood_row_sum);
         }
 
         let number_of_parts = query_invariant_terms.number_of_parts;
