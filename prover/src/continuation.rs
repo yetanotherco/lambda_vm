@@ -67,6 +67,10 @@ use crate::tables::register;
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
+use crate::test_utils::{
+    create_fext_fma_air_forbidden, create_fext_load_air_forbidden, create_fext_page_air_forbidden,
+    create_fext_store_air_forbidden,
+};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
     compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
@@ -421,7 +425,7 @@ fn build_epoch_airs(
         register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     ));
-    VmAirs::new(
+    let mut airs = VmAirs::new(
         elf,
         opts,
         false,
@@ -432,7 +436,17 @@ fn build_epoch_airs(
         None,
         None,
         register_preprocessed,
-    )
+    );
+    // Continuation disallows the FEXT accelerator: field-storage is not carried
+    // across epochs, so a value written in one epoch would read back as zero in
+    // the next. Force the four FEXT tables empty (μ = 0) at the AIR level so the
+    // *verifier* rejects any continuation proof that uses them — the prover-side
+    // guard in `build_traces` does not bind a malicious prover.
+    airs.fext_load = Box::new(create_fext_load_air_forbidden(opts));
+    airs.fext_fma = Box::new(create_fext_fma_air_forbidden(opts));
+    airs.fext_store = Box::new(create_fext_store_air_forbidden(opts));
+    airs.fext_page = Box::new(create_fext_page_air_forbidden(opts));
+    airs
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from

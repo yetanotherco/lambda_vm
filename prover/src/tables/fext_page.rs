@@ -289,6 +289,12 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextPageConstraints
         let na1 = b.main(0, cols::NEXT_ADDR_1);
         let addr1_next = b.main(1, cols::ADDR_1);
         b.emit_base_rows(10, tr, na1 - addr1_next);
+
+        // sel_same is a bit on EVERY row, including the last (whose definition,
+        // idx 6, is exempt). Without this a prover could set the addr-LT
+        // multiplicity to -1 on the last row and cancel an invalid `addr < next`
+        // lookup elsewhere, re-introducing duplicate (domain, addr) keys.
+        emit_is_bit(b, 11, cols::SEL_SAME, None);
     }
 
     fn max_degree(&self) -> usize {

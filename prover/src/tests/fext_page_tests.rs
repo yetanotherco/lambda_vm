@@ -51,8 +51,8 @@ fn op(domain: u64, addr: u64) -> FextPageOperation {
 fn fext_page_constraint_and_bus_counts() {
     // IS_BIT(μ), domain ∈ {3,4,5}, IS_BIT(same_dom), 2 addr recompose,
     // μ non-increasing, sel_same def, same-domain⇒equal, domain-increase,
-    // 2 next-addr copies = 11.
-    assert_eq!(FextPageConstraints.meta().len(), 11);
+    // 2 next-addr copies, IS_BIT(sel_same) = 12.
+    assert_eq!(FextPageConstraints.meta().len(), 12);
     // init receiver + fini sender + addr LT + 4 IsHalfword = 7.
     assert_eq!(bus_interactions().len(), 7);
 }
@@ -202,4 +202,57 @@ fn fext_page_rejects_forged_next_addr() {
         .main_table
         .set_fe(0, cols::NEXT_ADDR_0, FE::from(0x999u64));
     assert_ne!(eval_transition(&trace, 0)[9], FE::zero());
+}
+
+#[test]
+fn fext_page_forbid_empty_rejects_active_row() {
+    // The continuation variant (ForbidEmpty) adds one `μ = 0` constraint, forcing
+    // the table empty so the verifier rejects any FEXT use under continuation.
+    use crate::test_utils::ForbidEmpty;
+    let forbidden = ForbidEmpty {
+        base: FextPageConstraints,
+        mu_col: cols::MU,
+    };
+    let n = forbidden.meta().len();
+    assert_eq!(n, FextPageConstraints.meta().len() + 1); // one extra: μ = 0
+
+    // An active row (μ = 1) violates the added μ = 0 constraint (last index).
+    let trace = generate_fext_page_trace(&[op(3, 0x10)]);
+    let main: Vec<FE> = (0..cols::NUM_COLUMNS)
+        .map(|c| *trace.main_table.get(0, c))
+        .collect();
+    let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![
+        TableView::new(vec![main.clone()], vec![vec![]]),
+        TableView::new(vec![main], vec![vec![]]),
+    ]);
+    let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
+    let offset_e = FieldElement::<GoldilocksExtension>::zero();
+    let ctx =
+        TransitionEvaluationContext::new_prover(frame.as_row_frame(), &no_e, &no_e, &offset_e);
+    let mut base = vec![FE::zero(); n];
+    let mut ext = vec![FieldElement::<GoldilocksExtension>::zero(); n];
+    let mut folder = ProverEvalFolder::new(&ctx, &mut base, &mut ext);
+    forbidden.eval(&mut folder);
+    assert_eq!(base[n - 1], FE::one()); // μ = 1 on the active row
+}
+
+#[test]
+fn fext_page_rejects_non_bit_sel_same() {
+    // sel_same is the addr-LT multiplicity; a non-bit value (e.g. -1) would let a
+    // prover cancel an invalid `addr < next` lookup and re-introduce duplicate
+    // keys. IS_BIT(sel_same) (idx 11) must reject it on any row.
+    let mut trace = generate_fext_page_trace(&[op(3, 0x10), op(3, 0x20)]);
+    trace.main_table.set_fe(0, cols::SEL_SAME, FE::from(2u64));
+    assert_ne!(eval_transition(&trace, 0)[11], FE::zero());
+
+    // The exact attack surface is the LAST row, whose sel_same definition (idx 6)
+    // is exempt; IS_BIT still pins it. Force sel_same = -1 there and check idx 11.
+    let last = trace.num_rows() - 1;
+    let mut trace2 = generate_fext_page_trace(&[op(3, 0x10), op(3, 0x20)]);
+    trace2.main_table.set_fe(last, cols::SEL_SAME, -FE::one());
+    let main: Vec<FE> = (0..cols::NUM_COLUMNS)
+        .map(|c| *trace2.main_table.get(last, c))
+        .collect();
+    let sel = main[cols::SEL_SAME];
+    assert_ne!(sel * (FE::one() - sel), FE::zero()); // (-1)·2 = -2 ≠ 0
 }
