@@ -42,6 +42,14 @@ pub trait AsBytes {
 
     /// Streams the byte representation to `sink` without heap-allocating a `Vec`.
     /// Default falls back to `as_bytes`; override for zero-allocation hashing/transcript hot paths.
+    ///
+    /// An override must stream exactly the bytes `as_bytes` would return, in
+    /// order; splitting them across several `sink` calls is fine, but the
+    /// concatenation must be identical. Merkle leaf hashes and the Fiat-Shamir
+    /// transcript take their input through here, so an override that disagrees
+    /// with `as_bytes` silently changes commitments and challenges rather than
+    /// failing to compile. `math/tests/stream_bytes_parity.rs` pins this for the
+    /// Goldilocks fields.
     fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
         sink(&self.as_bytes());
     }
