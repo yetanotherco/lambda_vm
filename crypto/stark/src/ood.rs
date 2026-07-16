@@ -159,21 +159,23 @@ pub fn reconstruct_ood_full<E: IsField>(
         }
     }
 
-    for r in step_size..num_eval_points {
-        let next_row = r - step_size;
-        for c in 0..width {
-            let mut val = FieldElement::<E>::zero();
-            if mask_width > 0 {
-                for (m, &mc) in next_row_cols.iter().enumerate() {
-                    if mc == c {
-                        if let Some(v) = next_block.get(next_row * mask_width + m) {
-                            val = v.clone();
-                        }
-                        break;
-                    }
-                }
+    // Zero-fill the next-row rows, then scatter the surviving masked values
+    // directly into their columns instead of scanning `next_row_cols` per
+    // cell. `.max` keeps the current-row block intact even if
+    // `num_eval_points < step_size` (defensive only: for a well-formed AIR
+    // `num_eval_points` is always a positive multiple of `step_size`).
+    data.resize(
+        data.len().max(num_eval_points * width),
+        FieldElement::<E>::zero(),
+    );
+    for next_row in 0..num_eval_points.saturating_sub(step_size) {
+        let row_base = (step_size + next_row) * width;
+        for (m, &mc) in next_row_cols.iter().enumerate() {
+            if mc < width
+                && let Some(v) = next_block.get(next_row * mask_width + m)
+            {
+                data[row_base + mc] = v.clone();
             }
-            data.push(val);
         }
     }
 
@@ -243,6 +245,28 @@ mod tests {
         );
         assert_eq!(recon.get_row(0), full.get_row(0));
         assert_eq!(recon.get_row(1), &[Fe::zero(), Fe::zero()]);
+    }
+
+    #[test]
+    fn out_of_range_next_row_col_is_ignored_not_panicking() {
+        // width = 3, but next_row_cols advertises column 5 -- out of range.
+        let current_block = vec![fe(1), fe(2), fe(3)];
+        let next_block = vec![fe(99)]; // would-be value for the bogus column
+        let recon = reconstruct_ood_full(&current_block, 3, &next_block, 2, 1, &[5]);
+        assert_eq!(recon.get_row(0), &[fe(1), fe(2), fe(3)]);
+        assert_eq!(recon.get_row(1), &[Fe::zero(), Fe::zero(), Fe::zero()]);
+    }
+
+    #[test]
+    fn short_next_block_leaves_missing_cells_zero_not_panicking() {
+        // width = 3, 3 eval points (step_size 1) => 2 next rows, mask = {0, 2}
+        // so the mask implies 4 next-row values, but next_block only has 1.
+        let current_block = vec![fe(1), fe(2), fe(3)];
+        let next_block = vec![fe(99)];
+        let recon = reconstruct_ood_full(&current_block, 3, &next_block, 3, 1, &[0, 2]);
+        assert_eq!(recon.get_row(0), &[fe(1), fe(2), fe(3)]);
+        assert_eq!(recon.get_row(1), &[fe(99), Fe::zero(), Fe::zero()]); // only present value scattered
+        assert_eq!(recon.get_row(2), &[Fe::zero(), Fe::zero(), Fe::zero()]); // fully missing -> zero
     }
 
     #[test]
