@@ -412,7 +412,11 @@ pub trait IsStarkVerifier<
         domain: &VerifierDomain<Field>,
     ) -> crate::fri::terminal::FriFoldLayout {
         let k = air.options().fri_final_poly_log_degree as u32;
-        let blowup_log = (domain.lde_length / domain.trace_length).trailing_zeros();
+        // blowup = lde_length / trace_length, both powers of two, so log2(blowup)
+        // is the difference of their trailing-zero counts — no integer division
+        // (a runtime divisor is a real `divu` on the recursion guest).
+        let blowup_log =
+            domain.lde_length.trailing_zeros() - domain.trace_length.trailing_zeros();
         crate::fri::terminal::FriFoldLayout::new(domain.lde_length.trailing_zeros(), blowup_log, k)
     }
 

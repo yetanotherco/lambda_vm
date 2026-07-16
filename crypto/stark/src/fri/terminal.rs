@@ -143,7 +143,10 @@ where
     );
 
     let poly = Polynomial::new(coeffs);
-    let blowup = codeword_len / coeffs.len();
+    // codeword_len and coeffs.len() are both powers of two (asserted above), so
+    // the blowup ratio is a shift by the difference of their trailing-zero counts
+    // — avoids a runtime-divisor `divu` on the verifier/recursion path.
+    let blowup = 1usize << (codeword_len.trailing_zeros() - coeffs.len().trailing_zeros());
 
     // Step 1: coset FFT to get natural-order evaluations.
     let mut natural =
