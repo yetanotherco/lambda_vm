@@ -13,8 +13,13 @@ use math::field::{
 use crate::examples::multi_table_lookup::{
     new_add_air_with_lookup, new_cpu_air_with_lookup, new_mul_air_with_lookup,
 };
+use crate::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, Multiplicity,
+    NullBoundaryConstraintBuilder, Packing,
+};
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
+use crate::table::Table;
 use crate::test_utils::{multi_prove_batched_ram, multi_prove_ram};
 use crate::trace::TraceTable;
 use crate::traits::AIR;
@@ -825,6 +830,459 @@ fn test_tampered_acc_ood_evaluation() {
         ),
         "Proof with corrupted acc OOD evaluation must be rejected"
     );
+}
+
+/// A proof whose OOD trace-evaluation table has the wrong shape is rejected.
+///
+/// The table's dimensions are a public function of the AIR (transition offsets
+/// x step_size rows, main+aux columns), so the verifier derives the expected
+/// shape from AIR metadata and refuses any proof whose table does not match --
+/// a malicious prover cannot reshape it (e.g. drop a column) to dodge a check.
+#[test_log::test]
+fn test_malformed_ood_table_shape_rejected() {
+    // Same valid trace as `test_tampered_acc_ood_evaluation`: CPU sends (5,3,8).
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Drop one column from the ADD table's OOD evaluations while keeping the
+    // table internally consistent (data length matches the new width), so the
+    // rejection is the AIR-shape guard, not an out-of-bounds panic.
+    let add_proof = &mut multi_proof.proofs[1];
+    let old = &add_proof.trace_ood_evaluations;
+    assert!(old.width >= 1, "OOD table must have at least one column");
+    let new_width = old.width - 1;
+    let mut new_data = Vec::with_capacity(new_width * old.height);
+    for row in 0..old.height {
+        let full = old.get_row(row);
+        new_data.extend_from_slice(&full[..new_width]);
+    }
+    add_proof.trace_ood_evaluations = Table::new(new_data, new_width);
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Proof with a wrong-shaped OOD table must be rejected"
+    );
+}
+
+/// A next-row (g·z) OOD block whose advertised dimensions disagree with its
+/// backing data must be rejected, not panic. Unlike the current-row block
+/// (`test_malformed_ood_table_shape_rejected`), the next-row block is absorbed
+/// into the transcript via `get_row` in Round 3 BEFORE step_2's own shape guard
+/// runs, so without a pre-absorption guard a lying shape is an out-of-bounds
+/// slice panic rather than a `false` verdict. Owned path.
+#[test_log::test]
+fn test_malformed_ood_next_block_shape_rejected_owned() {
+    // Same valid trace as `test_malformed_ood_table_shape_rejected`.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Forge the ADD table's next-row OOD block to advertise a far larger shape
+    // than its data backs (the canonical hostile archive: width/height huge, one
+    // data element). `get_row` would slice `data[0..width]` out of bounds during
+    // Round-3 absorption; the Phase A guard must reject before that.
+    let add_proof = &mut multi_proof.proofs[1];
+    assert!(
+        add_proof.trace_ood_next_evaluations.width >= 1,
+        "next-row OOD block must open at least one column for this to be an OOB test"
+    );
+    add_proof.trace_ood_next_evaluations.width = 1000;
+    add_proof.trace_ood_next_evaluations.height = 1000;
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify(
+            &airs,
+            &multi_proof,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Proof with a lying next-row OOD block shape must be rejected, not panic"
+    );
+}
+
+/// The same attack through the rkyv-archived, read-in-place path — the real
+/// attack surface, since the recursion guest verifies archived proofs.
+/// `ArchivedTable::get_row` is the same unchecked slice, and rkyv's bytecheck
+/// does NOT enforce `width * height == data.len()`, so a forged archive reaches
+/// absorption. The Phase A guard must reject it; it must never panic.
+#[test_log::test]
+fn test_malformed_ood_next_block_shape_rejected_archived() {
+    // Same valid trace as the owned variant above.
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let mut multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // Forge before serialization: rkyv archives `data` (by its real length),
+    // `width`, and `height` as independent fields, so a width/height that
+    // disagree with the data survive `to_bytes` and surface on the archived
+    // table exactly as a hostile prover would craft them.
+    multi_proof.proofs[1].trace_ood_next_evaluations.width = 1000;
+    multi_proof.proofs[1].trace_ood_next_evaluations.height = 1000;
+
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&multi_proof).unwrap();
+    let archived = rkyv::access::<
+        crate::proof::stark::ArchivedMultiProof<F, E, ()>,
+        rkyv::rancor::Error,
+    >(&bytes)
+    .unwrap();
+
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+
+    assert!(
+        !Verifier::multi_verify_archived(
+            &airs,
+            &archived.proofs,
+            &mut DefaultTranscript::<E>::new(&[]),
+            &FieldElement::zero(),
+        ),
+        "Archived proof with a lying next-row OOD block shape must be rejected, not panic"
+    );
+}
+
+/// The transition window (`trace_ood_next_row_columns`) of a LogUp table is
+/// exactly the accumulator column — the sole column read at the next row after
+/// forward accumulation — expressed as a full-width `[main | aux]` index.
+#[test_log::test]
+fn test_trace_ood_next_row_columns_is_accumulator_only() {
+    let proof_options = ProofOptions::default_test_options();
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let (main, aux) = add_air.trace_layout();
+
+    // All ADD interactions are absorbed, so the single aux column is the
+    // accumulator; its full-width index is `main + (aux - 1)`.
+    let next = add_air.trace_ood_next_row_columns();
+    assert_eq!(next, vec![main + (aux - 1)]);
+
+    // Every returned index addresses a real column within the concatenated width.
+    for &c in &next {
+        assert!(
+            c < main + aux,
+            "next-row column {c} out of width {main}+{aux}"
+        );
+    }
+}
+
+/// Cross-check an AIR's *declared* OOD transition window
+/// ([`AIR::trace_ood_next_row_columns`]) against the next-row read set
+/// *derived* from its captured constraint IR.
+///
+/// The window declaration is load-bearing for soundness: the verifier opens
+/// every trace column at `z`, but prunes the `g·z` (next-row) opening down to
+/// exactly the declared columns and reconstructs ZERO for every other column at
+/// the next row (see [`crate::ood`]). So a transition constraint that reads a
+/// next-row column the declaration omits is fed zero there — a silent
+/// soundness/completeness bug. The declaration is hand-synced to the LogUp
+/// accumulator and ignores the wrapped constraint set, so nothing but a test
+/// catches drift (the `debug_assert`s that would are compiled out under the
+/// `--release` test profile this repo uses).
+///
+/// Asserts, from the read set derived by
+/// [`crate::constraint_ir::ConstraintProgram::next_row_trace_reads`]:
+/// * `derived ⊆ declared` — the critical, soundness direction, checked for
+///   every AIR: a derived column missing from the declaration is the bug above.
+/// * exact equality when `exact` — every `AirWithBuses` should declare
+///   *precisely* the accumulator column (or nothing, with no interactions);
+///   over-declaration only bloats the proof, but for these AIRs the window is
+///   exactly known, so drift in either direction is a defect.
+fn assert_ood_window_matches_ir(
+    air: &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+    exact: bool,
+    label: &str,
+) {
+    let (main, aux) = air.trace_layout();
+
+    let mut declared = air.trace_ood_next_row_columns();
+    declared.sort_unstable();
+    declared.dedup();
+
+    // Derive the true next-row read set from the captured constraint program,
+    // which runs the wrapped constraint set AND the LogUp emission through one
+    // CaptureBuilder — so any next-row read a base constraint makes is included.
+    let derived = air.constraint_program().next_row_trace_reads(main);
+
+    for &c in &derived {
+        assert!(
+            c < main + aux,
+            "[{label}] derived next-row column {c} out of concatenated width {main}+{aux}"
+        );
+        assert!(
+            declared.contains(&c),
+            "[{label}] a transition constraint reads full-width column {c} at the next row, but \
+             it is absent from trace_ood_next_row_columns() = {declared:?}; the verifier prunes \
+             that g·z opening to ZERO — soundness bug"
+        );
+    }
+
+    if exact {
+        assert_eq!(
+            derived, declared,
+            "[{label}] declared next-row window {declared:?} is not exactly the IR-derived read \
+             set {derived:?}: over-declaration bloats every g·z opening"
+        );
+    }
+}
+
+/// Generic counterpart to the hardcoded single-AIR expectation above: for every
+/// `AirWithBuses` in the crate's examples, the declared OOD transition window
+/// equals the next-row read set derived from its captured constraint IR. Covers
+/// the structural shapes `split_interactions` can produce — 1 absorbed, 2
+/// absorbed, and a committed batched pair — so the hand-synced declaration is
+/// validated against the real IR rather than a copy of itself.
+#[test_log::test]
+fn test_trace_ood_next_row_window_matches_captured_ir() {
+    let opts = ProofOptions::default_test_options();
+
+    // The multi-table lookup example AIRs the bus tests exercise:
+    // CPU sends on two buses (2 absorbed interactions, 0 committed pairs);
+    // ADD / MUL each receive on one bus (1 absorbed interaction).
+    assert_ood_window_matches_ir(&new_cpu_air_with_lookup(&opts), true, "CPU");
+    assert_ood_window_matches_ir(&new_add_air_with_lookup(&opts), true, "ADD");
+    assert_ood_window_matches_ir(&new_mul_air_with_lookup(&opts), true, "MUL");
+
+    // A committed-pair layout: 3 interactions split into 1 batched pair + 1
+    // absorbed. The batched-term constraint reads only the current row, so the
+    // next-row window is still exactly the accumulator column — a case the three
+    // example AIRs (0 committed pairs) do not reach.
+    let committed = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
+        6,
+        AuxiliaryTraceBuildData {
+            interactions: vec![
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(0),
+                    Packing::Direct.columns(&[1]),
+                ),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(2),
+                    Packing::Direct.columns(&[3]),
+                ),
+                BusInteraction::sender(
+                    TEST_BUS,
+                    Multiplicity::Column(4),
+                    Packing::Direct.columns(&[5]),
+                ),
+            ],
+        },
+        &opts,
+        1,
+        EmptyConstraints,
+    );
+    assert_ood_window_matches_ir(&committed, true, "committed_pair");
+
+    // A bus-less AIR: no interactions => no LogUp accumulator => an empty
+    // next-row window, derived and declared alike.
+    let busless = AirWithBuses::<F, E, NullBoundaryConstraintBuilder, (), _>::new(
+        3,
+        AuxiliaryTraceBuildData {
+            interactions: vec![],
+        },
+        &opts,
+        1,
+        EmptyConstraints,
+    );
+    assert!(busless.trace_ood_next_row_columns().is_empty());
+    assert_ood_window_matches_ir(&busless, true, "busless");
+}
+
+/// The g·z pruning actually shrinks the proof: a LogUp table opens every column
+/// at z (the current-row block) but only the accumulator at the next row.
+#[test_log::test]
+fn test_gz_pruning_reduces_next_row_openings() {
+    let mut cpu_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // add_flag
+            vec![FE::zero(); 4],                                 // mul_flag
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+        ],
+        1,
+    );
+    let mut add_trace = TraceTable::from_columns_main(
+        vec![
+            vec![FE::from(5), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(3), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::from(8), FE::zero(), FE::zero(), FE::zero()],
+            vec![FE::one(), FE::zero(), FE::zero(), FE::zero()], // multiplicity = 1
+        ],
+        1,
+    );
+    let mut mul_trace = TraceTable::from_columns_main(vec![vec![FE::zero(); 4]; 4], 1);
+
+    let proof_options = ProofOptions::default_test_options();
+    let cpu_air = new_cpu_air_with_lookup(&proof_options);
+    let add_air = new_add_air_with_lookup(&proof_options);
+    let mul_air = new_mul_air_with_lookup(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>,
+        _,
+        _,
+    )> = vec![
+        (&cpu_air, &mut cpu_trace, &()),
+        (&add_air, &mut add_trace, &()),
+        (&mul_air, &mut mul_trace, &()),
+    ];
+
+    let multi_proof =
+        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+
+    // ADD table: 4 main + 1 aux (accumulator). The current-row block opens all
+    // columns; the next-row block opens only the accumulator.
+    let add_proof = &multi_proof.proofs[1];
+    let (main, aux) = add_air.trace_layout();
+    assert_eq!(add_proof.trace_ood_evaluations.width, main + aux);
+    assert_eq!(add_proof.trace_ood_next_evaluations.width, 1);
+    assert!(
+        add_proof.trace_ood_next_evaluations.width < add_proof.trace_ood_evaluations.width,
+        "next-row OOD block must be pruned below the full width"
+    );
+
+    // The pruned proof still verifies (owned path).
+    let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
+        vec![&cpu_air, &add_air, &mul_air];
+    assert!(Verifier::multi_verify(
+        &airs,
+        &multi_proof,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    ));
+
+    // ...and through the rkyv-archived, read-in-place path — the same path the
+    // recursion guest uses. This exercises the new `trace_ood_next_evaluations`
+    // field's archival and the `StarkTableView::Archived` reads of the pruned
+    // next-row block, which the owned path above does not cover.
+    let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&multi_proof).unwrap();
+    let archived = rkyv::access::<
+        crate::proof::stark::ArchivedMultiProof<F, E, ()>,
+        rkyv::rancor::Error,
+    >(&bytes)
+    .unwrap();
+    assert!(Verifier::multi_verify_archived(
+        &airs,
+        &archived.proofs,
+        &mut DefaultTranscript::<E>::new(&[]),
+        &FieldElement::zero(),
+    ));
 }
 
 // =============================================================================

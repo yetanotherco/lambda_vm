@@ -367,6 +367,17 @@ where
         }
     }
 
+    /// The pruned next-row (g·z) OOD block: only the transition-window columns
+    /// the AIR reads at the next row (empty when it reads none). Parallels
+    /// [`Self::trace_ood_evaluations`]; the verifier scatters these back into the
+    /// full grid via [`crate::ood::reconstruct_ood_full`].
+    pub fn trace_ood_next_evaluations(&self) -> StarkTableView<'a, E> {
+        match self {
+            Self::Owned(p) => StarkTableView::Owned(&p.trace_ood_next_evaluations),
+            Self::Archived(p) => StarkTableView::Archived(&p.trace_ood_next_evaluations),
+        }
+    }
+
     pub fn composition_poly_root(&self) -> &'a Commitment {
         match self {
             Self::Owned(p) => &p.composition_poly_root,
@@ -498,6 +509,7 @@ fn assert_stark_proof_view_is_exhaustive<F: IsSubFieldOf<E>, E: IsField, PI>(
         lde_trace_aux_merkle_root: _,
         lde_trace_precomputed_merkle_root: _,
         trace_ood_evaluations: _,
+        trace_ood_next_evaluations: _,
         composition_poly_root: _,
         composition_poly_parts_ood_evaluation: _,
         fri_layers_merkle_roots: _,
