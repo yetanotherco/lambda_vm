@@ -989,7 +989,7 @@ mod tests {
         let mut out = Vec::with_capacity(num_rows);
         for row in 0..num_rows {
             // Forward accumulation: acc[0] = 0, fold the current row afterwards.
-            out.push(acc.clone());
+            out.push(acc);
             let mut rs = FieldElement::<E>::zero();
             for c in cols {
                 rs = &rs + &c[row];
