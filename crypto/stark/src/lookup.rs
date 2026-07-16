@@ -2346,7 +2346,7 @@ mod logup_single_source_tests {
     //! (verifier) — all bit-for-bit.
     //!
     //! Coverage: the accumulated constraint's 1-absorbed AND 2-absorbed branches
-    //! (the latter reads `aux(1, ·)` next-row cells), the batched-term
+    //! (the latter folds two absorbed interactions, degree 3), the batched-term
     //! constraint, and every [`Packing`] variant's fingerprint contribution.
     use super::*;
     use crate::constraint_ir::{eval_program, eval_program_verifier};
