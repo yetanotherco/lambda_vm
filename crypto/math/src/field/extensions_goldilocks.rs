@@ -554,6 +554,17 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
     }
+
+    // One sink call over a stack buffer instead of three (one per limb): each
+    // sink call lands as its own `Digest::update` on the guest, and dyn dispatch
+    // here is fully devirtualized by the #[inline(always)] chain, so call count
+    // — not indirection — is the cost being cut.
+    #[inline(always)]
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        let mut buf = [0u8; 24];
+        ByteConversion::write_bytes_be(self, &mut buf);
+        sink(&buf);
+    }
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {

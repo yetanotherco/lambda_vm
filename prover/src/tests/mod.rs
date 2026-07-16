@@ -71,6 +71,8 @@ pub mod prove_elfs_tests;
 #[cfg(test)]
 pub mod recursion_smoke_test;
 #[cfg(test)]
+pub mod recursion_soundness_gap_poc;
+#[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]
 pub mod shift_tests;

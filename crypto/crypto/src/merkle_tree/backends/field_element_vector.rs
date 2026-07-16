@@ -39,8 +39,8 @@ where
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
         let mut hasher = D::new();
-        hasher.update(input[0].as_bytes());
-        hasher.update(input[1].as_bytes());
+        input[0].stream_bytes(&mut |b| hasher.update(b));
+        input[1].stream_bytes(&mut |b| hasher.update(b));
         let mut result_hash = [0_u8; NUM_BYTES];
         result_hash.copy_from_slice(&hasher.finalize());
         result_hash
@@ -88,6 +88,28 @@ where
     }
 }
 
+impl<F, D: Digest, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+    [u8; NUM_BYTES]: From<Output<D>>,
+{
+    /// Leaf-hash the concatenation of two field-element slices `a ‖ b` without
+    /// materializing it. Streams every element of `a` then every element of `b`
+    /// into the digest, so the result is byte-identical to
+    /// `hash_data(&[a, b].concat())`: the sponge absorbs the same element bytes
+    /// in the same order, just without the intermediate `Vec`.
+    pub fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        let mut hasher = D::new();
+        for element in a.iter().chain(b.iter()) {
+            element.stream_bytes(&mut |bytes| hasher.update(bytes));
+        }
+        let mut result_hash = [0_u8; NUM_BYTES];
+        result_hash.copy_from_slice(&hasher.finalize());
+        result_hash
+    }
+}
+
 impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where
@@ -100,13 +122,10 @@ where
     type Data = Vec<FieldElement<F>>;
 
     fn hash_data(input: &Vec<FieldElement<F>>) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        for element in input.iter() {
-            hasher.update(element.as_bytes());
-        }
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        // Delegate to the two-slice hash so the leaf-hash byte layout has a
+        // single source of truth: a plain leaf is the concatenation with an
+        // empty second slice.
+        Self::hash_data_from_slices(input, &[])
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {

@@ -99,8 +99,17 @@ jobs:
 
       - name: Run ignored executor tests
         run: |
-          cargo test --release -p executor test_ethrex -- --ignored
           cargo test --release -p executor test_ckzg -- --ignored
+
+      # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
+      # workspace (ethrex pins rkyv's `unaligned` feature, which must not
+      # feature-unify with the main workspace's aligned proof format), so run
+      # them from that directory to use its isolated Cargo.lock. The guest ELF
+      # and committed fixtures are already present from the steps above.
+      # --include-ignored also runs the heavier synthetic-block test.
+      - name: Run ethrex host-reference tests (detached workspace)
+        run: |
+          cd tooling/ethrex-tests && cargo test --release -- --include-ignored
 
   test-cli:
     name: CLI tests
@@ -329,6 +338,24 @@ jobs:
         if: steps.cache-rust-elfs.outputs.cache-hit != 'true'
         run: |
           make compile-programs-rust
+
+      - name: Cache compiled recursion guest ELF artifacts
+        id: cache-recursion-elfs
+        uses: actions/cache@v4
+        with:
+          path: executor/program_artifacts/recursion
+          key: recursion-elf-artifacts-${{ hashFiles('bench_vs/lambda/**', 'prover/src/**', 'prover/Cargo.toml', 'crypto/**/src/**', 'crypto/**/Cargo.toml', 'executor/src/**', 'executor/Cargo.toml', 'syscalls/**', 'executor/programs/riscv64im-lambda-vm-elf.json', 'Makefile') }}
+          restore-keys: |
+            recursion-elf-artifacts-
+
+      - name: Setup Rust Environment (recursion ELFs)
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true' && steps.cache-rust-elfs.outputs.cache-hit == 'true'
+        uses: ./.github/actions/setup-rust
+
+      - name: Compile recursion guest ELFs
+        if: steps.cache-recursion-elfs.outputs.cache-hit != 'true'
+        run: |
+          make compile-recursion-elfs
 
       - name: Install nextest
         uses: taiki-e/install-action@v2

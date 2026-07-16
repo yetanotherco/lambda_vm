@@ -39,6 +39,12 @@ pub trait ByteConversion {
 pub trait AsBytes {
     /// Default serialize without args
     fn as_bytes(&self) -> alloc::vec::Vec<u8>;
+
+    /// Streams the byte representation to `sink` without heap-allocating a `Vec`.
+    /// Default falls back to `as_bytes`; override for zero-allocation hashing/transcript hot paths.
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        sink(&self.as_bytes());
+    }
 }
 
 #[cfg(feature = "alloc")]
