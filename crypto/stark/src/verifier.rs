@@ -18,7 +18,7 @@ use crate::{
     table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
+use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -122,34 +122,23 @@ pub trait IsStarkVerifier<
             .collect::<Vec<usize>>()
     }
 
-    /// Checks whether the purported evaluations of the composition polynomial parts and the trace
-    /// polynomials at the out-of-domain challenge are consistent.
-    /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
-    fn step_2_verify_claimed_composition_polynomial(
+    /// Validate the two OOD trace-opening blocks' public shapes (soundness
+    /// invariant I3) and reconstruct the full current+next-row OOD grid once, so
+    /// steps 2 and 3 can share it instead of each rebuilding it. Returns the grid
+    /// plus the per-column next-row mask, or `None` on any shape mismatch — which
+    /// rejects the proof.
+    ///
+    /// Both block shapes are a public function of the AIR, never of the
+    /// (prover-controlled) proof: the current-row block opens every column over
+    /// `step_size` rows; the next-row block opens only the transition-window
+    /// columns over the remaining rows (and is empty when there are none). Any
+    /// mismatch (including an archive whose advertised dims disagree with its data
+    /// length) is rejected before either block is used, so a malicious prover
+    /// cannot reshape them to dodge a check or desync the frame reconstruction.
+    fn reconstruct_ood_grid(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
-        public_inputs: &PI,
-        domain: &VerifierDomain<Field>,
-        challenges: &Challenges<FieldExtension>,
-    ) -> bool {
-        crate::profile_markers::step_marker::<
-            { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
-        >();
-        let trace_length = proof.trace_length();
-        // Owned `BusPublicInputs` (just the table contribution L — one field
-        // element) reconstructed for the AIR boundary call.
-        let bus_public_inputs = proof
-            .bus_table_contribution()
-            .map(BusPublicInputs::from_contribution);
-
-        // Soundness (I3): both OOD blocks' shapes are a public function of the
-        // AIR, never of the (prover-controlled) proof. The current-row block
-        // opens every column over `step_size` rows; the next-row block opens only
-        // the transition-window columns over the remaining rows (and is empty
-        // when there are none). Reject any mismatch (including an archive whose
-        // advertised dims disagree with its data length) before using either
-        // block, so a malicious prover cannot reshape them to dodge a check or
-        // desync the frame reconstruction below.
+    ) -> Option<(Table<FieldExtension>, Vec<bool>)> {
         let step_size = air.step_size();
         let num_eval_points = air.context().transition_offsets.len() * step_size;
         let next_row_cols = air.trace_ood_next_row_columns();
@@ -167,11 +156,9 @@ pub trait IsStarkVerifier<
             || ood_next.height() != expected_next_height
             || !ood_next.dimensions_consistent()
         {
-            return false;
+            return None;
         }
 
-        // Reconstruct the full current+next-row OOD grid (surviving values placed,
-        // pruned next-row entries zero -- those are never read by any constraint).
         let ood_full = crate::ood::reconstruct_ood_full(
             ood_current.row_major_data(),
             ood_current.width(),
@@ -180,6 +167,36 @@ pub trait IsStarkVerifier<
             step_size,
             &next_row_cols,
         );
+        let next_row_flags = crate::ood::next_row_col_flags(ood_full.width, &next_row_cols);
+        Some((ood_full, next_row_flags))
+    }
+
+    /// Checks whether the purported evaluations of the composition polynomial parts and the trace
+    /// polynomials at the out-of-domain challenge are consistent.
+    /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
+    fn step_2_verify_claimed_composition_polynomial(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        public_inputs: &PI,
+        domain: &VerifierDomain<Field>,
+        challenges: &Challenges<FieldExtension>,
+        ood_full: &Table<FieldExtension>,
+    ) -> bool {
+        crate::profile_markers::step_marker::<
+            { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
+        >();
+        let trace_length = proof.trace_length();
+        // Owned `BusPublicInputs` (just the table contribution L — one field
+        // element) reconstructed for the AIR boundary call.
+        let bus_public_inputs = proof
+            .bus_table_contribution()
+            .map(BusPublicInputs::from_contribution);
+
+        // The full current+next-row OOD grid (surviving values placed, pruned
+        // next-row entries zero — never read by any constraint) is reconstructed
+        // once by the caller and shared with step 3; its shape was validated there.
+        // `step_size` sizes the transition frame below.
+        let step_size = air.step_size();
 
         let boundary_constraints = air.boundary_constraints(
             public_inputs,
@@ -229,10 +246,26 @@ pub trait IsStarkVerifier<
             })
             .unzip();
 
-        // A malformed proof can land `z` on a boundary step, making a denominator zero.
+        // Fold the transition zerofier's shared denominator (zᴺ − 1) into the same
+        // batch inverse as one trailing element: ~3 muls instead of a separate
+        // extension inversion (~70 base muls). The boundary sum below zips against
+        // the length-B num/coeff vectors, so this element only feeds
+        // `inv_zerofier_denominator`, popped back off right after inversion.
+        boundary_c_i_evaluations_den
+            .push(-FieldElement::<Field>::one() + challenges.z.pow(trace_length));
+
+        // A malformed proof can land `z` on a boundary step, or on the trace domain
+        // (zᴺ = 1) — either makes a denominator zero.
         if FieldElement::inplace_batch_inverse(&mut boundary_c_i_evaluations_den).is_err() {
             return false;
         }
+
+        // Trailing element is now 1/(zᴺ − 1), the transition zerofier factor shared
+        // by every transition constraint.
+        let inv_zerofier_denominator = match boundary_c_i_evaluations_den.pop() {
+            Some(inv) => inv,
+            None => return false,
+        };
 
         let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
             boundary_c_i_evaluations_num
@@ -279,7 +312,7 @@ pub trait IsStarkVerifier<
         // its transition-window columns; the zero-filled remainder is never read.
         // `into_frame` lives on the borrowed table view, so wrap the owned grid.
         let ood_frame =
-            StarkTableView::Owned(&ood_full).into_frame(num_main_trace_columns, step_size);
+            StarkTableView::Owned(ood_full).into_frame(num_main_trace_columns, step_size);
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
@@ -290,19 +323,12 @@ pub trait IsStarkVerifier<
             air.compute_transition(&transition_evaluation_context);
 
         // Every transition constraint's zerofier at z is 1/(zᴺ − 1) times an
-        // end-exemptions correction ∏(z − rᵢ) that depends only on the
-        // constraint's `end_exemptions`. 1/(zᴺ − 1) is shared by all of them, so
-        // compute it once, group the constraints by `end_exemptions` (a tiny set —
-        // almost always just {0}), accumulate Σ βᵢ·evalᵢ per group, then factor the
-        // shared inverse and each group's correction out of the sum. Replaces the
-        // previous per-constraint zᴺ power + extension inversion.
-        let inv_zerofier_denominator =
-            match (-FieldElement::<Field>::one() + challenges.z.pow(trace_length)).inv() {
-                Ok(inv) => inv,
-                // z lands on the trace domain (zᴺ = 1); an honest off-domain z never
-                // does. Reject rather than divide by zero.
-                Err(_) => return false,
-            };
+        // end-exemptions correction ∏(z − rᵢ) that depends only on the constraint's
+        // `end_exemptions`. 1/(zᴺ − 1) is shared by all of them (computed once,
+        // folded into the boundary batch inverse above), so we group the constraints
+        // by `end_exemptions` (a tiny set — almost always just {0}), accumulate
+        // Σ βᵢ·evalᵢ per group, then factor the shared inverse and each group's
+        // correction out of the sum.
 
         // Σ βᵢ·evalᵢ bucketed by end_exemptions. `constraints_meta` has one entry per
         // active transition constraint; a constraint absent from it contributed a
@@ -377,35 +403,38 @@ pub trait IsStarkVerifier<
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        ood_full: &Table<FieldExtension>,
+        next_row_flags: &[bool],
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
-        // g·z pruning: rebuild the full OOD grid from the two proof blocks so
-        // the DEEP reconstruction can skip pruned next-row openings.
+        // g·z pruning: the full OOD grid (reconstructed once by the caller) lets
+        // the DEEP reconstruction skip pruned next-row openings; `step_size`
+        // separates the current- and next-row blocks below.
         let step_size = air.step_size();
-        let num_eval_points = air.context().transition_offsets.len() * step_size;
-        let next_row_cols = air.trace_ood_next_row_columns();
-        let ood_current = proof.trace_ood_evaluations();
-        let ood_full = crate::ood::reconstruct_ood_full(
-            ood_current.row_major_data(),
-            ood_current.width(),
-            proof.trace_ood_next_evaluations().row_major_data(),
-            num_eval_points,
-            step_size,
-            &next_row_cols,
-        );
-        let next_row_flags = crate::ood::next_row_col_flags(ood_full.width, &next_row_cols);
+
+        // The Q primary FRI evaluation points, computed once (one `pow` each) and
+        // shared between the DEEP reconstruction and the FRI eval-point inverses
+        // below — previously each recomputed them, so the primary point was `pow`ed
+        // twice per query and the symmetric point a third time.
+        let query_points: Vec<FieldElement<Field>> = challenges
+            .iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
+            .collect();
+
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges,
                 domain,
                 proof,
-                &ood_full,
-                &next_row_flags,
+                ood_full,
+                next_row_flags,
                 step_size,
+                &query_points,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -452,12 +481,10 @@ pub trait IsStarkVerifier<
                 layout.terminal_len,
             );
 
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
-            .collect::<Vec<FieldElement<Field>>>();
+        // verify FRI. Reuse the primary evaluation points already computed for the
+        // DEEP reconstruction (same `query_challenge_to_evaluation_point(iota, false)`)
+        // rather than `pow`ing them a second time.
+        let mut evaluation_point_inverse = query_points;
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
@@ -631,17 +658,23 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
+        // The committed leaf is the ordered pair `(a, b)` of this layer's two
+        // folded evaluations. Hash it from the two element slices directly — no
+        // `vec![a, b]` allocation (see `verify_opening_pair` / `hash_data_from_slices`).
+        let (a, b) = if iota % 2 == 1 {
+            (evaluation_sym, evaluation)
         } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
+            (evaluation, evaluation_sym)
         };
-
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        let leaf_hash = BatchedMerkleTreeBackend::<FieldExtension>::hash_data_from_slices(
+            core::slice::from_ref(a),
+            core::slice::from_ref(b),
+        );
+        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<FieldExtension>>(
             auth_path_sym,
             merkle_root,
             iota >> 1,
-            &evaluations,
+            leaf_hash,
         )
     }
 
@@ -686,12 +719,10 @@ pub trait IsStarkVerifier<
                     .is_some_and(|t| p0_eval_sym == t);
         }
 
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
+        // The per-layer inverse points 𝜐^(-2ⁱ) are produced lazily and zipped into
+        // the fold below — no intermediate Vec. Take the first (𝜐⁻²) here, before
+        // `evaluation_point_inv` is consumed reconstructing p₁.
+        let first_layer_point_inv = evaluation_point_inv.square();
 
         // Reconstruct p₁(𝜐²)
         let mut v =
@@ -706,7 +737,10 @@ pub trait IsStarkVerifier<
         let openings_ok = fri_layers_merkle_roots
             .iter()
             .zip(fri_decommitment.layers_evaluations_sym())
-            .zip(evaluation_point_vec)
+            .zip(core::iter::successors(
+                Some(first_layer_point_inv),
+                |evaluation_point| Some(evaluation_point.square()),
+            ))
             .enumerate()
             .fold(
                 true,
@@ -752,6 +786,10 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_flags: &[bool],
         step_size: usize,
+        // The Q primary FRI evaluation points (`query_challenge_to_evaluation_point`
+        // with `sym = false`), computed once by the caller and shared with the FRI
+        // eval-point inverses. The symmetric point of each is its negation.
+        query_points: &[FieldElement<Field>],
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -766,15 +804,10 @@ pub trait IsStarkVerifier<
             return None;
         }
 
-        let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
-            .expect("verifier domain root_order is a valid power of two");
-
-        // Each query's DEEP terms divide by (evaluation_point − z·gᵏ) for the OOD
-        // rows and by (evaluation_point − z^parts) for the composition part. The
-        // z·gᵏ row points and z^parts are query-independent, so build them once and
-        // then collect every query point's denominators (primary + symmetric) into
-        // one vector and run a SINGLE batch inverse for the whole proof — instead of
-        // the previous two tiny per-query inversions (2·num_queries of them).
+        // z·gᵏ for the OOD rows and z^parts are query-independent, so build them
+        // once. g is already stored on the domain (`trace_primitive_root`); recomputing
+        // it via `get_primitive_root_of_unity` would repeat ~log2(N) squarings per table.
+        let primitive_root = &domain.trace_primitive_root;
         let ood_height = ood_full.height;
         let mut z_row_points = Vec::with_capacity(ood_height);
         let mut current_z = challenges.z.clone();
@@ -785,18 +818,21 @@ pub trait IsStarkVerifier<
         let number_of_parts = proof.composition_poly_parts_ood_evaluation().len();
         let z_pow_parts = challenges.z.pow(number_of_parts);
 
-        // Layout per query point: `ood_height` trace denominators then 1 composition
-        // denominator; points ordered [q0 primary, q0 sym, q1 primary, q1 sym, …].
+        // Collect every query point's denominators (primary + symmetric) for a SINGLE
+        // batch inverse over the whole proof (was two tiny per-query inversions). The
+        // symmetric point is the negation of the primary (`sym_index = primary_index +
+        // N/2` and `lde_root^(N/2) = −1`), so it needs no extra `pow`. Layout per query
+        // point: `ood_height` trace denominators then 1 composition denominator; points
+        // ordered [q0 primary, q0 sym, q1 primary, q1 sym, …].
         let stride = ood_height + 1;
         let mut denominators = Vec::with_capacity(2 * num_queries * stride);
-        for iota in challenges.iotas.iter() {
-            for is_sym in [false, true] {
-                let evaluation_point =
-                    Self::query_challenge_to_evaluation_point(*iota, is_sym, domain);
+        for primary in query_points {
+            let sym = -primary;
+            for evaluation_point in [primary, &sym] {
                 for z_row_point in &z_row_points {
-                    denominators.push(&evaluation_point - z_row_point);
+                    denominators.push(evaluation_point - z_row_point);
                 }
-                denominators.push(&evaluation_point - &z_pow_parts);
+                denominators.push(evaluation_point - &z_pow_parts);
             }
         }
         // One inversion for the whole proof's DEEP denominators. Fails closed if any
@@ -1503,12 +1539,25 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer2 = Instant::now();
 
+        // Reconstruct the shared current+next-row OOD grid once (with soundness-I3
+        // shape validation) and reuse it across steps 2 and 3 rather than rebuilding
+        // it in each.
+        let (ood_full, next_row_flags) = match Self::reconstruct_ood_grid(air, proof) {
+            Some(pair) => pair,
+            None => {
+                #[cfg(not(feature = "test_fiat_shamir"))]
+                error!("OOD trace opening shape mismatch");
+                return false;
+            }
+        };
+
         if !Self::step_2_verify_claimed_composition_polynomial(
             air,
             proof,
             public_inputs,
             &domain,
             &challenges,
+            &ood_full,
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
@@ -1524,7 +1573,7 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer3 = Instant::now();
 
-        if !Self::step_3_verify_fri(air, proof, &domain, &challenges) {
+        if !Self::step_3_verify_fri(air, proof, &domain, &challenges, &ood_full, &next_row_flags) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;
