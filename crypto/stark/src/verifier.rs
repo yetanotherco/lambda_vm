@@ -2036,19 +2036,29 @@ pub trait IsStarkVerifier<
             .iter()
             .map(Self::batched_synthetic_table_proof)
             .collect();
-        let table_challenges: Vec<Challenges<FieldExtension>> = (0..num_tables)
-            .map(|i| Challenges {
+        // Move (not clone) each table's per-table coefficient vectors into its
+        // `Challenges`; they are never read again after this. Only `z` (one field
+        // element) and the shared `rap_challenges` are cloned per table.
+        let table_challenges: Vec<Challenges<FieldExtension>> = itertools::izip!(
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            trace_term_coeffs_all,
+            gammas_all,
+        )
+        .map(
+            |(boundary_coeffs, transition_coeffs, trace_term_coeffs, gammas)| Challenges {
                 z: z.clone(),
-                boundary_coeffs: boundary_coeffs_all[i].clone(),
-                transition_coeffs: transition_coeffs_all[i].clone(),
-                trace_term_coeffs: trace_term_coeffs_all[i].clone(),
-                gammas: gammas_all[i].clone(),
+                boundary_coeffs,
+                transition_coeffs,
+                trace_term_coeffs,
+                gammas,
                 zetas: Vec::new(),
                 iotas: Vec::new(),
                 rap_challenges: lookup_challenges.clone(),
                 grinding_seed: [0u8; 32],
-            })
-            .collect();
+            },
+        )
+        .collect();
 
         // The full current+next-row OOD grid, reconstructed once per table from
         // the two pruned proof blocks and shared by step 2, the query-invariant
