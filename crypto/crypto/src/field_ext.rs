@@ -33,14 +33,55 @@ pub trait Fp3Fma: IsField + Sized {
     fn ext_mul(a: &FieldElement<Self>, b: &FieldElement<Self>) -> FieldElement<Self> {
         a * b
     }
+
+    /// A resident accumulator for `acc += a*b*c` chains. On the accelerated
+    /// guest it lives in field-storage across the chain (operands loaded, the
+    /// accumulator never stored/reloaded mid-chain), removing the per-op
+    /// LOAD/STORE roundtrip of [`Fp3Fma::fma`]. On host it is a plain field
+    /// element.
+    type ProdAcc;
+
+    /// A fresh zero accumulator.
+    fn prod_acc_new() -> Self::ProdAcc;
+
+    /// `acc += a * b * c`.
+    fn prod_acc_add(
+        acc: &mut Self::ProdAcc,
+        a: &FieldElement<Self>,
+        b: &FieldElement<Self>,
+        c: &FieldElement<Self>,
+    );
+
+    /// Materialize the accumulator as a field element.
+    fn prod_acc_finish(acc: Self::ProdAcc) -> FieldElement<Self>;
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 mod imp {
     use super::Fp3Fma;
+    use math::field::element::FieldElement;
     use math::field::traits::IsField;
 
-    impl<E: IsField> Fp3Fma for E {}
+    impl<E: IsField> Fp3Fma for E {
+        type ProdAcc = FieldElement<E>;
+
+        fn prod_acc_new() -> FieldElement<E> {
+            FieldElement::zero()
+        }
+
+        fn prod_acc_add(
+            acc: &mut FieldElement<E>,
+            a: &FieldElement<E>,
+            b: &FieldElement<E>,
+            c: &FieldElement<E>,
+        ) {
+            *acc = &*acc + &(a * b * c);
+        }
+
+        fn prod_acc_finish(acc: FieldElement<E>) -> FieldElement<E> {
+            acc
+        }
+    }
 }
 
 #[cfg(target_arch = "riscv64")]
@@ -60,6 +101,12 @@ mod imp {
     const H_C: u64 = BASE + 2;
     const H_OUT: u64 = BASE + 3;
     const H_ZERO: u64 = BASE + 4;
+    // ProdAcc scratch: `H_T` holds `a*b`; the accumulator ping-pongs between
+    // `H_ACC0`/`H_ACC1` so every emitted FMA has `out != c` (the executor's
+    // pairwise-distinct guard forbids in-place accumulation).
+    const H_T: u64 = BASE + 5;
+    const H_ACC0: u64 = BASE + 6;
+    const H_ACC1: u64 = BASE + 7;
 
     type Fp3 = Degree3GoldilocksExtensionField;
 
@@ -101,7 +148,50 @@ mod imp {
             fext_fma(H_A, H_B, H_ZERO, H_OUT);
             from_coeffs(fext_store(H_OUT))
         }
+
+        type ProdAcc = super::GuestAcc;
+
+        fn prod_acc_new() -> super::GuestAcc {
+            // Zero the starting handle: it may hold a stale value from a
+            // previous chain (uninitialized-reads-as-zero doesn't apply here).
+            fext_load(H_ACC0, &[0, 0, 0]);
+            super::GuestAcc { buf: 0 }
+        }
+
+        fn prod_acc_add(
+            acc: &mut super::GuestAcc,
+            a: &FieldElement<Fp3>,
+            b: &FieldElement<Fp3>,
+            c: &FieldElement<Fp3>,
+        ) {
+            fext_load(H_A, &coeffs(a));
+            fext_load(H_B, &coeffs(b));
+            fext_load(H_C, &coeffs(c));
+            // tmp = a * b
+            fext_fma(H_A, H_B, H_ZERO, H_T);
+            let (cur, alt) = if acc.buf == 0 {
+                (H_ACC0, H_ACC1)
+            } else {
+                (H_ACC1, H_ACC0)
+            };
+            // alt = tmp * c + cur   (out=alt != c=cur, satisfies the guard)
+            fext_fma(H_T, H_C, cur, alt);
+            acc.buf ^= 1;
+        }
+
+        fn prod_acc_finish(acc: super::GuestAcc) -> FieldElement<Fp3> {
+            let cur = if acc.buf == 0 { H_ACC0 } else { H_ACC1 };
+            from_coeffs(fext_store(cur))
+        }
     }
+}
+
+/// Guest resident-accumulator state: which of the two double-buffer handles
+/// currently holds the running `acc += a*b*c` value. (`buf` stays private; only
+/// this module's guest impl constructs and reads it.)
+#[cfg(target_arch = "riscv64")]
+pub struct GuestAcc {
+    buf: u8,
 }
 
 #[cfg(test)]

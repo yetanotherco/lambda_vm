@@ -735,22 +735,22 @@ pub trait IsStarkVerifier<
         let trace_term = (0..ood_evaluations_table_width)
             .zip(&challenges.trace_term_coeffs)
             .fold(FieldElement::zero(), |trace_terms, (col_idx, coeff_row)| {
-                let trace_i = (0..ood_evaluations_table_height).zip(coeff_row).fold(
-                    FieldElement::zero(),
-                    |trace_t, (row_idx, coeff)| {
-                        let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
-                        // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
-                        let diff: FieldElement<FieldExtension> = if col_idx < num_base {
-                            &lde_trace_base_evaluations[col_idx] - ood_val
-                        } else {
-                            &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
-                        };
-                        let poly_evaluation =
-                            FieldExtension::ext_mul(&diff, &denoms_trace[row_idx]);
-                        FieldExtension::fma(&poly_evaluation, coeff, &trace_t)
-                    },
-                );
-                trace_terms + trace_i
+                // Inner term is `sum_row (diff * denom) * coeff`; accumulate it
+                // in a resident accumulator (`acc += diff*denom*coeff`) so the
+                // accelerated backend keeps the running sum in field-storage
+                // across the fold instead of a LOAD/STORE per multiply.
+                let mut acc = FieldExtension::prod_acc_new();
+                for (row_idx, coeff) in (0..ood_evaluations_table_height).zip(coeff_row) {
+                    let ood_val = &proof.trace_ood_evaluations.get_row(row_idx)[col_idx];
+                    // Stay in base when we can: F: IsSubFieldOf<E> gives F - E -> E.
+                    let diff: FieldElement<FieldExtension> = if col_idx < num_base {
+                        &lde_trace_base_evaluations[col_idx] - ood_val
+                    } else {
+                        &lde_trace_aux_evaluations[col_idx - num_base] - ood_val
+                    };
+                    FieldExtension::prod_acc_add(&mut acc, &diff, &denoms_trace[row_idx], coeff);
+                }
+                trace_terms + FieldExtension::prod_acc_finish(acc)
             });
 
         let number_of_parts = lde_composition_poly_parts_evaluation.len();
