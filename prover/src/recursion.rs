@@ -20,9 +20,10 @@
 //!
 //! [`program_id`] deliberately does not fold the `ProofOptions`: the security
 //! level is pinned by which verifier guest the outer proof is checked against
-//! (`recursion-min.elf` vs `recursion-blowup2.elf`/`recursion-blowup8.elf`,
-//! fixed at build time — see [`Preset`]). A consumer must pin that outer ELF
-//! too, or a 1-query `min` attestation is indistinguishable from a 128-bit one.
+//! (`recursion-min.elf` vs `recursion-blowup2.elf`/`recursion-blowup4.elf`/
+//! `recursion-blowup8.elf`, fixed at build time — see [`Preset`]). A consumer
+//! must pin that outer ELF too, or a 1-query `min` attestation is
+//! indistinguishable from a 128-bit one.
 
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;

@@ -155,9 +155,22 @@ fn drive_executor(
     (total_cycles, start.elapsed())
 }
 
+/// The identity + output a correct in-VM run must commit — the profile
+/// tests' correctness oracle. Computed host-side (trustless recompute) before
+/// the guest runs, then checked against the guest's actual committed
+/// attestation once profiling finishes ([`run_profile_from`]). Mirrors the
+/// production consumer check ([`recursion::check_attestation`]) for the
+/// monolithic path, and its continuation analog
+/// ([`crate::continuation::continuation_precomputed_commitments`] +
+/// [`recursion::program_id_from_elf`]) for the continuation path.
+struct ExpectedAttestation {
+    id: [u8; 32],
+    output: Vec<u8>,
+}
+
 /// Shared preamble: build the blob (an `empty` inner proof under the preset's
 /// options), load the `recursion-<preset>.elf` verifier, and stand up an
-/// executor. Returns `(elf_bytes, program, executor)`.
+/// executor. Returns `(elf_bytes, program, executor, expected_attestation)`.
 fn setup_guest_run(
     label: &str,
     preset: Preset,
@@ -165,13 +178,20 @@ fn setup_guest_run(
     Vec<u8>,
     executor::elf::Elf,
     executor::vm::execution::Executor,
+    ExpectedAttestation,
 ) {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
     let guest_elf_bytes = read_guest_elf(&root, preset.artifact_stem());
 
-    let (_inner_proof, blob) =
+    let (inner_proof, blob) =
         prove_inner_and_encode_blob(label, &empty_elf_bytes, &[], &preset.options());
+
+    let expected = ExpectedAttestation {
+        id: recursion::expected_program_id(&empty_elf_bytes, &preset.options())
+            .expect("expected_program_id errored"),
+        output: inner_proof.public_output,
+    };
 
     let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
     assert_ne!(
@@ -182,7 +202,7 @@ fn setup_guest_run(
     );
     let executor =
         executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
-    (guest_elf_bytes, program, executor)
+    (guest_elf_bytes, program, executor, expected)
 }
 
 /// Read the ethrex guest ELF (built by `make executor/program_artifacts/rust/ethrex.elf`).
@@ -206,7 +226,8 @@ fn read_ethrex_fixture(root: &std::path::Path, txs: u32) -> Vec<u8> {
 /// on `inner_input` via continuations (`epoch_log2`-cycle epochs) and loads
 /// `recursion-cont-<preset>.elf` instead of the monolithic `recursion-<preset>.elf`
 /// — the realistic in-VM cost of verifying a real (multi-epoch) inner proof
-/// instead of the `empty`-program diagnostic floor.
+/// instead of the `empty`-program diagnostic floor. Returns
+/// `(elf_bytes, program, executor, expected_attestation)`.
 fn setup_continuation_guest_run(
     label: &str,
     preset: Preset,
@@ -217,6 +238,7 @@ fn setup_continuation_guest_run(
     Vec<u8>,
     executor::elf::Elf,
     executor::vm::execution::Executor,
+    ExpectedAttestation,
 ) {
     let root = workspace_root();
     let guest_elf_bytes = read_guest_elf(&root, &format!("recursion-cont-{}", preset.name()));
@@ -230,6 +252,26 @@ fn setup_continuation_guest_run(
         crate::continuation::prove_continuation(inner_elf_bytes, inner_input, epoch_log2, &opts)
             .expect("inner continuation prove should succeed");
     eprintln!("[{label}] continuation epochs: {}", bundle.num_epochs());
+
+    // Ground truth, computed on the bundle before `encode_continuation_guest_input`
+    // consumes it: a full trustless host verify (mirrors the monolithic pipeline's
+    // host `verify_with_options` check) for the expected output, plus the
+    // continuation analog of `check_attestation`'s recompute for the expected id.
+    let expected_output =
+        crate::continuation::verify_continuation(inner_elf_bytes, &bundle, &opts)
+            .expect("verify_continuation errored")
+            .expect("continuation bundle must verify on host before profiling the guest");
+    let (expected_decode, expected_pages) =
+        crate::continuation::continuation_precomputed_commitments(inner_elf_bytes, &bundle, &opts)
+            .expect("continuation_precomputed_commitments errored");
+    let expected_id =
+        recursion::program_id_from_elf(inner_elf_bytes, &expected_decode, &expected_pages)
+            .expect("program_id_from_elf errored");
+    let expected = ExpectedAttestation {
+        id: expected_id,
+        output: expected_output,
+    };
+
     let blob = recursion::encode_continuation_guest_input(bundle, inner_elf_bytes, &opts)
         .expect("recursion::encode_continuation_guest_input failed");
     eprintln!("[{label}] rkyv blob: {} bytes", blob.len());
@@ -243,7 +285,7 @@ fn setup_continuation_guest_run(
     );
     let executor =
         executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
-    (guest_elf_bytes, program, executor)
+    (guest_elf_bytes, program, executor, expected)
 }
 
 /// Demangled enclosing-function name for a PC via the ELF symbol table;
@@ -392,7 +434,7 @@ fn print_step_breakdown(buckets: &[u64; 7], total_cycles: u64) {
 /// with `detailed`, also the top-25 functions table (needs a `pc_hist`
 /// HashMap, so gated).
 fn run_profile(preset: Preset, progress_stride: usize, detailed: bool) {
-    let (guest_elf_bytes, program, executor) = setup_guest_run("profile", preset);
+    let (guest_elf_bytes, program, executor, expected) = setup_guest_run("profile", preset);
     run_profile_from(
         preset,
         &guest_elf_bytes,
@@ -400,6 +442,7 @@ fn run_profile(preset: Preset, progress_stride: usize, detailed: bool) {
         executor,
         progress_stride,
         detailed,
+        &expected,
     );
 }
 
@@ -415,7 +458,7 @@ fn run_profile_continuation(
     progress_stride: usize,
     detailed: bool,
 ) {
-    let (guest_elf_bytes, program, executor) = setup_continuation_guest_run(
+    let (guest_elf_bytes, program, executor, expected) = setup_continuation_guest_run(
         "profile-block",
         preset,
         inner_elf_bytes,
@@ -429,6 +472,7 @@ fn run_profile_continuation(
         executor,
         progress_stride,
         detailed,
+        &expected,
     );
 }
 
@@ -442,6 +486,7 @@ fn run_profile_from(
     mut executor: executor::vm::execution::Executor,
     progress_stride: usize,
     detailed: bool,
+    expected: &ExpectedAttestation,
 ) {
     use std::collections::HashMap;
 
@@ -498,6 +543,29 @@ fn run_profile_from(
             }
         },
     );
+
+    // Correctness, not just crash-freedom: read the guest's actual committed
+    // attestation and check it against the trusted host recompute
+    // (`expected`, built by `setup_guest_run`/`setup_continuation_guest_run`
+    // before the guest ran) — the same identity+output binding a production
+    // consumer checks via `check_attestation`/its continuation analog.
+    let committed = executor
+        .finish()
+        .expect("read committed output after execution")
+        .memory_values;
+    let (id, output) = recursion::split_attestation(&committed)
+        .expect("attestation too short (guest committed fewer than 32 bytes)");
+    assert_eq!(
+        id, expected.id,
+        "guest attestation program_id mismatch — in-VM verify accepted a different \
+         (ELF, roots) identity than the trusted host recompute"
+    );
+    assert_eq!(
+        output, expected.output.as_slice(),
+        "attested inner public output mismatch — the in-VM verify's committed output \
+         diverges from the trusted host recompute"
+    );
+    eprintln!("[profile] guest attestation matched the trusted host recompute (program_id + inner public output) ✓");
 
     eprintln!();
     eprintln!("============================================================");
@@ -787,7 +855,7 @@ fn test_recursion_execute_1query() {
 #[test]
 #[ignore = "slow: runs the in-VM STARK verifier (minutes on CI)"]
 fn test_recursion_step_markers_observed_in_order() {
-    let (_bytes, program, mut executor) = setup_guest_run("step-markers", Preset::Min);
+    let (_bytes, program, mut executor, _expected) = setup_guest_run("step-markers", Preset::Min);
     let instructions = executor::vm::execution::InstructionCache::new(&program.data)
         .expect("instruction cache build failed");
 

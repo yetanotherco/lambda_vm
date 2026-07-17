@@ -60,8 +60,13 @@ RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf
 # exactly one of its preset Cargo features at build time (fixes the inner
 # ProofOptions — see main.rs). Each preset builds its own distinctly named
 # [[bin]] (recursion-<preset>-bench) to its own artifact, via the
-# define/foreach/eval below rather than the generic %.elf pattern rule. The
-# distinct bin names also make the per-preset `cp`s race-free under `make -j`.
+# define/foreach/eval below rather than the generic %.elf pattern rule.
+# `required-features` on each [[bin]] is a subset match, not an exact-set
+# match, so e.g. `--features "continuation min"` (the cont-min build) also
+# satisfies plain `recursion-min-bench`'s `required-features = ["min"]` and
+# cargo builds it too — racing with a concurrent `make -j` job building
+# `recursion-min.elf` (`--features min`) to that same shared-target-dir path.
+# `--bin $(2)` in build_guest_elf pins each invocation to its one target bin.
 RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
 # Continuation-verifying variants (the guest's `continuation` feature): verify a
 # multi-epoch ContinuationProof bundle instead of a monolithic VmProof. Kept to
@@ -197,6 +202,7 @@ cd $(1) && \
 		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 		-Z build-std-features=compiler-builtins-mem \
 		-Z json-target-spec \
+		--bin $(2) \
 		$(3)
 cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$(2) $@
 endef
