@@ -1393,6 +1393,7 @@ pub trait IsStarkVerifier<
     }
 
     /// Verifies a single table after round 1 has been replayed.
+    #[inline(always)]
     fn verify_rounds_2_to_4(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
