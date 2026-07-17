@@ -215,10 +215,24 @@ pub const RECURSION_INPUT_VERSION: u32 = 1;
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
 
-/// Aligning prefix length: `magic(4) + version(4) + reserved(4) = 12` bytes,
-/// chosen so the archive starts 16-aligned given the executor's
+/// Aligning prefix length: `magic(4) + version(4) + kind(1) + reserved(3) = 12`
+/// bytes, chosen so the archive starts 16-aligned given the executor's
 /// `PRIVATE_INPUT_START + 4` payload base. Asserted below.
 pub const RECURSION_INPUT_PREFIX_LEN: usize = 12;
+
+/// Layout discriminator for the archive that follows the prefix, stored in the
+/// first byte of the prefix's former 4-byte reserved field (byte offset 8).
+/// Monolithic blobs carry [`RECURSION_INPUT_KIND_MONOLITHIC`]; continuation
+/// blobs carry [`RECURSION_INPUT_KIND_CONTINUATION`]. Each guest feature checks
+/// the byte at the prefix stage, so feeding a blob of the other layout fails
+/// deterministically instead of relying on the rkyv bytecheck happening to
+/// reject a differently-shaped archive. Blobs encoded before the kind byte was
+/// introduced have zeros there, which is exactly `KIND_MONOLITHIC`, so they
+/// remain valid.
+pub const RECURSION_INPUT_KIND_MONOLITHIC: u8 = 0;
+
+/// See [`RECURSION_INPUT_KIND_MONOLITHIC`].
+pub const RECURSION_INPUT_KIND_CONTINUATION: u8 = 1;
 
 const _: () = {
     let payload_base = (executor::vm::memory::PRIVATE_INPUT_START_INDEX as usize) + 4;
@@ -244,7 +258,7 @@ pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
     let mut blob = Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
     blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
     blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
-    blob.extend_from_slice(&[0u8; 4]); // reserved
+    blob.extend_from_slice(&[RECURSION_INPUT_KIND_MONOLITHIC, 0, 0, 0]); // kind + reserved
     debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
     blob.extend_from_slice(&archive);
     Ok(blob)
@@ -253,6 +267,8 @@ pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
 /// Validate the wire prefix and return the archive bytes (zero-copy slice).
 /// Returns `None` if the magic or version doesn't match — the caller should
 /// halt cleanly rather than proceed into an `access_unchecked`.
+/// Layout-agnostic: callers that know which archive shape they expect should
+/// prefer [`recursion_archive_bytes_for_kind`].
 pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
     if blob.len() < RECURSION_INPUT_PREFIX_LEN {
         return None;
@@ -265,6 +281,19 @@ pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
         return None;
     }
     Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
+}
+
+/// [`recursion_archive_bytes`] plus a layout-kind check: returns `None` unless
+/// the blob's kind byte (prefix byte 8) equals `expected_kind`. Lets each guest
+/// feature reject the other layout at the prefix stage — a continuation blob
+/// fed to the monolithic verifier (or vice versa) now fails here instead of
+/// inside the bytecheck of a differently-shaped archive.
+pub fn recursion_archive_bytes_for_kind(blob: &[u8], expected_kind: u8) -> Option<&[u8]> {
+    let archive = recursion_archive_bytes(blob)?;
+    if blob[8] != expected_kind {
+        return None;
+    }
+    Some(archive)
 }
 
 /// Result of a recursion-blob verification: the verdict plus the inner
@@ -315,8 +344,12 @@ pub fn verify_recursion_blob<'a>(
     // precisely so the archive lands aligned at
     // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
     // loads do not trap.
-    let archive_bytes = recursion_archive_bytes(blob)
-        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+    let archive_bytes = recursion_archive_bytes_for_kind(blob, RECURSION_INPUT_KIND_MONOLITHIC)
+        .ok_or_else(|| {
+            Error::Execution(String::from(
+                "recursion blob: bad magic, version, or layout kind",
+            ))
+        })?;
 
     // A host caller's buffer carries no alignment guarantee (`Vec<u8>` is
     // align-1) — in-place access there would be UB. Fall back to one aligned

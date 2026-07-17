@@ -1033,6 +1033,9 @@ pub fn verify_continuation(
 /// into the attestation's `program_id`, and the consumer's recompute+compare
 /// is what restores the binding. `None` = recompute from the ELF (the
 /// trustless host path).
+///
+/// KEEP IN SYNC with [`verify_continuation_archived`]: same validation, same
+/// order — see the note there.
 pub fn verify_continuation_with_roots(
     elf_bytes: &[u8],
     bundle: &ContinuationProof,
@@ -1170,6 +1173,12 @@ pub fn verify_continuation_with_roots(
 /// place via [`StarkProofView::Archived`] instead of deserializing an owned
 /// [`MultiProof`]. Only small per-epoch metadata is materialized. Roots are
 /// always supplied here (the guest never recomputes from the ELF in-VM).
+///
+/// KEEP IN SYNC with [`verify_continuation_with_roots`]: the two must apply
+/// the same validation in the same order (page-count bound, `reg_fini` length,
+/// per-epoch verify, page-base canonicalization + alignment, global verify,
+/// L2G binding). Any check added to one must be mirrored in the other — the
+/// archived path processes the same untrusted bundle fields.
 pub(crate) fn verify_continuation_archived(
     archived: &ArchivedContinuationProof,
     elf_bytes: &[u8],
