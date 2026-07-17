@@ -182,12 +182,15 @@ impl Memory {
                 .enumerate()
                 .map(move |(i, &b)| (addr + i as u64, b))
         });
-        let private_iter = self.private_input_pages.iter().flat_map(|(&page_idx, page)| {
-            let base = PRIVATE_INPUT_START_INDEX + page_idx * PRIVATE_INPUT_PAGE_SIZE as u64;
-            page.iter()
-                .enumerate()
-                .map(move |(i, &b)| (base + i as u64, b))
-        });
+        let private_iter = self
+            .private_input_pages
+            .iter()
+            .flat_map(|(&page_idx, page)| {
+                let base = PRIVATE_INPUT_START_INDEX + page_idx * PRIVATE_INPUT_PAGE_SIZE as u64;
+                page.iter()
+                    .enumerate()
+                    .map(move |(i, &b)| (base + i as u64, b))
+            });
         cells_iter.chain(private_iter)
     }
 
