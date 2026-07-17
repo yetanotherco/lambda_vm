@@ -65,7 +65,7 @@ use crate::statement::{
 };
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
-use crate::tables::register;
+use crate::tables::{decode, register};
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
@@ -414,6 +414,7 @@ fn build_epoch_airs(
     register_init: &[u32],
     reg_fini: &[u32],
     is_final: bool,
+    decode_commitment: Commitment,
 ) -> VmAirs {
     // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
     // final register file is a verifier-known public value bound by the REG-C2
@@ -429,7 +430,9 @@ fn build_epoch_airs(
         false,
         page_configs,
         table_counts,
-        None,
+        // Supplied by the caller, who computes it once per bundle: deriving it
+        // here would re-decode the ELF and re-commit the DECODE table per epoch.
+        Some(decode_commitment),
         is_final,
         None,
         None,
@@ -450,6 +453,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -482,6 +486,7 @@ fn prove_epoch(
         start.register_init,
         &reg_fini,
         is_final,
+        decode_commitment,
     );
 
     let label = start.label;
@@ -544,6 +549,7 @@ fn verify_epoch(
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> bool {
     // Reject degenerate table counts (mirrors the monolithic verifier).
     if epoch.table_counts.validate().is_err() {
@@ -571,6 +577,7 @@ fn verify_epoch(
         register_init,
         &epoch.reg_fini,
         is_final,
+        decode_commitment,
     );
     let l2g_air = l2g_memory_air(opts, label);
     let mut refs = airs.air_refs();
@@ -779,6 +786,11 @@ pub fn prove_continuation(
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
+    // The DECODE preprocessed commitment depends only on the ELF — compute it
+    // once here rather than re-deriving it per epoch inside `build_epoch_airs`.
+    let decode_commitment = decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Prover(format!("decode commitment: {e:?}")))?;
+
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
     let mut image = build_initial_image_paged(&elf, private_inputs);
@@ -864,7 +876,16 @@ pub fn prove_continuation(
             register_init: &register_init,
             label,
         };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        let epoch = prove_epoch(
+            &elf,
+            elf_bytes,
+            &start,
+            traces,
+            is_final,
+            &boundary,
+            opts,
+            decode_commitment,
+        )?;
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -946,6 +967,14 @@ pub fn verify_continuation(
     // hashed the entire ELF twice — once per seeded transcript).
     let elf_digest = crate::statement::elf_digest(elf_bytes);
 
+    // Same hoist for the DECODE preprocessed commitment: it depends only on the
+    // ELF, so derive it once instead of re-decoding and re-committing the
+    // DECODE table (a full column FFT batch + Merkle) on every epoch.
+    let decode_commitment = match decode::commitment_from_elf(&elf, opts) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
     let n = bundle.epochs.len();
     if n == 0 {
         return Ok(None);
@@ -980,6 +1009,7 @@ pub fn verify_continuation(
             is_final,
             label,
             opts,
+            decode_commitment,
         ) {
             return Ok(None);
         }
