@@ -18,6 +18,7 @@ use stark::lookup::{
 };
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
+use stark::proof::view::MultiProofView;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -537,7 +538,10 @@ fn test_l2g_binding_holds() {
     let final_proof = prove_global(&boundaries);
     let roots: Vec<Commitment> = boundaries.iter().map(|b| l2g_root(b)).collect();
 
-    assert!(crate::verify_l2g_commitment_binding(&roots, &final_proof));
+    assert!(crate::verify_l2g_commitment_binding_view(
+        &roots,
+        MultiProofView::Owned(&final_proof)
+    ));
 }
 
 #[test]
@@ -560,7 +564,10 @@ fn test_l2g_binding_rejects_mismatch() {
     tampered[0][0].fini.value = 999;
     let final_proof = prove_global(&tampered);
 
-    assert!(!crate::verify_l2g_commitment_binding(&roots, &final_proof));
+    assert!(!crate::verify_l2g_commitment_binding_view(
+        &roots,
+        MultiProofView::Owned(&final_proof)
+    ));
 }
 
 // =========================================================================

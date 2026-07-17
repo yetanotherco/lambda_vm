@@ -58,6 +58,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstra
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
+use stark::proof::view::MultiProofView;
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
 use stark::traits::AIR;
@@ -72,7 +73,7 @@ use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
+    compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding_view,
 };
 
 type F = GoldilocksField;
@@ -154,7 +155,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 /// Uses the `EmptyConstraints` set deliberately: the MU boolean (`MU·(1-MU)=0`), the
 /// column range checks, and the `init_epoch < fini_epoch` ordering are NOT
 /// re-asserted here. They are enforced once in the epoch proof's `l2g_memory_air`,
-/// and `verify_l2g_commitment_binding` ties this global L2G sub-table to the *same*
+/// and `verify_l2g_commitment_binding_view` ties this global L2G sub-table to the *same*
 /// committed trace (equal Merkle roots). So under collision resistance the trace the
 /// global bus runs over already satisfies all those constraints — do not add them
 /// here (it would be redundant, not a missing check).
@@ -405,7 +406,7 @@ struct EpochProof {
     /// register binding. x254 (commit index) rides along at address 508.
     reg_fini: Vec<u32>,
     /// The committed L2G table root, tied to the global proof by
-    /// [`verify_l2g_commitment_binding`].
+    /// [`verify_l2g_commitment_binding_view`].
     l2g_root: Commitment,
 }
 
@@ -443,6 +444,142 @@ impl ContinuationProof {
     /// Number of epochs the execution was split into.
     pub fn num_epochs(&self) -> usize {
         self.epochs.len()
+    }
+}
+
+/// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
+/// `verify_epoch` take a single argument again instead of the field-by-field
+/// parameter list the owned/archived split used to force on every caller:
+/// each accessor reads straight off whichever representation is behind it, a
+/// plain field copy on the owned side and (for the small metadata fields) an
+/// `rkyv::deserialize` on the archived side.
+#[derive(Clone, Copy)]
+enum EpochProofView<'a> {
+    Owned(&'a EpochProof),
+    Archived(&'a ArchivedEpochProof),
+}
+
+impl<'a> EpochProofView<'a> {
+    /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table
+    /// last), as a [`MultiProofView`] — never materialized into an owned
+    /// `MultiProof` on the archived side.
+    fn proof(&self) -> MultiProofView<'a, F, E, ()> {
+        match self {
+            Self::Owned(e) => MultiProofView::Owned(&e.proof),
+            Self::Archived(e) => MultiProofView::Archived(&e.proof),
+        }
+    }
+
+    /// Bytes this epoch committed (zero-copy borrow either way).
+    fn public_output(&self) -> &'a [u8] {
+        match self {
+            Self::Owned(e) => &e.public_output,
+            Self::Archived(e) => e.public_output.as_slice(),
+        }
+    }
+
+    fn table_counts(&self) -> Result<TableCounts, Error> {
+        match self {
+            Self::Owned(e) => Ok(e.table_counts.clone()),
+            Self::Archived(e) => {
+                rkyv::deserialize::<TableCounts, rkyv::rancor::Error>(&e.table_counts).map_err(
+                    |err| Error::Execution(format!("rkyv deserialize table_counts failed: {err}")),
+                )
+            }
+        }
+    }
+
+    /// Always empty for continuation epochs (PAGE is skipped); still routed
+    /// through the archive rather than assumed, so a malformed non-empty
+    /// bundle value surfaces instead of being silently ignored.
+    fn runtime_page_ranges(&self) -> Result<Vec<RuntimePageRange>, Error> {
+        match self {
+            Self::Owned(e) => Ok(e.runtime_page_ranges.clone()),
+            Self::Archived(e) => rkyv::deserialize::<Vec<RuntimePageRange>, rkyv::rancor::Error>(
+                &e.runtime_page_ranges,
+            )
+            .map_err(|err| Error::Execution(format!("rkyv deserialize page ranges failed: {err}"))),
+        }
+    }
+
+    /// Length of `reg_fini` without materializing it — used for the
+    /// up-front malformed-bundle check, which only needs the count.
+    fn reg_fini_len(&self) -> usize {
+        match self {
+            Self::Owned(e) => e.reg_fini.len(),
+            Self::Archived(e) => e.reg_fini.len(),
+        }
+    }
+
+    fn reg_fini(&self) -> Result<Vec<u32>, Error> {
+        match self {
+            Self::Owned(e) => Ok(e.reg_fini.clone()),
+            Self::Archived(e) => rkyv::deserialize::<Vec<u32>, rkyv::rancor::Error>(&e.reg_fini)
+                .map_err(|err| {
+                    Error::Execution(format!("rkyv deserialize reg_fini failed: {err}"))
+                }),
+        }
+    }
+
+    fn l2g_root(&self) -> Commitment {
+        match self {
+            Self::Owned(e) => e.l2g_root,
+            Self::Archived(e) => e.l2g_root,
+        }
+    }
+}
+
+/// Borrowed view over a [`ContinuationProof`] (owned or archived-in-place),
+/// mirroring [`EpochProofView`] one level up. Lets
+/// [`verify_continuation_with_roots`] and [`verify_continuation_archived`]
+/// share one implementation ([`verify_continuation_view`]) instead of two
+/// near-duplicate ~130-line bodies.
+#[derive(Clone, Copy)]
+enum ContinuationProofView<'a> {
+    Owned(&'a ContinuationProof),
+    Archived(&'a ArchivedContinuationProof),
+}
+
+impl<'a> ContinuationProofView<'a> {
+    fn num_epochs(&self) -> usize {
+        match self {
+            Self::Owned(c) => c.epochs.len(),
+            Self::Archived(c) => c.epochs.len(),
+        }
+    }
+
+    fn epoch(&self, i: usize) -> EpochProofView<'a> {
+        match self {
+            Self::Owned(c) => EpochProofView::Owned(&c.epochs[i]),
+            Self::Archived(c) => EpochProofView::Archived(&c.epochs.as_slice()[i]),
+        }
+    }
+
+    fn epochs(&self) -> impl Iterator<Item = EpochProofView<'a>> {
+        let this = *self;
+        (0..this.num_epochs()).map(move |i| this.epoch(i))
+    }
+
+    /// The one cross-epoch global-memory proof, as a [`MultiProofView`].
+    fn global(&self) -> MultiProofView<'a, F, E, ()> {
+        match self {
+            Self::Owned(c) => MultiProofView::Owned(&c.global),
+            Self::Archived(c) => MultiProofView::Archived(&c.global),
+        }
+    }
+
+    fn num_private_input_pages(&self) -> usize {
+        match self {
+            Self::Owned(c) => c.num_private_input_pages,
+            Self::Archived(c) => c.num_private_input_pages.to_native() as usize,
+        }
+    }
+
+    fn touched_page_bases(&self) -> Vec<u64> {
+        match self {
+            Self::Owned(c) => c.touched_page_bases.clone(),
+            Self::Archived(c) => c.touched_page_bases.iter().map(|v| v.to_native()).collect(),
+        }
     }
 }
 
@@ -579,28 +716,33 @@ fn prove_epoch(
     })
 }
 
-/// Verify one epoch using ONLY the [`EpochProof`] bundle plus the verifier-derived
-/// `register_init` (epoch 0: from the ELF; epoch i>0: from the previous epoch's
-/// `reg_fini`), `is_final`, and `label`. Rebuilds the AIRs and transcript
-/// from the bundle's statement values and indexes commits from the carried x254
-/// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is skipped for
-/// continuation epochs, so the AIRs are built with no page configs (the bundle does
-/// not get to supply any). Returns `true` iff the proof verifies and its committed
-/// L2G root matches the claimed one.
+/// Verify one epoch using ONLY the epoch's public statement fields (via
+/// [`EpochProofView`]) plus the verifier-derived `register_init` (epoch 0:
+/// from the ELF; epoch i>0: from the previous epoch's `reg_fini`), `is_final`,
+/// and `label`. Rebuilds the AIRs and transcript from the bundle's statement
+/// values and indexes commits from the carried x254
+/// (`register_init[X254_INDEX]`), never from the prover's memory. PAGE is
+/// skipped for continuation epochs, so the AIRs are built with no page configs
+/// (the bundle does not get to supply any). Returns `Ok(true)` iff the proof
+/// verifies and its committed L2G root matches the claimed one; `Err` iff a
+/// small metadata field failed to materialize off an archived bundle.
+///
+/// `epoch` is zero-copy either way: owned or archived (see the two callers).
 #[allow(clippy::too_many_arguments)]
 fn verify_epoch(
     elf: &Elf,
     elf_bytes: &[u8],
-    epoch: &EpochProof,
+    epoch: EpochProofView<'_>,
     register_init: &[u32],
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
-) -> bool {
+) -> Result<bool, Error> {
+    let table_counts = epoch.table_counts()?;
     // Reject degenerate table counts (mirrors the monolithic verifier).
-    if epoch.table_counts.validate().is_err() {
-        return false;
+    if table_counts.validate().is_err() {
+        return Ok(false);
     }
 
     // Cross-check table_counts before building AIRs from bundle data. Continuation
@@ -611,18 +753,23 @@ fn verify_epoch(
     } else {
         FIXED_TABLE_COUNT - 1
     };
-    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 1;
-    if expected_proof_count != epoch.proof.proofs.len() {
-        return false;
+    let proof = epoch.proof();
+    let expected_proof_count = table_counts.total() + fixed_tables + 1;
+    if expected_proof_count != proof.len() {
+        return Ok(false);
     }
+
+    let reg_fini = epoch.reg_fini()?;
+    let runtime_page_ranges = epoch.runtime_page_ranges()?;
+    let public_output = epoch.public_output();
 
     let airs = build_epoch_airs(
         elf,
         opts,
         &[],
-        &epoch.table_counts,
+        &table_counts,
         register_init,
-        &epoch.reg_fini,
+        &reg_fini,
         is_final,
         decode_commitment,
     );
@@ -633,9 +780,9 @@ fn verify_epoch(
     let seed = || {
         epoch_transcript(
             elf_bytes,
-            &epoch.public_output,
-            &epoch.table_counts,
-            &epoch.runtime_page_ranges,
+            public_output,
+            &table_counts,
+            &runtime_page_ranges,
             label,
             opts.fri_final_poly_log_degree,
         )
@@ -648,29 +795,24 @@ fn verify_epoch(
         .copied()
         .unwrap_or(0) as u64;
 
-    let expected = match compute_expected_commit_bus_balance(
+    let expected = match compute_expected_commit_bus_balance_view(
         &refs,
-        &epoch.proof,
-        &epoch.public_output,
+        proof,
+        public_output,
         commit_start_index,
         &mut seed(),
     ) {
         Some(expected) => expected,
-        None => return false,
+        None => return Ok(false),
     };
 
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
-        return false;
+    if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+        return Ok(false);
     }
 
     // The claimed L2G root must be the one this proof actually committed (it is what
-    // verify_l2g_commitment_binding later ties to the global proof).
-    epoch
-        .proof
-        .proofs
-        .last()
-        .map(|p| p.lde_trace_main_merkle_root)
-        == Some(epoch.l2g_root)
+    // verify_l2g_commitment_binding_view later ties to the global proof).
+    Ok(proof.last().map(|p| *p.lde_trace_main_merkle_root()) == Some(epoch.l2g_root()))
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -755,7 +897,7 @@ fn prove_global(
 fn verify_global(
     num_epochs: usize,
     page_bases: &[u64],
-    proof: &MultiProof<F, E, ()>,
+    proof: MultiProofView<'_, F, E, ()>,
     elf: &Elf,
     elf_bytes: &[u8],
     num_private_input_pages: usize,
@@ -823,7 +965,7 @@ fn verify_global(
         refs.push(air as AirRef);
     }
 
-    Verifier::multi_verify(
+    Verifier::multi_verify_views(
         &refs,
         proof,
         &mut global_transcript(
@@ -1037,22 +1179,68 @@ pub fn verify_continuation_with_roots(
     decode_commitment: Option<Commitment>,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<Option<Vec<u8>>, Error> {
+    let result = verify_continuation_view(
+        ContinuationProofView::Owned(bundle),
+        elf_bytes,
+        opts,
+        decode_commitment,
+        page_genesis_commitments,
+    )?;
+    Ok(result.map(|(public_output, _entry_point)| public_output))
+}
+
+/// [`verify_continuation_with_roots`]'s zero-copy counterpart, for the
+/// recursion `continuation` guest: reads every per-epoch/global proof in
+/// place via [`ContinuationProofView::Archived`] instead of deserializing an
+/// owned [`MultiProof`]. Only small per-epoch metadata is materialized. Roots
+/// are always supplied here (the guest never recomputes from the ELF in-VM).
+///
+/// Also returns `entry_point` so callers can fold a `program_id` via
+/// [`crate::recursion::program_id_from_digest`] without a second `Elf::load`.
+pub(crate) fn verify_continuation_archived(
+    archived: &ArchivedContinuationProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    decode_commitment: Commitment,
+    page_genesis_commitments: &[(u64, Commitment)],
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
+    verify_continuation_view(
+        ContinuationProofView::Archived(archived),
+        elf_bytes,
+        opts,
+        Some(decode_commitment),
+        Some(page_genesis_commitments),
+    )
+}
+
+/// Shared implementation behind [`verify_continuation_with_roots`] (owned) and
+/// [`verify_continuation_archived`] (archived), operating on a
+/// [`ContinuationProofView`] rather than either's concrete type — the same
+/// split [`crate::verify_recursion_blob`] uses for the monolithic path.
+/// Returns the public output plus `entry_point` (see [`verify_continuation_archived`]).
+fn verify_continuation_view(
+    bundle: ContinuationProofView<'_>,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_genesis_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
     // Bound the claimed private-input page count before using it to size/allocate AIRs
     // (mirrors `verify_with_options`). The count is also bound into the global proof's
     // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
     // diverges the verifier's challenges and `verify_global`'s `multi_verify` rejects —
     // on top of the committed-AIR-shape mismatch a wrong count causes on a touched page.
     let max_private_input_pages = page::max_private_input_pages();
-    if bundle.num_private_input_pages > max_private_input_pages {
+    let num_private_input_pages = bundle.num_private_input_pages();
+    if num_private_input_pages > max_private_input_pages {
         return Err(Error::InvalidTableCounts(format!(
-            "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
-            bundle.num_private_input_pages
+            "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_private_input_pages})",
         )));
     }
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
-    let n = bundle.epochs.len();
+    let n = bundle.num_epochs();
     if n == 0 {
         return Ok(None);
     }
@@ -1060,11 +1248,11 @@ pub fn verify_continuation_with_roots(
     // Reject a malformed bundle up front. `reg_fini` is prover-supplied (deserialized,
     // untrusted) and is indexed by `NUM_REGISTER_ADDRESSES` when building each epoch's
     // preprocessed REGISTER commitment, so a wrong length would otherwise panic the
-    // verifier instead of cleanly rejecting the proof.
+    // verifier instead of cleanly rejecting the proof. Only the length is read here
+    // (no materialization) — the values are only needed once we actually verify.
     if bundle
-        .epochs
-        .iter()
-        .any(|e| e.reg_fini.len() != register::NUM_REGISTER_ADDRESSES)
+        .epochs()
+        .any(|e| e.reg_fini_len() != register::NUM_REGISTER_ADDRESSES)
     {
         return Ok(None);
     }
@@ -1074,9 +1262,11 @@ pub fn verify_continuation_with_roots(
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
-    for (index, epoch) in bundle.epochs.iter().enumerate() {
+    for (index, epoch) in bundle.epochs().enumerate() {
         let is_final = index == n - 1;
         let label = local_to_global::epoch_label(index as u64);
+        let l2g_root = epoch.l2g_root();
+        let epoch_public_output = epoch.public_output();
 
         if !verify_epoch(
             &elf,
@@ -1087,15 +1277,15 @@ pub fn verify_continuation_with_roots(
             label,
             opts,
             decode_commitment,
-        ) {
+        )? {
             return Ok(None);
         }
 
-        epoch_roots.push(epoch.l2g_root);
-        public_output.extend_from_slice(&epoch.public_output);
+        epoch_roots.push(l2g_root);
+        public_output.extend_from_slice(epoch_public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
-        register_init = epoch.reg_fini.clone();
+        register_init = epoch.reg_fini()?;
     }
 
     // Cross-epoch global memory: genesis for ELF/runtime pages is rebuilt FROM THE ELF
@@ -1107,7 +1297,8 @@ pub fn verify_continuation_with_roots(
     // touched page-base set (never cell values); the bundle carries the latter directly.
     // Canonicalize the (untrusted) list so a shuffled-but-same-set list still verifies,
     // while a different set fails via GlobalMemory-bus imbalance / AIR-count mismatch.
-    let page_bases = canonical_page_bases(&bundle.touched_page_bases);
+    let touched_page_bases = bundle.touched_page_bases();
+    let page_bases = canonical_page_bases(&touched_page_bases);
     // Every honest base is produced by `page::page_base_for_address`, so it is page-aligned; a
     // non-aligned base is only reachable via a hand-crafted bundle. Left unchecked, such a base
     // still falls in the private-input range (`page::is_private_input_page`), so it would be
@@ -1137,13 +1328,14 @@ pub fn verify_continuation_with_roots(
             "page_genesis_commitments contains a non-page-aligned entry".to_string(),
         ));
     }
+    let global_proof = bundle.global();
     if !verify_global(
         n,
         &page_bases,
-        &bundle.global,
+        global_proof,
         &elf,
         elf_bytes,
-        bundle.num_private_input_pages,
+        num_private_input_pages,
         opts,
         page_genesis_commitments,
     ) {
@@ -1151,11 +1343,11 @@ pub fn verify_continuation_with_roots(
     }
 
     // Each epoch's committed L2G table is the same one the global proof used.
-    if !verify_l2g_commitment_binding(&epoch_roots, &bundle.global) {
+    if !verify_l2g_commitment_binding_view(&epoch_roots, global_proof) {
         return Ok(None);
     }
 
-    Ok(Some(public_output))
+    Ok(Some((public_output, elf.entry_point)))
 }
 
 /// Precompute the ELF-derived roots [`verify_continuation_with_roots`] accepts:
@@ -1966,10 +2158,11 @@ mod tests {
         );
     }
 
-    // Negative: corrupting an epoch's claimed L2G table root must be rejected —
-    // `verify_l2g_commitment_binding` compares each epoch's `l2g_root` against the
-    // corresponding sub-proof root in the global proof, so a mismatched root causes
-    // the binding to fail. Guards the L2G root↔global commitment binding.
+    // Negative: corrupting an epoch's claimed L2G table root must be rejected. This
+    // tamper is caught by `verify_epoch`'s own root-consistency check (the epoch's
+    // claimed `l2g_root` no longer matches what its own proof committed) before the
+    // cross-epoch `verify_l2g_commitment_binding_view` ever runs — see
+    // `test_split_verify_rejects_global_proof_from_a_different_run` for that.
     #[test]
     fn test_split_verify_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -1985,6 +2178,126 @@ mod tests {
             verify_continuation(&elf_bytes, &bundle, &ProofOptions::default_test_options())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    // Same tamper as `test_split_verify_rejects_tampered_l2g_root`, but through the
+    // zero-copy blob path (`verify_continuation_and_attest`) rather than
+    // `verify_continuation`. Guards the archived path's per-epoch root check against
+    // the same corruption the owned path already catches.
+    #[test]
+    fn test_continuation_blob_rejects_tampered_l2g_root() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &crate::recursion::MIN_PROOF_OPTIONS).unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need multiple epochs to exercise the binding"
+        );
+        bundle.epochs[0].l2g_root[0] ^= 0xFF;
+
+        let blob = crate::recursion::encode_continuation_guest_input(
+            bundle,
+            &elf_bytes,
+            &crate::recursion::MIN_PROOF_OPTIONS,
+        )
+        .expect("encode_continuation_guest_input failed");
+
+        let result = crate::recursion::verify_continuation_and_attest(
+            &blob,
+            &crate::recursion::MIN_PROOF_OPTIONS,
+        )
+        .expect("verify_continuation_and_attest errored");
+        assert!(
+            result.is_none(),
+            "a tampered l2g_root must be rejected over the archived blob path too"
+        );
+    }
+
+    // Negative: `verify_l2g_commitment_binding_view`'s own reject branch, which the two
+    // tests above don't reach (they're caught earlier by `verify_epoch`'s per-epoch root
+    // check). Two bundles proved from the same ELF/epoch size with different
+    // same-length private inputs share every shape value (`n`, `table_counts`,
+    // `touched_page_bases`, `num_private_input_pages`) but commit different actual L2G
+    // data, so splicing one's `global` proof onto the other's epochs leaves every
+    // per-epoch check and `verify_global`'s own `multi_verify` passing (each half is
+    // independently valid for that exact shape) while the per-epoch claimed roots no
+    // longer match what the spliced-in global proof's L2G sub-tables actually commit.
+    #[test]
+    fn test_split_verify_rejects_global_proof_from_a_different_run() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = ProofOptions::default_test_options();
+
+        let input_a: Vec<u8> = (0u8..16).collect();
+        let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
+
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_a, &opts)
+                .unwrap()
+                .is_some(),
+            "bundle_a must verify standalone before splicing"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_b, &opts)
+                .unwrap()
+                .is_some(),
+            "bundle_b must verify standalone before splicing"
+        );
+        assert_eq!(
+            bundle_a.epochs.len(),
+            bundle_b.epochs.len(),
+            "same ELF/epoch size/input length must yield the same epoch split"
+        );
+        assert_eq!(
+            bundle_a.touched_page_bases, bundle_b.touched_page_bases,
+            "same-length private inputs must touch the same pages"
+        );
+        assert_ne!(
+            bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root,
+            "different private-input bytes must commit different L2G data"
+        );
+
+        bundle_a.global = bundle_b.global;
+
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_a, &opts)
+                .unwrap()
+                .is_none(),
+            "a global proof spliced in from a different run must be rejected"
+        );
+    }
+
+    // Same construction as `test_split_verify_rejects_global_proof_from_a_different_run`,
+    // but through the zero-copy blob path — guards
+    // `verify_l2g_commitment_binding_view`'s archived call site.
+    #[test]
+    fn test_continuation_blob_rejects_global_proof_from_a_different_run() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = crate::recursion::MIN_PROOF_OPTIONS;
+
+        let input_a: Vec<u8> = (0u8..16).collect();
+        let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
+
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
+        assert_eq!(bundle_a.epochs.len(), bundle_b.epochs.len());
+        assert_eq!(bundle_a.touched_page_bases, bundle_b.touched_page_bases);
+        assert_ne!(bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root);
+
+        bundle_a.global = bundle_b.global;
+
+        let blob = crate::recursion::encode_continuation_guest_input(bundle_a, &elf_bytes, &opts)
+            .expect("encode_continuation_guest_input failed");
+        let result = crate::recursion::verify_continuation_and_attest(&blob, &opts)
+            .expect("verify_continuation_and_attest errored");
+        assert!(
+            result.is_none(),
+            "a global proof spliced in from a different run must be rejected over the archived blob path too"
         );
     }
 }
