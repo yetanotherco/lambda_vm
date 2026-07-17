@@ -50,6 +50,36 @@ fn hash_streamed<D: Digest + 'static, const NUM_BYTES: usize>(
     result_hash
 }
 
+/// Hash a Merkle parent — always exactly two concatenated 32-byte nodes.
+///
+/// On the riscv64 guest, when `D` is the platform keccak digest and nodes are
+/// 32 bytes, this is one fixed-shape 64-byte compression ([`keccak256_pair`]):
+/// a single permutation with the input lanes and padding written straight into
+/// the state, skipping the incremental sponge's per-byte absorb, running
+/// offset, and separate padding pass. Byte-identical to streaming both nodes
+/// through the digest; every other digest / node size (and the host build)
+/// takes the generic streaming-and-finalize path unchanged.
+#[inline]
+fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
+    left: &[u8; NUM_BYTES],
+    right: &[u8; NUM_BYTES],
+) -> [u8; NUM_BYTES] {
+    #[cfg(target_arch = "riscv64")]
+    if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+        let l: &[u8; 32] = left[..].try_into().unwrap();
+        let r: &[u8; 32] = right[..].try_into().unwrap();
+        let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
+        let mut result = [0u8; NUM_BYTES];
+        result.copy_from_slice(&hash);
+        return result;
+    }
+
+    hash_streamed::<D, NUM_BYTES>(|sink| {
+        sink(left);
+        sink(right);
+    })
+}
+
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
 /// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
 /// as it avoids Vec allocation overhead.
@@ -86,10 +116,7 @@ where
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
-        hash_streamed::<D, NUM_BYTES>(|sink| {
-            sink(left);
-            sink(right);
-        })
+        hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
     }
 }
 
@@ -160,10 +187,7 @@ where
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
-        hash_streamed::<D, NUM_BYTES>(|sink| {
-            sink(left);
-            sink(right);
-        })
+        hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
     }
 }
 

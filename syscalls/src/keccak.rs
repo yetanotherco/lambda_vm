@@ -134,3 +134,36 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
     hasher.finalize(&mut out);
     out
 }
+
+/// Keccak-256 of exactly two concatenated 32-byte nodes (64 bytes) — the fixed
+/// shape of every Merkle parent hash. 64 bytes fit the 136-byte rate in one
+/// block, so this skips the incremental sponge entirely: load the eight data
+/// lanes straight from `left`/`right`, XOR the `pad10*1` bits in place, run one
+/// permutation, squeeze four lanes. Byte-identical to feeding `left` then
+/// `right` through the streaming [`Keccak256`] and finalizing.
+///
+/// The nodes are only byte-aligned, so lanes are assembled with `from_le_bytes`
+/// over owned arrays — never an aligned doubleword load, which the VM would trap
+/// on at a misaligned address.
+pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut state = [0u64; 25];
+    // Bytes 0..64 span rate lanes 0..8: lanes 0..4 from `left`, 4..8 from `right`.
+    for i in 0..4 {
+        let l: &[u8; 8] = left[i * 8..i * 8 + 8].try_into().unwrap();
+        state[i] = u64::from_le_bytes(*l);
+        let r: &[u8; 8] = right[i * 8..i * 8 + 8].try_into().unwrap();
+        state[4 + i] = u64::from_le_bytes(*r);
+    }
+    // pad10*1 for a 64-byte message at rate 136: delimiter at byte 64 (lane 8,
+    // low byte) and the final bit at the last rate byte (byte 135, lane 16 high
+    // byte). Both target lanes are still zero, so XOR == assignment.
+    state[8] ^= u64::from(DELIMITER);
+    state[RATE_LANES - 1] ^= FINAL_PAD_LANE_BIT;
+    keccak_permute(&mut state);
+
+    let mut out = [0u8; 32];
+    for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
+        chunk.copy_from_slice(&state[i].to_le_bytes());
+    }
+    out
+}
