@@ -56,9 +56,55 @@ pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 /// for every page-span computation over the private-input region.
 pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
+/// Page size for the private-input region's paged backing store. The private
+/// input region ([`PRIVATE_INPUT_START_INDEX`], `+ MAX_PRIVATE_INPUT_SIZE`) is
+/// backed by a `HashMap<page index, Box<[u8; PRIVATE_INPUT_PAGE_SIZE]>>`
+/// instead of one hashmap entry per 4-byte word, so growing/rehashing that
+/// table only ever moves 8-byte box pointers, never the page bytes
+/// themselves. Chosen to match the prover's `DEFAULT_PAGE_SIZE` concept
+/// (`prover/src/tables/page.rs`); redeclared locally since the executor must
+/// not depend on the prover crate.
+const PRIVATE_INPUT_PAGE_SIZE: usize = 256 * 1024;
+
+#[inline]
+fn is_private_input_addr(address: u64) -> bool {
+    address >= PRIVATE_INPUT_START_INDEX
+        && address < PRIVATE_INPUT_START_INDEX + MAX_PRIVATE_INPUT_SIZE
+}
+
+#[inline]
+fn private_page_index(address: u64) -> u64 {
+    (address - PRIVATE_INPUT_START_INDEX) / PRIVATE_INPUT_PAGE_SIZE as u64
+}
+
+#[inline]
+fn private_page_offset(address: u64) -> usize {
+    ((address - PRIVATE_INPUT_START_INDEX) % PRIVATE_INPUT_PAGE_SIZE as u64) as usize
+}
+
+/// Allocates a zero-filled private-input page using fallible allocation, so a
+/// guest requesting a page near `MAX_PRIVATE_INPUT_SIZE` fails cleanly with
+/// [`MemoryError::AllocationFailed`] instead of aborting the host process.
+fn try_allocate_private_page() -> Result<Box<[u8; PRIVATE_INPUT_PAGE_SIZE]>, MemoryError> {
+    let mut buf: Vec<u8> = Vec::new();
+    buf.try_reserve_exact(PRIVATE_INPUT_PAGE_SIZE)
+        .map_err(|_| MemoryError::AllocationFailed)?;
+    buf.resize(PRIVATE_INPUT_PAGE_SIZE, 0);
+    buf.into_boxed_slice()
+        .try_into()
+        .map_err(|_| MemoryError::AllocationFailed)
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
+    /// Private-input region backing store, paged at [`PRIVATE_INPUT_PAGE_SIZE`]
+    /// granularity: key is the page index (`(addr - PRIVATE_INPUT_START_INDEX)
+    /// / PRIVATE_INPUT_PAGE_SIZE`), value is a heap-boxed page. Only the boxed
+    /// pointer lives in the hashmap's table slot, so table growth/rehashing
+    /// moves 8-byte pointers, never the 256 KiB page contents. Pages are
+    /// allocated lazily, zero-filled, on first write.
+    private_input_pages: U64HashMap<Box<[u8; PRIVATE_INPUT_PAGE_SIZE]>>,
     /// Bytes committed to public output via `commit_public_output`. The
     /// COMMIT AIR doesn't write to a fixed memory region (it streams bytes
     /// onto the Commit bus by `index`), so this buffer is purely the
@@ -67,7 +113,33 @@ pub struct Memory {
 }
 
 impl Memory {
+    /// Fetches the boxed page for `page_idx`, allocating and inserting a
+    /// zero-filled page on first access (fallible allocation).
+    fn get_or_insert_private_page(
+        &mut self,
+        page_idx: u64,
+    ) -> Result<&mut [u8; PRIVATE_INPUT_PAGE_SIZE], MemoryError> {
+        use std::collections::hash_map::Entry;
+        let page = match self.private_input_pages.entry(page_idx) {
+            Entry::Occupied(o) => o.into_mut(),
+            Entry::Vacant(v) => {
+                let page = try_allocate_private_page()?;
+                v.insert(page)
+            }
+        };
+        Ok(&mut **page)
+    }
+
     pub fn load_byte(&self, address: u64) -> u8 {
+        if is_private_input_addr(address) {
+            let page_idx = private_page_index(address);
+            let offset = private_page_offset(address);
+            return self
+                .private_input_pages
+                .get(&page_idx)
+                .map(|p| p[offset])
+                .unwrap_or(0);
+        }
         let aligned_address = address - address % 4;
         let value = self
             .cells
@@ -78,6 +150,16 @@ impl Memory {
     }
 
     pub fn store_byte(&mut self, address: u64, value: u8) {
+        if is_private_input_addr(address) {
+            let page_idx = private_page_index(address);
+            let offset = private_page_offset(address);
+            let page = self
+                .private_input_pages
+                .entry(page_idx)
+                .or_insert_with(|| Box::new([0u8; PRIVATE_INPUT_PAGE_SIZE]));
+            page[offset] = value;
+            return;
+        }
         let aligned_address = address - address % 4;
         let entry = self
             .cells
@@ -86,20 +168,49 @@ impl Memory {
         entry[(address % 4) as usize] = value;
     }
 
-    /// Iterate over all stored bytes as `(address, value)` pairs. Cells are
-    /// stored as 4-byte words; each word expands into its four byte addresses.
-    /// Used to snapshot memory at an epoch boundary.
+    /// Iterate over all stored bytes as `(address, value)` pairs. Ordinary
+    /// cells are stored as 4-byte words; each word expands into its four byte
+    /// addresses. Private-input bytes are stored as
+    /// [`PRIVATE_INPUT_PAGE_SIZE`] pages; each allocated page expands into its
+    /// byte addresses (unallocated pages contribute nothing, matching bytes
+    /// never having been written). Used to snapshot memory at an epoch
+    /// boundary.
     pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
-        self.cells.iter().flat_map(|(&addr, bytes)| {
+        let cells_iter = self.cells.iter().flat_map(|(&addr, bytes)| {
             bytes
                 .iter()
                 .enumerate()
                 .map(move |(i, &b)| (addr + i as u64, b))
-        })
+        });
+        let private_iter = self.private_input_pages.iter().flat_map(|(&page_idx, page)| {
+            let base = PRIVATE_INPUT_START_INDEX + page_idx * PRIVATE_INPUT_PAGE_SIZE as u64;
+            page.iter()
+                .enumerate()
+                .map(move |(i, &b)| (base + i as u64, b))
+        });
+        cells_iter.chain(private_iter)
     }
 
     pub fn load_word(&self, address: u64) -> Result<u32, MemoryError> {
         if address.is_multiple_of(4) {
+            // `PRIVATE_INPUT_START_INDEX` and `MAX_PRIVATE_INPUT_SIZE` are both
+            // multiples of `PRIVATE_INPUT_PAGE_SIZE` (itself a multiple of 4),
+            // so a 4-aligned word address is either fully inside the private
+            // region and fully inside one page, or fully outside it.
+            if is_private_input_addr(address) {
+                let page_idx = private_page_index(address);
+                let offset = private_page_offset(address);
+                let bytes = self
+                    .private_input_pages
+                    .get(&page_idx)
+                    .map(|p| {
+                        let mut b = [0u8; 4];
+                        b.copy_from_slice(&p[offset..offset + 4]);
+                        b
+                    })
+                    .unwrap_or([0u8; 4]);
+                return Ok(u32::from_le_bytes(bytes));
+            }
             let bytes = self.cells.get(&address).cloned().unwrap_or_default();
             Ok(u32::from_le_bytes(bytes))
         } else {
@@ -116,7 +227,14 @@ impl Memory {
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
         let bytes = value.to_le_bytes();
         if address.is_multiple_of(4) {
-            self.cells.insert(address, bytes);
+            if is_private_input_addr(address) {
+                let page_idx = private_page_index(address);
+                let offset = private_page_offset(address);
+                let page = self.get_or_insert_private_page(page_idx)?;
+                page[offset..offset + 4].copy_from_slice(&bytes);
+            } else {
+                self.cells.insert(address, bytes);
+            }
         } else {
             address.checked_add(3).ok_or(MemoryError::AddressOverflow)?;
             for (i, b) in bytes.iter().enumerate() {
@@ -130,6 +248,28 @@ impl Memory {
     pub fn load_doubleword(&self, address: u64) -> Result<u64, MemoryError> {
         if address.is_multiple_of(8) {
             // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
+            // As with `load_word`, both region boundaries and the page size are
+            // multiples of 8, so an 8-aligned doubleword never straddles the
+            // private-input region boundary or a page boundary.
+            if is_private_input_addr(address) {
+                let page_idx = private_page_index(address);
+                let offset = private_page_offset(address);
+                let (low, high) = self
+                    .private_input_pages
+                    .get(&page_idx)
+                    .map(|p| {
+                        let mut low_bytes = [0u8; 4];
+                        let mut high_bytes = [0u8; 4];
+                        low_bytes.copy_from_slice(&p[offset..offset + 4]);
+                        high_bytes.copy_from_slice(&p[offset + 4..offset + 8]);
+                        (
+                            u32::from_le_bytes(low_bytes) as u64,
+                            u32::from_le_bytes(high_bytes) as u64,
+                        )
+                    })
+                    .unwrap_or((0, 0));
+                return Ok(low | (high << 32));
+            }
             let low_bytes = self.cells.get(&address).cloned().unwrap_or_default();
             let high_bytes = self.cells.get(&(address + 4)).cloned().unwrap_or_default();
             let low = u32::from_le_bytes(low_bytes) as u64;
@@ -151,8 +291,16 @@ impl Memory {
             let low = (value & 0xFFFFFFFF) as u32;
             let high = (value >> 32) as u32;
             // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
-            self.cells.insert(address, low.to_le_bytes());
-            self.cells.insert(address + 4, high.to_le_bytes());
+            if is_private_input_addr(address) {
+                let page_idx = private_page_index(address);
+                let offset = private_page_offset(address);
+                let page = self.get_or_insert_private_page(page_idx)?;
+                page[offset..offset + 4].copy_from_slice(&low.to_le_bytes());
+                page[offset + 4..offset + 8].copy_from_slice(&high.to_le_bytes());
+            } else {
+                self.cells.insert(address, low.to_le_bytes());
+                self.cells.insert(address + 4, high.to_le_bytes());
+            }
         } else {
             address.checked_add(7).ok_or(MemoryError::AddressOverflow)?;
             let bytes = value.to_le_bytes();
@@ -166,12 +314,25 @@ impl Memory {
     pub fn load_half(&self, address: u64) -> Result<u16, MemoryError> {
         if address.is_multiple_of(2) {
             let aligned_address = address - address % 4;
+            let offset = (address % 4) as usize;
+            // `aligned_address` is word-aligned, so (as with `load_word`) it's
+            // either fully inside the private region and one page, or fully
+            // outside.
+            if is_private_input_addr(aligned_address) {
+                let page_idx = private_page_index(aligned_address);
+                let page_offset = private_page_offset(aligned_address) + offset;
+                let bytes = self
+                    .private_input_pages
+                    .get(&page_idx)
+                    .map(|p| [p[page_offset], p[page_offset + 1]])
+                    .unwrap_or([0, 0]);
+                return Ok(u16::from_le_bytes(bytes));
+            }
             let bytes = self
                 .cells
                 .get(&aligned_address)
                 .cloned()
                 .unwrap_or_default();
-            let offset = (address % 4) as usize;
             Ok(u16::from_le_bytes([bytes[offset], bytes[offset + 1]]))
         } else {
             address.checked_add(1).ok_or(MemoryError::AddressOverflow)?;
@@ -186,11 +347,19 @@ impl Memory {
         let bytes = value.to_le_bytes();
         if address.is_multiple_of(2) {
             let aligned_address = address - address % 4;
+            let offset = (address % 4) as usize;
+            if is_private_input_addr(aligned_address) {
+                let page_idx = private_page_index(aligned_address);
+                let page_offset = private_page_offset(aligned_address) + offset;
+                let page = self.get_or_insert_private_page(page_idx)?;
+                page[page_offset] = bytes[0];
+                page[page_offset + 1] = bytes[1];
+                return Ok(());
+            }
             let entry = self
                 .cells
                 .entry(aligned_address)
                 .or_insert_with(|| [0, 0, 0, 0]);
-            let offset = (address % 4) as usize;
             entry[offset] = bytes[0];
             entry[offset + 1] = bytes[1];
         } else {
@@ -251,9 +420,24 @@ impl Memory {
             .map_err(|_| MemoryError::AllocationFailed)?;
         while addr < end {
             let aligned = addr - (addr % 4);
-            let bytes = self.cells.get(&aligned).cloned().unwrap_or_default();
             let offset = (addr % 4) as usize;
             let take = std::cmp::min(4 - offset, (end - addr) as usize);
+            // `aligned` is word-aligned, so it's either fully inside the
+            // private region and one page, or fully outside (see `load_word`).
+            let bytes = if is_private_input_addr(aligned) {
+                let page_idx = private_page_index(aligned);
+                let page_offset = private_page_offset(aligned);
+                self.private_input_pages
+                    .get(&page_idx)
+                    .map(|p| {
+                        let mut b = [0u8; 4];
+                        b.copy_from_slice(&p[page_offset..page_offset + 4]);
+                        b
+                    })
+                    .unwrap_or([0u8; 4])
+            } else {
+                self.cells.get(&aligned).cloned().unwrap_or_default()
+            };
             result.extend_from_slice(&bytes[offset..offset + take]);
             addr += take as u64;
         }
@@ -264,17 +448,43 @@ impl Memory {
     /// Should only be used to write to public output and private input where these limitations are not a problem
     pub(crate) fn set_bytes_aligned(
         &mut self,
-        mut addr: u64,
+        addr: u64,
         inputs: &[u8],
     ) -> Result<(), MemoryError> {
         if !addr.is_multiple_of(4) {
             return Err(MemoryError::UnalignedAccess);
         }
+        if is_private_input_addr(addr) {
+            return self.set_private_bytes_aligned(addr, inputs);
+        }
+        let mut addr = addr;
         for chunk in inputs.chunks(4) {
             let mut bytes = [0u8; 4];
             bytes[..chunk.len()].copy_from_slice(chunk);
             self.cells.insert(addr, bytes);
             addr += 4;
+        }
+        Ok(())
+    }
+
+    /// Writes `inputs` contiguously into the paged private-input store
+    /// starting at word-aligned `addr`, touching only the pages the data
+    /// actually spans (allocating each lazily, at most once). Unlike
+    /// `cells`, pages are raw zero-initialized byte arrays, so no zero
+    /// padding is needed for a partial trailing word: the page's
+    /// zero-initialized bytes already stand in for it.
+    fn set_private_bytes_aligned(&mut self, addr: u64, inputs: &[u8]) -> Result<(), MemoryError> {
+        let mut remaining = inputs;
+        let mut cur_addr = addr;
+        while !remaining.is_empty() {
+            let page_idx = private_page_index(cur_addr);
+            let page_offset = private_page_offset(cur_addr);
+            let space_in_page = PRIVATE_INPUT_PAGE_SIZE - page_offset;
+            let take = remaining.len().min(space_in_page);
+            let page = self.get_or_insert_private_page(page_idx)?;
+            page[page_offset..page_offset + take].copy_from_slice(&remaining[..take]);
+            remaining = &remaining[take..];
+            cur_addr += take as u64;
         }
         Ok(())
     }
