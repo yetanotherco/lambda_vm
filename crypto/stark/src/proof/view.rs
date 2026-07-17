@@ -524,6 +524,7 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    #[inline(always)]
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(p) => p.proofs.len(),
@@ -531,10 +532,12 @@ where
         }
     }
 
+    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    #[inline(always)]
     pub fn get(&self, i: usize) -> StarkProofView<'a, F, E, PI> {
         match self {
             Self::Owned(p) => StarkProofView::Owned(&p.proofs[i]),
@@ -542,11 +545,13 @@ where
         }
     }
 
+    #[inline(always)]
     pub fn last(&self) -> Option<StarkProofView<'a, F, E, PI>> {
         let len = self.len();
         (len > 0).then(|| self.get(len - 1))
     }
 
+    #[inline(always)]
     pub fn iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> + 'a {
         let this = *self;
         (0..this.len()).map(move |i| this.get(i))
@@ -578,9 +583,11 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    #[inline(always)]
     fn view_len(&self) -> usize {
         self.len()
     }
+    #[inline(always)]
     fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
         self.iter().copied()
     }
@@ -594,9 +601,11 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    #[inline(always)]
     fn view_len(&self) -> usize {
         self.len()
     }
+    #[inline(always)]
     fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
         self.iter().copied()
     }
@@ -610,9 +619,11 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    #[inline(always)]
     fn view_len(&self) -> usize {
         MultiProofView::len(self)
     }
+    #[inline(always)]
     fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
         MultiProofView::iter(self)
     }
