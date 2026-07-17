@@ -534,7 +534,7 @@ fn test_recursion_blob_decodes_and_verifies_on_host() {
 /// Continuation flavor of the roundtrip guard: prove the empty program via
 /// continuations (tiny epochs so the bundle is genuinely multi-epoch), encode
 /// the [`recursion::ContinuationGuestInput`] blob, decode it exactly as the
-/// `continuation`-feature guest does, and mirror its
+/// intended `continuation`-feature guest would, and mirror its
 /// `verify_continuation_and_attest` call — a cheap host-side check of the
 /// encode/decode/verify/attest contract without running the VM.
 #[test]
@@ -579,8 +579,8 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
 
     // Verify exactly as the guest does (built with `continuation` + `min`):
     // prefix validation + rkyv access + deserialize + verify + attest.
-    let attestation = recursion::verify_continuation_and_attest_blob(&blob, &MIN_PROOF_OPTIONS)
-        .expect("verify_continuation_and_attest_blob errored")
+    let attestation = recursion::verify_continuation_and_attest(&blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_continuation_and_attest errored")
         .expect("continuation proof did not survive the rkyv round-trip");
     let (id, output) = recursion::split_attestation(&attestation).expect("attestation too short");
     assert_eq!(

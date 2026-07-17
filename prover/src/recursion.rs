@@ -266,45 +266,21 @@ pub fn encode_continuation_guest_input(
     Ok(blob)
 }
 
-/// [`verify_and_attest_blob`]'s logic for a continuation bundle (the
-/// `continuation` guest feature): verify every epoch + the global memory
-/// proof against the supplied roots, then attest
+/// [`verify_and_attest_blob`]'s logic for a continuation bundle: takes the
+/// wire-format blob ([`encode_continuation_guest_input`]) and does the
+/// intended `continuation` guest's whole job in one call — verify every
+/// epoch + the global memory proof against the supplied roots, then attest
 /// `program_id(elf, roots) || public_output`. Uses the same [`program_id`] as
 /// the monolithic path over the continuation's root set (DECODE + touched
 /// data-page genesis roots), so a consumer re-binds with
 /// [`crate::continuation::continuation_precomputed_commitments`] over the
 /// bundle it holds — the touched-page set is bundle-dependent, unlike the
-/// monolithic path's ELF-only page set.
+/// monolithic path's ELF-only page set. The archive is bytecheck-validated,
+/// then verified zero-copy via
+/// [`crate::continuation::verify_continuation_archived`] — no owned
+/// deserialize of the (large) bundle, same as [`crate::verify_recursion_blob`]
+/// for the monolithic proof.
 pub fn verify_continuation_and_attest(
-    bundle: &crate::continuation::ContinuationProof,
-    elf_bytes: &[u8],
-    proof_options: &ProofOptions,
-    decode_commitment: Commitment,
-    page_commitments: &[(u64, Commitment)],
-) -> Result<Option<Vec<u8>>, Error> {
-    let Some(public_output) = crate::continuation::verify_continuation_with_roots(
-        elf_bytes,
-        bundle,
-        proof_options,
-        Some(decode_commitment),
-        Some(page_commitments),
-    )?
-    else {
-        return Ok(None);
-    };
-    let id = program_id_from_elf(elf_bytes, &decode_commitment, page_commitments)?;
-    let mut attestation = id.to_vec();
-    attestation.extend_from_slice(&public_output);
-    Ok(Some(attestation))
-}
-
-/// [`verify_continuation_and_attest`]'s logic over the wire-format blob
-/// ([`encode_continuation_guest_input`]) — the `continuation` guest's whole
-/// job in one call. The archive is bytecheck-validated, then verified
-/// zero-copy via [`crate::continuation::verify_continuation_archived`] — no
-/// owned deserialize of the (large) bundle, same as
-/// [`crate::verify_recursion_blob`] for the monolithic proof.
-pub fn verify_continuation_and_attest_blob(
     blob: &[u8],
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {

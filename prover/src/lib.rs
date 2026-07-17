@@ -940,8 +940,8 @@ pub(crate) fn replay_transcript_phase_a_view(
     (z, alpha)
 }
 
-/// View counterpart of [`compute_expected_commit_bus_balance`]: operates on a
-/// proof view slice (owned or archived-in-place).
+/// Computes the expected COMMIT bus balance for a proof view slice (owned or
+/// archived-in-place).
 pub(crate) fn compute_expected_commit_bus_balance_view(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
     proofs: &[StarkProofView<F, E, ()>],

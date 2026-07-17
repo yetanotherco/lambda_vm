@@ -2141,4 +2141,44 @@ mod tests {
                 .is_none()
         );
     }
+
+    // Same tamper as `test_split_verify_rejects_tampered_l2g_root`, but through the
+    // zero-copy blob path (`verify_continuation_and_attest`) rather than
+    // `verify_continuation`. Guards `verify_continuation_archived`'s view-based
+    // `verify_l2g_commitment_binding_views` against the same corruption its owned
+    // counterpart already catches.
+    #[test]
+    fn test_continuation_blob_rejects_tampered_l2g_root() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        let mut bundle = prove_continuation(
+            &elf_bytes,
+            &[],
+            3,
+            &crate::recursion::MIN_PROOF_OPTIONS,
+        )
+        .unwrap();
+        assert!(
+            bundle.epochs.len() >= 2,
+            "need multiple epochs to exercise the binding"
+        );
+        bundle.epochs[0].l2g_root[0] ^= 0xFF;
+
+        let blob = crate::recursion::encode_continuation_guest_input(
+            bundle,
+            &elf_bytes,
+            &crate::recursion::MIN_PROOF_OPTIONS,
+        )
+        .expect("encode_continuation_guest_input failed");
+
+        let result = crate::recursion::verify_continuation_and_attest(
+            &blob,
+            &crate::recursion::MIN_PROOF_OPTIONS,
+        )
+        .expect("verify_continuation_and_attest errored");
+        assert!(
+            result.is_none(),
+            "a tampered l2g_root must be rejected over the archived blob path too"
+        );
+    }
 }
