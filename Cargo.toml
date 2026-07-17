@@ -31,8 +31,9 @@ debug = true
 #   CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
 
 # EXPERIMENT: probe a codegen-sensitive CI-only failure (FEXT_PAGE composition).
-# codegen-units=1 didn't help; try opt-level=1 (a bigger codegen change). If this
-# makes CI green, bisect per-crate opt-level to find the miscompiled crate.
+# codegen-units=1 and opt-level=1 both still failed; try opt-level=0 (minimal
+# optimization). If this passes, it's optimization-driven; if it still fails, the
+# miscompile is not optimization-driven and needs escalation.
 [profile.release]
 codegen-units = 1
-opt-level = 1
+opt-level = 0
