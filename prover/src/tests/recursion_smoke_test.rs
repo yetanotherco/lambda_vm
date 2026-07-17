@@ -257,10 +257,9 @@ fn setup_continuation_guest_run(
     // consumes it: a full trustless host verify (mirrors the monolithic pipeline's
     // host `verify_with_options` check) for the expected output, plus the
     // continuation analog of `check_attestation`'s recompute for the expected id.
-    let expected_output =
-        crate::continuation::verify_continuation(inner_elf_bytes, &bundle, &opts)
-            .expect("verify_continuation errored")
-            .expect("continuation bundle must verify on host before profiling the guest");
+    let expected_output = crate::continuation::verify_continuation(inner_elf_bytes, &bundle, &opts)
+        .expect("verify_continuation errored")
+        .expect("continuation bundle must verify on host before profiling the guest");
     let (expected_decode, expected_pages) =
         crate::continuation::continuation_precomputed_commitments(inner_elf_bytes, &bundle, &opts)
             .expect("continuation_precomputed_commitments errored");
@@ -561,11 +560,14 @@ fn run_profile_from(
          (ELF, roots) identity than the trusted host recompute"
     );
     assert_eq!(
-        output, expected.output.as_slice(),
+        output,
+        expected.output.as_slice(),
         "attested inner public output mismatch — the in-VM verify's committed output \
          diverges from the trusted host recompute"
     );
-    eprintln!("[profile] guest attestation matched the trusted host recompute (program_id + inner public output) ✓");
+    eprintln!(
+        "[profile] guest attestation matched the trusted host recompute (program_id + inner public output) ✓"
+    );
 
     eprintln!();
     eprintln!("============================================================");
