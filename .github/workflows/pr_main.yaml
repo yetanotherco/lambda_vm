@@ -131,6 +131,9 @@ jobs:
       - name: Run CLI tests
         run: cargo test -p cli
 
+      - name: Run syscalls host tests (keccak differential vs sha3)
+        run: make test-syscalls
+
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
   test:
