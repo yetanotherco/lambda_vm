@@ -94,9 +94,17 @@ impl Keccak256 {
         while !input.is_empty() {
             // Whole-lane fast path: sponge offset on a lane boundary AND input
             // pointer 8-aligned (the VM traps on unaligned doubleword loads).
-            // Keccak state lanes are little-endian, so an in-memory u64 load
-            // equals the from_le_bytes lane value.
-            if self.offset % 8 == 0 && (input.as_ptr() as usize) % 8 == 0 && input.len() >= 8 {
+            // LE-only by construction: the raw `*const u64` read below equals the
+            // required little-endian lane value only on a little-endian target, so
+            // gate on it. `cfg!(target_endian = ...)` is a compile-time constant
+            // that folds away on every real target (riscv64im-lambda-vm and the
+            // host CI targets are all little-endian), leaving codegen unchanged;
+            // the byte-wise fallback is endian-correct everywhere.
+            if cfg!(target_endian = "little")
+                && self.offset % 8 == 0
+                && (input.as_ptr() as usize) % 8 == 0
+                && input.len() >= 8
+            {
                 let lanes_left = (RATE_BYTES - self.offset) / 8;
                 let take = lanes_left.min(input.len() / 8);
                 let base = self.offset / 8;
@@ -114,6 +122,11 @@ impl Keccak256 {
                     self.offset = 0;
                 }
             } else {
+                // Byte-wise fallback for misaligned input. A middle path that
+                // assembled each lane with `from_le_bytes` (three formulations,
+                // dropped commit f6d575ed) measured +4.7% cycles: on this
+                // 1-cycle-per-instruction VM the extra shifts/ORs cost more than
+                // the byte loop they replace, so don't re-propose it.
                 self.absorb_byte(input[0]);
                 input = &input[1..];
             }
@@ -129,10 +142,20 @@ impl Keccak256 {
         self.state[RATE_LANES - 1] ^= FINAL_PAD_LANE_BIT;
         keccak_permute(&mut self.state);
 
-        // Squeeze the first 32 bytes (4 u64 lanes).
-        for (i, chunk) in output.chunks_exact_mut(8).enumerate() {
-            chunk.copy_from_slice(&self.state[i].to_le_bytes());
-        }
+        squeeze32_into(&self.state, output);
+    }
+}
+
+/// Squeeze the 32-byte Keccak-256 digest out of a permuted state into `out`:
+/// rate lanes 0..4, little-endian. Shared by the streaming
+/// [`Keccak256::finalize`] and the fixed-shape [`keccak256_pair`] so the squeeze
+/// loop lives in exactly one place. Writes into a caller-owned buffer (rather
+/// than returning `[u8; 32]`) so `finalize` fills its `output` reference in
+/// place, keeping the guest codegen identical to the pre-dedup loop.
+#[inline(always)]
+fn squeeze32_into(state: &[u64; 25], out: &mut [u8; 32]) {
+    for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
+        chunk.copy_from_slice(&state[i].to_le_bytes());
     }
 }
 
@@ -172,9 +195,7 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     keccak_permute(&mut state);
 
     let mut out = [0u8; 32];
-    for (i, chunk) in out.chunks_exact_mut(8).enumerate() {
-        chunk.copy_from_slice(&state[i].to_le_bytes());
-    }
+    squeeze32_into(&state, &mut out);
     out
 }
 
@@ -188,24 +209,11 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[cfg(all(test, not(target_arch = "riscv64")))]
 mod tests {
     use super::*;
+    use rand::{Rng, SeedableRng, rngs::StdRng};
     use sha3::{Digest, Keccak256 as RefKeccak256};
 
     fn reference(input: &[u8]) -> [u8; 32] {
         RefKeccak256::digest(input).into()
-    }
-
-    /// Deterministic xorshift64* so the "fuzz" cases are reproducible.
-    struct Rng(u64);
-    impl Rng {
-        fn next(&mut self) -> u64 {
-            self.0 ^= self.0 << 13;
-            self.0 ^= self.0 >> 7;
-            self.0 ^= self.0 << 17;
-            self.0
-        }
-        fn below(&mut self, n: usize) -> usize {
-            (self.next() % n.max(1) as u64) as usize
-        }
     }
 
     /// Every length from empty through three full rate blocks (+2), so every
@@ -230,16 +238,16 @@ mod tests {
     #[test]
     fn chunked_misaligned_updates_match_reference() {
         let data: Vec<u8> = (0..1500).map(|i| (i * 131 + 17) as u8).collect();
-        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut rng = StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
         for case in 0..300 {
-            let len = rng.below(data.len());
-            let start = rng.below(data.len() - len + 1);
+            let len = rng.random_range(0..data.len());
+            let start = rng.random_range(0..data.len() - len + 1);
             let slice = &data[start..start + len];
 
             let mut hasher = Keccak256::new();
             let mut fed = 0;
             while fed < slice.len() {
-                let n = 1 + rng.below((slice.len() - fed).min(200));
+                let n = 1 + rng.random_range(0..(slice.len() - fed).min(200));
                 hasher.update(&slice[fed..fed + n]);
                 fed += n;
             }
@@ -256,12 +264,12 @@ mod tests {
     /// The fixed-shape parent path must equal hashing the 64-byte concatenation.
     #[test]
     fn pair_matches_reference() {
-        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        let mut rng = StdRng::seed_from_u64(0xD1B5_4A32_D192_ED03);
         for case in 0..64 {
             let mut left = [0u8; 32];
             let mut right = [0u8; 32];
             for b in left.iter_mut().chain(right.iter_mut()) {
-                *b = rng.next() as u8;
+                *b = rng.random();
             }
             let mut concat = [0u8; 64];
             concat[..32].copy_from_slice(&left);
