@@ -405,3 +405,10 @@ lint:
 
 flamegraph-prover:
 	cd crypto/stark && samply record cargo bench --bench profile_prover --features parallel
+
+# Continuation elf_digest A/B bench (branch vs main): proves one ethrex
+# continuation bundle and times `verify --continuations` on both refs.
+# Needs the guest sysroot (server). Overrides: N_PAIRS=20 TRANSFERS=100 make bench-elf-digest
+.PHONY: bench-elf-digest
+bench-elf-digest:
+	scripts/bench_elf_digest.sh "$${REF_A:-perf/verifier-eval-points-elf-digest}" "$${REF_B:-origin/main}" "$${N_PAIRS:-10}" "$${TRANSFERS:-20}" "$${EPOCH_LOG2:-20}"
