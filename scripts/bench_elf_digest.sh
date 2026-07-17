@@ -113,7 +113,7 @@ else
 fi
 
 # Epoch count: run the program once for its cycle count, derive E = ceil(cycles/2^log).
-CYCLES="$("$WORK/cli_B" run "$ELF" --private-input "$INPUT" --cycles 2>/dev/null | grep 'Cycles:' | grep -oE '[0-9]+' | tail -1 || true)"
+CYCLES="$("$WORK/cli_B" execute "$ELF" --private-input "$INPUT" --cycles 2>/dev/null | grep 'Cycles:' | grep -oE '[0-9]+' | tail -1 || true)"
 if [ -n "${CYCLES:-}" ] && [ "$CYCLES" -gt 0 ]; then
   EPOCHS=$(( (CYCLES + (1 << EPOCH_LOG2) - 1) / (1 << EPOCH_LOG2) ))
   echo "==> Program cycles: $CYCLES -> ~$EPOCHS epochs of 2^$EPOCH_LOG2"
