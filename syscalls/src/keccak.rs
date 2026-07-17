@@ -22,7 +22,17 @@
 //! On a non-`riscv64` host, `keccak_permute` panics — this module is only
 //! meant to be used from guest programs (compiled to `riscv64im-lambda-vm-elf`).
 
+#[cfg(not(all(test, not(target_arch = "riscv64"))))]
 use crate::syscalls::keccak_permute;
+
+/// Software Keccak-f[1600] so host `cargo test` can exercise the sponge's
+/// absorption/padding/squeezing against a reference implementation — the real
+/// permutation is the VM ecall, unavailable off-guest. Guest builds and host
+/// non-test builds are untouched.
+#[cfg(all(test, not(target_arch = "riscv64")))]
+fn keccak_permute(state: &mut [u64; 25]) {
+    keccak::f1600(state);
+}
 
 /// Keccak-256 sponge rate in bytes (1088 bits = 136 bytes; capacity = 512 bits).
 const RATE_BYTES: usize = 136;
@@ -166,4 +176,106 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
         chunk.copy_from_slice(&state[i].to_le_bytes());
     }
     out
+}
+
+/// Host-only differential tests: the sponge (absorption chunking, padding,
+/// squeezing, the fixed-shape pair path) must produce digests byte-identical
+/// to the reference `sha3::Keccak256` for every input length and every way of
+/// slicing the input across `update` calls. The permutation itself is the
+/// software `keccak::f1600` here (see `keccak_permute` above); on-guest the
+/// end-to-end oracle is proof-blob acceptance (any digest difference diverges
+/// the Fiat-Shamir transcript and fails verification loudly).
+#[cfg(all(test, not(target_arch = "riscv64")))]
+mod tests {
+    use super::*;
+    use sha3::{Digest, Keccak256 as RefKeccak256};
+
+    fn reference(input: &[u8]) -> [u8; 32] {
+        RefKeccak256::digest(input).into()
+    }
+
+    /// Deterministic xorshift64* so the "fuzz" cases are reproducible.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// Every length from empty through three full rate blocks (+2), so every
+    /// padding boundary (135/136/137, 271/272/273, …) is hit.
+    #[test]
+    fn one_shot_matches_reference_for_all_lengths() {
+        let data: Vec<u8> = (0..3 * RATE_BYTES + 2)
+            .map(|i| (i * 31 + 7) as u8)
+            .collect();
+        for len in 0..=data.len() {
+            assert_eq!(
+                keccak256(&data[..len]),
+                reference(&data[..len]),
+                "digest mismatch at len={len}"
+            );
+        }
+    }
+
+    /// Differential chunking fuzz: random sub-slices (random start => misaligned
+    /// pointers exercising the byte fallback) fed through `update` in random
+    /// pieces must match the one-shot reference digest.
+    #[test]
+    fn chunked_misaligned_updates_match_reference() {
+        let data: Vec<u8> = (0..1500).map(|i| (i * 131 + 17) as u8).collect();
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for case in 0..300 {
+            let len = rng.below(data.len());
+            let start = rng.below(data.len() - len + 1);
+            let slice = &data[start..start + len];
+
+            let mut hasher = Keccak256::new();
+            let mut fed = 0;
+            while fed < slice.len() {
+                let n = 1 + rng.below((slice.len() - fed).min(200));
+                hasher.update(&slice[fed..fed + n]);
+                fed += n;
+            }
+            let mut out = [0u8; 32];
+            hasher.finalize(&mut out);
+            assert_eq!(
+                out,
+                reference(slice),
+                "chunked digest mismatch: case={case} start={start} len={len}"
+            );
+        }
+    }
+
+    /// The fixed-shape parent path must equal hashing the 64-byte concatenation.
+    #[test]
+    fn pair_matches_reference() {
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for case in 0..64 {
+            let mut left = [0u8; 32];
+            let mut right = [0u8; 32];
+            for b in left.iter_mut().chain(right.iter_mut()) {
+                *b = rng.next() as u8;
+            }
+            let mut concat = [0u8; 64];
+            concat[..32].copy_from_slice(&left);
+            concat[32..].copy_from_slice(&right);
+            assert_eq!(
+                keccak256_pair(&left, &right),
+                reference(&concat),
+                "pair digest mismatch: case={case}"
+            );
+            assert_eq!(
+                keccak256_pair(&left, &right),
+                keccak256(&concat),
+                "pair vs streaming sponge mismatch: case={case}"
+            );
+        }
+    }
 }
