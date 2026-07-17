@@ -11,8 +11,8 @@ use crate::config::Commitment;
 use crate::frame::Frame;
 use crate::fri::fri_decommit::{ArchivedFriDecommitment, FriDecommitment};
 use crate::proof::stark::{
-    ArchivedDeepPolynomialOpening, ArchivedPolynomialOpenings, ArchivedStarkProof,
-    DeepPolynomialOpening, PolynomialOpenings, StarkProof,
+    ArchivedDeepPolynomialOpening, ArchivedMultiProof, ArchivedPolynomialOpenings,
+    ArchivedStarkProof, DeepPolynomialOpening, MultiProof, PolynomialOpenings, StarkProof,
 };
 use crate::table::{ArchivedTable, Table, TableView};
 use math::field::element::{ArchivedFieldElement, FieldElement};
@@ -478,6 +478,143 @@ where
                 rkyv::deserialize::<PI, rkyv::rancor::Error>(&p.public_inputs).ok()
             }
         }
+    }
+}
+
+/// Borrowed view over a [`MultiProof`] (owned or archived-in-place),
+/// producing per-proof [`StarkProofView`]s without ever materializing an
+/// owned `MultiProof` from an archive. Replaces the
+/// `proofs.iter().map(StarkProofView::Owned/Archived).collect()` boilerplate
+/// that used to appear at every `MultiProof` verify call site.
+pub enum MultiProofView<'a, F: IsSubFieldOf<E>, E: IsField, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    Owned(&'a MultiProof<F, E, PI>),
+    Archived(&'a ArchivedMultiProof<F, E, PI>),
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Clone for MultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Copy for MultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> MultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(p) => p.proofs.len(),
+            Self::Archived(p) => p.proofs.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn get(&self, i: usize) -> StarkProofView<'a, F, E, PI> {
+        match self {
+            Self::Owned(p) => StarkProofView::Owned(&p.proofs[i]),
+            Self::Archived(p) => StarkProofView::Archived(&p.proofs.as_slice()[i]),
+        }
+    }
+
+    pub fn last(&self) -> Option<StarkProofView<'a, F, E, PI>> {
+        let len = self.len();
+        (len > 0).then(|| self.get(len - 1))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> + 'a {
+        let this = *self;
+        (0..this.len()).map(move |i| this.get(i))
+    }
+}
+
+/// A source of [`StarkProofView`]s the verifier can iterate over more than
+/// once without ever materializing a `Vec` — implemented for a plain slice
+/// (or `Vec`) of views and for [`MultiProofView`] alike, so
+/// [`crate::verifier::IsStarkVerifier::multi_verify_views`] runs identically
+/// whether its caller already had a slice or is reading straight out of a
+/// (owned or archived) `MultiProof`.
+pub trait ProofViewSource<'a, F: IsSubFieldOf<E> + 'a, E: IsField + 'a, PI: 'a>: Copy
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn view_len(&self) -> usize;
+    fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>>;
+}
+
+impl<'a, F: IsSubFieldOf<E> + 'a, E: IsField + 'a, PI: 'a> ProofViewSource<'a, F, E, PI>
+    for &'a [StarkProofView<'a, F, E, PI>]
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn view_len(&self) -> usize {
+        self.len()
+    }
+    fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
+        self.iter().copied()
+    }
+}
+
+impl<'a, F: IsSubFieldOf<E> + 'a, E: IsField + 'a, PI: 'a> ProofViewSource<'a, F, E, PI>
+    for &'a Vec<StarkProofView<'a, F, E, PI>>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn view_len(&self) -> usize {
+        self.len()
+    }
+    fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
+        self.iter().copied()
+    }
+}
+
+impl<'a, F: IsSubFieldOf<E> + 'a, E: IsField + 'a, PI: 'a> ProofViewSource<'a, F, E, PI>
+    for MultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn view_len(&self) -> usize {
+        MultiProofView::len(self)
+    }
+    fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
+        MultiProofView::iter(self)
     }
 }
 

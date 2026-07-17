@@ -66,7 +66,7 @@ use crate::test_utils::{
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
-use stark::proof::view::StarkProofView;
+use stark::proof::view::{MultiProofView, ProofViewSource};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
@@ -372,16 +372,8 @@ pub fn verify_recursion_blob<'a>(
     let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let elf_digest = statement::elf_digest(inner_elf);
 
-    let views: Vec<StarkProofView<F, E, ()>> = archived
-        .vm_proof
-        .proof
-        .proofs
-        .as_slice()
-        .iter()
-        .map(StarkProofView::Archived)
-        .collect();
     let ok = verify_proof_parts(
-        &views,
+        MultiProofView::Archived(&archived.vm_proof.proof),
         &table_counts,
         &runtime_page_ranges,
         num_private_input_pages,
@@ -924,12 +916,12 @@ pub(crate) fn compute_commit_bus_offset(
 /// Replay the prover's Phase A (main trace commitments) to recover the shared
 /// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
 /// — no `MultiProof` deserialization required either way.
-pub(crate) fn replay_transcript_phase_a_view(
+pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: impl ProofViewSource<'p, F, E, ()>,
     transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    for (air, proof) in airs.iter().zip(proofs) {
+    for (air, proof) in airs.iter().zip(proofs.view_iter()) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
         }
@@ -942,9 +934,9 @@ pub(crate) fn replay_transcript_phase_a_view(
 
 /// Computes the expected COMMIT bus balance for a proof view slice (owned or
 /// archived-in-place).
-pub(crate) fn compute_expected_commit_bus_balance_view(
+pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: impl ProofViewSource<'p, F, E, ()>,
     public_output_bytes: &[u8],
     start_index: u64,
     transcript: &mut DefaultTranscript<E>,
@@ -956,36 +948,25 @@ pub(crate) fn compute_expected_commit_bus_balance_view(
 /// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
 ///
 /// The final proof commits one local-to-global sub-table per epoch as its first
-/// `N` tables, so `final_proof.proofs[i].lde_trace_main_merkle_root` is epoch
+/// `N` tables, so `final_proof.get(i).lde_trace_main_merkle_root()` is epoch
 /// `i`'s L2G commitment. `epoch_l2g_roots[i]` is the same root as committed in
 /// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
 /// the very same L2G tables the epochs committed (shared commitments).
 ///
-/// Called by `continuation::verify_continuation`; also exercised by the
+/// `final_proof` is a [`MultiProofView`] (owned or archived-in-place), so this
+/// reads straight off either representation with no `MultiProof` deserialization.
+///
+/// Called by `continuation::verify_continuation_view`; also exercised by the
 /// local-to-global bus tests.
-pub(crate) fn verify_l2g_commitment_binding(
+pub(crate) fn verify_l2g_commitment_binding_view(
     epoch_l2g_roots: &[Commitment],
-    final_proof: &MultiProof<F, E, ()>,
+    final_proof: MultiProofView<'_, F, E, ()>,
 ) -> bool {
-    final_proof.proofs.len() >= epoch_l2g_roots.len()
+    final_proof.len() >= epoch_l2g_roots.len()
         && epoch_l2g_roots
             .iter()
             .enumerate()
-            .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
-}
-
-/// View counterpart of [`verify_l2g_commitment_binding`]: reads each global
-/// sub-table's committed root directly off a proof view (owned or
-/// archived-in-place), with no `MultiProof` deserialization either way.
-pub(crate) fn verify_l2g_commitment_binding_views(
-    epoch_l2g_roots: &[Commitment],
-    final_proof_views: &[StarkProofView<F, E, ()>],
-) -> bool {
-    final_proof_views.len() >= epoch_l2g_roots.len()
-        && epoch_l2g_roots
-            .iter()
-            .enumerate()
-            .all(|(i, root)| *final_proof_views[i].lde_trace_main_merkle_root() == *root)
+            .all(|(i, root)| *final_proof.get(i).lde_trace_main_merkle_root() == *root)
 }
 
 // =============================================================================
@@ -1278,15 +1259,8 @@ pub(crate) fn verify_prepared(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
-    let views: Vec<StarkProofView<F, E, ()>> = vm_proof
-        .proof
-        .proofs
-        .iter()
-        .map(StarkProofView::Owned)
-        .collect();
-
     verify_proof_parts(
-        &views,
+        MultiProofView::Owned(&vm_proof.proof),
         &vm_proof.table_counts,
         &vm_proof.runtime_page_ranges,
         vm_proof.num_private_input_pages,
@@ -1302,12 +1276,12 @@ pub(crate) fn verify_prepared(
 /// The single VM-proof verification implementation, given the proof's
 /// metadata fields plus an already-parsed ELF and its digest. Both
 /// [`verify_prepared`] (owned proof) and [`verify_recursion_blob`] (guest
-/// blob, zero-copy) funnel here, passing a [`StarkProofView`] slice over
-/// their respective (owned or archived) proof data — no serialization, no
+/// blob, zero-copy) funnel here, passing a [`MultiProofView`] over their
+/// respective (owned or archived) proof data — no serialization, no
 /// duplicated verification logic, and no repeated `Elf::load`/digest.
 #[allow(clippy::too_many_arguments)]
 fn verify_proof_parts(
-    proofs: &[StarkProofView<F, E, ()>],
+    proofs: MultiProofView<'_, F, E, ()>,
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     num_private_input_pages: usize,

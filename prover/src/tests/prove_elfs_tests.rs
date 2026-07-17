@@ -18,7 +18,7 @@ use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData};
 use stark::proof::options::ProofOptions;
-use stark::proof::view::StarkProofView;
+use stark::proof::view::{MultiProofView, StarkProofView};
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
@@ -3401,7 +3401,10 @@ fn test_continuation_pipeline_end_to_end() {
     // epoch proof exposed equals the per-epoch L2G sub-table root in the final proof.
     let final_proof = crate::tests::local_to_global_bus_tests::prove_global(&boundaries);
     assert!(
-        crate::verify_l2g_commitment_binding(&epoch_roots, &final_proof),
+        crate::verify_l2g_commitment_binding_view(
+            &epoch_roots,
+            MultiProofView::Owned(&final_proof)
+        ),
         "final proof must be bound to the real per-epoch L2G roots"
     );
 }
