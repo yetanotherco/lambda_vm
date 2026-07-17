@@ -401,6 +401,16 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
+        // Each query's primary evaluation point is used twice — by the DEEP
+        // reconstruction (which also needs its symmetric counterpart, the
+        // negation) and by the FRI fold check below (which needs its
+        // inverse). Compute the points once here and share them, instead of
+        // recomputing a `pow` per use (3 domain exponentiations per query).
+        let evaluation_points = challenges
+            .iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, domain))
+            .collect::<Vec<FieldElement<Field>>>();
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges,
@@ -409,6 +419,7 @@ pub trait IsStarkVerifier<
                 ood_full,
                 next_row_cols,
                 step_size,
+                &evaluation_points,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -455,13 +466,9 @@ pub trait IsStarkVerifier<
                 layout.terminal_len,
             );
 
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
-            .collect::<Vec<FieldElement<Field>>>();
-        // Any zero evaluation point means a malformed query index, reject.
+        // verify FRI — reuse the points computed above; any zero evaluation
+        // point means a malformed query index, reject.
+        let mut evaluation_point_inverse = evaluation_points;
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
         }
@@ -482,17 +489,16 @@ pub trait IsStarkVerifier<
             })
     }
 
-    /// Returns the field element element of the domain `domain` corresponding to the given FRI query index challenge `iota`.
-    /// Returns the LDE-coset element for FRI query challenge `iota`. The
-    /// `sym` flag picks the symmetric counterpart (`iota*2+1`) instead of the
-    /// primary index (`iota*2`).
+    /// Returns the primary LDE-coset element for FRI query challenge `iota`
+    /// (index `2·iota` in the bit-reversed domain). The symmetric counterpart
+    /// (index `2·iota+1`) is its negation — bit-reversed indices `2i` and
+    /// `2i+1` differ only in the top bit, i.e. by `lde_length/2`, and
+    /// `ω^(lde_length/2) = −1` — so callers negate instead of recomputing.
     fn query_challenge_to_evaluation_point(
         iota: usize,
-        sym: bool,
         domain: &VerifierDomain<Field>,
     ) -> FieldElement<Field> {
-        let raw = iota * 2 + if sym { 1 } else { 0 };
-        domain.lde_coset_element(reverse_index(raw, domain.lde_length as u64))
+        domain.lde_coset_element(reverse_index(iota * 2, domain.lde_length as u64))
     }
 
     /// Verify a row-paired `PolynomialOpenings` against `root`. The row pair
@@ -825,6 +831,11 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
+        // Primary evaluation point per query, computed once by the caller
+        // (one entry per `challenges.iotas`) and shared with the FRI fold
+        // check. Each query's symmetric point is its negation (see
+        // `query_challenge_to_evaluation_point`).
+        evaluation_points: &[FieldElement<Field>],
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -856,7 +867,7 @@ pub trait IsStarkVerifier<
             step_size,
         )?;
 
-        for (i, iota) in challenges.iotas.iter().enumerate() {
+        for i in 0..challenges.iotas.len() {
             let opening = proof.deep_poly_opening(i);
 
             // Base-field portion as two borrowed slices in commit order —
@@ -885,12 +896,12 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations_sym())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
-            let evaluation_point_sym =
-                Self::query_challenge_to_evaluation_point(*iota, true, domain);
+            let evaluation_point = evaluation_points.get(i)?;
+            // The symmetric point is the primary's negation — no second `pow`.
+            let evaluation_point_sym = -evaluation_point;
             let (evaluation, evaluation_sym) =
                 Self::reconstruct_deep_composition_poly_evaluation_pair(
-                    &evaluation_point,
+                    evaluation_point,
                     &evaluation_point_sym,
                     primitive_root,
                     challenges,

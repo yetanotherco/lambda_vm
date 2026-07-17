@@ -60,10 +60,12 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
+use crate::statement::{
+    StatementKind, absorb_continuation_global_statement_with_digest, absorb_statement_with_digest,
+};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
-use crate::tables::register;
+use crate::tables::{decode, register};
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
@@ -81,7 +83,7 @@ type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 /// bus-balance replay all seed via this so their challenges match; the seeding
 /// pins each epoch proof to its program and position (replay protection).
 fn epoch_transcript(
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
@@ -89,10 +91,10 @@ fn epoch_transcript(
     fri_final_poly_log_degree: u8,
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
         StatementKind::ContinuationEpoch { epoch_label },
-        elf_bytes,
+        elf_digest,
         public_output,
         table_counts,
         // Continuation epochs skip PAGE (the L2G bookend replaces it), so they never
@@ -107,16 +109,16 @@ fn epoch_transcript(
 /// Fresh transcript seeded with the global proof's statement (ELF + epoch count).
 /// `prove_global` and `verify_global` both seed via this so their challenges match.
 fn global_transcript(
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     num_epochs: usize,
     num_private_input_pages: usize,
     fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(
+    absorb_continuation_global_statement_with_digest(
         &mut transcript,
-        elf_bytes,
+        elf_digest,
         num_epochs,
         num_private_input_pages,
         fri_final_poly_log_degree,
@@ -412,6 +414,7 @@ fn build_epoch_airs(
     register_init: &[u32],
     reg_fini: &[u32],
     is_final: bool,
+    decode_commitment: Commitment,
 ) -> VmAirs {
     // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
     // final register file is a verifier-known public value bound by the REG-C2
@@ -427,7 +430,9 @@ fn build_epoch_airs(
         false,
         page_configs,
         table_counts,
-        None,
+        // Supplied by the caller, who computes it once per bundle: deriving it
+        // here would re-decode the ELF and re-commit the DECODE table per epoch.
+        Some(decode_commitment),
         is_final,
         None,
         None,
@@ -448,6 +453,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -480,19 +486,18 @@ fn prove_epoch(
         start.register_init,
         &reg_fini,
         is_final,
+        decode_commitment,
     );
 
     let label = start.label;
-    let seed = || {
-        epoch_transcript(
-            elf_bytes,
-            &public_output,
-            &table_counts,
-            &runtime_page_ranges,
-            label,
-            opts.fri_final_poly_log_degree,
-        )
-    };
+    let mut seed = epoch_transcript(
+        &crate::statement::elf_digest(elf_bytes),
+        &public_output,
+        &table_counts,
+        &runtime_page_ranges,
+        label,
+        opts.fri_final_poly_log_degree,
+    );
 
     let l2g_air = l2g_memory_air(opts, label);
     // Build this epoch's L2G table from the cross-epoch boundary so it is identical
@@ -504,7 +509,7 @@ fn prove_epoch(
     pairs.push((&l2g_air, &mut l2g_trace, &()));
     let proof = Prover::multi_prove(
         pairs,
-        &mut seed(),
+        &mut seed,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
@@ -538,12 +543,13 @@ fn prove_epoch(
 /// L2G root matches the claimed one.
 fn verify_epoch(
     elf: &Elf,
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     epoch: &EpochProof,
     register_init: &[u32],
     is_final: bool,
     label: u64,
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> bool {
     // Reject degenerate table counts (mirrors the monolithic verifier).
     if epoch.table_counts.validate().is_err() {
@@ -571,21 +577,23 @@ fn verify_epoch(
         register_init,
         &epoch.reg_fini,
         is_final,
+        decode_commitment,
     );
     let l2g_air = l2g_memory_air(opts, label);
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
 
-    let seed = || {
-        epoch_transcript(
-            elf_bytes,
-            &epoch.public_output,
-            &epoch.table_counts,
-            &epoch.runtime_page_ranges,
-            label,
-            opts.fri_final_poly_log_degree,
-        )
-    };
+    // One seeded transcript per epoch, cloned for the bus-balance replay —
+    // building it absorbs the statement, and the ELF digest arrives precomputed
+    // so no full-ELF Keccak runs per seed (previously two per epoch).
+    let mut seed = epoch_transcript(
+        elf_digest,
+        &epoch.public_output,
+        &epoch.table_counts,
+        &epoch.runtime_page_ranges,
+        label,
+        opts.fri_final_poly_log_degree,
+    );
 
     // Start the commit index from the carried x254 (the derived INIT), not a free
     // input — this is what binds the per-epoch commit slice to its global position.
@@ -599,13 +607,13 @@ fn verify_epoch(
         &epoch.proof,
         &epoch.public_output,
         commit_start_index,
-        &mut seed(),
+        &mut seed.clone(),
     ) {
         Some(expected) => expected,
         None => return false,
     };
 
-    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed(), &expected) {
+    if !Verifier::multi_verify(&refs, &epoch.proof, &mut seed, &expected) {
         return false;
     }
 
@@ -685,7 +693,7 @@ fn prove_global(
     Prover::multi_prove(
         pairs,
         &mut global_transcript(
-            elf_bytes,
+            &crate::statement::elf_digest(elf_bytes),
             boundaries.len(),
             num_private_input_pages,
             opts.fri_final_poly_log_degree,
@@ -702,7 +710,7 @@ fn verify_global(
     page_bases: &[u64],
     proof: &MultiProof<F, E, ()>,
     elf: &Elf,
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     num_private_input_pages: usize,
     opts: &ProofOptions,
 ) -> bool {
@@ -734,7 +742,7 @@ fn verify_global(
         &refs,
         proof,
         &mut global_transcript(
-            elf_bytes,
+            elf_digest,
             num_epochs,
             num_private_input_pages,
             opts.fri_final_poly_log_degree,
@@ -777,6 +785,11 @@ pub fn prove_continuation(
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
+
+    // The DECODE preprocessed commitment depends only on the ELF — compute it
+    // once here rather than re-deriving it per epoch inside `build_epoch_airs`.
+    let decode_commitment = decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Prover(format!("decode commitment: {e:?}")))?;
 
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
@@ -863,7 +876,16 @@ pub fn prove_continuation(
             register_init: &register_init,
             label,
         };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        let epoch = prove_epoch(
+            &elf,
+            elf_bytes,
+            &start,
+            traces,
+            is_final,
+            &boundary,
+            opts,
+            decode_commitment,
+        )?;
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -940,6 +962,19 @@ pub fn verify_continuation(
 
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
 
+    // One full-ELF Keccak for the whole bundle: every epoch transcript and the
+    // global transcript absorb the same digest (previously each `verify_epoch`
+    // hashed the entire ELF twice — once per seeded transcript).
+    let elf_digest = crate::statement::elf_digest(elf_bytes);
+
+    // Same hoist for the DECODE preprocessed commitment: it depends only on the
+    // ELF, so derive it once instead of re-decoding and re-committing the
+    // DECODE table (a full column FFT batch + Merkle) on every epoch.
+    let decode_commitment = match decode::commitment_from_elf(&elf, opts) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+
     let n = bundle.epochs.len();
     if n == 0 {
         return Ok(None);
@@ -968,12 +1003,13 @@ pub fn verify_continuation(
 
         if !verify_epoch(
             &elf,
-            elf_bytes,
+            &elf_digest,
             epoch,
             &register_init,
             is_final,
             label,
             opts,
+            decode_commitment,
         ) {
             return Ok(None);
         }
@@ -1016,7 +1052,7 @@ pub fn verify_continuation(
         &page_bases,
         &bundle.global,
         &elf,
-        elf_bytes,
+        &elf_digest,
         bundle.num_private_input_pages,
         opts,
     ) {
