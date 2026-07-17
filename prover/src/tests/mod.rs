@@ -73,6 +73,8 @@ pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
 #[cfg(test)]
+pub mod ood_window_ir_tests;
+#[cfg(test)]
 pub mod page_tests;
 #[cfg(test)]
 pub mod prove_elfs_tests;

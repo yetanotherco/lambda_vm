@@ -294,4 +294,10 @@ impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextPageConstraints
     fn max_degree(&self) -> usize {
         3
     }
+
+    fn next_row_columns(&self) -> Vec<usize> {
+        // Constraints 5-10 read the next row via `main(1, ·)`: the contiguity and
+        // domain-ordering checks (DOMAIN, ADDR_0, ADDR_1) and μ non-increasing (MU).
+        vec![cols::DOMAIN, cols::ADDR_0, cols::ADDR_1, cols::MU]
+    }
 }
