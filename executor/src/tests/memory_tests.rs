@@ -5,8 +5,8 @@ use crate::vm::memory::{Memory, MemoryError};
 #[test]
 fn test_commit_public_output_single() {
     let mut memory = Memory::default();
-    memory.store_byte(0x100, b'a');
-    memory.store_byte(0x101, b'b');
+    memory.store_byte(0x100, b'a').unwrap();
+    memory.store_byte(0x101, b'b').unwrap();
 
     memory
         .commit_public_output(0x100, 2)
@@ -23,10 +23,10 @@ fn test_commit_public_output_single() {
 #[test]
 fn test_commit_public_output_appends() {
     let mut memory = Memory::default();
-    memory.store_byte(0x100, b'a');
-    memory.store_byte(0x101, b'b');
-    memory.store_byte(0x104, b'c');
-    memory.store_byte(0x105, b'd');
+    memory.store_byte(0x100, b'a').unwrap();
+    memory.store_byte(0x101, b'b').unwrap();
+    memory.store_byte(0x104, b'c').unwrap();
+    memory.store_byte(0x105, b'd').unwrap();
 
     memory
         .commit_public_output(0x100, 2)
