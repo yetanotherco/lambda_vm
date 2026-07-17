@@ -2151,13 +2151,8 @@ mod tests {
     fn test_continuation_blob_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("all_loadstore_32");
-        let mut bundle = prove_continuation(
-            &elf_bytes,
-            &[],
-            3,
-            &crate::recursion::MIN_PROOF_OPTIONS,
-        )
-        .unwrap();
+        let mut bundle =
+            prove_continuation(&elf_bytes, &[], 3, &crate::recursion::MIN_PROOF_OPTIONS).unwrap();
         assert!(
             bundle.epochs.len() >= 2,
             "need multiple epochs to exercise the binding"
