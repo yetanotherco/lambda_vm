@@ -151,7 +151,9 @@ impl Keccak256 {
 /// [`Keccak256::finalize`] and the fixed-shape [`keccak256_pair`] so the squeeze
 /// loop lives in exactly one place. Writes into a caller-owned buffer (rather
 /// than returning `[u8; 32]`) so `finalize` fills its `output` reference in
-/// place, keeping the guest codegen identical to the pre-dedup loop.
+/// place, keeping the guest codegen identical to the pre-dedup loop. Do NOT
+/// "simplify" this to a return-value form: that shape was measured at +81k
+/// guest cycles (min preset) from the extra stack temporary it introduces.
 #[inline(always)]
 fn squeeze32_into(state: &[u64; 25], out: &mut [u8; 32]) {
     for (i, chunk) in out.chunks_exact_mut(8).enumerate() {

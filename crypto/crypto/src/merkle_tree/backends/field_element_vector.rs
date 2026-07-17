@@ -28,6 +28,17 @@ use lambda_vm_syscalls::keccak::Keccak256 as SyscallKeccak256;
 /// pure plumbing around the one permutation. Byte-identical to the generic
 /// path; every other digest / node size (and the entire host build) takes the
 /// generic path unchanged.
+///
+/// DO NOT replace this `TypeId` dispatch with a generic `Digest::finalize_into`
+/// fix "at the adapter altitude" — that exact refactor was implemented and
+/// MEASURED SLOWER on the guest across every formulation tried (best:
+/// +60k min / +1.25M blowup8 cycles, i.e. +0.5%), including `#[inline]`
+/// adapters and a check-free `AsMut` output conversion. The residual is
+/// intrinsic: `FixedOutput::finalize_into` moves the 208-byte sponge by value
+/// through the newtype + trait layer into a non-inlined cross-crate call, and
+/// without LTO the placement isn't elided; the direct branch below builds the
+/// sponge in place at the call's ABI slot. Deleting the dispatch also cannot
+/// remove the `'static` bounds — `hash_new_parent_bytes` needs them regardless.
 #[inline]
 fn hash_streamed<D: Digest + 'static, const NUM_BYTES: usize>(
     feed: impl Fn(&mut dyn FnMut(&[u8])),
