@@ -285,13 +285,13 @@ where
     let archive_bytes: &'a [u8] = recursion_archive_bytes(blob)
         .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
 
-    let archive: &'s [u8] = if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN)
-    {
-        archive_bytes
-    } else {
-        aligned_fallback.extend_from_slice(archive_bytes);
-        aligned_fallback
-    };
+    let archive: &'s [u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            aligned_fallback
+        };
     let archive_base = archive.as_ptr();
 
     let archived: &'s T = rkyv::access::<T, rkyv::rancor::Error>(archive).map_err(|e| {

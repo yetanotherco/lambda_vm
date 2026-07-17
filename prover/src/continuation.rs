@@ -2291,9 +2291,8 @@ mod tests {
 
         bundle_a.global = bundle_b.global;
 
-        let blob =
-            crate::recursion::encode_continuation_guest_input(bundle_a, &elf_bytes, &opts)
-                .expect("encode_continuation_guest_input failed");
+        let blob = crate::recursion::encode_continuation_guest_input(bundle_a, &elf_bytes, &opts)
+            .expect("encode_continuation_guest_input failed");
         let result = crate::recursion::verify_continuation_and_attest(&blob, &opts)
             .expect("verify_continuation_and_attest errored");
         assert!(
