@@ -388,6 +388,69 @@ fn test_prove_elfs_fext() {
     );
 }
 
+/// Regression: the prover must be deterministic for a fixed program.
+///
+/// `generate_lt_trace` once ordered its rows by `HashMap` iteration (per-process
+/// random), so the LT main-trace Merkle root — and thus the shared Fiat-Shamir
+/// LogUp challenges derived from all main roots — varied run to run, which made
+/// FEXT_PAGE's composition check flaky in CI. Prove `test_fext` repeatedly and
+/// require every table's committed data to match. The grinding nonce and the
+/// query openings it selects are excluded: a parallel grinding search legitimately
+/// returns different valid nonces.
+#[test]
+fn test_prover_deterministic_fext() {
+    use std::hash::{Hash, Hasher};
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+
+    let prove_core_hash = || -> u64 {
+        let mut traces =
+            Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+        let proof_options = ProofOptions::default_test_options();
+        let table_counts = traces.table_counts();
+        let airs = VmAirs::new(
+            &elf,
+            &proof_options,
+            true,
+            &traces.page_configs,
+            &table_counts,
+            None,
+            true,
+            None,
+            None,
+            None,
+        );
+        let air_trace_pairs = airs.air_trace_pairs(&mut traces);
+        let mp = multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for p in &mp.proofs {
+            // Committed data only — nonce/query_list/deep_poly_openings vary with
+            // the parallel grinding search and are intentionally excluded.
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                p.trace_length,
+                p.lde_trace_main_merkle_root,
+                p.lde_trace_aux_merkle_root,
+                p.lde_trace_precomputed_merkle_root,
+                p.trace_ood_evaluations,
+                p.composition_poly_root,
+                p.composition_poly_parts_ood_evaluation,
+                (&p.fri_layers_merkle_roots, &p.fri_final_poly_coeffs),
+            )
+            .hash(&mut h);
+        }
+        h.finish()
+    };
+
+    let baseline = prove_core_hash();
+    for i in 0..8 {
+        assert_eq!(
+            baseline,
+            prove_core_hash(),
+            "prover produced nondeterministic committed data on reprove {i}"
+        );
+    }
+}
+
 /// Basic arithmetic test with 32 instructions covering:
 /// - 64-bit ADD with positive, negative, and edge cases
 /// - 64-bit SUB with underflow, negative results
