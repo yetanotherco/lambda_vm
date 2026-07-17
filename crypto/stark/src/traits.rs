@@ -198,6 +198,27 @@ pub trait AIR: Send + Sync {
         self.trace_layout().1
     }
 
+    /// The full-width trace column indices that transition constraints read at
+    /// the *next* row (offset 1) — lambda_vm's fine-grained analogue of
+    /// Plonky3's transition window (a whole-row "does this AIR use the next
+    /// row?" flag). Only these columns need an OOD opening at `g·z`; every other
+    /// column is opened solely at `z`. The set is a public function of the AIR,
+    /// computed identically by prover and verifier, so the pruned OOD shape is
+    /// never taken from the (prover-controlled) proof.
+    ///
+    /// Indices are into the concatenated `[main | aux]` column space and must be
+    /// strictly less than `trace_layout().0 + trace_layout().1`.
+    ///
+    /// The default is **conservative**: every column is opened at the next row,
+    /// i.e. no pruning, matching the pre-pruning behaviour. An AIR that reads the
+    /// next row therefore stays correct without overriding. Override with the
+    /// exact read set only when you know which columns a transition constraint
+    /// references at offset 1 — returning too small a set is a soundness bug.
+    fn trace_ood_next_row_columns(&self) -> Vec<usize> {
+        let (main, aux) = self.trace_layout();
+        (0..main + aux).collect()
+    }
+
     fn composition_poly_degree_bound(&self, trace_length: usize) -> usize;
 
     /// Evaluates the transitions corresponding to an evaluation frame at the

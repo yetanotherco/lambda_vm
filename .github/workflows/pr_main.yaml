@@ -131,6 +131,9 @@ jobs:
       - name: Run CLI tests
         run: cargo test -p cli
 
+      - name: Run syscalls host tests (keccak differential vs sha3)
+        run: make test-syscalls
+
   # "Test" is a required check — keep this name to avoid branch protection changes.
   # This gate job passes only when CLI, executor, disk-spill, and prover tests succeed.
   test:
@@ -292,9 +295,13 @@ jobs:
           retention-days: 1
 
   test-prover:
-    name: Prover tests (fext-only experiment)
+    name: Prover tests (${{ matrix.partition }}/4)
     needs: build-prover-tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -363,11 +370,11 @@ jobs:
         with:
           name: prover-tests
 
-      - name: Run prover tests (fext only)
+      - name: Run prover tests (shard ${{ matrix.partition }}/4)
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
-            -E 'test(=tests::prove_elfs_tests::test_prove_elfs_fext)' \
+            --partition hash:${{ matrix.partition }}/4 \
             --test-threads=1
 
   test-prover-comprehensive:
