@@ -9,6 +9,47 @@ use math::{
     traits::AsBytes,
 };
 
+#[cfg(target_arch = "riscv64")]
+use crate::hash::platform_keccak::PlatformKeccak256;
+#[cfg(target_arch = "riscv64")]
+use core::any::TypeId;
+#[cfg(target_arch = "riscv64")]
+use lambda_vm_syscalls::keccak::Keccak256 as SyscallKeccak256;
+
+/// Absorb `feed`'s byte stream into a fresh `D` and return the digest as a
+/// fixed `[u8; NUM_BYTES]`.
+///
+/// On the riscv64 guest, when `D` is the platform keccak digest and the node
+/// is 32 bytes, this drives the syscall sponge directly and squeezes straight
+/// into the result array. That skips the `Digest::finalize` blanket, which
+/// allocates a zeroed `GenericArray`, has the adapter fill a local `[u8; 32]`
+/// and copy it into that `Output`, then leaves the caller to copy the `Output`
+/// once more into its own array — two 32-byte memcpys plus a 32-byte memset of
+/// pure plumbing around the one permutation. Byte-identical to the generic
+/// path; every other digest / node size (and the entire host build) takes the
+/// generic path unchanged.
+#[inline]
+fn hash_streamed<D: Digest + 'static, const NUM_BYTES: usize>(
+    feed: impl Fn(&mut dyn FnMut(&[u8])),
+) -> [u8; NUM_BYTES] {
+    #[cfg(target_arch = "riscv64")]
+    if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+        let mut hasher = SyscallKeccak256::new();
+        feed(&mut |bytes| hasher.update(bytes));
+        let mut result = [0u8; NUM_BYTES];
+        // NUM_BYTES == 32 in this branch, so the slice is exactly a [u8; 32].
+        let out: &mut [u8; 32] = (&mut result[..]).try_into().unwrap();
+        hasher.finalize(out);
+        return result;
+    }
+
+    let mut hasher = D::new();
+    feed(&mut |bytes| hasher.update(bytes));
+    let mut result_hash = [0_u8; NUM_BYTES];
+    result_hash.copy_from_slice(&hasher.finalize());
+    result_hash
+}
+
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
 /// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
 /// as it avoids Vec allocation overhead.
@@ -27,7 +68,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementPairBackend<F
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementPairBackend<F, D, NUM_BYTES>
 where
     F: IsField,
@@ -38,21 +79,17 @@ where
     type Data = [FieldElement<F>; 2];
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        input[0].stream_bytes(&mut |b| hasher.update(b));
-        input[1].stream_bytes(&mut |b| hasher.update(b));
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            input[0].stream_bytes(sink);
+            input[1].stream_bytes(sink);
+        })
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        hasher.update(left);
-        hasher.update(right);
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            sink(left);
+            sink(right);
+        })
     }
 }
 
@@ -71,7 +108,7 @@ impl<F, D: Digest, const NUM_BYTES: usize> Default for FieldElementVectorBackend
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
 where
     [u8; NUM_BYTES]: From<Output<D>>,
 {
@@ -80,15 +117,11 @@ where
     /// once, avoiding per-element allocations while staying consistent with the
     /// backend's hash function.
     pub fn hash_bytes(data: &[u8]) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        hasher.update(data);
-        let mut result = [0u8; NUM_BYTES];
-        result.copy_from_slice(&hasher.finalize());
-        result
+        hash_streamed::<D, NUM_BYTES>(|sink| sink(data))
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> FieldElementVectorBackend<F, D, NUM_BYTES>
 where
     F: IsField,
     FieldElement<F>: AsBytes,
@@ -100,17 +133,15 @@ where
     /// `hash_data(&[a, b].concat())`: the sponge absorbs the same element bytes
     /// in the same order, just without the intermediate `Vec`.
     pub fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        for element in a.iter().chain(b.iter()) {
-            element.stream_bytes(&mut |bytes| hasher.update(bytes));
-        }
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            for element in a.iter().chain(b.iter()) {
+                element.stream_bytes(sink);
+            }
+        })
     }
 }
 
-impl<F, D: Digest, const NUM_BYTES: usize> IsMerkleTreeBackend
+impl<F, D: Digest + 'static, const NUM_BYTES: usize> IsMerkleTreeBackend
     for FieldElementVectorBackend<F, D, NUM_BYTES>
 where
     F: IsField,
@@ -129,12 +160,10 @@ where
     }
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
-        let mut hasher = D::new();
-        hasher.update(left);
-        hasher.update(right);
-        let mut result_hash = [0_u8; NUM_BYTES];
-        result_hash.copy_from_slice(&hasher.finalize());
-        result_hash
+        hash_streamed::<D, NUM_BYTES>(|sink| {
+            sink(left);
+            sink(right);
+        })
     }
 }
 
