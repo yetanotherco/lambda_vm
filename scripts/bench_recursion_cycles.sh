@@ -206,7 +206,7 @@ measure_ref() {
 
   # 2a. Build the recursion guest ELF(s) (+ empty.elf inner program). GUEST_TARGET_DIR,
   # when set, shares the RV64 build dir across ref worktrees (reuses build-std).
-  echo "==> [$role] make compile-recursion-elfs @ $sha8 (this can take 10-20 min the first time) ..." >&2
+  echo "==> [$role] make compile-recursion-elfs @ $sha8 (slow the first time) ..." >&2
   local glog="$WORK/build_guest_${sha8}.log"
   local -a make_args=(compile-recursion-elfs)
   if [ -n "${GUEST_TARGET_DIR:-}" ]; then

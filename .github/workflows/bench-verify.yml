@@ -26,10 +26,9 @@ jobs:
       startsWith(github.event.comment.body, '/bench-verify') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Job cap. The verifier bench is ~5-6 min and the recursion measurement itself ~1 min,
-    # but on a cold runner the recursion BUILDS dominate: MEASURE_CLI (release cli) once,
-    # plus PER REF a guest build (~10-20 min) and a prover-test build for the blob dump.
-    # All cached in /tmp for later runs, and build-std / the host cargo target are shared
+    # Job cap. On a cold runner the recursion BUILDS dominate: MEASURE_CLI (release cli)
+    # once, plus PER REF a guest build and a prover-test build for the blob dump. All
+    # cached in /tmp for later runs, and build-std / the host cargo target are shared
     # across ref worktrees (see the recursion step's env) to keep the cold run under this
     # cap. The recursion step also has its own tighter timeout so a runaway build there
     # can't burn the whole job and lose the already-captured verifier result.
@@ -46,7 +45,7 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⏳ **Benchmark started** on the bench server. The verifier bench takes ~5 min; the recursion-guest cycle comparison then adds guest builds — a few minutes when cached, up to ~1h on a cold run. The bench server is occupied until it finishes.'
+              body: '⏳ **Benchmark started** on the bench server. The recursion-guest cycle comparison adds guest builds on top of the verifier bench, longer on a cold runner. The bench server is occupied until it finishes.'
             });
 
       - name: Resolve PR head + pair count
@@ -96,9 +95,8 @@ jobs:
       # in three regimes: `min` (blowup=2, 1 query — cheap diagnostic floor) plus the
       # realistic full-query base-layer points `blowup2` (219 queries) and `blowup4`
       # (110 queries). Each measurement is one exact `execute --cycles` reading per ref
-      # (no ABBA; the full-query executes are ~1-2 min each).
-      # Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli) once, plus
-      # per ref a guest build (~10-20 min) and a prover-test build for the blob dump; the
+      # (no ABBA). Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli)
+      # once, plus a guest build and a prover-test build for the blob dump per ref; the
       # GUEST_TARGET_DIR / HOST_TARGET_DIR below share build-std and the host cargo target
       # across the two ref worktrees so the second ref is much cheaper (and per-worktree
       # disk shrinks). continue-on-error + `!cancelled()` keep this fully isolated from the
@@ -108,11 +106,9 @@ jobs:
         id: recursion
         if: ${{ !cancelled() }}
         continue-on-error: true
-        # Fail-fast well under the 90-min job cap so a runaway recursion build can't burn
+        # Fail-fast well under the job cap so a runaway recursion build can't burn
         # the whole job and lose the already-captured verifier result (continue-on-error
-        # absorbs the timeout; the job still posts the verifier verdict). Sized with
-        # headroom over a cold shared-build run (MEASURE_CLI + 2 guest builds + 2 blob-dump
-        # builds).
+        # absorbs the timeout; the job still posts the verifier verdict).
         timeout-minutes: 70
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
@@ -128,16 +124,23 @@ jobs:
           # Full-query regimes: the realistic base-layer proofs (the single-query `min`
           # regime above is a diagnostic floor, not the real verifier cost). Guest builds
           # and worktrees are already cached from the min run, so each adds only a blob
-          # dump (a full-query prove of the empty inner program, seconds) and one
-          # ~1-2 min execute per ref. Tolerated failure (else-note): refs predating the
-          # preset-aware dump test can only measure `min`; the min table above still posts.
-          for preset in blowup2 blowup4; do
-            if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "/tmp/recursion_out_${preset}.txt"; then
-              { echo; sed -n '/=== Recursion-guest cycle/,$p' "/tmp/recursion_out_${preset}.txt"; } >> /tmp/recursion_result.txt
-            else
-              { echo; echo "_(${preset} full-query regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
-            fi
-          done
+          # dump and one execute per ref. Both refs' dump tests must understand
+          # RECURSION_DUMP_PRESET to produce a comparable blob for a given preset — until
+          # `origin/main` merges the preset-aware dump test, it can only ever dump `min`
+          # options, so every blowup2/blowup4 attempt against it would fail the same way.
+          # Check that support once, up front, instead of attempting (and failing) each
+          # preset in turn.
+          if git grep -q RECURSION_DUMP_PRESET origin/main -- prover/src/tests/ 2>/dev/null; then
+            for preset in blowup2 blowup4; do
+              if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "/tmp/recursion_out_${preset}.txt"; then
+                { echo; sed -n '/=== Recursion-guest cycle/,$p' "/tmp/recursion_out_${preset}.txt"; } >> /tmp/recursion_result.txt
+              else
+                { echo; echo "_(${preset} full-query regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
+              fi
+            done
+          else
+            { echo; echo "_(blowup2/blowup4 full-query regimes need \`origin/main\` to have the preset-aware dump test (RECURSION_DUMP_PRESET) — not merged yet, so only \`min\` is compared for this PR.)_"; } >> /tmp/recursion_result.txt
+          fi
 
       - name: Post result
         if: always()
