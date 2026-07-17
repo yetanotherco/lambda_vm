@@ -1168,6 +1168,17 @@ pub fn continuation_precomputed_commitments(
     bundle: &ContinuationProof,
     opts: &ProofOptions,
 ) -> Result<(Commitment, Vec<(u64, Commitment)>), Error> {
+    // Same bound as `verify_continuation_with_roots`: `bundle` is untrusted
+    // (rkyv-deserialized), and `num_private_input_pages` feeds a `* page_size`
+    // multiplication downstream.
+    let max_private_input_pages = page::max_private_input_pages();
+    if bundle.num_private_input_pages > max_private_input_pages {
+        return Err(Error::InvalidTableCounts(format!(
+            "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
+            bundle.num_private_input_pages
+        )));
+    }
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
