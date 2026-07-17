@@ -30,8 +30,8 @@ N_PAIRS="${3:-10}"
 TRANSFERS="${4:-100}"
 EPOCH_LOG2="${5:-20}"
 
-ELF_REL="executor/program_artifacts/rust/ethrex.elf"
-INPUT_REL="executor/tests/ethrex_bench_${TRANSFERS}.bin"
+ELF_REL="${ELF_REL:-executor/program_artifacts/rust/ethrex.elf}"
+INPUT_REL="${INPUT_REL:-executor/tests/ethrex_bench_${TRANSFERS}.bin}"
 WORK="/tmp/elf_digest_bench"
 WT="/tmp/elf_digest_wt"
 
@@ -51,14 +51,19 @@ echo "==> B (base) $REF_B -> ${SHA_B:0:10}"
 
 # --- 1. Guest ELF + fixture (built once, shared) ---
 if [ ! -f "$ELF_REL" ]; then
-  echo "==> Building ethrex guest ELF (needs sysroot)"
+  echo "==> Building guest ELF (needs sysroot): $ELF_REL"
   export SYSROOT_DIR="${SYSROOT_DIR:-$HOME/.lambda-vm-sysroot}"
   make "$ELF_REL"
 fi
 if [ ! -f "$INPUT_REL" ]; then
-  echo "==> Generating ethrex ${TRANSFERS}-transfer fixture"
-  ( cd tooling/ethrex-fixtures && cargo build --release )
-  tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TRANSFERS" "$INPUT_REL" distinct
+  if [ "$INPUT_REL" = "executor/tests/ethrex_bench_${TRANSFERS}.bin" ]; then
+    echo "==> Generating ethrex ${TRANSFERS}-transfer fixture"
+    ( cd tooling/ethrex-fixtures && cargo build --release )
+    tooling/ethrex-fixtures/target/release/ethrex-fixtures "$TRANSFERS" "$INPUT_REL" distinct
+  else
+    echo "ERROR: input fixture not found: $INPUT_REL" >&2
+    exit 1
+  fi
 fi
 ELF="$(cd "$(dirname "$ELF_REL")" && pwd)/$(basename "$ELF_REL")"
 INPUT="$(cd "$(dirname "$INPUT_REL")" && pwd)/$(basename "$INPUT_REL")"
