@@ -16,7 +16,7 @@
 //! `ContinuationProof` bundle on the same wire format
 //! (`recursion::ContinuationGuestInput`, built by
 //! `recursion::encode_continuation_guest_input`), verified via
-//! `recursion::verify_continuation_and_attest_blob` — same trust model; the
+//! `recursion::verify_continuation_and_attest` — same trust model; the
 //! bundle is materialized with one rkyv deserialize pass (zero-copy epoch
 //! verify is follow-up work).
 //!
@@ -96,10 +96,9 @@ pub fn main() -> ! {
         .expect("inner proof failed verification");
 
     #[cfg(feature = "continuation")]
-    let attestation =
-        lambda_vm_prover::recursion::verify_continuation_and_attest_blob(blob, &options)
-            .expect("verify errored")
-            .expect("inner continuation proof failed verification");
+    let attestation = lambda_vm_prover::recursion::verify_continuation_and_attest(blob, &options)
+        .expect("verify errored")
+        .expect("inner continuation proof failed verification");
 
     lambda_vm_syscalls::syscalls::commit(&attestation);
     lambda_vm_syscalls::syscalls::sys_halt();

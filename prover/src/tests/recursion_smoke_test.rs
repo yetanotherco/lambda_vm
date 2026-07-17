@@ -1000,6 +1000,14 @@ fn test_dump_recursion_input() {
 
     let blob = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
         Ok(s) => {
+            // No recursion-cont-blowup8.elf is built (RECURSION_CONT_PRESETS stops
+            // at blowup4), so this blob would have no guest to verify it.
+            assert_ne!(
+                preset,
+                Preset::Blowup8,
+                "RECURSION_DUMP_PRESET=blowup8 has no recursion-cont-blowup8.elf guest; \
+                 continuation mode only supports min|blowup2|blowup4"
+            );
             let epoch_log2: u32 = s
                 .parse()
                 .unwrap_or_else(|e| panic!("bad RECURSION_DUMP_EPOCH_LOG2 '{s}': {e}"));

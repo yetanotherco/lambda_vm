@@ -17,8 +17,8 @@
 # Usage: scripts/bench_recursion_scaling.sh [RESULTS_FILE=/tmp/recursion_scaling.txt]
 #   Env:
 #     TXS="1 4 8 16"                 block sizes (transfers); fixtures are read from
-#                                    executor/tests/ethrex_bench_<N>.bin (committed for
-#                                    1/4/8/16) and generated via tooling/ethrex-fixtures
+#                                    executor/tests/ethrex_bench_<N>.bin (only _4 is
+#                                    committed) and generated via tooling/ethrex-fixtures
 #                                    when missing.
 #     PRESETS="blowup2 blowup4 min"  verifier presets, most important first.
 #     EPOCH_LOG2=21                  inner continuation epoch size (log2 cycles).
@@ -70,9 +70,12 @@ for P in $PRESETS; do
       tooling/ethrex-fixtures/target/release/ethrex-fixtures "$N" "$FIX" distinct >&2
     fi
 
-    # Inner block cost, once per block size (cheap; repeated per preset is fine —
-    # the count is deterministic and the run takes well under a second).
-    ic="$("$CLI" execute "$ETHREX" --private-input "$FIX" --cycles | awk -F': ' '/^Cycles:/{print $2; exit}')" || true
+    # Inner block cost, once per block size (cheap; deterministic).
+    if ! ic="$("$CLI" execute "$ETHREX" --private-input "$FIX" --cycles | awk -F': ' '/^Cycles:/{print $2; exit}')" || [ -z "$ic" ]; then
+      echo "txs=$N preset=$P inner_cycles=FAILED" >> "$RESULTS"
+      echo "ERROR: [${P}/${N}tx] inner cycle measurement failed for $FIX" >&2
+      continue
+    fi
 
     echo "==> [${P}/${N}tx] proving inner continuation (epoch=2^${EPOCH_LOG2}) ..." >&2
     rm -f /tmp/recursion_input.bin
@@ -86,7 +89,12 @@ for P in $PRESETS; do
       tail -20 "$DLOG" >&2
       continue
     fi
-    epochs="$(grep -o 'continuation epochs: [0-9]*' "$DLOG" | awk '{print $3}')" || true
+    epochs="$(grep -o 'continuation epochs: [0-9]*' "$DLOG" | awk '{print $3}')"
+    if [ -z "$epochs" ]; then
+      echo "txs=$N preset=$P inner_cycles=$ic EPOCHS_PARSE_FAILED" >> "$RESULTS"
+      echo "ERROR: [${P}/${N}tx] could not parse epoch count from $DLOG" >&2
+      continue
+    fi
     BLOB="$WORK/blob_${N}tx_${P}.bin"
     mv /tmp/recursion_input.bin "$BLOB"
     sz="$(wc -c < "$BLOB" | tr -d ' ')"
