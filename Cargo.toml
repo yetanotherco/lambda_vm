@@ -29,3 +29,8 @@ debug = true
 
 # For profiling with samply/perf, build with:
 #   CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release
+
+# EXPERIMENT: codegen-units=1 to test a codegen-sensitive CI-only failure
+# (FEXT_PAGE composition). Keeps opt-level=3 (runtime perf), only slows builds.
+[profile.release]
+codegen-units = 1
