@@ -524,7 +524,6 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
-    #[inline(always)]
     pub fn len(&self) -> usize {
         match self {
             Self::Owned(p) => p.proofs.len(),
@@ -532,12 +531,10 @@ where
         }
     }
 
-    #[inline(always)]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    #[inline(always)]
     pub fn get(&self, i: usize) -> StarkProofView<'a, F, E, PI> {
         match self {
             Self::Owned(p) => StarkProofView::Owned(&p.proofs[i]),
@@ -545,68 +542,14 @@ where
         }
     }
 
-    #[inline(always)]
     pub fn last(&self) -> Option<StarkProofView<'a, F, E, PI>> {
-        match self {
-            Self::Owned(p) => p.proofs.last().map(StarkProofView::Owned),
-            Self::Archived(p) => p.proofs.as_slice().last().map(StarkProofView::Archived),
-        }
+        let len = self.len();
+        (len > 0).then(|| self.get(len - 1))
     }
 
-    /// Which representation backs this view is decided ONCE here, not
-    /// per element: the returned [`MultiProofViewIter`] drives a plain
-    /// `slice::Iter` (no per-step bounds check or `Owned`/`Archived` match
-    /// against `self` — [`Self::get`] would redo both on every step across
-    /// every one of [`crate::verifier::IsStarkVerifier::multi_verify_views`]'s
-    /// several passes over the same proof set).
-    #[inline(always)]
-    pub fn iter(&self) -> MultiProofViewIter<'a, F, E, PI> {
-        match self {
-            Self::Owned(p) => MultiProofViewIter::Owned(p.proofs.iter()),
-            Self::Archived(p) => MultiProofViewIter::Archived(p.proofs.as_slice().iter()),
-        }
-    }
-}
-
-/// [`MultiProofView::iter`]'s iterator: a plain `slice::Iter` over whichever
-/// representation the source `MultiProofView` holds, chosen once at
-/// construction. Never re-checks `Owned`-vs-`Archived` against the source
-/// enum per element, and never bounds-checks — both were the case for the
-/// `(0..len).map(|i| view.get(i))` this replaces.
-pub enum MultiProofViewIter<'a, F: IsSubFieldOf<E>, E: IsField, PI>
-where
-    F::BaseType: math::field::element::NativeArchived,
-    E::BaseType: math::field::element::NativeArchived,
-    PI: rkyv::Archive,
-    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
-{
-    Owned(std::slice::Iter<'a, StarkProof<F, E, PI>>),
-    Archived(std::slice::Iter<'a, ArchivedStarkProof<F, E, PI>>),
-}
-
-impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Iterator for MultiProofViewIter<'a, F, E, PI>
-where
-    F::BaseType: math::field::element::NativeArchived,
-    E::BaseType: math::field::element::NativeArchived,
-    PI: rkyv::Archive,
-    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
-{
-    type Item = StarkProofView<'a, F, E, PI>;
-
-    #[inline(always)]
-    fn next(&mut self) -> Option<Self::Item> {
-        match self {
-            Self::Owned(it) => it.next().map(StarkProofView::Owned),
-            Self::Archived(it) => it.next().map(StarkProofView::Archived),
-        }
-    }
-
-    #[inline(always)]
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            Self::Owned(it) => it.size_hint(),
-            Self::Archived(it) => it.size_hint(),
-        }
+    pub fn iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> + 'a {
+        let this = *self;
+        (0..this.len()).map(move |i| this.get(i))
     }
 }
 
@@ -635,11 +578,9 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
-    #[inline(always)]
     fn view_len(&self) -> usize {
         self.len()
     }
-    #[inline(always)]
     fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
         self.iter().copied()
     }
@@ -653,11 +594,9 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
-    #[inline(always)]
     fn view_len(&self) -> usize {
         self.len()
     }
-    #[inline(always)]
     fn view_iter(&self) -> impl Iterator<Item = StarkProofView<'a, F, E, PI>> {
         self.iter().copied()
     }
