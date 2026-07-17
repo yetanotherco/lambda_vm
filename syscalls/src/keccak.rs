@@ -123,8 +123,9 @@ impl Keccak256 {
                 }
             } else {
                 // Byte-wise fallback for misaligned input. A middle path that
-                // assembled each lane with `from_le_bytes` (three formulations,
-                // dropped commit f6d575ed) measured +4.7% cycles: on this
+                // assembled each lane with `from_le_bytes` was tried in three
+                // formulations and measured +4.7% cycles at the blowup8 preset
+                // (see PR #847's measurement notes): on this
                 // 1-cycle-per-instruction VM the extra shifts/ORs cost more than
                 // the byte loop they replace, so don't re-propose it.
                 self.absorb_byte(input[0]);
@@ -211,7 +212,8 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 #[cfg(all(test, not(target_arch = "riscv64")))]
 mod tests {
     use super::*;
-    use rand::{Rng, SeedableRng, rngs::StdRng};
+    use rand::{Rng, SeedableRng};
+    use rand_chacha::ChaCha8Rng;
     use sha3::{Digest, Keccak256 as RefKeccak256};
 
     fn reference(input: &[u8]) -> [u8; 32] {
@@ -240,7 +242,7 @@ mod tests {
     #[test]
     fn chunked_misaligned_updates_match_reference() {
         let data: Vec<u8> = (0..1500).map(|i| (i * 131 + 17) as u8).collect();
-        let mut rng = StdRng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
+        let mut rng = ChaCha8Rng::seed_from_u64(0x9E37_79B9_7F4A_7C15);
         for case in 0..300 {
             let len = rng.random_range(0..data.len());
             let start = rng.random_range(0..data.len() - len + 1);
@@ -266,7 +268,7 @@ mod tests {
     /// The fixed-shape parent path must equal hashing the 64-byte concatenation.
     #[test]
     fn pair_matches_reference() {
-        let mut rng = StdRng::seed_from_u64(0xD1B5_4A32_D192_ED03);
+        let mut rng = ChaCha8Rng::seed_from_u64(0xD1B5_4A32_D192_ED03);
         for case in 0..64 {
             let mut left = [0u8; 32];
             let mut right = [0u8; 32];

@@ -297,7 +297,8 @@ check-ethrex-fixture-checksums:
 # entrypoints/allocator that assemble only for the guest target — see the root
 # Cargo.toml exclude), so the root `cargo test` never reaches its host
 # differential tests (the keccak sponge vs sha3 reference). Run them explicitly
-# in the crate dir; wired into `test` below so CI exercises them.
+# in the crate dir; wired into `test` below and run as a dedicated step
+# in CI's cli-test job (pr_main.yaml).
 test-syscalls:
 	cd syscalls && cargo test
 

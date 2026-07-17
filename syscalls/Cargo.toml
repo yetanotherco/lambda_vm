@@ -14,4 +14,6 @@ rand = "0.9.2"
 
 [dev-dependencies]
 keccak = "0.1"
+# Stable stream across versions (unlike StdRng), so fuzz-case seeds stay reproducible.
+rand_chacha = "0.9"
 sha3 = "0.10"

@@ -134,6 +134,7 @@ dependencies = [
  "keccak",
  "lazy_static",
  "rand",
+ "rand_chacha",
  "riscv",
  "sha3",
  "thiserror",

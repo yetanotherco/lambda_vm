@@ -32,7 +32,7 @@ use lambda_vm_syscalls::keccak::Keccak256 as SyscallKeccak256;
 /// DO NOT replace this `TypeId` dispatch with a generic `Digest::finalize_into`
 /// fix "at the adapter altitude" — that exact refactor was implemented and
 /// MEASURED SLOWER on the guest across every formulation tried (best:
-/// +60k min / +1.25M blowup8 cycles, i.e. +0.5%), including `#[inline]`
+/// +60k min = +0.14%, +1.25M blowup8 = +0.48%), including `#[inline]`
 /// adapters and a check-free `AsMut` output conversion. The residual is
 /// intrinsic: `FixedOutput::finalize_into` moves the 208-byte sponge by value
 /// through the newtype + trait layer into a non-inlined cross-crate call, and
