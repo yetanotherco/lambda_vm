@@ -115,7 +115,7 @@ extern "C" __global__ void logup_term_ext3(
 // Accumulated column (K4): running sum of the term columns, on device.
 //   row_sum[i] = sum over all term columns of term[col][i]
 //   S = inclusive prefix scan of row_sum ;  L = S[n-1] ;  offset = L / N
-//   acc[i] = S[i] - (i+1) * offset          (matches build_accumulated_column_from_terms)
+//   acc[i] = S[i-1] - i * offset  (acc[0]=0)  (matches build_accumulated_column_from_terms)
 // Additive 3-phase Hillis-Steele scan (mirrors inverse.cu, add not mul).
 // ===========================================================================
 
@@ -193,7 +193,10 @@ extern "C" __global__ void logup_apply_offsets_add_ext3(
   scan_inout[o + 2] = v.c;
 }
 
-// acc[i] = scan[i] - (i+1) * (L * inv_N), L = scan[n-1]. inv_N is ext3 (1/N).
+// Forward accumulation (matches build_accumulated_column_from_terms):
+//   acc[i] = scan_exclusive[i] - i * (L * inv_N), L = scan[n-1], inv_N = 1/N.
+// scan is the INCLUSIVE prefix scan, so scan_exclusive[i] = scan[i-1] and
+// acc[0] = 0. This is the exclusive-scan analogue of the old inclusive form.
 extern "C" __global__ void logup_finalize_accum_ext3(
     const uint64_t *__restrict__ scan, uint64_t n, uint64_t inv0, uint64_t inv1,
     uint64_t inv2, uint64_t *__restrict__ acc) {
@@ -203,8 +206,11 @@ extern "C" __global__ void logup_finalize_accum_ext3(
   uint64_t lo = (n - 1) * 3;
   Fe3 L = make(scan[lo], scan[lo + 1], scan[lo + 2]);
   Fe3 offset = mul(L, make(inv0, inv1, inv2));
-  Fe3 s = make(scan[i * 3], scan[i * 3 + 1], scan[i * 3 + 2]);
-  Fe3 a = sub(s, mul_base(offset, i + 1));
+  // Exclusive prefix: row 0 has no predecessor, so acc[0] = 0.
+  Fe3 s = (i == 0) ? zero()
+                   : make(scan[(i - 1) * 3], scan[(i - 1) * 3 + 1],
+                          scan[(i - 1) * 3 + 2]);
+  Fe3 a = sub(s, mul_base(offset, i));
   acc[i * 3] = a.a;
   acc[i * 3 + 1] = a.b;
   acc[i * 3 + 2] = a.c;

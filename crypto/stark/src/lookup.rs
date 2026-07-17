@@ -1003,6 +1003,19 @@ where
         self.trace_layout
     }
 
+    fn trace_ood_next_row_columns(&self) -> Vec<usize> {
+        // The only transition constraint that reads the next row is the circular
+        // LogUp accumulator, and after forward accumulation it reads only the
+        // accumulated column there (all committed terms and absorbed operands
+        // read the current row). Its full-width index is the main width plus the
+        // accumulated column's aux index. No interactions => no next-row reads.
+        if self.auxiliary_trace_build_data.interactions.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.trace_layout.0 + self.logup.acc_column_idx]
+        }
+    }
+
     fn has_trace_interaction(&self) -> bool {
         !self.auxiliary_trace_build_data.interactions.is_empty()
     }
@@ -1266,17 +1279,17 @@ where
         pub_inputs: &Self::PublicInputs,
         rap_challenges: &[FieldElement<E>],
         _bus_public_inputs: Option<&BusPublicInputs<E>>,
-        trace_length: usize,
+        _trace_length: usize,
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
 
-        // Pin acc[N-1] = 0 to remove the constant-shift degree of freedom
-        // in the circular transition constraint.
+        // Pin acc[0] = 0 to remove the constant-shift degree of freedom in the
+        // circular transition constraint (forward accumulation starts at 0).
         if !self.auxiliary_trace_build_data.interactions.is_empty() {
             let acc_col_idx = self.trace_layout.1 - 1; // last aux column = accumulated
             boundary_constraints.push(BoundaryConstraint::new_aux(
                 acc_col_idx,
-                trace_length - 1,
+                0,
                 FieldElement::zero(),
             ));
         }
@@ -1718,9 +1731,10 @@ where
 
 /// Builds the circular accumulated column from pre-computed term columns.
 ///
-/// For the circular constraint: acc[(i+1) mod N] - acc[i] - terms[(i+1) mod N] + L/N = 0
-/// We build: acc[0] = terms[0] - L/N, acc[i] = acc[i-1] + terms[i] - L/N
-/// Result: acc[N-1] = L - N*(L/N) = 0
+/// For the circular constraint: acc[(i+1) mod N] - acc[i] - terms[i] + L/N = 0
+/// (forward accumulation: the increment at transition i→i+1 uses the CURRENT
+/// row's terms). We build: acc[0] = 0, acc[i] = acc[i-1] + terms[i-1] - L/N.
+/// Result: the running sum returns to acc[0] since Σterms - N*(L/N) = 0.
 ///
 /// Returns L (table_contribution = sum of all terms across all rows).
 fn build_accumulated_column_from_terms<F, E>(
@@ -1751,15 +1765,17 @@ where
     let n = FieldElement::<E>::from(trace_len as u64);
     let offset_per_row = &table_contribution * n.inv().unwrap();
 
-    // Build circular accumulated column
+    // Build circular accumulated column (forward accumulation: write acc[row]
+    // BEFORE folding in the current row's terms, so acc[0] = 0 and
+    // acc[row+1] - acc[row] = row_sum[row] - L/N).
     let mut accumulated = FieldElement::<E>::zero();
     for row in 0..trace_len {
+        trace.set_aux(row, acc_column_idx, accumulated.clone());
         let mut row_sum = FieldElement::<E>::zero();
         for col in term_columns {
             row_sum = row_sum + &col[row];
         }
         accumulated = &accumulated + &row_sum - &offset_per_row;
-        trace.set_aux(row, acc_column_idx, accumulated.clone());
     }
 
     #[cfg(feature = "instruments")]
@@ -2156,9 +2172,12 @@ where
 }
 
 /// Emit the accumulated constraint (with 1–2 absorbed interactions).
-/// `acc_curr` reads row 0; `acc_next`,
-/// the committed-term sum and the absorbed fingerprints/multiplicities all read
-/// the NEXT row (offset 1).
+/// `acc_next` reads the NEXT row (offset 1) — the *only* next-row read in the
+/// whole constraint system. `acc_curr`, the committed-term sum and the absorbed
+/// fingerprints/multiplicities all read the CURRENT row (offset 0), so the
+/// forward recurrence is `acc[i+1] − acc[i] = Σterms[i] + absorbed[i] − L/N`.
+/// Keeping every non-`acc` operand on the current row lets the OOD opening send
+/// only `acc` at `g·z`, not the whole trace width.
 ///
 /// - 1 absorbed: `(acc_next − acc_curr − Σterms + L/N)·f − sign·m` (degree 2)
 /// - 2 absorbed: `(…)·f₁·f₂ − sign₁·m₁·f₂ − sign₂·m₂·f₁` (degree 3)
@@ -2171,30 +2190,33 @@ where
     let acc_curr = b.aux(0, layout.acc_column_idx);
     let acc_next = b.aux(1, layout.acc_column_idx);
 
-    // delta = acc_next − acc_curr − Σ committed_terms(next) + L/N
+    // delta = acc_next − acc_curr − Σ committed_terms(curr) + L/N.
+    // Committed terms read the current row (offset 0) so that `acc_next` is the
+    // sole next-row operand (see the doc comment).
     let mut delta = acc_next - acc_curr;
     for i in 0..layout.num_term_columns {
-        delta = delta - b.aux(1, i);
+        delta = delta - b.aux(0, i);
     }
     delta = delta + b.table_offset();
 
     let absorbed = layout.absorbed();
     let root = match absorbed.len() {
         1 => {
-            // delta · f − sign · m
-            let m = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
-            let f = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
+            // delta · f − sign · m; absorbed operands read the current row.
+            let m = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 0);
+            let f = emit_fingerprint::<F, E, B>(b, &absorbed[0], 0);
             let mt = if absorbed[0].is_sender { m } else { -m };
             // delta · f is ext; `mt` is base. The tower only implements base −
             // ext (base operand LEFT), so write `delta·f − mt` as `−(mt − delta·f)`.
             -(mt - delta * f)
         }
         2 => {
-            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1
-            let m1 = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 1);
-            let m2 = emit_multiplicity::<F, E, B>(b, &absorbed[1].multiplicity, 1);
-            let f1 = emit_fingerprint::<F, E, B>(b, &absorbed[0], 1);
-            let f2 = emit_fingerprint::<F, E, B>(b, &absorbed[1], 1);
+            // delta · f1 · f2 − sign1·m1·f2 − sign2·m2·f1; absorbed operands
+            // read the current row (offset 0).
+            let m1 = emit_multiplicity::<F, E, B>(b, &absorbed[0].multiplicity, 0);
+            let m2 = emit_multiplicity::<F, E, B>(b, &absorbed[1].multiplicity, 0);
+            let f1 = emit_fingerprint::<F, E, B>(b, &absorbed[0], 0);
+            let f2 = emit_fingerprint::<F, E, B>(b, &absorbed[1], 0);
 
             let term1 = m1 * f2.clone();
             let term1 = if absorbed[0].is_sender { term1 } else { -term1 };
@@ -2324,7 +2346,7 @@ mod logup_single_source_tests {
     //! (verifier) — all bit-for-bit.
     //!
     //! Coverage: the accumulated constraint's 1-absorbed AND 2-absorbed branches
-    //! (the latter reads `aux(1, ·)` next-row cells), the batched-term
+    //! (the latter folds two absorbed interactions, degree 3), the batched-term
     //! constraint, and every [`Packing`] variant's fingerprint contribution.
     use super::*;
     use crate::constraint_ir::{eval_program, eval_program_verifier};
@@ -2373,6 +2395,52 @@ mod logup_single_source_tests {
             Fp::from(rng.next_u64()),
             Fp::from(rng.next_u64()),
         ])
+    }
+
+    /// Forward-accumulation contract for [`build_accumulated_column_from_terms`]:
+    /// `acc[0] = 0` and the circular recurrence tied to the CURRENT row's terms
+    /// holds on EVERY row, including the wraparound (which closes the cycle back
+    /// to `acc[0]`). This is the invariant the OOD pruning relies on — only
+    /// `acc` is read at the next row; every term is read at the current row.
+    #[test]
+    fn accumulated_column_is_forward_and_circular() {
+        let mut rng = SplitMix64::new(0xC0FF_EE12_3456_789A);
+        let n_rows = 8usize;
+        let n_term_cols = 2usize;
+
+        let term_columns: Vec<Vec<Fp3>> = (0..n_term_cols)
+            .map(|_| (0..n_rows).map(|_| rand_fp3(&mut rng)).collect())
+            .collect();
+
+        // Accumulated column follows the committed term columns.
+        let acc_col_idx = n_term_cols;
+        let mut trace = TraceTable::<Gl, Ext3>::new_main(vec![Fp::zero(); n_rows], 1, 1);
+        trace.allocate_aux_table(n_term_cols + 1);
+
+        let l = build_accumulated_column_from_terms(acc_col_idx, &term_columns, &mut trace);
+
+        // Forward accumulation starts at zero.
+        assert_eq!(
+            *trace.get_aux(0, acc_col_idx),
+            Fp3::zero(),
+            "acc[0] must be 0 under forward accumulation"
+        );
+
+        // Circular recurrence tied to the CURRENT row's terms, on every row.
+        // Multiplied through by N to avoid dividing L by N:
+        //   (acc[(i+1) mod N] - acc[i]) * N == (Σ terms[i]) * N - L
+        let n_fe = Fp3::from(n_rows as u64);
+        for i in 0..n_rows {
+            let mut row_sum = Fp3::zero();
+            for col in &term_columns {
+                row_sum = row_sum + &col[i];
+            }
+            let acc_i = *trace.get_aux(i, acc_col_idx);
+            let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
+            let lhs = (acc_next - acc_i) * &n_fe;
+            let rhs = row_sum * &n_fe - &l;
+            assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");
+        }
     }
 
     /// The permanent regression check for one layout, on `TRIALS` random
