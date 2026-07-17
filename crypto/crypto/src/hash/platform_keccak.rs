@@ -11,6 +11,15 @@ mod imp {
     };
     use lambda_vm_syscalls::keccak::Keccak256 as SyscallKeccak256;
 
+    // INVARIANT (load-bearing): this adapter must remain a PURE PASSTHROUGH of
+    // `SyscallKeccak256`. The TypeId specializations in
+    // crypto/crypto/src/merkle_tree/backends/field_element_vector.rs bypass it
+    // and drive the syscall sponge directly, on the assumption that both paths
+    // hash identically. Adding ANY behavior here (a domain prefix, extra
+    // absorption, a different reset policy) silently desyncs the specialized
+    // branches from the generic path — and the failure surfaces as in-guest
+    // proof rejection, not as a host test failure.
+
     #[derive(Clone, Default)]
     pub struct PlatformKeccak256(SyscallKeccak256);
 
