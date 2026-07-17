@@ -2818,7 +2818,7 @@ fn test_verify_rejects_num_private_input_pages_exceeds_max() {
     let vm_proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove should succeed");
 
     let tampered = crate::VmProof {
-        num_private_input_pages: 1000,
+        num_private_input_pages: crate::tables::page::max_private_input_pages() + 1,
         ..vm_proof
     };
 

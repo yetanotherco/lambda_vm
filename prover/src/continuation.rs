@@ -1497,7 +1497,7 @@ mod tests {
 
     // The deserialized-count bound is the tight honest max: exactly the pages a MAX-size
     // input occupies, with no slack. Pin the value and the tightness (checked via the byte
-    // span so we don't allocate a 64 MiB test input).
+    // span so we don't allocate a 512 MiB test input).
     #[test]
     fn test_max_private_input_pages_is_tight() {
         use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
