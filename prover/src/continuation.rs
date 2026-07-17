@@ -1497,16 +1497,16 @@ mod tests {
 
     // The deserialized-count bound is the tight honest max: exactly the pages a MAX-size
     // input occupies, with no slack. Pin the value and the tightness (checked via the byte
-    // span so we don't allocate a 64 MiB test input).
+    // span so we don't allocate a 512 MiB test input).
     #[test]
     fn test_max_private_input_pages_is_tight() {
         use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
         let page_size = page::DEFAULT_PAGE_SIZE;
         let max = page::max_private_input_pages();
 
-        // (64 MiB + 4-byte prefix) / 256 KiB page = 257 pages (256 full data pages plus
+        // (512 MiB + 4-byte prefix) / 256 KiB page = 2049 pages (2048 full data pages plus
         // the one page the length prefix spills into). Pinned so a size/page change is caught.
-        assert_eq!(max, 257);
+        assert_eq!(max, 2049);
 
         // No slack: an honest MAX-size input needs the whole last page (the bound is not
         // padded), and never overflows into an extra one.
