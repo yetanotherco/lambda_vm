@@ -187,3 +187,158 @@ fn fext_load_rejects_non_canonical_coefficient() {
         );
     }
 }
+
+// Differential tests for the exact syscall sequences the in-guest STARK verifier
+// emits through `crypto::field_ext::Fp3Fma` (`ext_mul` and the `prod_acc`
+// resident accumulator). Those guest impls call `fext_load`/`fext_fma`/
+// `fext_store` and are `#[cfg(target_arch = "riscv64")]`, so they cannot run on
+// host; here we replay the same handle choreography against the real executor
+// and compare to a math-crate oracle. Keep these in sync with the sequences in
+// `crypto/crypto/src/field_ext.rs`.
+
+// Handles mirror `field_ext.rs`; only pairwise distinctness and "H_ZERO is never
+// loaded" (so it reads as the extension zero) actually matter here.
+const H_A: u64 = 0;
+const H_B: u64 = 1;
+const H_C: u64 = 2;
+const H_OUT: u64 = 3;
+const H_ZERO: u64 = 4;
+const H_T: u64 = 5;
+const H_ACC0: u64 = 6;
+const H_ACC1: u64 = 7;
+
+/// One `a*b*c` term of a `prod_acc` chain.
+type ProdTerm = ([u64; 3], [u64; 3], [u64; 3]);
+
+/// Dependency-free deterministic SplitMix64, used to draw random canonical Fp3
+/// coefficients without pulling `rand` into dev-dependencies.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn next_u64(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Canonical (`< p`) coefficients, the only form `fext_load` accepts.
+    fn coeffs(&mut self) -> [u64; 3] {
+        [
+            self.next_u64() % GOLDILOCKS_PRIME,
+            self.next_u64() % GOLDILOCKS_PRIME,
+            self.next_u64() % GOLDILOCKS_PRIME,
+        ]
+    }
+}
+
+/// Independent reference for `sum_i a_i * b_i * c_i` over Fp3 (the value the
+/// `prod_acc` chain computes).
+fn reference_prod_sum(terms: &[ProdTerm]) -> [u64; 3] {
+    let to_fp3 = |x: [u64; 3]| {
+        Fp3::from_raw([
+            GoldilocksElement::from(x[0]),
+            GoldilocksElement::from(x[1]),
+            GoldilocksElement::from(x[2]),
+        ])
+    };
+    let mut acc = Fp3::zero();
+    for (a, b, c) in terms {
+        acc += to_fp3(*a) * to_fp3(*b) * to_fp3(*c);
+    }
+    let v = acc.value();
+    [
+        v[0].canonical_u64(),
+        v[1].canonical_u64(),
+        v[2].canonical_u64(),
+    ]
+}
+
+/// Replays `Fp3Fma::prod_acc_{new,add,finish}` against the real executor and
+/// returns the stored accumulator coefficients.
+fn run_prod_acc_chain(terms: &[ProdTerm]) -> [u64; 3] {
+    let mut memory = Memory::default();
+    // prod_acc_new: zero the starting buffer (it is written across chains).
+    run_load(&mut memory, H_ACC0, [0, 0, 0]).unwrap();
+    let mut buf = 0u8;
+    for (a, b, c) in terms {
+        // prod_acc_add
+        run_load(&mut memory, H_A, *a).unwrap();
+        run_load(&mut memory, H_B, *b).unwrap();
+        run_load(&mut memory, H_C, *c).unwrap();
+        run_fma(&mut memory, H_T, H_A, H_B, H_ZERO); // tmp = a * b
+        let (cur, alt) = if buf == 0 {
+            (H_ACC0, H_ACC1)
+        } else {
+            (H_ACC1, H_ACC0)
+        };
+        run_fma(&mut memory, alt, H_T, H_C, cur); // alt = tmp * c + cur
+        buf ^= 1;
+    }
+    // prod_acc_finish
+    let cur = if buf == 0 { H_ACC0 } else { H_ACC1 };
+    memory.field_load(cur)
+}
+
+#[test]
+fn fext_ext_mul_via_unwritten_zero_matches_reference() {
+    // Replays `Fp3Fma::ext_mul`: fma(a, b, H_ZERO) with H_ZERO never loaded, so
+    // the accumulator input reads as zero and the result is a*b.
+    let mut rng = SplitMix64(0xF00D_BEEF);
+    for _ in 0..100 {
+        let (a, b) = (rng.coeffs(), rng.coeffs());
+        let mut memory = Memory::default();
+        run_load(&mut memory, H_A, a).unwrap();
+        run_load(&mut memory, H_B, b).unwrap();
+        run_fma(&mut memory, H_OUT, H_A, H_B, H_ZERO);
+        assert_eq!(
+            memory.field_load(H_OUT),
+            reference_fma(a, b, [0, 0, 0]),
+            "a={a:?} b={b:?}"
+        );
+    }
+}
+
+#[test]
+fn fext_prod_acc_chain_matches_reference() {
+    // Fixed chains covering the buffer-toggle boundaries: empty (finish reads the
+    // freshly zeroed H_ACC0), length 1 (ends on H_ACC1), length 2 (ends back on
+    // H_ACC0), length 3 (ends on H_ACC1), including a wrap-around coefficient.
+    let fixed: &[&[ProdTerm]] = &[
+        &[],
+        &[([1, 2, 3], [4, 5, 6], [7, 8, 9])],
+        &[
+            ([1, 2, 3], [4, 5, 6], [7, 8, 9]),
+            ([10, 0, 1], [0, 2, 0], [3, 3, 3]),
+        ],
+        &[
+            ([1, 0, 0], [0, 1, 0], [0, 0, 1]),
+            ([2, 2, 2], [1, 1, 1], [9, 0, 9]),
+            ([GOLDILOCKS_PRIME - 1, 0, 0], [2, 0, 0], [1, 1, 1]),
+        ],
+    ];
+    for terms in fixed {
+        assert_eq!(
+            run_prod_acc_chain(terms),
+            reference_prod_sum(terms),
+            "fixed chain len {}",
+            terms.len()
+        );
+    }
+
+    // Random chains of varying length exercise both toggle directions broadly.
+    let mut rng = SplitMix64(0x1234_5678);
+    for len in 0..=6usize {
+        for _ in 0..20 {
+            let terms: Vec<_> = (0..len)
+                .map(|_| (rng.coeffs(), rng.coeffs(), rng.coeffs()))
+                .collect();
+            assert_eq!(
+                run_prod_acc_chain(&terms),
+                reference_prod_sum(&terms),
+                "random chain len {len}"
+            );
+        }
+    }
+}

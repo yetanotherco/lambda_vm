@@ -8,6 +8,7 @@ compile_error!("the `disk-spill` feature requires memmap2, which does not compil
 extern crate alloc;
 
 pub mod fiat_shamir;
+pub mod field_ext;
 pub mod hash;
 pub mod merkle_tree;
 #[cfg(feature = "disk-spill")]

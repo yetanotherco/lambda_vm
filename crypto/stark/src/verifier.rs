@@ -16,6 +16,7 @@ use crate::{
     },
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
+use crypto::field_ext::Fp3Fma;
 use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
@@ -37,7 +38,7 @@ use std::time::Instant;
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > {
     phantom: PhantomData<(Field, FieldExtension, PI)>,
@@ -45,7 +46,7 @@ pub struct Verifier<
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    FieldExtension: IsField + Send + Sync + Fp3Fma,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 where
@@ -117,7 +118,7 @@ compile_error!("the zero-copy STARK verifier requires a little-endian target");
 /// downstream check — no serialization, no duplicated logic.
 pub trait IsStarkVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > where
     Field::BaseType: math::field::element::NativeArchived,
@@ -895,13 +896,31 @@ pub trait IsStarkVerifier<
                     base_row_sum += base_at(col_idx) * coeff;
                     base_row_sum_sym += base_at_sym(col_idx) * coeff;
                 } else {
+                    // Ext × ext products route through the FEXT accelerator on the
+                    // guest (`fma` is `a*b + c`, identical to `+= a*b` on host).
                     let aux_idx = col_idx - num_base;
-                    base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                    base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                    base_row_sum = FieldExtension::fma(
+                        &lde_trace_aux_evaluations[aux_idx],
+                        coeff,
+                        &base_row_sum,
+                    );
+                    base_row_sum_sym = FieldExtension::fma(
+                        &lde_trace_aux_evaluations_sym[aux_idx],
+                        coeff,
+                        &base_row_sum_sym,
+                    );
                 }
             }
-            trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
-            trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
+            trace_term = FieldExtension::fma(
+                &denoms_trace[row_idx],
+                &(&base_row_sum - ood_row_sum),
+                &trace_term,
+            );
+            trace_term_sym = FieldExtension::fma(
+                &denoms_trace_sym[row_idx],
+                &(&base_row_sum_sym - ood_row_sum),
+                &trace_term_sym,
+            );
         }
 
         let number_of_parts = query_invariant_terms.number_of_parts;
