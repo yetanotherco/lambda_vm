@@ -267,6 +267,39 @@ pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
     Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
 }
 
+/// Validate a recursion-input blob's wire prefix and bytecheck-validate its
+/// archive, in place. Shared by [`verify_recursion_blob`] and
+/// [`crate::recursion::verify_continuation_and_attest`].
+///
+/// Returns the archived value, the original (possibly-unaligned) archive
+/// bytes, and the base pointer `archived` reads from — callers rebasing
+/// zero-copy subslices back onto `blob` need that base.
+pub(crate) fn access_recursion_archive<'s, 'a: 's, T>(
+    blob: &'a [u8],
+    aligned_fallback: &'s mut rkyv::util::AlignedVec<RECURSION_INPUT_ALIGN>,
+) -> Result<(&'s T, &'a [u8], *const u8), Error>
+where
+    T: rkyv::Portable
+        + for<'b> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'b, rkyv::rancor::Error>>,
+{
+    let archive_bytes: &'a [u8] = recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+
+    let archive: &'s [u8] = if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN)
+    {
+        archive_bytes
+    } else {
+        aligned_fallback.extend_from_slice(archive_bytes);
+        aligned_fallback
+    };
+    let archive_base = archive.as_ptr();
+
+    let archived: &'s T = rkyv::access::<T, rkyv::rancor::Error>(archive).map_err(|e| {
+        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
+    })?;
+    Ok((archived, archive_bytes, archive_base))
+}
+
 /// Result of a recursion-blob verification: the verdict plus the inner
 /// proof's committed public output (zero-copy from the blob), which the
 /// recursion guest folds into `program_id(...) ‖ public_output`.
@@ -310,31 +343,15 @@ pub fn verify_recursion_blob<'a>(
 ) -> Result<RecursionVerification<'a>, Error> {
     use rkyv::rancor::Error as RkyvError;
 
-    // Validate + strip the aligning magic/version prefix. In the guest the
-    // returned slice starts at the 16-aligned archive base (the prefix exists
-    // precisely so the archive lands aligned at
+    // In the guest the blob's archive starts at the 16-aligned archive base
+    // (the wire prefix exists precisely so the archive lands aligned at
     // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
-    // loads do not trap.
-    let archive_bytes = recursion_archive_bytes(blob)
-        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
-
-    // A host caller's buffer carries no alignment guarantee (`Vec<u8>` is
-    // align-1) — in-place access there would be UB. Fall back to one aligned
-    // copy when the base is misaligned; the guest path is aligned by
-    // construction and stays zero-copy.
-    let mut aligned_fallback = rkyv::util::AlignedVec::<{ RECURSION_INPUT_ALIGN }>::new();
-    let archive: &[u8] = if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN)
-    {
-        archive_bytes
-    } else {
-        aligned_fallback.extend_from_slice(archive_bytes);
-        &aligned_fallback
-    };
-
-    // `blob` is untrusted; validate before the zero-copy access.
-    let archived = rkyv::access::<ArchivedGuestInput, RkyvError>(archive).map_err(|e| {
-        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
-    })?;
+    // loads do not trap. A host caller's buffer carries no such guarantee
+    // (`Vec<u8>` is align-1), so `access_recursion_archive` falls back to one
+    // aligned copy in `aligned_fallback` when the base is misaligned.
+    let mut aligned_fallback = rkyv::util::AlignedVec::<RECURSION_INPUT_ALIGN>::new();
+    let (archived, archive_bytes, archive_base): (&ArchivedGuestInput, &[u8], *const u8) =
+        access_recursion_archive(blob, &mut aligned_fallback)?;
 
     // Materialize only the small metadata; the proof stays in the buffer.
     let table_counts: TableCounts =
@@ -356,11 +373,11 @@ pub fn verify_recursion_blob<'a>(
     let public_output: &[u8] = archived.vm_proof.public_output.as_slice();
     let decode_commitment: Commitment = archived.decode_commitment;
 
-    // Rebase the returned slices onto the caller's buffer: `archive` may be
-    // the aligned fallback copy, whose lifetime ends with this call. Same
-    // bytes at the same offsets in both buffers.
+    // Rebase the returned slices onto the caller's buffer: `archived` may
+    // point into the aligned fallback copy, whose lifetime ends with this
+    // call. Same bytes at the same offsets in both buffers.
     let rebase = |s: &[u8]| -> &'a [u8] {
-        let offset = s.as_ptr() as usize - archive.as_ptr() as usize;
+        let offset = s.as_ptr() as usize - archive_base as usize;
         &archive_bytes[offset..offset + s.len()]
     };
     let inner_elf_rebased = rebase(inner_elf);

@@ -314,7 +314,7 @@ pub fn verify_continuation_and_attest(
     let decode_commitment: Commitment = archived.decode_commitment;
     let inner_elf: &[u8] = archived.inner_elf.as_slice();
 
-    let Some(public_output) = crate::continuation::verify_continuation_archived(
+    let Some((public_output, entry_point)) = crate::continuation::verify_continuation_archived(
         &archived.bundle,
         inner_elf,
         proof_options,
@@ -325,7 +325,9 @@ pub fn verify_continuation_and_attest(
         return Ok(None);
     };
 
-    let id = program_id_from_elf(inner_elf, &decode_commitment, &page_commitments)?;
+    // Avoids a second `Elf::load` (already done by `verify_continuation_archived`).
+    let digest = elf_digest(inner_elf);
+    let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
     let mut attestation = id.to_vec();
     attestation.extend_from_slice(&public_output);
     Ok(Some(attestation))

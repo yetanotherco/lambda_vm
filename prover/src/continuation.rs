@@ -1179,13 +1179,14 @@ pub fn verify_continuation_with_roots(
     decode_commitment: Option<Commitment>,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<Option<Vec<u8>>, Error> {
-    verify_continuation_view(
+    let result = verify_continuation_view(
         ContinuationProofView::Owned(bundle),
         elf_bytes,
         opts,
         decode_commitment,
         page_genesis_commitments,
-    )
+    )?;
+    Ok(result.map(|(public_output, _entry_point)| public_output))
 }
 
 /// [`verify_continuation_with_roots`]'s zero-copy counterpart, for the
@@ -1193,13 +1194,16 @@ pub fn verify_continuation_with_roots(
 /// place via [`ContinuationProofView::Archived`] instead of deserializing an
 /// owned [`MultiProof`]. Only small per-epoch metadata is materialized. Roots
 /// are always supplied here (the guest never recomputes from the ELF in-VM).
+///
+/// Also returns `entry_point` so callers can fold a `program_id` via
+/// [`crate::recursion::program_id_from_digest`] without a second `Elf::load`.
 pub(crate) fn verify_continuation_archived(
     archived: &ArchivedContinuationProof,
     elf_bytes: &[u8],
     opts: &ProofOptions,
     decode_commitment: Commitment,
     page_genesis_commitments: &[(u64, Commitment)],
-) -> Result<Option<Vec<u8>>, Error> {
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
     verify_continuation_view(
         ContinuationProofView::Archived(archived),
         elf_bytes,
@@ -1213,13 +1217,14 @@ pub(crate) fn verify_continuation_archived(
 /// [`verify_continuation_archived`] (archived), operating on a
 /// [`ContinuationProofView`] rather than either's concrete type — the same
 /// split [`crate::verify_recursion_blob`] uses for the monolithic path.
+/// Returns the public output plus `entry_point` (see [`verify_continuation_archived`]).
 fn verify_continuation_view(
     bundle: ContinuationProofView<'_>,
     elf_bytes: &[u8],
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
-) -> Result<Option<Vec<u8>>, Error> {
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
     // Bound the claimed private-input page count before using it to size/allocate AIRs
     // (mirrors `verify_with_options`). The count is also bound into the global proof's
     // Fiat-Shamir statement (`absorb_continuation_global_statement`), so any wrong value
@@ -1342,7 +1347,7 @@ fn verify_continuation_view(
         return Ok(None);
     }
 
-    Ok(Some(public_output))
+    Ok(Some((public_output, elf.entry_point)))
 }
 
 /// Precompute the ELF-derived roots [`verify_continuation_with_roots`] accepts:
@@ -2153,10 +2158,11 @@ mod tests {
         );
     }
 
-    // Negative: corrupting an epoch's claimed L2G table root must be rejected —
-    // `verify_l2g_commitment_binding_view` compares each epoch's `l2g_root` against the
-    // corresponding sub-proof root in the global proof, so a mismatched root causes
-    // the binding to fail. Guards the L2G root↔global commitment binding.
+    // Negative: corrupting an epoch's claimed L2G table root must be rejected. This
+    // tamper is caught by `verify_epoch`'s own root-consistency check (the epoch's
+    // claimed `l2g_root` no longer matches what its own proof committed) before the
+    // cross-epoch `verify_l2g_commitment_binding_view` ever runs — see
+    // `test_split_verify_rejects_global_proof_from_a_different_run` for that.
     #[test]
     fn test_split_verify_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -2177,9 +2183,8 @@ mod tests {
 
     // Same tamper as `test_split_verify_rejects_tampered_l2g_root`, but through the
     // zero-copy blob path (`verify_continuation_and_attest`) rather than
-    // `verify_continuation`. Guards `verify_continuation_archived`'s view-based
-    // `verify_l2g_commitment_binding_view` against the same corruption its owned
-    // counterpart already catches.
+    // `verify_continuation`. Guards the archived path's per-epoch root check against
+    // the same corruption the owned path already catches.
     #[test]
     fn test_continuation_blob_rejects_tampered_l2g_root() {
         let _ = env_logger::builder().is_test(true).try_init();
@@ -2207,6 +2212,93 @@ mod tests {
         assert!(
             result.is_none(),
             "a tampered l2g_root must be rejected over the archived blob path too"
+        );
+    }
+
+    // Negative: `verify_l2g_commitment_binding_view`'s own reject branch, which the two
+    // tests above don't reach (they're caught earlier by `verify_epoch`'s per-epoch root
+    // check). Two bundles proved from the same ELF/epoch size with different
+    // same-length private inputs share every shape value (`n`, `table_counts`,
+    // `touched_page_bases`, `num_private_input_pages`) but commit different actual L2G
+    // data, so splicing one's `global` proof onto the other's epochs leaves every
+    // per-epoch check and `verify_global`'s own `multi_verify` passing (each half is
+    // independently valid for that exact shape) while the per-epoch claimed roots no
+    // longer match what the spliced-in global proof's L2G sub-tables actually commit.
+    #[test]
+    fn test_split_verify_rejects_global_proof_from_a_different_run() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = ProofOptions::default_test_options();
+
+        let input_a: Vec<u8> = (0u8..16).collect();
+        let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
+
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_a, &opts)
+                .unwrap()
+                .is_some(),
+            "bundle_a must verify standalone before splicing"
+        );
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_b, &opts)
+                .unwrap()
+                .is_some(),
+            "bundle_b must verify standalone before splicing"
+        );
+        assert_eq!(
+            bundle_a.epochs.len(),
+            bundle_b.epochs.len(),
+            "same ELF/epoch size/input length must yield the same epoch split"
+        );
+        assert_eq!(
+            bundle_a.touched_page_bases, bundle_b.touched_page_bases,
+            "same-length private inputs must touch the same pages"
+        );
+        assert_ne!(
+            bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root,
+            "different private-input bytes must commit different L2G data"
+        );
+
+        bundle_a.global = bundle_b.global;
+
+        assert!(
+            verify_continuation(&elf_bytes, &bundle_a, &opts)
+                .unwrap()
+                .is_none(),
+            "a global proof spliced in from a different run must be rejected"
+        );
+    }
+
+    // Same construction as `test_split_verify_rejects_global_proof_from_a_different_run`,
+    // but through the zero-copy blob path — guards
+    // `verify_l2g_commitment_binding_view`'s archived call site.
+    #[test]
+    fn test_continuation_blob_rejects_global_proof_from_a_different_run() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_private_input_xpage");
+        let opts = crate::recursion::MIN_PROOF_OPTIONS;
+
+        let input_a: Vec<u8> = (0u8..16).collect();
+        let input_b: Vec<u8> = (0u8..16).map(|b| b ^ 0xFF).collect();
+
+        let mut bundle_a = prove_continuation(&elf_bytes, &input_a, 2, &opts).unwrap();
+        let bundle_b = prove_continuation(&elf_bytes, &input_b, 2, &opts).unwrap();
+        assert_eq!(bundle_a.epochs.len(), bundle_b.epochs.len());
+        assert_eq!(bundle_a.touched_page_bases, bundle_b.touched_page_bases);
+        assert_ne!(bundle_a.epochs[0].l2g_root, bundle_b.epochs[0].l2g_root);
+
+        bundle_a.global = bundle_b.global;
+
+        let blob =
+            crate::recursion::encode_continuation_guest_input(bundle_a, &elf_bytes, &opts)
+                .expect("encode_continuation_guest_input failed");
+        let result = crate::recursion::verify_continuation_and_attest(&blob, &opts)
+            .expect("verify_continuation_and_attest errored");
+        assert!(
+            result.is_none(),
+            "a global proof spliced in from a different run must be rejected over the archived blob path too"
         );
     }
 }
