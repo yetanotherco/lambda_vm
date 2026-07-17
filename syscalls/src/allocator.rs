@@ -1,7 +1,10 @@
 use embedded_alloc::TlsfHeap as Heap;
 use riscv as _;
 
-#[global_allocator]
+// Only the guest routes Rust allocations through this heap; on host (e.g.
+// `cargo test` for the sponge's differential tests) the attribute would hijack
+// the test harness's allocator with a never-initialized heap and abort.
+#[cfg_attr(target_arch = "riscv64", global_allocator)]
 static HEAP: Heap = Heap::empty();
 
 const MAX_MEMORY_SIZE: usize = 0xC000_0000;
