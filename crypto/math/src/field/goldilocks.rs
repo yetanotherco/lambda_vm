@@ -221,9 +221,11 @@ fn reduce128(x: u128) -> u64 {
 ///
 /// # Safety
 /// Caller must ensure x + y < 2^64 + ORDER.
+// EXPERIMENT (codegen-sensitive CI failure): x86 inline-asm variant disabled so the
+// portable path is used on x86_64 too. Revert (restore `target_arch = "x86_64"`) if CI stays red.
 #[inline(always)]
-#[cfg(target_arch = "x86_64")]
-unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
+#[cfg(any())]
+unsafe fn add_no_canonicalize_trashing_input_asm(x: u64, y: u64) -> u64 {
     let res_wrapped: u64;
     let adjustment: u64;
     unsafe {
@@ -241,7 +243,6 @@ unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
 }
 
 #[inline(always)]
-#[cfg(not(target_arch = "x86_64"))]
 unsafe fn add_no_canonicalize_trashing_input(x: u64, y: u64) -> u64 {
     let (res_wrapped, carry) = x.overflowing_add(y);
     res_wrapped.wrapping_add(EPSILON * (carry as u64))
