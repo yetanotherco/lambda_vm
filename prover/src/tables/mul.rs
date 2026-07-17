@@ -303,7 +303,10 @@ pub fn generate_mul_trace(
         }
     }
 
-    let unique_ops: Vec<_> = op_map.into_iter().collect();
+    // Canonical row order: HashMap iteration order is per-process random, so
+    // sort to keep the committed trace deterministic across runs.
+    let mut unique_ops: Vec<_> = op_map.into_iter().collect();
+    unique_ops.sort_unstable_by_key(|(op, _)| (op.lhs, op.lhs_signed, op.rhs, op.rhs_signed));
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
         crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
