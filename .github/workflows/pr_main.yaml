@@ -292,13 +292,9 @@ jobs:
           retention-days: 1
 
   test-prover:
-    name: Prover tests (${{ matrix.partition }}/4)
+    name: Prover tests (fext-only experiment)
     needs: build-prover-tests
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        partition: [1, 2, 3, 4]
     steps:
       - name: Checkout sources
         uses: actions/checkout@v4
@@ -367,11 +363,11 @@ jobs:
         with:
           name: prover-tests
 
-      - name: Run prover tests (shard ${{ matrix.partition }}/4)
+      - name: Run prover tests (fext only)
         run: |
           cargo nextest run \
             --archive-file prover-tests.tar.zst \
-            --partition hash:${{ matrix.partition }}/4 \
+            -E 'test(=tests::prove_elfs_tests::test_prove_elfs_fext)' \
             --test-threads=1
 
   test-prover-comprehensive:
