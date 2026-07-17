@@ -641,7 +641,7 @@ recursion/aggregation layer (deferred).
   `prove_and_verify_continuation` (the thin integrated wrapper).
 - `prover/src/lib.rs` — `verify_l2g_commitment_binding` (epoch L2G root ↔ global
   sub-table root) and the commit-bus offset/balance helpers
-  (`compute_commit_bus_offset`, `compute_expected_commit_bus_balance`) that take the
+  (`compute_commit_bus_offset`, `compute_expected_commit_bus_balance_view`) that take the
   carried x254 as `start_index`.
 - `prover/src/tables/trace_builder.rs` — seeds `current_commit_index` from x254
   (`read_index`) so committed-byte indexing carries across epochs.

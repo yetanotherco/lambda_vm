@@ -228,8 +228,10 @@ pub fn verify_and_attest_blob(
 /// by the bundle and the PAGE roots replaced by the global-memory genesis
 /// roots (see [`crate::continuation::continuation_precomputed_commitments`]).
 /// Rkyv-archived on the same magic-prefixed wire format as the monolithic
-/// blob ([`crate::encode_recursion_input`]); the guest is feature-pinned to
-/// one layout, and a blob of the other kind fails the bytecheck validation.
+/// blob ([`crate::encode_recursion_input`]), distinguished by the prefix's
+/// kind byte ([`crate::RECURSION_INPUT_KIND_CONTINUATION`]): each guest feature
+/// is pinned to one layout, and a blob of the other kind fails the prefix
+/// check deterministically, before any archive access.
 #[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ContinuationGuestInput {
     pub bundle: crate::continuation::ContinuationProof,
@@ -260,7 +262,7 @@ pub fn encode_continuation_guest_input(
     let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
     blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
     blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
-    blob.extend_from_slice(&[0u8; 4]); // reserved
+    blob.extend_from_slice(&[crate::RECURSION_INPUT_KIND_CONTINUATION, 0, 0, 0]); // kind + reserved
     debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
     blob.extend_from_slice(&archive);
     Ok(blob)
@@ -275,6 +277,10 @@ pub fn encode_continuation_guest_input(
 /// [`crate::continuation::continuation_precomputed_commitments`] over the
 /// bundle it holds — the touched-page set is bundle-dependent, unlike the
 /// monolithic path's ELF-only page set.
+///
+/// Host-side counterpart of [`verify_continuation_and_attest_blob`], kept for
+/// API symmetry with the monolithic [`verify_and_attest_blob`]/owned pair;
+/// the guest entry point is the `_blob` variant.
 pub fn verify_continuation_and_attest(
     bundle: &crate::continuation::ContinuationProof,
     elf_bytes: &[u8],
@@ -310,11 +316,13 @@ pub fn verify_continuation_and_attest_blob(
 ) -> Result<Option<Vec<u8>>, Error> {
     use rkyv::rancor::Error as RkyvError;
 
-    let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
-        Error::Execution(String::from(
-            "continuation recursion blob: bad magic or version",
-        ))
-    })?;
+    let archive_bytes =
+        crate::recursion_archive_bytes_for_kind(blob, crate::RECURSION_INPUT_KIND_CONTINUATION)
+            .ok_or_else(|| {
+                Error::Execution(String::from(
+                    "continuation recursion blob: bad magic, version, or layout kind",
+                ))
+            })?;
     // Host callers' Vec<u8> carries no alignment guarantee; the guest slice is
     // aligned by construction (same prefix arithmetic as the monolithic blob).
     let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();

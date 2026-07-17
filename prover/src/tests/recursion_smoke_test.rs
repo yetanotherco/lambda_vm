@@ -594,6 +594,101 @@ fn test_recursion_continuation_blob_decodes_and_verifies_on_host() {
     );
 }
 
+/// Continuation analog of [`test_recursion_rejects_corrupted_commitment`]:
+/// verifying an honest bundle against a corrupted DECODE root must fail
+/// (`Ok(None)`), not silently accept.
+#[test]
+fn test_recursion_continuation_rejects_corrupted_commitment() {
+    let root = workspace_root();
+    let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
+    let inner_input = 10u64.to_le_bytes();
+
+    let bundle = crate::continuation::prove_continuation(
+        &fib_elf_bytes,
+        &inner_input,
+        4,
+        &MIN_PROOF_OPTIONS,
+    )
+    .expect("continuation prove should succeed");
+    let (mut decode_commitment, page_commitments) =
+        crate::continuation::continuation_precomputed_commitments(
+            &fib_elf_bytes,
+            &bundle,
+            &MIN_PROOF_OPTIONS,
+        )
+        .expect("continuation_precomputed_commitments errored");
+    decode_commitment[0] ^= 0xFF;
+
+    let verdict = crate::continuation::verify_continuation_with_roots(
+        &fib_elf_bytes,
+        &bundle,
+        &MIN_PROOF_OPTIONS,
+        Some(decode_commitment),
+        Some(&page_commitments),
+    )
+    .expect("verify errored");
+    assert!(
+        verdict.is_none(),
+        "corrupted decode_commitment must be rejected, not silently accepted"
+    );
+}
+
+/// The prefix kind byte must discriminate the two guest layouts
+/// deterministically: a continuation blob is rejected by the monolithic
+/// verifier and vice versa, at the prefix stage (`Err`), before any archive
+/// access — no reliance on the rkyv bytecheck happening to fail.
+#[test]
+fn test_recursion_blob_kind_byte_discriminates_layouts() {
+    let root = workspace_root();
+    let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
+    let inner_input = 10u64.to_le_bytes();
+
+    // An honest continuation blob (kind = CONTINUATION).
+    let bundle = crate::continuation::prove_continuation(
+        &fib_elf_bytes,
+        &inner_input,
+        4,
+        &MIN_PROOF_OPTIONS,
+    )
+    .expect("continuation prove should succeed");
+    let continuation_blob =
+        recursion::encode_continuation_guest_input(bundle, &fib_elf_bytes, &MIN_PROOF_OPTIONS)
+            .expect("encode_continuation_guest_input failed");
+
+    // The continuation verifier accepts its own kind...
+    recursion::verify_continuation_and_attest_blob(&continuation_blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_continuation_and_attest_blob errored")
+        .expect("honest continuation blob must verify");
+    // ...but the monolithic verifier rejects it at the prefix check.
+    assert!(
+        recursion::verify_and_attest_blob(&continuation_blob, &MIN_PROOF_OPTIONS).is_err(),
+        "monolithic verifier must reject a continuation blob at the prefix stage"
+    );
+
+    // And the converse: a monolithic blob is rejected by the continuation verifier.
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
+    let (_vm_proof, monolithic_blob) = prove_inner_and_encode_blob(
+        "kind-discriminate",
+        &empty_elf_bytes,
+        &[],
+        &MIN_PROOF_OPTIONS,
+    );
+    assert!(
+        recursion::verify_continuation_and_attest_blob(&monolithic_blob, &MIN_PROOF_OPTIONS)
+            .is_err(),
+        "continuation verifier must reject a monolithic blob at the prefix stage"
+    );
+
+    // Flipping an honest continuation blob's kind byte to MONOLITHIC makes the
+    // continuation verifier reject its own otherwise-valid blob.
+    let mut tampered = continuation_blob;
+    tampered[8] = crate::RECURSION_INPUT_KIND_MONOLITHIC;
+    assert!(
+        recursion::verify_continuation_and_attest_blob(&tampered, &MIN_PROOF_OPTIONS).is_err(),
+        "continuation verifier must reject a blob whose kind byte was tampered"
+    );
+}
+
 /// Corrupting a private-input commitment on an *honest* proof makes
 /// verification fail (`Ok(false)`). Necessary but not sufficient alone — a
 /// custom prover can supply consistent mismatched roots (see
