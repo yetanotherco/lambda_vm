@@ -149,25 +149,62 @@ where
     acc
 }
 
-/// Evaluation of the constraint's zerofier at some point `z`, which may be in
-/// a field extension. Equal to `1/(zᴺ − 1)` ×
-/// [`end_exemptions_correction`]`(meta.end_exemptions, …)`.
-pub fn evaluate_zerofier<F, E>(
-    meta: &ConstraintMeta,
-    z: &FieldElement<E>,
-    trace_primitive_root: &FieldElement<F>,
-    trace_length: usize,
-) -> FieldElement<E>
-where
-    F: IsSubFieldOf<E>,
-    E: IsField,
-{
-    let end_exemptions_eval =
-        end_exemptions_correction(meta.end_exemptions, z, trace_primitive_root, trace_length);
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField;
+    use math::field::goldilocks::GoldilocksField;
 
-    // 1/(z^N − 1), times the end-exemptions correction.
-    (-FieldElement::<F>::one() + z.pow(trace_length))
-        .inv()
-        .unwrap()
-        * &end_exemptions_eval
+    type F = GoldilocksField;
+    type E = Degree3GoldilocksExtensionField;
+
+    /// The exempt-row product `∏(z − gⁱ)` over the last `end_exemptions` rows
+    /// (indices `N−e .. N−1`), derived directly from `gⁱ` — the value
+    /// [`end_exemptions_correction`] must equal. Independent of its backward
+    /// `g⁻¹` walk, so a mismatch catches an error in that root derivation.
+    fn exempt_product(
+        end_exemptions: usize,
+        z: &FieldElement<E>,
+        g: &FieldElement<F>,
+        n: usize,
+    ) -> FieldElement<E> {
+        let mut acc = FieldElement::<E>::one();
+        for i in (n - end_exemptions)..n {
+            // `-(gⁱ − z) = z − gⁱ`, keeping the ops subfield − superfield to
+            // match the production body.
+            acc *= -(g.pow(i) - *z);
+        }
+        acc
+    }
+
+    #[test]
+    fn correction_matches_direct_exempt_product_over_cubic_extension() {
+        let n = 16usize;
+        let g = F::get_primitive_root_of_unity(n.trailing_zeros() as u64).unwrap();
+        // A point off the trace domain, genuinely inside the cubic extension.
+        let z = FieldElement::<E>::new([
+            FieldElement::<F>::from(7u64),
+            FieldElement::<F>::from(3u64),
+            FieldElement::<F>::from(1u64),
+        ]);
+
+        // 0 → one() (no exemptions); 1..=3 exercise the multi-group fold the
+        // verifier drives, one distinct `end_exemptions` per group.
+        for end_exemptions in 0..=3usize {
+            let got = end_exemptions_correction::<F, E>(end_exemptions, &z, &g, n);
+            let want = exempt_product(end_exemptions, &z, &g, n);
+            assert_eq!(got, want, "mismatch for end_exemptions = {end_exemptions}");
+        }
+    }
+
+    #[test]
+    fn correction_with_no_exemptions_is_one() {
+        let n = 8usize;
+        let g = F::get_primitive_root_of_unity(n.trailing_zeros() as u64).unwrap();
+        let z = FieldElement::<E>::from(5u64);
+        assert_eq!(
+            end_exemptions_correction::<F, E>(0, &z, &g, n),
+            FieldElement::<E>::one()
+        );
+    }
 }
