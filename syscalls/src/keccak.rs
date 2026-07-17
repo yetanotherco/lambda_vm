@@ -209,6 +209,13 @@ pub fn keccak256_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
 /// software `keccak::f1600` here (see `keccak_permute` above); on-guest the
 /// end-to-end oracle is proof-blob acceptance (any digest difference diverges
 /// the Fiat-Shamir transcript and fails verification loudly).
+///
+/// What these tests do NOT cover: the `keccak_permute` ecall itself and the
+/// `#[cfg(target_arch = "riscv64")]` specialized call sites (the Merkle
+/// backends' TypeId branches) — those are validated only by the blob oracle.
+/// The generic-vs-specialized equivalence additionally rests on
+/// `PlatformKeccak256` staying a pure passthrough of this sponge; see the
+/// INVARIANT note in crypto/crypto/src/hash/platform_keccak.rs.
 #[cfg(all(test, not(target_arch = "riscv64")))]
 mod tests {
     use super::*;
@@ -261,6 +268,41 @@ mod tests {
                 out,
                 reference(slice),
                 "chunked digest mismatch: case={case} start={start} len={len}"
+            );
+        }
+    }
+
+    /// Structural (allocator-independent) coverage of BOTH absorb paths. The
+    /// other tests feed `Vec<u8>` slices, whose base alignment is up to the
+    /// allocator — on current platforms they happen to be 8-aligned, so the
+    /// whole-lane fast path is exercised only by luck. Here a `repr(align(8))`
+    /// buffer GUARANTEES the aligned fast path, and a +1-offset view of the
+    /// same bytes GUARANTEES the byte-wise fallback, across all padding
+    /// boundaries.
+    #[test]
+    fn aligned_and_misaligned_paths_match_reference() {
+        #[repr(align(8))]
+        struct Aligned([u8; 3 * RATE_BYTES + 9]);
+
+        let mut buf = Aligned([0u8; 3 * RATE_BYTES + 9]);
+        for (i, b) in buf.0.iter_mut().enumerate() {
+            *b = (i * 131 + 17) as u8;
+        }
+        assert_eq!(buf.0.as_ptr() as usize % 8, 0, "repr(align(8)) must hold");
+
+        for len in [0, 1, 7, 8, 9, 63, 64, 135, 136, 137, 271, 272, 273, 400] {
+            let aligned = &buf.0[..len];
+            assert_eq!(keccak256(aligned), reference(aligned), "aligned len={len}");
+            let misaligned = &buf.0[1..1 + len];
+            assert_eq!(
+                misaligned.as_ptr() as usize % 8,
+                1,
+                "offset view must be misaligned"
+            );
+            assert_eq!(
+                keccak256(misaligned),
+                reference(misaligned),
+                "misaligned len={len}"
             );
         }
     }
