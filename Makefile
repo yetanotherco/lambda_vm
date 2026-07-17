@@ -1,7 +1,7 @@
 .PHONY: deps deps-linux deps-macos compile-programs-asm compile-programs-rust compile-bench \
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
-test-rust test-ethrex test-executor test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
+test-rust test-ethrex test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
@@ -293,7 +293,15 @@ update-ethrex-fixture-checksums:
 check-ethrex-fixture-checksums:
 	python3 tooling/ethrex-fixtures/update_readme_checksums.py --check
 
-test: compile-programs
+# The syscalls crate is excluded from the workspace (riscv-only bare-metal
+# entrypoints/allocator that assemble only for the guest target — see the root
+# Cargo.toml exclude), so the root `cargo test` never reaches its host
+# differential tests (the keccak sponge vs sha3 reference). Run them explicitly
+# in the crate dir; wired into `test` below so CI exercises them.
+test-syscalls:
+	cd syscalls && cargo test
+
+test: compile-programs test-syscalls
 	cargo test
 
 # === Quick test shortcuts ===
