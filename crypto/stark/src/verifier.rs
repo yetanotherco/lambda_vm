@@ -359,21 +359,18 @@ pub trait IsStarkVerifier<
             }
         }
 
-        let transition_c_i_evaluations_sum = grouped_numerator_sums
-            .into_iter()
-            .fold(
-                FieldElement::zero(),
-                |acc, (end_exemptions, numerator_sum)| {
-                    let correction = crate::constraints::zerofier::end_exemptions_correction(
-                        end_exemptions,
-                        &challenges.z,
-                        &domain.trace_primitive_root,
-                        trace_length,
-                    );
-                    acc + correction * numerator_sum
-                },
-            )
-            * inv_zerofier_denominator;
+        let transition_c_i_evaluations_sum = grouped_numerator_sums.into_iter().fold(
+            FieldElement::zero(),
+            |acc, (end_exemptions, numerator_sum)| {
+                let correction = crate::constraints::zerofier::end_exemptions_correction(
+                    end_exemptions,
+                    &challenges.z,
+                    &domain.trace_primitive_root,
+                    trace_length,
+                );
+                acc + correction * numerator_sum
+            },
+        ) * inv_zerofier_denominator;
 
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
