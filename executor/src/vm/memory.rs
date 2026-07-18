@@ -38,6 +38,56 @@ impl BuildHasher for U64BuildHasher {
 
 pub type U64HashMap<V> = HashMap<u64, V, U64BuildHasher>;
 
+/// DJB2 hasher for the page map's keys. `U64Hasher`'s identity hash collapses
+/// hashbrown's SwissTable tag byte (the top 7 bits of the hash) whenever keys
+/// are small or share high bits — e.g. sequential page indices — degrading
+/// every probe to a full equality check and causing multi-hundred-second
+/// slowdowns on large maps. DJB2 is cheap (a handful of ALU ops) yet spreads
+/// bits enough to avoid that pathology; kept separate from `U64Hasher` so
+/// other identity-hash consumers (e.g. the pc-keyed instruction map) are
+/// unaffected.
+#[derive(Clone, Copy)]
+pub struct Djb2Hasher(u64);
+
+impl Default for Djb2Hasher {
+    #[inline]
+    fn default() -> Self {
+        Djb2Hasher(5381)
+    }
+}
+
+impl Hasher for Djb2Hasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = self.0.wrapping_mul(33).wrapping_add(b as u64);
+        }
+    }
+
+    #[inline]
+    fn write_u64(&mut self, i: u64) {
+        self.write(&i.to_le_bytes());
+    }
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Default, Clone)]
+pub struct Djb2BuildHasher;
+
+impl BuildHasher for Djb2BuildHasher {
+    type Hasher = Djb2Hasher;
+    #[inline]
+    fn build_hasher(&self) -> Djb2Hasher {
+        Djb2Hasher::default()
+    }
+}
+
+type Djb2HashMap<V> = HashMap<u64, V, Djb2BuildHasher>;
+
 /// Total cap on public output bytes across all `commit_public_output` calls.
 /// The COMMIT AIR concatenates calls via the running `x254` index, so this
 /// is enforced as a running-total budget rather than a per-call limit.
@@ -56,21 +106,25 @@ pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
 /// Page size for the whole address space's paged backing store. Memory is
-/// backed by a `HashMap<page index, Box<[u8; MEMORY_PAGE_SIZE]>>` instead of
-/// one hashmap entry per 4-byte word, so growing/rehashing that table only
-/// ever moves 8-byte box pointers, never page bytes themselves. Chosen to
-/// match the prover's `DEFAULT_PAGE_SIZE` concept (`prover/src/tables/page.rs`);
+/// backed by a `HashMap<page-aligned address, Box<[u8; MEMORY_PAGE_SIZE]>>`
+/// instead of one hashmap entry per 4-byte word, so growing/rehashing that
+/// table only ever moves 8-byte box pointers, never page bytes themselves.
+/// Matches the prover's `DEFAULT_PAGE_SIZE` (`prover/src/tables/page.rs`);
 /// redeclared locally since the executor must not depend on the prover crate.
-const MEMORY_PAGE_SIZE: usize = 4 * 1024;
+const MEMORY_PAGE_SIZE: usize = 256 * 1024;
 
+/// Keyed by the page-aligned base address rather than a page index: keying
+/// by a small sequential index collapsed the SwissTable tag byte (see
+/// [`Djb2Hasher`]), which the address's full bit spread avoids independently
+/// of the hash function.
 #[inline]
-fn page_index(address: u64) -> u64 {
-    address / MEMORY_PAGE_SIZE as u64
+fn page_base(address: u64) -> u64 {
+    address & !(MEMORY_PAGE_SIZE as u64 - 1)
 }
 
 #[inline]
 fn page_offset(address: u64) -> usize {
-    (address % MEMORY_PAGE_SIZE as u64) as usize
+    (address & (MEMORY_PAGE_SIZE as u64 - 1)) as usize
 }
 
 /// Allocates a zero-filled page using fallible allocation, so a guest driving
@@ -90,14 +144,14 @@ fn try_allocate_page() -> Result<Box<[u8; MEMORY_PAGE_SIZE]>, MemoryError> {
 #[derive(Default, Debug, Clone)]
 pub struct Memory {
     /// Whole-address-space backing store, paged at [`MEMORY_PAGE_SIZE`]
-    /// granularity: key is the page index (`address / MEMORY_PAGE_SIZE`),
+    /// granularity: key is the page-aligned base address (see [`page_base`]),
     /// value is a heap-boxed page. Only the boxed pointer lives in the
     /// hashmap's table slot, so table growth/rehashing moves 8-byte
     /// pointers, never page contents. Pages are allocated lazily,
     /// zero-filled, on first write. Private input is just memory written at
     /// a fixed high address (see [`PRIVATE_INPUT_START_INDEX`]) — it isn't
     /// special-cased at this layer.
-    pages: U64HashMap<Box<[u8; MEMORY_PAGE_SIZE]>>,
+    pages: Djb2HashMap<Box<[u8; MEMORY_PAGE_SIZE]>>,
     /// Bytes committed to public output via `commit_public_output`. The
     /// COMMIT AIR doesn't write to a fixed memory region (it streams bytes
     /// onto the Commit bus by `index`), so this buffer is purely the
@@ -125,13 +179,13 @@ impl Memory {
 
     pub fn load_byte(&self, address: u64) -> u8 {
         self.pages
-            .get(&page_index(address))
+            .get(&page_base(address))
             .map(|p| p[page_offset(address)])
             .unwrap_or(0)
     }
 
     pub fn store_byte(&mut self, address: u64, value: u8) -> Result<(), MemoryError> {
-        let idx = page_index(address);
+        let idx = page_base(address);
         let off = page_offset(address);
         let page = self.get_or_insert_page(idx)?;
         page[off] = value;
@@ -143,8 +197,7 @@ impl Memory {
     /// contribute nothing, matching bytes never having been written). Used
     /// to snapshot memory at an epoch boundary.
     pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
-        self.pages.iter().flat_map(|(&idx, page)| {
-            let base = idx * MEMORY_PAGE_SIZE as u64;
+        self.pages.iter().flat_map(|(&base, page)| {
             page.iter().enumerate().map(move |(i, &b)| (base + i as u64, b))
         })
     }
@@ -153,7 +206,7 @@ impl Memory {
         if address.is_multiple_of(4) {
             // `MEMORY_PAGE_SIZE` is a multiple of 4, so a 4-aligned word
             // address never straddles a page boundary.
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let bytes = self
                 .pages
@@ -179,7 +232,7 @@ impl Memory {
     pub fn store_word(&mut self, address: u64, value: u32) -> Result<(), MemoryError> {
         let bytes = value.to_le_bytes();
         if address.is_multiple_of(4) {
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let page = self.get_or_insert_page(idx)?;
             page[off..off + 4].copy_from_slice(&bytes);
@@ -198,7 +251,7 @@ impl Memory {
             // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't
             // overflow. `MEMORY_PAGE_SIZE` is a multiple of 8, so an 8-aligned
             // doubleword never straddles a page boundary.
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let (low, high) = self
                 .pages
@@ -231,7 +284,7 @@ impl Memory {
             let low = (value & 0xFFFFFFFF) as u32;
             let high = (value >> 32) as u32;
             // 8-alignment bounds `address` to `u64::MAX - 7`, so `address + 4` can't overflow.
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let page = self.get_or_insert_page(idx)?;
             page[off..off + 4].copy_from_slice(&low.to_le_bytes());
@@ -250,7 +303,7 @@ impl Memory {
         if address.is_multiple_of(2) {
             // `MEMORY_PAGE_SIZE` is a multiple of 2, so a 2-aligned half
             // address never straddles a page boundary.
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let bytes = self
                 .pages
@@ -270,7 +323,7 @@ impl Memory {
     pub fn store_half(&mut self, address: u64, value: u16) -> Result<(), MemoryError> {
         let bytes = value.to_le_bytes();
         if address.is_multiple_of(2) {
-            let idx = page_index(address);
+            let idx = page_base(address);
             let off = page_offset(address);
             let page = self.get_or_insert_page(idx)?;
             page[off] = bytes[0];
@@ -336,7 +389,7 @@ impl Memory {
             .try_reserve_exact(len_usize)
             .map_err(|_| MemoryError::AllocationFailed)?;
         while addr < end {
-            let idx = page_index(addr);
+            let idx = page_base(addr);
             let off = page_offset(addr);
             let take = std::cmp::min(MEMORY_PAGE_SIZE - off, (end - addr) as usize);
             match self.pages.get(&idx) {
@@ -364,7 +417,7 @@ impl Memory {
         let mut cur_addr = addr;
         let mut remaining = inputs;
         while !remaining.is_empty() {
-            let idx = page_index(cur_addr);
+            let idx = page_base(cur_addr);
             let off = page_offset(cur_addr);
             let space_in_page = MEMORY_PAGE_SIZE - off;
             let take = remaining.len().min(space_in_page);
