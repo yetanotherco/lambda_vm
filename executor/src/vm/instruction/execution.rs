@@ -189,7 +189,7 @@ impl Instruction {
                 match width {
                     LoadStoreWidth::Byte => {
                         let value = read_value & 0xFF;
-                        memory.store_byte(addr, value as u8);
+                        memory.store_byte(addr, value as u8)?;
                     }
                     LoadStoreWidth::Half => {
                         let value = read_value & 0xFFFF;
