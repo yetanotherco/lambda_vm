@@ -61,7 +61,7 @@ pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 /// ever moves 8-byte box pointers, never page bytes themselves. Chosen to
 /// match the prover's `DEFAULT_PAGE_SIZE` concept (`prover/src/tables/page.rs`);
 /// redeclared locally since the executor must not depend on the prover crate.
-const MEMORY_PAGE_SIZE: usize = 256 * 1024;
+const MEMORY_PAGE_SIZE: usize = 4 * 1024;
 
 #[inline]
 fn page_index(address: u64) -> u64 {
