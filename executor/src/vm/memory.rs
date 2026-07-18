@@ -198,7 +198,9 @@ impl Memory {
     /// to snapshot memory at an epoch boundary.
     pub fn iter_bytes(&self) -> impl Iterator<Item = (u64, u8)> + '_ {
         self.pages.iter().flat_map(|(&base, page)| {
-            page.iter().enumerate().map(move |(i, &b)| (base + i as u64, b))
+            page.iter()
+                .enumerate()
+                .map(move |(i, &b)| (base + i as u64, b))
         })
     }
 
