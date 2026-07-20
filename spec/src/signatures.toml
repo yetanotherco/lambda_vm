@@ -215,14 +215,9 @@ output = ["Byte", 8]
 [[signatures]]
 tag = "ECDAS"
 kind = "interaction"
-input = ["Bit", "DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
-
-[[signatures]]
-tag = "SERVE_K"
-kind = "interaction"
-input = ["DWordWL", "DWordWL", "Byte"]
+input = ["Bit", "Word",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
 
 [[signatures]]
 kind = "interaction"
 tag = "BIT"
-input = ["DWordWL", "Byte"]
+input = ["Word", "Byte"]

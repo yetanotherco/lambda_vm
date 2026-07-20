@@ -2,7 +2,7 @@ name = "ECDAS"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "Timestamp at which the operation is executed."
 pad = 0
 
