@@ -17,10 +17,12 @@
 #let load = raw(loadchip.name)
 #let fmachip = load_chip("src/fext_fma.toml", config)
 #let fma = raw(fmachip.name)
+#let zerochip = load_chip("src/fext_zero.toml", config)
+#let zero = raw(zerochip.name)
 
 We introduce a set of chips for faster processing of numbers mod the native goldilocks prime,
 or a degree three extension field thereof.
-Our approach is to offer an arithmetic black box, consisting of the *TODO* chips,
+Our approach is to offer an arithmetic black box, consisting of the #fma and #zero chips,
 that operates on a separate memory domain, and the #load chip to bridge the gap
 from normal byte-addressed RAM memory to this separate field-storage.
 As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for field-storage.
@@ -73,3 +75,20 @@ We express this chip using #nr_variables variables spanning #nr_columns columns 
 == Padding
 
 #render_chip_padding_table(fmachip, config)
+
+= The #zero chip
+
+This chip asserts that a field extension element in the ABB is zero.
+It uses #nr_variables variables spanning #nr_columns columns and #nr_interactions interactions.
+
+== Variables
+
+#render_chip_variable_table(zerochip, config)
+
+== Constraints
+
+#render_constraint_table(zerochip, config)
+
+== Padding
+
+#render_chip_padding_table(zerochip, config)
