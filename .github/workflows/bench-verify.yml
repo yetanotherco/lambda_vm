@@ -194,3 +194,13 @@ jobs:
                 issue_number: context.issue.number, body
               });
             }
+
+      # The recursion step's continue-on-error exists so its failure never costs the
+      # already-captured/posted verifier result — not to hide the failure. Fail here,
+      # after that result is safely posted, so the job's overall status still reflects
+      # reality instead of reading as a full green success.
+      - name: Fail if recursion cycle bench didn't complete
+        if: always() && steps.recursion.outcome != 'success'
+        run: |
+          echo "::error::Recursion cycle bench step did not complete (outcome=${{ steps.recursion.outcome }}) — see its log and the posted result above."
+          exit 1
