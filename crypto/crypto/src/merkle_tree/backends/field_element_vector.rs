@@ -75,25 +75,42 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
     left: &[u8; NUM_BYTES],
     right: &[u8; NUM_BYTES],
 ) -> [u8; NUM_BYTES] {
+    let mut out = [0u8; NUM_BYTES];
+    hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, &mut out);
+    out
+}
+
+/// Like [`hash_new_parent_bytes`] but writes the parent digest straight into
+/// `out`. Folding a Merkle path can then accumulate the running hash in place
+/// (ping-ponging two buffers) instead of reassigning the by-value return each
+/// step — that per-step 32-byte copy compiled to a `memcpy` call and dominated
+/// `verify_merkle_path_from_leaf_hash`. Byte-identical to the returning form.
+#[inline]
+fn hash_new_parent_bytes_into<D: Digest + 'static, const NUM_BYTES: usize>(
+    left: &[u8; NUM_BYTES],
+    right: &[u8; NUM_BYTES],
+    out: &mut [u8; NUM_BYTES],
+) {
     #[cfg(target_arch = "riscv64")]
     if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
         let l: &[u8; 32] = left[..].try_into().unwrap();
         let r: &[u8; 32] = right[..].try_into().unwrap();
+        let out32: &mut [u8; 32] = (&mut out[..]).try_into().unwrap();
         // EXPERIMENT 1: HASH_PAIR ecall replaces the in-guest 64-byte
         // compression (byte-identical). Off-feature keeps the guest sponge.
         #[cfg(feature = "sim-hash-ecalls")]
-        let hash = lambda_vm_syscalls::keccak::sim_hash_pair(l, r);
+        lambda_vm_syscalls::syscalls::sim_hash_pair(l.as_ptr(), r.as_ptr(), out32.as_mut_ptr());
         #[cfg(not(feature = "sim-hash-ecalls"))]
-        let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
-        let mut result = [0u8; NUM_BYTES];
-        result.copy_from_slice(&hash);
-        return result;
+        {
+            *out32 = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
+        }
+        return;
     }
 
-    hash_streamed::<D, NUM_BYTES>(|sink| {
+    *out = hash_streamed::<D, NUM_BYTES>(|sink| {
         sink(left);
         sink(right);
-    })
+    });
 }
 
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
@@ -153,6 +170,14 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+
+    fn hash_new_parent_into(
+        left: &[u8; NUM_BYTES],
+        right: &[u8; NUM_BYTES],
+        out: &mut [u8; NUM_BYTES],
+    ) {
+        hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
     }
 }
 
@@ -245,6 +270,14 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+
+    fn hash_new_parent_into(
+        left: &[u8; NUM_BYTES],
+        right: &[u8; NUM_BYTES],
+        out: &mut [u8; NUM_BYTES],
+    ) {
+        hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
     }
 }
 

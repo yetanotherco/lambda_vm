@@ -26,4 +26,13 @@ pub trait IsMerkleTreeBackend {
     /// This function takes to children nodes and builds a new parent node.
     /// It will be used in the construction of the Merkle tree.
     fn hash_new_parent(child_1: &Self::Node, child_2: &Self::Node) -> Self::Node;
+
+    /// Like [`hash_new_parent`](Self::hash_new_parent) but writes the result into
+    /// `out` instead of returning it, so a Merkle-path fold can accumulate in
+    /// place (ping-ponging two buffers) without the per-step by-value node copy.
+    /// `out` may not alias `child_1`/`child_2`. The default is the returning form
+    /// plus a move; backends whose hash can target `out` directly override this.
+    fn hash_new_parent_into(child_1: &Self::Node, child_2: &Self::Node, out: &mut Self::Node) {
+        *out = Self::hash_new_parent(child_1, child_2);
+    }
 }
