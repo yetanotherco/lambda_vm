@@ -113,6 +113,31 @@ fn hash_new_parent_bytes_into<D: Digest + 'static, const NUM_BYTES: usize>(
     });
 }
 
+/// Equality of two `NUM_BYTES`-byte nodes. For the 32-byte digests this compares
+/// four `u64` words (which LLVM keeps inline) instead of the generic `memcmp`
+/// call that `[u8; 32] == [u8; 32]` lowers to; that call was the root check at
+/// the end of every Merkle-path fold. Byte-array equality is unchanged: equal
+/// words iff equal bytes (same native endianness on both sides).
+#[inline]
+fn nodes_eq_bytes<const NUM_BYTES: usize>(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+    if NUM_BYTES == 32 {
+        let a: &[u8; 32] = a[..].try_into().unwrap();
+        let b: &[u8; 32] = b[..].try_into().unwrap();
+        let mut i = 0;
+        while i < 32 {
+            let aw = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+            let bw = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+            if aw != bw {
+                return false;
+            }
+            i += 8;
+        }
+        true
+    } else {
+        a == b
+    }
+}
+
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
 /// This is more efficient than `FieldElementVectorBackend` when the batch size is always 2,
 /// as it avoids Vec allocation overhead.
@@ -178,6 +203,10 @@ where
         out: &mut [u8; NUM_BYTES],
     ) {
         hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
+    }
+
+    fn nodes_eq(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+        nodes_eq_bytes::<NUM_BYTES>(a, b)
     }
 }
 
@@ -278,6 +307,10 @@ where
         out: &mut [u8; NUM_BYTES],
     ) {
         hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
+    }
+
+    fn nodes_eq(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+        nodes_eq_bytes::<NUM_BYTES>(a, b)
     }
 }
 

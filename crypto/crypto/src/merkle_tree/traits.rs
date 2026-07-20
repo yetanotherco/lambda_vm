@@ -35,4 +35,11 @@ pub trait IsMerkleTreeBackend {
     fn hash_new_parent_into(child_1: &Self::Node, child_2: &Self::Node, out: &mut Self::Node) {
         *out = Self::hash_new_parent(child_1, child_2);
     }
+
+    /// Node equality for the root check at the end of a path fold. Defaults to
+    /// `PartialEq`; fixed-size byte-array backends override it to compare wide
+    /// words instead of falling into a generic `memcmp` call on the hot path.
+    fn nodes_eq(a: &Self::Node, b: &Self::Node) -> bool {
+        a == b
+    }
 }

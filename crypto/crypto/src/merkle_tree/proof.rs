@@ -57,7 +57,7 @@ where
         index >>= 1;
     }
 
-    root_hash == src
+    B::nodes_eq(root_hash, src)
 }
 
 /// Verifies a Merkle inclusion proof given the authentication path as a borrowed
