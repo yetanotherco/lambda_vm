@@ -91,7 +91,7 @@ multiplicity = "μ"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [["+", 3, "d"], ["idx", "input_addrs", "i"], ["arr", ["idx", ["idx", "values", "i"], "d"], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+input = [["+", 3, "d"], ["idx", "input_addrs", "i"], ["arr", ["idx", ["idx", "values", "i"], "d"], 0, 0, 0, 0, 0, 0, 0], ["+", "timestamp", "i"], 0, 0, 0]
 output = ["arr", ["idx", ["idx", "values", "i"], "d"], 0, 0, 0, 0, 0, 0, 0]
 iters = [["d", 0, 2], ["i", 0, 2]]
 multiplicity = "μ"
@@ -99,7 +99,7 @@ multiplicity = "μ"
 [[constraints.all]]
 kind = "interaction"
 tag = "MEMW"
-input = [["+", 3, "d"], "output_addr", ["arr", ["idx", "output", "d"], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
+input = [["+", 3, "d"], "output_addr", ["arr", ["idx", "output", "d"], 0, 0, 0, 0, 0, 0, 0], ["+", "timestamp", 3], 0, 0, 0]
 multiplicity = "μ"
 iter = ["d", 0, 2]
 
