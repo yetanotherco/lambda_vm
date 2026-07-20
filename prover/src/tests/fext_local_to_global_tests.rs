@@ -1,9 +1,9 @@
 //! Tests for the FEXT_LOCAL_TO_GLOBAL per-epoch field-storage bookend table.
 
 use crate::tables::fext_local_to_global::{
-    FextLocalToGlobalConstraints, FieldCellBoundary, collect_bitwise_from_fext_l2g, cols,
-    generate_fext_local_to_global_trace, global_bus_interactions, memory_bus_interactions,
-    range_check_interactions,
+    FextLocalToGlobalConstraints, FieldCellBoundary, collect_bitwise_from_fext_l2g,
+    collect_lt_from_touches, cols, generate_fext_local_to_global_trace, global_bus_interactions,
+    memory_bus_interactions, range_check_interactions,
 };
 use crate::tables::types::{FE, GoldilocksExtension, GoldilocksField, VmTable};
 use math::field::element::FieldElement;
@@ -101,9 +101,21 @@ fn fext_l2g_trace_layout_and_padding() {
 
 #[test]
 fn fext_l2g_bitwise_collector_count() {
-    // 6 halfword lookups per cell (4 addr + 2 init_epoch).
+    // 7 lookups per cell: 4 addr IsHalfword + 2 init_epoch IsHalfword + 1 IsB20.
     let cells = vec![boundary(3, 0x10), boundary(4, 0x20)];
-    assert_eq!(collect_bitwise_from_fext_l2g(&cells).len(), 2 * 6);
+    assert_eq!(collect_bitwise_from_fext_l2g(&cells, 5).len(), 2 * 7);
+}
+
+#[test]
+fn fext_l2g_lt_collector_same_domain_windows() {
+    // Same-domain consecutive cells yield one addr-LT each; the domain change does not.
+    let touched = vec![
+        (3u64, 0x10u64, 0u64, 0u64),
+        (3, 0x20, 0, 0),
+        (4, 0x08, 0, 0),
+    ];
+    // (3,0x10)<(3,0x20) is one LT; (3,0x20)->(4,0x08) crosses domains → none.
+    assert_eq!(collect_lt_from_touches(&touched).len(), 1);
 }
 
 #[test]

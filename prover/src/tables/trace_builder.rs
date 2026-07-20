@@ -3463,6 +3463,11 @@ fn build_traces<I: ImageSource + Sync>(
     lt_ops.extend(collect_lt_from_fext_fma(&fext_fma_ops));
     lt_ops.extend(collect_lt_from_fext_store(&fext_store_ops));
     lt_ops.extend(collect_lt_from_fext_page(&fext_page_ops));
+    // Continuation field bookend (fext_local_to_global): the addr-LT uniqueness ops,
+    // known from the sorted touched cells at build time (empty for monolithic).
+    lt_ops.extend(fext_local_to_global::collect_lt_from_touches(
+        &touched_field_cells,
+    ));
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups

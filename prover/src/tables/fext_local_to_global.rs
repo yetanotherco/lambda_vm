@@ -378,7 +378,10 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
 /// balance [`range_check_interactions`]' `IsHalfword` and `IsB20` senders. Padding
 /// rows (`MU = 0`) fire nothing, so none are emitted for them. Keep in sync with
 /// [`range_check_interactions`].
-pub fn collect_bitwise_from_fext_l2g(boundaries: &[FieldCellBoundary]) -> Vec<BitwiseOperation> {
+pub fn collect_bitwise_from_fext_l2g(
+    boundaries: &[FieldCellBoundary],
+    epoch_label: u64,
+) -> Vec<BitwiseOperation> {
     let mut ops = Vec::new();
     let push_halfword = |ops: &mut Vec<BitwiseOperation>, v16: u64| {
         ops.push(BitwiseOperation::halfword(
@@ -397,8 +400,31 @@ pub fn collect_bitwise_from_fext_l2g(boundaries: &[FieldCellBoundary]) -> Vec<Bi
         let init_epoch = epoch_halfwords(b.init_epoch);
         push_halfword(&mut ops, init_epoch[0]);
         push_halfword(&mut ops, init_epoch[1]);
+        // Ordering: IsB20[epoch_label - 1 - init_epoch] (init_epoch < fini_epoch).
+        let diff = epoch_label - 1 - b.init_epoch;
+        ops.push(BitwiseOperation::b20(
+            (diff & 0xFF) as u8,
+            ((diff >> 8) & 0xFF) as u8,
+            ((diff >> 16) & 0xF) as u8,
+        ));
     }
     ops
+}
+
+/// The addr `<` ALU LT ops the uniqueness argument needs (same-domain consecutive
+/// touched cells), which the epoch's LT table must receive. Derived from the sorted
+/// touched-cell set (available at trace-build time), so it does not depend on the
+/// driver-computed init_epoch. Matches the `SEL_SAME`-gated addr-LT bus sends.
+pub fn collect_lt_from_touches(touched: &FieldTouches) -> Vec<super::lt::LtOperation> {
+    let mut sorted = touched.to_vec();
+    sorted.sort_by_key(|&(domain, addr, _, _)| (domain, addr));
+    let mut lt_ops = Vec::new();
+    for pair in sorted.windows(2) {
+        if pair[0].0 == pair[1].0 {
+            lt_ops.push(super::lt::LtOperation::new(pair[0].1, pair[1].1, false));
+        }
+    }
+    lt_ops
 }
 
 // =========================================================================
