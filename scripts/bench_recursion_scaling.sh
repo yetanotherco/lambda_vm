@@ -6,13 +6,11 @@
 # execution via CONTINUATIONS (memory-bounded 2^EPOCH_LOG2-cycle epochs, so any
 # block size proves on a bounded-RAM box), then executes the continuation
 # recursion guest (recursion-cont-<preset>.elf) on the bundle and records the
-# EXACT deterministic guest cycle count — the in-VM cost of verifying that
-# block's proof.
+# exact deterministic guest cycle count.
 #
-# Sweep order is PRESET-MAJOR on purpose: the full block-size curve for the
-# first preset completes before the next preset starts, so the headline regime
-# (blowup2 = the realistic base-layer options, 219 FRI queries) yields a usable
-# scaling curve as early as possible instead of only when everything ends.
+# Sweep order is PRESET-MAJOR: the full block-size curve for the first preset
+# completes before the next starts, so the headline regime (blowup2) yields a
+# usable curve early instead of only when everything ends.
 #
 # Usage: scripts/bench_recursion_scaling.sh [RESULTS_FILE=/tmp/recursion_scaling.txt]
 #   Env:

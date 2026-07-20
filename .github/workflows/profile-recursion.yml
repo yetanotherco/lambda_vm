@@ -42,6 +42,9 @@ jobs:
           - name: multi-query
             test: multi
             title: "Multi query (blowup=8, 128-bit)"
+          - name: block
+            test: block
+            title: "Real ethrex block, 4 transfers (blowup=4, 110 queries)"
     steps:
       - name: React to comment
         if: github.event_name == 'issue_comment' && matrix.name == 'single-query'
@@ -136,9 +139,10 @@ jobs:
           {
             echo "## Recursion guest profile"
             echo
-            # Single-query first, then multi-query, then any others.
+            # Single-query first, then multi-query, then the real-block profile.
             for frag in fragments/fragment-single-query.md \
-                        fragments/fragment-multi-query.md; do
+                        fragments/fragment-multi-query.md \
+                        fragments/fragment-block.md; do
               [ -f "$frag" ] && { cat "$frag"; echo; }
             done
             echo "<sub>Commit: ${COMMIT_SHA:0:8} · Runner: self-hosted bench</sub>"

@@ -156,13 +156,8 @@ fn drive_executor(
 }
 
 /// The identity + output a correct in-VM run must commit — the profile
-/// tests' correctness oracle. Computed host-side (trustless recompute) before
-/// the guest runs, then checked against the guest's actual committed
-/// attestation once profiling finishes ([`run_profile_from`]). Mirrors the
-/// production consumer check ([`recursion::check_attestation`]) for the
-/// monolithic path, and its continuation analog
-/// ([`crate::continuation::continuation_precomputed_commitments`] +
-/// [`recursion::program_id_from_elf`]) for the continuation path.
+/// tests' correctness oracle, computed host-side before the guest runs and
+/// checked against its committed attestation in [`run_profile_from`].
 struct ExpectedAttestation {
     id: [u8; 32],
     output: Vec<u8>,
@@ -206,13 +201,9 @@ fn setup_guest_run(
 }
 
 /// [`setup_guest_run`]'s fixture-based counterpart for a real ethrex block:
-/// reads a pre-proved continuation input instead of proving one in-process.
-/// Proving a real block's continuation bundle is minutes of real prover
-/// work — the `recursion-profile-block-input` Makefile target does it ONCE
-/// into `executor/program_artifacts/recursion/recursion-cont-blowup4-block4.bin`
-/// (+ `.expected` sidecar: 32-byte id || inner public output, written by
-/// `test_dump_recursion_input`), so this test only ever measures the verifier
-/// guest, never the inner prove.
+/// reads a pre-proved continuation input (`make recursion-profile-block-input`)
+/// instead of proving one in-process, so this test only ever measures the
+/// verifier guest, never the inner prove.
 fn setup_block4_blowup4_guest_run() -> (
     Vec<u8>,
     executor::elf::Elf,
@@ -413,9 +404,8 @@ fn run_profile(preset: Preset, progress_stride: usize, detailed: bool) {
     );
 }
 
-/// Shared profiling loop for [`run_profile`]/`test_recursion_profile_blowup4_block`: runs
-/// an already-set-up guest executor and prints the same cycle/step/function
-/// breakdown regardless of which inner program it verified.
+/// Shared profiling loop: runs an already-set-up guest executor and prints
+/// the same cycle/step/function breakdown regardless of the inner program.
 fn run_profile_from(
     preset: Preset,
     guest_elf_bytes: &[u8],
@@ -481,11 +471,8 @@ fn run_profile_from(
         },
     );
 
-    // Correctness, not just crash-freedom: read the guest's actual committed
-    // attestation and check it against the trusted host recompute
-    // (`expected`, built by `setup_guest_run`/`setup_block4_blowup4_guest_run`
-    // before the guest ran) — the same identity+output binding a production
-    // consumer checks via `check_attestation`/its continuation analog.
+    // Correctness, not just crash-freedom: check the guest's committed
+    // attestation against the trusted host recompute (`expected`).
     let committed = executor
         .finish()
         .expect("read committed output after execution")
@@ -896,17 +883,12 @@ fn test_recursion_prove_1query() {
 ///
 /// Env knobs:
 /// * `RECURSION_DUMP_PRESET` (`min`|`blowup2`|`blowup4`|`blowup8`, default
-///   `min`) — the [`Preset`] whose options the inner proof is generated under;
-///   must match the `recursion-<preset>.elf` the blob will be fed to, or the
-///   guest rejects the proof.
-/// * `RECURSION_DUMP_INNER_ELF` (path, default the `empty` guest) — the inner
-///   program to prove, for realistic trace heights (e.g. the ethrex guest).
-/// * `RECURSION_DUMP_INNER_INPUT` (path, default none) — the inner program's
-///   private input (e.g. an ethrex-fixtures block).
-/// * `RECURSION_DUMP_EPOCH_LOG2` (int, default unset = monolithic) — prove the
-///   inner via continuations with `2^n`-cycle epochs (memory-bounded prover)
-///   and encode a [`recursion::ContinuationGuestInput`] blob instead; feed it
-///   to `recursion-cont-<preset>.elf`, not the monolithic guest.
+///   `min`) — must match the `recursion-<preset>.elf` the blob is fed to.
+/// * `RECURSION_DUMP_INNER_ELF` (path, default the `empty` guest).
+/// * `RECURSION_DUMP_INNER_INPUT` (path, default none).
+/// * `RECURSION_DUMP_EPOCH_LOG2` (int, default unset = monolithic) — prove via
+///   continuations with `2^n`-cycle epochs and encode a
+///   [`recursion::ContinuationGuestInput`] blob for `recursion-cont-<preset>.elf`.
 #[test]
 #[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
 fn test_dump_recursion_input() {
@@ -937,15 +919,13 @@ fn test_dump_recursion_input() {
     };
 
     // Continuation dumps also get an `.expected` sidecar (32-byte id || inner
-    // public output) — the ground truth a caller needs to check a guest's
-    // committed attestation, computed here while the `ContinuationProof`
-    // bundle still exists (`encode_continuation_guest_input` consumes it).
-    // Lets a consumer (e.g. `test_recursion_profile_blowup4_block`) verify
-    // the pre-proved fixture without re-deriving it from the bundle.
+    // public output), computed here while the `ContinuationProof` bundle
+    // still exists (`encode_continuation_guest_input` consumes it) — lets a
+    // consumer check the pre-proved fixture without re-deriving it.
     let (blob, expected_sidecar) = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
         Ok(s) => {
-            // No recursion-cont-blowup8.elf is built (RECURSION_CONT_PRESETS stops
-            // at blowup4), so this blob would have no guest to verify it.
+            // No recursion-cont-blowup8.elf is built (RECURSION_CONT_PRESETS
+            // stops at blowup4).
             assert_ne!(
                 preset,
                 Preset::Blowup8,
@@ -1055,14 +1035,9 @@ fn test_recursion_cycles_blowup4() {
 }
 
 /// Full profile (top-25 + per-step) of the recursion `continuation` guest
-/// verifying a REAL ethrex block (4 transfers) — not the `empty`-program
-/// diagnostic floor `test_recursion_profile_1query`/`_multiquery` measure.
-/// blowup=4 (110 queries): the cheaper of the two realistic base-layer
-/// presets, so the full histogram stays tractable; `bench_recursion_cycles.sh`/
-/// `bench_recursion_scaling.sh` already cover cycle counts across every preset
-/// and block size, so this only needs to exist for the detailed breakdown.
-/// Requires `make recursion-profile-block-input` — the pre-proved fixture
-/// [`setup_block4_blowup4_guest_run`] reads.
+/// verifying a REAL ethrex block (4 transfers), blowup=4 — not the
+/// `empty`-program diagnostic floor `test_recursion_profile_1query`/
+/// `_multiquery` measure. Requires `make recursion-profile-block-input`.
 #[test]
 #[ignore = "diagnostic: heavy; recursion guest histogram + steps over a real ethrex block (blowup=4)"]
 fn test_recursion_profile_blowup4_block() {

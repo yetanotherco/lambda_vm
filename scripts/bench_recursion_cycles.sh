@@ -36,21 +36,20 @@
 #   REF_A    ref/SHA to evaluate (the PR side).
 #   REF_B    baseline ref/SHA (default origin/main).
 #   PRESET   recursion-verifier preset (default min): min = blowup=2, 1 query
-#            (cheap diagnostic regime); blowup2 = blowup=2, 219 queries (the
-#            realistic base-layer proof shape at 128-bit — production pipelines
-#            prove the base at low blowup and wrap at high blowup); blowup4 =
-#            blowup=4, 110 queries (the other realistic base-layer point);
-#            blowup8 = blowup=8, 73 queries. The preset picks BOTH the guest ELF
-#            (recursion-<PRESET>.elf, falling back to recursion.elf on older refs
-#            that build a single unnamed min guest) AND the inner-proof options of
-#            the dumped blob (exported as RECURSION_DUMP_PRESET to the dump test).
-#            Refs predating the preset-aware dump test always dump min options, so
-#            only PRESET=min is measurable for them — the script fails loudly
-#            up front rather than let the guest reject the blob in-VM. It is
-#            EXPECTED and correct for the two sides to use DIFFERENT artifact
-#            names (e.g. main→recursion.elf vs PR→recursion-min.elf) — both are
-#            verified under the SAME preset options. The printed per-ref
-#            `guest=<artifact>` labels show which each side used.
+#            (cheap diagnostic); blowup2 = blowup=2, 219 queries (realistic
+#            base-layer, 128-bit); blowup4 = blowup=4, 110 queries (the other
+#            base-layer point); blowup8 = blowup=8, 73 queries. Picks BOTH the
+#            guest ELF (recursion-<PRESET>.elf, falling back to recursion.elf
+#            on older refs) AND the dumped blob's inner-proof options (via
+#            RECURSION_DUMP_PRESET). Refs predating the preset-aware dump test
+#            only support PRESET=min — the script fails loudly up front rather
+#            than let the guest reject the blob in-VM. Different artifact
+#            names across refs (e.g. recursion.elf vs recursion-min.elf) is
+#            expected — both verify under the SAME preset options.
+#            `blowup4-block` isn't a build preset: it's the `continuation` guest
+#            (recursion-cont-blowup4.elf) verifying a real ethrex block instead
+#            of the `empty` diagnostic program — real prover minutes per ref
+#            (see the blob cache below), not seconds.
 #   Env:
 #     REBUILD=1            force rebuild of MEASURE_CLI and re-run of every ref
 #                          (guest build + blob dump + measurement); ignore caches.
@@ -63,6 +62,9 @@
 #     PRUNE_KEEP=<n>       cap on cached ref worktrees kept under $WORK (default 10);
 #                          older ones (+ their results/blobs/logs) are pruned at startup
 #                          to bound disk on the long-lived bench runner.
+#     BLOCK_TXS=4          PRESET=blowup4-block only: ethrex block size, reading
+#                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin (only _4 committed).
+#     BLOCK_EPOCH_LOG2=21  PRESET=blowup4-block only: inner continuation epoch size.
 #
 # Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset + the
 # MEASURE_CLI source SHA (so a baseline and PR side are never compared across two
@@ -70,7 +72,9 @@
 # read: a truncated/partial cache is discarded and re-measured, never emitted as zeros.
 # Ref worktrees are kept (named by SHA) so a re-measure is a cargo no-op; the newest
 # PRUNE_KEEP are retained and older ones pruned. A worktree whose guest build fails
-# mid-run is removed immediately. REBUILD=1 forces everything.
+# mid-run is removed immediately. The dumped input blob is also cached (keyed on SHA +
+# preset), so re-proving blowup4-block's real ethrex block only happens once per ref.
+# REBUILD=1 forces everything.
 #
 set -euo pipefail
 
@@ -176,10 +180,33 @@ valid_result() {
 measure_ref() {
   local ref="$1" sha="$2" role="$3"
   local sha8="${sha:0:8}"
+  # `blowup4-block`: same cache/worktree/measure plumbing, but a real ethrex
+  # block through the continuation guest instead of the `min`/`blowup*`
+  # presets' `empty`-program blob. BLOCK_PRESET is the underlying build
+  # preset (blowup4); BLOCK_TXS/BLOCK_EPOCH_LOG2 pin the fixture and epoch
+  # size to what `make recursion-profile-block-input` proves.
+  local is_block=0 block_preset=""
+  if [ "$PRESET" = "blowup4-block" ]; then
+    is_block=1
+    block_preset="blowup4"
+  fi
+  local block_txs="${BLOCK_TXS:-4}"
+  local block_epoch_log2="${BLOCK_EPOCH_LOG2:-21}"
   # Key the cache on ref SHA + preset AND the MEASURE_CLI source SHA, so a baseline and
   # PR side measured by different counters (after a cli change) never share a result.
   local result="$WORK/result_${sha8}_${PRESET}_m${HEAD_SHA:0:8}.txt"
   local wt="$WORK/wt_${sha8}"
+
+  # Blob cache: keyed on sha + preset (+ block fixture/epoch), persists across runs.
+  local blob_key="$PRESET"
+  if [ "$is_block" = 1 ]; then
+    blob_key="${PRESET}_txs${block_txs}_epoch${block_epoch_log2}"
+  fi
+  local blob="$WORK/blob_${sha8}_${blob_key}.bin"
+  local need_dump=1
+  if [ "${REBUILD:-0}" != "1" ] && [ -s "$blob" ]; then
+    need_dump=0
+  fi
 
   if [ "${REBUILD:-0}" != "1" ] && [ -f "$result" ]; then
     if valid_result < "$result"; then
@@ -204,16 +231,21 @@ measure_ref() {
   fi
   touch "$wt" 2>/dev/null || true
 
-  # 2a. Build the recursion guest ELF(s) (+ empty.elf inner program). GUEST_TARGET_DIR,
-  # when set, shares the RV64 build dir across ref worktrees (reuses build-std).
+  # 2a. Build the recursion guest ELF(s) (+ empty.elf inner program), and for
+  # block mode also the ethrex inner guest. GUEST_TARGET_DIR, when set, shares
+  # the RV64 build dir across ref worktrees (reuses build-std).
   echo "==> [$role] make compile-recursion-elfs @ $sha8 (slow the first time) ..." >&2
   local glog="$WORK/build_guest_${sha8}.log"
-  local -a make_args=(compile-recursion-elfs)
+  local -a make_goals=(compile-recursion-elfs)
+  if [ "$is_block" = 1 ] && [ "$need_dump" = 1 ]; then
+    make_goals+=(executor/program_artifacts/rust/ethrex.elf)
+  fi
+  local -a make_args=("${make_goals[@]}")
   if [ -n "${GUEST_TARGET_DIR:-}" ]; then
     make_args+=("SHARED_TARGET_DIR=$GUEST_TARGET_DIR")
   fi
   if ! ( cd "$wt" && SYSROOT_DIR="$SYSROOT_DIR" make "${make_args[@]}" ) >"$glog" 2>&1; then
-    echo "ERROR: [$role] 'make compile-recursion-elfs' failed for $ref ($sha8). Tail of $glog:" >&2
+    echo "ERROR: [$role] 'make ${make_goals[*]}' failed for $ref ($sha8). Tail of $glog:" >&2
     tail -40 "$glog" >&2
     # A failed build can leave a partial worktree; drop it so it never lingers or
     # poisons a later reuse. (The startup prune also caps total worktrees.)
@@ -222,10 +254,17 @@ measure_ref() {
     exit 1
   fi
 
-  # 2b. Detect the guest ELF: prefer recursion-<PRESET>.elf, else recursion.elf.
+  # 2b. Detect the guest ELF: block mode always wants recursion-cont-<preset>.elf;
+  # otherwise prefer recursion-<PRESET>.elf, else recursion.elf.
   local artdir="$wt/executor/program_artifacts/recursion"
   local guest_elf=""
-  if [ -f "$artdir/recursion-${PRESET}.elf" ]; then
+  if [ "$is_block" = 1 ]; then
+    guest_elf="$artdir/recursion-cont-${block_preset}.elf"
+    if [ ! -f "$guest_elf" ]; then
+      echo "ERROR: [$role] no $guest_elf for $ref ($sha8) — ref predates the continuation guest." >&2
+      exit 1
+    fi
+  elif [ -f "$artdir/recursion-${PRESET}.elf" ]; then
     guest_elf="$artdir/recursion-${PRESET}.elf"
   elif [ -f "$artdir/recursion.elf" ]; then
     guest_elf="$artdir/recursion.elf"
@@ -237,40 +276,59 @@ measure_ref() {
   fi
   echo "==> [$role] guest ELF: $(basename "$guest_elf")" >&2
 
-  # 2c. Generate this ref's own input blob via its ignored dump test, under this
-  # preset's options (RECURSION_DUMP_PRESET). Refs predating the preset-aware dump
-  # test always prove the min options; feeding that blob to a non-min guest would
-  # only fail in-VM verification much later, so refuse loudly up front instead.
-  if ! grep -rq "fn test_dump_recursion_input" "$wt/prover/src/tests/" 2>/dev/null; then
-    echo "ERROR: [$role] ref $ref ($sha8) has no 'test_dump_recursion_input' — cannot generate its input blob." >&2
-    exit 1
-  fi
-  if [ "$PRESET" != "min" ] && ! grep -rq "RECURSION_DUMP_PRESET" "$wt/prover/src/tests/" 2>/dev/null; then
-    echo "ERROR: [$role] ref $ref ($sha8) predates the preset-aware dump test (no RECURSION_DUMP_PRESET) — only PRESET=min is measurable for it." >&2
-    exit 1
-  fi
-  echo "==> [$role] dumping recursion input blob (cargo test test_dump_recursion_input, preset=$PRESET) ..." >&2
-  rm -f /tmp/recursion_input.bin
-  local dlog="$WORK/dump_${sha8}_${PRESET}.log"
-  if [ -n "${HOST_TARGET_DIR:-}" ]; then
-    if ! ( cd "$wt" && RECURSION_DUMP_PRESET="$PRESET" CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
-      echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
-      tail -40 "$dlog" >&2
-      exit 1
-    fi
+  # 2c. Generate this ref's own input blob via its ignored dump test, unless a
+  # cached blob covers this sha/preset already (need_dump=0). Refuse up front if
+  # the ref predates a needed knob, instead of failing in-VM verification later.
+  if [ "$need_dump" = 0 ]; then
+    echo "==> [$role] Reusing cached recursion input blob ($blob) — skipping re-prove." >&2
   else
-    if ! ( cd "$wt" && RECURSION_DUMP_PRESET="$PRESET" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
-      echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
-      tail -40 "$dlog" >&2
+    if ! grep -rq "fn test_dump_recursion_input" "$wt/prover/src/tests/" 2>/dev/null; then
+      echo "ERROR: [$role] ref $ref ($sha8) has no 'test_dump_recursion_input' — cannot generate its input blob." >&2
       exit 1
     fi
+    if [ "$PRESET" != "min" ] && ! grep -rq "RECURSION_DUMP_PRESET" "$wt/prover/src/tests/" 2>/dev/null; then
+      echo "ERROR: [$role] ref $ref ($sha8) predates the preset-aware dump test (no RECURSION_DUMP_PRESET) — only PRESET=min is measurable for it." >&2
+      exit 1
+    fi
+    local -a dump_env=("RECURSION_DUMP_PRESET=${block_preset:-$PRESET}")
+    if [ "$is_block" = 1 ]; then
+      if ! grep -rq "RECURSION_DUMP_EPOCH_LOG2" "$wt/prover/src/tests/" 2>/dev/null; then
+        echo "ERROR: [$role] ref $ref ($sha8) predates RECURSION_DUMP_EPOCH_LOG2 — blowup4-block is not measurable for it." >&2
+        exit 1
+      fi
+      local block_fixture="$wt/executor/tests/ethrex_bench_${block_txs}.bin"
+      if [ ! -f "$block_fixture" ]; then
+        echo "ERROR: [$role] ref $ref ($sha8) is missing $block_fixture (ethrex block fixture) — blowup4-block is not measurable for it." >&2
+        exit 1
+      fi
+      dump_env+=(
+        "RECURSION_DUMP_EPOCH_LOG2=$block_epoch_log2"
+        "RECURSION_DUMP_INNER_ELF=$wt/executor/program_artifacts/rust/ethrex.elf"
+        "RECURSION_DUMP_INNER_INPUT=$block_fixture"
+      )
+    fi
+    echo "==> [$role] dumping recursion input blob (cargo test test_dump_recursion_input, preset=$PRESET) ..." >&2
+    rm -f /tmp/recursion_input.bin
+    local dlog="$WORK/dump_${sha8}_${PRESET}.log"
+    if [ -n "${HOST_TARGET_DIR:-}" ]; then
+      if ! ( cd "$wt" && env "${dump_env[@]}" CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
+        echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
+        tail -40 "$dlog" >&2
+        exit 1
+      fi
+    else
+      if ! ( cd "$wt" && env "${dump_env[@]}" cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture ) >"$dlog" 2>&1; then
+        echo "ERROR: [$role] blob-dump test failed for $ref ($sha8). Tail of $dlog:" >&2
+        tail -40 "$dlog" >&2
+        exit 1
+      fi
+    fi
+    if [ ! -f /tmp/recursion_input.bin ]; then
+      echo "ERROR: [$role] test_dump_recursion_input did not write /tmp/recursion_input.bin for $ref ($sha8)." >&2
+      exit 1
+    fi
+    mv /tmp/recursion_input.bin "$blob"
   fi
-  if [ ! -f /tmp/recursion_input.bin ]; then
-    echo "ERROR: [$role] test_dump_recursion_input did not write /tmp/recursion_input.bin for $ref ($sha8)." >&2
-    exit 1
-  fi
-  local blob="$WORK/blob_${sha8}_${PRESET}.bin"
-  cp /tmp/recursion_input.bin "$blob"
   echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes -> $blob" >&2
 
   # 2d. Measure: one deterministic execute --cycles run. Time it (CI feasibility).
@@ -356,6 +414,7 @@ case "$PRESET" in
   blowup2) REGIME="128-bit (blowup=2, 219 queries — realistic base-layer)" ;;
   blowup4) REGIME="128-bit (blowup=4, 110 queries — realistic base-layer)" ;;
   blowup8) REGIME="128-bit (blowup=8, 73 queries)" ;;
+  blowup4-block) REGIME="128-bit (blowup=4, 110 queries) — real ethrex block, 4 transfers" ;;
   *)       REGIME="$PRESET" ;;
 esac
 

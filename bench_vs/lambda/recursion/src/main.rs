@@ -13,12 +13,10 @@
 //! `VmProof`.
 //!
 //! The `continuation` feature swaps the monolithic proof for a multi-epoch
-//! `ContinuationProof` bundle on the same wire format
-//! (`recursion::ContinuationGuestInput`, built by
+//! `ContinuationProof` bundle (`recursion::ContinuationGuestInput`, built by
 //! `recursion::encode_continuation_guest_input`), verified via
-//! `recursion::verify_continuation_and_attest` — same trust model; the
-//! bundle is materialized with one rkyv deserialize pass (zero-copy epoch
-//! verify is follow-up work).
+//! `recursion::verify_continuation_and_attest` — same trust model, one rkyv
+//! deserialize pass (zero-copy epoch verify is follow-up work).
 //!
 //! `ProofOptions` is fixed by exactly one preset Cargo feature
 //! (`min`/`blowup2`/`blowup4`/`blowup8` — a `Preset`), not private input — an

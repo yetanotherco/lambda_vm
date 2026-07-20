@@ -53,16 +53,12 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
 pub enum Preset {
     /// Blowup=2, 1 query ([`MIN_PROOF_OPTIONS`]) — insecure, diagnostics only.
     Min,
-    /// Blowup=2, full 128-bit query count (219 queries at 20 grinding bits) —
-    /// the realistic base-layer shape: production pipelines prove the base
-    /// proof at low blowup (2/4) and reserve high blowup for the final wrap.
+    /// Blowup=2, 219 queries — 128-bit, realistic base-layer shape (low
+    /// blowup, high query count; final wrap uses high blowup instead).
     Blowup2,
-    /// Blowup=4, 110 queries — the other realistic base-layer point (e.g.
-    /// Zisk's compressor layer): 2× the prover LDE of blowup=2 for half the
-    /// queries to verify.
+    /// Blowup=4, 110 queries — the other realistic base-layer point.
     Blowup4,
-    /// Blowup=8, multi-query (73 queries) — 128-bit security at final-wrap-style
-    /// parameters: more prover work per row, far fewer queries to verify.
+    /// Blowup=8, 73 queries — 128-bit, final-wrap-style parameters.
     Blowup8,
 }
 

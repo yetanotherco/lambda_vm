@@ -26,12 +26,9 @@ jobs:
       startsWith(github.event.comment.body, '/bench-verify') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Job cap. On a cold runner the recursion BUILDS dominate: MEASURE_CLI (release cli)
-    # once, plus PER REF a guest build and a prover-test build for the blob dump. All
-    # cached in /tmp for later runs, and build-std / the host cargo target are shared
-    # across ref worktrees (see the recursion step's env) to keep the cold run under this
-    # cap. The recursion step also has its own tighter timeout so a runaway build there
-    # can't burn the whole job and lose the already-captured verifier result.
+    # Job cap. On a cold runner the recursion BUILDS dominate: MEASURE_CLI once, plus
+    # per ref a guest build and a prover-test build. Cached in /tmp; build-std / host
+    # cargo target shared across ref worktrees (see the recursion step's env).
     timeout-minutes: 90
     steps:
       - name: Acknowledge (react + occupancy notice)
@@ -91,24 +88,20 @@ jobs:
           scripts/bench_verify.sh "$HEAD_SHA" origin/main "$PAIRS" 2>&1 | tee /tmp/verify_out.txt
           sed -n '/=== Verify ABBA result/,$p' /tmp/verify_out.txt > /tmp/verify_result.txt
 
-      # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main),
-      # in three regimes: `min` (blowup=2, 1 query — cheap diagnostic floor) plus the
-      # realistic full-query base-layer points `blowup2` (219 queries) and `blowup4`
-      # (110 queries). Each measurement is one exact `execute --cycles` reading per ref
-      # (no ABBA). Cold wall time is dominated by BUILDS: MEASURE_CLI (release cli)
-      # once, plus a guest build and a prover-test build for the blob dump per ref; the
-      # GUEST_TARGET_DIR / HOST_TARGET_DIR below share build-std and the host cargo target
-      # across the two ref worktrees so the second ref is much cheaper (and per-worktree
-      # disk shrinks). continue-on-error + `!cancelled()` keep this fully isolated from the
-      # verifier bench above: a failure OR timeout here never fails the job nor clobbers the
-      # verifier verdict, and it still runs if the verifier step failed.
+      # Additive: deterministic recursion-guest cycle+accelerator diff (PR vs main), in
+      # four regimes: `min`, `blowup2`, `blowup4` (empty diagnostic inner program) plus
+      # `blowup4-block` (same verifier over a REAL ethrex block, via the `continuation`
+      # guest). One exact `execute --cycles` reading per ref (no ABBA); blowup4-block's
+      # dumped blob is cached by ref SHA (bench_recursion_cycles.sh), so a repeat run
+      # skips re-proving. GUEST_TARGET_DIR / HOST_TARGET_DIR share build-std and the
+      # host cargo target across ref worktrees. continue-on-error + `!cancelled()`
+      # isolate this from the verifier bench above.
       - name: Run recursion guest cycle benchmark
         id: recursion
         if: ${{ !cancelled() }}
         continue-on-error: true
-        # Fail-fast well under the job cap so a runaway recursion build can't burn
-        # the whole job and lose the already-captured verifier result (continue-on-error
-        # absorbs the timeout; the job still posts the verifier verdict).
+        # Fail-fast under the job cap so a runaway build can't burn the whole job
+        # (continue-on-error absorbs the timeout; the verifier verdict still posts).
         timeout-minutes: 70
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
@@ -121,15 +114,9 @@ jobs:
           set -o pipefail
           scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main min 2>&1 | tee /tmp/recursion_out.txt
           sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out.txt > /tmp/recursion_result.txt
-          # Full-query regimes: the realistic base-layer proofs (the single-query `min`
-          # regime above is a diagnostic floor, not the real verifier cost). Guest builds
-          # and worktrees are already cached from the min run, so each adds only a blob
-          # dump and one execute per ref. Both refs' dump tests must understand
-          # RECURSION_DUMP_PRESET to produce a comparable blob for a given preset — until
-          # `origin/main` merges the preset-aware dump test, it can only ever dump `min`
-          # options, so every blowup2/blowup4 attempt against it would fail the same way.
-          # Check that support once, up front, instead of attempting (and failing) each
-          # preset in turn.
+          # Full-query regimes, reusing the min run's cached guest builds/worktrees.
+          # origin/main needs RECURSION_DUMP_PRESET support to dump non-min blobs;
+          # check once up front instead of failing each preset in turn.
           if git grep -q RECURSION_DUMP_PRESET origin/main -- prover/src/tests/ 2>/dev/null; then
             for preset in blowup2 blowup4; do
               if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "/tmp/recursion_out_${preset}.txt"; then
@@ -140,6 +127,17 @@ jobs:
             done
           else
             { echo; echo "_(blowup2/blowup4 full-query regimes need \`origin/main\` to have the preset-aware dump test (RECURSION_DUMP_PRESET) — not merged yet, so only \`min\` is compared for this PR.)_"; } >> /tmp/recursion_result.txt
+          fi
+          # Real-block regime: needs origin/main to support RECURSION_DUMP_EPOCH_LOG2
+          # (continuation dumps); checked once up front like the loop above.
+          if git grep -q RECURSION_DUMP_EPOCH_LOG2 origin/main -- prover/src/tests/ 2>/dev/null; then
+            if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main blowup4-block 2>&1 | tee /tmp/recursion_out_blowup4-block.txt; then
+              { echo; sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out_blowup4-block.txt; } >> /tmp/recursion_result.txt
+            else
+              { echo; echo "_(blowup4-block real-ethrex-block regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
+            fi
+          else
+            { echo; echo "_(blowup4-block real-ethrex-block regime needs \`origin/main\` to support RECURSION_DUMP_EPOCH_LOG2 — not merged yet.)_"; } >> /tmp/recursion_result.txt
           fi
 
       - name: Post result

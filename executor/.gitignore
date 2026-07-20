@@ -2,9 +2,7 @@
 /program_artifacts/rust
 /tests/ethrex_hoodi.bin
 /tests/ethrex_bench_*.bin
-# _4 is committed: prover/src/tests/recursion_smoke_test.rs reads it directly
-# (~17 KB), and scripts/bench_recursion_scaling.sh also reads it as part of its
-# scaling ladder. The other ladder sizes (_1/_8/_16) and bigger ones (e.g. _20)
-# stay ignored — bench_recursion_scaling.sh generates any missing fixture on
-# demand via tooling/ethrex-fixtures.
+# _4 is committed (~17 KB): used by `make recursion-profile-block-input` and
+# scripts/bench_recursion_scaling.sh. Other sizes stay ignored — scaling.sh
+# generates any missing fixture on demand via tooling/ethrex-fixtures.
 !/tests/ethrex_bench_4.bin
