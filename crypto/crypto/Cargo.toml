@@ -47,3 +47,10 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Swaps the guest
+# transcript-absorb / transcript-sample / Merkle leaf+parent hash software paths
+# for trusted host ecalls. riscv64-only effect; on the host the
+# `lambda-vm-syscalls` dep is target-gated out, so this feature is inert there.
+# EXECUTE-ONLY: a build with this on must never be proven (the ecalls drive no
+# chip). Off by default -> a normal build is byte-identical.
+sim-hash-ecalls = ["lambda-vm-syscalls/sim-hash-ecalls"]

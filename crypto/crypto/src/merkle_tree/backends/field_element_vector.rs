@@ -79,6 +79,11 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
     if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
         let l: &[u8; 32] = left[..].try_into().unwrap();
         let r: &[u8; 32] = right[..].try_into().unwrap();
+        // EXPERIMENT 1: HASH_PAIR ecall replaces the in-guest 64-byte
+        // compression (byte-identical). Off-feature keeps the guest sponge.
+        #[cfg(feature = "sim-hash-ecalls")]
+        let hash = lambda_vm_syscalls::keccak::sim_hash_pair(l, r);
+        #[cfg(not(feature = "sim-hash-ecalls"))]
         let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
         let mut result = [0u8; NUM_BYTES];
         result.copy_from_slice(&hash);
@@ -120,6 +125,26 @@ where
     type Data = [FieldElement<F>; 2];
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
+        // EXPERIMENT 1: one-shot HASH_FELTS ecall over the two contiguous
+        // elements. `FieldElement<F>` is `#[repr(transparent)]` over its
+        // Goldilocks limbs, so the array pointer is the raw-limb pointer and
+        // `size_of / 8` is the per-element limb count (kind). Byte-identical to
+        // the `stream_bytes` streaming path below.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+            let kind = core::mem::size_of::<FieldElement<F>>() / 8;
+            let hash = lambda_vm_syscalls::keccak::sim_hash_felts(
+                core::ptr::from_ref(input).cast::<u8>(),
+                2,
+                core::ptr::null(),
+                0,
+                kind,
+            );
+            let mut result = [0u8; NUM_BYTES];
+            result.copy_from_slice(&hash);
+            return result;
+        }
+
         hash_streamed::<D, NUM_BYTES>(|sink| {
             input[0].stream_bytes(sink);
             input[1].stream_bytes(sink);
@@ -171,6 +196,27 @@ where
     /// `hash_data(&[a, b].concat())`: the sponge absorbs the same element bytes
     /// in the same order, just without the intermediate `Vec`.
     pub fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        // EXPERIMENT 1: one-shot HASH_FELTS ecall over the two slices `a ‖ b`
+        // (the verifier's `evaluations ‖ evaluations_sym` leaf shape; the plain
+        // leaf case passes an empty `b`). Elements are contiguous
+        // `#[repr(transparent)]` limbs, so each slice's `as_ptr()` is its
+        // raw-limb pointer and `size_of / 8` is the kind. Byte-identical to the
+        // streaming path below.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+            let kind = core::mem::size_of::<FieldElement<F>>() / 8;
+            let hash = lambda_vm_syscalls::keccak::sim_hash_felts(
+                a.as_ptr().cast::<u8>(),
+                a.len(),
+                b.as_ptr().cast::<u8>(),
+                b.len(),
+                kind,
+            );
+            let mut result = [0u8; NUM_BYTES];
+            result.copy_from_slice(&hash);
+            return result;
+        }
+
         hash_streamed::<D, NUM_BYTES>(|sink| {
             for element in a.iter().chain(b.iter()) {
                 element.stream_bytes(sink);

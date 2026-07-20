@@ -13,6 +13,9 @@ debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Forwards to
+# `crypto`; only affects the riscv64 guest verifier. EXECUTE-ONLY (never prove).
+sim-hash-ecalls = ["crypto/sim-hash-ecalls"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }

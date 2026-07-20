@@ -1,5 +1,6 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
+    instruction::sim_hash,
     logs::Log,
     memory::{Memory, MemoryError},
     registers::Registers,
@@ -7,6 +8,7 @@ use crate::vm::{
 
 const REGULAR_PC_UPDATE: u64 = 4;
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SyscallNumbers {
     // Placeholder discriminant. The actual syscall value is KECCAK_SYSCALL_NUMBER.
     KeccakPermute = 0,
@@ -16,6 +18,15 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Placeholder
+    // discriminants; the actual syscall values are the `SIM_*_SYSCALL_NUMBER`
+    // constants below. These are TRUSTED, execute-only stubs that drive NO chip
+    // (see `accelerator()` and `sim_hash_ecall()`): a stub build is never proven.
+    SimAbsorbFelts = 95,
+    SimAbsorbBytes = 96,
+    SimTranscriptSample = 97,
+    SimHashPair = 98,
+    SimHashFelts = 99,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -35,6 +46,18 @@ pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
 
+// Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Each computes
+// the correct value host-side, byte-identically to the guest software path it
+// replaces (see `sim_hash.rs`), and returns in one VM cycle. They drive no chip,
+// so a build using them is EXECUTE-ONLY (never proven — the same LogUp-bus caveat
+// as the Print ecall). Values `u64::MAX - {2..6}` sit in the unused
+// high-syscall-number band (keccak = MAX-1, ecsm = MAX-10).
+pub const SIM_ABSORB_FELTS_SYSCALL_NUMBER: u64 = u64::MAX - 2;
+pub const SIM_ABSORB_BYTES_SYSCALL_NUMBER: u64 = u64::MAX - 3;
+pub const SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER: u64 = u64::MAX - 4;
+pub const SIM_HASH_PAIR_SYSCALL_NUMBER: u64 = u64::MAX - 5;
+pub const SIM_HASH_FELTS_SYSCALL_NUMBER: u64 = u64::MAX - 6;
+
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
     fn try_from(value: u64) -> Result<Self, Self::Error> {
@@ -45,6 +68,13 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == SIM_ABSORB_FELTS_SYSCALL_NUMBER => Ok(SyscallNumbers::SimAbsorbFelts),
+            v if v == SIM_ABSORB_BYTES_SYSCALL_NUMBER => Ok(SyscallNumbers::SimAbsorbBytes),
+            v if v == SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER => {
+                Ok(SyscallNumbers::SimTranscriptSample)
+            }
+            v if v == SIM_HASH_PAIR_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashPair),
+            v if v == SIM_HASH_FELTS_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashFelts),
             _ => Err(()),
         }
     }
@@ -57,6 +87,19 @@ pub enum Accelerator {
     Ecsm,
 }
 
+/// One of the five field-native hash/transcript measurement ecalls
+/// (EXPERIMENT 1). These drive NO chip — they are trusted, execute-only stubs
+/// counted separately from real accelerators so the optimistic-ceiling score
+/// can be recomputed under different chip-cost assumptions.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SimHashEcall {
+    AbsorbFelts,
+    AbsorbBytes,
+    TranscriptSample,
+    HashPair,
+    HashFelts,
+}
+
 impl SyscallNumbers {
     /// The accelerator this syscall drives, if any. Exhaustive `match self`:
     /// adding a `SyscallNumbers` variant is a compile error here, so a new
@@ -66,6 +109,32 @@ impl SyscallNumbers {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
             SyscallNumbers::Print
+            | SyscallNumbers::Panic
+            | SyscallNumbers::Commit
+            | SyscallNumbers::Halt
+            // The sim ecalls are measurement stubs, not chips.
+            | SyscallNumbers::SimAbsorbFelts
+            | SyscallNumbers::SimAbsorbBytes
+            | SyscallNumbers::SimTranscriptSample
+            | SyscallNumbers::SimHashPair
+            | SyscallNumbers::SimHashFelts => None,
+        }
+    }
+
+    /// The field-native hash/transcript measurement ecall this syscall is, if
+    /// any. Exhaustive `match self` for the same "new variant = compile error"
+    /// reason as [`accelerator`](Self::accelerator); the CLI tallies each of
+    /// these separately under `--cycles`.
+    pub fn sim_hash_ecall(self) -> Option<SimHashEcall> {
+        match self {
+            SyscallNumbers::SimAbsorbFelts => Some(SimHashEcall::AbsorbFelts),
+            SyscallNumbers::SimAbsorbBytes => Some(SimHashEcall::AbsorbBytes),
+            SyscallNumbers::SimTranscriptSample => Some(SimHashEcall::TranscriptSample),
+            SyscallNumbers::SimHashPair => Some(SimHashEcall::HashPair),
+            SyscallNumbers::SimHashFelts => Some(SimHashEcall::HashFelts),
+            SyscallNumbers::KeccakPermute
+            | SyscallNumbers::Ecsm
+            | SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
             | SyscallNumbers::Halt => None,
@@ -454,6 +523,61 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    // Field-native hash/transcript measurement ecalls (EXPERIMENT 1).
+                    // Each reproduces host-side, byte-identically, the guest software
+                    // path it replaces (see `sim_hash`). Args are read from a0.. (x10..)
+                    // in order: ABSORB_FELTS uses a0..a3, HASH_FELTS uses a0..a5. The
+                    // carried log values mirror keccak/ecsm (pointers only) but are
+                    // never consumed by a prover — a stub build is execute-only.
+                    SyscallNumbers::SimAbsorbFelts => {
+                        let state_ptr = registers.read(10)?;
+                        let elems_ptr = registers.read(11)?;
+                        let count = registers.read(12)?;
+                        let kind = registers.read(13)?;
+                        sim_hash::absorb_felts(memory, state_ptr, elems_ptr, count, kind)?;
+                        src2_val = state_ptr;
+                        dst_val = elems_ptr;
+                    }
+                    SyscallNumbers::SimAbsorbBytes => {
+                        let state_ptr = registers.read(10)?;
+                        let bytes_ptr = registers.read(11)?;
+                        let len = registers.read(12)?;
+                        sim_hash::absorb_bytes(memory, state_ptr, bytes_ptr, len)?;
+                        src2_val = state_ptr;
+                        dst_val = bytes_ptr;
+                    }
+                    SyscallNumbers::SimTranscriptSample => {
+                        let state_ptr = registers.read(10)?;
+                        let out_ptr = registers.read(11)?;
+                        sim_hash::transcript_sample(memory, state_ptr, out_ptr)?;
+                        src2_val = state_ptr;
+                        dst_val = out_ptr;
+                    }
+                    SyscallNumbers::SimHashPair => {
+                        let l_ptr = registers.read(10)?;
+                        let r_ptr = registers.read(11)?;
+                        let out_ptr = registers.read(12)?;
+                        sim_hash::hash_pair(memory, l_ptr, r_ptr, out_ptr)?;
+                        src2_val = l_ptr;
+                        dst_val = out_ptr;
+                    }
+                    SyscallNumbers::SimHashFelts => {
+                        // Two-slice leaf hash a‖b: a0=a_ptr a1=a_count a2=b_ptr
+                        // a3=b_count a4=kind a5=out_ptr (b_count=0 for a single
+                        // slice). Matches the verifier's `evaluations ‖
+                        // evaluations_sym` leaf shape.
+                        let a_ptr = registers.read(10)?;
+                        let a_count = registers.read(11)?;
+                        let b_ptr = registers.read(12)?;
+                        let b_count = registers.read(13)?;
+                        let kind = registers.read(14)?;
+                        let out_ptr = registers.read(15)?;
+                        sim_hash::hash_felts(
+                            memory, a_ptr, a_count, b_ptr, b_count, kind, out_ptr,
+                        )?;
+                        src2_val = a_ptr;
+                        dst_val = out_ptr;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -636,6 +760,14 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
+    #[error("sim-hash ecall: unaligned 8-byte address: {0:#018x}")]
+    SimHashUnalignedAddress(u64),
+    #[error("sim-hash ecall: sponge offset out of range [0, 136): {0}")]
+    SimHashInvalidState(u64),
+    #[error("sim-hash ecall: element limb count (kind) out of range [1, 3]: {0}")]
+    SimHashInvalidKind(u64),
+    #[error("sim-hash ecall: address range overflows")]
+    SimHashAddressOverflow,
 }
 
 // =============================================================================

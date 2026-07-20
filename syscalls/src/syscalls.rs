@@ -33,6 +33,24 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+// Field-native hash/transcript measurement ecalls (EXPERIMENT 1). These are
+// TRUSTED, execute-only stubs: the executor computes the correct value host-side
+// and returns it in one cycle. They drive no chip, so a program that emits them
+// must never be proven (the same unbalanced-Ecall-bus caveat as `Print`); they
+// exist only to measure the optimistic cycle ceiling of a field-native
+// hash/transcript accelerator. Guarded by the `sim-hash-ecalls` cfg so a normal
+// guest build is byte-identical (the wrappers below are simply not compiled).
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_ABSORB_FELTS_SYSCALL_NUMBER: usize = usize::MAX - 2;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_ABSORB_BYTES_SYSCALL_NUMBER: usize = usize::MAX - 3;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER: usize = usize::MAX - 4;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_HASH_PAIR_SYSCALL_NUMBER: usize = usize::MAX - 5;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_HASH_FELTS_SYSCALL_NUMBER: usize = usize::MAX - 6;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -185,6 +203,108 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+// =============================================================================
+// Field-native hash/transcript measurement ecalls (EXPERIMENT 1)
+//
+// Raw ecall wrappers for the five trusted stubs. The host reproduces the exact
+// byte semantics of the corresponding guest software path (see the executor's
+// `sim_hash` module) and returns in one cycle. 4-argument calls pass the fourth
+// operand in a3 (x13); the executor reads a0/a1/a2/a3 accordingly. All pointers
+// are into guest memory. Only compiled under the `sim-hash-ecalls` feature (the
+// `crypto` swap sites forward it), so a normal build never references them.
+// =============================================================================
+
+/// `ABSORB_FELTS(state_ptr, elems_ptr, count, kind)`: absorb `count` field
+/// elements (each `kind` Goldilocks limbs, read as raw doublewords) into the
+/// sponge at `state_ptr`, using the canonical `stream_bytes` serialization.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_absorb_felts(state_ptr: *mut u8, elems_ptr: *const u8, count: usize, kind: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") elems_ptr,
+            in("a2") count,
+            in("a3") kind,
+            in("a7") SIM_ABSORB_FELTS_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `ABSORB_BYTES(state_ptr, bytes_ptr, len)`: absorb `len` raw bytes into the
+/// sponge at `state_ptr`.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_absorb_bytes(state_ptr: *mut u8, bytes_ptr: *const u8, len: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") bytes_ptr,
+            in("a2") len,
+            in("a7") SIM_ABSORB_BYTES_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `TRANSCRIPT_SAMPLE(state_ptr, out32_ptr)`: run the whole transcript
+/// `sample()` on the sponge at `state_ptr` and write the 32-byte result to
+/// `out32_ptr` (finalize-reset + reverse + re-absorb, in one call).
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_transcript_sample(state_ptr: *mut u8, out32_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") out32_ptr,
+            in("a7") SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `HASH_PAIR(l_ptr, r_ptr, out_ptr)`: Keccak-256 of the two concatenated
+/// 32-byte nodes (the fixed Merkle-parent shape); writes 32 bytes to `out_ptr`.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_hash_pair(l_ptr: *const u8, r_ptr: *const u8, out_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") l_ptr,
+            in("a1") r_ptr,
+            in("a2") out_ptr,
+            in("a7") SIM_HASH_PAIR_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `HASH_FELTS(a_ptr, a_count, b_ptr, b_count, kind, out_ptr)`: one-shot leaf
+/// hash of the concatenation `a ‖ b` of two field-element slices (each `kind`
+/// limbs); writes the 32-byte digest to `out_ptr`. A single-slice leaf passes
+/// `b_count = 0`. The two-slice form matches the verifier's `evaluations ‖
+/// evaluations_sym` leaf shape. Uses a0..a5.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+#[allow(clippy::too_many_arguments)]
+pub fn sim_hash_felts(
+    a_ptr: *const u8,
+    a_count: usize,
+    b_ptr: *const u8,
+    b_count: usize,
+    kind: usize,
+    out_ptr: *mut u8,
+) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") a_ptr,
+            in("a1") a_count,
+            in("a2") b_ptr,
+            in("a3") b_count,
+            in("a4") kind,
+            in("a5") out_ptr,
+            in("a7") SIM_HASH_FELTS_SYSCALL_NUMBER,
+        )
+    }
 }
 
 // =============================================================================

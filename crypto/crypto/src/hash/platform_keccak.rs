@@ -56,6 +56,26 @@ mod imp {
             out.copy_from_slice(&digest);
         }
     }
+
+    // Field-native hash/transcript measurement ecalls (EXPERIMENT 1): thin
+    // pass-throughs to the inner sponge's ecall helpers, so the transcript swap
+    // sites can drive the host ecalls without reaching the private field. These
+    // route to the same byte semantics as the software path (the INVARIANT above
+    // still holds — the sponge produced is identical), just computed host-side.
+    #[cfg(feature = "sim-hash-ecalls")]
+    impl PlatformKeccak256 {
+        pub fn sim_absorb_bytes(&mut self, bytes: &[u8]) {
+            self.0.sim_absorb_bytes(bytes);
+        }
+
+        pub fn sim_absorb_felts(&mut self, elems_ptr: *const u8, count: usize, kind: usize) {
+            self.0.sim_absorb_felts(elems_ptr, count, kind);
+        }
+
+        pub fn sim_transcript_sample(&mut self) -> [u8; 32] {
+            self.0.sim_transcript_sample()
+        }
+    }
 }
 
 #[cfg(not(target_arch = "riscv64"))]

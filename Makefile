@@ -249,6 +249,24 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RE
 endef
 $(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 
+# EXPERIMENT 1 (field-native hash/transcript ecalls) measurement ELFs: the
+# blowup2 preset with the `sim-hash-ecalls` feature, monolithic and continuation.
+# Deliberately NOT part of RECURSION_VERIFIER_ARTIFACTS / compile-recursion-elfs
+# — they are EXECUTE-ONLY measurement builds (never proven), built on demand via
+# `make compile-recursion-simhash-elfs` (or the individual .elf target). Each is
+# measured against the matching non-simhash baseline (recursion-cont-blowup2.elf
+# / recursion-blowup2.elf) with `cli execute --cycles`.
+.PHONY: compile-recursion-simhash-elfs
+compile-recursion-simhash-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-simhash.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simhash.elf
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-simhash.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-blowup2-simhash-bench,--features "blowup2 sim-hash-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simhash.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simhash-bench,--features "continuation blowup2 sim-hash-ecalls")
+
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
 

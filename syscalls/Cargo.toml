@@ -3,6 +3,13 @@ name = "lambda-vm-syscalls"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Compiles the
+# `sim_*` ecall wrappers + the `Keccak256` sponge-pointer helpers used by the
+# `crypto` swap sites. Off by default so a normal guest build is byte-identical;
+# `crypto`'s `sim-hash-ecalls` feature forwards to this one on riscv64.
+sim-hash-ecalls = []
+
 [dependencies]
 embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }

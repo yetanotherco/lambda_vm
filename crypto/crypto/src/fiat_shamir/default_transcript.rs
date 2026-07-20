@@ -41,10 +41,19 @@ where
     }
 
     pub fn sample(&mut self) -> [u8; 32] {
-        let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
-        result_hash.reverse();
-        self.hasher.update(result_hash);
-        result_hash
+        // EXPERIMENT 1: one TRANSCRIPT_SAMPLE ecall does the whole finalize-reset
+        // + reverse + re-absorb host-side (byte-identical result).
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        {
+            self.hasher.sim_transcript_sample()
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-hash-ecalls")))]
+        {
+            let mut result_hash: [u8; 32] = self.hasher.finalize_reset().into();
+            result_hash.reverse();
+            self.hasher.update(result_hash);
+            result_hash
+        }
     }
 }
 
@@ -64,11 +73,34 @@ where
     FieldElement<F>: AsBytes,
 {
     fn append_bytes(&mut self, new_bytes: &[u8]) {
-        self.hasher.update(new_bytes);
+        // EXPERIMENT 1: absorb raw bytes via the ABSORB_BYTES ecall.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        {
+            self.hasher.sim_absorb_bytes(new_bytes);
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-hash-ecalls")))]
+        {
+            self.hasher.update(new_bytes);
+        }
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
-        element.stream_bytes(&mut |b| self.hasher.update(b));
+        // EXPERIMENT 1: absorb the raw limbs via the ABSORB_FELTS ecall; the host
+        // applies the canonical `stream_bytes` serialization. `FieldElement<F>`
+        // is `#[repr(transparent)]` over its Goldilocks limbs ([u64; N]), so
+        // `size_of / 8` is the limb count and the element pointer is the limb
+        // pointer. Byte-identical to the `stream_bytes` path below for the
+        // transcript field (Goldilocks base = 1 limb, Fp3 = 3 limbs).
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        {
+            let kind = core::mem::size_of::<FieldElement<F>>() / 8;
+            self.hasher
+                .sim_absorb_felts(core::ptr::from_ref(element).cast::<u8>(), 1, kind);
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-hash-ecalls")))]
+        {
+            element.stream_bytes(&mut |b| self.hasher.update(b));
+        }
     }
 
     fn state(&self) -> [u8; 32] {

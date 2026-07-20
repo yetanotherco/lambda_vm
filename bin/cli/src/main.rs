@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
+use executor::vm::instruction::execution::{Accelerator, SimHashEcall, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -377,6 +377,33 @@ fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Ac
         .and_then(|s| s.accelerator())
 }
 
+/// Classifies one executed instruction as a field-native hash/transcript
+/// measurement ecall (EXPERIMENT 1). Same shape as [`accelerator_of`]; these
+/// stubs drive no chip, so they are counted here rather than as accelerators.
+fn sim_hash_ecall_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<SimHashEcall> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    SyscallNumbers::try_from(src1_val)
+        .ok()
+        .and_then(|s| s.sim_hash_ecall())
+}
+
+/// Per-ecall invocation tallies printed under `--cycles`. Keccak/ECSM are real
+/// accelerator chips; the five `sim_*` fields are the EXPERIMENT 1 measurement
+/// stubs, counted separately so the optimistic-ceiling score can be recomputed
+/// under different chip-cost assumptions.
+#[derive(Default, Clone, Copy)]
+struct EcallCounts {
+    keccak: u64,
+    ecsm: u64,
+    sim_absorb_felts: u64,
+    sim_absorb_bytes: u64,
+    sim_transcript_sample: u64,
+    sim_hash_pair: u64,
+    sim_hash_felts: u64,
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
@@ -408,11 +435,11 @@ fn cmd_execute(
         }
     };
 
-    // Accelerator invocation counts, tallied only in the plain streaming path
-    // below (the flamegraph path drives execution inside the executor and does
-    // not expose per-log data). `None` means "not counted", so the accel lines
-    // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    // Ecall invocation counts, tallied only in the plain streaming path below
+    // (the flamegraph path drives execution inside the executor and does not
+    // expose per-log data). `None` means "not counted", so the ecall lines are
+    // omitted rather than printed as misleading zeros.
+    let mut ecall_counts: Option<EcallCounts> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -478,14 +505,14 @@ fn cmd_execute(
         };
 
         let mut cycle_count: u64 = 0;
-        let mut keccak_calls: u64 = 0;
-        let mut ecsm_calls: u64 = 0;
+        let mut counts = EcallCounts::default();
         // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
-        // accelerator syscall number. This is a cheap superset — a non-ECALL
-        // instruction can hold the same value in src1 — that `accelerator_of`
-        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
-        // `&mut`) is released so the instruction cache can be read again.
-        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
+        // accelerator OR sim-hash-ecall syscall number. This is a cheap superset
+        // — a non-ECALL instruction can hold the same value in src1 — that the
+        // `*_of` classifiers confirm below, once the chunk's `&Log` borrow (tied
+        // to the executor's `&mut`) is released so the instruction cache can be
+        // read again.
+        let mut ecall_candidates: Vec<(u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
                 Ok(logs) => logs,
@@ -499,19 +526,28 @@ fn cmd_execute(
             if cycles {
                 for log in logs {
                     if SyscallNumbers::try_from(log.src1_val)
-                        .map(|s| s.accelerator().is_some())
+                        .map(|s| s.accelerator().is_some() || s.sim_hash_ecall().is_some())
                         .unwrap_or(false)
                     {
-                        accel_candidates.push((log.current_pc, log.src1_val));
+                        ecall_candidates.push((log.current_pc, log.src1_val));
                     }
                 }
             }
             // `logs` is no longer used, so the executor's `&mut` borrow is free
             // and the instruction cache can be read to confirm each candidate.
-            for (pc, a7) in accel_candidates.drain(..) {
-                match accelerator_of(executor.instructions.get(pc), a7) {
-                    Some(Accelerator::Keccak) => keccak_calls += 1,
-                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
+            for (pc, a7) in ecall_candidates.drain(..) {
+                let instr = executor.instructions.get(pc);
+                match accelerator_of(instr, a7) {
+                    Some(Accelerator::Keccak) => counts.keccak += 1,
+                    Some(Accelerator::Ecsm) => counts.ecsm += 1,
+                    None => {}
+                }
+                match sim_hash_ecall_of(instr, a7) {
+                    Some(SimHashEcall::AbsorbFelts) => counts.sim_absorb_felts += 1,
+                    Some(SimHashEcall::AbsorbBytes) => counts.sim_absorb_bytes += 1,
+                    Some(SimHashEcall::TranscriptSample) => counts.sim_transcript_sample += 1,
+                    Some(SimHashEcall::HashPair) => counts.sim_hash_pair += 1,
+                    Some(SimHashEcall::HashFelts) => counts.sim_hash_felts += 1,
                     None => {}
                 }
             }
@@ -526,16 +562,21 @@ fn cmd_execute(
         }
 
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            ecall_counts = Some(counts);
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
-            println!("Keccak calls: {}", keccak_calls);
-            println!("Ecsm calls: {}", ecsm_calls);
+        if let Some(c) = ecall_counts {
+            println!("Keccak calls: {}", c.keccak);
+            println!("Ecsm calls: {}", c.ecsm);
+            println!("Sim absorb_felts calls: {}", c.sim_absorb_felts);
+            println!("Sim absorb_bytes calls: {}", c.sim_absorb_bytes);
+            println!("Sim transcript_sample calls: {}", c.sim_transcript_sample);
+            println!("Sim hash_pair calls: {}", c.sim_hash_pair);
+            println!("Sim hash_felts calls: {}", c.sim_hash_felts);
         }
     }
 
