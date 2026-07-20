@@ -210,3 +210,19 @@ tag = "KECCAK_RC"
 kind = "interaction"
 input = ["BaseField"]
 output = ["Byte", 8]
+
+# ECSM
+[[signatures]]
+tag = "ECDAS"
+kind = "interaction"
+input = ["Bit", "DWordWL",  "U256BL", "U256BL", "U256BL", "U256BL", "Byte", "Bit"]
+
+[[signatures]]
+tag = "SERVE_K"
+kind = "interaction"
+input = ["DWordWL", "DWordWL", "Byte"]
+
+[[signatures]]
+kind = "interaction"
+tag = "BIT"
+input = ["DWordWL", "Byte"]

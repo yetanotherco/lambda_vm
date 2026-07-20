@@ -1,5 +1,6 @@
 #import "@preview/shiroa:0.3.1": *
 #import "/templates/page.typ": project
+#import "@preview/equate:0.3.2": equate
 
 #show: book
 
@@ -49,6 +50,10 @@
       ("commit.typ", [`COMMIT` chip], <commit>),
       ("sha256.typ", [`SHA256` accelerator], <sha256>),
       ("keccak.typ", [`KECCAK` accelerator], <keccak>),
+      ("ecsm.typ", [`ECSM` accelerator], <ecsm>),
+    )),
+    ("MATHEMATICS", (
+      ("limbs_and_carries.typ", [On limb decomposition and carries], <limbs>),
     ))
   )
 )
@@ -67,6 +72,7 @@
 #let common-formatting(body) = {
   set footnote(numbering: "[1]")
   show raw.where(block: true): it => block(it, inset: 1em, width: 100%, radius: 5pt)
+  show ref: equate.with(sub-numbering: true, breakable: true, number-mode: "label")
   body
 }
 
@@ -79,15 +85,19 @@
 #let et = todo.with(background: rgb("d4aa3a"), name: "Erik")
 #let cdsg = todo.with(background: olive, name: "Cyprien")
 
-#let aside(title, body) = context figure(
+#let highlight(title, body, color) = context figure(
   block(inset: (left: 1em, right: 1em, bottom: 1em), stroke: luma(50%), breakable: false)[
     #block(inset: (left: 1em, right: 1em, top: .75em, bottom: .75em),
            width: 100% + 2em,
-           fill: rgb("55aaff"),
+           fill: color,
            stroke: luma(50%),
            align(center, strong(text(fill: black, title))))
     #align(left, body)
 ])
+
+#let aside(title, body) = highlight(title, body, rgb("55aaff"))
+
+#let attention(title, body) = highlight("Attention: " + title, body, rgb("#ff2600"))
 
 
 #let is-shiroa = "x-target" in sys.inputs
