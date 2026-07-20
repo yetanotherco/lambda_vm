@@ -192,16 +192,18 @@ measure_ref() {
   fi
   local block_txs="${BLOCK_TXS:-4}"
   local block_epoch_log2="${BLOCK_EPOCH_LOG2:-21}"
-  # Key the cache on ref SHA + preset AND the MEASURE_CLI source SHA, so a baseline and
-  # PR side measured by different counters (after a cli change) never share a result.
-  local result="$WORK/result_${sha8}_${PRESET}_m${HEAD_SHA:0:8}.txt"
-  local wt="$WORK/wt_${sha8}"
 
   # Blob cache: keyed on sha + preset (+ block fixture/epoch), persists across runs.
   local blob_key="$PRESET"
   if [ "$is_block" = 1 ]; then
     blob_key="${PRESET}_txs${block_txs}_epoch${block_epoch_log2}"
   fi
+  # Key the result cache on ref SHA + blob_key (so a BLOCK_TXS/BLOCK_EPOCH_LOG2
+  # override never reuses a stale measurement) AND the MEASURE_CLI source SHA
+  # (so a baseline and PR side measured by different counters never share a result).
+  local result="$WORK/result_${sha8}_${blob_key}_m${HEAD_SHA:0:8}.txt"
+  local wt="$WORK/wt_${sha8}"
+
   local blob="$WORK/blob_${sha8}_${blob_key}.bin"
   local need_dump=1
   if [ "${REBUILD:-0}" != "1" ] && [ -s "$blob" ]; then

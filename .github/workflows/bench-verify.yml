@@ -76,7 +76,11 @@ jobs:
             N=${N:-20}
           fi
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
+          if ! [[ "$N" =~ ^[0-9]+$ ]]; then
+            echo "::warning::pair count '$N' is not a number; using 20"
+            N=20
+          fi
+          if [ "$N" -lt 2 ] || [ "$N" -gt 40 ]; then
             echo "::warning::pair count $N out of range [2,40]; using 20"
             N=20
           fi
@@ -195,10 +199,7 @@ jobs:
               });
             }
 
-      # The recursion step's continue-on-error exists so its failure never costs the
-      # already-captured/posted verifier result — not to hide the failure. Fail here,
-      # after that result is safely posted, so the job's overall status still reflects
-      # reality instead of reading as a full green success.
+      # continue-on-error above protects the posted verifier result, not the failure itself.
       - name: Fail if recursion cycle bench didn't complete
         if: always() && steps.recursion.outcome != 'success'
         run: |
