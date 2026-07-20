@@ -240,7 +240,7 @@ type = ["Byte", 33]
 desc = "Offset value; equals $3 #`p`$"
 
 [[variables.constant]]
-name = "carry_offsets"
+name = "offsets"
 type = ["Half", 3]
 desc = "Range-offsets for carries `c0`, `c1` and `c2`."
 
@@ -383,7 +383,7 @@ ref = "ecdas:c:c0_63_is_zero"
 [[constraints.lambda]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c0", "i"], ["idx", "carry_offsets", 0]]]
+input = [["+", ["idx", "c0", "i"], ["idx", "offsets", 0]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 ref = "ecdas:c:range_c0"
@@ -449,7 +449,7 @@ poly = ["idx", "c1", 63]
 [[constraints.xR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c1", "i"], ["idx", "carry_offsets", 1]]]
+input = [["+", ["idx", "c1", "i"], ["idx", "offsets", 1]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 
@@ -517,7 +517,7 @@ poly = ["idx", "c2", 63]
 [[constraints.yR]]
 kind = "interaction"
 tag = "IS_HALF"
-input = [["+", ["idx", "c2", "i"], ["idx", "carry_offsets", 2]]]
+input = [["+", ["idx", "c2", "i"], ["idx", "offsets", 2]]]
 iter = ["i", 0, 62]
 multiplicity = "μ"
 

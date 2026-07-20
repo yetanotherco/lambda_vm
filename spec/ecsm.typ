@@ -181,7 +181,7 @@ Note that the `timestamp` on both memory accesses is offset to allow `addr_xR` t
 #render_constraint_table(ecsm_chip, config, groups: "write_xR")
 
 == Carry offsets
-We close by deriving the values of `carry_offsets`.
+We close by deriving the values of `offsets`.
 To this end, we decompose the formulae
 $
   #`xG`^2 - #`x2` - q_0 dot p &= 0,\
@@ -197,10 +197,10 @@ $
   #`c0`_i &in [-8160, 8159],\
   #`c1`_i &in [-24478, 24477].\
 $
-When we selectc $#`carry_offsets` = (8160, 24478)$, we arrive at
+When we select $#`offsets` = (8160, 24478)$, we arrive at
 $
-  #`c0`_i + #`carry_offsets[1]` &in [0, &16319] subset.eq [2^16],\
-  #`c1`_i + #`carry_offsets[2]` &in [0, &48955] subset.eq [2^16].\
+  #`c0`_i + #`offsets[1]` &in [0, &16319] subset.eq [2^16],\
+  #`c1`_i + #`offsets[2]` &in [0, &48955] subset.eq [2^16].\
 $
 
 == Padding
@@ -321,7 +321,7 @@ Setting this bit to 1 can only be done in active rows (@ecdas:c:next_op_implies_
 #render_constraint_table(ecdas_chip, config, groups: "send")
 
 == Carry offsets
-We derive the values of `carry_offsets`.
+We derive the values of `offsets`.
 We start with the three formulae
 $
   #`op` dot (lambda (x_G - x_A) - y_G + y_A) + (1-#`op`) (2lambda y_A - 3x_A^2 - a) + (#`r` - q_0) p &= 0,\
@@ -340,11 +340,11 @@ $
   #`c1`_i &in [-8416, 16828], text("and")\
   #`c2`_i &in [-16830, 16828].\
 $
-Selecting $#`carry_offsets` = (33657,8416,16830)$, we arrive at
+Selecting $#`offsets` = (33657,8416,16830)$, we arrive at
 $
-  #`c0`_i + #`carry_offsets[0]` &in [0, 58899] subset.eq [2^16],\
-  #`c1`_i + #`carry_offsets[1]` &in [0, 25244] subset.eq [2^16],text("and")\
-  #`c2`_i + #`carry_offsets[2]` &in [0, 33658] subset.eq [2^16].
+  #`c0`_i + #`offsets[0]` &in [0, 58899] subset.eq [2^16],\
+  #`c1`_i + #`offsets[1]` &in [0, 25244] subset.eq [2^16],text("and")\
+  #`c2`_i + #`offsets[2]` &in [0, 33658] subset.eq [2^16].
 $
 
 == Padding
