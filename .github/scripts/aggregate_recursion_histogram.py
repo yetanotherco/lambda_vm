@@ -93,10 +93,6 @@ def parse(text):
     return total_cycles, unique_pcs, exec_time, tables
 
 
-def short(name, width=90):
-    return name if len(name) <= width else name[: width - 1] + "…"
-
-
 def render_table(rows, denom_label):
     if not rows:
         return "> _no rows_\n"
@@ -105,7 +101,7 @@ def render_table(rows, denom_label):
     for i, r in enumerate(rows, 1):
         body += (
             f"| {i} | {r['cycles']:,} | {r['pct']}% | {r['cum']}% | "
-            f"{r['pcs']} | `{short(r['fn'])}` |\n"
+            f"{r['pcs']} | `{r['fn']}` |\n"
         )
     last_cum = rows[-1]["cum"]
     body += (
