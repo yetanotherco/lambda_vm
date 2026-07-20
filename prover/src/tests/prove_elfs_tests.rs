@@ -400,6 +400,94 @@ fn test_prove_elfs_fext() {
     );
 }
 
+/// Adversarial: a FEXT_STORE read-back forged into the non-canonical `V + p`
+/// word pair (same field element mod p, so the field-storage `Memory` read still
+/// balances, but a 64-bit value >= p) must be rejected — the `coeff_lt_p` ALU-LT
+/// canonicality check is the guard. Complements the AIR-only recompose test in
+/// `fext_store_tests.rs` (which never drives the bus lookup).
+#[test]
+fn test_prove_elfs_fext_rejects_noncanonical_store_readback() {
+    use crate::tables::fext_store::cols as sc;
+    const P: u64 = 0xFFFF_FFFF_0000_0001;
+
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    let nrows = traces.fext_store.num_rows();
+    let t = &mut traces.fext_store.main_table;
+    let row = (0..nrows)
+        .find(|&r| *t.get(r, sc::MU).value() == 1)
+        .expect("test_fext must have an active FEXT_STORE row");
+    let v = *t.get(row, sc::C0_LO).value() | (*t.get(row, sc::C0_HI).value() << 32);
+    assert!(
+        v < (1u64 << 32) - 1,
+        "stored coeff must be small enough for the V+p alias to fit in u64"
+    );
+    let alias = v + P;
+    let (lo, hi) = (alias & 0xFFFF_FFFF, alias >> 32);
+    t.set(row, sc::C0_LO, FieldElement::<GoldilocksField>::from(lo));
+    t.set(row, sc::C0_HI, FieldElement::<GoldilocksField>::from(hi));
+    // Keep the half-word recompose AIR constraints satisfied so the forgery can
+    // only be caught by the bus-level `coeff_lt_p` check, not the recompose.
+    t.set(
+        row,
+        sc::hw(sc::C0_LO),
+        FieldElement::<GoldilocksField>::from(lo & 0xFFFF),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_LO) + 1,
+        FieldElement::<GoldilocksField>::from(lo >> 16),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_HI),
+        FieldElement::<GoldilocksField>::from(hi & 0xFFFF),
+    );
+    t.set(
+        row,
+        sc::hw(sc::C0_HI) + 1,
+        FieldElement::<GoldilocksField>::from(hi >> 16),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "non-canonical STORE read-back (V+p alias) must be rejected"
+    );
+}
+
+/// Adversarial: forging a touched field cell's finalized value in the FEXT_PAGE
+/// bookend must be rejected — the `Memory`/GlobalFieldMemory token for that cell
+/// no longer matches its last access, so the bus cannot balance. Guards the
+/// field-storage carry/bookend value integrity (the AIR-only page tests never
+/// drive this bus).
+#[test]
+fn test_prove_elfs_fext_rejects_tampered_field_final_value() {
+    use crate::tables::fext_page::cols as pc;
+
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+
+    let nrows = traces.fext_page.num_rows();
+    let t = &mut traces.fext_page.main_table;
+    let row = (0..nrows)
+        .find(|&r| *t.get(r, pc::MU).value() == 1)
+        .expect("test_fext must have an active FEXT_PAGE row");
+    let forged = t.get(row, pc::FINAL_VAL).value().wrapping_add(1);
+    t.set(
+        row,
+        pc::FINAL_VAL,
+        FieldElement::<GoldilocksField>::from(forged),
+    );
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "a tampered field-cell final value must be rejected"
+    );
+}
+
 /// Regression: the prover must be deterministic for a fixed program.
 ///
 /// `generate_lt_trace` once ordered its rows by `HashMap` iteration (per-process
