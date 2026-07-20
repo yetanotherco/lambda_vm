@@ -33,6 +33,20 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+/// Syscall number for the `REDUCED_OPENING_ROW` measurement stub (Level A).
+///
+/// MEASUREMENT-ONLY: has no chip table, so NEVER prove a build that emits it —
+/// the unmatched Ecall on the LogUp bus would fail verification (same caveat as
+/// `Print`). Only used behind the `sim-ro-ecalls` feature of the recursion
+/// verifier guest.
+#[cfg(target_arch = "riscv64")]
+const REDUCED_OPENING_ROW_SYSCALL_NUMBER: usize = usize::MAX - 20;
+
+/// Syscall number for the `REDUCED_OPENING_QUERY` measurement stub (Level B).
+/// Same MEASUREMENT-ONLY caveat as [`REDUCED_OPENING_ROW_SYSCALL_NUMBER`].
+#[cfg(target_arch = "riscv64")]
+const REDUCED_OPENING_QUERY_SYSCALL_NUMBER: usize = usize::MAX - 21;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -184,6 +198,61 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 #[cfg(not(target_arch = "riscv64"))]
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+// =============================================================================
+// DEEP reduced-opening measurement stubs (Level A / Level B).
+//
+// MEASUREMENT-ONLY. Each computes the CORRECT reduced-opening value host-side
+// in one VM cycle (trusted passthrough) so the guest still accepts the proof,
+// letting us measure the cycle ceiling of a fused reduced-opening chip. They
+// have NO chip table — NEVER prove a build that emits them (LogUp bus would
+// unbalance, like `Print`). See `math::sim_ro` for the input struct layouts and
+// `others/accelerator_noop_sim_spec.md` (Experiment 2).
+// =============================================================================
+
+/// Level A — `REDUCED_OPENING_ROW`. `input_ptr` points to a
+/// `math::sim_ro::ReducedOpeningRowInput`; the host writes
+/// `(base_row_sum, base_row_sum_sym)` (2 extension elements = 6 u64) at
+/// `out_ptr` for the given `row_idx`.
+#[cfg(target_arch = "riscv64")]
+pub fn reduced_opening_row(input_ptr: usize, row_idx: usize, out_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a1") row_idx,
+            in("a2") out_ptr,
+            in("a7") REDUCED_OPENING_ROW_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Level A reduced-opening measurement stub (riscv64 guest only).
+pub fn reduced_opening_row(_input_ptr: usize, _row_idx: usize, _out_ptr: usize) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Level B — `REDUCED_OPENING_QUERY`. `input_ptr` points to a
+/// `math::sim_ro::ReducedOpeningQueryInput`; the host writes
+/// `(deep_eval, deep_eval_sym)` (2 extension elements = 6 u64) at `out_ptr`.
+#[cfg(target_arch = "riscv64")]
+pub fn reduced_opening_query(input_ptr: usize, out_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a1") out_ptr,
+            in("a7") REDUCED_OPENING_QUERY_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Level B reduced-opening measurement stub (riscv64 guest only).
+pub fn reduced_opening_query(_input_ptr: usize, _out_ptr: usize) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

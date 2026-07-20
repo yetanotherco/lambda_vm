@@ -1,5 +1,9 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
+    instruction::sim_reduced_opening::{
+        REDUCED_OPENING_QUERY_SYSCALL_NUMBER, REDUCED_OPENING_ROW_SYSCALL_NUMBER,
+        reduced_opening_query, reduced_opening_row,
+    },
     logs::Log,
     memory::{Memory, MemoryError},
     registers::Registers,
@@ -16,6 +20,10 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminants. The actual syscall values are the
+    // REDUCED_OPENING_* consts below. Measurement-only stubs, not accelerators.
+    ReducedOpeningRow = 95,
+    ReducedOpeningQuery = 96,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -45,6 +53,10 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == REDUCED_OPENING_ROW_SYSCALL_NUMBER => Ok(SyscallNumbers::ReducedOpeningRow),
+            v if v == REDUCED_OPENING_QUERY_SYSCALL_NUMBER => {
+                Ok(SyscallNumbers::ReducedOpeningQuery)
+            }
             _ => Err(()),
         }
     }
@@ -65,7 +77,11 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
-            SyscallNumbers::Print
+            // Measurement stubs, not real accelerators: no chip table, never
+            // proven. The CLI tallies them separately (see bin/cli).
+            SyscallNumbers::ReducedOpeningRow
+            | SyscallNumbers::ReducedOpeningQuery
+            | SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
             | SyscallNumbers::Halt => None,
@@ -454,6 +470,27 @@ impl Instruction {
                         src2_val = addr_xg;
                         dst_val = addr_k;
                     }
+                    SyscallNumbers::ReducedOpeningRow => {
+                        // MEASUREMENT-ONLY (never proven). Level A: compute one
+                        // OOD row's (base_row_sum, base_row_sum_sym) host-side.
+                        // x10 = &input struct, x11 = row_idx, x12 = out_ptr.
+                        let input_ptr = registers.read(10)?;
+                        let row_idx = registers.read(11)?;
+                        let out_ptr = registers.read(12)?;
+                        reduced_opening_row(memory, input_ptr, row_idx, out_ptr)?;
+                        src2_val = input_ptr;
+                        dst_val = out_ptr;
+                    }
+                    SyscallNumbers::ReducedOpeningQuery => {
+                        // MEASUREMENT-ONLY (never proven). Level B: reconstruct
+                        // the whole (deep_eval, deep_eval_sym) pair host-side.
+                        // x10 = &input struct, x11 = out_ptr.
+                        let input_ptr = registers.read(10)?;
+                        let out_ptr = registers.read(11)?;
+                        reduced_opening_query(memory, input_ptr, out_ptr)?;
+                        src2_val = input_ptr;
+                        dst_val = out_ptr;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -636,6 +673,10 @@ pub enum ExecutionError {
     EcsmOperandOverlap,
     #[error("ECSM scalar multiplication error: {0}")]
     Ecsm(#[from] ecsm::EcsmError),
+    #[error("reduced-opening stub: inconsistent input dimensions")]
+    SimReducedOpeningInvalidDims,
+    #[error("reduced-opening stub: non-invertible denominator")]
+    SimReducedOpeningInverse,
 }
 
 // =============================================================================

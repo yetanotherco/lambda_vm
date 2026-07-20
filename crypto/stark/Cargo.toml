@@ -38,6 +38,13 @@ serde-wasm-bindgen = { version = "0.5", optional = true }
 web-sys = { version = "0.3.64", features = ['console'], optional = true }
 serde_cbor = { version = "0.11.1" }
 
+# Guest-only: the DEEP reduced-opening measurement stubs (sim-ro-ecalls /
+# sim-ro-query) call ecall wrappers from the syscalls crate. Only referenced by
+# riscv64-cfg'd + feature-gated code, so host builds never see it (mirrors
+# crypto/crypto's platform_keccak wiring).
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
+
 [dev-dependencies]
 math = { path = "../math", features = ["test-utils"] }
 criterion = { version = "0.4", default-features = false }
@@ -58,6 +65,14 @@ cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
+
+# MEASUREMENT-ONLY (never prove a build with these on). Swap the DEEP
+# reduced-opening hot loop for a trusted 1-cycle ecall to measure its cycle
+# ceiling. `sim-ro-ecalls` = Level A (per-(query×row) column loop);
+# `sim-ro-query` additionally fuses to Level B (whole per-query pair). Only
+# effective on the riscv64 recursion guest; a no-op on host builds.
+sim-ro-ecalls = []
+sim-ro-query = ["sim-ro-ecalls"]
 
 
 [package.metadata.wasm-pack.profile.dev]

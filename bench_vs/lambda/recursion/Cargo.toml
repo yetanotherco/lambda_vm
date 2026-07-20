@@ -21,6 +21,12 @@ blowup8 = []
 # memory-bounded inner prove) instead of a monolithic VmProof. Selects the
 # `recursion-cont-<preset>-bench` bins below.
 continuation = []
+# MEASUREMENT-ONLY (never prove these). Replace the DEEP reduced-opening hot
+# loop with a trusted 1-cycle ecall to measure its cycle ceiling.
+# sim-ro-ecalls = Level A (per-row column loop); sim-ro-query = Level B (whole
+# per-query pair, implies Level A). See crypto/stark + others/accelerator_noop_sim_spec.md.
+sim-ro-ecalls = ["lambda-vm-prover/sim-ro-ecalls"]
+sim-ro-query = ["lambda-vm-prover/sim-ro-query", "sim-ro-ecalls"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
@@ -59,6 +65,19 @@ required-features = ["continuation", "blowup2"]
 name = "recursion-cont-blowup4-bench"
 path = "src/main.rs"
 required-features = ["continuation", "blowup4"]
+
+# MEASUREMENT-ONLY reduced-opening stub variants of the cont/blowup2 guest.
+# Level A (simroA): per-row column-loop ecall. Level B (simroB): whole per-query
+# pair ecall. NEVER prove these builds.
+[[bin]]
+name = "recursion-cont-blowup2-simroA-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-ro-ecalls"]
+
+[[bin]]
+name = "recursion-cont-blowup2-simroB-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-ro-query"]
 
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [

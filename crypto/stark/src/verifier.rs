@@ -939,131 +939,303 @@ pub trait IsStarkVerifier<
         lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
     ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
-        let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
-        let ood_evaluations_table_width = query_invariant_terms.ood_width;
-        let trace_term_coeffs = &challenges.trace_term_coeffs;
+        // MEASUREMENT-ONLY stubs (never prove a build with these features on).
+        // Level B (`sim-ro-query`) hands the whole function to one trusted
+        // ecall; Level A (`sim-ro-ecalls`) replaces only the per-row column
+        // loop below. Both are no-ops on host / with the features off, leaving
+        // the original path byte-identical.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+        return Self::sim_reduced_opening_query_ecall(
+            evaluation_point,
+            evaluation_point_sym,
+            primitive_root,
+            challenges,
+            query_invariant_terms,
+            next_row_cols,
+            step_size,
+            lde_trace_precomputed_evaluations,
+            lde_trace_main_evaluations,
+            lde_trace_aux_evaluations,
+            lde_composition_poly_parts_evaluation,
+            lde_trace_precomputed_evaluations_sym,
+            lde_trace_main_evaluations_sym,
+            lde_trace_aux_evaluations_sym,
+            lde_composition_poly_parts_evaluation_sym,
+        );
 
-        // Base columns are supplied as two slices (precomputed ‖ main) that the
-        // prover concatenated in this order; `num_base`/`base_at` index into
-        // them as if concatenated, without allocating.
-        let num_precomputed = lde_trace_precomputed_evaluations.len();
-        let num_base = num_precomputed + lde_trace_main_evaluations.len();
-        let base_at = move |col: usize| -> &'b FieldElement<Field> {
-            if col < num_precomputed {
-                &lde_trace_precomputed_evaluations[col]
-            } else {
-                &lde_trace_main_evaluations[col - num_precomputed]
-            }
-        };
-        let num_precomputed_sym = lde_trace_precomputed_evaluations_sym.len();
-        let num_base_sym = num_precomputed_sym + lde_trace_main_evaluations_sym.len();
-        let base_at_sym = move |col: usize| -> &'b FieldElement<Field> {
-            if col < num_precomputed_sym {
-                &lde_trace_precomputed_evaluations_sym[col]
-            } else {
-                &lde_trace_main_evaluations_sym[col - num_precomputed_sym]
-            }
-        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-query")))]
+        return {
+            let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
+            let ood_evaluations_table_width = query_invariant_terms.ood_width;
+            let trace_term_coeffs = &challenges.trace_term_coeffs;
 
-        // Runtime guards: a malformed proof may supply opening evaluations
-        // whose column count does not match the OOD table width, or whose
-        // regular/symmetric base-column split disagree. Without these checks
-        // the indexing below would panic in release builds.
-        if num_base != num_base_sym {
-            return None;
-        }
-        if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
-            || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
-        {
-            return None;
-        }
-
-        // Build both denominator sets (regular, then symmetric) and invert
-        // them together in a single batch.
-        let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms.push(evaluation_point - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms.push(evaluation_point_sym - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
-        FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
-        let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
-
-        let mut trace_term = FieldElement::<FieldExtension>::zero();
-        let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
-        for row_idx in 0..ood_evaluations_table_height {
-            let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
-            let mut base_row_sum = FieldElement::<FieldExtension>::zero();
-            let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
-            if row_idx < step_size {
-                for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
-                    let coeff = &coeff_col[row_idx];
-                    if col_idx < num_base {
-                        // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
-                        base_row_sum += base_at(col_idx) * coeff;
-                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
-                    } else {
-                        let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
-                    }
+            // Base columns are supplied as two slices (precomputed ‖ main) that the
+            // prover concatenated in this order; `num_base`/`base_at` index into
+            // them as if concatenated, without allocating. (`base_at`/`base_at_sym`
+            // feed only the software column loop, so they are compiled out when
+            // the Level A ecall replaces it.)
+            let num_precomputed = lde_trace_precomputed_evaluations.len();
+            let num_base = num_precomputed + lde_trace_main_evaluations.len();
+            #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-ecalls")))]
+            let base_at = move |col: usize| -> &'b FieldElement<Field> {
+                if col < num_precomputed {
+                    &lde_trace_precomputed_evaluations[col]
+                } else {
+                    &lde_trace_main_evaluations[col - num_precomputed]
                 }
-            } else {
-                // g·z pruning: the next-row block opens only transition-window
-                // columns; every other column's coefficient is zero
-                // (`build_pruned_trace_term_coeffs`), so summing the window
-                // alone is exact — and skipping the rest is where the
-                // verifier/recursion cycle saving lands.
-                for &col_idx in next_row_cols {
-                    let coeff = &trace_term_coeffs[col_idx][row_idx];
-                    if col_idx < num_base {
-                        base_row_sum += base_at(col_idx) * coeff;
-                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
-                    } else {
-                        let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
-                    }
+            };
+            let num_precomputed_sym = lde_trace_precomputed_evaluations_sym.len();
+            let num_base_sym = num_precomputed_sym + lde_trace_main_evaluations_sym.len();
+            #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-ecalls")))]
+            let base_at_sym = move |col: usize| -> &'b FieldElement<Field> {
+                if col < num_precomputed_sym {
+                    &lde_trace_precomputed_evaluations_sym[col]
+                } else {
+                    &lde_trace_main_evaluations_sym[col - num_precomputed_sym]
                 }
+            };
+
+            // Runtime guards: a malformed proof may supply opening evaluations
+            // whose column count does not match the OOD table width, or whose
+            // regular/symmetric base-column split disagree. Without these checks
+            // the indexing below would panic in release builds.
+            if num_base != num_base_sym {
+                return None;
             }
-            trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
-            trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
-        }
+            if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
+                || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
+            {
+                return None;
+            }
 
-        let number_of_parts = query_invariant_terms.number_of_parts;
-        // Also rejects a per-query opening length that disagrees with the
-        // proof-level `number_of_parts`, not just a regular/symmetric mismatch.
-        if lde_composition_poly_parts_evaluation.len() != number_of_parts
-            || lde_composition_poly_parts_evaluation_sym.len() != number_of_parts
-        {
-            return None;
-        }
-        let z_pow = &query_invariant_terms.z_pow;
+            // Build both denominator sets (regular, then symmetric) and invert
+            // them together in a single batch.
+            let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
+            let mut current_z = challenges.z.clone();
+            for _ in 0..ood_evaluations_table_height {
+                denoms.push(evaluation_point - &current_z);
+                current_z = primitive_root * &current_z;
+            }
+            let mut current_z = challenges.z.clone();
+            for _ in 0..ood_evaluations_table_height {
+                denoms.push(evaluation_point_sym - &current_z);
+                current_z = primitive_root * &current_z;
+            }
+            // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
+            FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
+            let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
 
-        // A malformed proof can make evaluation_point == z_pow, reject.
-        let mut denom_composition_pair = [evaluation_point - z_pow, evaluation_point_sym - z_pow];
-        FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
-        let [denom_composition, denom_composition_sym] = denom_composition_pair;
+            // Level A (`sim-ro-ecalls`): build the per-query reduced-opening
+            // ecall input once (constant across the row loop). `sim_col_ptrs`
+            // is a per-column pointer table into the [col][row] coeff grid; it
+            // must outlive the loop (the ecall reads through its addresses).
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            {
+                debug_assert_eq!(core::mem::size_of::<FieldElement<Field>>(), 8);
+                debug_assert_eq!(core::mem::size_of::<FieldElement<FieldExtension>>(), 24);
+            }
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            let sim_col_ptrs: Vec<u64> = trace_term_coeffs
+                .iter()
+                .map(|c| c.as_ptr() as u64)
+                .collect();
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            let sim_row_input = math::sim_ro::ReducedOpeningRowInput {
+                precomputed_ptr: lde_trace_precomputed_evaluations.as_ptr() as u64,
+                precomputed_len: lde_trace_precomputed_evaluations.len() as u64,
+                main_ptr: lde_trace_main_evaluations.as_ptr() as u64,
+                main_len: lde_trace_main_evaluations.len() as u64,
+                aux_ptr: lde_trace_aux_evaluations.as_ptr() as u64,
+                aux_len: lde_trace_aux_evaluations.len() as u64,
+                precomputed_sym_ptr: lde_trace_precomputed_evaluations_sym.as_ptr() as u64,
+                precomputed_sym_len: lde_trace_precomputed_evaluations_sym.len() as u64,
+                main_sym_ptr: lde_trace_main_evaluations_sym.as_ptr() as u64,
+                main_sym_len: lde_trace_main_evaluations_sym.len() as u64,
+                aux_sym_ptr: lde_trace_aux_evaluations_sym.as_ptr() as u64,
+                aux_sym_len: lde_trace_aux_evaluations_sym.len() as u64,
+                coeff_col_ptrs_ptr: sim_col_ptrs.as_ptr() as u64,
+                next_row_cols_ptr: next_row_cols.as_ptr() as u64,
+                next_row_cols_len: next_row_cols.len() as u64,
+                ood_width: ood_evaluations_table_width as u64,
+                step_size: step_size as u64,
+            };
 
-        let mut h_sum = FieldElement::<FieldExtension>::zero();
-        let mut h_sum_sym = FieldElement::<FieldExtension>::zero();
-        for j in 0..number_of_parts {
-            let h_i_upsilon = &lde_composition_poly_parts_evaluation[j];
-            let h_i_upsilon_sym = &lde_composition_poly_parts_evaluation_sym[j];
-            let gamma = &challenges.gammas[j];
-            h_sum += h_i_upsilon * gamma;
-            h_sum_sym += h_i_upsilon_sym * gamma;
-        }
-        let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
-        let h_terms_sym = (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
+            let mut trace_term = FieldElement::<FieldExtension>::zero();
+            let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
+            for row_idx in 0..ood_evaluations_table_height {
+                let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
 
-        Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
+                #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+                let (base_row_sum, base_row_sum_sym) = {
+                    // Two-element literal (not `[x; 2]`): the generic
+                    // `FieldExtension` isn't `Copy`. The ecall (asm memory
+                    // clobber) writes both elements; move them out afterward.
+                    let mut out = [
+                        FieldElement::<FieldExtension>::zero(),
+                        FieldElement::<FieldExtension>::zero(),
+                    ];
+                    lambda_vm_syscalls::syscalls::reduced_opening_row(
+                        &sim_row_input as *const _ as usize,
+                        row_idx,
+                        out.as_mut_ptr() as usize,
+                    );
+                    let [base_row_sum, base_row_sum_sym] = out;
+                    (base_row_sum, base_row_sum_sym)
+                };
+
+                #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-ecalls")))]
+                let (base_row_sum, base_row_sum_sym) = {
+                    let mut base_row_sum = FieldElement::<FieldExtension>::zero();
+                    let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
+                    if row_idx < step_size {
+                        for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
+                            let coeff = &coeff_col[row_idx];
+                            if col_idx < num_base {
+                                // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
+                                base_row_sum += base_at(col_idx) * coeff;
+                                base_row_sum_sym += base_at_sym(col_idx) * coeff;
+                            } else {
+                                let aux_idx = col_idx - num_base;
+                                base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
+                                base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                            }
+                        }
+                    } else {
+                        // g·z pruning: the next-row block opens only transition-window
+                        // columns; every other column's coefficient is zero
+                        // (`build_pruned_trace_term_coeffs`), so summing the window
+                        // alone is exact — and skipping the rest is where the
+                        // verifier/recursion cycle saving lands.
+                        for &col_idx in next_row_cols {
+                            let coeff = &trace_term_coeffs[col_idx][row_idx];
+                            if col_idx < num_base {
+                                base_row_sum += base_at(col_idx) * coeff;
+                                base_row_sum_sym += base_at_sym(col_idx) * coeff;
+                            } else {
+                                let aux_idx = col_idx - num_base;
+                                base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
+                                base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                            }
+                        }
+                    }
+                    (base_row_sum, base_row_sum_sym)
+                };
+
+                trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
+                trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
+            }
+
+            let number_of_parts = query_invariant_terms.number_of_parts;
+            // Also rejects a per-query opening length that disagrees with the
+            // proof-level `number_of_parts`, not just a regular/symmetric mismatch.
+            if lde_composition_poly_parts_evaluation.len() != number_of_parts
+                || lde_composition_poly_parts_evaluation_sym.len() != number_of_parts
+            {
+                return None;
+            }
+            let z_pow = &query_invariant_terms.z_pow;
+
+            // A malformed proof can make evaluation_point == z_pow, reject.
+            let mut denom_composition_pair =
+                [evaluation_point - z_pow, evaluation_point_sym - z_pow];
+            FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
+            let [denom_composition, denom_composition_sym] = denom_composition_pair;
+
+            let mut h_sum = FieldElement::<FieldExtension>::zero();
+            let mut h_sum_sym = FieldElement::<FieldExtension>::zero();
+            for j in 0..number_of_parts {
+                let h_i_upsilon = &lde_composition_poly_parts_evaluation[j];
+                let h_i_upsilon_sym = &lde_composition_poly_parts_evaluation_sym[j];
+                let gamma = &challenges.gammas[j];
+                h_sum += h_i_upsilon * gamma;
+                h_sum_sym += h_i_upsilon_sym * gamma;
+            }
+            let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
+            let h_terms_sym =
+                (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
+
+            Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
+        };
+    }
+
+    /// MEASUREMENT-ONLY (Level B, `sim-ro-query`). Marshals every input of
+    /// [`Self::reconstruct_deep_composition_poly_evaluation_pair`] into the
+    /// [`math::sim_ro::ReducedOpeningQueryInput`] ABI and delegates the whole
+    /// `(deep_eval, deep_eval_sym)` reconstruction to the trusted
+    /// `REDUCED_OPENING_QUERY` ecall (see `others/accelerator_noop_sim_spec.md`,
+    /// Experiment 2, fusion upper bound). NEVER prove a build with this on — the
+    /// unmatched ecall unbalances the LogUp bus.
+    ///
+    /// Field-element scalars are passed by pointer (this generic method cannot
+    /// assume `Field::BaseType == u64`); `sim_col_ptrs` (the per-column pointer
+    /// table into the coeff grid) must outlive the ecall.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+    #[allow(clippy::too_many_arguments)]
+    fn sim_reduced_opening_query_ecall<'b>(
+        evaluation_point: &FieldElement<Field>,
+        evaluation_point_sym: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        challenges: &Challenges<FieldExtension>,
+        query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
+        lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
+        lde_trace_main_evaluations: &'b [FieldElement<Field>],
+        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
+        lde_trace_precomputed_evaluations_sym: &'b [FieldElement<Field>],
+        lde_trace_main_evaluations_sym: &'b [FieldElement<Field>],
+        lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
+    ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
+        debug_assert_eq!(core::mem::size_of::<FieldElement<Field>>(), 8);
+        debug_assert_eq!(core::mem::size_of::<FieldElement<FieldExtension>>(), 24);
+        let sim_col_ptrs: Vec<u64> = challenges
+            .trace_term_coeffs
+            .iter()
+            .map(|c| c.as_ptr() as u64)
+            .collect();
+        let input = math::sim_ro::ReducedOpeningQueryInput {
+            evaluation_point_ptr: evaluation_point as *const _ as u64,
+            evaluation_point_sym_ptr: evaluation_point_sym as *const _ as u64,
+            primitive_root_ptr: primitive_root as *const _ as u64,
+            z_ptr: &challenges.z as *const _ as u64,
+            z_pow_ptr: &query_invariant_terms.z_pow as *const _ as u64,
+            h_sum_zpow_ptr: &query_invariant_terms.h_sum_zpow as *const _ as u64,
+            ood_height: query_invariant_terms.ood_row_sum.len() as u64,
+            ood_width: query_invariant_terms.ood_width as u64,
+            number_of_parts: query_invariant_terms.number_of_parts as u64,
+            step_size: step_size as u64,
+            precomputed_ptr: lde_trace_precomputed_evaluations.as_ptr() as u64,
+            precomputed_len: lde_trace_precomputed_evaluations.len() as u64,
+            main_ptr: lde_trace_main_evaluations.as_ptr() as u64,
+            main_len: lde_trace_main_evaluations.len() as u64,
+            aux_ptr: lde_trace_aux_evaluations.as_ptr() as u64,
+            aux_len: lde_trace_aux_evaluations.len() as u64,
+            precomputed_sym_ptr: lde_trace_precomputed_evaluations_sym.as_ptr() as u64,
+            precomputed_sym_len: lde_trace_precomputed_evaluations_sym.len() as u64,
+            main_sym_ptr: lde_trace_main_evaluations_sym.as_ptr() as u64,
+            main_sym_len: lde_trace_main_evaluations_sym.len() as u64,
+            aux_sym_ptr: lde_trace_aux_evaluations_sym.as_ptr() as u64,
+            aux_sym_len: lde_trace_aux_evaluations_sym.len() as u64,
+            composition_ptr: lde_composition_poly_parts_evaluation.as_ptr() as u64,
+            composition_sym_ptr: lde_composition_poly_parts_evaluation_sym.as_ptr() as u64,
+            coeff_col_ptrs_ptr: sim_col_ptrs.as_ptr() as u64,
+            gammas_ptr: challenges.gammas.as_ptr() as u64,
+            ood_row_sum_ptr: query_invariant_terms.ood_row_sum.as_ptr() as u64,
+            next_row_cols_ptr: next_row_cols.as_ptr() as u64,
+            next_row_cols_len: next_row_cols.len() as u64,
+        };
+        let mut out = [
+            FieldElement::<FieldExtension>::zero(),
+            FieldElement::<FieldExtension>::zero(),
+        ];
+        lambda_vm_syscalls::syscalls::reduced_opening_query(
+            &input as *const _ as usize,
+            out.as_mut_ptr() as usize,
+        );
+        let [deep_eval, deep_eval_sym] = out;
+        Some((deep_eval, deep_eval_sym))
     }
 
     /// Verifies one or more STARK proofs with their corresponding AIRs.

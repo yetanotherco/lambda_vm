@@ -377,6 +377,43 @@ fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Ac
         .and_then(|s| s.accelerator())
 }
 
+/// A DEEP reduced-opening MEASUREMENT stub ecall (Experiment 2). These are not
+/// accelerators (no chip, never proven), so they don't appear in
+/// [`accelerator_of`]; they are tallied separately so an execute-only ceiling
+/// run can report how many were swallowed alongside the (unchanged) keccak count.
+enum SimReducedOpening {
+    Row,
+    Query,
+}
+
+fn sim_reduced_opening_of(
+    instruction: Option<&Instruction>,
+    src1_val: u64,
+) -> Option<SimReducedOpening> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    match SyscallNumbers::try_from(src1_val).ok()? {
+        SyscallNumbers::ReducedOpeningRow => Some(SimReducedOpening::Row),
+        SyscallNumbers::ReducedOpeningQuery => Some(SimReducedOpening::Query),
+        _ => None,
+    }
+}
+
+/// Whether an ECALL's `a7` value is one this CLI tallies (accelerator or sim
+/// reduced-opening stub). Cheap `src1_val`-only prefilter for candidate
+/// collection; `accelerator_of` / `sim_reduced_opening_of` confirm the
+/// instruction afterward.
+fn is_counted_syscall(src1_val: u64) -> bool {
+    matches!(
+        SyscallNumbers::try_from(src1_val),
+        Ok(SyscallNumbers::KeccakPermute
+            | SyscallNumbers::Ecsm
+            | SyscallNumbers::ReducedOpeningRow
+            | SyscallNumbers::ReducedOpeningQuery)
+    )
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
@@ -408,11 +445,12 @@ fn cmd_execute(
         }
     };
 
-    // Accelerator invocation counts, tallied only in the plain streaming path
-    // below (the flamegraph path drives execution inside the executor and does
-    // not expose per-log data). `None` means "not counted", so the accel lines
-    // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    // Invocation counts (keccak, ecsm, reduced-opening row, reduced-opening
+    // query), tallied only in the plain streaming path below (the flamegraph
+    // path drives execution inside the executor and does not expose per-log
+    // data). `None` means "not counted", so the lines are omitted rather than
+    // printed as misleading zeros.
+    let mut accel_counts: Option<(u64, u64, u64, u64)> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -480,11 +518,15 @@ fn cmd_execute(
         let mut cycle_count: u64 = 0;
         let mut keccak_calls: u64 = 0;
         let mut ecsm_calls: u64 = 0;
-        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
-        // accelerator syscall number. This is a cheap superset — a non-ECALL
-        // instruction can hold the same value in src1 — that `accelerator_of`
-        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
-        // `&mut`) is released so the instruction cache can be read again.
+        // MEASUREMENT-ONLY reduced-opening stub call counts (Experiment 2).
+        let mut reduced_opening_row_calls: u64 = 0;
+        let mut reduced_opening_query_calls: u64 = 0;
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches a
+        // counted syscall number (accelerator or sim stub). This is a cheap
+        // superset — a non-ECALL instruction can hold the same value in src1 —
+        // that `accelerator_of` / `sim_reduced_opening_of` confirm below, once
+        // the chunk's `&Log` borrow (tied to the executor's `&mut`) is released
+        // so the instruction cache can be read again.
         let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
@@ -498,10 +540,7 @@ fn cmd_execute(
             cycle_count += logs.len() as u64;
             if cycles {
                 for log in logs {
-                    if SyscallNumbers::try_from(log.src1_val)
-                        .map(|s| s.accelerator().is_some())
-                        .unwrap_or(false)
-                    {
+                    if is_counted_syscall(log.src1_val) {
                         accel_candidates.push((log.current_pc, log.src1_val));
                     }
                 }
@@ -509,10 +548,15 @@ fn cmd_execute(
             // `logs` is no longer used, so the executor's `&mut` borrow is free
             // and the instruction cache can be read to confirm each candidate.
             for (pc, a7) in accel_candidates.drain(..) {
-                match accelerator_of(executor.instructions.get(pc), a7) {
+                let instruction = executor.instructions.get(pc);
+                match accelerator_of(instruction, a7) {
                     Some(Accelerator::Keccak) => keccak_calls += 1,
                     Some(Accelerator::Ecsm) => ecsm_calls += 1,
-                    None => {}
+                    None => match sim_reduced_opening_of(instruction, a7) {
+                        Some(SimReducedOpening::Row) => reduced_opening_row_calls += 1,
+                        Some(SimReducedOpening::Query) => reduced_opening_query_calls += 1,
+                        None => {}
+                    },
                 }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
@@ -526,16 +570,38 @@ fn cmd_execute(
         }
 
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            accel_counts = Some((
+                keccak_calls,
+                ecsm_calls,
+                reduced_opening_row_calls,
+                reduced_opening_query_calls,
+            ));
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
+        if let Some((
+            keccak_calls,
+            ecsm_calls,
+            reduced_opening_row_calls,
+            reduced_opening_query_calls,
+        )) = accel_counts
+        {
             println!("Keccak calls: {}", keccak_calls);
             println!("Ecsm calls: {}", ecsm_calls);
+            // Only surface the stub lines when a stub build actually fired them,
+            // so ordinary runs keep their two-line accelerator report.
+            if reduced_opening_row_calls > 0 {
+                println!("Reduced-opening row calls: {}", reduced_opening_row_calls);
+            }
+            if reduced_opening_query_calls > 0 {
+                println!(
+                    "Reduced-opening query calls: {}",
+                    reduced_opening_query_calls
+                );
+            }
         }
     }
 
