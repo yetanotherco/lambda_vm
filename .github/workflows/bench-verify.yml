@@ -1,7 +1,15 @@
 name: Bench verifier
 
-# Manual-only (/bench-verify); separate from /bench so they never share the bench server.
+# Manual-only (/bench-verify, or workflow_dispatch to test workflow changes on a
+# branch — issue_comment always runs main's copy of this file, see profile-recursion.yml);
+# separate from /bench so they never share the bench server.
 on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: "ABBA pair count (2-40)"
+        required: false
+        default: "20"
   issue_comment:
     types: [created]
 
@@ -22,9 +30,11 @@ permissions:
 jobs:
   verify:
     if: >-
-      github.event.issue.pull_request &&
-      startsWith(github.event.comment.body, '/bench-verify') &&
-      contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/bench-verify') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: [self-hosted, bench]
     # Job cap. On a cold runner the recursion BUILDS dominate: MEASURE_CLI once, plus
     # per ref a guest build and a prover-test build. Cached in /tmp; build-std / host
@@ -32,6 +42,7 @@ jobs:
     timeout-minutes: 90
     steps:
       - name: Acknowledge (react + occupancy notice)
+        if: github.event_name == 'issue_comment'
         uses: actions/github-script@v7
         with:
           script: |
@@ -51,13 +62,20 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           PR_NUM: ${{ github.event.issue.number }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          DISPATCH_PAIRS: ${{ github.event.inputs.pairs }}
         run: |
-          # Head SHA (not branch name) so fork PRs resolve and a mid-run force-push can't race.
-          HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ]; then
+            # Testing this workflow's own changes: bench the dispatched branch vs main.
+            HEAD_SHA="$GITHUB_SHA"
+            N="${DISPATCH_PAIRS:-20}"
+          else
+            # Head SHA (not branch name) so fork PRs resolve and a mid-run force-push can't race.
+            HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+            # Optional pair count "/bench-verify 32"; default 20.
+            N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-verify[[:space:]]*\([0-9]\+\).*|\1|p')
+            N=${N:-20}
+          fi
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          # Optional pair count "/bench-verify 32"; default 20, clamp [2,40].
-          N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-verify[[:space:]]*\([0-9]\+\).*|\1|p')
-          N=${N:-20}
           if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
             echo "::warning::pair count $N out of range [2,40]; using 20"
             N=20
@@ -70,6 +88,7 @@ jobs:
           fetch-depth: 0
 
       - name: Fetch PR head commit (works for fork PRs)
+        if: github.event_name == 'issue_comment'
         env:
           PR_NUM: ${{ github.event.issue.number }}
         run: git fetch origin "pull/$PR_NUM/head" --quiet
@@ -152,6 +171,11 @@ jobs:
               const rtail = tail(read('/tmp/recursion_out.txt'), 20);
               body += '⚠️ Recursion cycle bench did not complete (does not affect the verifier verdict above).';
               body += rtail ? ' Last log lines:\n\n' + '```\n' + rtail + '\n```\n' : '\n';
+            }
+            // workflow_dispatch has no PR to comment on; write to the job summary instead.
+            if (context.eventName !== 'issue_comment') {
+              await core.summary.addRaw(body).write();
+              return;
             }
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner, repo: context.repo.repo,
