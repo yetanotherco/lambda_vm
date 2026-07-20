@@ -64,12 +64,16 @@ use crate::statement::{StatementKind, absorb_continuation_global_statement, abso
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
+use crate::tables::trace_builder::collect_bitwise_from_lt;
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
-use crate::tables::{MaxRowsConfig, fext_local_to_global, global_field_memory, global_memory};
+use crate::tables::{
+    MaxRowsConfig, bitwise, fext_local_to_global, global_field_memory, global_memory, lt,
+};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
-    compute_expected_commit_bus_balance, verify_l2g_commitment_binding,
+    compute_expected_commit_bus_balance, create_bitwise_air, create_lt_air,
+    verify_fext_l2g_commitment_binding, verify_l2g_commitment_binding,
 };
 
 type F = GoldilocksField;
@@ -267,8 +271,6 @@ fn fext_l2g_memory_air(
 /// global proof). The field-storage analog of [`l2g_global_air`]: `EmptyConstraints`,
 /// since the uniqueness/range/ordering checks are enforced on the epoch-local
 /// `fext_l2g_memory_air` and inherited here via the equal-root commitment binding.
-// TODO(fext-continuation): wired into prove_global/verify_global (Phase 3b Edit F).
-#[allow(dead_code)]
 fn fext_l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
@@ -288,8 +290,6 @@ fn fext_l2g_global_air(
 /// anchor). Unlike RAM's dense preprocessed `global_memory_air`, this table is sparse,
 /// so it carries its own sorted-keys uniqueness constraints + `IsHalfword`/addr-LT
 /// lookups — hence the global proof must provide BITWISE + LT tables for it.
-// TODO(fext-continuation): wired into prove_global/verify_global (Phase 3b Edit F).
-#[allow(dead_code)]
 fn global_field_memory_air(
     opts: &ProofOptions,
 ) -> AirWithBuses<
@@ -655,7 +655,8 @@ fn verify_epoch(
     } else {
         FIXED_TABLE_COUNT - 1
     };
-    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 1;
+    // Two trailing bookend tables: L2G then FEXT_L2G.
+    let expected_proof_count = epoch.table_counts.total() + fixed_tables + 2;
     if expected_proof_count != epoch.proof.proofs.len() {
         return false;
     }
@@ -670,8 +671,10 @@ fn verify_epoch(
         is_final,
     );
     let l2g_air = l2g_memory_air(opts, label);
+    let fext_l2g_air = fext_l2g_memory_air(opts, label);
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
+    refs.push(&fext_l2g_air);
 
     let seed = || {
         epoch_transcript(
@@ -706,14 +709,15 @@ fn verify_epoch(
         return false;
     }
 
-    // The claimed L2G root must be the one this proof actually committed (it is what
-    // verify_l2g_commitment_binding later ties to the global proof).
-    epoch
-        .proof
-        .proofs
-        .last()
-        .map(|p| p.lde_trace_main_merkle_root)
-        == Some(epoch.l2g_root)
+    // The claimed L2G / FEXT_L2G roots must be the ones this proof actually committed
+    // (trailing tables [.., L2G, FEXT_L2G]); the commitment binding later ties both to
+    // the global proof.
+    let n = epoch.proof.proofs.len();
+    if n < 2 {
+        return false;
+    }
+    epoch.proof.proofs[n - 2].lde_trace_main_merkle_root == epoch.l2g_root
+        && epoch.proof.proofs[n - 1].lde_trace_main_merkle_root == epoch.fext_l2g_root
 }
 
 /// Build the cross-epoch global memory proof: every epoch's L2G sub-table on the
@@ -723,8 +727,10 @@ fn verify_epoch(
 /// non-preprocessed (committed, bus-enforced genesis — see `global_memory_air` / §3.6).
 /// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
 /// matches its source (the ELF for ELF/runtime pages).
+#[allow(clippy::too_many_arguments)]
 fn prove_global(
     boundaries: &[Vec<CellBoundary>],
+    field_boundaries: &[Vec<fext_local_to_global::FieldCellBoundary>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
@@ -770,6 +776,55 @@ fn prove_global(
         .map(|config| global_memory_air(opts, config))
         .collect();
 
+    // --- field-storage cross-epoch aggregation (GlobalFieldMemory bus) ---------
+    // Each cell's final value + last-touching epoch label (epoch order, last wins).
+    let mut field_final: HashMap<(u64, u64), (u64, u64)> = HashMap::new();
+    for (i, epoch) in field_boundaries.iter().enumerate() {
+        let label = local_to_global::epoch_label(i as u64);
+        for fb in epoch {
+            field_final.insert((fb.domain, fb.addr), (fb.final_val, label));
+        }
+    }
+    let anchor_cells: Vec<global_field_memory::FieldCellFinal> = field_final
+        .iter()
+        .map(
+            |(&(domain, addr), &(value, epoch))| global_field_memory::FieldCellFinal {
+                domain,
+                addr,
+                value,
+                epoch,
+            },
+        )
+        .collect();
+
+    let mut fext_l2g_traces: Vec<TraceTable<F, E>> = field_boundaries
+        .iter()
+        .map(|epoch| fext_local_to_global::generate_fext_local_to_global_trace(epoch))
+        .collect();
+    let mut anchor_trace = global_field_memory::generate_global_field_trace(&anchor_cells);
+
+    // Providers for the anchor's sorted-keys uniqueness. The anchor is sparse (unlike
+    // RAM's dense global_memory), so the global proof must provide BITWISE + LT for its
+    // IsHalfword + addr-LT lookups.
+    let anchor_lt_ops = global_field_memory::collect_lt(&anchor_cells);
+    let mut lt_trace = lt::generate_lt_trace(&anchor_lt_ops);
+    let mut bitwise_trace = bitwise::generate_bitwise_trace();
+    let mut bw_ops = global_field_memory::collect_bitwise(&anchor_cells);
+    bw_ops.extend(collect_bitwise_from_lt(&anchor_lt_ops));
+    bitwise::update_multiplicities(&mut bitwise_trace, &bw_ops);
+
+    let fext_l2g_airs: Vec<_> = (0..field_boundaries.len())
+        .map(|i| fext_l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
+    let anchor_air = global_field_memory_air(opts);
+    let lt_air = create_lt_air(opts);
+    let bitwise_air = create_bitwise_air(opts).with_preprocessed(
+        bitwise::preprocessed_commitment(opts),
+        bitwise::NUM_PRECOMPUTED_COLS,
+    );
+
+    // Table order (prover and verifier MUST agree): L2G*, GM*, FEXT_L2G*, anchor,
+    // BITWISE, LT.
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
         .iter()
         .zip(l2g_traces.iter_mut())
@@ -778,6 +833,12 @@ fn prove_global(
     for (air, trace) in gm_airs.iter().zip(gm_traces.iter_mut()) {
         pairs.push((air as AirRef, trace, &()));
     }
+    for (air, trace) in fext_l2g_airs.iter().zip(fext_l2g_traces.iter_mut()) {
+        pairs.push((air as AirRef, trace, &()));
+    }
+    pairs.push((&anchor_air as AirRef, &mut anchor_trace, &()));
+    pairs.push((&bitwise_air as AirRef, &mut bitwise_trace, &()));
+    pairs.push((&lt_air as AirRef, &mut lt_trace, &()));
 
     Prover::multi_prove(
         pairs,
@@ -822,10 +883,29 @@ fn verify_global(
         .map(|config| global_memory_air(opts, config))
         .collect();
 
+    // Field-storage aggregation airs, config-free and mirroring `prove_global`'s order:
+    // FEXT_L2G* (one per epoch), the GLOBAL_FIELD_MEMORY anchor, then its BITWISE + LT
+    // providers.
+    let fext_l2g_airs: Vec<_> = (0..num_epochs)
+        .map(|i| fext_l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .collect();
+    let anchor_air = global_field_memory_air(opts);
+    let lt_air = create_lt_air(opts);
+    let bitwise_air = create_bitwise_air(opts).with_preprocessed(
+        bitwise::preprocessed_commitment(opts),
+        bitwise::NUM_PRECOMPUTED_COLS,
+    );
+
     let mut refs: Vec<AirRef> = l2g_airs.iter().map(|a| a as AirRef).collect();
     for air in &gm_airs {
         refs.push(air as AirRef);
     }
+    for air in &fext_l2g_airs {
+        refs.push(air as AirRef);
+    }
+    refs.push(&anchor_air as AirRef);
+    refs.push(&bitwise_air as AirRef);
+    refs.push(&lt_air as AirRef);
 
     Verifier::multi_verify(
         &refs,
@@ -1012,6 +1092,7 @@ pub fn prove_continuation(
     let touched_page_bases = touched_page_bases(&all_boundaries);
     let global = prove_global(
         &all_boundaries,
+        &all_field_boundaries,
         elf_bytes,
         &init_page_data,
         &touched_page_bases,
@@ -1085,6 +1166,7 @@ pub fn verify_continuation(
     // Derived from the ELF for epoch 0, then from each epoch's bound fini.
     let mut register_init = register::register_init_from_entry_point(elf.entry_point);
     let mut epoch_roots: Vec<Commitment> = Vec::with_capacity(n);
+    let mut epoch_fext_roots: Vec<Commitment> = Vec::with_capacity(n);
     let mut public_output: Vec<u8> = Vec::new();
 
     for (index, epoch) in bundle.epochs.iter().enumerate() {
@@ -1104,6 +1186,7 @@ pub fn verify_continuation(
         }
 
         epoch_roots.push(epoch.l2g_root);
+        epoch_fext_roots.push(epoch.fext_l2g_root);
         public_output.extend_from_slice(&epoch.public_output);
         // Next epoch's init is this epoch's bound fini — the cross-epoch register
         // (and x254) binding. A mismatched fini desyncs the next epoch's AIRs.
@@ -1152,6 +1235,12 @@ pub fn verify_continuation(
     if !verify_l2g_commitment_binding(&epoch_roots, &bundle.global) {
         return Ok(None);
     }
+    // Same for the FEXT_L2G tables: they follow the L2G (n) + GLOBAL_MEMORY
+    // (page_bases.len()) tables in the global proof.
+    let fext_offset = n + page_bases.len();
+    if !verify_fext_l2g_commitment_binding(&epoch_fext_roots, &bundle.global, fext_offset) {
+        return Ok(None);
+    }
 
     Ok(Some(public_output))
 }
@@ -1172,6 +1261,30 @@ pub fn prove_and_verify_continuation(
 mod tests {
     use super::*;
     use crate::test_utils::asm_elf_bytes;
+
+    // FEXT accelerator ecalls under continuation: field-storage is carried across
+    // epochs (fext_local_to_global bookend + GlobalFieldMemory aggregation). A small
+    // epoch size splits `test_fext` so field-cell lifetimes cross epoch boundaries,
+    // exercising the carry; the whole continuation must prove and verify.
+    #[test]
+    fn fext_works_under_continuation() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("test_fext");
+        let opts = ProofOptions::default_test_options();
+
+        // Force multiple epochs so a value written in one epoch is read in a later one.
+        let bundle = prove_continuation(&elf_bytes, &[], 4, &opts).unwrap();
+        assert!(
+            bundle.num_epochs() > 1,
+            "16-cycle epochs must split test_fext into multiple epochs to exercise the carry"
+        );
+        let output = verify_continuation(&elf_bytes, &bundle, &opts).unwrap();
+        assert!(
+            output.is_some(),
+            "FEXT continuation proof must verify (the field-storage carry closes the \
+             GlobalFieldMemory bus)"
+        );
+    }
 
     // `test_commit_split` issues two Commit syscalls, one early and one late, so a
     // small epoch puts the second commit in a later epoch. That epoch starts with

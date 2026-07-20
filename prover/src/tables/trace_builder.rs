@@ -1986,7 +1986,7 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
 
     for op in lt_ops {
@@ -3415,19 +3415,9 @@ fn build_traces<I: ImageSource + Sync>(
     l2g_memory_bookend: bool,
     touched_field_cells: fext_local_to_global::FieldTouches,
 ) -> Result<Traces, Error> {
-    // Interim soundness guard: field-storage is NOT carried across continuation
-    // epochs (RAM and registers are, but `field_state` resets to default each
-    // epoch), so a FEXT value written in one epoch would read back as zero in the
-    // next — an unsound reset. Reject any FEXT accelerator use under continuation
-    // until L2G field-storage carry lands (monolithic proving is unaffected, as it
-    // carries field-storage within the single proof via the FEXT_PAGE bookend).
-    if l2g_memory_bookend
-        && (!ops.fext_load_ops.is_empty()
-            || !ops.fext_fma_ops.is_empty()
-            || !ops.fext_store_ops.is_empty())
-    {
-        return Err(Error::FextInContinuation);
-    }
+    // Field-storage is now carried across continuation epochs (the fext_local_to_global
+    // bookend + GlobalFieldMemory aggregation), so FEXT accelerator ecalls are sound
+    // under continuation — no interim guard here.
     let CollectedOps {
         cpu_ops,
         memw_ops,

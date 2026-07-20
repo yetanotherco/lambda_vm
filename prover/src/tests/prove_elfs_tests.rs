@@ -3444,11 +3444,13 @@ fn test_continuation_pipeline_end_to_end() {
     );
 }
 
-/// FEXT accelerator ecalls under continuation (`l2g_memory_bookend = true`) are
-/// rejected: field-storage is not carried across epochs, so a written value would
-/// read back as zero in the next epoch. The guard must fire before any trace is built.
+/// FEXT accelerator ecalls under continuation (`l2g_memory_bookend = true`) are now
+/// supported: field-storage is carried across epochs by the fext_local_to_global
+/// bookend + GlobalFieldMemory aggregation, so trace building no longer rejects them.
+/// (End-to-end prove+verify across epochs is `fext_works_under_continuation` in the
+/// continuation module.)
 #[test]
-fn fext_rejected_under_continuation() {
+fn fext_trace_builds_under_continuation() {
     use crate::tables::register;
     use crate::tables::trace_builder::build_initial_image;
 
@@ -3467,11 +3469,11 @@ fn fext_rejected_under_continuation() {
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     );
-    match result {
-        Err(crate::Error::FextInContinuation) => {}
-        Err(e) => panic!("expected FextInContinuation, got a different error: {e}"),
-        Ok(_) => panic!("expected FextInContinuation, but trace building succeeded"),
-    }
+    assert!(
+        result.is_ok(),
+        "FEXT trace building under continuation must succeed now: {:?}",
+        result.err()
+    );
 }
 
 /// A continuation epoch built with `l2g_memory_bookend = true` proves and verifies:

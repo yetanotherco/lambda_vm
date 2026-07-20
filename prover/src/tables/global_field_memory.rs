@@ -48,6 +48,7 @@ use stark::trace::TraceTable;
 
 use crate::constraints::templates::emit_is_bit;
 
+use super::bitwise::{BitwiseOperation, BitwiseOperationType};
 use super::local_to_global::GENESIS_EPOCH;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
@@ -249,6 +250,42 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         is_halfword(cols::ADDR1_HW_LO),
         is_halfword(cols::ADDR1_HW_HI),
     ]
+}
+
+/// The BITWISE `IsHalfword` rows the anchor's addr-limb range checks send (4 per
+/// cell), which the global proof's BITWISE provider must count.
+pub fn collect_bitwise(cells: &[FieldCellFinal]) -> Vec<BitwiseOperation> {
+    let mut ops = Vec::with_capacity(cells.len() * 4);
+    for c in cells {
+        for word in [c.addr & 0xFFFF_FFFF, c.addr >> 32] {
+            for hv in [word & 0xFFFF, (word >> 16) & 0xFFFF] {
+                ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::IsHalf,
+                    (hv & 0xFF) as u8,
+                    ((hv >> 8) & 0xFF) as u8,
+                ));
+            }
+        }
+    }
+    ops
+}
+
+/// The addr `<` ALU LT ops the anchor's uniqueness sends (same-domain consecutive
+/// cells), which the global proof's LT provider must receive.
+pub fn collect_lt(cells: &[FieldCellFinal]) -> Vec<super::lt::LtOperation> {
+    let mut sorted = cells.to_vec();
+    sorted.sort_by_key(|c| (c.domain, c.addr));
+    let mut lt_ops = Vec::new();
+    for pair in sorted.windows(2) {
+        if pair[0].domain == pair[1].domain {
+            lt_ops.push(super::lt::LtOperation::new(
+                pair[0].addr,
+                pair[1].addr,
+                false,
+            ));
+        }
+    }
+    lt_ops
 }
 
 // =========================================================================

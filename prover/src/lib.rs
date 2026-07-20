@@ -1044,6 +1044,22 @@ pub(crate) fn verify_l2g_commitment_binding(
             .all(|(i, root)| final_proof.proofs[i].lde_trace_main_merkle_root == *root)
 }
 
+/// Bind each epoch's FEXT_L2G (field-storage bookend) root to the global proof, which
+/// commits the per-epoch FEXT_L2G sub-tables starting at `offset` (after the `N` L2G
+/// tables and the per-page GLOBAL_MEMORY tables). Equal roots prove the cross-epoch
+/// field-storage matching ran over the very same tables the epochs committed.
+pub(crate) fn verify_fext_l2g_commitment_binding(
+    epoch_fext_l2g_roots: &[Commitment],
+    final_proof: &MultiProof<F, E, ()>,
+    offset: usize,
+) -> bool {
+    final_proof.proofs.len() >= offset + epoch_fext_l2g_roots.len()
+        && epoch_fext_l2g_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| final_proof.proofs[offset + i].lde_trace_main_merkle_root == *root)
+}
+
 // =============================================================================
 // Public API: Prove / Verify
 // =============================================================================
