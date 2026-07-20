@@ -51,6 +51,10 @@ const SIM_HASH_PAIR_SYSCALL_NUMBER: usize = usize::MAX - 5;
 #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
 const SIM_HASH_FELTS_SYSCALL_NUMBER: usize = usize::MAX - 6;
 
+/// Syscall number for the Goldilocks inverse HINT (u64::MAX - 7). EXPERIMENT 5.
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+const INV_GOLDILOCKS_HINT_SYSCALL_NUMBER: usize = usize::MAX - 7;
+
 /// Syscall number for the `REDUCED_OPENING_ROW` measurement stub (Level A).
 ///
 /// MEASUREMENT-ONLY: has no chip table, so NEVER prove a build that emits it —
@@ -217,6 +221,29 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Goldilocks inverse HINT (EXPERIMENT 5). Asks the executor for `x^-1`: it
+/// overwrites `x` in place with the inverse and returns it. The returned value
+/// is UNTRUSTED — the caller MUST verify `x * result == 1` (one field multiply)
+/// and reject on mismatch. Because only the true inverse passes that check,
+/// hinting is SOUND: a wrong hint can only make an honest proof reject, never
+/// make a false one accept. `x` must be a nonzero canonical Goldilocks element.
+///
+/// The ecall drives no chip on this branch (the value is checked in-circuit), so
+/// a build that emits it is execute-only — never prove it (the Ecall-bus caveat
+/// shared with `Print`).
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+pub fn inv_goldilocks_hint(x: u64) -> u64 {
+    let mut slot = x;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") &mut slot as *mut u64,
+            in("a7") INV_GOLDILOCKS_HINT_SYSCALL_NUMBER,
+        )
+    }
+    slot
 }
 
 // =============================================================================

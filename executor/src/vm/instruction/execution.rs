@@ -37,6 +37,13 @@ pub enum SyscallNumbers {
     // Measurement-only stubs, not accelerators.
     ReducedOpeningRow = 100,
     ReducedOpeningQuery = 101,
+    // Goldilocks inverse HINT (EXPERIMENT 5). Placeholder discriminant; the
+    // actual syscall value is INV_GOLDILOCKS_HINT_SYSCALL_NUMBER. UNTRUSTED by
+    // construction: the guest verifies `x * hint == 1` in-circuit and rejects a
+    // wrong hint, so this is SOUND (not a trusted passthrough like the sim
+    // stubs). It still drives no chip on this branch, so a build emitting it is
+    // execute-only (never proven — the Print/Ecall-bus caveat).
+    InvGoldilocksHint = 102,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -68,6 +75,14 @@ pub const SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER: u64 = u64::MAX - 4;
 pub const SIM_HASH_PAIR_SYSCALL_NUMBER: u64 = u64::MAX - 5;
 pub const SIM_HASH_FELTS_SYSCALL_NUMBER: u64 = u64::MAX - 6;
 
+/// Syscall number for the Goldilocks inverse HINT (EXPERIMENT 5). The guest
+/// passes a pointer to a canonical field element in x10; the executor overwrites
+/// it in place with `x^-1`. UNTRUSTED: the guest checks `x * hint == 1` and
+/// rejects a wrong hint, so returning a wrong value here cannot make a false
+/// proof accept — it can only make an honest one reject. Drives no chip, so a
+/// build emitting it is execute-only (never proven).
+pub const INV_GOLDILOCKS_HINT_SYSCALL_NUMBER: u64 = u64::MAX - 7;
+
 impl TryFrom<u64> for SyscallNumbers {
     type Error = ();
     fn try_from(value: u64) -> Result<Self, Self::Error> {
@@ -85,6 +100,7 @@ impl TryFrom<u64> for SyscallNumbers {
             }
             v if v == SIM_HASH_PAIR_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashPair),
             v if v == SIM_HASH_FELTS_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashFelts),
+            v if v == INV_GOLDILOCKS_HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::InvGoldilocksHint),
             v if v == REDUCED_OPENING_ROW_SYSCALL_NUMBER => Ok(SyscallNumbers::ReducedOpeningRow),
             v if v == REDUCED_OPENING_QUERY_SYSCALL_NUMBER => {
                 Ok(SyscallNumbers::ReducedOpeningQuery)
@@ -126,6 +142,9 @@ impl SyscallNumbers {
             // proven. The CLI tallies them separately (see bin/cli).
             SyscallNumbers::ReducedOpeningRow
             | SyscallNumbers::ReducedOpeningQuery
+            // The inverse hint drives no chip on this branch (a real chip would
+            // just place it on the Ecall bus; the value is verified in-circuit).
+            | SyscallNumbers::InvGoldilocksHint
             | SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
@@ -156,10 +175,11 @@ impl SyscallNumbers {
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
             | SyscallNumbers::Halt
-            // EXPERIMENT 2 reduced-opening stubs are counted by the CLI's own
-            // reduced-opening classifier, not here.
+            // EXPERIMENT 2 reduced-opening stubs and the EXPERIMENT 5 inverse
+            // hint are counted by the CLI's own classifiers, not here.
             | SyscallNumbers::ReducedOpeningRow
-            | SyscallNumbers::ReducedOpeningQuery => None,
+            | SyscallNumbers::ReducedOpeningQuery
+            | SyscallNumbers::InvGoldilocksHint => None,
         }
     }
 }
@@ -187,6 +207,18 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
 /// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
 fn ecsm_addr_ok(addr: u64, max_offset: u64) -> bool {
     (addr % LOW_LIMB) + max_offset < LOW_LIMB
+}
+
+/// Host-side Goldilocks inverse for the `INV_GOLDILOCKS_HINT` ecall. Returns the
+/// true inverse of `x` (canonicalized), or `0` for a zero input, which has no
+/// inverse. A zero (or otherwise wrong) return can never make a false proof
+/// accept: the guest checks `x * hint == 1` and rejects on mismatch, and the
+/// honest guest never hints a zero. Uses the same field arithmetic the guest
+/// would otherwise run in-circuit, so an accepted hint is exactly `x^-1`.
+fn goldilocks_inv_hint(x: u64) -> u64 {
+    use math::field::goldilocks::GoldilocksField;
+    use math::field::traits::IsField;
+    GoldilocksField::inv(&x).unwrap_or(0)
 }
 
 impl Instruction {
@@ -620,6 +652,19 @@ impl Instruction {
                         reduced_opening_query(memory, input_ptr, out_ptr)?;
                         src2_val = input_ptr;
                         dst_val = out_ptr;
+                    }
+                    SyscallNumbers::InvGoldilocksHint => {
+                        // Goldilocks inverse HINT (EXPERIMENT 5). x10 points at a
+                        // canonical field element; overwrite it in place with
+                        // x^-1. UNTRUSTED — the guest verifies `x * hint == 1`
+                        // and rejects a wrong value, so this handler needs no
+                        // chip and can't unsoundly force acceptance.
+                        let ptr = registers.read(10)?;
+                        let x = memory.load_doubleword(ptr)?;
+                        let inv = goldilocks_inv_hint(x);
+                        memory.store_doubleword(ptr, inv)?;
+                        src2_val = ptr;
+                        dst_val = inv;
                     }
                     SyscallNumbers::Halt => {
                         // halt

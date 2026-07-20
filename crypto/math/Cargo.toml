@@ -31,6 +31,13 @@ rkyv = { version = "0.8.10", default-features = false, features = [
     "aligned",
 ], optional = true }
 
+# Guest-only: the Goldilocks inverse HINT (sim-inv-hint) calls an ecall wrapper
+# from the syscalls crate. Target-gated to riscv64, so on the host this dep is
+# absent and the `sim-inv-hint` feature is inert (math stays host-buildable and
+# does not depend on syscalls off-target). No cycle: syscalls has no math dep.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
+
 [dev-dependencies]
 rand_chacha = "0.3.1"
 criterion = "0.5.1"
@@ -48,6 +55,12 @@ proptest = ["dep:proptest"]
 instruments = []
 test-utils = []
 rkyv = ["dep:rkyv"]
+# Goldilocks inverse HINT (EXPERIMENT 5). On riscv64 swaps `GoldilocksField::inv`
+# to ask the executor for `x^-1` and verify it in-circuit (`x * hint == 1`)
+# instead of running the ~72-mul addition chain. riscv64-only effect; inert on
+# the host (the syscalls dep is target-gated out). EXECUTE-ONLY: the ecall drives
+# no chip, so a build with this on must never be proven. Off by default.
+sim-inv-hint = ["lambda-vm-syscalls/sim-inv-hint"]
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }

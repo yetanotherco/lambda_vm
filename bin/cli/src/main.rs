@@ -412,6 +412,17 @@ fn sim_reduced_opening_of(
     }
 }
 
+/// Whether an executed instruction is the Goldilocks inverse HINT ecall
+/// (EXPERIMENT 5). Verified in-circuit by the guest, so it is sound (not a
+/// trusted passthrough) but still drives no chip; tallied separately.
+fn is_inv_hint(instruction: Option<&Instruction>, src1_val: u64) -> bool {
+    matches!(instruction, Some(Instruction::EcallEbreak))
+        && matches!(
+            SyscallNumbers::try_from(src1_val),
+            Ok(SyscallNumbers::InvGoldilocksHint)
+        )
+}
+
 /// Whether an ECALL's `a7` value is one this CLI tallies (accelerator, sim-hash,
 /// or reduced-opening stub). Cheap `src1_val`-only prefilter for candidate
 /// collection; the `*_of` classifiers confirm the instruction afterward.
@@ -422,7 +433,9 @@ fn is_counted_syscall(src1_val: u64) -> bool {
                 || s.sim_hash_ecall().is_some()
                 || matches!(
                     s,
-                    SyscallNumbers::ReducedOpeningRow | SyscallNumbers::ReducedOpeningQuery
+                    SyscallNumbers::ReducedOpeningRow
+                        | SyscallNumbers::ReducedOpeningQuery
+                        | SyscallNumbers::InvGoldilocksHint
                 )
         })
         .unwrap_or(false)
@@ -444,6 +457,7 @@ struct EcallCounts {
     sim_hash_felts: u64,
     reduced_opening_row: u64,
     reduced_opening_query: u64,
+    inv_goldilocks_hint: u64,
 }
 
 fn cmd_execute(
@@ -595,6 +609,9 @@ fn cmd_execute(
                     Some(SimReducedOpening::Query) => counts.reduced_opening_query += 1,
                     None => {}
                 }
+                if is_inv_hint(instr, a7) {
+                    counts.inv_goldilocks_hint += 1;
+                }
             }
             if cycle_budget.is_some_and(|budget| cycle_count >= budget) {
                 break;
@@ -639,6 +656,9 @@ fn cmd_execute(
             }
             if c.reduced_opening_query > 0 {
                 println!("Reduced-opening query calls: {}", c.reduced_opening_query);
+            }
+            if c.inv_goldilocks_hint > 0 {
+                println!("Inverse-hint calls: {}", c.inv_goldilocks_hint);
             }
         }
     }

@@ -145,6 +145,22 @@ impl IsField for GoldilocksField {
         if canonical == 0 {
             return Err(FieldError::InvZeroError);
         }
+        // EXPERIMENT 5: on the guest, ask the executor for `canonical^-1` and
+        // VERIFY it (`canonical * hint == 1`) instead of running the ~72-mul
+        // addition chain. Sound by construction — only the true inverse passes
+        // the check, so a wrong hint makes the guest reject, never accept. The
+        // check is a single Goldilocks multiply. All other inversion paths
+        // (Fp3 norm, batch inverse) bottom out here, so they inherit the hint.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+        {
+            let hint = lambda_vm_syscalls::syscalls::inv_goldilocks_hint(canonical);
+            assert!(
+                Self::canonical(&Self::mul(&canonical, &hint)) == 1,
+                "goldilocks inverse hint failed in-circuit verification"
+            );
+            return Ok(hint);
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-inv-hint")))]
         Ok(exp_p_minus_2(canonical))
     }
 

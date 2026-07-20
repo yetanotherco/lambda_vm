@@ -15,6 +15,11 @@ sim-hash-ecalls = []
 # guest (measured ~49 MiB total vs a ~3 GiB heap), so it opts in; other guests
 # keep TLSF. riscv64-only effect; on the host the attribute isn't applied.
 bump-alloc = []
+# Goldilocks inverse HINT ecall wrapper (EXPERIMENT 5). Compiles the
+# `inv_goldilocks_hint` guest wrapper; `math`'s `sim-inv-hint` feature forwards
+# to this one on riscv64 and swaps `GoldilocksField::inv` to call it (verifying
+# the returned hint in-circuit). Off by default so a normal build is unaffected.
+sim-inv-hint = []
 
 [dependencies]
 embedded-alloc = "0.6"

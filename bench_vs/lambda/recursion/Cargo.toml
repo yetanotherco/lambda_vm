@@ -37,6 +37,10 @@ sim-ro-query = ["lambda-vm-prover/sim-ro-query", "sim-ro-ecalls"]
 # allocator (no-op free) — sound here because the verifier's TOTAL allocation
 # (~49 MiB) fits the ~3 GiB heap.
 bump-alloc = ["lambda-vm-syscalls/bump-alloc"]
+# `inv-hint` swaps the guest's Goldilocks field inversion for an executor HINT
+# verified in-circuit (`x * hint == 1`) — sound, and it collapses the ~72-mul
+# addition chain (base inv, Fp3 norm, batch inverse all bottom out there).
+inv-hint = ["lambda-vm-prover/sim-inv-hint"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp

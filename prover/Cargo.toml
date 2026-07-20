@@ -20,6 +20,9 @@ sim-hash-ecalls = ["crypto/sim-hash-ecalls"]
 # verifier. Never prove a build with these on. See crypto/stark features.
 sim-ro-ecalls = ["stark/sim-ro-ecalls"]
 sim-ro-query = ["stark/sim-ro-query"]
+# Goldilocks inverse HINT (EXPERIMENT 5). Forwards to `math`; only affects the
+# riscv64 guest verifier's field inversion. EXECUTE-ONLY (never prove).
+sim-inv-hint = ["math/sim-inv-hint"]
 
 [dependencies]
 stark = { path = "../crypto/stark" }
