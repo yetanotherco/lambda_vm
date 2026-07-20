@@ -195,9 +195,9 @@ $
 Applying @limbs:cor:carry-upper-bound with $(L, n) = (2^8, 32)$, we find that
 $
   #`c0`_i &in [-8160, 8159],\
-  #`c1`_i &in [-24477, 24478].\
+  #`c1`_i &in [-24478, 24477].\
 $
-When we selectc $#`carry_offsets` = (8160, 24477)$, we arrive at
+When we selectc $#`carry_offsets` = (8160, 24478)$, we arrive at
 $
   #`c0`_i + #`carry_offsets[1]` &in [0, &16319] subset.eq [2^16],\
   #`c1`_i + #`carry_offsets[2]` &in [0, &48955] subset.eq [2^16].\
