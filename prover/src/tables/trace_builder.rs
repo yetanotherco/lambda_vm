@@ -4210,7 +4210,8 @@ pub fn count_table_lengths(
         // register reads and field-storage accesses (into `field_state`), and we
         // partition their MEMW ops exactly as the trace build does.
         if cpu_op.ecall_fext_load {
-            let (memw_ops, _) = collect_fext_load_ops(&cpu_op, &mut register_state, &mut field_state);
+            let (memw_ops, _) =
+                collect_fext_load_ops(&cpu_op, &mut register_state, &mut field_state);
             for memw_op in &memw_ops {
                 partition_memw(
                     memw_op,
@@ -4222,7 +4223,8 @@ pub fn count_table_lengths(
             fext_load_count += 1;
         }
         if cpu_op.ecall_fext_fma {
-            let (memw_ops, _) = collect_fext_fma_ops(&cpu_op, &mut register_state, &mut field_state);
+            let (memw_ops, _) =
+                collect_fext_fma_ops(&cpu_op, &mut register_state, &mut field_state);
             for memw_op in &memw_ops {
                 partition_memw(
                     memw_op,
@@ -4294,10 +4296,7 @@ pub fn count_table_lengths(
     // bound on the LT rows these add (LT dedups, so `>=` actual, as the drift
     // test requires).
     let fext_page_count = field_state.cells.len();
-    lt_count += 3 * fext_load_count
-        + 12 * fext_fma_count
-        + 3 * fext_store_count
-        + fext_page_count;
+    lt_count += 3 * fext_load_count + 12 * fext_fma_count + 3 * fext_store_count + fext_page_count;
 
     let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
     let unique_byte_count = memory_state.cells.len() as u64;

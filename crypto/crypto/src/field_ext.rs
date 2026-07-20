@@ -221,11 +221,7 @@ mod imp {
             super::GuestAcc { buf: 0, slot }
         }
 
-        fn mul_acc_add(
-            acc: &mut super::GuestAcc,
-            a: &FieldElement<Fp3>,
-            b: &FieldElement<Fp3>,
-        ) {
+        fn mul_acc_add(acc: &mut super::GuestAcc, a: &FieldElement<Fp3>, b: &FieldElement<Fp3>) {
             fext_load(H_A, &coeffs(a));
             fext_load(H_B, &coeffs(b));
             let (lo, hi) = acc_pair(acc.slot);
