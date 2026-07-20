@@ -52,7 +52,7 @@ The remaing case that $(x_P, y_P) = (x_Q, -y_Q)$ corresponds with $Q = -P$; the 
 
 = Overview
 This accelerator provides a compact way to prove the $x$-coordinate of the product $k times G$ for scalar $k in [1, N)$ and point $G in E(a, b, p) without {#inf}$ with $p in [3, 2^256)$ that induce curves of odd order.
-In particular, the accelerator supports the curves `secp256k1` ($#`id` = 0$) and `secp256r1` ($#`id` = 1$).
+In particular, the accelerator supports the curves `secp256k1` and `secp256r1`.
 
 #attention("Variable space.")[
     This accelerator is _variable-space_ in the value of $k$; different values of $k$ may result in different table sizes.
@@ -76,12 +76,21 @@ The accelerator comprises two chips:
 = ECSM <ecsm-sm>
 
 The #ecsm (Elliptic Curve Scalar Multiply) chip is generic over the constants
-- $#`id` in {0, 1}$, the curve identifier,
 - $p in NN$, the prime field modulus,
 - $a < p$, the first curve coefficient,
 - $b < p$, the second curve coefficient, and
 - $N in NN$, the order of the curve group.
 To support scalar multiplication over different curves, one chip instance should be created for each curve, where each instance is given a unique `id`.
+
+To prevent cross-instance communication between the `ecsm` and `ecdas` chips, each curve instance must be assigned a unique `id` that acts as a domain separator.
+Here follows the present `id` mapping:
+#align(center)[#table(
+  columns: (auto, auto),
+  table.header(`id`, "curve"),
+  "0",  `secp256k1`,
+  "1",  `secp256r1`,
+)]
+Supporting other curves only requires assigning them a unique `id`.#footnote([Note that adding a curve does require `id`'s type to be updated as well, since its current type (`Bit`) is now saturated.])
 
 The chip is triggered by executing `ECALL`, with the ECALL-number set to $-11$ (`secp256k1`) or $-12$ (`secp256r1`).
 The chip expects 
