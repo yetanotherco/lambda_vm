@@ -111,34 +111,7 @@ jobs:
           HOST_TARGET_DIR: /tmp/recursion_cycles_run/shared_host_target
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
-          set -o pipefail
-          scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main min 2>&1 | tee /tmp/recursion_out.txt
-          sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out.txt > /tmp/recursion_result.txt
-          # Full-query regimes, reusing the min run's cached guest builds/worktrees.
-          # origin/main needs RECURSION_DUMP_PRESET support to dump non-min blobs;
-          # check once up front instead of failing each preset in turn.
-          if git grep -q RECURSION_DUMP_PRESET origin/main -- prover/src/tests/ 2>/dev/null; then
-            for preset in blowup2 blowup4; do
-              if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "/tmp/recursion_out_${preset}.txt"; then
-                { echo; sed -n '/=== Recursion-guest cycle/,$p' "/tmp/recursion_out_${preset}.txt"; } >> /tmp/recursion_result.txt
-              else
-                { echo; echo "_(${preset} full-query regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
-              fi
-            done
-          else
-            { echo; echo "_(blowup2/blowup4 full-query regimes need \`origin/main\` to have the preset-aware dump test (RECURSION_DUMP_PRESET) — not merged yet, so only \`min\` is compared for this PR.)_"; } >> /tmp/recursion_result.txt
-          fi
-          # Real-block regime: needs origin/main to support RECURSION_DUMP_EPOCH_LOG2
-          # (continuation dumps); checked once up front like the loop above.
-          if git grep -q RECURSION_DUMP_EPOCH_LOG2 origin/main -- prover/src/tests/ 2>/dev/null; then
-            if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main blowup4-block 2>&1 | tee /tmp/recursion_out_blowup4-block.txt; then
-              { echo; sed -n '/=== Recursion-guest cycle/,$p' /tmp/recursion_out_blowup4-block.txt; } >> /tmp/recursion_result.txt
-            else
-              { echo; echo "_(blowup4-block real-ethrex-block regime unavailable for these refs — see the workflow log.)_"; } >> /tmp/recursion_result.txt
-            fi
-          else
-            { echo; echo "_(blowup4-block real-ethrex-block regime needs \`origin/main\` to support RECURSION_DUMP_EPOCH_LOG2 — not merged yet.)_"; } >> /tmp/recursion_result.txt
-          fi
+          .github/scripts/run_recursion_bench.sh "$HEAD_SHA"
 
       - name: Post result
         if: always()
