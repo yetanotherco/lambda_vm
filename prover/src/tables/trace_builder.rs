@@ -4066,6 +4066,10 @@ pub struct TableLengths {
     pub dvrm_padded_rows: u64,
     pub branch_padded_rows: u64,
     pub commit_padded_rows: u64,
+    pub fext_load_padded_rows: u64,
+    pub fext_fma_padded_rows: u64,
+    pub fext_store_padded_rows: u64,
+    pub fext_page_padded_rows: u64,
     pub decode_rows: u64,
     pub unique_page_count: u64,
     pub cycle_count: u64,
@@ -4106,6 +4110,12 @@ pub fn count_table_lengths(
     let mut branch_count = 0usize;
     let mut commit_count = 0usize;
     let mut current_commit_index = 0u32;
+    // FEXT accelerator: one table row per ecall, plus the field-storage access
+    // chain tracked in `field_state` (its unique cells become FEXT_PAGE rows).
+    let mut fext_load_count = 0usize;
+    let mut fext_fma_count = 0usize;
+    let mut fext_store_count = 0usize;
+    let mut field_state = FieldStorageState::default();
 
     let partition_memw = |op: &MemwOperation,
                           by_width: &mut [usize; 4],
@@ -4196,6 +4206,47 @@ pub fn count_table_lengths(
                 .ok_or_else(|| Error::Execution("commit index exceeds u32 range".into()))?;
         }
 
+        // FEXT accelerator ecalls: mirror `build_traces` — the collectors do the
+        // register reads and field-storage accesses (into `field_state`), and we
+        // partition their MEMW ops exactly as the trace build does.
+        if cpu_op.ecall_fext_load {
+            let (memw_ops, _) = collect_fext_load_ops(&cpu_op, &mut register_state, &mut field_state);
+            for memw_op in &memw_ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            fext_load_count += 1;
+        }
+        if cpu_op.ecall_fext_fma {
+            let (memw_ops, _) = collect_fext_fma_ops(&cpu_op, &mut register_state, &mut field_state);
+            for memw_op in &memw_ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            fext_fma_count += 1;
+        }
+        if cpu_op.ecall_fext_store {
+            let (memw_ops, _) =
+                collect_fext_store_ops(&cpu_op, &mut register_state, &mut field_state);
+            for memw_op in &memw_ops {
+                partition_memw(
+                    memw_op,
+                    &mut memw_by_width,
+                    &mut memw_aligned_count,
+                    &mut memw_register_count,
+                );
+            }
+            fext_store_count += 1;
+        }
+
         // CPU-side per-instruction-kind counters (non-word; word → CPU32, B5b)
         let f = &cpu_op.decode.fields;
         if !f.word_instr && f.is_lt() {
@@ -4236,6 +4287,18 @@ pub fn count_table_lengths(
     mul_count += 2 * dvrm_count;
     lt_count += dvrm_count;
 
+    // FEXT field-storage accesses each send an `old_ts < ts` LT (temporal
+    // ordering): 3 per LOAD (writes), 12 per FMA (9 reads + 3 writes), 3 per
+    // STORE (reads) — see each table's `Alu` bus interactions. FEXT_PAGE's
+    // sorted-keys uniqueness sends at most one addr-LT per touched cell. Upper
+    // bound on the LT rows these add (LT dedups, so `>=` actual, as the drift
+    // test requires).
+    let fext_page_count = field_state.cells.len();
+    lt_count += 3 * fext_load_count
+        + 12 * fext_fma_count
+        + 3 * fext_store_count
+        + fext_page_count;
+
     let unique_page_count = memory_state.unique_page_count(page::DEFAULT_PAGE_SIZE as u64);
     let unique_byte_count = memory_state.cells.len() as u64;
     let cycle_count = logs.len() as u64;
@@ -4252,6 +4315,23 @@ pub fn count_table_lengths(
         dvrm_padded_rows: padded_chunked_rows(dvrm_count, max_rows.dvrm),
         branch_padded_rows: padded_chunked_rows(branch_count, max_rows.branch),
         commit_padded_rows: commit_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
+        // FEXT tables pad `count.next_power_of_two().max(4)` (no chunking).
+        fext_load_padded_rows: fext_load_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
+        fext_fma_padded_rows: fext_fma_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
+        fext_store_padded_rows: fext_store_count
+            .checked_next_power_of_two()
+            .unwrap_or(usize::MAX)
+            .max(4) as u64,
+        fext_page_padded_rows: fext_page_count
             .checked_next_power_of_two()
             .unwrap_or(usize::MAX)
             .max(4) as u64,
