@@ -133,12 +133,6 @@ pad = 0
 
 # Auxiliary
 [[variables.auxiliary]]
-name = "prev_pc_timestamp_borrow"
-type = "Bit"
-desc = "The borrow bit for computing the previous timestamp the PC was accessed"
-pad = 0
-
-[[variables.auxiliary]]
 name = "pc_double_read"
 type = "Bit"
 desc = "Whether the PC is being read as a general purpose register (`rs1`) this cycle"
@@ -479,11 +473,6 @@ iter = ["i", 0, 1]
 kind = "template"
 tag = "IS_BIT"
 input = ["pc_double_read"]
-
-[[constraints.mem]]
-kind = "template"
-tag = "IS_BIT"
-input = ["prev_pc_timestamp_borrow"]
 
 [[constraints.mem]]
 kind = "interaction"
