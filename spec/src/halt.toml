@@ -52,7 +52,7 @@ ref = "halt:c:consume_pc"
 [[constraints.all]]
 kind = "interaction"
 tag = "memory"
-input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", 1], ["idx", ["arr", 1, 0], "i"]]
+input = [1, ["arr", ["+", ["*", 2, 255], "i"], 0], ["+", "timestamp", 1], ["-", 1, "i"]]
 multiplicity = -1
 iter = ["i", 0, 1]
 ref = "halt:c:emit_pc"
