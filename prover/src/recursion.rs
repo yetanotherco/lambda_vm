@@ -20,9 +20,9 @@
 //!
 //! [`program_id`] deliberately does not fold the `ProofOptions`: the security
 //! level is pinned by which verifier guest the outer proof is checked against
-//! (`recursion-min.elf` vs `recursion-blowup8.elf`, fixed at build time — see
-//! [`Preset`]). A consumer must pin that outer ELF too, or a 1-query `min`
-//! attestation is indistinguishable from a 128-bit `blowup8` one.
+//! (`recursion-min.elf` vs `recursion-blowup2.elf`/`recursion-blowup8.elf`,
+//! fixed at build time — see [`Preset`]). A consumer must pin that outer ELF
+//! too, or a 1-query `min` attestation is indistinguishable from a 128-bit one.
 
 use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use digest::Digest;
@@ -52,15 +52,37 @@ pub const MIN_PROOF_OPTIONS: ProofOptions = ProofOptions {
 pub enum Preset {
     /// Blowup=2, 1 query ([`MIN_PROOF_OPTIONS`]) — insecure, diagnostics only.
     Min,
-    /// Blowup=8, multi-query — 128-bit security.
+    /// Blowup=2, full 128-bit query count (219 queries at 20 grinding bits) —
+    /// the realistic base-layer shape: production pipelines prove the base
+    /// proof at low blowup (2/4) and reserve high blowup for the final wrap.
+    Blowup2,
+    /// Blowup=4, 110 queries — the other realistic base-layer point (e.g.
+    /// Zisk's compressor layer): 2× the prover LDE of blowup=2 for half the
+    /// queries to verify.
+    Blowup4,
+    /// Blowup=8, multi-query (73 queries) — 128-bit security at final-wrap-style
+    /// parameters: more prover work per row, far fewer queries to verify.
     Blowup8,
 }
 
 impl Preset {
+    /// Every preset, for name→preset lookups (e.g. the blob-dump test's
+    /// `RECURSION_DUMP_PRESET`). Keep in sync with the enum.
+    pub const ALL: [Preset; 4] = [
+        Preset::Min,
+        Preset::Blowup2,
+        Preset::Blowup4,
+        Preset::Blowup8,
+    ];
+
     /// The fixed `ProofOptions` this preset's guest verifies with.
     pub fn options(&self) -> ProofOptions {
         match self {
             Preset::Min => MIN_PROOF_OPTIONS,
+            Preset::Blowup2 => crate::GoldilocksCubicProofOptions::with_blowup(2)
+                .expect("blowup=2 is always valid"),
+            Preset::Blowup4 => crate::GoldilocksCubicProofOptions::with_blowup(4)
+                .expect("blowup=4 is always valid"),
             Preset::Blowup8 => crate::GoldilocksCubicProofOptions::with_blowup(8)
                 .expect("blowup=8 is always valid"),
         }
@@ -71,6 +93,8 @@ impl Preset {
     pub fn artifact_stem(&self) -> &'static str {
         match self {
             Preset::Min => "recursion-min",
+            Preset::Blowup2 => "recursion-blowup2",
+            Preset::Blowup4 => "recursion-blowup4",
             Preset::Blowup8 => "recursion-blowup8",
         }
     }
@@ -79,6 +103,8 @@ impl Preset {
     pub fn name(&self) -> &'static str {
         match self {
             Preset::Min => "min",
+            Preset::Blowup2 => "blowup2",
+            Preset::Blowup4 => "blowup4",
             Preset::Blowup8 => "blowup8",
         }
     }

@@ -2,3 +2,9 @@
 /program_artifacts/rust
 /tests/ethrex_hoodi.bin
 /tests/ethrex_bench_*.bin
+# The small scaling-ladder fixtures ARE committed (scripts/bench_recursion_scaling.sh
+# reads them; ~13-30 KB each). Bigger generated fixtures (e.g. _20) stay ignored.
+!/tests/ethrex_bench_1.bin
+!/tests/ethrex_bench_4.bin
+!/tests/ethrex_bench_8.bin
+!/tests/ethrex_bench_16.bin
