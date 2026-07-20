@@ -10,10 +10,12 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedStarkProof, MultiProof},
+    proof::stark::{ArchivedMultiProof, MultiProof},
     proof::view::{
-        DeepPolynomialOpeningView, FriDecommitmentView, PolynomialOpeningsView, StarkProofView,
+        DeepPolynomialOpeningView, FriDecommitmentView, MultiProofView, PolynomialOpeningsView,
+        ProofViewSource, StarkProofView, StarkTableView,
     },
+    table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
@@ -90,8 +92,11 @@ pub struct QueryInvariantDeepTerms<FieldExtension>
 where
     FieldExtension: Send + Sync + IsField,
 {
-    /// `ood_row_sum[row] = sum_col trace_term_coeffs[col][row] * ood(row, col)`.
+    /// `ood_row_sum[row] = sum_col trace_term_coeffs[col][row] * ood(row, col)`,
+    /// over the reconstructed full OOD grid (g·z-pruned positions are zero).
     ood_row_sum: Vec<FieldElement<FieldExtension>>,
+    /// Width of the reconstructed full OOD grid (= full trace width).
+    ood_width: usize,
     /// Derived from `proof.composition_poly_parts_ood_evaluation().len()`.
     number_of_parts: usize,
     /// `challenges.z.pow(number_of_parts)`.
@@ -149,15 +154,74 @@ pub trait IsStarkVerifier<
             .collect::<Vec<usize>>()
     }
 
+    /// The pruned-OOD layout for this AIR — the single place in the verifier that
+    /// reads the shape metadata (`trace_columns`, `step_size`, the
+    /// transition-offset count, and the next-row column set). Everything that used
+    /// to recompute these values now derives them from the returned
+    /// [`crate::ood::OodLayout`]. Pure AIR metadata, never a proof dimension.
+    fn ood_layout(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+    ) -> crate::ood::OodLayout {
+        crate::ood::OodLayout::new(
+            air.context().trace_columns,
+            air.context().transition_offsets.len() * air.step_size(),
+            air.step_size(),
+            air.trace_ood_next_row_columns(),
+        )
+    }
+
     /// Checks whether the purported evaluations of the composition polynomial parts and the trace
     /// polynomials at the out-of-domain challenge are consistent.
     /// See https://lambdaclass.github.io/lambdaworks/starks/protocol.html#step-2-verify-claimed-composition-polynomial
+    /// Soundness (I3): both OOD blocks' shapes are a public function of the AIR,
+    /// never of the (prover-controlled) proof. The current-row block opens every
+    /// column over `step_size` rows; the next-row block opens only the
+    /// transition-window columns over the remaining rows, and is empty when the
+    /// AIR reads none.
+    ///
+    /// Must run before Round 3, which absorbs the next-row block through
+    /// `get_row` — an unchecked `data[start..start + width]` slice. A hostile
+    /// archive whose advertised dims disagree with its data length would panic
+    /// there rather than be rejected as a false proof; `dimensions_consistent()`
+    /// closes that gap, which rkyv's bytecheck leaves open.
+    fn ood_blocks_well_formed(
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        proof: StarkProofView<'_, Field, FieldExtension, PI>,
+    ) -> bool {
+        let step_size = air.step_size();
+        let num_eval_points = air.context().transition_offsets.len() * step_size;
+        let expected_next_width = air.trace_ood_next_row_columns().len();
+        let expected_next_height = if expected_next_width == 0 {
+            0
+        } else {
+            num_eval_points.saturating_sub(step_size)
+        };
+        let current = proof.trace_ood_evaluations();
+        let next = proof.trace_ood_next_evaluations();
+
+        // `height == step_size` also rejects a height-0 current block: every AIR
+        // reports `step_size >= 1`.
+        current.dimensions_consistent()
+            && current.width() == air.trace_layout().0 + air.num_auxiliary_rap_columns()
+            && current.height() == step_size
+            && next.dimensions_consistent()
+            && next.width() == expected_next_width
+            && next.height() == expected_next_height
+    }
+
     fn step_2_verify_claimed_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         public_inputs: &PI,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        // The full current+next-row OOD grid, shape-checked and reconstructed once
+        // by the caller (after `ood_blocks_well_formed`) and shared with
+        // `step_3_verify_fri`. Its pruned next-row entries are zero — those are
+        // never read by any constraint. `step_size` accompanies it for the frame
+        // split below.
+        ood_full: &Table<FieldExtension>,
+        step_size: usize,
     ) -> bool {
         crate::profile_markers::step_marker::<
             { crate::profile_markers::STEP_VERIFY_CLAIMED_COMPOSITION_POLYNOMIAL },
@@ -168,6 +232,7 @@ pub trait IsStarkVerifier<
         let bus_public_inputs = proof
             .bus_table_contribution()
             .map(BusPublicInputs::from_contribution);
+
         let boundary_constraints = air.boundary_constraints(
             public_inputs,
             &challenges.rap_challenges,
@@ -230,7 +295,9 @@ pub trait IsStarkVerifier<
                 .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
 
         // A malformed archive can advertise fewer OOD columns than the AIR's
-        // aux count; reject instead of underflowing.
+        // aux count; reject instead of underflowing. The current-row block keeps
+        // the full trace width even under g·z pruning, so this still yields the
+        // main width.
         let num_main_trace_columns = match trace_ood_evaluations
             .width()
             .checked_sub(air.num_auxiliary_rap_columns())
@@ -260,7 +327,11 @@ pub trait IsStarkVerifier<
             None => FieldElement::zero(),
         };
 
-        let ood_frame = trace_ood_evaluations.into_frame(num_main_trace_columns, air.step_size());
+        // Frame from the reconstructed full grid: the next-row step reads only
+        // its transition-window columns; the zero-filled remainder is never read.
+        // `into_frame` lives on the borrowed table view, so wrap the owned grid.
+        let ood_frame =
+            StarkTableView::Owned(ood_full).into_frame(num_main_trace_columns, step_size);
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
@@ -331,6 +402,12 @@ pub trait IsStarkVerifier<
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
         domain: &VerifierDomain<Field>,
         challenges: &Challenges<FieldExtension>,
+        // g·z pruning: the full OOD grid (reconstructed once by the caller and
+        // shared with `step_2`) plus the transition-window column indices, so the
+        // DEEP reconstruction can skip pruned next-row openings.
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
     ) -> bool
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -339,7 +416,12 @@ pub trait IsStarkVerifier<
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
-                challenges, domain, proof,
+                challenges,
+                domain,
+                proof,
+                ood_full,
+                next_row_cols,
+                step_size,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -681,14 +763,22 @@ pub trait IsStarkVerifier<
     /// Sums that depend only on `challenges` and proof-level OOD/gamma data —
     /// identical for every FRI query — computed once instead of once per
     /// query.
+    ///
+    /// g·z pruning: the trace OOD values come from the reconstructed full grid
+    /// `ood_full` (current-row block plus the scattered next-row window, zeros
+    /// elsewhere), not from `proof.trace_ood_evaluations()` which now carries
+    /// only the current-row block. Pruned positions are zero in both the grid
+    /// and `trace_term_coeffs`, so next rows sum only the window columns.
     fn compute_query_invariant_deep_terms(
         challenges: &Challenges<FieldExtension>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
     ) -> Option<QueryInvariantDeepTerms<FieldExtension>> {
-        let trace_ood_evaluations = proof.trace_ood_evaluations();
-        let ood_evaluations_table_height = trace_ood_evaluations.height();
-        let ood_evaluations_table_width = trace_ood_evaluations.width();
-        let ood_data = trace_ood_evaluations.row_major_data();
+        let ood_evaluations_table_height = ood_full.height;
+        let ood_evaluations_table_width = ood_full.width;
+        let ood_data = ood_full.row_major_data();
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
         if trace_term_coeffs.is_empty()
@@ -703,8 +793,16 @@ pub trait IsStarkVerifier<
             let ood_row = &ood_data[row_idx * ood_evaluations_table_width
                 ..(row_idx + 1) * ood_evaluations_table_width];
             let mut sum = FieldElement::<FieldExtension>::zero();
-            for col_idx in 0..ood_evaluations_table_width {
-                sum += &trace_term_coeffs[col_idx][row_idx] * &ood_row[col_idx];
+            if row_idx < step_size {
+                for col_idx in 0..ood_evaluations_table_width {
+                    sum += &trace_term_coeffs[col_idx][row_idx] * &ood_row[col_idx];
+                }
+            } else {
+                // Next-row row: off-window columns contribute coeff·0 with a
+                // zero coeff too, so the window-only sum is exact.
+                for &col_idx in next_row_cols {
+                    sum += &trace_term_coeffs[col_idx][row_idx] * &ood_row[col_idx];
+                }
             }
             ood_row_sum.push(sum);
         }
@@ -726,6 +824,7 @@ pub trait IsStarkVerifier<
 
         Some(QueryInvariantDeepTerms {
             ood_row_sum,
+            ood_width: ood_evaluations_table_width,
             number_of_parts,
             z_pow,
             h_sum_zpow,
@@ -736,6 +835,9 @@ pub trait IsStarkVerifier<
         challenges: &Challenges<FieldExtension>,
         domain: &VerifierDomain<Field>,
         proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        ood_full: &Table<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -759,7 +861,13 @@ pub trait IsStarkVerifier<
         let primitive_root = &Field::get_primitive_root_of_unity(domain.root_order as u64)
             .expect("verifier domain root_order is a valid power of two");
 
-        let query_invariant_terms = Self::compute_query_invariant_deep_terms(challenges, proof)?;
+        let query_invariant_terms = Self::compute_query_invariant_deep_terms(
+            challenges,
+            proof,
+            ood_full,
+            next_row_cols,
+            step_size,
+        )?;
 
         for (i, iota) in challenges.iotas.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
@@ -795,12 +903,13 @@ pub trait IsStarkVerifier<
                 Self::query_challenge_to_evaluation_point(*iota, true, domain);
             let (evaluation, evaluation_sym) =
                 Self::reconstruct_deep_composition_poly_evaluation_pair(
-                    proof,
                     &evaluation_point,
                     &evaluation_point_sym,
                     primitive_root,
                     challenges,
                     &query_invariant_terms,
+                    next_row_cols,
+                    step_size,
                     lde_precomputed,
                     lde_main,
                     lde_aux,
@@ -822,14 +931,18 @@ pub trait IsStarkVerifier<
     /// isolates `coeff*ood` (identical for both points, hoisted into
     /// `query_invariant_terms`) from `coeff*base` (per-point), so both points
     /// share the OOD walk and a single batch-inverse for their denominators.
+    /// g·z pruning restricts next rows (`row_idx >= step_size`) to the
+    /// transition-window columns `next_row_cols` — all other next-row
+    /// coefficients are zero, so those terms vanish from both sums.
     #[allow(clippy::too_many_arguments)]
     fn reconstruct_deep_composition_poly_evaluation_pair<'b>(
-        proof: StarkProofView<'_, Field, FieldExtension, PI>,
         evaluation_point: &FieldElement<Field>,
         evaluation_point_sym: &FieldElement<Field>,
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
         lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
         lde_trace_main_evaluations: &'b [FieldElement<Field>],
         lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
@@ -840,7 +953,7 @@ pub trait IsStarkVerifier<
         lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
     ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
         let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
-        let ood_evaluations_table_width = proof.trace_ood_evaluations().width();
+        let ood_evaluations_table_width = query_invariant_terms.ood_width;
         let trace_term_coeffs = &challenges.trace_term_coeffs;
 
         // Base columns are supplied as two slices (precomputed ‖ main) that the
@@ -901,16 +1014,35 @@ pub trait IsStarkVerifier<
             let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
             let mut base_row_sum = FieldElement::<FieldExtension>::zero();
             let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
-            for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
-                let coeff = &coeff_col[row_idx];
-                if col_idx < num_base {
-                    // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
-                    base_row_sum += base_at(col_idx) * coeff;
-                    base_row_sum_sym += base_at_sym(col_idx) * coeff;
-                } else {
-                    let aux_idx = col_idx - num_base;
-                    base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                    base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+            if row_idx < step_size {
+                for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
+                    let coeff = &coeff_col[row_idx];
+                    if col_idx < num_base {
+                        // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
+                        base_row_sum += base_at(col_idx) * coeff;
+                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
+                    } else {
+                        let aux_idx = col_idx - num_base;
+                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
+                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                    }
+                }
+            } else {
+                // g·z pruning: the next-row block opens only transition-window
+                // columns; every other column's coefficient is zero
+                // (`build_pruned_trace_term_coeffs`), so summing the window
+                // alone is exact — and skipping the rest is where the
+                // verifier/recursion cycle saving lands.
+                for &col_idx in next_row_cols {
+                    let coeff = &trace_term_coeffs[col_idx][row_idx];
+                    if col_idx < num_base {
+                        base_row_sum += base_at(col_idx) * coeff;
+                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
+                    } else {
+                        let aux_idx = col_idx - num_base;
+                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
+                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
+                    }
                 }
             }
             trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
@@ -976,19 +1108,19 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> = multi_proof
-            .proofs
-            .iter()
-            .map(StarkProofView::Owned)
-            .collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
+        Self::multi_verify_views(
+            airs,
+            MultiProofView::Owned(multi_proof),
+            transcript,
+            expected_bus_balance,
+        )
     }
 
     /// Verifies one or more rkyv-archived STARK proofs read **in place** from
     /// their archive buffer — no proof deserialization, no per-field allocation.
     fn multi_verify_archived(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        proofs: &[ArchivedStarkProof<Field, FieldExtension, PI>],
+        multi_proof: &ArchivedMultiProof<Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
@@ -996,29 +1128,35 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let views: Vec<StarkProofView<Field, FieldExtension, PI>> =
-            proofs.iter().map(StarkProofView::Archived).collect();
-        Self::multi_verify_views(airs, &views, transcript, expected_bus_balance)
+        Self::multi_verify_views(
+            airs,
+            MultiProofView::Archived(multi_proof),
+            transcript,
+            expected_bus_balance,
+        )
     }
 
     /// The single verification implementation, shared by [`Self::multi_verify`]
     /// (owned) and [`Self::multi_verify_archived`] (archived), operating on
     /// proof views rather than either's concrete type.
-    fn multi_verify_views(
+    fn multi_verify_views<'p>(
         airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
-        proofs: &[StarkProofView<Field, FieldExtension, PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
         expected_bus_balance: &FieldElement<FieldExtension>,
     ) -> bool
     where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        if airs.len() != proofs.len() {
+        if airs.len() != proofs.view_len() {
             error!(
                 "AIR count ({}) does not match proof count ({})",
                 airs.len(),
-                proofs.len()
+                proofs.view_len()
             );
             return false;
         }
@@ -1032,8 +1170,7 @@ pub trait IsStarkVerifier<
         // For preprocessed tables, use the hardcoded commitment (verifier cannot
         // trust the prover). For normal tables, use the commitment from the proof.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             // Soundness: the number of composition-poly parts is fixed by the AIR's
             // degree bound, NOT chosen by the prover. Deriving it from the proof would
             // let a malicious prover inflate the part count, widening the composition
@@ -1046,32 +1183,15 @@ pub trait IsStarkVerifier<
             {
                 return false;
             }
-            // The archive is read in place without validation; reject an OOD
-            // table whose advertised dimensions disagree with its data length,
-            // has no rows, whose width doesn't match the AIR's column layout, or
-            // whose height isn't a whole number of AIR steps (which `into_frame`
-            // below only `debug_assert!`s, not checks) — all before any row
-            // access indexes into it.
-            //
-            // The width check is load-bearing and prevents two distinct faults:
-            // (a) the AIR-derived column index `main_trace_width + c.col` in
-            //     `step_2_verify_claimed_composition_polynomial` indexing past a
-            //     too-narrow OOD row (a release-mode out-of-bounds panic), and
-            // (b) a width-0 table, whose `width * height == 0 == data.len()`
-            //     satisfies `dimensions_consistent()` for an arbitrary advertised
-            //     height and would otherwise slip through this guard entirely.
-            // An honest proof always commits exactly `main_trace_width + num_aux`
-            // OOD columns (the same quantities `column_idx` and the `checked_sub`
-            // boundary use), so exact equality never rejects a valid proof.
-            let trace_ood_evaluations = proof.trace_ood_evaluations();
-            let expected_ood_width = air.trace_layout().0 + air.num_auxiliary_rap_columns();
-            if !trace_ood_evaluations.dimensions_consistent()
-                || trace_ood_evaluations.height() == 0
-                || trace_ood_evaluations.width() != expected_ood_width
-                || !trace_ood_evaluations
-                    .height()
-                    .is_multiple_of(air.step_size())
-            {
+            // The archive is read in place without validation, so both OOD blocks
+            // must be shape-checked here — before Round 3 absorbs the next-row
+            // block and before any row access indexes into either. The width check
+            // is load-bearing: it stops the AIR-derived column index
+            // `main_trace_width + c.col` in `step_2_verify_claimed_composition_polynomial`
+            // from indexing past a too-narrow OOD row, and it rejects a width-0
+            // table, whose `width * height == 0 == data.len()` would otherwise
+            // satisfy `dimensions_consistent()` for any advertised height.
+            if !Self::ood_blocks_well_formed(*air, proof) {
                 return false;
             }
             if air.is_preprocessed() {
@@ -1127,8 +1247,7 @@ pub trait IsStarkVerifier<
         // boundary constraints on LogUp columns, so the bus balance check is
         // the only cross-table validation.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             if air.has_trace_interaction() && !proof.has_bus_public_inputs() {
                 error!(
                     "Table {idx}: AIR has LogUp interactions but proof is missing bus_public_inputs"
@@ -1150,8 +1269,7 @@ pub trait IsStarkVerifier<
         // state after Phase B, domain-separated by table index). This matches
         // the prover's forking and makes per-table verification independent.
 
-        for (idx, (air, proof)) in airs.iter().zip(proofs).enumerate() {
-            let proof = *proof;
+        for (idx, (air, proof)) in airs.iter().zip(proofs.view_iter()).enumerate() {
             // Must match prover: fork with domain separator for multi-table,
             // use original transcript directly for single-table.
             let num_tables = airs.len();
@@ -1207,7 +1325,7 @@ pub trait IsStarkVerifier<
 
         if needs_lookup_challenges {
             let mut total = FieldElement::<FieldExtension>::zero();
-            for (air, proof) in airs.iter().zip(proofs) {
+            for (air, proof) in airs.iter().zip(proofs.view_iter()) {
                 if air.has_trace_interaction()
                     && let Some(contribution) = proof.bus_table_contribution()
                 {
@@ -1243,7 +1361,7 @@ pub trait IsStarkVerifier<
     {
         Self::multi_verify_views(
             &[air],
-            &[StarkProofView::Owned(proof)],
+            &[StarkProofView::Owned(proof)][..],
             transcript,
             &FieldElement::zero(),
         )
@@ -1258,6 +1376,7 @@ pub trait IsStarkVerifier<
         domain: &VerifierDomain<Field>,
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
         rap_challenges: Vec<FieldElement<FieldExtension>>,
+        layout: &crate::ood::OodLayout,
     ) -> Challenges<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
@@ -1308,13 +1427,18 @@ pub trait IsStarkVerifier<
             &domain.coset_offset,
         );
 
-        // <<<< Receive values: tⱼ(zgᵏ)
-        // Column-major append (matches `Table::columns()` order) reading the
+        // <<<< Receive values: tⱼ(zgᵏ). Absorb the two pruned OOD blocks in the
+        // same order the prover sent them (current-row block, then next-row
+        // block), each column-major (matching `Table::columns()` order) reading
         // rows in place, without materializing transposed columns.
-        let ood = proof.trace_ood_evaluations();
-        for col_idx in 0..ood.width() {
-            for row_idx in 0..ood.height() {
-                transcript.append_field_element(&ood.get_row(row_idx)[col_idx]);
+        for ood in [
+            proof.trace_ood_evaluations(),
+            proof.trace_ood_next_evaluations(),
+        ] {
+            for col_idx in 0..ood.width() {
+                for row_idx in 0..ood.height() {
+                    transcript.append_field_element(&ood.get_row(row_idx)[col_idx]);
+                }
             }
         }
         // <<<< Receive value: Hᵢ(z^N)
@@ -1327,8 +1451,10 @@ pub trait IsStarkVerifier<
         // ===================================
 
         let num_terms_composition_poly = proof.composition_poly_parts_ood_evaluation().len();
-        let num_terms_trace =
-            air.context().transition_offsets.len() * air.step_size() * air.context().trace_columns;
+        // Must match the prover's g·z pruning exactly (same AIR metadata): the
+        // current-row block opens every column, the next-row block only the
+        // transition-window columns.
+        let num_terms_trace = layout.num_surviving();
         let gamma = transcript.sample_field_element();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
@@ -1337,12 +1463,10 @@ pub trait IsStarkVerifier<
                 .take(num_terms_composition_poly + num_terms_trace)
                 .collect();
 
-        let trace_term_coeffs: Vec<_> = deep_composition_coefficients
+        let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
-            .collect::<Vec<_>>()
-            .chunks(air.context().transition_offsets.len() * air.step_size())
-            .map(|chunk| chunk.to_vec())
             .collect();
+        let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
 
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
@@ -1424,6 +1548,12 @@ pub trait IsStarkVerifier<
             return false;
         }
 
+        // The pruned-OOD layout, read from the AIR once and shared by the round-4
+        // challenge replay, the block-shape guard, the single grid reconstruction,
+        // and both verify steps below — one reconstruction instead of the previous
+        // two, and no chance of the sites drifting apart.
+        let layout = Self::ood_layout(air);
+
         #[cfg(feature = "instruments")]
         println!("- Started step 1: Recover challenges");
         #[cfg(feature = "instruments")]
@@ -1436,6 +1566,7 @@ pub trait IsStarkVerifier<
             &domain,
             transcript,
             rap_challenges,
+            &layout,
         );
 
         // verify grinding
@@ -1462,12 +1593,37 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer2 = Instant::now();
 
+        // Reject either OOD block whose shape disagrees with the AIR before
+        // reconstructing or using it, so a malicious prover cannot reshape them
+        // to dodge a check or desync the frame reconstruction. This guard used to
+        // run at the top of `step_2`; `step_3` silently relied on it. Now it runs
+        // once here, before both steps, and the full grid is reconstructed once
+        // and shared with them (one reconstruction instead of two). The Phase A
+        // loop in `multi_verify_views` runs the same guard even earlier, before
+        // Round 3 absorbs the next-row block.
+        if !Self::ood_blocks_well_formed(air, proof) {
+            #[cfg(not(feature = "test_fiat_shamir"))]
+            error!("Composition Polynomial verification failed");
+            return false;
+        }
+        let ood_current = proof.trace_ood_evaluations();
+        let ood_next = proof.trace_ood_next_evaluations();
+        // Full current+next-row OOD grid (surviving values placed, pruned next-row
+        // entries zero — those are never read by any constraint).
+        let ood_full = layout.reconstruct_full(
+            ood_current.row_major_data(),
+            ood_current.width(),
+            ood_next.row_major_data(),
+        );
+
         if !Self::step_2_verify_claimed_composition_polynomial(
             air,
             proof,
             public_inputs,
             &domain,
             &challenges,
+            &ood_full,
+            layout.step_size(),
         ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("Composition Polynomial verification failed");
@@ -1483,7 +1639,15 @@ pub trait IsStarkVerifier<
         #[cfg(feature = "instruments")]
         let timer3 = Instant::now();
 
-        if !Self::step_3_verify_fri(air, proof, &domain, &challenges) {
+        if !Self::step_3_verify_fri(
+            air,
+            proof,
+            &domain,
+            &challenges,
+            &ood_full,
+            layout.next_row_cols(),
+            layout.step_size(),
+        ) {
             #[cfg(not(feature = "test_fiat_shamir"))]
             error!("FRI verification failed");
             return false;

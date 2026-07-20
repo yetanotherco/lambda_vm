@@ -555,10 +555,14 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
         self.to_bytes_be()
     }
 
-    // One sink call over a stack buffer instead of three (one per limb): each
-    // sink call lands as its own `Digest::update` on the guest, and dyn dispatch
-    // here is fully devirtualized by the #[inline(always)] chain, so call count
-    // — not indirection — is the cost being cut.
+    // Same 24 bytes as `as_bytes`, staged in a stack buffer so the guest skips
+    // the per-element `Vec`; `#[inline(always)]` is what lets the `dyn` sink
+    // devirtualize at the call site. Emitting them in one call rather than one
+    // per limb keeps it to a single `Digest::update`.
+    //
+    // The layout is load-bearing beyond this crate: `math-cuda`'s
+    // `keccak_leaves_ext3` kernel reads components in order 0,1,2 to match
+    // `write_bytes_be`, and CPU/GPU leaf parity depends on the two agreeing.
     #[inline(always)]
     fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
         let mut buf = [0u8; 24];
