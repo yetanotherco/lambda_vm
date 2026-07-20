@@ -1,4 +1,5 @@
 name = "FEXT_FMA"
+code = "FMA"
 
 [[variables.input]]
 name = "input_addrs"

@@ -1,4 +1,5 @@
 name = "FEXT_LOAD"
+code = "FXL"
 
 [[variables.input]]
 name = "timestamp"
