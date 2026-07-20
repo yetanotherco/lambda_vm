@@ -36,6 +36,7 @@ use stark::trace::TraceTable;
 use crate::constraints::templates::emit_is_bit;
 
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::local_to_global::GENESIS_EPOCH;
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
 };
@@ -101,6 +102,44 @@ pub struct FieldCellBoundary {
     pub final_val: u64,
     /// Last access timestamp for the cell this epoch.
     pub final_ts: u64,
+}
+
+/// One epoch's touched field cells, each as `(domain, addr, final_value, final_ts)`
+/// — the field-storage analog of [`super::local_to_global::EpochTouches`], produced
+/// by the trace builder and turned into [`FieldCellBoundary`]s by the driver.
+pub type FieldTouches = Vec<(u64, u64, u64, u64)>;
+
+/// Per-cell field-storage provenance: `(domain, addr) → (last_writer_epoch, value)`.
+/// Unset cells read back as the genesis default `(GENESIS_EPOCH, 0)`. No timestamp:
+/// the cross-epoch init token is seeded at ts=0 (timestamps are epoch-local).
+pub type FieldProvenance = std::collections::HashMap<(u64, u64), (u64, u64)>;
+
+/// One epoch's field boundaries: take each touched cell's `init` from the running
+/// `provenance` (its last writer + value) and record this epoch (1-based `epoch`
+/// label) as the new writer of its `final` value. Mirrors
+/// [`super::local_to_global::epoch_boundary`] for field-storage cells.
+pub fn field_epoch_boundary(
+    provenance: &mut FieldProvenance,
+    epoch: u64,
+    touched: &FieldTouches,
+) -> Vec<FieldCellBoundary> {
+    let mut boundaries = Vec::with_capacity(touched.len());
+    for &(domain, addr, final_val, final_ts) in touched {
+        let (init_epoch, init_val) = provenance
+            .get(&(domain, addr))
+            .copied()
+            .unwrap_or((GENESIS_EPOCH, 0));
+        boundaries.push(FieldCellBoundary {
+            domain,
+            addr,
+            init_val,
+            init_epoch,
+            final_val,
+            final_ts,
+        });
+        provenance.insert((domain, addr), (epoch, final_val));
+    }
+    boundaries
 }
 
 // =========================================================================

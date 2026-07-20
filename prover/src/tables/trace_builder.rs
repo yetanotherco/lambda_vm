@@ -52,6 +52,7 @@ use super::ecsm;
 use super::eq;
 use super::fext_fma;
 use super::fext_load;
+use super::fext_local_to_global;
 use super::fext_page;
 use super::fext_store;
 use super::halt;
@@ -988,13 +989,30 @@ fn collect_ecsm_ops(
 #[derive(Default)]
 struct FieldStorageState {
     cells: HashMap<(u64, u64), (u64, u64)>,
+    /// Values carried in from the previous epoch (continuation only). A cell not yet
+    /// touched this epoch reads back its carried value (at ts=0), instead of 0.
+    /// Empty for monolithic proving, so `read` returns `(0, 0)` as before.
+    carried: HashMap<(u64, u64), u64>,
 }
 
 impl FieldStorageState {
-    /// Current `(value, last_ts)` of a cell (`(0, 0)` if never touched — the
-    /// zero-init token FEXT_PAGE emits).
+    /// A state seeded with the previous epoch's final field-storage values (the
+    /// cross-epoch carry). Untouched cells read back their carried value at ts=0.
+    fn with_carried(carried: HashMap<(u64, u64), u64>) -> Self {
+        Self {
+            cells: HashMap::new(),
+            carried,
+        }
+    }
+
+    /// Current `(value, last_ts)` of a cell. If untouched this epoch, its carried
+    /// value at ts=0 (the epoch-start seed the bookend init token emits) — `(0, 0)`
+    /// when there is no carry (monolithic, or a genesis cell).
     fn read(&self, domain: u64, addr: u64) -> (u64, u64) {
-        self.cells.get(&(domain, addr)).copied().unwrap_or((0, 0))
+        self.cells
+            .get(&(domain, addr))
+            .copied()
+            .unwrap_or_else(|| (self.carried.get(&(domain, addr)).copied().unwrap_or(0), 0))
     }
 
     /// Record an access at `ts` that leaves `value` in the cell.
@@ -1003,7 +1021,7 @@ impl FieldStorageState {
     }
 
     /// One `FEXT_PAGE` row per touched cell, in deterministic `(domain, addr)`
-    /// order.
+    /// order (monolithic bookend).
     fn into_page_ops(self) -> Vec<fext_page::FextPageOperation> {
         let mut ops: Vec<_> = self
             .cells
@@ -1019,6 +1037,20 @@ impl FieldStorageState {
             .collect();
         ops.sort_by_key(|o| (o.domain, o.addr));
         ops
+    }
+
+    /// This epoch's touched field cells as `(domain, addr, final_val, final_ts)`,
+    /// in deterministic `(domain, addr)` order — the continuation carry's per-epoch
+    /// touch set (the driver turns it into `FextLocalToGlobal` boundaries). The
+    /// per-cell init value comes from the driver's field provenance, not here.
+    fn into_touched_field_cells(self) -> fext_local_to_global::FieldTouches {
+        let mut touches: fext_local_to_global::FieldTouches = self
+            .cells
+            .into_iter()
+            .map(|((domain, addr), (final_val, final_ts))| (domain, addr, final_val, final_ts))
+            .collect();
+        touches.sort_by_key(|&(domain, addr, _, _)| (domain, addr));
+        touches
     }
 }
 
@@ -3110,6 +3142,14 @@ pub struct Traces {
     /// `(address, end_value, end_timestamp)`. Populated only for continuation
     /// epochs that use the L2G memory bookend.
     pub touched_memory_cells: local_to_global::EpochTouches,
+    /// Per-epoch field-storage bookend for continuation epochs (the field-storage
+    /// analog of `local_to_global`). Empty unless the continuation driver fills it
+    /// with the boundary derived from `touched_field_cells`.
+    pub fext_local_to_global: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// Touched field-storage cells observed this epoch, each as
+    /// `(domain, addr, final_value, final_ts)`. Populated only for continuation
+    /// epochs (used by the driver to build the field boundary + carry).
+    pub touched_field_cells: fext_local_to_global::FieldTouches,
     // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
     pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -3373,6 +3413,7 @@ fn build_traces<I: ImageSource + Sync>(
     private_input: &[u8],
     is_final: bool,
     l2g_memory_bookend: bool,
+    touched_field_cells: fext_local_to_global::FieldTouches,
 ) -> Result<Traces, Error> {
     // Interim soundness guard: field-storage is NOT carried across continuation
     // epochs (RAM and registers are, but `field_state` resets to default each
@@ -3952,6 +3993,9 @@ fn build_traces<I: ImageSource + Sync>(
         Vec::new()
     };
     let local_to_global = local_to_global::generate_local_to_global_trace(&[]);
+    // Like `local_to_global`: the driver installs the real field bookend trace after
+    // applying field provenance. Build an empty placeholder here.
+    let fext_local_to_global = fext_local_to_global::generate_fext_local_to_global_trace(&[]);
 
     #[cfg(feature = "instruments")]
     drop(__sp);
@@ -3985,6 +4029,8 @@ fn build_traces<I: ImageSource + Sync>(
         memw_registers,
         local_to_global,
         touched_memory_cells,
+        fext_local_to_global,
+        touched_field_cells,
         eqs,
         bytewises,
         stores,
@@ -4299,6 +4345,8 @@ impl Traces {
             public_output_bytes: _,
             local_to_global: _,
             touched_memory_cells: _,
+            fext_local_to_global: _,
+            touched_field_cells: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -4441,6 +4489,8 @@ impl Traces {
             public_output_bytes: _,
             local_to_global: _,
             touched_memory_cells: _,
+            fext_local_to_global: _,
+            touched_field_cells: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -4671,6 +4721,12 @@ impl Traces {
     /// `is_final` marks the last epoch: it applies HALT finalization (zeroize
     /// registers, require the terminating ECALL). Intermediate epochs (`false`)
     /// skip HALT and keep their boundary register/memory state.
+    ///
+    /// Field-storage carry: without a carried image (this delegate), a continuation
+    /// epoch reads field cells back as zero — only sound if the program uses no FEXT
+    /// accelerator ecalls. The continuation driver calls
+    /// [`Self::from_image_and_logs_carried`] with the previous epoch's final field
+    /// values instead.
     #[allow(clippy::too_many_arguments)]
     pub fn from_image_and_logs<I: ImageSource + Sync>(
         elf: &Elf,
@@ -4681,6 +4737,38 @@ impl Traces {
         private_input: &[u8],
         is_final: bool,
         l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        Self::from_image_and_logs_carried(
+            elf,
+            initial_image,
+            register_init,
+            logs,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            &HashMap::new(),
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Like [`Self::from_image_and_logs`] but seeds field-storage from `carried_field`
+    /// (the previous epoch's final `(domain, addr) -> value`), so FEXT accelerator
+    /// ecalls read the carried value instead of zero. Under continuation the driver
+    /// derives the field boundary + cross-epoch carry from `Traces::touched_field_cells`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_image_and_logs_carried<I: ImageSource + Sync>(
+        elf: &Elf,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        carried_field: &HashMap<(u64, u64), u64>,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
         // A non-final epoch must not contain the program-terminating instruction
@@ -4714,7 +4802,7 @@ impl Traces {
         let mut register_state = RegisterState::from_init(register_init);
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p2a_collect_cpu");
-        let mut field_state = FieldStorageState::default();
+        let mut field_state = FieldStorageState::with_carried(carried_field.clone());
         let (
             memw_ops,
             load_ops,
@@ -4738,6 +4826,18 @@ impl Traces {
         #[cfg(feature = "instruments")]
         drop(__sp);
 
+        // Monolithic runs bookend field-storage with FEXT_PAGE; continuation epochs
+        // skip FEXT_PAGE (empty ops) and hand the touched cells to the driver, which
+        // builds the fext_local_to_global bookend + the cross-epoch carry.
+        let (fext_page_ops, touched_field_cells) = if l2g_memory_bookend {
+            (Vec::new(), field_state.into_touched_field_cells())
+        } else {
+            (
+                field_state.into_page_ops(),
+                fext_local_to_global::FieldTouches::new(),
+            )
+        };
+
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
@@ -4755,7 +4855,7 @@ impl Traces {
             fext_load_ops,
             fext_fma_ops,
             fext_store_ops,
-            field_state.into_page_ops(),
+            fext_page_ops,
             &mut register_state,
             is_final,
         );
@@ -4779,6 +4879,7 @@ impl Traces {
             private_input,
             is_final,
             l2g_memory_bookend,
+            touched_field_cells,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -4864,6 +4965,7 @@ impl Traces {
             &[],
             true,
             false,
+            fext_local_to_global::FieldTouches::new(),
         )
     }
 }
