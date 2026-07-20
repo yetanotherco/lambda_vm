@@ -156,11 +156,13 @@
   } else if t == str {
     ("s", leaf-transform(val))
   } else if t == dictionary {
-    ("d", val.pairs().map(recurse).sum(default: _SEP))
+    ("d", val.pairs().sorted().map(recurse).sum(default: _SEP))
   } else if t == array {
     ("a", val.map(recurse).join(_SEP, default: _SEP))
   } else if t == int {
     ("i", val.to-bytes())
+  } else {
+    assert(false, message: "to-bytes: unsupported object type: " + str(type(val)))
   }
   bytes("(") + bytes(tag) + val + bytes(")")
 }
@@ -213,7 +215,11 @@
   let _EXCLUDED_LABELS = ("desc", "ref", "constraint")
   let digest_constraint(c) = {
     // filter out excluded fields
-    let filtered = c.keys().filter(k => k not in _EXCLUDED_LABELS).map(k => c.at(k))
+    let filtered = c
+      .keys()
+      .sorted()
+      .filter(k => k not in _EXCLUDED_LABELS)
+      .map(k => c.at(k))
 
     // replace iter variables with stub
     let iters = if "iters" in c {c.iters} else if "iter" in c {(c.iter,)} else {()}
