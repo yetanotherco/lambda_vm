@@ -389,10 +389,50 @@ fn sim_hash_ecall_of(instruction: Option<&Instruction>, src1_val: u64) -> Option
         .and_then(|s| s.sim_hash_ecall())
 }
 
+/// A DEEP reduced-opening MEASUREMENT stub ecall (Experiment 2). These are not
+/// accelerators (no chip, never proven), so they don't appear in
+/// [`accelerator_of`]; they are tallied separately so an execute-only ceiling
+/// run can report how many were swallowed alongside the (unchanged) keccak count.
+enum SimReducedOpening {
+    Row,
+    Query,
+}
+
+fn sim_reduced_opening_of(
+    instruction: Option<&Instruction>,
+    src1_val: u64,
+) -> Option<SimReducedOpening> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    match SyscallNumbers::try_from(src1_val).ok()? {
+        SyscallNumbers::ReducedOpeningRow => Some(SimReducedOpening::Row),
+        SyscallNumbers::ReducedOpeningQuery => Some(SimReducedOpening::Query),
+        _ => None,
+    }
+}
+
+/// Whether an ECALL's `a7` value is one this CLI tallies (accelerator, sim-hash,
+/// or reduced-opening stub). Cheap `src1_val`-only prefilter for candidate
+/// collection; the `*_of` classifiers confirm the instruction afterward.
+fn is_counted_syscall(src1_val: u64) -> bool {
+    SyscallNumbers::try_from(src1_val)
+        .map(|s| {
+            s.accelerator().is_some()
+                || s.sim_hash_ecall().is_some()
+                || matches!(
+                    s,
+                    SyscallNumbers::ReducedOpeningRow | SyscallNumbers::ReducedOpeningQuery
+                )
+        })
+        .unwrap_or(false)
+}
+
 /// Per-ecall invocation tallies printed under `--cycles`. Keccak/ECSM are real
-/// accelerator chips; the five `sim_*` fields are the EXPERIMENT 1 measurement
-/// stubs, counted separately so the optimistic-ceiling score can be recomputed
-/// under different chip-cost assumptions.
+/// accelerator chips; the `sim_*` fields are EXPERIMENT 1 (hash/transcript) and
+/// the `reduced_opening_*` fields are EXPERIMENT 2 measurement stubs, each
+/// counted separately so the optimistic-ceiling score can be recomputed under
+/// different chip-cost assumptions.
 #[derive(Default, Clone, Copy)]
 struct EcallCounts {
     keccak: u64,
@@ -402,6 +442,8 @@ struct EcallCounts {
     sim_transcript_sample: u64,
     sim_hash_pair: u64,
     sim_hash_felts: u64,
+    reduced_opening_row: u64,
+    reduced_opening_query: u64,
 }
 
 fn cmd_execute(
@@ -435,10 +477,11 @@ fn cmd_execute(
         }
     };
 
-    // Ecall invocation counts, tallied only in the plain streaming path below
-    // (the flamegraph path drives execution inside the executor and does not
-    // expose per-log data). `None` means "not counted", so the ecall lines are
-    // omitted rather than printed as misleading zeros.
+    // Ecall invocation counts (keccak, ecsm, the five EXPERIMENT 1 sim-hash
+    // stubs, and the two EXPERIMENT 2 reduced-opening stubs), tallied only in the
+    // plain streaming path below (the flamegraph path drives execution inside the
+    // executor and does not expose per-log data). `None` means "not counted", so
+    // the ecall lines are omitted rather than printed as misleading zeros.
     let mut ecall_counts: Option<EcallCounts> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
@@ -506,12 +549,12 @@ fn cmd_execute(
 
         let mut cycle_count: u64 = 0;
         let mut counts = EcallCounts::default();
-        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
-        // accelerator OR sim-hash-ecall syscall number. This is a cheap superset
-        // — a non-ECALL instruction can hold the same value in src1 — that the
-        // `*_of` classifiers confirm below, once the chunk's `&Log` borrow (tied
-        // to the executor's `&mut`) is released so the instruction cache can be
-        // read again.
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches a
+        // counted syscall number (accelerator or either experiment's sim stub).
+        // This is a cheap superset — a non-ECALL instruction can hold the same
+        // value in src1 — that the `*_of` classifiers confirm below, once the
+        // chunk's `&Log` borrow (tied to the executor's `&mut`) is released so
+        // the instruction cache can be read again.
         let mut ecall_candidates: Vec<(u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
@@ -525,10 +568,7 @@ fn cmd_execute(
             cycle_count += logs.len() as u64;
             if cycles {
                 for log in logs {
-                    if SyscallNumbers::try_from(log.src1_val)
-                        .map(|s| s.accelerator().is_some() || s.sim_hash_ecall().is_some())
-                        .unwrap_or(false)
-                    {
+                    if is_counted_syscall(log.src1_val) {
                         ecall_candidates.push((log.current_pc, log.src1_val));
                     }
                 }
@@ -548,6 +588,11 @@ fn cmd_execute(
                     Some(SimHashEcall::TranscriptSample) => counts.sim_transcript_sample += 1,
                     Some(SimHashEcall::HashPair) => counts.sim_hash_pair += 1,
                     Some(SimHashEcall::HashFelts) => counts.sim_hash_felts += 1,
+                    None => {}
+                }
+                match sim_reduced_opening_of(instr, a7) {
+                    Some(SimReducedOpening::Row) => counts.reduced_opening_row += 1,
+                    Some(SimReducedOpening::Query) => counts.reduced_opening_query += 1,
                     None => {}
                 }
             }
@@ -572,11 +617,29 @@ fn cmd_execute(
         if let Some(c) = ecall_counts {
             println!("Keccak calls: {}", c.keccak);
             println!("Ecsm calls: {}", c.ecsm);
-            println!("Sim absorb_felts calls: {}", c.sim_absorb_felts);
-            println!("Sim absorb_bytes calls: {}", c.sim_absorb_bytes);
-            println!("Sim transcript_sample calls: {}", c.sim_transcript_sample);
-            println!("Sim hash_pair calls: {}", c.sim_hash_pair);
-            println!("Sim hash_felts calls: {}", c.sim_hash_felts);
+            // Only surface a stub line when that build actually fired it, so
+            // ordinary runs keep their two-line accelerator report.
+            if c.sim_absorb_felts > 0 {
+                println!("Sim absorb_felts calls: {}", c.sim_absorb_felts);
+            }
+            if c.sim_absorb_bytes > 0 {
+                println!("Sim absorb_bytes calls: {}", c.sim_absorb_bytes);
+            }
+            if c.sim_transcript_sample > 0 {
+                println!("Sim transcript_sample calls: {}", c.sim_transcript_sample);
+            }
+            if c.sim_hash_pair > 0 {
+                println!("Sim hash_pair calls: {}", c.sim_hash_pair);
+            }
+            if c.sim_hash_felts > 0 {
+                println!("Sim hash_felts calls: {}", c.sim_hash_felts);
+            }
+            if c.reduced_opening_row > 0 {
+                println!("Reduced-opening row calls: {}", c.reduced_opening_row);
+            }
+            if c.reduced_opening_query > 0 {
+                println!("Reduced-opening query calls: {}", c.reduced_opening_query);
+            }
         }
     }
 

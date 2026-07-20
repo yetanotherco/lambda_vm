@@ -267,6 +267,38 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-simhash.elf: FORCE | prepare-sysroo
 $(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simhash.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simhash-bench,--features "continuation blowup2 sim-hash-ecalls")
 
+# MEASUREMENT-ONLY: DEEP reduced-opening stub variants of the cont/blowup2 guest
+# (Experiment 2). Level A (simroA) = per-row column-loop ecall; Level B (simroB)
+# = whole per-query pair ecall. NEVER prove these ELFs (the unmatched ecall
+# unbalances the LogUp bus) — execute-only cycle measurement. Kept OUT of
+# compile-recursion-elfs/compile-programs so they never build by accident; build
+# explicitly with `make compile-recursion-sim-ro-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroA.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simroA-bench,--features "continuation blowup2 sim-ro-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroB.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simroB-bench,--features "continuation blowup2 sim-ro-query")
+
+.PHONY: compile-recursion-sim-ro-elfs
+compile-recursion-sim-ro-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroA.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroB.elf
+
+# EXPERIMENT 3 (combined) measurement ELFs: EXPERIMENT 1 hash/transcript ecalls
+# AND EXPERIMENT 2 reduced-opening ecalls in one cont/blowup2 guest. simboth =
+# Level A RO; simbothB = Level B RO. EXECUTE-ONLY (never prove). Kept out of the
+# default targets; build with `make compile-recursion-simboth-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simbothB.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simbothB-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-query")
+
+.PHONY: compile-recursion-simboth-elfs
+compile-recursion-simboth-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simbothB.elf
+
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
 

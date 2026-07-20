@@ -8,6 +8,10 @@ license.workspace = true
 thiserror = "1.0.68"
 rustc-demangle = "0.1"
 ecsm = { path = "../crypto/ecsm" }
+# Host-side Goldilocks + degree-3 extension arithmetic for the reduced-opening
+# measurement ecalls (sim-ro-ecalls / sim-ro-query). Acyclic: math does not
+# depend on executor. `std` pulls in `alloc` (needed for batch inverse).
+math = { path = "../crypto/math", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }

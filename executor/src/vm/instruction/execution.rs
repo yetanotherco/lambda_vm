@@ -1,6 +1,10 @@
 use crate::vm::{
     instruction::decoding::{ArithOp, Comparison, Instruction, LoadStoreWidth},
     instruction::sim_hash,
+    instruction::sim_reduced_opening::{
+        REDUCED_OPENING_QUERY_SYSCALL_NUMBER, REDUCED_OPENING_ROW_SYSCALL_NUMBER,
+        reduced_opening_query, reduced_opening_row,
+    },
     logs::Log,
     memory::{Memory, MemoryError},
     registers::Registers,
@@ -27,6 +31,12 @@ pub enum SyscallNumbers {
     SimTranscriptSample = 97,
     SimHashPair = 98,
     SimHashFelts = 99,
+    // DEEP reduced-opening measurement ecalls (EXPERIMENT 2). Placeholder
+    // discriminants (100/101 to avoid colliding with the EXPERIMENT 1 stubs
+    // above); the actual syscall values are the REDUCED_OPENING_* consts.
+    // Measurement-only stubs, not accelerators.
+    ReducedOpeningRow = 100,
+    ReducedOpeningQuery = 101,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -75,6 +85,10 @@ impl TryFrom<u64> for SyscallNumbers {
             }
             v if v == SIM_HASH_PAIR_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashPair),
             v if v == SIM_HASH_FELTS_SYSCALL_NUMBER => Ok(SyscallNumbers::SimHashFelts),
+            v if v == REDUCED_OPENING_ROW_SYSCALL_NUMBER => Ok(SyscallNumbers::ReducedOpeningRow),
+            v if v == REDUCED_OPENING_QUERY_SYSCALL_NUMBER => {
+                Ok(SyscallNumbers::ReducedOpeningQuery)
+            }
             _ => Err(()),
         }
     }
@@ -108,7 +122,11 @@ impl SyscallNumbers {
         match self {
             SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
             SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
-            SyscallNumbers::Print
+            // Measurement stubs, not real accelerators: no chip table, never
+            // proven. The CLI tallies them separately (see bin/cli).
+            SyscallNumbers::ReducedOpeningRow
+            | SyscallNumbers::ReducedOpeningQuery
+            | SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
             | SyscallNumbers::Halt
@@ -137,7 +155,11 @@ impl SyscallNumbers {
             | SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
-            | SyscallNumbers::Halt => None,
+            | SyscallNumbers::Halt
+            // EXPERIMENT 2 reduced-opening stubs are counted by the CLI's own
+            // reduced-opening classifier, not here.
+            | SyscallNumbers::ReducedOpeningRow
+            | SyscallNumbers::ReducedOpeningQuery => None,
         }
     }
 }
@@ -578,6 +600,27 @@ impl Instruction {
                         src2_val = a_ptr;
                         dst_val = out_ptr;
                     }
+                    SyscallNumbers::ReducedOpeningRow => {
+                        // MEASUREMENT-ONLY (never proven). Level A: compute one
+                        // OOD row's (base_row_sum, base_row_sum_sym) host-side.
+                        // x10 = &input struct, x11 = row_idx, x12 = out_ptr.
+                        let input_ptr = registers.read(10)?;
+                        let row_idx = registers.read(11)?;
+                        let out_ptr = registers.read(12)?;
+                        reduced_opening_row(memory, input_ptr, row_idx, out_ptr)?;
+                        src2_val = input_ptr;
+                        dst_val = out_ptr;
+                    }
+                    SyscallNumbers::ReducedOpeningQuery => {
+                        // MEASUREMENT-ONLY (never proven). Level B: reconstruct
+                        // the whole (deep_eval, deep_eval_sym) pair host-side.
+                        // x10 = &input struct, x11 = out_ptr.
+                        let input_ptr = registers.read(10)?;
+                        let out_ptr = registers.read(11)?;
+                        reduced_opening_query(memory, input_ptr, out_ptr)?;
+                        src2_val = input_ptr;
+                        dst_val = out_ptr;
+                    }
                     SyscallNumbers::Halt => {
                         // halt
                         return Ok(Log {
@@ -768,6 +811,10 @@ pub enum ExecutionError {
     SimHashInvalidKind(u64),
     #[error("sim-hash ecall: address range overflows")]
     SimHashAddressOverflow,
+    #[error("reduced-opening stub: inconsistent input dimensions")]
+    SimReducedOpeningInvalidDims,
+    #[error("reduced-opening stub: non-invertible denominator")]
+    SimReducedOpeningInverse,
 }
 
 // =============================================================================

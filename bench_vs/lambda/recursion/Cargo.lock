@@ -233,6 +233,7 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "math",
  "rustc-demangle",
  "thiserror",
 ]
@@ -853,6 +854,7 @@ dependencies = [
  "crypto",
  "digest",
  "itertools",
+ "lambda-vm-syscalls",
  "log",
  "math",
  "rkyv",

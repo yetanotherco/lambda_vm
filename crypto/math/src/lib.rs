@@ -5,6 +5,8 @@ extern crate alloc;
 
 pub mod errors;
 pub mod field;
+/// Measurement-only ABI structs for the reduced-opening stub ecalls.
+pub mod sim_ro;
 pub mod spill_safe;
 pub mod traits;
 pub mod unsigned_integer;
