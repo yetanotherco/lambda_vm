@@ -2,7 +2,7 @@
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
-test-profile-recursion-block \
+test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
@@ -298,8 +298,26 @@ test-profile-recursion-single: compile-recursion-elfs
 test-profile-recursion-multi: compile-recursion-elfs
 	cargo test --package lambda-vm-prover --lib test_recursion_profile_multiquery -- --ignored --nocapture
 
+# Pre-proved continuation input for test_recursion_profile_blowup4_block:
+# proving a real ethrex block's continuation bundle is real prover work (not
+# the verifier-guest cost that test profiles), so it's built ONCE here and
+# include_bytes!'d by the test, rather than re-proven on every test run.
+# Epoch=2^21 matches scripts/bench_recursion_scaling.sh's default.
+RECURSION_PROFILE_BLOCK_INPUT := $(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-block4.bin
+
+recursion-profile-block-input: $(RECURSION_PROFILE_BLOCK_INPUT)
+
+$(RECURSION_PROFILE_BLOCK_INPUT): $(RUST_ARTIFACTS_DIR)/ethrex.elf executor/tests/ethrex_bench_4.bin | $(RECURSION_ARTIFACTS_DIR)
+	rm -f /tmp/recursion_input.bin /tmp/recursion_input.bin.expected
+	RECURSION_DUMP_PRESET=blowup4 RECURSION_DUMP_EPOCH_LOG2=21 \
+		RECURSION_DUMP_INNER_ELF=$(CURDIR)/$(RUST_ARTIFACTS_DIR)/ethrex.elf \
+		RECURSION_DUMP_INNER_INPUT=$(CURDIR)/executor/tests/ethrex_bench_4.bin \
+		cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture
+	mv /tmp/recursion_input.bin $@
+	mv /tmp/recursion_input.bin.expected $@.expected
+
 # Real-block profile (ethrex, blowup=4/4 transfers), via the `continuation` guest.
-test-profile-recursion-block: compile-recursion-elfs $(RUST_ARTIFACTS_DIR)/ethrex.elf
+test-profile-recursion-block: compile-recursion-elfs $(RECURSION_PROFILE_BLOCK_INPUT)
 	cargo test --package lambda-vm-prover --lib --release test_recursion_profile_blowup4_block -- --ignored --nocapture
 
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).

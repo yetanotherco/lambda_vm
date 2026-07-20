@@ -205,82 +205,50 @@ fn setup_guest_run(
     (guest_elf_bytes, program, executor, expected)
 }
 
-/// Read the ethrex guest ELF (built by `make executor/program_artifacts/rust/ethrex.elf`).
-fn read_ethrex_elf(root: &std::path::Path) -> Vec<u8> {
-    let path = root.join("executor/program_artifacts/rust/ethrex.elf");
-    std::fs::read(&path).unwrap_or_else(|e| {
-        panic!(
-            "failed to read {} — run `make executor/program_artifacts/rust/ethrex.elf`: {e}",
-            path.display()
-        )
-    })
-}
-
-/// Read a committed ethrex block fixture (`executor/tests/ethrex_bench_<txs>.bin`).
-fn read_ethrex_fixture(root: &std::path::Path, txs: u32) -> Vec<u8> {
-    let path = root.join(format!("executor/tests/ethrex_bench_{txs}.bin"));
-    std::fs::read(&path).unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
-}
-
-/// [`setup_guest_run`] for the `continuation` guest feature: proves `inner_elf`
-/// on `inner_input` via continuations (`epoch_log2`-cycle epochs) and loads
-/// `recursion-cont-<preset>.elf` instead of the monolithic `recursion-<preset>.elf`
-/// — the realistic in-VM cost of verifying a real (multi-epoch) inner proof
-/// instead of the `empty`-program diagnostic floor. Returns
-/// `(elf_bytes, program, executor, expected_attestation)`.
-fn setup_continuation_guest_run(
-    label: &str,
-    preset: Preset,
-    inner_elf_bytes: &[u8],
-    inner_input: &[u8],
-    epoch_log2: u32,
-) -> (
+/// [`setup_guest_run`]'s fixture-based counterpart for a real ethrex block:
+/// reads a pre-proved continuation input instead of proving one in-process.
+/// Proving a real block's continuation bundle is minutes of real prover
+/// work — the `recursion-profile-block-input` Makefile target does it ONCE
+/// into `executor/program_artifacts/recursion/recursion-cont-blowup4-block4.bin`
+/// (+ `.expected` sidecar: 32-byte id || inner public output, written by
+/// `test_dump_recursion_input`), so this test only ever measures the verifier
+/// guest, never the inner prove.
+fn setup_block4_blowup4_guest_run() -> (
     Vec<u8>,
     executor::elf::Elf,
     executor::vm::execution::Executor,
     ExpectedAttestation,
 ) {
     let root = workspace_root();
-    let guest_elf_bytes = read_guest_elf(&root, &format!("recursion-cont-{}", preset.name()));
+    let guest_elf_bytes = read_guest_elf(&root, "recursion-cont-blowup4");
 
-    let opts = preset.options();
-    eprintln!(
-        "[{label}] proving inner continuation (blowup={}, fri_queries={}, epoch=2^{epoch_log2}) ...",
-        opts.blowup_factor, opts.fri_number_of_queries
-    );
-    let bundle =
-        crate::continuation::prove_continuation(inner_elf_bytes, inner_input, epoch_log2, &opts)
-            .expect("inner continuation prove should succeed");
-    eprintln!("[{label}] continuation epochs: {}", bundle.num_epochs());
-
-    // Ground truth, computed on the bundle before `encode_continuation_guest_input`
-    // consumes it: a full trustless host verify (mirrors the monolithic pipeline's
-    // host `verify_with_options` check) for the expected output, plus the
-    // continuation analog of `check_attestation`'s recompute for the expected id.
-    let expected_output = crate::continuation::verify_continuation(inner_elf_bytes, &bundle, &opts)
-        .expect("verify_continuation errored")
-        .expect("continuation bundle must verify on host before profiling the guest");
-    let (expected_decode, expected_pages) =
-        crate::continuation::continuation_precomputed_commitments(inner_elf_bytes, &bundle, &opts)
-            .expect("continuation_precomputed_commitments errored");
-    let expected_id =
-        recursion::program_id_from_elf(inner_elf_bytes, &expected_decode, &expected_pages)
-            .expect("program_id_from_elf errored");
+    let art = root.join("executor/program_artifacts/recursion");
+    let blob_path = art.join("recursion-cont-blowup4-block4.bin");
+    let blob = std::fs::read(&blob_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read {} — run `make recursion-profile-block-input`: {e}",
+            blob_path.display()
+        )
+    });
+    let expected_path = art.join("recursion-cont-blowup4-block4.bin.expected");
+    let expected_bytes = std::fs::read(&expected_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to read {} — run `make recursion-profile-block-input`: {e}",
+            expected_path.display()
+        )
+    });
+    let (id_bytes, output) = expected_bytes.split_at(32);
     let expected = ExpectedAttestation {
-        id: expected_id,
-        output: expected_output,
+        id: id_bytes
+            .try_into()
+            .expect("expected sidecar id is 32 bytes"),
+        output: output.to_vec(),
     };
-
-    let blob = recursion::encode_continuation_guest_input(bundle, inner_elf_bytes, &opts)
-        .expect("recursion::encode_continuation_guest_input failed");
-    eprintln!("[{label}] rkyv blob: {} bytes", blob.len());
 
     let program = executor::elf::Elf::load(&guest_elf_bytes).expect("ELF load failed");
     assert_ne!(
-        program.entry_point,
-        0,
-        "recursion-cont-{} ELF has entry_point=0 — build artifact is malformed",
-        preset.name()
+        program.entry_point, 0,
+        "recursion-cont-blowup4 ELF has entry_point=0 — build artifact is malformed",
     );
     let executor =
         executor::vm::execution::Executor::new(&program, blob).expect("Executor::new failed");
@@ -445,37 +413,7 @@ fn run_profile(preset: Preset, progress_stride: usize, detailed: bool) {
     );
 }
 
-/// [`run_profile`] over a REAL inner program instead of `empty`: verifies
-/// `inner_elf_bytes`/`inner_input` via the `continuation` guest
-/// (`recursion-cont-<preset>.elf`) — the realistic in-VM verifier cost, not
-/// the intrinsic-overhead floor.
-fn run_profile_continuation(
-    preset: Preset,
-    inner_elf_bytes: &[u8],
-    inner_input: &[u8],
-    epoch_log2: u32,
-    progress_stride: usize,
-    detailed: bool,
-) {
-    let (guest_elf_bytes, program, executor, expected) = setup_continuation_guest_run(
-        "profile-block",
-        preset,
-        inner_elf_bytes,
-        inner_input,
-        epoch_log2,
-    );
-    run_profile_from(
-        preset,
-        &guest_elf_bytes,
-        &program,
-        executor,
-        progress_stride,
-        detailed,
-        &expected,
-    );
-}
-
-/// Shared profiling loop for [`run_profile`]/[`run_profile_continuation`]: runs
+/// Shared profiling loop for [`run_profile`]/`test_recursion_profile_blowup4_block`: runs
 /// an already-set-up guest executor and prints the same cycle/step/function
 /// breakdown regardless of which inner program it verified.
 fn run_profile_from(
@@ -545,7 +483,7 @@ fn run_profile_from(
 
     // Correctness, not just crash-freedom: read the guest's actual committed
     // attestation and check it against the trusted host recompute
-    // (`expected`, built by `setup_guest_run`/`setup_continuation_guest_run`
+    // (`expected`, built by `setup_guest_run`/`setup_block4_blowup4_guest_run`
     // before the guest ran) — the same identity+output binding a production
     // consumer checks via `check_attestation`/its continuation analog.
     let committed = executor
@@ -998,7 +936,13 @@ fn test_dump_recursion_input() {
         Err(_) => Vec::new(),
     };
 
-    let blob = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
+    // Continuation dumps also get an `.expected` sidecar (32-byte id || inner
+    // public output) — the ground truth a caller needs to check a guest's
+    // committed attestation, computed here while the `ContinuationProof`
+    // bundle still exists (`encode_continuation_guest_input` consumes it).
+    // Lets a consumer (e.g. `test_recursion_profile_blowup4_block`) verify
+    // the pre-proved fixture without re-deriving it from the bundle.
+    let (blob, expected_sidecar) = match std::env::var("RECURSION_DUMP_EPOCH_LOG2") {
         Ok(s) => {
             // No recursion-cont-blowup8.elf is built (RECURSION_CONT_PRESETS stops
             // at blowup4), so this blob would have no guest to verify it.
@@ -1024,8 +968,25 @@ fn test_dump_recursion_input() {
             )
             .expect("inner continuation prove should succeed");
             eprintln!("[dump-input] continuation epochs: {}", bundle.num_epochs());
-            recursion::encode_continuation_guest_input(bundle, &inner_elf_bytes, &opts)
-                .expect("recursion::encode_continuation_guest_input failed")
+
+            let expected_output =
+                crate::continuation::verify_continuation(&inner_elf_bytes, &bundle, &opts)
+                    .expect("verify_continuation errored")
+                    .expect("continuation bundle must verify on host before dumping");
+            let (expected_decode, expected_pages) =
+                crate::continuation::continuation_precomputed_commitments(
+                    &inner_elf_bytes,
+                    &bundle,
+                    &opts,
+                )
+                .expect("continuation_precomputed_commitments errored");
+            let expected_id =
+                recursion::program_id_from_elf(&inner_elf_bytes, &expected_decode, &expected_pages)
+                    .expect("program_id_from_elf errored");
+
+            let blob = recursion::encode_continuation_guest_input(bundle, &inner_elf_bytes, &opts)
+                .expect("recursion::encode_continuation_guest_input failed");
+            (blob, Some((expected_id, expected_output)))
         }
         Err(_) => {
             let (_inner_proof, blob) = prove_inner_and_encode_blob(
@@ -1034,7 +995,7 @@ fn test_dump_recursion_input() {
                 &inner_input,
                 &preset.options(),
             );
-            blob
+            (blob, None)
         }
     };
     assert!(
@@ -1049,6 +1010,18 @@ fn test_dump_recursion_input() {
         preset.name(),
         blob.len()
     );
+
+    if let Some((id, output)) = expected_sidecar {
+        let mut sidecar_data = Vec::with_capacity(32 + output.len());
+        sidecar_data.extend_from_slice(&id);
+        sidecar_data.extend_from_slice(&output);
+        let sidecar_path = format!("{path}.expected");
+        std::fs::write(&sidecar_path, &sidecar_data).expect("write expected sidecar");
+        eprintln!(
+            "[dump-input] wrote {} bytes to {sidecar_path}",
+            sidecar_data.len()
+        );
+    }
 }
 
 /// Cycle count only of the recursion guest verifying a 1-query inner proof.
@@ -1081,10 +1054,6 @@ fn test_recursion_cycles_blowup4() {
     run_profile(Preset::Blowup4, 500, false);
 }
 
-/// Continuation epoch size for the real-block profile below — matches
-/// `scripts/bench_recursion_scaling.sh`'s default.
-const BLOCK_EPOCH_LOG2: u32 = 21;
-
 /// Full profile (top-25 + per-step) of the recursion `continuation` guest
 /// verifying a REAL ethrex block (4 transfers) — not the `empty`-program
 /// diagnostic floor `test_recursion_profile_1query`/`_multiquery` measure.
@@ -1092,19 +1061,20 @@ const BLOCK_EPOCH_LOG2: u32 = 21;
 /// presets, so the full histogram stays tractable; `bench_recursion_cycles.sh`/
 /// `bench_recursion_scaling.sh` already cover cycle counts across every preset
 /// and block size, so this only needs to exist for the detailed breakdown.
+/// Requires `make recursion-profile-block-input` — the pre-proved fixture
+/// [`setup_block4_blowup4_guest_run`] reads.
 #[test]
 #[ignore = "diagnostic: heavy; recursion guest histogram + steps over a real ethrex block (blowup=4)"]
 fn test_recursion_profile_blowup4_block() {
-    let root = workspace_root();
-    let ethrex_elf_bytes = read_ethrex_elf(&root);
-    let fixture = read_ethrex_fixture(&root, 4);
-    run_profile_continuation(
+    let (guest_elf_bytes, program, executor, expected) = setup_block4_blowup4_guest_run();
+    run_profile_from(
         Preset::Blowup4,
-        &ethrex_elf_bytes,
-        &fixture,
-        BLOCK_EPOCH_LOG2,
+        &guest_elf_bytes,
+        &program,
+        executor,
         500,
         true,
+        &expected,
     );
 }
 
