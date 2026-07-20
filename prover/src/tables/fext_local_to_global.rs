@@ -29,16 +29,29 @@
 //! range-checked here (two `IsHalfword` halfwords) and ordered by
 //! `IsB20[epoch_label − 1 − init_epoch]`, forcing `init_epoch < fini_epoch`.
 
-use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, RowDomain};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::trace::TraceTable;
 
-use crate::constraints::templates::emit_is_bit;
-
 use super::bitwise::{BitwiseOperation, BitwiseOperationType};
+use super::fext_sorted_keys::{self, SortedKeysLayout};
 use super::local_to_global::GENESIS_EPOCH;
-use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op, zeroed_fe_vec,
+use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable, zeroed_fe_vec};
+
+/// Column layout for the shared `(domain, addr)` sorted-keys uniqueness argument.
+const LAYOUT: SortedKeysLayout = SortedKeysLayout {
+    domain: cols::DOMAIN,
+    addr_0: cols::ADDR_0,
+    addr_1: cols::ADDR_1,
+    mu: cols::MU,
+    addr0_hw_lo: cols::ADDR0_HW_LO,
+    addr0_hw_hi: cols::ADDR0_HW_HI,
+    addr1_hw_lo: cols::ADDR1_HW_LO,
+    addr1_hw_hi: cols::ADDR1_HW_HI,
+    next_addr_0: cols::NEXT_ADDR_0,
+    next_addr_1: cols::NEXT_ADDR_1,
+    same_dom: cols::SAME_DOM,
+    sel_same: cols::SEL_SAME,
 };
 
 // =========================================================================
@@ -179,44 +192,10 @@ pub fn generate_fext_local_to_global_trace(
         table.set_dword_wl(row, cols::FINAL_TS_0, b.final_ts);
         table.set_fe(row, cols::FINAL_VAL, FE::from(b.final_val));
         table.set_fe(row, cols::MU, FE::one());
-
-        let lo = b.addr & 0xFFFF_FFFF;
-        let hi = b.addr >> 32;
-        table.set_fe(row, cols::ADDR0_HW_LO, FE::from(lo & 0xFFFF));
-        table.set_fe(row, cols::ADDR0_HW_HI, FE::from(lo >> 16));
-        table.set_fe(row, cols::ADDR1_HW_LO, FE::from(hi & 0xFFFF));
-        table.set_fe(row, cols::ADDR1_HW_HI, FE::from(hi >> 16));
     }
 
-    for row in boundaries.len()..num_rows {
-        table.set_fe(row, cols::DOMAIN, FE::from(3u64));
-    }
-
-    for row in 0..num_rows - 1 {
-        let next_addr_0 = *table.get(row + 1, cols::ADDR_0);
-        let next_addr_1 = *table.get(row + 1, cols::ADDR_1);
-        let cur_dom = *table.get(row, cols::DOMAIN);
-        let next_dom = *table.get(row + 1, cols::DOMAIN);
-        let next_active = *table.get(row + 1, cols::MU) == FE::one();
-        let same = cur_dom == next_dom;
-
-        table.set_fe(row, cols::NEXT_ADDR_0, next_addr_0);
-        table.set_fe(row, cols::NEXT_ADDR_1, next_addr_1);
-        table.set_fe(
-            row,
-            cols::SAME_DOM,
-            if same { FE::one() } else { FE::zero() },
-        );
-        table.set_fe(
-            row,
-            cols::SEL_SAME,
-            if same && next_active {
-                FE::one()
-            } else {
-                FE::zero()
-            },
-        );
-    }
+    // Shared sorted-keys columns: addr half-words, padding domain, cross-row helpers.
+    LAYOUT.fill_trace(table, boundaries.len(), num_rows);
 
     trace
 }
@@ -321,13 +300,11 @@ pub fn memory_bus_interactions() -> Vec<BusInteraction> {
 /// - the uniqueness `addr[i] < addr[i+1]` ALU LT on same-domain transitions.
 pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
     debug_assert!(epoch_label >= 1, "epoch_label must be a 1-based fini epoch");
-    let mut interactions =
-        Vec::with_capacity(cols::ADDR_HALFWORDS.len() + cols::RANGE_CHECKED_HALFWORDS.len() + 2);
+    // Shared addr-LT + addr-limb IsHalfword, then the cross-epoch-only init_epoch
+    // IsHalfword + the IsB20 ordering check (init_epoch < fini_epoch).
+    let mut interactions = LAYOUT.bus_interactions();
 
-    for &column in cols::ADDR_HALFWORDS
-        .iter()
-        .chain(&cols::RANGE_CHECKED_HALFWORDS)
-    {
+    for &column in &cols::RANGE_CHECKED_HALFWORDS {
         interactions.push(BusInteraction::sender(
             BusId::IsHalfword,
             mu(),
@@ -335,7 +312,6 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
         ));
     }
 
-    // Ordering: IsB20[epoch_label - 1 - init_epoch].
     interactions.push(BusInteraction::sender(
         BusId::IsB20,
         mu(),
@@ -352,25 +328,6 @@ pub fn range_check_interactions(epoch_label: u64) -> Vec<BusInteraction> {
         ])],
     ));
 
-    // Uniqueness: addr[i] < addr[i+1] on same-domain active transitions.
-    interactions.push(BusInteraction::sender(
-        BusId::Alu,
-        Multiplicity::Column(cols::SEL_SAME),
-        vec![
-            BusValue::Packed {
-                start_column: cols::ADDR_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::Packed {
-                start_column: cols::NEXT_ADDR_0,
-                packing: Packing::DWordWL,
-            },
-            BusValue::constant(alu_op::LT as u64),
-            BusValue::constant(1),
-            BusValue::constant(0),
-        ],
-    ));
-
     interactions
 }
 
@@ -382,24 +339,18 @@ pub fn collect_bitwise_from_fext_l2g(
     boundaries: &[FieldCellBoundary],
     epoch_label: u64,
 ) -> Vec<BitwiseOperation> {
-    let mut ops = Vec::new();
-    let push_halfword = |ops: &mut Vec<BitwiseOperation>, v16: u64| {
-        ops.push(BitwiseOperation::halfword(
-            BitwiseOperationType::IsHalf,
-            (v16 & 0xFF) as u8,
-            ((v16 >> 8) & 0xFF) as u8,
-        ));
-    };
+    // Shared addr-limb halfwords (4/cell), then the cross-epoch-only init_epoch
+    // halfwords (2/cell) + IsB20 ordering (1/cell). BITWISE is a histogram, so order
+    // does not matter.
+    let mut ops = fext_sorted_keys::collect_bitwise(boundaries.iter().map(|b| b.addr));
     for b in boundaries {
-        let lo = b.addr & 0xFFFF_FFFF;
-        let hi = b.addr >> 32;
-        push_halfword(&mut ops, lo & 0xFFFF);
-        push_halfword(&mut ops, lo >> 16);
-        push_halfword(&mut ops, hi & 0xFFFF);
-        push_halfword(&mut ops, hi >> 16);
-        let init_epoch = epoch_halfwords(b.init_epoch);
-        push_halfword(&mut ops, init_epoch[0]);
-        push_halfword(&mut ops, init_epoch[1]);
+        for v16 in epoch_halfwords(b.init_epoch) {
+            ops.push(BitwiseOperation::halfword(
+                BitwiseOperationType::IsHalf,
+                (v16 & 0xFF) as u8,
+                ((v16 >> 8) & 0xFF) as u8,
+            ));
+        }
         // Ordering: IsB20[epoch_label - 1 - init_epoch] (init_epoch < fini_epoch).
         let diff = epoch_label - 1 - b.init_epoch;
         ops.push(BitwiseOperation::b20(
@@ -414,17 +365,9 @@ pub fn collect_bitwise_from_fext_l2g(
 /// The addr `<` ALU LT ops the uniqueness argument needs (same-domain consecutive
 /// touched cells), which the epoch's LT table must receive. Derived from the sorted
 /// touched-cell set (available at trace-build time), so it does not depend on the
-/// driver-computed init_epoch. Matches the `SEL_SAME`-gated addr-LT bus sends.
+/// driver-computed init_epoch.
 pub fn collect_lt_from_touches(touched: &FieldTouches) -> Vec<super::lt::LtOperation> {
-    let mut sorted = touched.to_vec();
-    sorted.sort_by_key(|&(domain, addr, _, _)| (domain, addr));
-    let mut lt_ops = Vec::new();
-    for pair in sorted.windows(2) {
-        if pair[0].0 == pair[1].0 {
-            lt_ops.push(super::lt::LtOperation::new(pair[0].1, pair[1].1, false));
-        }
-    }
-    lt_ops
+    fext_sorted_keys::collect_lt(touched.iter().map(|&(domain, addr, _, _)| (domain, addr)))
 }
 
 // =========================================================================
@@ -438,51 +381,9 @@ pub struct FextLocalToGlobalConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextLocalToGlobalConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        emit_is_bit(b, 0, cols::MU, None);
-
-        let d = b.main(0, cols::DOMAIN);
-        let three = b.const_base(3);
-        let four = b.const_base(4);
-        let five = b.const_base(5);
-        b.emit_base(1, (d.clone() - three) * (d.clone() - four) * (d - five));
-
-        emit_is_bit(b, 2, cols::SAME_DOM, None);
-
-        let two16 = b.const_base(1 << 16);
-        let a0 = b.main(0, cols::ADDR_0);
-        let a0_lo = b.main(0, cols::ADDR0_HW_LO);
-        let a0_hi = b.main(0, cols::ADDR0_HW_HI);
-        b.emit_base(3, a0 - (a0_lo + two16.clone() * a0_hi));
-        let a1 = b.main(0, cols::ADDR_1);
-        let a1_lo = b.main(0, cols::ADDR1_HW_LO);
-        let a1_hi = b.main(0, cols::ADDR1_HW_HI);
-        b.emit_base(4, a1 - (a1_lo + two16.clone() * a1_hi));
-
-        let tr = RowDomain::except_last(1);
-        let one = b.one();
-        let two = b.const_base(2);
-
-        let mu_cur = b.main(0, cols::MU);
-        let mu_next = b.main(1, cols::MU);
-        let same = b.main(0, cols::SAME_DOM);
-        let sel = b.main(0, cols::SEL_SAME);
-        let d_cur = b.main(0, cols::DOMAIN);
-        let d_next = b.main(1, cols::DOMAIN);
-
-        b.emit_base_rows(5, tr, mu_next.clone() * (one.clone() - mu_cur));
-        b.emit_base_rows(6, tr, sel.clone() - mu_next.clone() * same);
-        b.emit_base_rows(7, tr, sel.clone() * (d_next.clone() - d_cur.clone()));
-
-        let sel_diff = mu_next - sel;
-        let delta = d_next - d_cur;
-        b.emit_base_rows(8, tr, sel_diff * (delta.clone() - one) * (delta - two));
-
-        let na0 = b.main(0, cols::NEXT_ADDR_0);
-        let addr0_next = b.main(1, cols::ADDR_0);
-        b.emit_base_rows(9, tr, na0 - addr0_next);
-        let na1 = b.main(0, cols::NEXT_ADDR_1);
-        let addr1_next = b.main(1, cols::ADDR_1);
-        b.emit_base_rows(10, tr, na1 - addr1_next);
+        // The shared sorted-keys uniqueness argument (indices 0..=10); the cross-epoch
+        // ordering (IsB20) and value bindings ride the buses, not extra AIR constraints.
+        LAYOUT.emit_constraints(b);
     }
 
     fn max_degree(&self) -> usize {

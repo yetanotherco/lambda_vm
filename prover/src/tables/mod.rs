@@ -36,6 +36,7 @@ pub mod fext_fma;
 pub mod fext_load;
 pub mod fext_local_to_global;
 pub mod fext_page;
+pub mod fext_sorted_keys;
 pub mod fext_store;
 pub mod global_field_memory;
 pub mod global_memory;
