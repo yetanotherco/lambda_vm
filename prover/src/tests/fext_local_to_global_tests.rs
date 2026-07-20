@@ -51,7 +51,7 @@ fn boundary(domain: u64, addr: u64) -> FieldCellBoundary {
 
 #[test]
 fn fext_l2g_constraint_and_bus_counts() {
-    assert_eq!(FextLocalToGlobalConstraints.meta().len(), 11);
+    assert_eq!(FextLocalToGlobalConstraints.meta().len(), 12);
     // cross-epoch init receiver + fini sender.
     assert_eq!(global_bus_interactions(2).len(), 2);
     // epoch-local Memory init receiver + fini sender.

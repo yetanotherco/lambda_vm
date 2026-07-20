@@ -375,13 +375,14 @@ pub fn collect_lt_from_touches(touched: &FieldTouches) -> Vec<super::lt::LtOpera
 // =========================================================================
 
 /// FEXT_LOCAL_TO_GLOBAL constraints: `IS_BIT(μ)` (0), domain `∈ {3,4,5}` (1),
-/// `IS_BIT(same_dom)` (2), addr-limb recompose (3, 4), and the sorted-keys
-/// uniqueness transition constraints (5..=10), identical in shape to FEXT_PAGE.
+/// `IS_BIT(same_dom)` (2), addr-limb recompose (3, 4), the sorted-keys uniqueness
+/// transition constraints (5..=10), and `IS_BIT(sel_same)` (11), identical in shape
+/// to FEXT_PAGE.
 pub struct FextLocalToGlobalConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextLocalToGlobalConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
-        // The shared sorted-keys uniqueness argument (indices 0..=10); the cross-epoch
+        // The shared sorted-keys uniqueness argument (indices 0..=11); the cross-epoch
         // ordering (IsB20) and value bindings ride the buses, not extra AIR constraints.
         LAYOUT.emit_constraints(b);
     }

@@ -25,7 +25,7 @@ fn eval_transition(
     };
     let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![
         TableView::new(vec![get_row(row)], vec![vec![]]),
-        TableView::new(vec![get_row(row + 1)], vec![vec![]]),
+        TableView::new(vec![get_row((row + 1) % trace.num_rows())], vec![vec![]]),
     ]);
     let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
     let offset_e = FieldElement::<GoldilocksExtension>::zero();
@@ -51,8 +51,8 @@ fn op(domain: u64, addr: u64) -> FextPageOperation {
 fn fext_page_constraint_and_bus_counts() {
     // IS_BIT(μ), domain ∈ {3,4,5}, IS_BIT(same_dom), 2 addr recompose,
     // μ non-increasing, sel_same def, same-domain⇒equal, domain-increase,
-    // 2 next-addr copies = 11.
-    assert_eq!(FextPageConstraints.meta().len(), 11);
+    // 2 next-addr copies, IS_BIT(sel_same) = 12.
+    assert_eq!(FextPageConstraints.meta().len(), 12);
     // init receiver + fini sender + addr LT + 4 IsHalfword = 7.
     assert_eq!(bus_interactions().len(), 7);
 }
@@ -202,4 +202,20 @@ fn fext_page_rejects_forged_next_addr() {
         .main_table
         .set_fe(0, cols::NEXT_ADDR_0, FE::from(0x999u64));
     assert_ne!(eval_transition(&trace, 0)[9], FE::zero());
+}
+
+#[test]
+fn fext_page_rejects_free_last_row_sel_same() {
+    // CRIT-001 regression: the `sel_same` definition (idx 6) is `except_last`-gated,
+    // so it never pins the final row's `sel_same`. Since `sel_same` is the addr-LT
+    // sender's multiplicity, a free last-row value of −1 would cancel a forced `+1`
+    // LT claim of the same tuple and erase the strict-increase check (enabling a
+    // duplicate cell). The ungated `IS_BIT(sel_same)` (idx 11) must reject any
+    // non-{0,1} last-row multiplicity — here the −1 wildcard.
+    let mut trace = generate_fext_page_trace(&[op(3, 0x10), op(3, 0x20)]);
+    let last = trace.num_rows() - 1;
+    trace
+        .main_table
+        .set_fe(last, cols::SEL_SAME, FE::zero() - FE::one());
+    assert_ne!(eval_transition(&trace, last)[11], FE::zero());
 }

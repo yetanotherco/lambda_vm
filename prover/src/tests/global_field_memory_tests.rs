@@ -26,7 +26,7 @@ fn eval_transition(
     };
     let frame = Frame::<GoldilocksField, GoldilocksExtension>::new(vec![
         TableView::new(vec![get_row(row)], vec![vec![]]),
-        TableView::new(vec![get_row(row + 1)], vec![vec![]]),
+        TableView::new(vec![get_row((row + 1) % trace.num_rows())], vec![vec![]]),
     ]);
     let no_e: Vec<FieldElement<GoldilocksExtension>> = vec![];
     let offset_e = FieldElement::<GoldilocksExtension>::zero();
@@ -50,8 +50,8 @@ fn cell(domain: u64, addr: u64) -> FieldCellFinal {
 
 #[test]
 fn global_field_memory_constraint_and_bus_counts() {
-    // Same sorted-keys shape as FEXT_PAGE: 11 constraints.
-    assert_eq!(GlobalFieldMemoryConstraints.meta().len(), 11);
+    // Same sorted-keys shape as FEXT_PAGE: 12 constraints.
+    assert_eq!(GlobalFieldMemoryConstraints.meta().len(), 12);
     // GFM-GENESIS + GFM-FINAL + addr LT + 4 IsHalfword = 7.
     assert_eq!(bus_interactions().len(), 7);
 }
@@ -159,4 +159,19 @@ fn global_field_memory_rejects_forged_next_addr() {
         .main_table
         .set_fe(0, cols::NEXT_ADDR_0, FE::from(0x999u64));
     assert_ne!(eval_transition(&trace, 0)[9], FE::zero());
+}
+
+#[test]
+fn global_field_memory_rejects_free_last_row_sel_same() {
+    // CRIT-001 regression at the cross-epoch anchor: the `sel_same` definition
+    // (idx 6) is `except_last`-gated, leaving the final anchor row's `sel_same`
+    // free. As the addr-LT sender's multiplicity, a −1 there would cancel a forced
+    // `+1` LT claim and duplicate an anchor row (forking cross-epoch history). The
+    // ungated `IS_BIT(sel_same)` (idx 11) must reject the non-{0,1} multiplicity.
+    let mut trace = generate_global_field_trace(&[cell(3, 0x10), cell(3, 0x20)]);
+    let last = trace.num_rows() - 1;
+    trace
+        .main_table
+        .set_fe(last, cols::SEL_SAME, FE::zero() - FE::one());
+    assert_ne!(eval_transition(&trace, last)[11], FE::zero());
 }

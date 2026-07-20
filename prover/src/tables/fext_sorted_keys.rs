@@ -49,11 +49,23 @@ pub struct SortedKeysLayout {
 }
 
 impl SortedKeysLayout {
-    /// Emit the 11 uniqueness constraints (indices 0..=10): `IS_BIT(μ)` (0), domain
+    /// Emit the 12 uniqueness constraints (indices 0..=11): `IS_BIT(μ)` (0), domain
     /// `∈ {3,4,5}` (1), `IS_BIT(same_dom)` (2), addr-limb recompose (3, 4), then the
     /// strict-ascending transition checks exempting the last row — `μ` non-increasing
     /// (5), `sel_same` definition (6), same-domain ⇒ equal domain (7), domain steps by
-    /// 1 or 2 on a change (8), next-addr copies (9, 10).
+    /// 1 or 2 on a change (8), next-addr copies (9, 10) — and finally `IS_BIT(sel_same)`
+    /// (11), which unlike (6) applies to *every* row.
+    ///
+    /// Constraint (11) is what makes `sel_same` safe as the addr-LT sender's
+    /// multiplicity. On interior rows (6) already pins `sel_same = μ_next·same_dom`, a
+    /// product of two bits, so it is `{0,1}` there by construction — but (6) is
+    /// `except_last`-gated, leaving the last row's `sel_same` a free field element.
+    /// Since it is the LT sender's `Multiplicity::Column`, a free last-row value of `−1`
+    /// would let a prover cancel a forced `+1` LT claim of the same tuple (the sum-based
+    /// LogUp balance permits negative multiplicities), erasing the strict-increase check
+    /// and re-opening duplicate-cell / token-cycle forgeries. The ungated `IS_BIT`
+    /// forbids any non-`{0,1}` last-row multiplicity (the honest fill leaves it 0), which
+    /// closes that cancellation for all three field-storage tables at once.
     pub fn emit_constraints<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
         &self,
         b: &mut B,
@@ -103,10 +115,12 @@ impl SortedKeysLayout {
         let na1 = b.main(0, self.next_addr_1);
         let addr1_next = b.main(1, self.addr_1);
         b.emit_base_rows(10, tr, na1 - addr1_next);
+
+        emit_is_bit(b, 11, self.sel_same, None);
     }
 
     /// Number of constraints [`emit_constraints`](Self::emit_constraints) emits.
-    pub const NUM_CONSTRAINTS: usize = 11;
+    pub const NUM_CONSTRAINTS: usize = 12;
 
     /// The uniqueness bus interactions: the `addr[i] < addr[i+1]` ALU LT on same-domain
     /// active transitions (multiplicity `sel_same`), plus the four `IsHalfword` checks

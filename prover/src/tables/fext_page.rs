@@ -170,14 +170,15 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// `IS_BIT(same_dom)` (2), addr-limb recompose (3, 4). Transition (exempting the
 /// last row): `μ` non-increasing (5), `sel_same` definition (6), same-domain ⇒
 /// equal domain (7), domain increases by 1 or 2 on a change (8), next-addr copies
-/// (9, 10).
+/// (9, 10). Per-row again: `IS_BIT(sel_same)` (11), pinning the LT sender's
+/// multiplicity to `{0,1}` on the last row too.
 pub struct FextPageConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for FextPageConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // FEXT_PAGE's entire constraint set is the shared sorted-keys uniqueness
         // argument (IS_BIT(μ), domain ∈ {3,4,5}, addr recompose, strict-ascending
-        // transitions), indices 0..=10.
+        // transitions, IS_BIT(sel_same)), indices 0..=11.
         LAYOUT.emit_constraints(b);
     }
 

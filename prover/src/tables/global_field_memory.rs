@@ -224,13 +224,14 @@ pub fn collect_lt(cells: &[FieldCellFinal]) -> Vec<super::lt::LtOperation> {
 /// (1), `IS_BIT(same_dom)` (2), addr-limb recompose (3, 4). Transition (exempting
 /// the last row): `μ` non-increasing (5), `sel_same` definition (6), same-domain ⇒
 /// equal domain (7), domain increases by 1 or 2 on a change (8), next-addr copies
-/// (9, 10). Mirrors FEXT_PAGE's sorted-keys uniqueness argument exactly.
+/// (9, 10). Per-row again: `IS_BIT(sel_same)` (11). Mirrors FEXT_PAGE's sorted-keys
+/// uniqueness argument exactly.
 pub struct GlobalFieldMemoryConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for GlobalFieldMemoryConstraints {
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         // The sparse anchor's entire constraint set is the shared sorted-keys
-        // uniqueness argument (indices 0..=10); the genesis-value and finalization
+        // uniqueness argument (indices 0..=11); the genesis-value and finalization
         // bindings ride the GlobalFieldMemory bus, not extra AIR constraints.
         LAYOUT.emit_constraints(b);
     }
