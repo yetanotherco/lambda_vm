@@ -11,6 +11,12 @@
 
 #show: book-page("streaming.typ")
 
+#let config = load_config()
+#let l2gchip = load_chip("src/l2g.toml", config)
+#let l2g = raw(l2gchip.name)
+#let pagechip = load_chip("src/page.toml", config)
+#let page = raw(pagechip.name)
+
 In this chapter, we present our approach, which we name "epoch proving",#footnote[
   We additionally considered a "streaming" prover approach,
   proceeding in multiple phases (commit, logup, FRI, open),
@@ -45,6 +51,8 @@ although no part of the VM requires a global timestamp to be materialized.
 Since we choose to represent the epoch-local timestamps as 32-bit `Word` values,
 an epoch _should not_ consist of more than $2^30$ cycles
 (refer to the scaling factor in @memory:aside:granularity).
+The epochs should be 1-indexed, such that @l2g:c:lt_epoch can be properly satisfied in combination with the
+initialization performed by the #page chip.
 
 As such, each epoch proceeds by committing to all its tables,#footnote[
   The local-to-global will require a separate Merkle tree to allow the separation of epoch-local and cross-epoch proving.
@@ -72,10 +80,6 @@ it comes with some tradeoffs:
 - The overall proof conceptually consists of several sub-proofs that should however _not_ be considered
   in isolation, as there must be shared commitments between the epoch-local proofs and the global memory proof.
 
-
-#let config = load_config()
-#let l2gchip = load_chip("src/l2g.toml", config)
-#let l2g = raw(l2gchip.name)
 = #l2g chip
 
 == Variables
@@ -109,9 +113,6 @@ Even though they are not touched by the current epoch, the #l2g chips claims the
 and simply has finalization clean up the spurious initialization, by setting
 `fini_value = init_value` and `fini_timestamp = 0`.
 
-
-#let pagechip = load_chip("src/page.toml", config)
-#let page = raw(pagechip.name)
 = #page chip
 
 We resume here the description of memory initialization and finalization from @memory,
