@@ -122,4 +122,27 @@ fn all_table_windows_match_captured_ir() {
     assert_ood_window_matches_ir(&create_fext_fma_air(&opts), true, "FEXT_FMA");
     assert_ood_window_matches_ir(&create_fext_store_air(&opts), true, "FEXT_STORE");
     assert_ood_window_matches_ir(&create_fext_page_air(&opts), true, "FEXT_PAGE");
+    // Continuation field-storage aggregation AIRs. GLOBAL_FIELD_MEMORY and the
+    // epoch-local FEXT_LOCAL_TO_GLOBAL read the next row via the SAME shared
+    // `SortedKeysLayout::emit_constraints` (DOMAIN/ADDR_0/ADDR_1/MU at row+1) and
+    // must declare it — the identical soundness-critical contract as FEXT_PAGE,
+    // previously unguarded here. The global FEXT_L2G aggregation is
+    // `EmptyConstraints` (its checks are inherited via the equal-root binding), so
+    // it reads only the LogUp accumulator; covered for completeness. `epoch_label`
+    // is a bus parameter and does not affect the constraint IR's next-row reads.
+    assert_ood_window_matches_ir(
+        &crate::continuation::global_field_memory_air(&opts),
+        true,
+        "GLOBAL_FIELD_MEMORY",
+    );
+    assert_ood_window_matches_ir(
+        &crate::continuation::fext_l2g_memory_air(&opts, 1),
+        true,
+        "FEXT_LOCAL_TO_GLOBAL",
+    );
+    assert_ood_window_matches_ir(
+        &crate::continuation::fext_l2g_global_air(&opts, 1),
+        true,
+        "FEXT_L2G_GLOBAL",
+    );
 }

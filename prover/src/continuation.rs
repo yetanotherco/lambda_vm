@@ -254,7 +254,7 @@ fn global_memory_air(
 /// (this proof has the BITWISE + LT providers). `epoch_label` is the `fini_epoch`
 /// constant. The global proof commits the identical trace (root-bound), so it inherits
 /// these checks.
-fn fext_l2g_memory_air(
+pub(crate) fn fext_l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<
@@ -282,7 +282,7 @@ fn fext_l2g_memory_air(
 /// global proof). The field-storage analog of [`l2g_global_air`]: `EmptyConstraints`,
 /// since the uniqueness/range/ordering checks are enforced on the epoch-local
 /// `fext_l2g_memory_air` and inherited here via the equal-root commitment binding.
-fn fext_l2g_global_air(
+pub(crate) fn fext_l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
@@ -301,7 +301,7 @@ fn fext_l2g_global_air(
 /// anchor). Unlike RAM's dense preprocessed `global_memory_air`, this table is sparse,
 /// so it carries its own sorted-keys uniqueness constraints + `IsHalfword`/addr-LT
 /// lookups — hence the global proof must provide BITWISE + LT tables for it.
-fn global_field_memory_air(
+pub(crate) fn global_field_memory_air(
     opts: &ProofOptions,
 ) -> AirWithBuses<
     F,
