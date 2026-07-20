@@ -1008,26 +1008,34 @@ pub trait IsStarkVerifier<
         let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
         for row_idx in 0..ood_evaluations_table_height {
             let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
+            // Base columns (the cheap asymmetric F * E product) accumulate
+            // natively; aux columns (the Ext * Ext product) fold through a
+            // resident accumulator kept in field-storage on the accelerated
+            // guest — regular on slot 0, symmetric on slot 1 — so the running
+            // aux sum is never stored/reloaded per column. Splitting the two
+            // reorders the row sum, which is exact (field addition is
+            // associative/commutative).
             let mut base_row_sum = FieldElement::<FieldExtension>::zero();
             let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
+            let mut aux_acc = FieldExtension::mul_acc_new(0);
+            let mut aux_acc_sym = FieldExtension::mul_acc_new(1);
             if row_idx < step_size {
                 for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
                     let coeff = &coeff_col[row_idx];
                     if col_idx < num_base {
-                        // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
                         base_row_sum += base_at(col_idx) * coeff;
                         base_row_sum_sym += base_at_sym(col_idx) * coeff;
                     } else {
                         let aux_idx = col_idx - num_base;
-                        base_row_sum = FieldExtension::fma(
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc,
                             coeff,
                             &lde_trace_aux_evaluations[aux_idx],
-                            &base_row_sum,
                         );
-                        base_row_sum_sym = FieldExtension::fma(
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc_sym,
                             coeff,
                             &lde_trace_aux_evaluations_sym[aux_idx],
-                            &base_row_sum_sym,
                         );
                     }
                 }
@@ -1044,19 +1052,22 @@ pub trait IsStarkVerifier<
                         base_row_sum_sym += base_at_sym(col_idx) * coeff;
                     } else {
                         let aux_idx = col_idx - num_base;
-                        base_row_sum = FieldExtension::fma(
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc,
                             coeff,
                             &lde_trace_aux_evaluations[aux_idx],
-                            &base_row_sum,
                         );
-                        base_row_sum_sym = FieldExtension::fma(
+                        FieldExtension::mul_acc_add(
+                            &mut aux_acc_sym,
                             coeff,
                             &lde_trace_aux_evaluations_sym[aux_idx],
-                            &base_row_sum_sym,
                         );
                     }
                 }
             }
+            let base_row_sum = &base_row_sum + &FieldExtension::prod_acc_finish(aux_acc);
+            let base_row_sum_sym =
+                &base_row_sum_sym + &FieldExtension::prod_acc_finish(aux_acc_sym);
             let trace_diff = &base_row_sum - ood_row_sum;
             trace_term = FieldExtension::fma(&denoms_trace[row_idx], &trace_diff, &trace_term);
             let trace_diff_sym = &base_row_sum_sym - ood_row_sum;

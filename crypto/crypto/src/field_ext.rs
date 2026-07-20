@@ -54,6 +54,19 @@ pub trait Fp3Fma: IsField + Sized {
 
     /// Materialize the accumulator as a field element.
     fn prod_acc_finish(acc: Self::ProdAcc) -> FieldElement<Self>;
+
+    /// A fresh zero two-way resident accumulator for `acc += a*b` folds. `slot`
+    /// picks one of a fixed set of independent accumulators (the guest keeps each
+    /// in its own field-storage handle pair) so several folds can run at once —
+    /// e.g. the regular and symmetric row sums of a DEEP query. Callers must keep
+    /// distinct live accumulators on distinct slots and not exceed the guest's
+    /// slot count; host ignores `slot`. Materialize with `prod_acc_finish`.
+    fn mul_acc_new(slot: u8) -> Self::ProdAcc;
+
+    /// `acc += a * b`. Like `prod_acc_add` but without the third factor: on the
+    /// guest it is a single FMA into the resident accumulator (no `a*b` temp),
+    /// matching the `fma(a, b, acc)` folds the verifier runs over trace columns.
+    fn mul_acc_add(acc: &mut Self::ProdAcc, a: &FieldElement<Self>, b: &FieldElement<Self>);
 }
 
 #[cfg(not(target_arch = "riscv64"))]
@@ -81,6 +94,14 @@ mod imp {
         fn prod_acc_finish(acc: FieldElement<E>) -> FieldElement<E> {
             acc
         }
+
+        fn mul_acc_new(_slot: u8) -> FieldElement<E> {
+            FieldElement::zero()
+        }
+
+        fn mul_acc_add(acc: &mut FieldElement<E>, a: &FieldElement<E>, b: &FieldElement<E>) {
+            *acc = &*acc + &(a * b);
+        }
     }
 }
 
@@ -105,8 +126,19 @@ mod imp {
     // `H_ACC0`/`H_ACC1` so every emitted FMA has `out != c` (the executor's
     // pairwise-distinct guard forbids in-place accumulation).
     const H_T: u64 = BASE + 5;
-    const H_ACC0: u64 = BASE + 6;
-    const H_ACC1: u64 = BASE + 7;
+    // Resident-accumulator handle pairs, one per slot: slot `s` owns
+    // `(ACC_BASE + 2s, ACC_BASE + 2s + 1)` and ping-pongs between them so every
+    // emitted FMA has `out != c`. `MAX_SLOTS` independent accumulators can be
+    // live at once (e.g. the regular and symmetric DEEP row sums).
+    const ACC_BASE: u64 = BASE + 6;
+    const MAX_SLOTS: u8 = 4;
+
+    #[inline]
+    fn acc_pair(slot: u8) -> (u64, u64) {
+        debug_assert!(slot < MAX_SLOTS);
+        let lo = ACC_BASE + 2 * slot as u64;
+        (lo, lo + 1)
+    }
 
     type Fp3 = Degree3GoldilocksExtensionField;
 
@@ -154,8 +186,9 @@ mod imp {
         fn prod_acc_new() -> super::GuestAcc {
             // Zero the starting handle: it may hold a stale value from a
             // previous chain (uninitialized-reads-as-zero doesn't apply here).
-            fext_load(H_ACC0, &[0, 0, 0]);
-            super::GuestAcc { buf: 0 }
+            let (lo, _) = acc_pair(0);
+            fext_load(lo, &[0, 0, 0]);
+            super::GuestAcc { buf: 0, slot: 0 }
         }
 
         fn prod_acc_add(
@@ -169,29 +202,48 @@ mod imp {
             fext_load(H_C, &coeffs(c));
             // tmp = a * b
             fext_fma(H_A, H_B, H_ZERO, H_T);
-            let (cur, alt) = if acc.buf == 0 {
-                (H_ACC0, H_ACC1)
-            } else {
-                (H_ACC1, H_ACC0)
-            };
+            let (lo, hi) = acc_pair(acc.slot);
+            let (cur, alt) = if acc.buf == 0 { (lo, hi) } else { (hi, lo) };
             // alt = tmp * c + cur   (out=alt != c=cur, satisfies the guard)
             fext_fma(H_T, H_C, cur, alt);
             acc.buf ^= 1;
         }
 
         fn prod_acc_finish(acc: super::GuestAcc) -> FieldElement<Fp3> {
-            let cur = if acc.buf == 0 { H_ACC0 } else { H_ACC1 };
+            let (lo, hi) = acc_pair(acc.slot);
+            let cur = if acc.buf == 0 { lo } else { hi };
             from_coeffs(fext_store(cur))
+        }
+
+        fn mul_acc_new(slot: u8) -> super::GuestAcc {
+            let (lo, _) = acc_pair(slot);
+            fext_load(lo, &[0, 0, 0]);
+            super::GuestAcc { buf: 0, slot }
+        }
+
+        fn mul_acc_add(
+            acc: &mut super::GuestAcc,
+            a: &FieldElement<Fp3>,
+            b: &FieldElement<Fp3>,
+        ) {
+            fext_load(H_A, &coeffs(a));
+            fext_load(H_B, &coeffs(b));
+            let (lo, hi) = acc_pair(acc.slot);
+            let (cur, alt) = if acc.buf == 0 { (lo, hi) } else { (hi, lo) };
+            // alt = a * b + cur   (out=alt != c=cur, satisfies the guard)
+            fext_fma(H_A, H_B, cur, alt);
+            acc.buf ^= 1;
         }
     }
 }
 
-/// Guest resident-accumulator state: which of the two double-buffer handles
-/// currently holds the running `acc += a*b*c` value. (`buf` stays private; only
-/// this module's guest impl constructs and reads it.)
+/// Guest resident-accumulator state: `slot` selects the handle pair, `buf`
+/// selects which of that pair currently holds the running value. (Both stay
+/// private; only this module's guest impl constructs and reads them.)
 #[cfg(target_arch = "riscv64")]
 pub struct GuestAcc {
     buf: u8,
+    slot: u8,
 }
 
 #[cfg(test)]
@@ -229,5 +281,41 @@ mod tests {
             assert_eq!(Fp3F::fma(&a, &b, &c), &a * &b + &c);
             assert_eq!(Fp3F::ext_mul(&a, &b), &a * &b);
         }
+    }
+
+    /// The resident accumulators must fold to the same value as the plain sums
+    /// they replace: `prod_acc` to `Σ aᵢ·bᵢ·cᵢ`, `mul_acc` to `Σ aᵢ·bᵢ`. Two
+    /// `mul_acc` chains on distinct slots run interleaved (as the verifier folds
+    /// the regular and symmetric row sums at once) and must stay independent.
+    #[test]
+    fn resident_accumulators_match_plain_sums() {
+        let terms = [
+            ([1u64, 2, 3], [4u64, 5, 6], [7u64, 8, 9]),
+            ([10, 0, 5], [2, 3, 4], [1, 1, 1]),
+            ([123, 456, 789], [9, 8, 7], [2, 0, 4]),
+        ];
+
+        let mut prod = Fp3F::prod_acc_new();
+        let mut expected_prod = Fp3::from_raw([GoldilocksElement::from(0); 3]);
+        for (a, b, c) in terms {
+            let (a, b, c) = (e(a), e(b), e(c));
+            Fp3F::prod_acc_add(&mut prod, &a, &b, &c);
+            expected_prod = &expected_prod + &(&a * &b * &c);
+        }
+        assert_eq!(Fp3F::prod_acc_finish(prod), expected_prod);
+
+        let mut acc0 = Fp3F::mul_acc_new(0);
+        let mut acc1 = Fp3F::mul_acc_new(1);
+        let mut expected0 = Fp3::from_raw([GoldilocksElement::from(0); 3]);
+        let mut expected1 = Fp3::from_raw([GoldilocksElement::from(0); 3]);
+        for (a, b, c) in terms {
+            let (a, b, c) = (e(a), e(b), e(c));
+            Fp3F::mul_acc_add(&mut acc0, &a, &b);
+            Fp3F::mul_acc_add(&mut acc1, &a, &c);
+            expected0 = &expected0 + &(&a * &b);
+            expected1 = &expected1 + &(&a * &c);
+        }
+        assert_eq!(Fp3F::prod_acc_finish(acc0), expected0);
+        assert_eq!(Fp3F::prod_acc_finish(acc1), expected1);
     }
 }
