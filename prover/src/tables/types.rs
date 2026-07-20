@@ -359,6 +359,12 @@ pub enum BusId {
     /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
     /// boundary claims, matched across epochs by the final aggregation LogUp.
     GlobalMemory = 31,
+    /// Cross-epoch field-storage bus: the FEXT_PAGE per-cell init/fini boundary
+    /// claims for memory domains 3/4/5, matched across epochs by the
+    /// GLOBAL_FIELD_MEMORY aggregation. Distinct from [`GlobalMemory`](BusId::GlobalMemory):
+    /// its token carries the domain (field-storage spans domains 3/4/5, whereas RAM
+    /// is domain 0 only) and a full field-element value (not a byte).
+    GlobalFieldMemory = 32,
 }
 
 impl BusId {
@@ -388,6 +394,7 @@ impl BusId {
             BusId::Ecdas => "Ecdas",
             BusId::Bit => "Bit",
             BusId::GlobalMemory => "GlobalMemory",
+            BusId::GlobalFieldMemory => "GlobalFieldMemory",
         }
     }
 }
@@ -420,6 +427,7 @@ impl TryFrom<u64> for BusId {
             28 => Ok(BusId::Ecdas),
             30 => Ok(BusId::Bit),
             31 => Ok(BusId::GlobalMemory),
+            32 => Ok(BusId::GlobalFieldMemory),
             other => Err(other),
         }
     }
