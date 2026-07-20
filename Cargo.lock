@@ -1563,6 +1563,7 @@ dependencies = [
  "digest",
  "env_logger",
  "itertools 0.11.0",
+ "lambda-vm-syscalls",
  "libc",
  "log",
  "math",

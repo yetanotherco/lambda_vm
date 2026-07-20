@@ -299,6 +299,19 @@ compile-recursion-simboth-elfs: prepare-sysroot \
 	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth.elf \
 	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simbothB.elf
 
+# EXPERIMENT 5 (software-path optimizations): the simboth guest (both stub
+# families) plus REAL, sound guest-side software wins — a bump allocator
+# (`bump-alloc`). Reuses the simboth bin with extra features on top. Still
+# EXECUTE-ONLY (built on the sim-ecall base, which drives no chip): measure with
+# `cli execute --cycles`, never prove. Build with
+# `make compile-recursion-simboth-sw-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls bump-alloc")
+
+.PHONY: compile-recursion-simboth-sw-elf
+compile-recursion-simboth-sw-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw.elf
+
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
 

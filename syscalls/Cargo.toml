@@ -9,6 +9,12 @@ edition = "2024"
 # `crypto` swap sites. Off by default so a normal guest build is byte-identical;
 # `crypto`'s `sim-hash-ecalls` feature forwards to this one on riscv64.
 sim-hash-ecalls = []
+# Replace the TLSF global allocator with a bump allocator (no-op `dealloc`).
+# SOUND only for guests whose TOTAL allocated bytes over the whole run fit the
+# heap region (nothing is ever reclaimed). The recursion verifier is such a
+# guest (measured ~49 MiB total vs a ~3 GiB heap), so it opts in; other guests
+# keep TLSF. riscv64-only effect; on the host the attribute isn't applied.
+bump-alloc = []
 
 [dependencies]
 embedded-alloc = "0.6"

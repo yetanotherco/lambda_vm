@@ -32,6 +32,11 @@ sim-hash-ecalls = ["lambda-vm-prover/sim-hash-ecalls"]
 # per-query pair, implies Level A). See crypto/stark + others/accelerator_noop_sim_spec.md.
 sim-ro-ecalls = ["lambda-vm-prover/sim-ro-ecalls"]
 sim-ro-query = ["lambda-vm-prover/sim-ro-query", "sim-ro-ecalls"]
+# EXPERIMENT 5 (software-path optimizations): real, sound guest-side wins layered
+# on the sim-ecall base. `bump-alloc` swaps the TLSF global allocator for a bump
+# allocator (no-op free) — sound here because the verifier's TOTAL allocation
+# (~49 MiB) fits the ~3 GiB heap.
+bump-alloc = ["lambda-vm-syscalls/bump-alloc"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
