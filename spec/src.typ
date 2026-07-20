@@ -115,7 +115,7 @@
   }
 }
 
-/// Fowler-Noll-Vo (FNV) hash function, version 1a
+/// Fowler-Noll-Vo (FNV) 64-bit hash function, version 1a
 /// Src: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
 /// 
 /// Note: this is a non-cryptographic hash function; it is optimized
@@ -123,7 +123,7 @@
 /// 
 /// This implementation operates on two 32-bit limbs, rather than a single 
 /// 64-bit limb, since Typst does not support u64s.
-#let FNV-1a(bytes) = {
+#let FNV64-1a(bytes) = {
   // FNV_prime := 0x00000100000001B3
   let prime = (0x000001B3, 0x00000100)
 
@@ -138,12 +138,19 @@
     )
     
     // Carry result
-    let carry = lo.bit-rshift(32)
+    let carry = lo.bit-rshift(32, logical: true)
     lo = lo.bit-and(0xFFFFFFFF)
     hi = (hi + carry).bit-and(0xFFFFFFFF)
   }
 
   (lo + hi.bit-lshift(32)).to-bytes()
+}
+
+// 32-bit FNV, derived from FNV64-1a through XOR-folding.
+// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html#xor-fold
+#let FNV32-1a(inp) = {
+  let a64 = array(FNV64-1a(inp))
+  return bytes(a64.zip(a64.slice(4)).map(((lhs,rhs)) => lhs.bit-xor(rhs)))
 }
 
 // Recursively map nested object to bytes
@@ -170,8 +177,8 @@
 /// Tag constraints with an identifier
 #let _add_constraint_ids(chip) = {
 
-  /// A NON-CRYPTOGRAPHIC hash function.
-  let nchf(bytes) = FNV-1a(bytes)
+  /// A 32-bit NON-CRYPTOGRAPHIC hash function.
+  let nchf(bytes) = FNV32-1a(bytes)
 
   /// Digests an object
   let digest(obj, leaf-transform: bytes) = nchf(to-bytes(leaf-transform, obj))
@@ -181,23 +188,19 @@
   let ID_CHAR_SET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
 
   // Constants
+  let DIGEST_BITSIZE = 32;
   let LOG_ID_RADIX = 5
   let RADIX = calc.pow(2, LOG_ID_RADIX)
   assert(ID_CHAR_SET.len() == RADIX, message: "ID_CHAR_SET <> RADIX mismatch")
-  assert(ID_CHAR_LEN * LOG_ID_RADIX <= 64, message: "digest size too small for configured ID entropy")
+  assert(ID_CHAR_LEN * LOG_ID_RADIX <= DIGEST_BITSIZE, message: "digest size too small for configured ID entropy")
   
   // Map hash digest to ID
-  let MIN_DIGEST_BYTES = calc.ceil((LOG_ID_RADIX * ID_CHAR_LEN) / 8)
   let digest_to_id(digest) = {
-    assert(
-      digest.len() >= MIN_DIGEST_BYTES, 
-      message: "too few bytes to digest: " + str(digest.len()) + "<" + str(MIN_DIGEST_BYTES)
-    )
-
-    let int = int.from-bytes(digest.slice(0, count: MIN_DIGEST_BYTES))
+    assert(8 * digest.len() == DIGEST_BITSIZE)
+    let int = int.from-bytes(digest)
     for _ in range(ID_CHAR_LEN) {
-      let idx = int.bit-and(31)
-      int = int.bit-rshift(5)
+      let idx = int.bit-and(RADIX - 1)
+      int = int.bit-rshift(LOG_ID_RADIX)
       (ID_CHAR_SET.at(idx), )
     }.sum()
   }
