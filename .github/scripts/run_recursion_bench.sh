@@ -13,7 +13,8 @@ RESULT=/tmp/recursion_result.txt
 : > "$RESULT"
 
 run_preset() {
-  local preset="$1" log="/tmp/recursion_out_${preset}.txt"
+  local preset="$1"
+  local log="/tmp/recursion_out_${preset}.txt"
   if scripts/bench_recursion_cycles.sh "$HEAD_SHA" origin/main "$preset" 2>&1 | tee "$log"; then
     { echo; sed -n '/=== Recursion-guest cycle/,$p' "$log"; } >> "$RESULT"
   else
