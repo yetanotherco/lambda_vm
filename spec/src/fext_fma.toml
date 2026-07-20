@@ -34,17 +34,17 @@ pad = 0
 [[variables.constant]]
 name = "α"
 type = "BaseField"
-desc = "The X^2 coefficient of the definining polynomial"
+desc = "The $#`X`^2$ coefficient of the definining polynomial"
 
 [[variables.constant]]
 name = "β"
 type = "BaseField"
-desc = "The X^1 coefficient of the definining polynomial"
+desc = "The $#`X`^1$ coefficient of the definining polynomial"
 
 [[variables.constant]]
 name = "γ"
 type = "BaseField"
-desc = "The X^0 coefficient of the definining polynomial"
+desc = "The $#`X`^0$ coefficient of the definining polynomial"
 
 [[variables.virtual]]
 name = "a"
@@ -105,7 +105,7 @@ iter = ["d", 0, 2]
 
 [[constraints.all]]
 kind = "arith"
-constraint = "$#`output[0]` = a_0 b_0 + gamma (a_1 b_2 + a_2 b_1 + alpha a_2 b_2) + c_0$"
+constraint = "$#`output[0]` = a_0 b_0 + gamma (a_1 b_2 + a_2 b_1 + alpha dot a_2 b_2) + c_0$"
 poly = ["-", ["idx", "output", 0],
   ["*", ["idx", "a", 0], ["idx", "b", 0]],
   ["*", "γ", ["+",
@@ -116,7 +116,7 @@ poly = ["-", ["idx", "output", 0],
 
 [[constraints.all]]
 kind = "arith"
-constraint = "$#`output[1]` = a_0 b_1 + a_1 b_0 + beta (a_1 b_2 + a_2 b_1) + (alpha beta + gamma) a_2 b_2$"
+constraint = "$#`output[1]` = a_0 b_1 + a_1 b_0 + beta (a_1 b_2 + a_2 b_1) + (alpha beta + gamma) a_2 b_2 + c_1$"
 poly = ["-", ["idx", "output", 1],
   ["*", ["idx", "a", 0], ["idx", "b", 1]],
   ["*", ["idx", "a", 1], ["idx", "b", 0]],
@@ -127,7 +127,7 @@ poly = ["-", ["idx", "output", 1],
 
 [[constraints.all]]
 kind = "arith"
-constraint = "$#`output[2]` = a_0 b_2 + a_1 b_1 + a_2 b_0 + alpha (a_1 b_2 + a_2 b_1) + (alpha^2 + beta) a_2 b_2$"
+constraint = "$#`output[2]` = a_0 b_2 + a_1 b_1 + a_2 b_0 + alpha (a_1 b_2 + a_2 b_1) + (alpha^2 + beta) a_2 b_2 + c_2$"
 poly = ["-", ["idx", "output", 2],
   ["*", ["idx", "a", 0], ["idx", "b", 2]],
   ["*", ["idx", "a", 1], ["idx", "b", 1]],

@@ -20,7 +20,7 @@
 
 We introduce a set of chips for faster processing of numbers mod the native goldilocks prime,
 or a degree three extension field thereof.
-Our approach is to off an arithmetic black box, consisting of the *TODO* chips,
+Our approach is to offer an arithmetic black box, consisting of the *TODO* chips,
 that operates on a separate memory domain, and the #load chip to bridge the gap
 from normal byte-addressed RAM memory to this separate field-storage.
 As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for field-storage.
