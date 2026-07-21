@@ -514,10 +514,15 @@ where
 {
     /// Evaluations of the composition polynomial parts over the LDE domain.
     pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
-    /// The Merkle tree built to compute the commitment to the composition polynomial parts.
-    pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
-    /// The commitment to the composition polynomial parts.
-    pub(crate) composition_poly_root: Commitment,
+    /// The Merkle tree built to commit the composition polynomial parts. `None`
+    /// on the batched path's host commit: there every table's composition columns
+    /// are opened from the ONE shared composition MMCS, so the per-table tree is
+    /// never built (see `build_composition_tree` in
+    /// [`round_2_compute_composition_polynomial`](IsStarkProver::round_2_compute_composition_polynomial)).
+    pub(crate) composition_poly_merkle_tree: Option<BatchedMerkleTree<F>>,
+    /// The commitment to the composition polynomial parts. `None` exactly when
+    /// `composition_poly_merkle_tree` is `None`.
+    pub(crate) composition_poly_root: Option<Commitment>,
     /// Device-resident de-interleaved LDE handle from the R2 fused GPU path
     /// (`try_evaluate_parts_on_lde_gpu_keep`). When present, R4 DEEP skips
     /// the `num_parts * 3 * lde_size * 8` byte H2D and reads parts on
@@ -1356,6 +1361,16 @@ pub trait IsStarkProver<
     }
 
     /// Returns the result of the second round of the STARK Prove protocol.
+    /// `build_composition_tree`: the per-table Merkle tree over the composition
+    /// polynomial parts. The reference per-table path opens it directly, so it
+    /// passes `true`. The batched path opens every table's composition columns
+    /// from ONE shared composition MMCS instead and never touches the per-table
+    /// tree, so it passes `false` — skipping the tree build on the host commit
+    /// path and leaving `Round2::{composition_poly_merkle_tree, composition_poly_root}`
+    /// `None`. Mirrors the main-tree skip in `commit_main_trace`. (The cuda fused
+    /// pipeline always builds the tree on-device; the skip applies to the host
+    /// commit path.)
+    #[allow(clippy::too_many_arguments)]
     fn round_2_compute_composition_polynomial(
         air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
         pub_inputs: &PI,
@@ -1364,6 +1379,7 @@ pub trait IsStarkProver<
         round_1_result: &Round1<Field, FieldExtension>,
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
+        build_composition_tree: bool,
     ) -> Result<Round2<FieldExtension>, ProvingError>
     where
         FieldElement<Field>: AsBytes,
@@ -1464,6 +1480,11 @@ pub trait IsStarkProver<
         // GPU path keeps the composition tree resident on device (no whole tree
         // copy) and returns a root only host tree. The device tree is threaded
         // to R4 in `Round2.gpu_composition_tree`.
+        // The cuda fused pipeline always builds the composition tree on-device;
+        // `build_composition_tree` gates only the host CPU commit path below
+        // (mirrors `commit_main_trace`'s main-tree skip).
+        #[cfg(feature = "cuda")]
+        let _ = build_composition_tree;
         #[cfg(feature = "cuda")]
         let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
             match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
@@ -1473,7 +1494,7 @@ pub trait IsStarkProver<
             {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
-                    (host_tree, root, Some(dev_tree))
+                    (Some(host_tree), Some(root), Some(dev_tree))
                 }
                 None => {
                     let (tree, root) = crate::commitment::commit_bit_reversed(
@@ -1481,16 +1502,22 @@ pub trait IsStarkProver<
                         crate::commitment::ROWS_PER_LEAF,
                     )
                     .ok_or(ProvingError::EmptyCommitment)?;
-                    (tree, root, None)
+                    (Some(tree), Some(root), None)
                 }
             };
         #[cfg(not(feature = "cuda"))]
-        let (composition_poly_merkle_tree, composition_poly_root) =
-            crate::commitment::commit_bit_reversed(
+        let (composition_poly_merkle_tree, composition_poly_root) = if build_composition_tree {
+            let (tree, root) = crate::commitment::commit_bit_reversed(
                 &lde_composition_poly_parts_evaluations,
                 crate::commitment::ROWS_PER_LEAF,
             )
             .ok_or(ProvingError::EmptyCommitment)?;
+            (Some(tree), Some(root))
+        } else {
+            // Batched path: the composition columns are opened from the shared
+            // composition MMCS, so skip the dead per-table composition tree.
+            (None, None)
+        };
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
 
@@ -2371,6 +2398,14 @@ pub trait IsStarkProver<
             });
 
             let composition_openings = {
+                // The reference per-table path always builds the composition tree
+                // (batched opens the shared composition MMCS instead and never
+                // reaches this code).
+                #[cfg_attr(feature = "cuda", allow(unused_variables))]
+                let composition_tree = round_2_result
+                    .composition_poly_merkle_tree
+                    .as_ref()
+                    .expect("per-table path builds the composition tree");
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &comp_dev_proofs {
@@ -2381,7 +2416,7 @@ pub trait IsStarkProver<
                         )
                     } else {
                         Self::open_composition_poly(
-                            &round_2_result.composition_poly_merkle_tree,
+                            composition_tree,
                             &round_2_result.lde_composition_poly_evaluations,
                             *index,
                         )
@@ -2390,7 +2425,7 @@ pub trait IsStarkProver<
                 #[cfg(not(feature = "cuda"))]
                 {
                     Self::open_composition_poly(
-                        &round_2_result.composition_poly_merkle_tree,
+                        composition_tree,
                         &round_2_result.lde_composition_poly_evaluations,
                         *index,
                     )
@@ -3078,6 +3113,9 @@ pub trait IsStarkProver<
                     &round_1_result,
                     &transition_coefficients,
                     &boundary_coefficients,
+                    // Batched path: composition columns are opened from the shared
+                    // composition MMCS, so skip the dead per-table composition tree.
+                    false,
                 )?;
                 Ok((round_1_result, round_2_result))
             })
@@ -3995,10 +4033,18 @@ pub trait IsStarkProver<
             round_1_result,
             &transition_coefficients,
             &boundary_coefficients,
+            // Reference per-table path: the composition tree is opened directly.
+            true,
         )?;
 
-        // >>>> Send commitments: [H₁], [H₂]
-        transcript.append_bytes(&round_2_result.composition_poly_root);
+        // >>>> Send commitments: [H₁], [H₂]. The per-table path always builds the
+        // composition tree, so its root is present (the batched path skips it and
+        // absorbs the shared composition MMCS root instead).
+        transcript.append_bytes(
+            &round_2_result
+                .composition_poly_root
+                .expect("per-table path builds the composition tree"),
+        );
 
         // ===================================
         // ==========|   Round 3   |==========
@@ -4093,7 +4139,9 @@ pub trait IsStarkProver<
             trace_ood_evaluations: ood_block0,
             trace_ood_next_evaluations: ood_block1,
             // [H₁] and [H₂]
-            composition_poly_root: round_2_result.composition_poly_root,
+            composition_poly_root: round_2_result
+                .composition_poly_root
+                .expect("per-table path builds the composition tree"),
             // Hᵢ(z^N)
             composition_poly_parts_ood_evaluation: round_3_result
                 .composition_poly_parts_ood_evaluation,
