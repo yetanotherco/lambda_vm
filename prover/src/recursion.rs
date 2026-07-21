@@ -220,6 +220,47 @@ pub fn encode_continuation_guest_input(
     Ok(blob)
 }
 
+/// The GKR continuation guest's private-input layout (the `gkr` +
+/// `continuation` guest features): [`ContinuationGuestInput`] with the bundle
+/// replaced by its [`crate::continuation::GkrContinuationProof`] counterpart.
+/// Same magic-prefixed wire format; a blob of another layout fails the
+/// bytecheck validation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrContinuationGuestInput {
+    pub bundle: crate::continuation::GkrContinuationProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+/// Build the GKR continuation guest's private-input blob for `bundle` of
+/// `inner_elf` — [`encode_continuation_guest_input`] for a
+/// [`crate::continuation::GkrContinuationProof`]. Roots are precomputed over
+/// the bundle's standard `base` (the touched-page set is mode-independent).
+pub fn encode_gkr_continuation_guest_input(
+    bundle: crate::continuation::GkrContinuationProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) =
+        crate::continuation::continuation_precomputed_commitments(inner_elf, bundle.base(), opts)?;
+    let input = GkrContinuationGuestInput {
+        bundle,
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
 /// Domain tag for [`program_id`].
 const PROGRAM_ID_TAG: &[u8] = b"LAMBDAVM_PROGRAM_ID_V1";
 
@@ -401,6 +442,60 @@ pub fn verify_continuation_and_attest(
     };
 
     // Avoids a second `Elf::load` (already done by `verify_continuation_archived`).
+    let digest = elf_digest(inner_elf);
+    let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(&public_output);
+    Ok(Some(attestation))
+}
+
+/// [`verify_continuation_and_attest`] for a GKR continuation bundle
+/// ([`encode_gkr_continuation_guest_input`]): epochs + global proof verified
+/// with the batch-GKR replay, per-table proofs read in place from the archive
+/// (only the KB-scale GKR artifacts are deserialized), then the SAME
+/// `program_id(elf, roots) || public_output` attestation as the standard
+/// continuation path.
+pub fn verify_gkr_continuation_and_attest(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let archive_bytes = crate::recursion_archive_bytes(blob).ok_or_else(|| {
+        Error::Execution(String::from(
+            "GKR continuation recursion blob: bad magic or version",
+        ))
+    })?;
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(crate::RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            &aligned_fallback
+        };
+    let archived = rkyv::access::<ArchivedGkrContinuationGuestInput, RkyvError>(archive)
+        .map_err(|e| Error::Execution(format!("GKR continuation blob validation failed: {e}")))?;
+
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let decode_commitment: Commitment = archived.decode_commitment;
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+
+    let Some((public_output, entry_point)) = crate::continuation::verify_gkr_continuation_archived(
+        &archived.bundle,
+        inner_elf,
+        proof_options,
+        decode_commitment,
+        &page_commitments,
+    )?
+    else {
+        return Ok(None);
+    };
+
     let digest = elf_digest(inner_elf);
     let id = program_id_from_digest(&digest, entry_point, &decode_commitment, &page_commitments);
     let mut attestation = id.to_vec();

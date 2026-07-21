@@ -70,12 +70,14 @@ RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
 # `continuation` feature: verify a multi-epoch ContinuationProof bundle instead
 # of a monolithic VmProof. Only the presets the benchmarks actually measure.
 RECURSION_CONT_PRESETS := min blowup2 blowup4
-# `gkr` feature: verify a LogUpMode::Gkr inner proof (GkrGuestInput blob).
-# Experimental — only the presets the GKR guest-cycle measurements use.
+# `gkr` feature: verify a LogUpMode::Gkr inner proof (GkrGuestInput blob;
+# with `continuation`, a GkrContinuationProof bundle). Experimental — only the
+# presets the GKR guest-cycle measurements use.
 RECURSION_GKR_PRESETS := min blowup2
 RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS))) \
 	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS))) \
-	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-gkr-, $(addsuffix .elf, $(RECURSION_GKR_PRESETS)))
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-gkr-, $(addsuffix .elf, $(RECURSION_GKR_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-gkr-cont-, $(addsuffix .elf, $(RECURSION_GKR_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -256,6 +258,14 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-gkr-$(1).elf: FORCE | prepare-sysroot $(REC
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-gkr-$(1)-bench,--features "gkr $(1)")
 endef
 $(foreach preset,$(RECURSION_GKR_PRESETS),$(eval $(call recursion_gkr_verifier_rule,$(preset))))
+
+# GKR continuation variants: `gkr` + `continuation` on top of the preset ->
+# recursion-gkr-cont-<preset>-bench -> recursion-gkr-cont-<preset>.elf.
+define recursion_gkr_cont_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-gkr-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-gkr-cont-$(1)-bench,--features "gkr continuation $(1)")
+endef
+$(foreach preset,$(RECURSION_GKR_PRESETS),$(eval $(call recursion_gkr_cont_verifier_rule,$(preset))))
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

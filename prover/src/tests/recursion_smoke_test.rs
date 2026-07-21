@@ -594,6 +594,75 @@ fn run_recursion_pipeline(
     );
 }
 
+/// The GKR continuation analogue of the host roundtrip tests: prove a small
+/// continuation in `LogUpMode::Gkr` (multiple epochs), verify the bundle on
+/// the host (owned path), then mirror the `gkr`+`continuation` guest exactly —
+/// encode the `GkrContinuationGuestInput` blob, verify+attest over the
+/// archive, and run the consumer check.
+#[test]
+fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
+    let root = workspace_root();
+    let empty_elf_bytes = read_guest_elf(&root, "empty");
+
+    // Epoch 2^6 = 64 cycles: small enough that `empty` splits into several
+    // epochs, exercising the cross-epoch GKR batches.
+    let bundle =
+        crate::continuation::prove_continuation_gkr(&empty_elf_bytes, &[], 6, &MIN_PROOF_OPTIONS)
+            .expect("GKR continuation prove should succeed");
+    assert!(
+        bundle.num_epochs() > 1,
+        "fixture must split into multiple epochs to exercise the cross-epoch path \
+         (got {})",
+        bundle.num_epochs()
+    );
+
+    // Host verify (owned path, full ELF-root recompute).
+    let expected_output =
+        crate::continuation::verify_continuation_gkr(&empty_elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
+            .expect("verify_continuation_gkr errored")
+            .expect("GKR continuation bundle must verify");
+
+    // Guest path: blob → archived verify+attest → consumer check.
+    let blob = recursion::encode_gkr_continuation_guest_input(
+        bundle,
+        &empty_elf_bytes,
+        &MIN_PROOF_OPTIONS,
+    )
+    .expect("encode_gkr_continuation_guest_input failed");
+    assert!(
+        blob.len() <= executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
+        "GKR continuation input exceeds MAX_PRIVATE_INPUT_SIZE"
+    );
+    let attestation = recursion::verify_gkr_continuation_and_attest(&blob, &MIN_PROOF_OPTIONS)
+        .expect("verify_gkr_continuation_and_attest errored")
+        .expect("GKR continuation proof did not survive the rkyv round-trip");
+
+    let (id, output) = recursion::split_attestation(&attestation).expect("attestation too short");
+    assert_eq!(output, expected_output, "attested output mismatch");
+    // The continuation program_id folds the bundle-dependent touched-page
+    // genesis roots, so recompute over the bundle the consumer holds (the
+    // standard consumer flow for continuations).
+    let archive_bytes = crate::recursion_archive_bytes(&blob).expect("wire prefix");
+    let mut aligned = rkyv::util::AlignedVec::<{ crate::RECURSION_INPUT_ALIGN }>::new();
+    aligned.extend_from_slice(archive_bytes);
+    let archived =
+        rkyv::access::<recursion::ArchivedGkrContinuationGuestInput, rkyv::rancor::Error>(&aligned)
+            .expect("blob validates");
+    let owned_bundle: crate::continuation::GkrContinuationProof =
+        rkyv::deserialize::<_, rkyv::rancor::Error>(&archived.bundle).expect("bundle deserializes");
+    let (expected_decode, expected_pages) =
+        crate::continuation::continuation_precomputed_commitments(
+            &empty_elf_bytes,
+            owned_bundle.base(),
+            &MIN_PROOF_OPTIONS,
+        )
+        .expect("continuation_precomputed_commitments errored");
+    let expected_id =
+        recursion::program_id_from_elf(&empty_elf_bytes, &expected_decode, &expected_pages)
+            .expect("program_id_from_elf errored");
+    assert_eq!(id, expected_id, "attested program_id mismatch");
+}
+
 /// The GKR analogue of `test_recursion_blob_decodes_and_verifies_on_host`:
 /// prove the inner in `LogUpMode::Gkr`, encode a `GkrGuestInput` blob, mirror
 /// the `gkr` guest's verify+attest on the host (per-table proofs read in
@@ -943,9 +1012,10 @@ fn test_recursion_prove_1query() {
 ///   continuations with `2^n`-cycle epochs and encode a
 ///   [`recursion::ContinuationGuestInput`] blob for `recursion-cont-<preset>.elf`.
 /// * `RECURSION_DUMP_GKR=1` (default unset) — prove the inner in
-///   `LogUpMode::Gkr` and encode a [`crate::GkrGuestInput`] blob for
-///   `recursion-gkr-<preset>.elf`. Mutually exclusive with
-///   `RECURSION_DUMP_EPOCH_LOG2`.
+///   `LogUpMode::Gkr`: a [`crate::GkrGuestInput`] blob for
+///   `recursion-gkr-<preset>.elf`, or (with `RECURSION_DUMP_EPOCH_LOG2`) a
+///   [`recursion::GkrContinuationGuestInput`] blob for
+///   `recursion-gkr-cont-<preset>.elf`.
 #[test]
 #[ignore = "diagnostic: writes recursion private input to /tmp/recursion_input.bin"]
 fn test_dump_recursion_input() {
@@ -993,37 +1063,76 @@ fn test_dump_recursion_input() {
                 .parse()
                 .unwrap_or_else(|e| panic!("bad RECURSION_DUMP_EPOCH_LOG2 '{s}': {e}"));
             let opts = preset.options();
+            let gkr = std::env::var("RECURSION_DUMP_GKR").is_ok_and(|v| v == "1");
             eprintln!(
-                "[dump-input] proving inner continuation (blowup={}, fri_queries={}, epoch=2^{epoch_log2}) ...",
+                "[dump-input] proving inner continuation (blowup={}, fri_queries={}, epoch=2^{epoch_log2}, gkr={gkr}) ...",
                 opts.blowup_factor, opts.fri_number_of_queries
             );
-            let bundle = crate::continuation::prove_continuation(
-                &inner_elf_bytes,
-                &inner_input,
-                epoch_log2,
-                &opts,
-            )
-            .expect("inner continuation prove should succeed");
-            eprintln!("[dump-input] continuation epochs: {}", bundle.num_epochs());
-
-            let expected_output =
-                crate::continuation::verify_continuation(&inner_elf_bytes, &bundle, &opts)
-                    .expect("verify_continuation errored")
-                    .expect("continuation bundle must verify on host before dumping");
-            let (expected_decode, expected_pages) =
-                crate::continuation::continuation_precomputed_commitments(
+            if gkr {
+                let bundle = crate::continuation::prove_continuation_gkr(
                     &inner_elf_bytes,
-                    &bundle,
+                    &inner_input,
+                    epoch_log2,
                     &opts,
                 )
-                .expect("continuation_precomputed_commitments errored");
-            let expected_id =
-                recursion::program_id_from_elf(&inner_elf_bytes, &expected_decode, &expected_pages)
-                    .expect("program_id_from_elf errored");
+                .expect("inner GKR continuation prove should succeed");
+                eprintln!("[dump-input] continuation epochs: {}", bundle.num_epochs());
 
-            let blob = recursion::encode_continuation_guest_input(bundle, &inner_elf_bytes, &opts)
-                .expect("recursion::encode_continuation_guest_input failed");
-            (blob, Some((expected_id, expected_output)))
+                let expected_output =
+                    crate::continuation::verify_continuation_gkr(&inner_elf_bytes, &bundle, &opts)
+                        .expect("verify_continuation_gkr errored")
+                        .expect("GKR continuation bundle must verify on host before dumping");
+                let (expected_decode, expected_pages) =
+                    crate::continuation::continuation_precomputed_commitments(
+                        &inner_elf_bytes,
+                        bundle.base(),
+                        &opts,
+                    )
+                    .expect("continuation_precomputed_commitments errored");
+                let expected_id = recursion::program_id_from_elf(
+                    &inner_elf_bytes,
+                    &expected_decode,
+                    &expected_pages,
+                )
+                .expect("program_id_from_elf errored");
+
+                let blob =
+                    recursion::encode_gkr_continuation_guest_input(bundle, &inner_elf_bytes, &opts)
+                        .expect("recursion::encode_gkr_continuation_guest_input failed");
+                (blob, Some((expected_id, expected_output)))
+            } else {
+                let bundle = crate::continuation::prove_continuation(
+                    &inner_elf_bytes,
+                    &inner_input,
+                    epoch_log2,
+                    &opts,
+                )
+                .expect("inner continuation prove should succeed");
+                eprintln!("[dump-input] continuation epochs: {}", bundle.num_epochs());
+
+                let expected_output =
+                    crate::continuation::verify_continuation(&inner_elf_bytes, &bundle, &opts)
+                        .expect("verify_continuation errored")
+                        .expect("continuation bundle must verify on host before dumping");
+                let (expected_decode, expected_pages) =
+                    crate::continuation::continuation_precomputed_commitments(
+                        &inner_elf_bytes,
+                        &bundle,
+                        &opts,
+                    )
+                    .expect("continuation_precomputed_commitments errored");
+                let expected_id = recursion::program_id_from_elf(
+                    &inner_elf_bytes,
+                    &expected_decode,
+                    &expected_pages,
+                )
+                .expect("program_id_from_elf errored");
+
+                let blob =
+                    recursion::encode_continuation_guest_input(bundle, &inner_elf_bytes, &opts)
+                        .expect("recursion::encode_continuation_guest_input failed");
+                (blob, Some((expected_id, expected_output)))
+            }
         }
         Err(_) if std::env::var("RECURSION_DUMP_GKR").is_ok_and(|v| v == "1") => {
             let opts = preset.options();

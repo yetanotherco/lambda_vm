@@ -55,9 +55,12 @@ use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
 use stark::config::Commitment;
 use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
-use stark::lookup::{AirWithBuses, AuxiliaryTraceBuildData, NullBoundaryConstraintBuilder};
+use stark::gkr::BatchGkrProof;
+use stark::lookup::{
+    AirWithBuses, AuxiliaryTraceBuildData, LogUpMode, NullBoundaryConstraintBuilder,
+};
 use stark::proof::options::ProofOptions;
-use stark::proof::stark::MultiProof;
+use stark::proof::stark::{GkrColumnClaims, MultiProof};
 use stark::proof::view::MultiProofView;
 use stark::prover::{IsStarkProver, Prover};
 use stark::trace::TraceTable;
@@ -79,6 +82,9 @@ use crate::{
 type F = GoldilocksField;
 type E = GoldilocksExtension;
 type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
+/// [`prove_global`]'s result: the proof plus its GKR artifacts (Some exactly
+/// under [`LogUpMode::Gkr`]).
+type GlobalProveResult = Result<(MultiProof<F, E, ()>, Option<GkrProofExtras>), Error>;
 
 /// Fresh transcript seeded with the epoch's statement (ELF, public output, table
 /// layout) and `epoch_label` (its position). The epoch's prove, verify, and
@@ -162,6 +168,7 @@ impl ConstraintSet<F, E> for L2gMemoryConstraints {
 fn l2g_global_air(
     opts: &ProofOptions,
     epoch_label: u64,
+    mode: LogUpMode,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     AirWithBuses::new(
         local_to_global::cols::NUM_COLUMNS,
@@ -172,6 +179,7 @@ fn l2g_global_air(
         1,
         EmptyConstraints,
     )
+    .with_logup_mode(mode)
 }
 
 /// Local-to-global AIR on the epoch-local Memory bus (used inside an epoch proof).
@@ -183,6 +191,7 @@ fn l2g_global_air(
 fn l2g_memory_air(
     opts: &ProofOptions,
     epoch_label: u64,
+    mode: LogUpMode,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), L2gMemoryConstraints> {
     let interactions = [
         local_to_global::memory_bus_interactions(),
@@ -196,6 +205,7 @@ fn l2g_memory_air(
         1,
         L2gMemoryConstraints,
     )
+    .with_logup_mode(mode)
 }
 
 /// GLOBAL_MEMORY AIR for one touched page (the cross-epoch analog of PAGE).
@@ -221,6 +231,7 @@ fn global_memory_air(
     opts: &ProofOptions,
     config: &PageConfig,
     preprocessed: Option<Commitment>,
+    mode: LogUpMode,
 ) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let air = AirWithBuses::new(
         global_memory::cols::NUM_COLUMNS,
@@ -230,7 +241,8 @@ fn global_memory_air(
         opts,
         1,
         EmptyConstraints,
-    );
+    )
+    .with_logup_mode(mode);
     if config.is_private_input {
         return air;
     }
@@ -447,6 +459,46 @@ impl ContinuationProof {
     }
 }
 
+/// The GKR artifacts of one multi-table proof under
+/// [`LogUpMode::Gkr`]: the batch GKR proof plus the per-table column claims —
+/// the two fields a [`stark::proof::stark::GkrMultiProof`] carries beyond its
+/// inner [`MultiProof`]. KB-scale, so the archived verify path deserializes
+/// these while the per-table proofs stay zero-copy.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrProofExtras {
+    pub batch_gkr_proof: BatchGkrProof<E>,
+    pub column_claims_by_table: Vec<Option<GkrColumnClaims<E>>>,
+}
+
+/// A continuation proof under [`LogUpMode::Gkr`]: the standard
+/// [`ContinuationProof`] layout (per-epoch proofs are plain [`MultiProof`]s
+/// with no bus public inputs) plus each proof's GKR artifacts. Containing the
+/// standard bundle as `base` keeps every view, binding check, and root
+/// precompute working unchanged; the standard bundle's wire format is
+/// untouched (this is a separate top-level type, like
+/// [`stark::proof::stark::GkrMultiProof`] vs [`MultiProof`]).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrContinuationProof {
+    base: ContinuationProof,
+    /// Per-epoch GKR artifacts, aligned with `base.epochs`.
+    epoch_gkr: Vec<GkrProofExtras>,
+    /// The global-memory proof's GKR artifacts.
+    global_gkr: GkrProofExtras,
+}
+
+impl GkrContinuationProof {
+    /// Number of epochs the execution was split into.
+    pub fn num_epochs(&self) -> usize {
+        self.base.num_epochs()
+    }
+
+    /// The standard-layout bundle inside (per-epoch + global proofs and the
+    /// public statement fields) — what root precomputes and consumers read.
+    pub fn base(&self) -> &ContinuationProof {
+        &self.base
+    }
+}
+
 /// Borrowed view over an [`EpochProof`] (owned or archived-in-place). Lets
 /// `verify_epoch` take a single argument again instead of the field-by-field
 /// parameter list the owned/archived split used to force on every caller:
@@ -599,6 +651,7 @@ fn build_epoch_airs(
     reg_fini: &[u32],
     is_final: bool,
     decode_commitment: Option<Commitment>,
+    mode: LogUpMode,
 ) -> VmAirs {
     // Continuation epochs preprocess FINI = R_{i+1} too (not just INIT = R_i), so the
     // final register file is a verifier-known public value bound by the REG-C2
@@ -608,7 +661,7 @@ fn build_epoch_airs(
         register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     ));
-    VmAirs::new(
+    VmAirs::new_with_logup_mode(
         elf,
         opts,
         false,
@@ -619,6 +672,7 @@ fn build_epoch_airs(
         None,
         None,
         register_preprocessed,
+        mode,
     )
 }
 
@@ -635,7 +689,8 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
-) -> Result<EpochProof, Error> {
+    mode: LogUpMode,
+) -> Result<(EpochProof, Option<GkrProofExtras>), Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
     crate::tables::bitwise::update_multiplicities(
@@ -668,6 +723,7 @@ fn prove_epoch(
         &reg_fini,
         is_final,
         None,
+        mode,
     );
 
     let label = start.label;
@@ -682,7 +738,7 @@ fn prove_epoch(
         )
     };
 
-    let l2g_air = l2g_memory_air(opts, label);
+    let l2g_air = l2g_memory_air(opts, label, mode);
     // Build this epoch's L2G table from the cross-epoch boundary so it is identical
     // to the one the global proof commits (the commitment binding compares their
     // roots). It is appended to the proof below, not through `air_trace_pairs`.
@@ -690,13 +746,34 @@ fn prove_epoch(
 
     let mut pairs = airs.air_trace_pairs(&mut traces);
     pairs.push((&l2g_air, &mut l2g_trace, &()));
-    let proof = Prover::multi_prove(
-        pairs,
-        &mut seed(),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    let (proof, gkr_extras) = match mode {
+        LogUpMode::Standard => (
+            Prover::multi_prove(
+                pairs,
+                &mut seed(),
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?,
+            None,
+        ),
+        LogUpMode::Gkr => {
+            let gkr = Prover::multi_prove_gkr(
+                pairs,
+                &mut seed(),
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+            (
+                gkr.multi,
+                Some(GkrProofExtras {
+                    batch_gkr_proof: gkr.batch_gkr_proof,
+                    column_claims_by_table: gkr.column_claims_by_table,
+                }),
+            )
+        }
+    };
 
     let l2g_root = proof
         .proofs
@@ -706,14 +783,17 @@ fn prove_epoch(
         })?
         .lde_trace_main_merkle_root;
 
-    Ok(EpochProof {
-        proof,
-        public_output,
-        table_counts,
-        runtime_page_ranges,
-        reg_fini,
-        l2g_root,
-    })
+    Ok((
+        EpochProof {
+            proof,
+            public_output,
+            table_counts,
+            runtime_page_ranges,
+            reg_fini,
+            l2g_root,
+        },
+        gkr_extras,
+    ))
 }
 
 /// Verify one epoch using ONLY the epoch's public statement fields (via
@@ -738,6 +818,7 @@ fn verify_epoch(
     label: u64,
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
+    gkr: Option<&GkrProofExtras>,
 ) -> Result<bool, Error> {
     let table_counts = epoch.table_counts()?;
     // Reject degenerate table counts (mirrors the monolithic verifier).
@@ -763,6 +844,11 @@ fn verify_epoch(
     let runtime_page_ranges = epoch.runtime_page_ranges()?;
     let public_output = epoch.public_output();
 
+    let mode = if gkr.is_some() {
+        LogUpMode::Gkr
+    } else {
+        LogUpMode::Standard
+    };
     let airs = build_epoch_airs(
         elf,
         opts,
@@ -772,8 +858,9 @@ fn verify_epoch(
         &reg_fini,
         is_final,
         decode_commitment,
+        mode,
     );
-    let l2g_air = l2g_memory_air(opts, label);
+    let l2g_air = l2g_memory_air(opts, label, mode);
     let mut refs = airs.air_refs();
     refs.push(&l2g_air);
 
@@ -806,7 +893,18 @@ fn verify_epoch(
         None => return Ok(false),
     };
 
-    if !Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected) {
+    let verified = match gkr {
+        None => Verifier::multi_verify_views(&refs, proof, &mut seed(), &expected),
+        Some(extras) => Verifier::multi_verify_gkr_views(
+            &refs,
+            proof,
+            &extras.batch_gkr_proof,
+            &extras.column_claims_by_table,
+            &mut seed(),
+            &expected,
+        ),
+    };
+    if !verified {
         return Ok(false);
     }
 
@@ -829,7 +927,8 @@ fn prove_global(
     page_bases: &[u64],
     num_private_input_pages: usize,
     opts: &ProofOptions,
-) -> Result<MultiProof<F, E, ()>, Error> {
+    mode: LogUpMode,
+) -> GlobalProveResult {
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
     let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
@@ -862,11 +961,11 @@ fn prove_global(
 
     // One L2G air per epoch, each carrying its own 1-based `fini_epoch` constant.
     let l2g_airs: Vec<_> = (0..boundaries.len())
-        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64), mode))
         .collect();
     let gm_airs: Vec<_> = gm_configs
         .iter()
-        .map(|config| global_memory_air(opts, config, None))
+        .map(|config| global_memory_air(opts, config, None, mode))
         .collect();
 
     let mut pairs: Vec<(AirRef, &mut TraceTable<F, E>, &())> = l2g_airs
@@ -878,19 +977,41 @@ fn prove_global(
         pairs.push((air as AirRef, trace, &()));
     }
 
-    Prover::multi_prove(
-        pairs,
-        &mut global_transcript(
-            elf_bytes,
-            boundaries.len(),
-            num_private_input_pages,
-            opts.fri_final_poly_log_degree,
-            page_bases,
-        ),
-        #[cfg(feature = "disk-spill")]
-        stark::storage_mode::StorageMode::Ram,
-    )
-    .map_err(|e| Error::Prover(format!("{e:?}")))
+    let mut transcript = global_transcript(
+        elf_bytes,
+        boundaries.len(),
+        num_private_input_pages,
+        opts.fri_final_poly_log_degree,
+        page_bases,
+    );
+    match mode {
+        LogUpMode::Standard => Ok((
+            Prover::multi_prove(
+                pairs,
+                &mut transcript,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?,
+            None,
+        )),
+        LogUpMode::Gkr => {
+            let gkr = Prover::multi_prove_gkr(
+                pairs,
+                &mut transcript,
+                #[cfg(feature = "disk-spill")]
+                stark::storage_mode::StorageMode::Ram,
+            )
+            .map_err(|e| Error::Prover(format!("{e:?}")))?;
+            Ok((
+                gkr.multi,
+                Some(GkrProofExtras {
+                    batch_gkr_proof: gkr.batch_gkr_proof,
+                    column_claims_by_table: gkr.column_claims_by_table,
+                }),
+            ))
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -903,11 +1024,17 @@ fn verify_global(
     num_private_input_pages: usize,
     opts: &ProofOptions,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
+    gkr: Option<&GkrProofExtras>,
 ) -> bool {
+    let mode = if gkr.is_some() {
+        LogUpMode::Gkr
+    } else {
+        LogUpMode::Standard
+    };
     // One L2G air per epoch, each with its own 1-based `fini_epoch` constant —
     // must match the order/labels the global proof committed in `prove_global`.
     let l2g_airs: Vec<_> = (0..num_epochs)
-        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
+        .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64), mode))
         .collect();
     // Rebuild the genesis configs FROM THE ELF (no private bytes) and recompute their
     // commitments: this is the binding for ELF/runtime pages — a prover that claimed
@@ -956,7 +1083,7 @@ fn verify_global(
             } else {
                 Some(zero_init_root)
             };
-            global_memory_air(opts, config, preprocessed)
+            global_memory_air(opts, config, preprocessed, mode)
         })
         .collect();
 
@@ -965,18 +1092,24 @@ fn verify_global(
         refs.push(air as AirRef);
     }
 
-    Verifier::multi_verify_views(
-        &refs,
-        proof,
-        &mut global_transcript(
-            elf_bytes,
-            num_epochs,
-            num_private_input_pages,
-            opts.fri_final_poly_log_degree,
-            page_bases,
+    let mut transcript = global_transcript(
+        elf_bytes,
+        num_epochs,
+        num_private_input_pages,
+        opts.fri_final_poly_log_degree,
+        page_bases,
+    );
+    match gkr {
+        None => Verifier::multi_verify_views(&refs, proof, &mut transcript, &FieldElement::zero()),
+        Some(extras) => Verifier::multi_verify_gkr_views(
+            &refs,
+            proof,
+            &extras.batch_gkr_proof,
+            &extras.column_claims_by_table,
+            &mut transcript,
+            &FieldElement::zero(),
         ),
-        &FieldElement::zero(),
-    )
+    }
 }
 
 /// Prove a full continuation and return a self-contained [`ContinuationProof`]
@@ -998,6 +1131,58 @@ pub fn prove_continuation(
     epoch_size_log2: u32,
     opts: &ProofOptions,
 ) -> Result<ContinuationProof, Error> {
+    let (bundle, _extras) = prove_continuation_impl(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        LogUpMode::Standard,
+    )?;
+    Ok(bundle)
+}
+
+/// [`prove_continuation`] under [`LogUpMode::Gkr`]: every epoch and the
+/// global-memory proof prove their LogUp sums with the batch GKR; the bundle
+/// carries each proof's GKR artifacts alongside the standard layout.
+pub fn prove_continuation_gkr(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+) -> Result<GkrContinuationProof, Error> {
+    let (base, extras) = prove_continuation_impl(
+        elf_bytes,
+        private_inputs,
+        epoch_size_log2,
+        opts,
+        LogUpMode::Gkr,
+    )?;
+    let (epoch_gkr, global_gkr) = extras.ok_or_else(|| {
+        Error::ContinuationInvariant("GKR prove returned no GKR artifacts".to_string())
+    })?;
+    Ok(GkrContinuationProof {
+        base,
+        epoch_gkr,
+        global_gkr,
+    })
+}
+
+/// Shared driver behind [`prove_continuation`] / [`prove_continuation_gkr`];
+/// the extras component is `Some` exactly under [`LogUpMode::Gkr`].
+#[allow(clippy::type_complexity)]
+fn prove_continuation_impl(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    epoch_size_log2: u32,
+    opts: &ProofOptions,
+    mode: LogUpMode,
+) -> Result<
+    (
+        ContinuationProof,
+        Option<(Vec<GkrProofExtras>, GkrProofExtras)>,
+    ),
+    Error,
+> {
     if epoch_size_log2 < 2 {
         return Err(Error::InvalidContinuationEpochSize(
             "epoch_size_log2 must be at least 2 (4 cycles)".to_string(),
@@ -1021,6 +1206,7 @@ pub fn prove_continuation(
         local_to_global::genesis_provenance(image.iter().map(|(a, v)| (a, v as u64)));
 
     let mut epochs: Vec<EpochProof> = Vec::new();
+    let mut epoch_extras: Vec<GkrProofExtras> = Vec::new();
     // Full per-epoch boundaries, kept prover-local for `prove_global` (L2G traces +
     // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
     // holds cell values (private-input bytes for private reads); only the value-free
@@ -1098,7 +1284,12 @@ pub fn prove_continuation(
             register_init: &register_init,
             label,
         };
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        let (epoch, extras) = prove_epoch(
+            &elf, elf_bytes, &start, traces, is_final, &boundary, opts, mode,
+        )?;
+        if let Some(extras) = extras {
+            epoch_extras.push(extras);
+        }
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -1120,21 +1311,36 @@ pub fn prove_continuation(
     // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
     // tables and is shipped in the bundle, so the two can never diverge in set or order.
     let touched_page_bases = touched_page_bases(&all_boundaries);
-    let global = prove_global(
+    let (global, global_extras) = prove_global(
         &all_boundaries,
         elf_bytes,
         &init_page_data,
         &touched_page_bases,
         num_private_input_pages,
         opts,
+        mode,
     )?;
 
-    Ok(ContinuationProof {
-        epochs,
-        global,
-        num_private_input_pages,
-        touched_page_bases,
-    })
+    let extras = match mode {
+        LogUpMode::Standard => None,
+        LogUpMode::Gkr => Some((
+            epoch_extras,
+            global_extras.ok_or_else(|| {
+                Error::ContinuationInvariant(
+                    "GKR global prove returned no GKR artifacts".to_string(),
+                )
+            })?,
+        )),
+    };
+    Ok((
+        ContinuationProof {
+            epochs,
+            global,
+            num_private_input_pages,
+            touched_page_bases,
+        },
+        extras,
+    ))
 }
 
 /// Verify a [`ContinuationProof`] using ONLY the bundle and the ELF — nothing from
@@ -1185,6 +1391,7 @@ pub fn verify_continuation_with_roots(
         opts,
         decode_commitment,
         page_genesis_commitments,
+        None,
     )?;
     Ok(result.map(|(public_output, _entry_point)| public_output))
 }
@@ -1210,6 +1417,64 @@ pub(crate) fn verify_continuation_archived(
         opts,
         Some(decode_commitment),
         Some(page_genesis_commitments),
+        None,
+    )
+}
+
+/// [`verify_continuation`] for a [`GkrContinuationProof`]: every epoch and the
+/// global proof verified with the batch-GKR replay (the GKR analogue, full
+/// ELF-root recompute — the trustless host path).
+pub fn verify_continuation_gkr(
+    elf_bytes: &[u8],
+    bundle: &GkrContinuationProof,
+    opts: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    let result = verify_continuation_view(
+        ContinuationProofView::Owned(&bundle.base),
+        elf_bytes,
+        opts,
+        None,
+        None,
+        Some((&bundle.epoch_gkr, &bundle.global_gkr)),
+    )?;
+    Ok(result.map(|(public_output, _entry_point)| public_output))
+}
+
+/// [`verify_continuation_archived`]'s GKR counterpart, for the recursion
+/// `gkr`+`continuation` guest: per-epoch/global proofs read in place via the
+/// archived `base` bundle; only the KB-scale per-proof GKR artifacts are
+/// deserialized.
+pub(crate) fn verify_gkr_continuation_archived(
+    archived: &ArchivedGkrContinuationProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    decode_commitment: Commitment,
+    page_genesis_commitments: &[(u64, Commitment)],
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let epoch_gkr: Vec<GkrProofExtras> = archived
+        .epoch_gkr
+        .as_slice()
+        .iter()
+        .map(|e| {
+            rkyv::deserialize::<GkrProofExtras, RkyvError>(e).map_err(|err| {
+                Error::Execution(format!("rkyv deserialize epoch GKR extras failed: {err}"))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let global_gkr: GkrProofExtras = rkyv::deserialize::<_, RkyvError>(&archived.global_gkr)
+        .map_err(|err| {
+            Error::Execution(format!("rkyv deserialize global GKR extras failed: {err}"))
+        })?;
+
+    verify_continuation_view(
+        ContinuationProofView::Archived(&archived.base),
+        elf_bytes,
+        opts,
+        Some(decode_commitment),
+        Some(page_genesis_commitments),
+        Some((&epoch_gkr, &global_gkr)),
     )
 }
 
@@ -1224,6 +1489,7 @@ fn verify_continuation_view(
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
+    gkr: Option<(&[GkrProofExtras], &GkrProofExtras)>,
 ) -> Result<Option<(Vec<u8>, u64)>, Error> {
     // Bound the claimed private-input page count before using it to size/allocate AIRs
     // (mirrors `verify_with_options`). The count is also bound into the global proof's
@@ -1243,6 +1509,18 @@ fn verify_continuation_view(
     let n = bundle.num_epochs();
     if n == 0 {
         return Ok(None);
+    }
+
+    // GKR bundles must carry exactly one extras entry per epoch (structural —
+    // a malformed bundle, not a failed proof).
+    if let Some((epoch_gkr, _)) = gkr
+        && epoch_gkr.len() != n
+    {
+        return Err(Error::MalformedContinuationBundle(format!(
+            "GKR bundle has {} epoch extras for {} epochs",
+            epoch_gkr.len(),
+            n,
+        )));
     }
 
     // Reject a malformed bundle up front. `reg_fini` is prover-supplied (deserialized,
@@ -1277,6 +1555,7 @@ fn verify_continuation_view(
             label,
             opts,
             decode_commitment,
+            gkr.map(|(epoch_gkr, _)| &epoch_gkr[index]),
         )? {
             return Ok(None);
         }
@@ -1338,6 +1617,7 @@ fn verify_continuation_view(
         num_private_input_pages,
         opts,
         page_genesis_commitments,
+        gkr.map(|(_, global_gkr)| global_gkr),
     ) {
         return Ok(None);
     }
