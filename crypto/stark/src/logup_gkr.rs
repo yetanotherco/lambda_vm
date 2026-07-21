@@ -1398,15 +1398,37 @@ mod tests {
 
         let table_a = mk_table(16, 7);
         let table_b = mk_table(8, 1_000);
+        // A wide instance (K = 20 → K̂ = 32) exercises the STREAMED deep
+        // rounds (slots 32 and 16 stream; slots ≤ 8 materialize).
+        let wide_interactions: Vec<BusInteraction> = (0..20)
+            .map(|k| {
+                if k % 2 == 0 {
+                    BusInteraction::sender(
+                        k as u64,
+                        Multiplicity::One,
+                        Packing::Direct.columns(&[k % 3]),
+                    )
+                } else {
+                    BusInteraction::receiver(
+                        k as u64,
+                        Multiplicity::Column(2),
+                        Packing::Direct.columns(&[(k + 1) % 3]),
+                    )
+                }
+            })
+            .collect();
+        let table_c = mk_table(16, 55);
 
         // Materialized extended trees (the Stage-1 shape).
         let mat_a = compute_logup_layers::<F, F>(&interactions, &table_a, 16, &challenges);
         let mat_b = compute_logup_layers::<F, F>(&interactions, &table_b, 8, &challenges);
+        let mat_c = compute_logup_layers::<F, F>(&wide_interactions, &table_c, 16, &challenges);
         let mut t1 = DefaultTranscript::<F>::new(&[42]);
         let (proof_m, point_m, claims_m) = gkr_prove_batch(
             vec![
                 GkrInstance::materialized(mat_a),
                 GkrInstance::materialized(mat_b),
+                GkrInstance::materialized(mat_c),
             ],
             &mut t1,
         );
@@ -1414,8 +1436,9 @@ mod tests {
         // Streamed instances (the Stage-2 shape).
         let inst_a = build_gkr_instance::<F, F>(&interactions, &table_a, 16, &challenges);
         let inst_b = build_gkr_instance::<F, F>(&interactions, &table_b, 8, &challenges);
+        let inst_c = build_gkr_instance::<F, F>(&wide_interactions, &table_c, 16, &challenges);
         let mut t2 = DefaultTranscript::<F>::new(&[42]);
-        let (proof_s, point_s, claims_s) = gkr_prove_batch(vec![inst_a, inst_b], &mut t2);
+        let (proof_s, point_s, claims_s) = gkr_prove_batch(vec![inst_a, inst_b, inst_c], &mut t2);
 
         assert_eq!(point_m, point_s, "shared random points diverge");
         assert_eq!(claims_m, claims_s, "instance claims diverge");

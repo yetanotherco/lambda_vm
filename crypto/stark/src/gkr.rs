@@ -1651,9 +1651,15 @@ pub fn gkr_prove_batch<E: IsField>(
                         my_parent_num_vars,
                         kp + oracle.num_rows().trailing_zeros() as usize,
                     );
-                    if kp == 0 {
-                        // No k-bit rounds: the split tables are already
-                        // N-sized — materialize now, ordinary path after.
+                    // Small deep layers (child ≤ 8·N) are materialized whole
+                    // and run the ordinary fold path — their tables are a
+                    // bounded transient (≤ 8N pairs, decaying per round) while
+                    // streaming them would rebuild a per-row sub-tree of
+                    // ~K̂ fraction-adds EVERY round (the dominant cost of the
+                    // all-streamed variant). The big layers (slots > 8) stream:
+                    // their per-row rebuild is shallow (≤ 2 fold levels) and
+                    // their tables are the ones that don't fit.
+                    if kp == 0 || slots <= 8 {
                         let (nl_table, nr_table, dl_table, dr_table) =
                             oracle.materialize_split(tree_layer_idx);
                         return build_tables_from_split(
