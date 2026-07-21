@@ -150,6 +150,33 @@ pub fn encode_guest_input(
     })
 }
 
+/// Build the GKR guest's private-input blob for `inner_proof` of `inner_elf`:
+/// precomputes the roots and rkyv-encodes a [`crate::GkrGuestInput`] behind
+/// the standard aligning prefix — [`encode_guest_input`] for a
+/// [`crate::GkrVmProof`] inner.
+pub fn encode_gkr_guest_input(
+    inner_proof: &crate::GkrVmProof,
+    inner_elf: &[u8],
+    opts: &ProofOptions,
+) -> Result<Vec<u8>, Error> {
+    let (decode_commitment, page_commitments) = precomputed_commitments(inner_elf, opts)?;
+    let input = crate::GkrGuestInput {
+        gkr_proof: inner_proof.clone(),
+        inner_elf: inner_elf.to_vec(),
+        decode_commitment,
+        page_commitments,
+    };
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(&input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(crate::RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&crate::RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&crate::RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), crate::RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
 /// The continuation guest's private-input layout (the `continuation` guest
 /// feature). Mirrors [`crate::GuestInput`] with the monolithic proof replaced
 /// by the bundle and the PAGE roots replaced by the global-memory genesis
@@ -275,6 +302,31 @@ pub fn verify_and_attest_blob(
     proof_options: &ProofOptions,
 ) -> Result<Option<Vec<u8>>, Error> {
     let verification = crate::verify_recursion_blob(blob, proof_options)?;
+    if !verification.ok {
+        return Ok(None);
+    }
+    let id = program_id_from_digest(
+        &verification.elf_digest,
+        verification.entry_point,
+        &verification.decode_commitment,
+        &verification.page_commitments,
+    );
+    let mut attestation = id.to_vec();
+    attestation.extend_from_slice(verification.public_output);
+    Ok(Some(attestation))
+}
+
+/// [`verify_and_attest_blob`] for a [`LogUpMode::Gkr`](stark::lookup::LogUpMode)
+/// inner proof: verifies a [`crate::GkrGuestInput`] blob
+/// ([`encode_gkr_guest_input`]) — per-table proofs in place from the archive,
+/// only the small GKR artifacts materialized — and attests the SAME
+/// `program_id(elf, roots) || inner_public_output` as the standard path (the
+/// LogUp mode changes how bus sums are proven, not the program identity).
+pub fn verify_and_attest_gkr_blob(
+    blob: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<Option<Vec<u8>>, Error> {
+    let verification = crate::verify_gkr_recursion_blob(blob, proof_options)?;
     if !verification.ok {
         return Ok(None);
     }

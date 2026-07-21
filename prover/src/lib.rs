@@ -213,6 +213,18 @@ pub struct GuestInput {
     pub page_commitments: Vec<(u64, Commitment)>,
 }
 
+/// [`GuestInput`] for a [`LogUpMode::Gkr`] inner proof: the monolithic
+/// [`VmProof`] replaced by the [`GkrVmProof`] bundle. Same wire format
+/// (magic-prefixed rkyv archive); the guest is feature-pinned to one layout
+/// and a blob of the other kind fails the bytecheck validation.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrGuestInput {
+    pub gkr_proof: GkrVmProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
 // ============================================================================
 // Recursion-input wire format: aligning magic prefix + rkyv archive
 // ============================================================================
@@ -1435,46 +1447,81 @@ pub fn verify_gkr_with_options(
 ) -> Result<bool, Error> {
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let elf_digest = statement::elf_digest(elf_bytes);
+    verify_gkr_proof_parts(
+        MultiProofView::Owned(&gkr_proof.proof.multi),
+        &gkr_proof.proof.batch_gkr_proof,
+        &gkr_proof.proof.column_claims_by_table,
+        &gkr_proof.table_counts,
+        &gkr_proof.runtime_page_ranges,
+        gkr_proof.num_private_input_pages,
+        &gkr_proof.public_output,
+        &program,
+        &elf_digest,
+        proof_options,
+        None,
+        None,
+    )
+}
 
-    gkr_proof.table_counts.validate()?;
+/// The single GKR VM-proof verification implementation, given the proof's
+/// metadata fields plus an already-parsed ELF and its digest — the GKR
+/// analogue of [`verify_proof_parts`]. Both [`verify_gkr_with_options`]
+/// (owned) and [`verify_gkr_recursion_blob`] (guest blob) funnel here: the
+/// per-table STARK proofs come in as a [`MultiProofView`] (owned or archived,
+/// read in place), while the small GKR artifacts (batch proof + column
+/// claims) come in as borrowed values the guest deserializes cheaply.
+#[allow(clippy::too_many_arguments)]
+fn verify_gkr_proof_parts(
+    proofs: MultiProofView<'_, F, E, ()>,
+    batch_gkr_proof: &stark::gkr::BatchGkrProof<E>,
+    column_claims_by_table: &[Option<stark::proof::stark::GkrColumnClaims<E>>],
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    num_private_input_pages: usize,
+    public_output: &[u8],
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
+    table_counts.validate()?;
     {
         let max_pages = crate::tables::page::max_private_input_pages();
-        if gkr_proof.num_private_input_pages > max_pages {
+        if num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
-                "num_private_input_pages ({}) exceeds max ({max_pages})",
-                gkr_proof.num_private_input_pages,
+                "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",
             )));
         }
     }
 
     let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
-        &gkr_proof.runtime_page_ranges,
-        gkr_proof.num_private_input_pages,
+        program,
+        runtime_page_ranges,
+        num_private_input_pages,
     );
 
-    let expected_proof_count =
-        gkr_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected_proof_count != gkr_proof.proof.multi.proofs.len() {
+    let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    if expected_proof_count != proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
-            gkr_proof.table_counts.total(),
+            table_counts.total(),
             page_configs.len(),
             expected_proof_count,
-            gkr_proof.proof.multi.proofs.len(),
+            proofs.len(),
         )));
     }
 
     let airs = VmAirs::new_with_logup_mode(
-        &program,
+        program,
         proof_options,
         false,
         &page_configs,
-        &gkr_proof.table_counts,
-        None,
+        table_counts,
+        decode_commitment,
         true,
         None,
-        None,
+        page_commitments,
         None,
         LogUpMode::Gkr,
     );
@@ -1484,11 +1531,11 @@ pub fn verify_gkr_with_options(
     absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
-        &elf_digest,
-        &gkr_proof.public_output,
-        &gkr_proof.table_counts,
-        gkr_proof.num_private_input_pages,
-        &gkr_proof.runtime_page_ranges,
+        elf_digest,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
         proof_options.fri_final_poly_log_degree,
     );
 
@@ -1497,8 +1544,8 @@ pub fn verify_gkr_with_options(
     let mut transcript_for_replay = transcript.clone();
     let expected_bus_balance = match compute_expected_commit_bus_balance_view(
         &air_refs,
-        MultiProofView::Owned(&gkr_proof.proof.multi),
-        &gkr_proof.public_output,
+        proofs,
+        public_output,
         0,
         &mut transcript_for_replay,
     ) {
@@ -1506,12 +1553,97 @@ pub fn verify_gkr_with_options(
         None => return Ok(false),
     };
 
-    Ok(Verifier::multi_verify_gkr(
+    Ok(Verifier::multi_verify_gkr_views(
         &air_refs,
-        &gkr_proof.proof,
+        proofs,
+        batch_gkr_proof,
+        column_claims_by_table,
         &mut transcript,
         &expected_bus_balance,
     ))
+}
+
+/// Verify a GKR recursion-input blob produced by
+/// [`recursion::encode_gkr_guest_input`] — the GKR analogue of
+/// [`verify_recursion_blob`]. The per-table STARK proofs are verified
+/// **in place** from the archive (zero-copy, like the standard path); only
+/// the small metadata and the GKR artifacts (batch proof + column claims,
+/// KBs against the MB-scale proof data) are materialized.
+pub fn verify_gkr_recursion_blob<'a>(
+    blob: &'a [u8],
+    proof_options: &ProofOptions,
+) -> Result<RecursionVerification<'a>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let mut aligned_fallback = rkyv::util::AlignedVec::<RECURSION_INPUT_ALIGN>::new();
+    let (archived, archive_bytes, archive_base): (&ArchivedGkrGuestInput, &[u8], *const u8) =
+        access_recursion_archive(blob, &mut aligned_fallback)?;
+
+    // Materialize only the small metadata; the per-table proofs stay in the
+    // buffer.
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.gkr_proof.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: Vec<RuntimePageRange> = rkyv::deserialize::<
+        Vec<RuntimePageRange>,
+        RkyvError,
+    >(&archived.gkr_proof.runtime_page_ranges)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    // The GKR artifacts are small (root claims + layer round polys + column
+    // claims — KBs); an owned deserialize here keeps the batch-GKR verifier
+    // and claim reconstruction unchanged while the heavy data stays archived.
+    let batch_gkr_proof: stark::gkr::BatchGkrProof<E> =
+        rkyv::deserialize::<_, RkyvError>(&archived.gkr_proof.proof.batch_gkr_proof)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize batch proof failed: {e}")))?;
+    let column_claims_by_table: Vec<Option<stark::proof::stark::GkrColumnClaims<E>>> =
+        rkyv::deserialize::<_, RkyvError>(&archived.gkr_proof.proof.column_claims_by_table)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize column claims failed: {e}")))?;
+    let num_private_input_pages = archived.gkr_proof.num_private_input_pages.to_native() as usize;
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+    let public_output: &[u8] = archived.gkr_proof.public_output.as_slice();
+    let decode_commitment: Commitment = archived.decode_commitment;
+
+    // Rebase the returned slices onto the caller's buffer (`archived` may
+    // point into the aligned fallback copy) — same as the standard path.
+    let rebase = |s: &[u8]| -> &'a [u8] {
+        let offset = s.as_ptr() as usize - archive_base as usize;
+        &archive_bytes[offset..offset + s.len()]
+    };
+    let inner_elf_rebased = rebase(inner_elf);
+    let public_output_rebased = rebase(public_output);
+
+    let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(inner_elf);
+
+    let ok = verify_gkr_proof_parts(
+        MultiProofView::Archived(&archived.gkr_proof.proof.multi),
+        &batch_gkr_proof,
+        &column_claims_by_table,
+        &table_counts,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        &program,
+        &elf_digest,
+        proof_options,
+        Some(decode_commitment),
+        Some(&page_commitments),
+    )?;
+
+    Ok(RecursionVerification {
+        ok,
+        public_output: public_output_rebased,
+        inner_elf: inner_elf_rebased,
+        decode_commitment,
+        page_commitments,
+        elf_digest,
+        entry_point: program.entry_point,
+    })
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.

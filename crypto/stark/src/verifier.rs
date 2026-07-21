@@ -1168,6 +1168,36 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
         PI: Clone,
     {
+        Self::multi_verify_gkr_views(
+            airs,
+            MultiProofView::Owned(&gkr_proof.multi),
+            &gkr_proof.batch_gkr_proof,
+            gkr_proof.column_claims_by_table.as_slice(),
+            transcript,
+            expected_bus_balance,
+        )
+    }
+
+    /// [`Self::multi_verify_gkr`] over proof VIEWS: the per-table STARK proofs
+    /// come in as a [`ProofViewSource`] (owned or rkyv-archived, read in
+    /// place), while the (small) batch GKR proof and column claims come in as
+    /// borrowed values — the recursion guest deserializes only those and keeps
+    /// the heavy per-table data zero-copy.
+    fn multi_verify_gkr_views<'p>(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proofs: impl ProofViewSource<'p, Field, FieldExtension, PI>,
+        batch_gkr_proof: &BatchGkrProof<FieldExtension>,
+        column_claims_by_table: &[Option<crate::proof::stark::GkrColumnClaims<FieldExtension>>],
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        Field: 'p,
+        FieldExtension: 'p,
+        PI: 'p,
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+    {
         if airs
             .iter()
             .any(|air| air.has_trace_interaction() && air.logup_mode() != LogUpMode::Gkr)
@@ -1177,13 +1207,10 @@ pub trait IsStarkVerifier<
         }
         Self::multi_verify_views_impl(
             airs,
-            MultiProofView::Owned(&gkr_proof.multi),
+            proofs,
             transcript,
             expected_bus_balance,
-            Some((
-                &gkr_proof.batch_gkr_proof,
-                gkr_proof.column_claims_by_table.as_slice(),
-            )),
+            Some((batch_gkr_proof, column_claims_by_table)),
         )
     }
 
