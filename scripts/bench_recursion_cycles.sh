@@ -15,19 +15,24 @@
 # "total verifier work for each side's own proof", not an isolated guest-code delta.
 #
 # For each ref we report two numbers, both read from one `execute --cycles` run of a
-# single measuring CLI (MEASURE_CLI) built once from the checkout this script runs in:
+# measuring CLI built FROM THAT REF (its own worktree, release `cli`):
 #   * Guest cycles  — retired instructions.
 #   * Keccak calls  — keccak-permutation accelerator ecalls (one cycle each, but each
 #                     runs a whole permutation invisibly, so it's the companion signal:
 #                     the verifier's Merkle/transcript hashing rides on this syscall).
 # The CLI also prints an Ecsm (EC scalar-mul) count, but the STARK verifier does no
 # scalar-mul, so it is structurally 0 for a recursion proof — dropped as noise, not read.
-# MEASURE_CLI's executor counts ANY ref's guest ELF correctly (it just feeds the blob
-# as private input and reads the counters), so building it once is fine — indeed
-# preferable: the SAME counter reads both refs. In CI's issue_comment flow the checkout
-# has no explicit ref, so MEASURE_CLI is built from the repo default branch (main),
-# whose `cli` has `execute --cycles` with the keccak/ecsm counters (#807); that is
-# intentional — one stable counter applied identically to both refs.
+# Each ref is measured by a CLI built from THAT SAME ref — never a single shared counter
+# built from the checkout (main, in CI's issue_comment flow). A shared main-built CLI
+# only counts guests whose syscalls main already knows; the moment a PR guest emits a
+# NEW syscall (e.g. a new accelerator ecall) the main executor aborts with
+# `UnknownSyscall(...)` and the whole cycle bench fails — even though the PR itself is
+# fine. Building the counter per ref makes each VM understand exactly its own guest's
+# syscalls, so it is robust for PRs that add OR remove a syscall in either direction —
+# mirroring the per-side build already done by scripts/bench_verify.sh. Cost: one extra
+# native release `cli` build per ref; it shares HOST_TARGET_DIR with the blob-dump build
+# when that is set, so most deps are already warm, and it fits the recursion step's
+# existing multi-build budget (two guest builds + two blob dumps already).
 #
 # Improvement convention matches scripts/bench_verify.sh:
 #   NEGATIVE Δ  =  REF_A (PR) does fewer cycles/calls  =  better.
@@ -51,8 +56,8 @@
 #            of the `empty` diagnostic program — real prover minutes per ref
 #            (see the blob cache below), not seconds.
 #   Env:
-#     REBUILD=1            force rebuild of MEASURE_CLI and re-run of every ref
-#                          (guest build + blob dump + measurement); ignore caches.
+#     REBUILD=1            force rebuild of each ref's measuring CLI and re-run of every
+#                          ref (guest build + blob dump + measurement); ignore caches.
 #     SYSROOT_DIR=<path>   guest-build sysroot (default $HOME/.lambda-vm-sysroot).
 #     GUEST_TARGET_DIR=<p> share the RV64 guest build dir across ref worktrees
 #                          (reuses build-std → big speedup for the 2nd ref's guest
@@ -66,9 +71,9 @@
 #                          executor/tests/ethrex_bench_<BLOCK_TXS>.bin (only _4 committed).
 #     BLOCK_EPOCH_LOG2=21  PRESET=blowup4-block only: inner continuation epoch size.
 #
-# Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset + the
-# MEASURE_CLI source SHA (so a baseline and PR side are never compared across two
-# different counters). Result files are written ATOMICALLY (tmp + mv) and VALIDATED on
+# Caching: each ref's result is cached in $WORK keyed on its resolved SHA + preset. The
+# measuring CLI is built from that same SHA, so the SHA already identifies the counter (no
+# separate CLI-SHA key component). Result files are written ATOMICALLY (tmp + mv) and VALIDATED on
 # read: a truncated/partial cache is discarded and re-measured, never emitted as zeros.
 # Ref worktrees are kept (named by SHA) so a re-measure is a cargo no-op; the newest
 # PRUNE_KEEP are retained and older ones pruned. A worktree whose guest build fails
@@ -117,7 +122,8 @@ prune_worktree_cache() {
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin \
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
-          "$WORK"/measure_"${s8}"*.err
+          "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}" \
+          "$WORK"/build_cli_"${s8}".log
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
@@ -137,26 +143,12 @@ if [ ! -d "$SYSROOT_DIR/lib" ]; then
   exit 1
 fi
 
-# --- 1. Build MEASURE_CLI once (release) from the checkout we run in ------------
-# `cli` on main has `execute --cycles` with the keccak/ecsm counters (#807), so the
-# checkout this script runs in builds a counter that reads any ref's guest ELF
-# correctly. In CI's issue_comment flow the checkout is the default branch (main) — a
-# single stable counter for both refs, which is exactly what we want.
-HEAD_SHA="$(git rev-parse HEAD)"
-MEASURE_CLI="$WORK/measure_cli"
-if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$MEASURE_CLI" ] || \
-   [ "$(cat "$MEASURE_CLI.sha" 2>/dev/null)" != "$HEAD_SHA" ]; then
-  echo "==> Building MEASURE_CLI (cli, release) from ${HEAD_SHA:0:10} ..."
-  if ! cargo build --release -p cli >"$WORK/build_measure_cli.log" 2>&1; then
-    echo "ERROR: MEASURE_CLI build failed. Tail of $WORK/build_measure_cli.log:" >&2
-    tail -40 "$WORK/build_measure_cli.log" >&2
-    exit 1
-  fi
-  cp "$ROOT/target/release/cli" "$MEASURE_CLI"
-  echo "$HEAD_SHA" > "$MEASURE_CLI.sha"
-else
-  echo "==> Reusing cached MEASURE_CLI (${HEAD_SHA:0:10})"
-fi
+# --- 1. Measuring CLI is built PER REF (see measure_ref, step 2c2) --------------
+# There is deliberately no single shared counter built here. Each ref's guest is
+# executed by a `cli` built from that same ref's worktree, so the executor always knows
+# exactly the syscalls its own guest emits. A main-built CLI cannot run a PR guest that
+# introduces a new syscall — it aborts with `UnknownSyscall(...)` — which is precisely
+# the failure this per-ref scheme replaces.
 
 # Validate a result record (key=value lines on stdin): the three numeric keys must be
 # present and integer, and elf must be non-empty. Exit 0 iff trustworthy. Used both to
@@ -199,9 +191,11 @@ measure_ref() {
     blob_key="${PRESET}_txs${block_txs}_epoch${block_epoch_log2}"
   fi
   # Key the result cache on ref SHA + blob_key (so a BLOCK_TXS/BLOCK_EPOCH_LOG2
-  # override never reuses a stale measurement) AND the MEASURE_CLI source SHA
-  # (so a baseline and PR side measured by different counters never share a result).
-  local result="$WORK/result_${sha8}_${blob_key}_m${HEAD_SHA:0:8}.txt"
+  # override never reuses a stale measurement). The counter is now built from this same
+  # ref SHA, so the SHA already identifies the counter — no separate CLI-SHA component is
+  # needed. This new key shape also naturally ignores any caches written by the old
+  # single-main-CLI scheme (which carried a `_m<head_sha>` suffix).
+  local result="$WORK/result_${sha8}_${blob_key}.txt"
   local wt="$WORK/wt_${sha8}"
 
   local blob="$WORK/blob_${sha8}_${blob_key}.bin"
@@ -333,12 +327,43 @@ measure_ref() {
   fi
   echo "==> [$role] blob: $(wc -c <"$blob" | tr -d '[:space:]') bytes -> $blob" >&2
 
+  # 2c2. Build the measuring CLI FROM THIS REF's worktree (native release `cli`) and keep
+  # it at a per-ref stable path. This is the crux of the per-ref design: the guest ELF
+  # above may emit a syscall this ref introduced, so it must be executed by an executor
+  # built from the same ref — a CLI built from another ref (e.g. main) would abort with
+  # UnknownSyscall. Share HOST_TARGET_DIR (when set) with the blob-dump build so common
+  # native deps are already compiled, and copy the result out so a shared target dir's
+  # `cli` isn't clobbered by the other ref's build. The per-ref binary name encodes the
+  # SHA, so it doubles as its own cache (rebuilt only on REBUILD=1 or first sight).
+  local measure_cli="$WORK/measure_cli_${sha8}"
+  if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$measure_cli" ]; then
+    echo "==> [$role] building measuring CLI (cli, release) @ $sha8 ..." >&2
+    local clilog="$WORK/build_cli_${sha8}.log"
+    if [ -n "${HOST_TARGET_DIR:-}" ]; then
+      if ! ( cd "$wt" && CARGO_TARGET_DIR="$HOST_TARGET_DIR" cargo build --release -p cli ) >"$clilog" 2>&1; then
+        echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
+        tail -40 "$clilog" >&2
+        exit 1
+      fi
+      cp "$HOST_TARGET_DIR/release/cli" "$measure_cli"
+    else
+      if ! ( cd "$wt" && cargo build --release -p cli ) >"$clilog" 2>&1; then
+        echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
+        tail -40 "$clilog" >&2
+        exit 1
+      fi
+      cp "$wt/target/release/cli" "$measure_cli"
+    fi
+  else
+    echo "==> [$role] reusing cached measuring CLI ($measure_cli)" >&2
+  fi
+
   # 2d. Measure: one deterministic execute --cycles run. Time it (CI feasibility).
-  echo "==> [$role] measuring: $MEASURE_CLI execute $(basename "$guest_elf") --private-input <blob> --cycles" >&2
+  echo "==> [$role] measuring: $measure_cli execute $(basename "$guest_elf") --private-input <blob> --cycles" >&2
   local t0 t1 dt out
   t0=$(date +%s)
-  if ! out="$("$MEASURE_CLI" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}_${PRESET}.err")"; then
-    echo "ERROR: [$role] MEASURE_CLI execute failed for $ref ($sha8). Tail of stderr:" >&2
+  if ! out="$("$measure_cli" execute "$guest_elf" --private-input "$blob" --cycles 2>"$WORK/measure_${sha8}_${PRESET}.err")"; then
+    echo "ERROR: [$role] measuring-CLI execute failed for $ref ($sha8). Tail of stderr:" >&2
     tail -20 "$WORK/measure_${sha8}_${PRESET}.err" >&2
     exit 1
   fi
@@ -350,7 +375,7 @@ measure_ref() {
   # The CLI also prints an "Ecsm calls:" line; we intentionally don't read it — it is
   # structurally 0 for a recursion proof (no EC scalar-mul), so it's dropped as noise.
   if [ -z "$cyc" ] || [ -z "$kec" ]; then
-    echo "ERROR: [$role] could not parse Cycles/Keccak from MEASURE_CLI output for $ref ($sha8):" >&2
+    echo "ERROR: [$role] could not parse Cycles/Keccak from measuring-CLI output for $ref ($sha8):" >&2
     printf '%s\n' "$out" >&2
     exit 1
   fi

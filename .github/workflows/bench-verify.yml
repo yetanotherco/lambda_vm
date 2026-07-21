@@ -36,9 +36,11 @@ jobs:
        startsWith(github.event.comment.body, '/bench-verify') &&
        contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
     runs-on: [self-hosted, bench]
-    # Job cap. On a cold runner the recursion BUILDS dominate: MEASURE_CLI once, plus
-    # per ref a guest build and a prover-test build. Cached in /tmp; build-std / host
-    # cargo target shared across ref worktrees (see the recursion step's env).
+    # Job cap. On a cold runner the recursion BUILDS dominate: per ref a guest build, a
+    # prover-test build, and a measuring-CLI build (the CLI is built FROM each ref so it
+    # understands that ref's own guest syscalls). Cached in /tmp; build-std / host cargo
+    # target shared across ref worktrees (see the recursion step's env), so the second
+    # ref's native builds mostly reuse the first ref's compiled deps.
     timeout-minutes: 90
     steps:
       - name: Acknowledge (react + occupancy notice)
