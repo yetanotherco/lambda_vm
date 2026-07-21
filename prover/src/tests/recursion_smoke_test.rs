@@ -604,10 +604,11 @@ fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
     let empty_elf_bytes = read_guest_elf(&root, "empty");
 
-    // Epoch 2^6 = 64 cycles: small enough that `empty` splits into several
-    // epochs, exercising the cross-epoch GKR batches.
+    // Epoch 2^3 = 8 cycles: small enough that `empty` splits into several
+    // epochs, exercising the cross-epoch GKR batches (the standard
+    // continuation tests use 2^3 with the same fixture).
     let bundle =
-        crate::continuation::prove_continuation_gkr(&empty_elf_bytes, &[], 6, &MIN_PROOF_OPTIONS)
+        crate::continuation::prove_continuation_gkr(&empty_elf_bytes, &[], 3, &MIN_PROOF_OPTIONS)
             .expect("GKR continuation prove should succeed");
     assert!(
         bundle.num_epochs() > 1,
