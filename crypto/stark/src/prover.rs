@@ -29,8 +29,7 @@ use crate::debug::validate_trace;
 use crate::fri;
 use crate::gkr::{BatchGkrProof, gkr_prove_batch, instance_eval_point};
 use crate::logup_gkr::{
-    LogUpGkrResult, compute_logup_layers, extend_rap_challenges_with_bridge,
-    finalize_logup_gkr_result,
+    LogUpGkrResult, extend_rap_challenges_with_bridge, finalize_logup_gkr_result,
 };
 use crate::lookup::{LOGUP_NUM_CHALLENGES, LogUpMode};
 use crate::proof::stark::{DeepPolynomialOpenings, GkrMultiProof, PolynomialOpenings};
@@ -2661,10 +2660,13 @@ pub trait IsStarkProver<
             // committed term columns lives.
             #[cfg(feature = "instruments")]
             let __sp_gkr = crate::instruments::span("r1_gkr_trees");
-            let layers_per_instance: Vec<Vec<crate::gkr::Layer<FieldExtension>>> =
+            // Stage 2 of the input-layer design: instances carry only the
+            // >=N tree plus a deep-layer oracle — the K-hat*N input layer is
+            // never resident (one deep layer's split tables at a time).
+            let layers_per_instance: Vec<crate::gkr::GkrInstance<'_, FieldExtension>> =
                 crate::par::par_map_collect(0..gkr_indices.len(), |k| {
                     let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
-                    compute_logup_layers(
+                    crate::logup_gkr::build_gkr_instance(
                         air.bus_interactions(),
                         &trace.main_table,
                         trace.num_rows(),

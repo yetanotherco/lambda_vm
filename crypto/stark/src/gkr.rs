@@ -1222,6 +1222,126 @@ pub fn gkr_verify<E: IsField>(
 
 /// Run the batch GKR prover on multiple instances (each a Vec<Layer>).
 ///
+/// Streams the deep (below-N) layers of an extended-input instance
+/// (thoughts/logup-gkr/input-layer-design.md). The batch prover materializes
+/// ONE deep layer's four split tables at a time — directly from this oracle,
+/// freed when the layer's sumcheck completes — so the K̂·N input layer and the
+/// intermediate deep layers are never resident. Layer values are the balanced
+/// partial fraction sums of the per-row interaction leaves, identical to what
+/// a materialized extended tree would hold (pair-level associativity), so the
+/// transcript is byte-identical either way.
+pub trait DeepLayerOracle<E: IsField>: Send + Sync {
+    /// Padded interaction count K̂ (a power of two).
+    fn k_hat(&self) -> usize;
+    /// Trace rows N (a power of two).
+    fn num_rows(&self) -> usize;
+    /// Materialize the child layer at extended-tree index `c`
+    /// (`0 <= c < log2(K̂)`, size `K̂·N/2^c`) split by slot parity:
+    /// `(nl, nr, dl, dr)`, each of `K̂·N/2^(c+1)` entries, where entry
+    /// `i·S/2 + s/2` (S = per-row slots) is the balanced fraction sum of the
+    /// row's leaf range for slot `s` (even → l, odd → r).
+    #[allow(clippy::type_complexity)]
+    fn materialize_split(
+        &self,
+        c: usize,
+    ) -> (
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+    );
+}
+
+/// One batch-GKR instance: the materialized layers from size N up to the root
+/// plus (for extended-input instances) the deep-layer oracle. A plain
+/// materialized tree is the degenerate case (`input_num_vars = 0`).
+pub struct GkrInstance<'a, E: IsField> {
+    /// Layers from size N (index 0) to the root (last), as from [`gen_layers`].
+    pub upper_layers: Vec<Layer<E>>,
+    /// Number of extended-tree layers BELOW `upper_layers[0]` (= log2(K̂)).
+    pub input_num_vars: usize,
+    /// Streams the deep layers; required iff `input_num_vars > 0`.
+    pub deep_oracle: Option<Box<dyn DeepLayerOracle<E> + 'a>>,
+}
+
+impl<E: IsField> GkrInstance<'_, E> {
+    /// A fully materialized instance (no deep layers) — the pre-extension
+    /// shape, used by tests and as the differential oracle for the streamed
+    /// path.
+    pub fn materialized(upper_layers: Vec<Layer<E>>) -> Self {
+        Self {
+            upper_layers,
+            input_num_vars: 0,
+            deep_oracle: None,
+        }
+    }
+
+    /// Number of reduction steps (batch layers) this instance spans.
+    fn n_layers(&self) -> usize {
+        self.upper_layers.len() - 1 + self.input_num_vars
+    }
+
+    /// The child layer's variable count at extended-tree index `t`.
+    fn child_n_vars(&self, t: usize) -> usize {
+        if t >= self.input_num_vars {
+            self.upper_layers[t - self.input_num_vars].n_variables()
+        } else {
+            self.upper_layers[0].n_variables() + self.input_num_vars - t
+        }
+    }
+}
+
+/// Assemble a batch layer's [`PerInstanceTables`] from its four split tables:
+/// the instance evaluation point, the eq tables (SVO split above the
+/// threshold), and the fold bookkeeping. Shared by the materialized path
+/// (tables split from a resident tree layer) and the deep path (tables
+/// streamed from a [`DeepLayerOracle`]).
+fn build_tables_from_split<E: IsField>(
+    nl_table: Vec<FieldElement<E>>,
+    nr_table: Vec<FieldElement<E>>,
+    dl_table: Vec<FieldElement<E>>,
+    dr_table: Vec<FieldElement<E>>,
+    is_singles: bool,
+    my_parent_num_vars: usize,
+    current_point: &[FieldElement<E>],
+) -> PerInstanceTables<E> {
+    // current_point must have at least parent_num_vars coordinates
+    // (it grows by max_parent_vars+1 each layer, matching the tree doubling).
+    debug_assert!(
+        current_point.len() >= my_parent_num_vars,
+        "current_point.len()={} < parent_num_vars={}",
+        current_point.len(),
+        my_parent_num_vars
+    );
+    let inst_point = instance_eval_point(current_point, my_parent_num_vars);
+    let use_svo = my_parent_num_vars >= SVO_THRESHOLD;
+    let svo_suffix_len = if use_svo { my_parent_num_vars / 2 } else { 0 };
+
+    let (eq_table, eq_prefix, eq_suffix) = if use_svo {
+        let suffix = compute_eq_evals(&inst_point[..svo_suffix_len]);
+        let prefix = compute_eq_evals(&inst_point[svo_suffix_len..my_parent_num_vars]);
+        (Vec::new(), prefix, suffix)
+    } else {
+        (compute_eq_evals(&inst_point), Vec::new(), Vec::new())
+    };
+
+    PerInstanceTables {
+        nl_table,
+        nr_table,
+        dl_table,
+        dr_table,
+        eq_table,
+        eq_correction: FieldElement::one(),
+        is_singles,
+        parent_num_vars: my_parent_num_vars,
+        instance_point: inst_point,
+        use_svo,
+        svo_suffix_len,
+        eq_prefix,
+        eq_suffix,
+    }
+}
+
 /// All instances share one sumcheck per layer via random linear combination
 /// (sumcheck_alpha). Instances can have different numbers of layers (different
 /// trace lengths). Smaller instances start participating at later layers.
@@ -1235,7 +1355,7 @@ pub fn gkr_verify<E: IsField>(
 /// A `BatchGkrProof`, the shared `random_point`, and per-instance `(n_claim, d_claim)`.
 #[allow(clippy::type_complexity)]
 pub fn gkr_prove_batch<E: IsField>(
-    layers_per_instance: Vec<Vec<Layer<E>>>,
+    layers_per_instance: Vec<GkrInstance<'_, E>>,
     transcript: &mut impl IsTranscript<E>,
 ) -> (
     BatchGkrProof<E>,
@@ -1259,18 +1379,19 @@ pub fn gkr_prove_batch<E: IsField>(
         );
     }
 
-    // n_layers_by_instance[i] = number of tree layers - 1 = number of reduction steps
+    // n_layers_by_instance[i] = reduction steps: materialized upper layers
+    // plus the streamed deep layers.
     let n_layers_by_instance: Vec<usize> = layers_per_instance
         .iter()
-        .map(|layers| layers.len() - 1)
+        .map(|inst| inst.n_layers())
         .collect();
     let max_layers = *n_layers_by_instance.iter().max().unwrap();
 
     // Extract root (numerator, denominator) for each instance
     let root_claims: Vec<(FieldElement<E>, FieldElement<E>)> = layers_per_instance
         .iter()
-        .map(|layers| {
-            let root = layers.last().unwrap();
+        .map(|inst| {
+            let root = inst.upper_layers.last().unwrap();
             root.try_into_output_values()
                 .expect("root layer must be output")
         })
@@ -1348,7 +1469,7 @@ pub fn gkr_prove_batch<E: IsField>(
                 let tree_layer_idx = n_remaining - 1;
                 // tree_layer_idx is the child layer; the parent has half the size
                 // child has 2^k elements → parent has 2^{k-1} → parent_num_vars = k-1
-                let child_n_vars = layers_per_instance[i][tree_layer_idx].n_variables();
+                let child_n_vars = layers_per_instance[i].child_n_vars(tree_layer_idx);
                 debug_assert!(
                     child_n_vars >= 1,
                     "child of a non-output layer must have >= 2 elements"
@@ -1365,7 +1486,25 @@ pub fn gkr_prove_batch<E: IsField>(
 
             for (idx, &i) in active_instances.iter().enumerate() {
                 let tree_layer_idx = n_remaining - 1;
-                let child = &layers_per_instance[i][tree_layer_idx];
+                let inst = &layers_per_instance[i];
+                if tree_layer_idx < inst.input_num_vars {
+                    // Deep trivial layer (single-row extended instance):
+                    // materialize the 2-entry child from the oracle.
+                    let oracle = inst
+                        .deep_oracle
+                        .as_ref()
+                        .expect("extended instance requires a deep oracle");
+                    let (nl, nr, dl, dr) = oracle.materialize_split(tree_layer_idx);
+                    debug_assert_eq!(nl.len(), 1, "trivial deep child has 2 entries");
+                    child_claims_by_instance.push([
+                        nl[0].clone(),
+                        nr[0].clone(),
+                        dl[0].clone(),
+                        dr[0].clone(),
+                    ]);
+                    continue;
+                }
+                let child = &inst.upper_layers[tree_layer_idx - inst.input_num_vars];
 
                 let (child_n, child_d) = match child {
                     Layer::LogUpGeneric {
@@ -1456,7 +1595,31 @@ pub fn gkr_prove_batch<E: IsField>(
 
             let build_instance_tables = |&i: &usize| {
                 let tree_layer_idx = n_remaining - 1;
-                let child = &layers_per_instance[i][tree_layer_idx];
+                let inst = &layers_per_instance[i];
+
+                // Deep (below-N) layer of an extended instance: materialize
+                // THIS layer's four split tables straight from the oracle —
+                // the child layer itself is never resident, and these tables
+                // are dropped when the batch layer's sumcheck completes.
+                if tree_layer_idx < inst.input_num_vars {
+                    let oracle = inst
+                        .deep_oracle
+                        .as_ref()
+                        .expect("extended instance requires a deep oracle");
+                    let (nl_table, nr_table, dl_table, dr_table) =
+                        oracle.materialize_split(tree_layer_idx);
+                    return build_tables_from_split(
+                        nl_table,
+                        nr_table,
+                        dl_table,
+                        dr_table,
+                        false,
+                        parent_num_vars_by_instance
+                            [active_instances.iter().position(|&x| x == i).unwrap()],
+                        &current_point,
+                    );
+                }
+                let child = &inst.upper_layers[tree_layer_idx - inst.input_num_vars];
 
                 let parent_size = match child {
                     Layer::LogUpGeneric { denominators, .. }
@@ -1483,41 +1646,15 @@ pub fn gkr_prove_batch<E: IsField>(
 
                 let my_parent_num_vars = parent_num_vars_by_instance
                     [active_instances.iter().position(|&x| x == i).unwrap()];
-                // current_point must have at least parent_num_vars coordinates
-                // (it grows by max_parent_vars+1 each layer, matching the tree doubling).
-                debug_assert!(
-                    current_point.len() >= my_parent_num_vars,
-                    "current_point.len()={} < parent_num_vars={}",
-                    current_point.len(),
-                    my_parent_num_vars
-                );
-                let inst_point = instance_eval_point(&current_point, my_parent_num_vars);
-                let use_svo = my_parent_num_vars >= SVO_THRESHOLD;
-                let svo_suffix_len = if use_svo { my_parent_num_vars / 2 } else { 0 };
-
-                let (eq_table, eq_prefix, eq_suffix) = if use_svo {
-                    let suffix = compute_eq_evals(&inst_point[..svo_suffix_len]);
-                    let prefix = compute_eq_evals(&inst_point[svo_suffix_len..my_parent_num_vars]);
-                    (Vec::new(), prefix, suffix)
-                } else {
-                    (compute_eq_evals(&inst_point), Vec::new(), Vec::new())
-                };
-
-                PerInstanceTables {
+                build_tables_from_split(
                     nl_table,
                     nr_table,
                     dl_table,
                     dr_table,
-                    eq_table,
-                    eq_correction: FieldElement::one(),
                     is_singles,
-                    parent_num_vars: my_parent_num_vars,
-                    instance_point: inst_point,
-                    use_svo,
-                    svo_suffix_len,
-                    eq_prefix,
-                    eq_suffix,
-                }
+                    my_parent_num_vars,
+                    &current_point,
+                )
             };
 
             #[cfg(feature = "parallel")]
@@ -3179,8 +3316,13 @@ mod tests {
             (0..3).map(|_| gen_layers(make_generic_leaf(2))).collect();
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, shared_point, final_claims) =
-            gkr_prove_batch(instances, &mut prover_transcript);
+        let (proof, shared_point, final_claims) = gkr_prove_batch(
+            instances
+                .into_iter()
+                .map(GkrInstance::materialized)
+                .collect(),
+            &mut prover_transcript,
+        );
 
         assert_eq!(proof.root_claims.len(), 3);
         assert_eq!(final_claims.len(), 3);
@@ -3208,7 +3350,13 @@ mod tests {
         let instances: Vec<Vec<Layer<GoldilocksField>>> =
             (0..2).map(|_| gen_layers(make_generic_leaf(2))).collect();
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, _, _) = gkr_prove_batch(instances, &mut prover_transcript);
+        let (proof, _, _) = gkr_prove_batch(
+            instances
+                .into_iter()
+                .map(GkrInstance::materialized)
+                .collect(),
+            &mut prover_transcript,
+        );
         let n_layers = vec![2usize, 2];
 
         // rkyv roundtrip → verifies.
@@ -3264,8 +3412,13 @@ mod tests {
         assert_eq!(n_layers, vec![2, 4, 6]);
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, shared_point, final_claims) =
-            gkr_prove_batch(instances, &mut prover_transcript);
+        let (proof, shared_point, final_claims) = gkr_prove_batch(
+            instances
+                .into_iter()
+                .map(GkrInstance::materialized)
+                .collect(),
+            &mut prover_transcript,
+        );
 
         assert_eq!(proof.root_claims.len(), 3);
 
@@ -3295,8 +3448,13 @@ mod tests {
         let n_layers: Vec<usize> = instances.iter().map(|l| l.len() - 1).collect();
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, shared_point, final_claims) =
-            gkr_prove_batch(instances, &mut prover_transcript);
+        let (proof, shared_point, final_claims) = gkr_prove_batch(
+            instances
+                .into_iter()
+                .map(GkrInstance::materialized)
+                .collect(),
+            &mut prover_transcript,
+        );
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let result = gkr_verify_batch(&proof, &n_layers, &mut verifier_transcript);
@@ -3325,8 +3483,13 @@ mod tests {
         let n_layers: Vec<usize> = instances.iter().map(|l| l.len() - 1).collect();
 
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
-        let (proof, shared_point, final_claims) =
-            gkr_prove_batch(instances, &mut prover_transcript);
+        let (proof, shared_point, final_claims) = gkr_prove_batch(
+            instances
+                .into_iter()
+                .map(GkrInstance::materialized)
+                .collect(),
+            &mut prover_transcript,
+        );
 
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let result = gkr_verify_batch(&proof, &n_layers, &mut verifier_transcript);

@@ -24,7 +24,7 @@ use math::field::{
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 
-use crate::gkr::{Layer, gen_layers};
+use crate::gkr::{DeepLayerOracle, GkrInstance, Layer, gen_layers};
 use crate::lagrange_kernel::compute_lagrange_kernel;
 use crate::lookup::{BusInteraction, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
 use crate::table::Table;
@@ -296,6 +296,204 @@ where
     Layer::LogUpGeneric {
         numerators,
         denominators,
+    }
+}
+
+/// The K̂ leaf pairs of one row: `(sign_k·m_k, fp_k)` for `k < K`, the
+/// fraction identity `(0, 1)` for padding. Shared by the Stage-1 materialized
+/// input layer and the deep-layer oracle.
+fn row_leaf_pairs<F, E>(
+    interactions: &[BusInteraction],
+    row: &[FieldElement<F>],
+    z: &FieldElement<E>,
+    alpha_powers: &[FieldElement<E>],
+    shifts: &PackingShifts<F>,
+    k_hat: usize,
+) -> Vec<(FieldElement<E>, FieldElement<E>)>
+where
+    F: IsField + IsSubFieldOf<E>,
+    E: IsField,
+{
+    let mut leaves = Vec::with_capacity(k_hat);
+    for inter in interactions {
+        let fp = compute_fingerprint_at_row(inter, row, z, alpha_powers, shifts);
+        let m = inter.multiplicity.evaluate_from(|col| row[col].clone());
+        let n = if inter.is_sender {
+            m.to_extension()
+        } else {
+            (-m).to_extension()
+        };
+        leaves.push((n, fp));
+    }
+    leaves.resize_with(k_hat, || {
+        (FieldElement::<E>::zero(), FieldElement::<E>::one())
+    });
+    leaves
+}
+
+/// [`DeepLayerOracle`] over a table's interactions and (borrowed) row-major
+/// main trace: materializes one deep layer's four split tables at a time by
+/// streaming rows — the K̂·N input layer is never resident.
+struct LogUpDeepOracle<'a, F: IsField, E: IsField> {
+    interactions: &'a [BusInteraction],
+    main: &'a Table<F>,
+    z: FieldElement<E>,
+    alpha_powers: Vec<FieldElement<E>>,
+    shifts: PackingShifts<F>,
+    k_hat: usize,
+    trace_len: usize,
+}
+
+impl<F, E> DeepLayerOracle<E> for LogUpDeepOracle<'_, F, E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    fn k_hat(&self) -> usize {
+        self.k_hat
+    }
+
+    fn num_rows(&self) -> usize {
+        self.trace_len
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn materialize_split(
+        &self,
+        c: usize,
+    ) -> (
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+    ) {
+        debug_assert!(c < self.k_hat.trailing_zeros() as usize);
+        // Per-row slots at child level c, and per-row entries per split table.
+        let slots = self.k_hat >> c;
+        let half = slots / 2;
+        let out_len = self.trace_len * half;
+
+        let mut nl = vec![FieldElement::<E>::zero(); out_len];
+        let mut nr = vec![FieldElement::<E>::zero(); out_len];
+        let mut dl = vec![FieldElement::<E>::zero(); out_len];
+        let mut dr = vec![FieldElement::<E>::zero(); out_len];
+
+        // Each row owns the contiguous span [row·half, (row+1)·half) in every
+        // table: zip per-row chunks so the fill is embarrassingly parallel.
+        let fill_row = |row_idx: usize,
+                        nl_c: &mut [FieldElement<E>],
+                        nr_c: &mut [FieldElement<E>],
+                        dl_c: &mut [FieldElement<E>],
+                        dr_c: &mut [FieldElement<E>]| {
+            let row = self.main.get_row(row_idx);
+            let mut leaves = row_leaf_pairs(
+                self.interactions,
+                row,
+                &self.z,
+                &self.alpha_powers,
+                &self.shifts,
+                self.k_hat,
+            );
+            // Fold c levels of pairwise fraction addition (balanced, matching
+            // the extended tree's deep layers bit-for-bit).
+            for _ in 0..c {
+                let m = leaves.len() / 2;
+                for t in 0..m {
+                    let (n0, d0) = leaves[2 * t].clone();
+                    let (n1, d1) = leaves[2 * t + 1].clone();
+                    leaves[t] = (&(&n0 * &d1) + &(&n1 * &d0), &d0 * &d1);
+                }
+                leaves.truncate(m);
+            }
+            for t in 0..half {
+                let (n_even, d_even) = leaves[2 * t].clone();
+                let (n_odd, d_odd) = leaves[2 * t + 1].clone();
+                nl_c[t] = n_even;
+                dl_c[t] = d_even;
+                nr_c[t] = n_odd;
+                dr_c[t] = d_odd;
+            }
+        };
+
+        #[cfg(feature = "parallel")]
+        nl.par_chunks_mut(half)
+            .zip(nr.par_chunks_mut(half))
+            .zip(dl.par_chunks_mut(half))
+            .zip(dr.par_chunks_mut(half))
+            .enumerate()
+            .for_each(|(row_idx, (((nl_c, nr_c), dl_c), dr_c))| {
+                fill_row(row_idx, nl_c, nr_c, dl_c, dr_c)
+            });
+        #[cfg(not(feature = "parallel"))]
+        for row_idx in 0..self.trace_len {
+            let span = row_idx * half..(row_idx + 1) * half;
+            let (nl_c, nr_c, dl_c, dr_c) = (
+                &mut nl[span.clone()],
+                &mut nr[span.clone()],
+                &mut dl[span.clone()],
+                &mut dr[span.clone()],
+            );
+            // Split borrows: fall back to per-row temporary buffers.
+            let mut nl_t = nl_c.to_vec();
+            let mut nr_t = nr_c.to_vec();
+            let mut dl_t = dl_c.to_vec();
+            let mut dr_t = dr_c.to_vec();
+            fill_row(row_idx, &mut nl_t, &mut nr_t, &mut dl_t, &mut dr_t);
+            nl[span.clone()].clone_from_slice(&nl_t);
+            nr[span.clone()].clone_from_slice(&nr_t);
+            dl[span.clone()].clone_from_slice(&dl_t);
+            dr[span].clone_from_slice(&dr_t);
+        }
+
+        (nl, nr, dl, dr)
+    }
+}
+
+/// Build a table's batch-GKR instance (Stage 2 of the input-layer design):
+/// the materialized layers from the N-sized cross-multiplied fractions up to
+/// the root, plus the deep-layer oracle streaming the below-N layers. Peak
+/// memory is one deep layer's split tables at a time — the K̂·N input layer is
+/// never resident. Transcript-identical to a fully materialized extended tree.
+pub fn build_gkr_instance<'a, F, E>(
+    interactions: &'a [BusInteraction],
+    main: &'a Table<F>,
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+) -> GkrInstance<'a, E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync + 'a,
+    E: IsField + Send + Sync + 'a,
+{
+    let (numerators, denominators) =
+        compute_logup_leaf_fractions(interactions, main, trace_len, challenges);
+    let upper_layers = gen_layers(Layer::LogUpGeneric {
+        numerators,
+        denominators,
+    });
+    let input_num_vars = gkr_input_num_vars(interactions.len());
+    let deep_oracle: Option<Box<dyn DeepLayerOracle<E> + 'a>> = if input_num_vars > 0 {
+        let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+        let max_bus_elements = interactions
+            .iter()
+            .map(|inter| inter.num_bus_elements())
+            .max()
+            .unwrap();
+        Some(Box::new(LogUpDeepOracle {
+            interactions,
+            main,
+            z: challenges[LOGUP_CHALLENGE_Z].clone(),
+            alpha_powers: compute_alpha_powers(alpha, max_bus_elements),
+            shifts: PackingShifts::<F>::new(),
+            k_hat: interactions.len().next_power_of_two(),
+            trace_len,
+        }))
+    } else {
+        None
+    };
+    GkrInstance {
+        upper_layers,
+        input_num_vars,
+        deep_oracle,
     }
 }
 
@@ -897,6 +1095,64 @@ mod tests {
             }
             other => panic!("unexpected layer variant: {other:?}"),
         }
+    }
+
+    /// THE Stage-2 gate: the streamed deep-layer path
+    /// ([`build_gkr_instance`], oracle-backed) must be TRANSCRIPT-IDENTICAL
+    /// to a fully materialized extended tree ([`compute_logup_layers`]) —
+    /// same seed, byte-identical proof, same point, same claims. Mixed sizes
+    /// and padding included (K = 3 → K̂ = 4, two trace lengths).
+    #[test]
+    fn streamed_deep_layers_match_materialized_extended_tree() {
+        use crate::gkr::{GkrInstance, gkr_prove_batch};
+        use crypto::fiat_shamir::default_transcript::DefaultTranscript;
+        use crypto::fiat_shamir::is_transcript::IsTranscript;
+
+        let mk_table = |rows: usize, seed: u64| {
+            let col0: Vec<FE> = (0..rows).map(|v| FE::from(seed + v as u64)).collect();
+            let col1: Vec<FE> = (0..rows).map(|v| FE::from(seed + 100 + v as u64)).collect();
+            let col2: Vec<FE> = (0..rows).map(|v| FE::from((v as u64) % 3)).collect();
+            Table::from_columns(vec![col0, col1, col2])
+        };
+        let interactions = vec![
+            BusInteraction::sender(3u64, Multiplicity::One, Packing::Direct.columns(&[0])),
+            BusInteraction::receiver(3u64, Multiplicity::Column(2), Packing::Direct.columns(&[1])),
+            BusInteraction::sender(5u64, Multiplicity::Column(2), Packing::Word2L.columns(&[0])),
+        ];
+        let challenges = vec![FE::from(0xDEAD_BEEFu64), FE::from(0x1234_5678u64)];
+
+        let table_a = mk_table(16, 7);
+        let table_b = mk_table(8, 1_000);
+
+        // Materialized extended trees (the Stage-1 shape).
+        let mat_a = compute_logup_layers::<F, F>(&interactions, &table_a, 16, &challenges);
+        let mat_b = compute_logup_layers::<F, F>(&interactions, &table_b, 8, &challenges);
+        let mut t1 = DefaultTranscript::<F>::new(&[42]);
+        let (proof_m, point_m, claims_m) = gkr_prove_batch(
+            vec![
+                GkrInstance::materialized(mat_a),
+                GkrInstance::materialized(mat_b),
+            ],
+            &mut t1,
+        );
+
+        // Streamed instances (the Stage-2 shape).
+        let inst_a = build_gkr_instance::<F, F>(&interactions, &table_a, 16, &challenges);
+        let inst_b = build_gkr_instance::<F, F>(&interactions, &table_b, 8, &challenges);
+        let mut t2 = DefaultTranscript::<F>::new(&[42]);
+        let (proof_s, point_s, claims_s) = gkr_prove_batch(vec![inst_a, inst_b], &mut t2);
+
+        assert_eq!(point_m, point_s, "shared random points diverge");
+        assert_eq!(claims_m, claims_s, "instance claims diverge");
+        let bytes_m = rkyv::to_bytes::<rkyv::rancor::Error>(&proof_m).unwrap();
+        let bytes_s = rkyv::to_bytes::<rkyv::rancor::Error>(&proof_s).unwrap();
+        assert_eq!(
+            bytes_m.as_slice(),
+            bytes_s.as_slice(),
+            "streamed and materialized proofs are not byte-identical"
+        );
+        // The transcripts must have absorbed identical data too.
+        assert_eq!(t1.state(), t2.state(), "transcript states diverge");
     }
 
     /// The cross-mode oracle: the GKR summation-tree ROOT must equal the
