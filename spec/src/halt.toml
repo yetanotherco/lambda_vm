@@ -18,11 +18,10 @@ desc = "`IS_WORD[timestamp]`"
 name = "all"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
+kind = "template"
+tag = "REGW"
+input = ["i", ["cast", 0, "DWordWL"], ["-", ["^", 2, 32], 1]]
 iter = ["i", 1, 9]
-multiplicity = 1
 ref = "halt:c:zeroize_registers_lo"
 
 [[constraints.all]]
@@ -33,11 +32,10 @@ output = ["cast", 0, "DWordWL"]
 ref = "halt:c:read_zero_exit_code"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, "i"], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
+kind = "template"
+tag = "REGW"
+input = ["i", ["cast", 0, "DWordWL"], ["-", ["^", 2, 32], 1]]
 iter = ["i", 11, 31]
-multiplicity = 1
 ref = "halt:c:zeroize_registers_hi"
 
 [[constraints.all]]

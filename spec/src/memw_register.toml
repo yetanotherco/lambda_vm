@@ -129,7 +129,7 @@ output = "old"
 cond = ["-", "μ_read"]
 
 [[constraints.output]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["arr", ["cast", ["*", 2, "address"], "Word"], 0], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-multiplicity = ["-", "μ_write"]
+kind = "template"
+tag = "REGW"
+input = ["address", "val", "timestamp"]
+cond = ["-", "μ_write"]

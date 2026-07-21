@@ -338,10 +338,10 @@ poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
 iter = ["i", 0, 2]
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 2], 1, 0, 0]
-multiplicity = "write_register"
+kind = "template"
+tag = "REGW"
+input = ["rd", "rvd", ["+", "timestamp", 2]]
+cond = "write_register"
 
 [[constraint_groups]]
 name = "logup"
