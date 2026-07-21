@@ -1250,6 +1250,37 @@ pub trait DeepLayerOracle<E: IsField>: Send + Sync {
         Vec<FieldElement<E>>,
         Vec<FieldElement<E>>,
     );
+
+    /// Streamed gate sums for a k-bit round of the deep layer at child index
+    /// `c`: `(h0, h2)` = Σ over gate pairs of `eq_k[pair] · eq_row[row] ·
+    /// gate_t`, where the four per-row split arrays are folded by `bound`
+    /// (this layer's challenges so far) and the gate is EXACTLY
+    /// `gate_generic`'s: `g0 = nl_l·dr_l + dl_l·(nr_l + λ·dr_l)` at the pair's
+    /// left entries, `g2` on the `2·r − l` extrapolations. `eq_k` is the
+    /// pre-halved k-part eq table (len = pairs per row).
+    fn deep_gate_sums(
+        &self,
+        c: usize,
+        bound: &[FieldElement<E>],
+        eq_k: &[FieldElement<E>],
+        eq_row: &[FieldElement<E>],
+        lambda: &FieldElement<E>,
+    ) -> (FieldElement<E>, FieldElement<E>);
+
+    /// Materialize the deep layer's four split tables AFTER all k-bit rounds:
+    /// each per-row array folded by the full `bound` vector down to one entry
+    /// → four N-sized tables, handed to the ordinary row-round fold path.
+    #[allow(clippy::type_complexity)]
+    fn materialize_folded_rows(
+        &self,
+        c: usize,
+        bound: &[FieldElement<E>],
+    ) -> (
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+    );
 }
 
 /// One batch-GKR instance: the materialized layers from size N up to the root
@@ -1296,7 +1327,7 @@ impl<E: IsField> GkrInstance<'_, E> {
 /// threshold), and the fold bookkeeping. Shared by the materialized path
 /// (tables split from a resident tree layer) and the deep path (tables
 /// streamed from a [`DeepLayerOracle`]).
-fn build_tables_from_split<E: IsField>(
+fn build_tables_from_split<'a, E: IsField>(
     nl_table: Vec<FieldElement<E>>,
     nr_table: Vec<FieldElement<E>>,
     dl_table: Vec<FieldElement<E>>,
@@ -1304,7 +1335,7 @@ fn build_tables_from_split<E: IsField>(
     is_singles: bool,
     my_parent_num_vars: usize,
     current_point: &[FieldElement<E>],
-) -> PerInstanceTables<E> {
+) -> PerInstanceTables<'a, E> {
     // current_point must have at least parent_num_vars coordinates
     // (it grows by max_parent_vars+1 each layer, matching the tree doubling).
     debug_assert!(
@@ -1326,6 +1357,7 @@ fn build_tables_from_split<E: IsField>(
     };
 
     PerInstanceTables {
+        deep: None,
         nl_table,
         nr_table,
         dl_table,
@@ -1597,27 +1629,68 @@ pub fn gkr_prove_batch<E: IsField>(
                 let tree_layer_idx = n_remaining - 1;
                 let inst = &layers_per_instance[i];
 
-                // Deep (below-N) layer of an extended instance: materialize
-                // THIS layer's four split tables straight from the oracle —
-                // the child layer itself is never resident, and these tables
-                // are dropped when the batch layer's sumcheck completes.
+                // Deep (below-N) layer of an extended instance: nothing is
+                // materialized during the k-bit rounds — gate sums stream
+                // through the oracle; the four split tables appear only at
+                // N size once every k-bit is bound (or immediately when the
+                // layer has no k-bit rounds left, kp == 0). The K̂·N input
+                // layer and the intermediate deep layers are never resident.
                 if tree_layer_idx < inst.input_num_vars {
-                    let oracle = inst
+                    let oracle: &dyn DeepLayerOracle<E> = inst
                         .deep_oracle
                         .as_ref()
-                        .expect("extended instance requires a deep oracle");
-                    let (nl_table, nr_table, dl_table, dr_table) =
-                        oracle.materialize_split(tree_layer_idx);
-                    return build_tables_from_split(
-                        nl_table,
-                        nr_table,
-                        dl_table,
-                        dr_table,
-                        false,
-                        parent_num_vars_by_instance
-                            [active_instances.iter().position(|&x| x == i).unwrap()],
-                        &current_point,
+                        .expect("extended instance requires a deep oracle")
+                        .as_ref();
+                    let my_parent_num_vars = parent_num_vars_by_instance
+                        [active_instances.iter().position(|&x| x == i).unwrap()];
+                    let inst_point = instance_eval_point(&current_point, my_parent_num_vars);
+                    // Per-row slots at this child level; k-bit rounds kp.
+                    let slots = oracle.k_hat() >> tree_layer_idx;
+                    let kp = (slots / 2).trailing_zeros() as usize;
+                    debug_assert_eq!(
+                        my_parent_num_vars,
+                        kp + oracle.num_rows().trailing_zeros() as usize,
                     );
+                    if kp == 0 {
+                        // No k-bit rounds: the split tables are already
+                        // N-sized — materialize now, ordinary path after.
+                        let (nl_table, nr_table, dl_table, dr_table) =
+                            oracle.materialize_split(tree_layer_idx);
+                        return build_tables_from_split(
+                            nl_table,
+                            nr_table,
+                            dl_table,
+                            dr_table,
+                            false,
+                            my_parent_num_vars,
+                            &current_point,
+                        );
+                    }
+                    let eq_k = compute_eq_evals(&inst_point[..kp]);
+                    let eq_row = compute_eq_evals(&inst_point[kp..my_parent_num_vars]);
+                    return PerInstanceTables {
+                        deep: Some(DeepPhase {
+                            oracle,
+                            c: tree_layer_idx,
+                            kp,
+                            bound: Vec::with_capacity(kp),
+                            eq_k,
+                            eq_row,
+                        }),
+                        nl_table: Vec::new(),
+                        nr_table: Vec::new(),
+                        dl_table: Vec::new(),
+                        dr_table: Vec::new(),
+                        eq_table: Vec::new(),
+                        eq_correction: FieldElement::one(),
+                        is_singles: false,
+                        parent_num_vars: my_parent_num_vars,
+                        instance_point: inst_point,
+                        use_svo: false,
+                        svo_suffix_len: 0,
+                        eq_prefix: Vec::new(),
+                        eq_suffix: Vec::new(),
+                    };
                 }
                 let child = &inst.upper_layers[tree_layer_idx - inst.input_num_vars];
 
@@ -1658,12 +1731,12 @@ pub fn gkr_prove_batch<E: IsField>(
             };
 
             #[cfg(feature = "parallel")]
-            let mut per_instance_tables: Vec<PerInstanceTables<E>> = active_instances
+            let mut per_instance_tables: Vec<PerInstanceTables<'_, E>> = active_instances
                 .par_iter()
                 .map(build_instance_tables)
                 .collect();
             #[cfg(not(feature = "parallel"))]
-            let mut per_instance_tables: Vec<PerInstanceTables<E>> =
+            let mut per_instance_tables: Vec<PerInstanceTables<'_, E>> =
                 active_instances.iter().map(build_instance_tables).collect();
 
             let mut round_polys = Vec::with_capacity(max_parent_vars);
@@ -1697,7 +1770,7 @@ pub fn gkr_prove_batch<E: IsField>(
                 // parallel across instances, with parallel inner sums for the
                 // large early rounds.
                 let compute_instance = |idx: usize,
-                                        tables: &mut PerInstanceTables<E>|
+                                        tables: &mut PerInstanceTables<'_, E>|
                  -> [FieldElement<E>; 4] {
                     let n_unused = max_parent_vars - tables.parent_num_vars;
 
@@ -1713,6 +1786,44 @@ pub fn gkr_prove_batch<E: IsField>(
                     }
 
                     let instance_round = round_idx - n_unused;
+
+                    // Streamed deep k-bit round: pre-halve the k-part eq and
+                    // let the oracle compute the raw gate sums; the S(t)
+                    // recovery below is shared with the materialized path.
+                    if let Some(deep) = tables.deep.as_mut() {
+                        let eq_half = deep.eq_k.len() / 2;
+                        for j in 0..eq_half {
+                            deep.eq_k[j] = &deep.eq_k[2 * j] + &deep.eq_k[2 * j + 1];
+                        }
+                        deep.eq_k.truncate(eq_half);
+
+                        let (raw_h0, raw_h2) = deep.oracle.deep_gate_sums(
+                            deep.c,
+                            &deep.bound,
+                            &deep.eq_k,
+                            &deep.eq_row,
+                            &lambda,
+                        );
+
+                        let r_round = tables.instance_point[instance_round].clone();
+                        let one = FieldElement::<E>::one();
+                        let total_h0 = &tables.eq_correction * &raw_h0;
+                        let total_h2 = &tables.eq_correction * &raw_h2;
+                        let one_minus_r = &one - &r_round;
+                        let s0 = &one_minus_r * &total_h0;
+                        let s1 = &combined_claims[idx] - &s0;
+                        let r_inv = r_round.inv().expect("r_round = 0 is probability 2^{-64}");
+                        let h1 = &s1 * &r_inv;
+                        let three = FieldElement::<E>::from(3u64);
+                        let h3 = &(&(&three * &total_h2) - &(&three * &h1)) + &total_h0;
+                        let eq_at_2 = &(&three * &r_round) - &one;
+                        let s2 = &eq_at_2 * &total_h2;
+                        let eq_at_3 = &(&FieldElement::<E>::from(5u64) * &r_round)
+                            - &FieldElement::<E>::from(2u64);
+                        let s3 = &eq_at_3 * &h3;
+                        return [s0, s1, s2, s3];
+                    }
+
                     let half = tables.nl_table.len().max(tables.dl_table.len()) / 2;
 
                     if half == 0 {
@@ -1731,7 +1842,7 @@ pub fn gkr_prove_batch<E: IsField>(
                     let one = FieldElement::<E>::one();
 
                     // Helper: compute gate h(0) and h(2) for a generic pair at index j.
-                    let gate_generic = |tables: &PerInstanceTables<E>,
+                    let gate_generic = |tables: &PerInstanceTables<'_, E>,
                                         j: usize|
                      -> [FieldElement<E>; 2] {
                         let nl_l = &tables.nl_table[2 * j];
@@ -1753,7 +1864,7 @@ pub fn gkr_prove_batch<E: IsField>(
                     };
 
                     let gate_singles =
-                        |tables: &PerInstanceTables<E>, j: usize| -> [FieldElement<E>; 2] {
+                        |tables: &PerInstanceTables<'_, E>, j: usize| -> [FieldElement<E>; 2] {
                             let dl_l = &tables.dl_table[2 * j];
                             let dl_r = &tables.dl_table[2 * j + 1];
                             let dr_l = &tables.dr_table[2 * j];
@@ -1783,7 +1894,7 @@ pub fn gkr_prove_batch<E: IsField>(
 
                         // Eq mutations are done; sum over an immutable view so the
                         // gate closures can run in parallel.
-                        let view: &PerInstanceTables<E> = tables;
+                        let view: &PerInstanceTables<'_, E> = tables;
                         let suffix_sum = |suffix_idx: usize| -> (FieldElement<E>, FieldElement<E>) {
                             let eq_s = &view.eq_suffix[suffix_idx];
                             let mut ch0 = FieldElement::<E>::zero();
@@ -1849,7 +1960,7 @@ pub fn gkr_prove_batch<E: IsField>(
                         tables.eq_table.truncate(half);
 
                         // Eq mutations are done; sum over an immutable view.
-                        let view: &PerInstanceTables<E> = tables;
+                        let view: &PerInstanceTables<'_, E> = tables;
                         let pair_sum = |j: usize| -> (FieldElement<E>, FieldElement<E>) {
                             let eq_rem = &view.eq_table[j];
                             let [g0, g2] = if view.is_singles {
@@ -1956,7 +2067,7 @@ pub fn gkr_prove_batch<E: IsField>(
                 // update combined_claims via O(1) polynomial evaluation (not
                 // O(N) table scan). Instances are independent — parallel.
                 let update_instance =
-                    |tables: &mut PerInstanceTables<E>,
+                    |tables: &mut PerInstanceTables<'_, E>,
                      claim: &mut FieldElement<E>,
                      evals: &[FieldElement<E>; 4]| {
                         // S_i(challenge) via degree-3 Lagrange interpolation at {0,1,2,3}.
@@ -1970,11 +2081,43 @@ pub fn gkr_prove_batch<E: IsField>(
                         *claim = instance_poly.evaluate(&challenge);
 
                         let n_unused = max_parent_vars - tables.parent_num_vars;
-                        if round_idx < n_unused || tables.dl_table.len() / 2 == 0 {
+                        if round_idx < n_unused {
                             return;
                         }
 
                         let instance_round = round_idx - n_unused;
+
+                        // Streamed deep k-bit round: bind the challenge, update
+                        // eq_correction, and — once every k-bit is bound —
+                        // materialize the four N-sized tables and hand off to
+                        // the ordinary row-round fold path below (next round).
+                        if let Some(deep) = tables.deep.as_mut() {
+                            let r_round = &tables.instance_point[instance_round];
+                            let one = FieldElement::<E>::one();
+                            let eq_update = &(r_round * &challenge)
+                                + &(&(&one - r_round) * &(&one - &challenge));
+                            tables.eq_correction = &tables.eq_correction * &eq_update;
+
+                            deep.bound.push(challenge.clone());
+                            if deep.bound.len() == deep.kp {
+                                debug_assert_eq!(deep.eq_k.len(), 1);
+                                tables.eq_correction = &tables.eq_correction * &deep.eq_k[0];
+                                let (nl, nr, dl, dr) =
+                                    deep.oracle.materialize_folded_rows(deep.c, &deep.bound);
+                                let eq_row = std::mem::take(&mut deep.eq_row);
+                                tables.nl_table = nl;
+                                tables.nr_table = nr;
+                                tables.dl_table = dl;
+                                tables.dr_table = dr;
+                                tables.eq_table = eq_row;
+                                tables.deep = None;
+                            }
+                            return;
+                        }
+
+                        if tables.dl_table.len() / 2 == 0 {
+                            return;
+                        }
                         let half = tables.dl_table.len() / 2;
 
                         // Update eq_correction using instance-specific eval point
@@ -2127,7 +2270,26 @@ pub(crate) fn instance_eval_point<E: IsField>(
 }
 
 /// Per-instance bookkeeping tables for the batch sumcheck inner loop.
-struct PerInstanceTables<E: IsField> {
+/// In-progress k-bit-round state of a streamed deep layer: nothing is
+/// materialized; gate sums and folds are answered by the oracle from `bound`.
+struct DeepPhase<'a, E: IsField> {
+    oracle: &'a dyn DeepLayerOracle<E>,
+    /// Extended-tree child index of this layer.
+    c: usize,
+    /// Number of k-bit rounds (`log2(per-row slots) − 1`).
+    kp: usize,
+    /// This layer's bound challenges so far (k-bit rounds only).
+    bound: Vec<FieldElement<E>>,
+    /// eq over the parent's k-bits, pre-halved per k-round.
+    eq_k: Vec<FieldElement<E>>,
+    /// eq over the row bits — untouched during k-rounds, becomes the layer's
+    /// eq_table at materialization.
+    eq_row: Vec<FieldElement<E>>,
+}
+
+struct PerInstanceTables<'a, E: IsField> {
+    /// `Some` while a streamed deep layer is in its k-bit rounds.
+    deep: Option<DeepPhase<'a, E>>,
     nl_table: Vec<FieldElement<E>>,
     nr_table: Vec<FieldElement<E>>,
     dl_table: Vec<FieldElement<E>>,

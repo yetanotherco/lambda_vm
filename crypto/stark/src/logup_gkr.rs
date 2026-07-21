@@ -344,6 +344,77 @@ struct LogUpDeepOracle<'a, F: IsField, E: IsField> {
     trace_len: usize,
 }
 
+impl<F, E> LogUpDeepOracle<'_, F, E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    /// One row's four split arrays at child level `c`, folded by this layer's
+    /// bound challenges: build the K̂ leaves, fold `c` levels of balanced
+    /// fraction addition (the deep-tree values), split by slot parity into
+    /// (nl, nr, dl, dr) row arrays, then fold each `bound.len()` times with
+    /// the sumcheck's multilinear rule `v' = l + ch·(r − l)` — exactly what
+    /// `fold_table` does to materialized tables, per row.
+    #[allow(clippy::type_complexity)]
+    fn folded_row_arrays(
+        &self,
+        c: usize,
+        bound: &[FieldElement<E>],
+        row_idx: usize,
+    ) -> (
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+    ) {
+        let row = self.main.get_row(row_idx);
+        let mut leaves = row_leaf_pairs(
+            self.interactions,
+            row,
+            &self.z,
+            &self.alpha_powers,
+            &self.shifts,
+            self.k_hat,
+        );
+        for _ in 0..c {
+            let m = leaves.len() / 2;
+            for t in 0..m {
+                let (n0, d0) = leaves[2 * t].clone();
+                let (n1, d1) = leaves[2 * t + 1].clone();
+                leaves[t] = (&(&n0 * &d1) + &(&n1 * &d0), &d0 * &d1);
+            }
+            leaves.truncate(m);
+        }
+
+        let half = leaves.len() / 2;
+        let mut nl = Vec::with_capacity(half);
+        let mut nr = Vec::with_capacity(half);
+        let mut dl = Vec::with_capacity(half);
+        let mut dr = Vec::with_capacity(half);
+        for t in 0..half {
+            let (n_even, d_even) = leaves[2 * t].clone();
+            let (n_odd, d_odd) = leaves[2 * t + 1].clone();
+            nl.push(n_even);
+            dl.push(d_even);
+            nr.push(n_odd);
+            dr.push(d_odd);
+        }
+
+        for ch in bound {
+            for table in [&mut nl, &mut nr, &mut dl, &mut dr] {
+                let m = table.len() / 2;
+                for j in 0..m {
+                    let left = table[2 * j].clone();
+                    let right = table[2 * j + 1].clone();
+                    table[j] = &left + &(ch * &(&right - &left));
+                }
+                table.truncate(m);
+            }
+        }
+        (nl, nr, dl, dr)
+    }
+}
+
 impl<F, E> DeepLayerOracle<E> for LogUpDeepOracle<'_, F, E>
 where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
@@ -445,6 +516,103 @@ where
             dr[span].clone_from_slice(&dr_t);
         }
 
+        (nl, nr, dl, dr)
+    }
+
+    fn deep_gate_sums(
+        &self,
+        c: usize,
+        bound: &[FieldElement<E>],
+        eq_k: &[FieldElement<E>],
+        eq_row: &[FieldElement<E>],
+        lambda: &FieldElement<E>,
+    ) -> (FieldElement<E>, FieldElement<E>) {
+        let row_sums = |row_idx: usize| -> (FieldElement<E>, FieldElement<E>) {
+            let (fnl, fnr, fdl, fdr) = self.folded_row_arrays(c, bound, row_idx);
+            let pairs = fnl.len() / 2;
+            debug_assert_eq!(eq_k.len(), pairs);
+            let mut h0 = FieldElement::<E>::zero();
+            let mut h2 = FieldElement::<E>::zero();
+            for j in 0..pairs {
+                // EXACTLY gate_generic's formulas (crypto/stark/src/gkr.rs):
+                // g0 on the pair's left entries, g2 on the 2·r − l
+                // extrapolations. The stage-2 differential test pins parity.
+                let (nl_l, nl_r) = (&fnl[2 * j], &fnl[2 * j + 1]);
+                let (nr_l, nr_r) = (&fnr[2 * j], &fnr[2 * j + 1]);
+                let (dl_l, dl_r) = (&fdl[2 * j], &fdl[2 * j + 1]);
+                let (dr_l, dr_r) = (&fdr[2 * j], &fdr[2 * j + 1]);
+
+                let gate_0 = &(nl_l * dr_l) + &(dl_l * &(nr_l + &(lambda * dr_l)));
+                let nl_2 = &(nl_r + nl_r) - nl_l;
+                let nr_2 = &(nr_r + nr_r) - nr_l;
+                let dl_2 = &(dl_r + dl_r) - dl_l;
+                let dr_2 = &(dr_r + dr_r) - dr_l;
+                let gate_2 = &(&nl_2 * &dr_2) + &(&dl_2 * &(&nr_2 + &(lambda * &dr_2)));
+
+                h0 = &h0 + &(&eq_k[j] * &gate_0);
+                h2 = &h2 + &(&eq_k[j] * &gate_2);
+            }
+            (&eq_row[row_idx] * &h0, &eq_row[row_idx] * &h2)
+        };
+
+        #[cfg(feature = "parallel")]
+        {
+            (0..self.trace_len).into_par_iter().map(row_sums).reduce(
+                || (FieldElement::<E>::zero(), FieldElement::<E>::zero()),
+                |(a0, a2), (b0, b2)| (&a0 + &b0, &a2 + &b2),
+            )
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            let mut h0 = FieldElement::<E>::zero();
+            let mut h2 = FieldElement::<E>::zero();
+            for row_idx in 0..self.trace_len {
+                let (r0, r2) = row_sums(row_idx);
+                h0 = &h0 + &r0;
+                h2 = &h2 + &r2;
+            }
+            (h0, h2)
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn materialize_folded_rows(
+        &self,
+        c: usize,
+        bound: &[FieldElement<E>],
+    ) -> (
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+        Vec<FieldElement<E>>,
+    ) {
+        let n = self.trace_len;
+        let row_entry = |row_idx: usize| {
+            let (fnl, fnr, fdl, fdr) = self.folded_row_arrays(c, bound, row_idx);
+            debug_assert_eq!(fnl.len(), 1, "all k-bits must be bound");
+            (
+                fnl.into_iter().next().unwrap(),
+                fnr.into_iter().next().unwrap(),
+                fdl.into_iter().next().unwrap(),
+                fdr.into_iter().next().unwrap(),
+            )
+        };
+
+        #[cfg(feature = "parallel")]
+        let entries: Vec<_> = (0..n).into_par_iter().map(row_entry).collect();
+        #[cfg(not(feature = "parallel"))]
+        let entries: Vec<_> = (0..n).map(row_entry).collect();
+
+        let mut nl = Vec::with_capacity(n);
+        let mut nr = Vec::with_capacity(n);
+        let mut dl = Vec::with_capacity(n);
+        let mut dr = Vec::with_capacity(n);
+        for (a, b, c_, d) in entries {
+            nl.push(a);
+            nr.push(b);
+            dl.push(c_);
+            dr.push(d);
+        }
         (nl, nr, dl, dr)
     }
 }
