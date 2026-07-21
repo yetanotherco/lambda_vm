@@ -1049,7 +1049,7 @@ fn test_malformed_ood_next_block_shape_rejected_archived() {
     assert!(
         !Verifier::multi_verify_archived(
             &airs,
-            &archived.proofs,
+            archived,
             &mut DefaultTranscript::<E>::new(&[]),
             &FieldElement::zero(),
         ),
@@ -1279,7 +1279,7 @@ fn test_gz_pruning_reduces_next_row_openings() {
     .unwrap();
     assert!(Verifier::multi_verify_archived(
         &airs,
-        &archived.proofs,
+        archived,
         &mut DefaultTranscript::<E>::new(&[]),
         &FieldElement::zero(),
     ));

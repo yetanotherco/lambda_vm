@@ -1046,6 +1046,67 @@ pub fn verify_continuation(
     Ok(Some(public_output))
 }
 
+/// Precompute the roots the `continuation` recursion guest carries in its private
+/// input: the DECODE preprocessed root (shared by every epoch) and the
+/// global-memory genesis roots for touched ELF/runtime data pages. Ported
+/// verbatim from the main-era #844/#845 helper — it is orthogonal to the batched
+/// FRI change (pure genesis/decode Merkle work) and reuses the batched branch's
+/// own `global_memory_configs` / `page::compute_precomputed_commitment` so the
+/// commitments equal what `verify_continuation` recomputes in-VM.
+pub fn continuation_precomputed_commitments(
+    elf_bytes: &[u8],
+    bundle: &ContinuationProof,
+    opts: &ProofOptions,
+) -> Result<(Commitment, Vec<(u64, Commitment)>), Error> {
+    let max_private_input_pages = page::max_private_input_pages();
+    if bundle.num_private_input_pages > max_private_input_pages {
+        return Err(Error::InvalidTableCounts(format!(
+            "num_private_input_pages ({}) exceeds max ({max_private_input_pages})",
+            bundle.num_private_input_pages
+        )));
+    }
+
+    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    let page_bases = canonical_page_bases(&bundle.touched_page_bases);
+    let page_commitments = global_memory_configs(&page_bases, &elf, bundle.num_private_input_pages)
+        .iter()
+        .filter(|c| !c.is_private_input && c.init_values.is_some())
+        .map(|c| (c.page_base, page::compute_precomputed_commitment(c, opts)))
+        .collect();
+    Ok((decode_commitment, page_commitments))
+}
+
+/// Archived-bundle bridge for the `continuation` recursion guest entrypoint
+/// (`crate::recursion::verify_continuation_and_attest`), introduced by #844/#845.
+/// Those PRs also added a zero-copy `ContinuationProofView` and a supplied-roots
+/// epoch/global verify (the guest skips the in-VM DECODE + genesis root
+/// recomputation); the batched-FRI proof format does not yet have either, so this
+/// bridge materializes the archived bundle and delegates to [`verify_continuation`],
+/// which RECOMPUTES those roots in-VM. The supplied `decode_commitment` /
+/// `page_genesis_commitments` are consumed by the CALLER for the attestation
+/// `program_id` — they equal what [`verify_continuation`] recomputes — and are not
+/// yet used by the verify here.
+///
+/// Wiring the supplied roots into the epoch/global verify (so the guest can skip the
+/// in-VM recompute) is a follow-up.
+pub(crate) fn verify_continuation_archived(
+    archived: &ArchivedContinuationProof,
+    elf_bytes: &[u8],
+    opts: &ProofOptions,
+    _decode_commitment: Commitment,
+    _page_genesis_commitments: &[(u64, Commitment)],
+) -> Result<Option<(Vec<u8>, u64)>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+    let bundle: ContinuationProof = rkyv::deserialize::<ContinuationProof, RkyvError>(archived)
+        .map_err(|e| Error::Execution(format!("rkyv deserialize continuation bundle failed: {e}")))?;
+    let entry_point = Elf::load(elf_bytes)
+        .map_err(|e| Error::ElfLoad(format!("{e}")))?
+        .entry_point;
+    Ok(verify_continuation(elf_bytes, &bundle, opts)?.map(|public_output| (public_output, entry_point)))
+}
+
 /// Convenience wrapper: prove then verify in one call (the original integrated API).
 /// Returns `Ok(Some(public_output))` iff the continuation proves and verifies.
 pub fn prove_and_verify_continuation(
