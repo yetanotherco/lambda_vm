@@ -1219,11 +1219,16 @@ where
     let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
     let inv_denoms_raw: &[u64] =
         unsafe { from_raw_parts(inv_denoms_host.as_ptr() as *const u64, inv_denoms_len) };
-    let sums_raw =
-        match math_cuda::barycentric::barycentric_ext3_on_device(handle, row_stride, points_raw, inv_denoms_raw, n) {
-            Ok(v) => v,
-            Err(_) => return None,
-        };
+    let sums_raw = match math_cuda::barycentric::barycentric_ext3_on_device(
+        handle,
+        row_stride,
+        points_raw,
+        inv_denoms_raw,
+        n,
+    ) {
+        Ok(v) => v,
+        Err(_) => return None,
+    };
     GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
     let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
     Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
