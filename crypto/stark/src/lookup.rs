@@ -699,6 +699,65 @@ impl BusValue {
         }
     }
 
+    /// Row-accessor variant of [`Self::accumulate_fingerprint`]: reads column
+    /// values through `get_col` (e.g. a borrowed row-major trace row) instead
+    /// of column-major vectors. Value-identical, including the zero-skip on
+    /// `Linear` elements.
+    pub fn accumulate_fingerprint_row<'a, F, E>(
+        &self,
+        get_col: impl Fn(usize) -> &'a FieldElement<F>,
+        alpha_powers: &[FieldElement<E>],
+        alpha_offset: usize,
+        acc: &mut FieldElement<E>,
+        shifts: &PackingShifts<F>,
+    ) -> usize
+    where
+        F: IsField + IsSubFieldOf<E> + 'a,
+        E: IsField,
+    {
+        match self {
+            BusValue::Packed {
+                start_column,
+                packing,
+            } => packing.accumulate_fingerprint_with(
+                *start_column,
+                get_col,
+                alpha_powers,
+                alpha_offset,
+                acc,
+                shifts,
+            ),
+            BusValue::Linear(terms) => {
+                let mut result = FieldElement::<F>::zero();
+                for term in terms {
+                    match term {
+                        LinearTerm::Column {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += get_col(*column) * coeff;
+                        }
+                        LinearTerm::ColumnUnsigned {
+                            coefficient,
+                            column,
+                        } => {
+                            let coeff = FieldElement::<F>::from(*coefficient);
+                            result += get_col(*column) * coeff;
+                        }
+                        LinearTerm::Constant(value) => {
+                            result += FieldElement::<F>::from(*value);
+                        }
+                    }
+                }
+                if result != FieldElement::<F>::zero() {
+                    *acc += &result * &alpha_powers[alpha_offset];
+                }
+                1
+            }
+        }
+    }
+
     /// Computes the bus element value from column values.
     ///
     /// # Arguments

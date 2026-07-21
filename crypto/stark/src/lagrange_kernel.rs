@@ -17,50 +17,41 @@ use rayon::prelude::*;
 /// claims back to committed univariate traces. It satisfies the partition-of-unity
 /// property: sum_{i=0}^{N-1} s[i] = 1 for any r.
 ///
-/// Uses the butterfly algorithm in O(N) time and O(N) space.
+/// Uses the doubling algorithm: each coordinate doubles the table with one
+/// multiplication and one subtraction per output pair, O(N) total work (the
+/// per-bit full-table passes would be O(n·N)).
 pub fn compute_lagrange_kernel<E: IsField>(r: &[FieldElement<E>]) -> Vec<FieldElement<E>> {
     let n = r.len();
-    let big_n = 1usize << n;
-    let one = FieldElement::<E>::one();
+    let mut s = vec![FieldElement::<E>::one()];
 
-    let mut s = vec![one.clone(); big_n];
-
-    #[allow(clippy::needless_range_loop)]
-    for j in 0..n {
+    // Process coordinates from LAST to FIRST, interleaving each step:
+    //   next[2t+1] = s[t]·r_j
+    //   next[2t]   = s[t] − next[2t+1]        (= s[t]·(1 − r_j))
+    // After processing r_{n-1}..r_0, bit l of the index selects the r_l
+    // factor — identical values (and order) to the per-bit product
+    // definition s[i] = ∏_l [r_l·b_l(i) + (1−r_l)·(1−b_l(i))].
+    for j in (0..n).rev() {
         let rj = &r[j];
-        let one_minus_rj = &one - rj;
+        let m = s.len();
+        let mut next = vec![FieldElement::<E>::zero(); 2 * m];
 
         #[cfg(feature = "parallel")]
-        {
-            if big_n >= 1024 {
-                s.par_iter_mut().enumerate().for_each(|(i, s_i)| {
-                    if (i >> j) & 1 == 1 {
-                        *s_i = &*s_i * rj;
-                    } else {
-                        *s_i = &*s_i * &one_minus_rj;
-                    }
+        if m >= 1024 {
+            next.par_chunks_mut(2)
+                .zip(s.par_iter())
+                .for_each(|(pair, s_t)| {
+                    pair[1] = s_t * rj;
+                    pair[0] = s_t - &pair[1];
                 });
-            } else {
-                for i in 0..big_n {
-                    if (i >> j) & 1 == 1 {
-                        s[i] = &s[i] * rj;
-                    } else {
-                        s[i] = &s[i] * &one_minus_rj;
-                    }
-                }
-            }
+            s = next;
+            continue;
         }
 
-        #[cfg(not(feature = "parallel"))]
-        {
-            for i in 0..big_n {
-                if (i >> j) & 1 == 1 {
-                    s[i] = &s[i] * rj;
-                } else {
-                    s[i] = &s[i] * &one_minus_rj;
-                }
-            }
+        for (t, s_t) in s.iter().enumerate() {
+            next[2 * t + 1] = s_t * rj;
+            next[2 * t] = s_t - &next[2 * t + 1];
         }
+        s = next;
     }
 
     s
@@ -211,6 +202,25 @@ mod tests {
         // Verify partition of unity: sum = 12 + (-18) + (-14) + 21 = 1
         let sum = ((s[0] + s[1]) + s[2]) + s[3];
         assert_eq!(sum, FE::one());
+    }
+
+    /// The doubling algorithm must match the per-bit product definition
+    /// s[i] = ∏_l [r_l·b_l(i) + (1−r_l)·(1−b_l(i))] exactly.
+    #[test]
+    fn test_kernel_doubling_matches_naive_definition() {
+        for &(n, seed) in &[(1usize, 3u64), (2, 7), (3, 11), (5, 13), (8, 17)] {
+            let r: Vec<FE> = (0..n).map(|l| FE::from(seed + 31 * l as u64)).collect();
+            let fast = compute_lagrange_kernel(&r);
+            let one = FE::one();
+            for (i, v) in fast.iter().enumerate() {
+                let mut expected = FE::one();
+                for (l, r_l) in r.iter().enumerate() {
+                    let bit = (i >> l) & 1;
+                    expected *= if bit == 1 { *r_l } else { &one - r_l };
+                }
+                assert_eq!(*v, expected, "kernel mismatch at n={n}, i={i}");
+            }
+        }
     }
 
     #[test]

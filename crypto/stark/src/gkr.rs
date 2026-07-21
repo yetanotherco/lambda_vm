@@ -1431,85 +1431,103 @@ pub fn gkr_prove_batch<E: IsField>(
             // For each active instance, build bookkeeping tables.
 
             // We run the sumcheck manually, combining round polynomials across instances.
-            let mut per_instance_tables: Vec<PerInstanceTables<E>> = active_instances
-                .iter()
-                .map(|&i| {
-                    let tree_layer_idx = n_remaining - 1;
-                    let child = &layers_per_instance[i][tree_layer_idx];
-
-                    let parent_size = match child {
-                        Layer::LogUpGeneric { denominators, .. }
-                        | Layer::LogUpSingles { denominators } => denominators.len() / 2,
-                    };
-
-                    let (nl_table, nr_table, is_singles) = match child {
-                        Layer::LogUpGeneric { numerators, .. } => {
-                            let nl: Vec<_> = (0..parent_size)
-                                .map(|j| numerators[2 * j].clone())
-                                .collect();
-                            let nr: Vec<_> = (0..parent_size)
-                                .map(|j| numerators[2 * j + 1].clone())
-                                .collect();
-                            (nl, nr, false)
-                        }
-                        Layer::LogUpSingles { .. } => {
-                            // Singles: numerators are all 1
-                            (vec![], vec![], true)
-                        }
-                    };
-
-                    let denominators = match child {
-                        Layer::LogUpGeneric { denominators, .. }
-                        | Layer::LogUpSingles { denominators } => denominators,
-                    };
-
-                    let dl_table: Vec<_> = (0..parent_size)
-                        .map(|j| denominators[2 * j].clone())
+            // Even/odd split of a layer vector: parallel for the large leaf
+            // layers (element-wise clones dominate the batch setup otherwise).
+            fn split_even_odd<E: IsField>(
+                src: &[FieldElement<E>],
+                parent_size: usize,
+            ) -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>) {
+                #[cfg(feature = "parallel")]
+                if parent_size >= 1 << 10 {
+                    let even: Vec<_> = (0..parent_size)
+                        .into_par_iter()
+                        .map(|j| src[2 * j].clone())
                         .collect();
-                    let dr_table: Vec<_> = (0..parent_size)
-                        .map(|j| denominators[2 * j + 1].clone())
+                    let odd: Vec<_> = (0..parent_size)
+                        .into_par_iter()
+                        .map(|j| src[2 * j + 1].clone())
                         .collect();
+                    return (even, odd);
+                }
+                let even: Vec<_> = (0..parent_size).map(|j| src[2 * j].clone()).collect();
+                let odd: Vec<_> = (0..parent_size).map(|j| src[2 * j + 1].clone()).collect();
+                (even, odd)
+            }
 
-                    let my_parent_num_vars = parent_num_vars_by_instance
-                        [active_instances.iter().position(|&x| x == i).unwrap()];
-                    // current_point must have at least parent_num_vars coordinates
-                    // (it grows by max_parent_vars+1 each layer, matching the tree doubling).
-                    debug_assert!(
-                        current_point.len() >= my_parent_num_vars,
-                        "current_point.len()={} < parent_num_vars={}",
-                        current_point.len(),
-                        my_parent_num_vars
-                    );
-                    let inst_point = instance_eval_point(&current_point, my_parent_num_vars);
-                    let use_svo = my_parent_num_vars >= SVO_THRESHOLD;
-                    let svo_suffix_len = if use_svo { my_parent_num_vars / 2 } else { 0 };
+            let build_instance_tables = |&i: &usize| {
+                let tree_layer_idx = n_remaining - 1;
+                let child = &layers_per_instance[i][tree_layer_idx];
 
-                    let (eq_table, eq_prefix, eq_suffix) = if use_svo {
-                        let suffix = compute_eq_evals(&inst_point[..svo_suffix_len]);
-                        let prefix =
-                            compute_eq_evals(&inst_point[svo_suffix_len..my_parent_num_vars]);
-                        (Vec::new(), prefix, suffix)
-                    } else {
-                        (compute_eq_evals(&inst_point), Vec::new(), Vec::new())
-                    };
+                let parent_size = match child {
+                    Layer::LogUpGeneric { denominators, .. }
+                    | Layer::LogUpSingles { denominators } => denominators.len() / 2,
+                };
 
-                    PerInstanceTables {
-                        nl_table,
-                        nr_table,
-                        dl_table,
-                        dr_table,
-                        eq_table,
-                        eq_correction: FieldElement::one(),
-                        is_singles,
-                        parent_num_vars: my_parent_num_vars,
-                        instance_point: inst_point,
-                        use_svo,
-                        svo_suffix_len,
-                        eq_prefix,
-                        eq_suffix,
+                let (nl_table, nr_table, is_singles) = match child {
+                    Layer::LogUpGeneric { numerators, .. } => {
+                        let (nl, nr) = split_even_odd(numerators, parent_size);
+                        (nl, nr, false)
                     }
-                })
+                    Layer::LogUpSingles { .. } => {
+                        // Singles: numerators are all 1
+                        (vec![], vec![], true)
+                    }
+                };
+
+                let denominators = match child {
+                    Layer::LogUpGeneric { denominators, .. }
+                    | Layer::LogUpSingles { denominators } => denominators,
+                };
+
+                let (dl_table, dr_table) = split_even_odd(denominators, parent_size);
+
+                let my_parent_num_vars = parent_num_vars_by_instance
+                    [active_instances.iter().position(|&x| x == i).unwrap()];
+                // current_point must have at least parent_num_vars coordinates
+                // (it grows by max_parent_vars+1 each layer, matching the tree doubling).
+                debug_assert!(
+                    current_point.len() >= my_parent_num_vars,
+                    "current_point.len()={} < parent_num_vars={}",
+                    current_point.len(),
+                    my_parent_num_vars
+                );
+                let inst_point = instance_eval_point(&current_point, my_parent_num_vars);
+                let use_svo = my_parent_num_vars >= SVO_THRESHOLD;
+                let svo_suffix_len = if use_svo { my_parent_num_vars / 2 } else { 0 };
+
+                let (eq_table, eq_prefix, eq_suffix) = if use_svo {
+                    let suffix = compute_eq_evals(&inst_point[..svo_suffix_len]);
+                    let prefix = compute_eq_evals(&inst_point[svo_suffix_len..my_parent_num_vars]);
+                    (Vec::new(), prefix, suffix)
+                } else {
+                    (compute_eq_evals(&inst_point), Vec::new(), Vec::new())
+                };
+
+                PerInstanceTables {
+                    nl_table,
+                    nr_table,
+                    dl_table,
+                    dr_table,
+                    eq_table,
+                    eq_correction: FieldElement::one(),
+                    is_singles,
+                    parent_num_vars: my_parent_num_vars,
+                    instance_point: inst_point,
+                    use_svo,
+                    svo_suffix_len,
+                    eq_prefix,
+                    eq_suffix,
+                }
+            };
+
+            #[cfg(feature = "parallel")]
+            let mut per_instance_tables: Vec<PerInstanceTables<E>> = active_instances
+                .par_iter()
+                .map(build_instance_tables)
                 .collect();
+            #[cfg(not(feature = "parallel"))]
+            let mut per_instance_tables: Vec<PerInstanceTables<E>> =
+                active_instances.iter().map(build_instance_tables).collect();
 
             let mut round_polys = Vec::with_capacity(max_parent_vars);
             let mut challenges = Vec::with_capacity(max_parent_vars);
@@ -1524,67 +1542,51 @@ pub fn gkr_prove_batch<E: IsField>(
                 sum
             };
 
-            // Per-instance round polynomial evals, used to update combined_claims
-            // via O(1) interpolation instead of O(N) table scan.
-            let mut per_instance_evals: Vec<[FieldElement<E>; 4]> = vec![
-                [
-                    FieldElement::zero(),
-                    FieldElement::zero(),
-                    FieldElement::zero(),
-                    FieldElement::zero()
-                ];
-                per_instance_tables.len()
-            ];
+            // Constants hoisted out of the round loop (the old code inverted 2
+            // per instance per round).
+            let inv_two = FieldElement::<E>::from(2u64)
+                .inv()
+                .expect("2 is invertible");
+            /// Above this pair count the per-round gate/eq sums and folds use
+            /// parallel reductions (field ops are exact, so any reduction
+            /// order is value-identical).
+            #[cfg(feature = "parallel")]
+            const PAR_SUM_THRESHOLD: usize = 1 << 10;
 
             for round_idx in 0..max_parent_vars {
-                // For each active instance, compute the round poly contribution
-                let mut batch_s0 = FieldElement::<E>::zero();
-                let mut batch_s1 = FieldElement::<E>::zero();
-                let mut batch_s2 = FieldElement::<E>::zero();
-                let mut batch_s3 = FieldElement::<E>::zero();
-                let mut alpha_pow = FieldElement::<E>::one();
-
-                for (idx, tables) in per_instance_tables.iter_mut().enumerate() {
+                // Per-instance round evals S_i(t) at t = 0,1,2,3. Instances are
+                // independent given the (read-only) combined claims, so this —
+                // the dominant work of the whole batch prove — runs in
+                // parallel across instances, with parallel inner sums for the
+                // large early rounds.
+                let compute_instance = |idx: usize,
+                                        tables: &mut PerInstanceTables<E>|
+                 -> [FieldElement<E>; 4] {
                     let n_unused = max_parent_vars - tables.parent_num_vars;
 
                     if round_idx < n_unused {
-                        // This instance hasn't started yet — constant polynomial = claim/2
-                        let half_claim =
-                            &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
-                        // S(0) = S(1) = half_claim, S(2) = S(3) = half_claim (constant)
-                        per_instance_evals[idx] = [
+                        // This instance hasn't started yet — constant polynomial = claim/2.
+                        let half_claim = &combined_claims[idx] * &inv_two;
+                        return [
                             half_claim.clone(),
                             half_claim.clone(),
                             half_claim.clone(),
-                            half_claim.clone(),
+                            half_claim,
                         ];
-                        batch_s0 = &batch_s0 + &(&alpha_pow * &half_claim);
-                        batch_s1 = &batch_s1 + &(&alpha_pow * &half_claim);
-                        batch_s2 = &batch_s2 + &(&alpha_pow * &half_claim);
-                        batch_s3 = &batch_s3 + &(&alpha_pow * &half_claim);
-                        alpha_pow = &alpha_pow * &sumcheck_alpha;
-                        continue;
                     }
 
                     let instance_round = round_idx - n_unused;
                     let half = tables.nl_table.len().max(tables.dl_table.len()) / 2;
 
                     if half == 0 {
-                        // Already reduced to constant
-                        let half_claim =
-                            &combined_claims[idx] * &FieldElement::<E>::from(2u64).inv().unwrap();
-                        per_instance_evals[idx] = [
+                        // Already reduced to constant.
+                        let half_claim = &combined_claims[idx] * &inv_two;
+                        return [
                             half_claim.clone(),
                             half_claim.clone(),
                             half_claim.clone(),
-                            half_claim.clone(),
+                            half_claim,
                         ];
-                        batch_s0 = &batch_s0 + &(&alpha_pow * &half_claim);
-                        batch_s1 = &batch_s1 + &(&alpha_pow * &half_claim);
-                        batch_s2 = &batch_s2 + &(&alpha_pow * &half_claim);
-                        batch_s3 = &batch_s3 + &(&alpha_pow * &half_claim);
-                        alpha_pow = &alpha_pow * &sumcheck_alpha;
-                        continue;
                     }
 
                     // Eq polynomial factoring (same as single-instance prover).
@@ -1628,73 +1630,127 @@ pub fn gkr_prove_batch<E: IsField>(
                         };
 
                     // Compute h(0) and h(2) using SVO or standard path.
-                    let (raw_h0, raw_h2) =
-                        if tables.use_svo && instance_round < tables.svo_suffix_len {
-                            // SVO suffix round: nested eq_suffix × (eq_prefix × gate) loop
-                            let suffix_half = tables.eq_suffix.len() / 2;
-                            let prefix_size = tables.eq_prefix.len();
+                    let (raw_h0, raw_h2) = if tables.use_svo
+                        && instance_round < tables.svo_suffix_len
+                    {
+                        // SVO suffix round: nested eq_suffix × (eq_prefix × gate) loop
+                        let suffix_half = tables.eq_suffix.len() / 2;
+                        let prefix_size = tables.eq_prefix.len();
 
-                            // Pre-halve eq_suffix
-                            for j in 0..suffix_half {
-                                tables.eq_suffix[j] =
-                                    &tables.eq_suffix[2 * j] + &tables.eq_suffix[2 * j + 1];
+                        // Pre-halve eq_suffix
+                        for j in 0..suffix_half {
+                            tables.eq_suffix[j] =
+                                &tables.eq_suffix[2 * j] + &tables.eq_suffix[2 * j + 1];
+                        }
+                        tables.eq_suffix.truncate(suffix_half);
+
+                        // Eq mutations are done; sum over an immutable view so the
+                        // gate closures can run in parallel.
+                        let view: &PerInstanceTables<E> = tables;
+                        let suffix_sum = |suffix_idx: usize| -> (FieldElement<E>, FieldElement<E>) {
+                            let eq_s = &view.eq_suffix[suffix_idx];
+                            let mut ch0 = FieldElement::<E>::zero();
+                            let mut ch2 = FieldElement::<E>::zero();
+                            #[allow(clippy::needless_range_loop)]
+                            for prefix_idx in 0..prefix_size {
+                                let j = prefix_idx * suffix_half + suffix_idx;
+                                let eq_p = &view.eq_prefix[prefix_idx];
+                                let [g0, g2] = if view.is_singles {
+                                    gate_singles(view, j)
+                                } else {
+                                    gate_generic(view, j)
+                                };
+                                ch0 = &ch0 + &(eq_p * &g0);
+                                ch2 = &ch2 + &(eq_p * &g2);
                             }
-                            tables.eq_suffix.truncate(suffix_half);
+                            (eq_s * &ch0, eq_s * &ch2)
+                        };
 
+                        #[cfg(feature = "parallel")]
+                        if suffix_half * prefix_size >= PAR_SUM_THRESHOLD {
+                            (0..suffix_half).into_par_iter().map(suffix_sum).reduce(
+                                || (FieldElement::<E>::zero(), FieldElement::<E>::zero()),
+                                |(a0, a2), (b0, b2)| (&a0 + &b0, &a2 + &b2),
+                            )
+                        } else {
                             let mut h0 = FieldElement::<E>::zero();
                             let mut h2 = FieldElement::<E>::zero();
                             for suffix_idx in 0..suffix_half {
-                                let eq_s = &tables.eq_suffix[suffix_idx];
-                                let mut ch0 = FieldElement::<E>::zero();
-                                let mut ch2 = FieldElement::<E>::zero();
-                                #[allow(clippy::needless_range_loop)]
-                                for prefix_idx in 0..prefix_size {
-                                    let j = prefix_idx * suffix_half + suffix_idx;
-                                    let eq_p = &tables.eq_prefix[prefix_idx];
-                                    let [g0, g2] = if tables.is_singles {
-                                        gate_singles(tables, j)
-                                    } else {
-                                        gate_generic(tables, j)
-                                    };
-                                    ch0 = &ch0 + &(eq_p * &g0);
-                                    ch2 = &ch2 + &(eq_p * &g2);
-                                }
-                                h0 = &h0 + &(eq_s * &ch0);
-                                h2 = &h2 + &(eq_s * &ch2);
+                                let (c0, c2) = suffix_sum(suffix_idx);
+                                h0 = &h0 + &c0;
+                                h2 = &h2 + &c2;
                             }
                             (h0, h2)
+                        }
+                        #[cfg(not(feature = "parallel"))]
+                        {
+                            let mut h0 = FieldElement::<E>::zero();
+                            let mut h2 = FieldElement::<E>::zero();
+                            for suffix_idx in 0..suffix_half {
+                                let (c0, c2) = suffix_sum(suffix_idx);
+                                h0 = &h0 + &c0;
+                                h2 = &h2 + &c2;
+                            }
+                            (h0, h2)
+                        }
+                    } else {
+                        // Standard path (non-SVO, or SVO prefix rounds after suffix is exhausted)
+                        if tables.use_svo && instance_round == tables.svo_suffix_len {
+                            // Transition: absorb remaining eq_suffix into eq_correction
+                            // and switch to eq_prefix as eq_table.
+                            debug_assert_eq!(tables.eq_suffix.len(), 1);
+                            tables.eq_correction = &tables.eq_correction * &tables.eq_suffix[0];
+                            tables.eq_table = std::mem::take(&mut tables.eq_prefix);
+                            tables.use_svo = false;
+                        }
+
+                        // Pre-halve eq_table
+                        for j in 0..half {
+                            tables.eq_table[j] =
+                                &tables.eq_table[2 * j] + &tables.eq_table[2 * j + 1];
+                        }
+                        tables.eq_table.truncate(half);
+
+                        // Eq mutations are done; sum over an immutable view.
+                        let view: &PerInstanceTables<E> = tables;
+                        let pair_sum = |j: usize| -> (FieldElement<E>, FieldElement<E>) {
+                            let eq_rem = &view.eq_table[j];
+                            let [g0, g2] = if view.is_singles {
+                                gate_singles(view, j)
+                            } else {
+                                gate_generic(view, j)
+                            };
+                            (eq_rem * &g0, eq_rem * &g2)
+                        };
+
+                        #[cfg(feature = "parallel")]
+                        if half >= PAR_SUM_THRESHOLD {
+                            (0..half).into_par_iter().map(pair_sum).reduce(
+                                || (FieldElement::<E>::zero(), FieldElement::<E>::zero()),
+                                |(a0, a2), (b0, b2)| (&a0 + &b0, &a2 + &b2),
+                            )
                         } else {
-                            // Standard path (non-SVO, or SVO prefix rounds after suffix is exhausted)
-                            if tables.use_svo && instance_round == tables.svo_suffix_len {
-                                // Transition: absorb remaining eq_suffix into eq_correction
-                                // and switch to eq_prefix as eq_table.
-                                debug_assert_eq!(tables.eq_suffix.len(), 1);
-                                tables.eq_correction = &tables.eq_correction * &tables.eq_suffix[0];
-                                tables.eq_table = std::mem::take(&mut tables.eq_prefix);
-                                tables.use_svo = false;
-                            }
-
-                            // Pre-halve eq_table
-                            for j in 0..half {
-                                tables.eq_table[j] =
-                                    &tables.eq_table[2 * j] + &tables.eq_table[2 * j + 1];
-                            }
-                            tables.eq_table.truncate(half);
-
                             let mut h0 = FieldElement::<E>::zero();
                             let mut h2 = FieldElement::<E>::zero();
                             for j in 0..half {
-                                let eq_rem = &tables.eq_table[j];
-                                let [g0, g2] = if tables.is_singles {
-                                    gate_singles(tables, j)
-                                } else {
-                                    gate_generic(tables, j)
-                                };
-                                h0 = &h0 + &(eq_rem * &g0);
-                                h2 = &h2 + &(eq_rem * &g2);
+                                let (c0, c2) = pair_sum(j);
+                                h0 = &h0 + &c0;
+                                h2 = &h2 + &c2;
                             }
                             (h0, h2)
-                        };
+                        }
+                        #[cfg(not(feature = "parallel"))]
+                        {
+                            let mut h0 = FieldElement::<E>::zero();
+                            let mut h2 = FieldElement::<E>::zero();
+                            for j in 0..half {
+                                let (c0, c2) = pair_sum(j);
+                                h0 = &h0 + &c0;
+                                h2 = &h2 + &c2;
+                            }
+                            (h0, h2)
+                        }
+                    };
 
                     // Apply eq_correction
                     let total_h0 = &tables.eq_correction * &raw_h0;
@@ -1718,11 +1774,33 @@ pub fn gkr_prove_batch<E: IsField>(
                         - &FieldElement::<E>::from(2u64);
                     let s3 = &eq_at_3 * &h3;
 
-                    per_instance_evals[idx] = [s0.clone(), s1.clone(), s2.clone(), s3.clone()];
-                    batch_s0 = &batch_s0 + &(&alpha_pow * &s0);
-                    batch_s1 = &batch_s1 + &(&alpha_pow * &s1);
-                    batch_s2 = &batch_s2 + &(&alpha_pow * &s2);
-                    batch_s3 = &batch_s3 + &(&alpha_pow * &s3);
+                    [s0, s1, s2, s3]
+                };
+
+                #[cfg(feature = "parallel")]
+                let per_instance_evals: Vec<[FieldElement<E>; 4]> = per_instance_tables
+                    .par_iter_mut()
+                    .enumerate()
+                    .map(|(idx, tables)| compute_instance(idx, tables))
+                    .collect();
+                #[cfg(not(feature = "parallel"))]
+                let per_instance_evals: Vec<[FieldElement<E>; 4]> = per_instance_tables
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(idx, tables)| compute_instance(idx, tables))
+                    .collect();
+
+                // α-combine the per-instance evals (sequential; O(instances)).
+                let mut batch_s0 = FieldElement::<E>::zero();
+                let mut batch_s1 = FieldElement::<E>::zero();
+                let mut batch_s2 = FieldElement::<E>::zero();
+                let mut batch_s3 = FieldElement::<E>::zero();
+                let mut alpha_pow = FieldElement::<E>::one();
+                for [s0, s1, s2, s3] in &per_instance_evals {
+                    batch_s0 = &batch_s0 + &(&alpha_pow * s0);
+                    batch_s1 = &batch_s1 + &(&alpha_pow * s1);
+                    batch_s2 = &batch_s2 + &(&alpha_pow * s2);
+                    batch_s3 = &batch_s3 + &(&alpha_pow * s3);
                     alpha_pow = &alpha_pow * &sumcheck_alpha;
                 }
 
@@ -1738,56 +1816,76 @@ pub fn gkr_prove_batch<E: IsField>(
                 _round_combined_claim = round_poly.evaluate(&challenge);
 
                 // Update per-instance: fold tables, update eq_correction, and
-                // update combined_claims via O(1) polynomial evaluation (not O(N) table scan).
-                for (idx, tables) in per_instance_tables.iter_mut().enumerate() {
-                    // Update combined_claims from saved per-instance round poly evals.
-                    // S_i(challenge) via degree-3 Lagrange interpolation at {0,1,2,3}.
-                    let [ref si0, ref si1, ref si2, ref si3] = per_instance_evals[idx];
-                    let instance_poly =
-                        RoundPoly::new(vec![si0.clone(), si1.clone(), si2.clone(), si3.clone()]);
-                    combined_claims[idx] = instance_poly.evaluate(&challenge);
+                // update combined_claims via O(1) polynomial evaluation (not
+                // O(N) table scan). Instances are independent — parallel.
+                let update_instance =
+                    |tables: &mut PerInstanceTables<E>,
+                     claim: &mut FieldElement<E>,
+                     evals: &[FieldElement<E>; 4]| {
+                        // S_i(challenge) via degree-3 Lagrange interpolation at {0,1,2,3}.
+                        let [si0, si1, si2, si3] = evals;
+                        let instance_poly = RoundPoly::new(vec![
+                            si0.clone(),
+                            si1.clone(),
+                            si2.clone(),
+                            si3.clone(),
+                        ]);
+                        *claim = instance_poly.evaluate(&challenge);
 
-                    let n_unused = max_parent_vars - tables.parent_num_vars;
-                    if round_idx < n_unused || tables.dl_table.len() / 2 == 0 {
-                        continue;
-                    }
-
-                    let instance_round = round_idx - n_unused;
-                    let half = tables.dl_table.len() / 2;
-
-                    // Update eq_correction using instance-specific eval point
-                    let r_round = &tables.instance_point[instance_round];
-                    let one = FieldElement::<E>::one();
-                    let eq_update =
-                        &(r_round * &challenge) + &(&(&one - r_round) * &(&one - &challenge));
-                    tables.eq_correction = &tables.eq_correction * &eq_update;
-
-                    // Fold gate tables
-                    let fold_table = |table: &mut Vec<FieldElement<E>>| {
-                        #[cfg(feature = "parallel")]
-                        if half >= 256 {
-                            let folded: Vec<FieldElement<E>> = table
-                                .par_chunks(2)
-                                .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
-                                .collect();
-                            *table = folded;
+                        let n_unused = max_parent_vars - tables.parent_num_vars;
+                        if round_idx < n_unused || tables.dl_table.len() / 2 == 0 {
                             return;
                         }
-                        for j in 0..half {
-                            let left = &table[2 * j];
-                            let right = &table[2 * j + 1];
-                            table[j] = left + &(&challenge * &(right - left));
+
+                        let instance_round = round_idx - n_unused;
+                        let half = tables.dl_table.len() / 2;
+
+                        // Update eq_correction using instance-specific eval point
+                        let r_round = &tables.instance_point[instance_round];
+                        let one = FieldElement::<E>::one();
+                        let eq_update =
+                            &(r_round * &challenge) + &(&(&one - r_round) * &(&one - &challenge));
+                        tables.eq_correction = &tables.eq_correction * &eq_update;
+
+                        // Fold gate tables
+                        let fold_table = |table: &mut Vec<FieldElement<E>>| {
+                            #[cfg(feature = "parallel")]
+                            if half >= 256 {
+                                let folded: Vec<FieldElement<E>> = table
+                                    .par_chunks(2)
+                                    .map(|pair| &pair[0] + &(&challenge * &(&pair[1] - &pair[0])))
+                                    .collect();
+                                *table = folded;
+                                return;
+                            }
+                            for j in 0..half {
+                                let left = &table[2 * j];
+                                let right = &table[2 * j + 1];
+                                table[j] = left + &(&challenge * &(right - left));
+                            }
+                            table.truncate(half);
+                        };
+
+                        if !tables.is_singles {
+                            fold_table(&mut tables.nl_table);
+                            fold_table(&mut tables.nr_table);
                         }
-                        table.truncate(half);
+                        fold_table(&mut tables.dl_table);
+                        fold_table(&mut tables.dr_table);
                     };
 
-                    if !tables.is_singles {
-                        fold_table(&mut tables.nl_table);
-                        fold_table(&mut tables.nr_table);
-                    }
-                    fold_table(&mut tables.dl_table);
-                    fold_table(&mut tables.dr_table);
-                }
+                #[cfg(feature = "parallel")]
+                per_instance_tables
+                    .par_iter_mut()
+                    .zip(combined_claims.par_iter_mut())
+                    .zip(per_instance_evals.par_iter())
+                    .for_each(|((tables, claim), evals)| update_instance(tables, claim, evals));
+                #[cfg(not(feature = "parallel"))]
+                per_instance_tables
+                    .iter_mut()
+                    .zip(combined_claims.iter_mut())
+                    .zip(per_instance_evals.iter())
+                    .for_each(|((tables, claim), evals)| update_instance(tables, claim, evals));
 
                 round_polys.push(round_poly);
                 challenges.push(challenge);

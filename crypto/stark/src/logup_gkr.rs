@@ -25,8 +25,9 @@ use math::field::{
 use rayon::prelude::*;
 
 use crate::gkr::{Layer, gen_layers};
-use crate::lagrange_kernel::{compute_lagrange_kernel, eval_mle_base_with_kernel};
+use crate::lagrange_kernel::compute_lagrange_kernel;
 use crate::lookup::{BusInteraction, LOGUP_CHALLENGE_ALPHA, PackingShifts, compute_alpha_powers};
+use crate::table::Table;
 use crate::trace::TraceTable;
 
 // =============================================================================
@@ -101,11 +102,11 @@ pub fn extract_column_indices(interactions: &[BusInteraction]) -> Vec<usize> {
 // =============================================================================
 
 /// The fingerprint `z − (bus_id + Σ αⁱ·elementᵢ)` for one interaction at one
-/// row. `α⁰ = 1`: the bus-id term is embedded directly, no multiply.
+/// row (a borrowed row-major slice). `α⁰ = 1`: the bus-id term is embedded
+/// directly, no multiply.
 fn compute_fingerprint_at_row<F, E>(
     interaction: &BusInteraction,
-    main_segment_cols: &[Vec<FieldElement<F>>],
-    row: usize,
+    row: &[FieldElement<F>],
     z: &FieldElement<E>,
     alpha_powers: &[FieldElement<E>],
     shifts: &PackingShifts<F>,
@@ -117,9 +118,8 @@ where
     let mut lc = FieldElement::<E>::from(interaction.bus_id);
     let mut alpha_offset = 1;
     for bv in &interaction.values {
-        alpha_offset += bv.accumulate_fingerprint(
-            main_segment_cols,
-            row,
+        alpha_offset += bv.accumulate_fingerprint_row(
+            |col| &row[col],
             alpha_powers,
             alpha_offset,
             &mut lc,
@@ -144,7 +144,7 @@ where
 /// Returns `(numerators, denominators)`, each of length `trace_len`.
 pub fn compute_logup_leaf_fractions<F, E>(
     interactions: &[BusInteraction],
-    main_segment_cols: &[Vec<FieldElement<F>>],
+    main: &Table<F>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
 ) -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>)
@@ -167,19 +167,15 @@ where
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
     let shifts = PackingShifts::<F>::new();
 
-    let leaf_at_row = |row: usize| {
+    // Rows are read in place from the row-major main table (borrowed slices,
+    // no column-major transpose/clone of the segment).
+    let leaf_at_row = |row_idx: usize| {
+        let row = main.get_row(row_idx);
         let mut running_n = FieldElement::<E>::zero();
         let mut running_d = FieldElement::<E>::one();
         for inter in interactions {
-            let fp = compute_fingerprint_at_row(
-                inter,
-                main_segment_cols,
-                row,
-                z,
-                &alpha_powers,
-                &shifts,
-            );
-            let m = inter.multiplicity.evaluate_at_row(main_segment_cols, row);
+            let fp = compute_fingerprint_at_row(inter, row, z, &alpha_powers, &shifts);
+            let m = inter.multiplicity.evaluate_from(|col| row[col].clone());
             // m·d is F×E (base operand LEFT); the sign resolves as add vs neg.
             let cross = &m * &running_d;
             let cross = if inter.is_sender { cross } else { -cross };
@@ -202,7 +198,7 @@ where
 /// fractions, then pairwise fraction-summation layers up to the root.
 pub fn compute_logup_layers<F, E>(
     interactions: &[BusInteraction],
-    main_segment_cols: &[Vec<FieldElement<F>>],
+    main: &Table<F>,
     trace_len: usize,
     challenges: &[FieldElement<E>],
 ) -> Vec<Layer<E>>
@@ -211,7 +207,7 @@ where
     E: IsField + Send + Sync,
 {
     let (numerators, denominators) =
-        compute_logup_leaf_fractions(interactions, main_segment_cols, trace_len, challenges);
+        compute_logup_leaf_fractions(interactions, main, trace_len, challenges);
     gen_layers(Layer::LogUpGeneric {
         numerators,
         denominators,
@@ -245,7 +241,7 @@ pub struct LogUpGkrResult<E: IsField> {
 /// use — the aux-trace build recomputes it to keep this result small).
 pub fn finalize_logup_gkr_result<F, E>(
     interactions: &[BusInteraction],
-    main_segment_cols: &[Vec<FieldElement<F>>],
+    main: &Table<F>,
     random_point: Vec<FieldElement<E>>,
     n_claim: FieldElement<E>,
     d_claim: FieldElement<E>,
@@ -257,18 +253,51 @@ where
 {
     let col_indices = extract_column_indices(interactions);
     let kernel = compute_lagrange_kernel(&random_point);
+    let k = col_indices.len();
+    let num_rows = main.height;
+
+    // All K inner products ⟨kernel, col_j⟩ in ONE row-major pass (per-chunk
+    // partial accumulators, reduced by field addition — value-identical to
+    // per-column sums, no column-major transpose of the segment).
+    let row_partial = |acc: &mut [FieldElement<E>], row_idx: usize| {
+        let row = main.get_row(row_idx);
+        let k_r = &kernel[row_idx];
+        for (j, &col_idx) in col_indices.iter().enumerate() {
+            // F×E (base operand LEFT).
+            acc[j] = &acc[j] + &(&row[col_idx] * k_r);
+        }
+    };
 
     #[cfg(feature = "parallel")]
-    let col_iter = col_indices.into_par_iter();
+    let claims: Vec<FieldElement<E>> = (0..num_rows)
+        .into_par_iter()
+        .fold(
+            || vec![FieldElement::<E>::zero(); k],
+            |mut acc, row_idx| {
+                row_partial(&mut acc, row_idx);
+                acc
+            },
+        )
+        .reduce(
+            || vec![FieldElement::<E>::zero(); k],
+            |mut a, b| {
+                for (x, y) in a.iter_mut().zip(b) {
+                    *x = &*x + &y;
+                }
+                a
+            },
+        );
     #[cfg(not(feature = "parallel"))]
-    let col_iter = col_indices.into_iter();
+    let claims: Vec<FieldElement<E>> = {
+        let mut acc = vec![FieldElement::<E>::zero(); k];
+        for row_idx in 0..num_rows {
+            row_partial(&mut acc, row_idx);
+        }
+        acc
+    };
 
-    let column_claims: Vec<(usize, FieldElement<E>)> = col_iter
-        .map(|col_idx| {
-            let claim = eval_mle_base_with_kernel(&main_segment_cols[col_idx], &kernel);
-            (col_idx, claim)
-        })
-        .collect();
+    let column_claims: Vec<(usize, FieldElement<E>)> =
+        col_indices.into_iter().zip(claims).collect();
 
     LogUpGkrResult {
         table_contribution,
@@ -388,15 +417,16 @@ pub(crate) fn build_gkr_aux_columns<F, E>(
     let bridge_offset = &challenges[LOGUP_BRIDGE_OFFSET_IDX];
 
     let kernel = compute_lagrange_kernel(random_point);
-    let main_segment_cols = trace.columns_main();
 
-    // batched[i] = Σ_j γ^j·col_j[i] + γ^K·l[i] — row-parallel, matches the
-    // bridge constraint's batched sum exactly.
-    let batched_at_row = |row: usize| {
-        let mut acc = &gamma_powers[k] * &kernel[row];
+    // batched[i] = Σ_j γ^j·col_j[i] + γ^K·l[i] — row-parallel over borrowed
+    // row-major rows (no column-major clone of the main segment), matching
+    // the bridge constraint's batched sum exactly.
+    let batched_at_row = |row_idx: usize| {
+        let row = trace.main_table.get_row(row_idx);
+        let mut acc = &gamma_powers[k] * &kernel[row_idx];
         for (j, &col_idx) in column_indices.iter().enumerate() {
             // col·γ is F×E (base operand LEFT).
-            acc += &main_segment_cols[col_idx][row] * &gamma_powers[j];
+            acc += &row[col_idx] * &gamma_powers[j];
         }
         acc
     };
@@ -541,7 +571,7 @@ mod tests {
     fn leaf_fractions_single_sender() {
         let trace_len = 4;
         let col0: Vec<FE> = [10u64, 20, 30, 40].iter().map(|&v| FE::from(v)).collect();
-        let main_segment_cols = vec![col0.clone()];
+        let main_segment_cols = Table::from_columns(vec![col0.clone()]);
         let interactions = vec![BusInteraction::sender(
             1u64,
             Multiplicity::One,
@@ -573,7 +603,7 @@ mod tests {
         let trace_len = 4;
         let col0: Vec<FE> = [5u64, 6, 7, 8].iter().map(|&v| FE::from(v)).collect();
         let col1: Vec<FE> = [2u64, 0, 1, 3].iter().map(|&v| FE::from(v)).collect();
-        let main_segment_cols = vec![col0.clone(), col1.clone()];
+        let main_segment_cols = Table::from_columns(vec![col0.clone(), col1.clone()]);
         let interactions = vec![BusInteraction::receiver(
             0u64,
             Multiplicity::Column(1),
@@ -606,7 +636,7 @@ mod tests {
         let trace_len = 2;
         let col0: Vec<FE> = [10u64, 20].iter().map(|&v| FE::from(v)).collect();
         let col1: Vec<FE> = [30u64, 40].iter().map(|&v| FE::from(v)).collect();
-        let main_segment_cols = vec![col0.clone(), col1.clone()];
+        let main_segment_cols = Table::from_columns(vec![col0.clone(), col1.clone()]);
         let interactions = vec![
             BusInteraction::sender(0u64, Multiplicity::One, Packing::Direct.columns(&[0])),
             BusInteraction::receiver(1u64, Multiplicity::One, Packing::Direct.columns(&[1])),
@@ -721,7 +751,10 @@ mod tests {
             .iter()
             .map(|&v| FE::from(v))
             .collect();
-        let main_segment_cols = vec![col0, col1, col2];
+        // The standard term-column path takes column-major vectors; the GKR
+        // path reads the row-major table — same data, both representations.
+        let columns = vec![col0, col1, col2];
+        let main_segment_cols = Table::from_columns(columns.clone());
 
         let interactions = vec![
             BusInteraction::sender(3u64, Multiplicity::One, Packing::Direct.columns(&[0])),
@@ -735,7 +768,7 @@ mod tests {
         for inter in &interactions {
             let terms = crate::lookup::compute_logup_term_column::<F, F>(
                 &[inter],
-                &main_segment_cols,
+                &columns,
                 trace_len,
                 &challenges,
                 "oracle",

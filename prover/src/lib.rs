@@ -1334,6 +1334,13 @@ pub fn prove_gkr_with_options_and_inputs(
     proof_options: &ProofOptions,
     max_rows: &MaxRowsConfig,
 ) -> Result<GkrVmProof, Error> {
+    // Wall-clock span tree (same output as the standard path's timeline, so
+    // GKR-vs-standard phase breakdowns compare directly under `instruments`).
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_total");
+
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -1398,6 +1405,17 @@ pub fn prove_gkr_with_options_and_inputs(
         storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    #[cfg(feature = "instruments")]
+    {
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
+    }
 
     Ok(GkrVmProof {
         proof,

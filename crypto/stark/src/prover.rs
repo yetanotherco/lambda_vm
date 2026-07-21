@@ -2659,23 +2659,33 @@ pub trait IsStarkProver<
             // Transient: consumed by the batch prove below, freed before the
             // aux/LDE phases — this transience is where GKR's memory win over
             // committed term columns lives.
+            #[cfg(feature = "instruments")]
+            let __sp_gkr = crate::instruments::span("r1_gkr_trees");
             let layers_per_instance: Vec<Vec<crate::gkr::Layer<FieldExtension>>> =
                 crate::par::par_map_collect(0..gkr_indices.len(), |k| {
                     let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
                     compute_logup_layers(
                         air.bus_interactions(),
-                        &trace.columns_main(),
+                        &trace.main_table,
                         trace.num_rows(),
                         &lookup_challenges,
                     )
                 });
+            #[cfg(feature = "instruments")]
+            drop(__sp_gkr);
 
+            #[cfg(feature = "instruments")]
+            let __sp_gkr = crate::instruments::span("r1_gkr_batch_prove");
             let (batch_gkr_proof, shared_point, final_claims) =
                 gkr_prove_batch(layers_per_instance, transcript);
+            #[cfg(feature = "instruments")]
+            drop(__sp_gkr);
 
             // Per-instance finalize (parallel): column-claim MLE evaluations at
             // the instance random point (the per-column ⟨l, col⟩ inner products
             // are the heavy part).
+            #[cfg(feature = "instruments")]
+            let __sp_gkr = crate::instruments::span("r1_gkr_finalize");
             let results: Vec<LogUpGkrResult<FieldExtension>> =
                 crate::par::par_map_collect(0..gkr_indices.len(), |k| {
                     let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
@@ -2689,13 +2699,15 @@ pub trait IsStarkProver<
                             .expect("honest GKR root denominator is nonzero");
                     finalize_logup_gkr_result(
                         air.bus_interactions(),
-                        &trace.columns_main(),
+                        &trace.main_table,
                         random_point,
                         n_claim,
                         d_claim,
                         table_contribution,
                     )
                 });
+            #[cfg(feature = "instruments")]
+            drop(__sp_gkr);
 
             // Phase B″: bind every table's column claims into the shared
             // transcript, THEN sample γ — the claims must precede the challenge
