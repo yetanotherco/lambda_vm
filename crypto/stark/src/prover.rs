@@ -512,8 +512,15 @@ where
     F: IsField,
     FieldElement<F>: AsBytes,
 {
-    /// Evaluations of the composition polynomial parts over the LDE domain.
-    pub(crate) lde_composition_poly_evaluations: Vec<Vec<FieldElement<F>>>,
+    /// Host-side evaluations of the composition polynomial parts over the LDE
+    /// domain. `Some` on the CPU path and while the composition LDE is retained
+    /// on host (Steps A–C2, and C4 under `GPU_RETAIN_COMPOSITION_HOST`); `None`
+    /// when the composition LDE is device-only (C4), so every host consumer must
+    /// handle the device-only case explicitly instead of indexing empty data.
+    pub(crate) host_composition_lde: Option<Vec<Vec<FieldElement<F>>>>,
+    /// Number of composition parts, always available even when the host LDE is
+    /// dropped (device-only). Equals `air.composition_poly_degree_bound / trace_length`.
+    pub(crate) num_composition_parts: usize,
     /// The Merkle tree built to compute the commitment to the composition polynomial parts.
     pub(crate) composition_poly_merkle_tree: BatchedMerkleTree<F>,
     /// The commitment to the composition polynomial parts.
@@ -524,6 +531,23 @@ where
     /// `None` on the CPU path.
     #[cfg(feature = "cuda")]
     pub(crate) gpu_composition_tree: Option<math_cuda::lde::GpuMerkleTree>,
+}
+
+impl<F> Round2<F>
+where
+    F: IsField,
+    FieldElement<F>: AsBytes,
+{
+    /// The host composition-LDE evaluations. Panics if the composition LDE is
+    /// device-only (`host_composition_lde` is `None`): every caller of this must
+    /// be on a path that retained the host copy. The device-only paths read the
+    /// resident handle instead and never call this.
+    pub(crate) fn host_evals(&self) -> &[Vec<FieldElement<F>>] {
+        self.host_composition_lde
+            .as_ref()
+            .expect("host composition LDE present (device-only paths must read the resident handle)")
+            .as_slice()
+    }
 }
 
 /// A container for the results of the third round of the STARK Prove protocol.
@@ -1403,8 +1427,10 @@ pub trait IsStarkProver<
             }
         }
 
+        let num_composition_parts = lde_composition_poly_parts_evaluations.len();
         Ok(Round2 {
-            lde_composition_poly_evaluations: lde_composition_poly_parts_evaluations,
+            host_composition_lde: Some(lde_composition_poly_parts_evaluations),
+            num_composition_parts,
             composition_poly_merkle_tree,
             composition_poly_root,
             #[cfg(feature = "cuda")]
@@ -1424,7 +1450,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.num_composition_parts;
         let z_power = z.pow(num_parts);
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
@@ -1437,7 +1463,7 @@ pub trait IsStarkProver<
         let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
         let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .lde_composition_poly_evaluations
+            .host_evals()
             .iter()
             .map(|lde_evals| {
                 // Extract trace-size evaluations (stride = blowup_factor)
@@ -1541,7 +1567,7 @@ pub trait IsStarkProver<
 
         let gamma = transcript.sample_field_element();
 
-        let n_terms_composition_poly = round_2_result.lde_composition_poly_evaluations.len();
+        let n_terms_composition_poly = round_2_result.num_composition_parts;
         // g·z pruning: only the current-row block (all columns) plus the masked
         // next-row columns get an opening / DEEP coefficient.
         let layout = Self::ood_layout(air);
@@ -1679,7 +1705,7 @@ pub trait IsStarkProver<
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
-        let num_parts = round_2_result.lde_composition_poly_evaluations.len();
+        let num_parts = round_2_result.num_composition_parts;
         let z_power = z.pow(num_parts); // pole for H terms
 
         // Number of evaluation points per trace column (= transition_offsets.len() * step_size)
@@ -1728,7 +1754,7 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        &round_2_result.lde_composition_poly_evaluations,
+                        round_2_result.host_evals(),
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -1764,7 +1790,7 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    &round_2_result.lde_composition_poly_evaluations,
+                    round_2_result.host_evals(),
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -1830,7 +1856,7 @@ pub trait IsStarkProver<
 
             // H terms
             for j in 0..num_parts {
-                let h_j_val = &round_2_result.lde_composition_poly_evaluations[j][i];
+                let h_j_val = &round_2_result.host_evals()[j][i];
                 let h_j_ood = &h_ood[j];
                 result += &composition_poly_gammas[j] * (h_j_val - h_j_ood) * &inv_h[i];
             }
@@ -2335,14 +2361,14 @@ pub trait IsStarkProver<
                     if let Some(proofs) = &comp_dev_proofs {
                         let host = Self::open_composition_poly_with_proof(
                             proofs[qi].clone(),
-                            &round_2_result.lde_composition_poly_evaluations,
+                            round_2_result.host_evals(),
                             *index,
                         );
                         // C2 cross-check: the values gathered off the resident
                         // handle must equal the host values (host authoritative).
                         if let Some(dev_vals) = comp_dev_values.as_ref() {
                             let num_parts_comp =
-                                round_2_result.lde_composition_poly_evaluations.len();
+                                round_2_result.num_composition_parts;
                             let (even, odd) = Self::device_row_pair::<FieldExtension>(
                                 dev_vals,
                                 qi,
@@ -2361,7 +2387,7 @@ pub trait IsStarkProver<
                     } else {
                         Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,
-                            &round_2_result.lde_composition_poly_evaluations,
+                            round_2_result.host_evals(),
                             *index,
                         )
                     }
@@ -2370,7 +2396,7 @@ pub trait IsStarkProver<
                 {
                     Self::open_composition_poly(
                         &round_2_result.composition_poly_merkle_tree,
-                        &round_2_result.lde_composition_poly_evaluations,
+                        round_2_result.host_evals(),
                         *index,
                     )
                 }
