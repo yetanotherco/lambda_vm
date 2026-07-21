@@ -122,12 +122,19 @@ prune_worktree_cache() {
     git worktree remove --force "$wt" >/dev/null 2>&1 || rm -rf "$wt"
     rm -f "$WORK"/result_"${s8}"_*.txt "$WORK"/blob_"${s8}"_*.bin \
           "$WORK"/build_guest_"${s8}".log "$WORK"/dump_"${s8}"*.log \
-          "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}" \
+          "$WORK"/measure_"${s8}"*.err "$WORK"/measure_cli_"${s8}"* \
           "$WORK"/build_cli_"${s8}".log
   done <<< "$stale"
   git worktree prune >/dev/null 2>&1 || true
 }
 prune_worktree_cache
+
+# One-time sweep of the retired single-CLI scheme's fixed-name artifacts. Before this
+# script measured per ref it built one shared counter at $WORK/measure_cli (+ its .sha
+# marker and build_measure_cli.log). Those are never written or read anymore, and their
+# fixed names escape the per-SHA prune globs above, so on the long-lived bench runner
+# they would linger forever. Drop them so the disk-bounding claim actually holds.
+rm -f "$WORK"/measure_cli "$WORK"/measure_cli.sha "$WORK"/build_measure_cli.log
 
 echo "==> Refs"
 git fetch origin --quiet || echo "WARNING: 'git fetch origin' failed — resolving against possibly-stale local refs." >&2
@@ -272,6 +279,19 @@ measure_ref() {
   fi
   echo "==> [$role] guest ELF: $(basename "$guest_elf")" >&2
 
+  # The measuring CLI is now built from THIS ref (step 2c2), not from main. The old
+  # shared-from-main counter always carried the `execute --cycles` keccak/ecsm counters
+  # (#807, 7dbbb1ff), so it could measure any ref; a per-ref CLI can only if THIS ref has
+  # them. A ref predating #807 still builds a `cli` that runs, but prints no
+  # `Keccak calls:` line — the parse in step 2d would then fail late with an opaque
+  # message. Refuse up front (before the expensive blob dump), matching the other
+  # "ref predates X" guards below. The default baseline origin/main always has #807, so
+  # normal PR-vs-main runs never hit this; it only bites a deliberately old baseline.
+  if ! grep -q "Keccak calls:" "$wt/bin/cli/src/main.rs" 2>/dev/null; then
+    echo "ERROR: [$role] ref $ref ($sha8) predates the execute --cycles keccak/ecsm counters (#807, 7dbbb1ff): its CLI emits no 'Keccak calls:' line, so guest cycles/keccak are not measurable. Use a baseline at or after #807." >&2
+    exit 1
+  fi
+
   # 2c. Generate this ref's own input blob via its ignored dump test, unless a
   # cached blob covers this sha/preset already (need_dump=0). Refuse up front if
   # the ref predates a needed knob, instead of failing in-VM verification later.
@@ -333,8 +353,11 @@ measure_ref() {
   # built from the same ref — a CLI built from another ref (e.g. main) would abort with
   # UnknownSyscall. Share HOST_TARGET_DIR (when set) with the blob-dump build so common
   # native deps are already compiled, and copy the result out so a shared target dir's
-  # `cli` isn't clobbered by the other ref's build. The per-ref binary name encodes the
-  # SHA, so it doubles as its own cache (rebuilt only on REBUILD=1 or first sight).
+  # `cli` isn't clobbered by the other ref's build. The copy-out is ATOMIC (cp to a tmp
+  # path + mv within $WORK), so a run killed mid-copy can never leave a truncated-but-
+  # executable binary that the `[ -x ]` reuse check would then trust — matching the
+  # atomic tmp+mv used for result files below. The per-ref binary name encodes the SHA,
+  # so it doubles as its own cache (rebuilt only on REBUILD=1 or first sight).
   local measure_cli="$WORK/measure_cli_${sha8}"
   if [ "${REBUILD:-0}" = "1" ] || [ ! -x "$measure_cli" ]; then
     echo "==> [$role] building measuring CLI (cli, release) @ $sha8 ..." >&2
@@ -345,15 +368,16 @@ measure_ref() {
         tail -40 "$clilog" >&2
         exit 1
       fi
-      cp "$HOST_TARGET_DIR/release/cli" "$measure_cli"
+      cp "$HOST_TARGET_DIR/release/cli" "$measure_cli.tmp"
     else
       if ! ( cd "$wt" && cargo build --release -p cli ) >"$clilog" 2>&1; then
         echo "ERROR: [$role] cli build failed for $ref ($sha8). Tail of $clilog:" >&2
         tail -40 "$clilog" >&2
         exit 1
       fi
-      cp "$wt/target/release/cli" "$measure_cli"
+      cp "$wt/target/release/cli" "$measure_cli.tmp"
     fi
+    mv -f "$measure_cli.tmp" "$measure_cli"
   else
     echo "==> [$role] reusing cached measuring CLI ($measure_cli)" >&2
   fi
