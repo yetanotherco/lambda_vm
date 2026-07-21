@@ -145,3 +145,73 @@ the box (time and peak heap vs Stage 1 and vs the pre-fix branch).
   today; Stage 2 expected ≈ today or better (leaf cross-multiplication was
   the single largest GKR phase and it dissolves into cheaper on-the-fly
   evals).
+
+## Stage 2 implementation spec (refined after Stage 1's OOM on ethrex-10tx)
+
+Stage 1 measured: simple-tx 32.8 s / 33.8 GB peak (pre-fix GKR: 27.3 GB on
+the BIGGER 10tx workload); 10tx OOMs a 62 GiB box. The deep layers must
+never be materialized — the deepest alone is K̂N/2 pairs (~13 GB for CPU).
+
+**Seam:** `gkr_prove_batch` takes `Vec<GkrInstance<E>>` instead of
+`Vec<Vec<Layer<E>>>`:
+
+```rust
+pub struct GkrInstance<E: IsField> {
+    /// Layers from size N up to the root (tree indices input_vars..), built
+    /// by gen_layers from the N-sized cross-multiplied fractions — EXACTLY
+    /// today's tree.
+    pub upper_layers: Vec<Layer<E>>,
+    /// log2(K̂); 0 = fully materialized instance (old behavior).
+    pub input_num_vars: usize,
+    /// Streams the K̂ leaf pairs of a row range: out[r][k] = (±m_k, fp_k),
+    /// padding (0,1). Boxed closure built in logup_gkr.rs over
+    /// (interactions, main table, challenges). Send + Sync for chunked
+    /// parallel streaming.
+    pub input_oracle: Option<Box<dyn RowLeafOracle<E>>>,
+}
+```
+
+**Deep layer j (child tree index input_vars − j, j = 1..=input_vars) —
+per-instance state:** the k-weight vector `w: Vec<(E, E)>` (numerator/
+denominator weights... NO — weights are scalars): after r bound challenges
+c_1..c_r of this layer, the partially-folded child entry at (row i, slot t)
+= Σ_{k in block(t)} w[k mod 2^?]·leaf — maintain `w: Vec<E>` of length
+2^(k_bits_remaining_at_round_r)… concretely: at layer j the child has
+K_j = K̂/2^(j−1) k-slots per row. Sumcheck round r < log2(K_j) − ... the
+k-bit rounds fold w: w'[t] = (1−c)·w[2t] + c·w[2t+1] starting from
+w = [1; K_j]-shaped identity per slot pair… implement as: fold_weights
+matrix W (K_j columns → shrinking), where folded_child(row, t) =
+Σ_k W[t][k]·leaf(row, k) with W starting as identity blocks and each
+challenge combining adjacent column groups. Store W as one Vec<E> of len
+K_j (per current slot: the run of leaf weights) — because folds only ever
+combine ADJACENT full blocks, W is fully described by one weight per leaf:
+w[k], with slot t owning the contiguous range [t·2^r, (t+1)·2^r). Update
+per round: for k in block: new_w[k] = w[k] · ((1−c) if k's bit r == 0 else
+c). So: ONE Vec<E> of length K_j, O(K_j) update per round. Folded child
+entry (row, t) = Σ_{k in slot t's range} w[k]·leaf(row, k).
+
+**k-bit rounds (streamed):** h(0)/h(2) accumulate over parent entries =
+(row, parent slot). Per row chunk: oracle streams the K̂ leaves once per
+round; for each parent slot pair compute the two folded-child values via w;
+gate as usual; eq factor = eq_k(remaining k-bits) ⊗ eq_row(all row bits) —
+eq_row is the standard table (size N, halved only during ROW rounds, so
+during k rounds it stays full and multiplies per row); eq_k is tiny. Fold
+after challenge: update w only (no table exists). Parallel over row chunks
+(rayon fold/reduce as in the current PAR_SUM paths).
+
+**Row-bit rounds:** once k-bits of the layer are exhausted (r = log2 slots),
+materialize the folded child as FOUR N-sized tables (nl/nr/dl/dr where
+l/r split is now on the LOWEST ROW BIT — one more stream applying w) and
+fall through to the EXISTING materialized code path for the remaining
+rounds (eq pre-halving, SVO if applicable, fold_table). Free at layer end.
+
+**Costs:** streams per deep layer = (k-bit rounds + 1 materialization)
+≈ log2(K̂)−j+2; total ≈ 21 streams for K̂ = 64, each O(N·(K fingerprints +
+K̂ muls)) — chunk-parallel. Peak memory: eq_row (N) + the 4 N-sized tables
+at handoff = today's footprint.
+
+**The gate:** Stage 2 is prover-internal only — same transcript, same
+values. Same seed ⇒ BYTE-IDENTICAL proofs vs Stage 1. Differential-test on
+fixtures small enough for Stage 1 (unit AIRs + the gkr_mode_tests suite),
+plus the ethrex-10tx run that Stage 1 OOMs (memory gate: peak ≤ pre-fix
++ ~1 GB; correctness gate: verifies).
