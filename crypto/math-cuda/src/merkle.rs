@@ -400,7 +400,6 @@ fn build_comp_poly_tree_nodes_dev(
     let lde_size = ext3_elems;
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
     let num_leaves = lde_size / 2;
-    let tight_total_nodes = 2 * num_leaves - 1;
 
     let be = backend()?;
     let stream = be.next_stream();
@@ -420,9 +419,28 @@ fn build_comp_poly_tree_nodes_dev(
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
     stream.synchronize()?;
+    crate::stagebytes::add_comp_merkle_h2d(mb * lde_size * 8);
     drop(staging);
 
-    // Leaves into tail of a tight node buffer.
+    let nodes_dev = comp_poly_leaves_and_tree(&buf, m, lde_size, &stream)?;
+    Ok((nodes_dev, num_leaves, stream))
+}
+
+/// Row-pair Keccak leaves + inner tree levels over a device-resident comp-poly
+/// LDE buffer in slab layout `buf[(part*3 + k) * lde_size + r]` (`m` parts).
+/// Shared by the host-evals path (which packs + H2Ds into `buf` first) and the
+/// device-buf path (which reuses an already-resident `GpuLdeExt3` buffer, so no
+/// re-upload). Returns the tight node buffer (`(2*num_leaves - 1) * 32` bytes,
+/// root at 0, leaves at the tail).
+fn comp_poly_leaves_and_tree(
+    buf: &CudaSlice<u64>,
+    m: usize,
+    lde_size: usize,
+    stream: &Arc<CudaStream>,
+) -> Result<CudaSlice<u8>> {
+    let be = backend()?;
+    let num_leaves = lde_size / 2;
+    let tight_total_nodes = 2 * num_leaves - 1;
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
     let leaves_offset_bytes = (num_leaves - 1) * 32;
     {
@@ -436,7 +454,7 @@ fn build_comp_poly_tree_nodes_dev(
         unsafe {
             stream
                 .launch_builder(&be.keccak_comp_poly_leaves_ext3)
-                .arg(&buf)
+                .arg(buf)
                 .arg(&col_stride_u64)
                 .arg(&num_parts_u64)
                 .arg(&num_rows_u64)
@@ -445,9 +463,37 @@ fn build_comp_poly_tree_nodes_dev(
                 .launch(cfg)?;
         }
     }
-
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-    Ok((nodes_dev, num_leaves, stream))
+    Ok(nodes_dev)
+}
+
+/// Build the comp-poly Merkle tree directly from an already-resident device LDE
+/// buffer (slab layout `buf[(part*3 + k) * lde_size + r]`, `m` parts), skipping
+/// the host pack + H2D that [`build_comp_poly_tree_from_evals_ext3_keep`] does.
+/// Used when the extended composition LDE is already on device (the `_keep`
+/// extend handle). Returns the tree kept resident, root copied to host.
+pub fn build_comp_poly_tree_from_dev_buf(
+    buf: &CudaSlice<u64>,
+    m: usize,
+    lde_size: usize,
+) -> Result<crate::lde::GpuMerkleTree> {
+    assert!(lde_size.is_power_of_two() && lde_size >= 2);
+    assert!(
+        buf.len() >= 3 * m * lde_size,
+        "device buf must hold at least 3*m*lde_size u64s"
+    );
+    let be = backend()?;
+    let stream = be.next_stream();
+    let num_leaves = lde_size / 2;
+    let nodes_dev = comp_poly_leaves_and_tree(buf, m, lde_size, &stream)?;
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+    stream.synchronize()?;
+    Ok(crate::lde::GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    })
 }
 
 /// Build the comp poly Merkle tree on device and keep the nodes resident
@@ -466,6 +512,30 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep(
         leaves_len: num_leaves,
         root,
     })
+}
+
+/// Parity harness for [`build_comp_poly_tree_from_dev_buf`]: pack `num_parts`
+/// interleaved ext3 eval columns into slab layout, upload to a device buffer,
+/// and build the tree via the device-buf path. Lets the parity suite exercise
+/// the resident-handle Merkle commit (Step B) directly, for any `m`, without a
+/// prior LDE. `parts_interleaved[i]` is `3*lde_size` u64s.
+#[doc(hidden)]
+pub fn build_comp_poly_tree_from_host_parts_via_dev_buf(
+    parts_interleaved: &[&[u64]],
+) -> Result<crate::lde::GpuMerkleTree> {
+    assert!(!parts_interleaved.is_empty());
+    let m = parts_interleaved.len();
+    let lde_size = parts_interleaved[0].len() / 3;
+    for p in parts_interleaved.iter() {
+        assert_eq!(p.len(), 3 * lde_size);
+    }
+    let be = backend()?;
+    let stream = be.next_stream();
+    let mut host = vec![0u64; 3 * m * lde_size];
+    pack_ext3_to_pinned_slabs(parts_interleaved, &mut host, lde_size);
+    let buf = stream.clone_htod(&host)?;
+    stream.synchronize()?;
+    build_comp_poly_tree_from_dev_buf(&buf, m, lde_size)
 }
 
 /// Test-only parity harness: build a FRI layer Merkle tree on device from an

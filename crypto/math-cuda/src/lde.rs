@@ -1519,15 +1519,43 @@ pub fn coset_lde_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    coset_lde_batch_ext3_into_inner(columns, n, blowup_factor, weights, outputs, false)?;
+    Ok(())
+}
+
+/// Like [`coset_lde_batch_ext3_into`] but also retains the device buffer and
+/// returns it as a [`GpuLdeExt3`] handle (slab layout `(c*3+k)*lde_size`), so
+/// the composition Merkle commit and DEEP can reuse it without re-uploading it
+/// from host. The host `outputs` are still filled (compat with the existing R4
+/// composition openings, which still read the host evals).
+pub fn coset_lde_batch_ext3_into_keep(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<GpuLdeExt3> {
+    let opt = coset_lde_batch_ext3_into_inner(columns, n, blowup_factor, weights, outputs, true)?;
+    Ok(opt.expect("keep_device_buf=true must return Some"))
+}
+
+fn coset_lde_batch_ext3_into_inner(
+    columns: &[&[u64]],
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+    keep_device_buf: bool,
+) -> Result<Option<GpuLdeExt3>> {
     if columns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     let m = columns.len();
     assert_eq!(outputs.len(), m, "outputs must match columns count");
     // Empty domain must short-circuit before the power-of-two assert
     // (is_power_of_two returns false for 0).
     if n == 0 {
-        return Ok(());
+        return Ok(None);
     }
     assert!(n.is_power_of_two(), "n must be a power of two");
     assert_eq!(weights.len(), n, "weights length must match n");
@@ -1631,7 +1659,19 @@ pub fn coset_lde_batch_ext3_into(
     // ext3-per-element layout.
     unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
     drop(staging);
-    Ok(())
+    if keep_device_buf {
+        // Same slab layout the comp-poly Merkle kernel and DEEP expect:
+        // `buf[(c*3 + k) * lde_size + r]`.
+        Ok(Some(GpuLdeExt3 {
+            buf: std::sync::Arc::new(buf),
+            m,
+            lde_size,
+            tree: None,
+        }))
+    } else {
+        drop(buf);
+        Ok(None)
+    }
 }
 
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched

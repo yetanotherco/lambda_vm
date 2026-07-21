@@ -274,5 +274,6 @@ pub fn eval_composition_on_device(
     }
     let out = stream.clone_dtoh(&d_h)?;
     stream.synchronize()?;
+    crate::stagebytes::add_comp_dh_d2h(out.len() * 8);
     Ok(out)
 }

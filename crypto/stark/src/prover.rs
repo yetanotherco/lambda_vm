@@ -1144,6 +1144,7 @@ pub trait IsStarkProver<
         constraint_evaluations: &[FieldElement<FieldExtension>],
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
+        #[cfg(feature = "cuda")] gpu_parts_out: &mut Option<math_cuda::lde::GpuLdeExt3>,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1180,9 +1181,12 @@ pub trait IsStarkProver<
         // GPU fast path: batch both halves into one ext3 LDE call. Requires
         // `cuda` feature and a qualifying size. Falls through to CPU when not.
         #[cfg(feature = "cuda")]
-        if let Some((lde_h0, lde_h1)) =
+        if let Some((lde_h0, lde_h1, handle)) =
             crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
         {
+            // Hand the resident extended-LDE buffer to the session so the
+            // composition Merkle commit and DEEP reuse it (mirrors the d>2 path).
+            *gpu_parts_out = Some(handle);
             return vec![lde_h0, lde_h1];
         }
 
@@ -1268,7 +1272,19 @@ pub trait IsStarkProver<
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
-            Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            #[cfg(feature = "cuda")]
+            {
+                Self::decompose_and_extend_d2(
+                    &constraint_evaluations,
+                    domain,
+                    twiddles,
+                    &mut gpu_composition_parts,
+                )
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
+            }
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
             vec![constraint_evaluations]
@@ -1330,12 +1346,25 @@ pub trait IsStarkProver<
         // copy) and returns a root only host tree. The device tree is threaded
         // to R4 in `Round2.gpu_composition_tree`.
         #[cfg(feature = "cuda")]
-        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) =
-            match crate::gpu_lde::try_build_comp_poly_tree_gpu::<
-                FieldExtension,
-                BatchedMerkleTreeBackend<FieldExtension>,
-            >(&lde_composition_poly_parts_evaluations)
-            {
+        let (composition_poly_merkle_tree, composition_poly_root, gpu_composition_tree) = {
+            // Prefer the resident extended-LDE handle (no host re-upload); fall
+            // back to committing from the host eval Vecs when there is no handle
+            // (e.g. the CPU-extend path or the d>2 branch), then to full CPU.
+            // GPU_NO_RESIDENT_MERKLE=1 forces the host-evals re-upload (the
+            // pre-Step-B path) for interleaved A-B-B-A measurement.
+            let use_handle =
+                gpu_composition_parts.is_some() && !crate::gpu_lde::merkle_resident_disabled();
+            let gpu_tree = if use_handle {
+                crate::gpu_lde::try_build_comp_poly_tree_from_handle::<
+                    BatchedMerkleTreeBackend<FieldExtension>,
+                >(gpu_composition_parts.as_ref().unwrap())
+            } else {
+                crate::gpu_lde::try_build_comp_poly_tree_gpu::<
+                    FieldExtension,
+                    BatchedMerkleTreeBackend<FieldExtension>,
+                >(&lde_composition_poly_parts_evaluations)
+            };
+            match gpu_tree {
                 Some((host_tree, dev_tree)) => {
                     let root = host_tree.root;
                     (host_tree, root, Some(dev_tree))
@@ -1348,7 +1377,8 @@ pub trait IsStarkProver<
                     .ok_or(ProvingError::EmptyCommitment)?;
                     (tree, root, None)
                 }
-            };
+            }
+        };
         #[cfg(not(feature = "cuda"))]
         let (composition_poly_merkle_tree, composition_poly_root) =
             crate::commitment::commit_bit_reversed(
@@ -1366,7 +1396,11 @@ pub trait IsStarkProver<
         // R2 to R4). The host evaluations stay in `Round2` for R4 openings.
         #[cfg(feature = "cuda")]
         if let Some(handle) = gpu_composition_parts {
-            round_1_result.lde_trace.set_gpu_composition_parts(handle);
+            // GPU_NO_RESIDENT_DEEP=1 withholds the handle so DEEP re-uploads
+            // (the pre-Step-A baseline), for interleaved A-B-B-A measurement.
+            if !crate::gpu_lde::deep_resident_disabled() {
+                round_1_result.lde_trace.set_gpu_composition_parts(handle);
+            }
         }
 
         Ok(Round2 {

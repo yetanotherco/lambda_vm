@@ -490,7 +490,11 @@ pub(crate) fn try_extend_two_halves_gpu<F, E>(
     h0: &[FieldElement<E>],
     h1: &[FieldElement<E>],
     domain: &Domain<F>,
-) -> Option<(Vec<FieldElement<E>>, Vec<FieldElement<E>>)>
+) -> Option<(
+    Vec<FieldElement<E>>,
+    Vec<FieldElement<E>>,
+    math_cuda::lde::GpuLdeExt3,
+)>
 where
     F: IsFFTField + IsField + 'static,
     E: IsField + 'static,
@@ -524,6 +528,7 @@ where
     };
     let h0_raw = to_u64(h0);
     let h1_raw = to_u64(h1);
+    math_cuda::stagebytes::add_comp_h01_h2d((h0_raw.len() + h1_raw.len()) * 8);
 
     // weights[k] = g^(-k) / N as a u64.
     let inv_n = FieldElement::<F>::from(n as u64).inv().expect("N nonzero");
@@ -545,7 +550,7 @@ where
     // Two ext3 columns (h0 + h1), each composed of 3 base-field components.
     const NUM_COLS: usize = 2;
     GPU_LDE_CALLS.fetch_add((NUM_COLS * 3) as u64, Ordering::Relaxed);
-    {
+    let handle = {
         let inputs: [&[u64]; 2] = [&h0_raw, &h1_raw];
         // View each output Vec<FieldElement<E>> as &mut [u64] of length 3*lde_size.
         let out0_ptr = lde_h0.as_mut_ptr() as *mut u64;
@@ -558,14 +563,25 @@ where
         let out0_slice = unsafe { from_raw_parts_mut(out0_ptr, ext3_len) };
         let out1_slice = unsafe { from_raw_parts_mut(out1_ptr, ext3_len) };
         let mut outputs: [&mut [u64]; 2] = [out0_slice, out1_slice];
-        if math_cuda::lde::coset_lde_batch_ext3_into(&inputs, n, blowup, &weights_u64, &mut outputs)
-            .is_err()
-        {
-            return None;
-        }
-    }
+        // `_keep` fills the host `outputs` (still consumed by R4 openings) AND
+        // retains the device buffer as a handle, so the Merkle commit and DEEP
+        // reuse it instead of re-uploading the parts.
+        let h = match math_cuda::lde::coset_lde_batch_ext3_into_keep(
+            &inputs,
+            n,
+            blowup,
+            &weights_u64,
+            &mut outputs,
+        ) {
+            Ok(h) => h,
+            Err(_) => return None,
+        };
+        // The host D2H the `_into`/`_keep` still performs for compatibility.
+        math_cuda::stagebytes::add_comp_h01_lde_d2h((ext3_len * NUM_COLS) * 8);
+        h
+    };
 
-    Some((lde_h0, lde_h1))
+    Some((lde_h0, lde_h1, handle))
 }
 
 pub(crate) static GPU_LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -936,6 +952,54 @@ where
         Err(_) => return None,
     };
     debug_assert_eq!(dev_tree.leaves_len, lde_size / 2);
+    GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
+    let host = MerkleTree::<B>::from_root(dev_tree.root);
+    Some((host, dev_tree))
+}
+
+/// A-B-B-A toggles (profiling only): force the pre-residency behavior at runtime
+/// so baseline / Step A / Step A+B can be measured interleaved in one binary.
+/// `GPU_NO_RESIDENT_DEEP=1` makes DEEP re-upload the parts (disables Step A);
+/// `GPU_NO_RESIDENT_MERKLE=1` makes the comp-poly commit re-upload from host
+/// (disables Step B). Both default off (residency on).
+pub fn deep_resident_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_NO_RESIDENT_DEEP")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+pub fn merkle_resident_disabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_NO_RESIDENT_MERKLE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
+/// R2 GPU dispatch: build the composition-polynomial Merkle tree directly from
+/// the device-resident extended-LDE handle (the `_keep` extend buffer), skipping
+/// the host re-upload that [`try_build_comp_poly_tree_gpu`] performs. Same slab
+/// layout and kernels, so the root is identical. Returns `None` on a math-cuda
+/// `Err` (caller falls back to the host-evals path).
+pub(crate) fn try_build_comp_poly_tree_from_handle<B>(
+    handle: &math_cuda::lde::GpuLdeExt3,
+) -> Option<(MerkleTree<B>, math_cuda::lde::GpuMerkleTree)>
+where
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    if handle.lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    let dev_tree = math_cuda::merkle::build_comp_poly_tree_from_dev_buf(
+        &handle.buf,
+        handle.m,
+        handle.lde_size,
+    )
+    .ok()?;
+    debug_assert_eq!(dev_tree.leaves_len, handle.lde_size / 2);
     GPU_COMP_POLY_TREE_CALLS.fetch_add(1, Ordering::Relaxed);
     let host = MerkleTree::<B>::from_root(dev_tree.root);
     Some((host, dev_tree))
@@ -1509,6 +1573,7 @@ where
                     packed[(p * 3 + 2) * lde_size + r] = chunk[2];
                 }
             }
+            math_cuda::stagebytes::add_comp_deep_h2d(packed.len() * 8);
             parts_host_packed = packed;
             // Host inv_denoms required when going through this path; we
             // validated the slice length above.
@@ -1665,6 +1730,7 @@ pub(crate) fn gather_proofs_dev(
         stream,
     )
     .ok()?;
+    math_cuda::stagebytes::add_query_gather(bytes.len());
     let depth = tree.leaves_len.trailing_zeros() as usize;
     debug_assert_eq!(bytes.len(), positions.len() * depth * 32);
     let mut proofs = Vec::with_capacity(positions.len());

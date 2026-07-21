@@ -214,6 +214,7 @@ impl FriCommitState {
             let view = self.evals_a.slice(0..3 * n_out);
             self.stream.clone_dtoh(&view)?
         };
+        crate::stagebytes::add_fri_layer_d2h(layer_evals.len() * 8);
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
         // R4 query openings gather paths on device instead of copying the tree.
