@@ -33,7 +33,7 @@ use rayon::prelude::{
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::fri;
-use crate::fri::mmcs::MixedMmcs;
+use crate::fri::mmcs::{BorrowedMatrix, MixedMmcs};
 use crate::lookup::LOGUP_NUM_CHALLENGES;
 use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
@@ -791,12 +791,12 @@ pub trait IsStarkProver<
     /// preprocessed tables (`commit.num_precomputed_cols`); those stay
     /// committed separately via the existing hardcoded precomputed tree.
     ///
-    /// `main_ldes` is row-major in NATURAL order (row r = the LDE evaluation
-    /// at domain point r); `MixedMmcs::commit` requires row-major data
-    /// already permuted into BIT-REVERSED order, so this builds a temporary
-    /// permuted copy per table (see the Task 2 report's memory note). The
-    /// resulting single-matrix root is byte-identical to the existing
-    /// per-table row-pair tree root over the same column range.
+    /// `main_ldes` is row-major in NATURAL order (row r = the LDE evaluation at
+    /// domain point r). The MMCS reads its bit-reversed row-pair leaves straight
+    /// from these buffers via [`BorrowedMatrix::RowMajorNatural`] — no permuted
+    /// copy is materialized and the tree stores only digests. The resulting
+    /// single-matrix root is byte-identical to the existing per-table row-pair
+    /// tree root over the same column range.
     fn build_batched_main_mmcs(
         main_commits: &[TableCommit<Field>],
         main_ldes: &[(Vec<FieldElement<Field>>, usize)],
@@ -804,7 +804,7 @@ pub trait IsStarkProver<
     where
         FieldElement<Field>: AsBytes + Sync + Send,
     {
-        let mats: Vec<(Vec<FieldElement<Field>>, usize, usize)> = main_commits
+        let mats: Vec<BorrowedMatrix<Field>> = main_commits
             .iter()
             .zip(main_ldes.iter())
             .map(|(commit, (main_data, total_cols))| {
@@ -812,13 +812,13 @@ pub trait IsStarkProver<
                 let width = total_cols - col_start;
                 let num_rows = main_data.len() / total_cols;
                 let log_height = num_rows.trailing_zeros() as usize;
-                let mut data: Vec<FieldElement<Field>> = Vec::with_capacity(num_rows * width);
-                for r in 0..num_rows {
-                    let br = reverse_index(r, num_rows as u64);
-                    let src = br * total_cols + col_start;
-                    data.extend_from_slice(&main_data[src..src + width]);
+                BorrowedMatrix::RowMajorNatural {
+                    data: main_data.as_slice(),
+                    stride: *total_cols,
+                    col_start,
+                    width,
+                    log_height,
                 }
-                (data, log_height, width)
             })
             .collect();
 
@@ -2554,15 +2554,11 @@ pub trait IsStarkProver<
         }
 
         // Absorb ONE batched root over every table's main-split LDE, replacing
-        // the N per-table root absorptions above. This MMCS is transient: we
-        // only need its root for the transcript here; Round 4 still opens the
-        // existing per-table trees (kept in `main_commits`) unchanged.
-        //
-        // Task 5: rebuild this MMCS (or thread it through instead of dropping
-        // it) so Round 4 opens it directly and the per-table trees can be
-        // dropped. Until then this is a second full pass over every table's
-        // main LDE columns purely to extract a root — real, but transient,
-        // memory/CPU cost that the Task 10 perf gate should account for.
+        // the N per-table root absorptions above. This MMCS is KEPT (returned in
+        // `RoundsOneToThree`) so batched Round 4 opens every table's main columns
+        // from it directly. It stores only digests: its leaves are read on demand
+        // from the main LDE buffers already retained in `round1s` for DEEP (via
+        // `BorrowedMatrix`), so no copy of the LDE is duplicated here.
         let main_mmcs = Self::build_batched_main_mmcs(&main_commits, &main_ldes);
         transcript.append_bytes(&main_mmcs.root());
 
@@ -2845,12 +2841,16 @@ pub trait IsStarkProver<
 
         // Absorb ONE batched root over every aux-carrying table's LDE (batched
         // unified-shard plan), replacing the per-fork aux root absorptions. This
-        // MMCS is transient: only its root is needed for the transcript here;
-        // Round 4 still opens the per-table aux trees (kept in `aux_results`).
-        // Built AFTER Phase B LogUp challenges (aux depends on them) and BEFORE
-        // forking, so the shared aux root is bound into every fork.
+        // MMCS is KEPT (returned in `RoundsOneToThree`) so batched Round 4 opens
+        // every aux-carrying table from it directly; it stores only digests, its
+        // leaves read on demand from the aux LDE buffers retained in `round1s`
+        // (via `BorrowedMatrix`), so no copy of the LDE is duplicated. Built AFTER
+        // Phase B LogUp challenges (aux depends on them) and BEFORE forking, so
+        // the shared aux root is bound into every fork. Only aux-carrying tables
+        // are committed, in table order — the same subset Round 4 re-derives from
+        // `round1s[idx].aux.is_some()`.
         let aux_mmcs: Option<MixedMmcs<FieldExtension>> = {
-            let mut aux_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
+            let mut aux_mats: Vec<BorrowedMatrix<FieldExtension>> =
                 Vec::with_capacity(aux_results.len());
             for res in aux_results.iter() {
                 // AuxResult is cfg-gated (an extra GPU handle under cuda); bind
@@ -2865,14 +2865,13 @@ pub trait IsStarkProver<
                 let (aux_data, total_cols) = aux_lde;
                 let num_rows = aux_data.len() / *total_cols;
                 let log_height = num_rows.trailing_zeros() as usize;
-                let mut data: Vec<FieldElement<FieldExtension>> =
-                    Vec::with_capacity(num_rows * *total_cols);
-                for r in 0..num_rows {
-                    let br = reverse_index(r, num_rows as u64);
-                    let src = br * *total_cols;
-                    data.extend_from_slice(&aux_data[src..src + *total_cols]);
-                }
-                aux_mats.push((data, log_height, *total_cols));
+                aux_mats.push(BorrowedMatrix::RowMajorNatural {
+                    data: aux_data.as_slice(),
+                    stride: *total_cols,
+                    col_start: 0,
+                    width: *total_cols,
+                    log_height,
+                });
             }
             if aux_mats.is_empty() {
                 None
@@ -3026,28 +3025,25 @@ pub trait IsStarkProver<
         }
 
         // >>>> Send commitment: ONE batched composition-poly root over all
-        // tables' composition parts (mixed-height MMCS). Transient — round 4
-        // still opens the per-table composition trees.
+        // tables' composition parts (mixed-height MMCS). KEPT (returned in
+        // `RoundsOneToThree`) so batched Round 4 opens it directly; it stores only
+        // digests, its leaves read on demand from the composition-poly LDE columns
+        // retained in `round2s` (via `BorrowedMatrix::ColMajorNatural`), so no copy
+        // is duplicated. `round2s` is therefore held live through Round 4's opening
+        // loop instead of being dropped right after DEEP.
         let comp_mmcs: MixedMmcs<FieldExtension> = {
-            let mut comp_mats: Vec<(Vec<FieldElement<FieldExtension>>, usize, usize)> =
-                Vec::with_capacity(num_airs);
+            let mut comp_mats: Vec<BorrowedMatrix<FieldExtension>> = Vec::with_capacity(num_airs);
             for r2 in round2s.iter() {
                 let cols = &r2.lde_composition_poly_evaluations;
-                let width = cols.len();
-                if width == 0 {
+                if cols.is_empty() {
                     continue;
                 }
                 let num_rows = cols[0].len();
                 let log_height = num_rows.trailing_zeros() as usize;
-                let mut data: Vec<FieldElement<FieldExtension>> =
-                    Vec::with_capacity(num_rows * width);
-                for r in 0..num_rows {
-                    let br = reverse_index(r, num_rows as u64);
-                    for col in cols.iter() {
-                        data.push(col[br]);
-                    }
-                }
-                comp_mats.push((data, log_height, width));
+                comp_mats.push(BorrowedMatrix::ColMajorNatural {
+                    cols: cols.as_slice(),
+                    log_height,
+                });
             }
             debug_assert!(
                 !comp_mats.is_empty(),
@@ -4160,10 +4156,12 @@ pub trait IsStarkProver<
             deep_inputs.push((codeword, heights[idx]));
         }
 
-        // All tables' composition-poly LDE evaluations are now baked into the DEEP
-        // codewords above and are never read again. Free them before the FRI commit
-        // and query-opening phases, which keep every table's round1 LDE resident.
-        drop(round2s);
+        // `round2s` (every table's composition-poly LDE) is now the leaf source
+        // for the shared composition MMCS openings below, so it must stay resident
+        // through the query-opening loop. It is dropped right after that loop —
+        // replacing the batched MMCS's former owned copy, which lived even longer
+        // (through FRI). Net: strictly less memory than committing an owned copy
+        // and dropping `round2s` here.
 
         // Bind the height histogram, then sample the cross-table batching alpha.
         crate::fri::batched::absorb_height_histogram::<FieldExtension, _>(transcript, &heights);
@@ -4205,14 +4203,65 @@ pub trait IsStarkProver<
             .map(|layer| layer.merkle_tree.root)
             .collect();
 
+        // Leaf sources for the three shared MMCS trees: each serves its opened
+        // rows straight from the LDE buffers already retained for DEEP (main/aux
+        // in `round1s`, composition in `round2s`), so the trees themselves hold
+        // only digests. Built once and reused across every query. These mirror the
+        // matrices each tree was committed over: main = every table's main-split
+        // columns (`[num_precomputed_cols, num_main_cols)`); aux = the aux-carrying
+        // tables in table order (`aux.is_some()`, the same subset the aux MMCS
+        // filtered); composition = every table's composition-poly columns.
+        let main_src: Vec<BorrowedMatrix<Field>> = round1s
+            .iter()
+            .map(|r1| {
+                let stride = r1.lde_trace.num_main_cols();
+                let col_start = r1.main.num_precomputed_cols;
+                let data = r1.lde_trace.main_data();
+                let num_rows = data.len() / stride;
+                BorrowedMatrix::RowMajorNatural {
+                    data,
+                    stride,
+                    col_start,
+                    width: stride - col_start,
+                    log_height: num_rows.trailing_zeros() as usize,
+                }
+            })
+            .collect();
+        let aux_src: Vec<BorrowedMatrix<FieldExtension>> = round1s
+            .iter()
+            .filter(|r1| r1.aux.is_some())
+            .map(|r1| {
+                let stride = r1.lde_trace.num_aux_cols();
+                let data = r1.lde_trace.aux_data();
+                let num_rows = data.len() / stride;
+                BorrowedMatrix::RowMajorNatural {
+                    data,
+                    stride,
+                    col_start: 0,
+                    width: stride,
+                    log_height: num_rows.trailing_zeros() as usize,
+                }
+            })
+            .collect();
+        let comp_src: Vec<BorrowedMatrix<FieldExtension>> = round2s
+            .iter()
+            .filter_map(|r2| {
+                let cols = &r2.lde_composition_poly_evaluations;
+                (!cols.is_empty()).then(|| BorrowedMatrix::ColMajorNatural {
+                    cols: cols.as_slice(),
+                    log_height: cols[0].len().trailing_zeros() as usize,
+                })
+            })
+            .collect();
+
         // Per-query openings: one MixedOpening per phase (main/aux/composition)
         // covering all tables at once, plus per-preprocessed-table precomputed
         // openings (those columns are outside the shared main MMCS).
         let mut deep_poly_openings = Vec::with_capacity(iotas.len());
         for &iota in iotas.iter() {
-            let main = main_mmcs.open_batch(iota);
-            let aux = aux_mmcs.as_ref().map(|m| m.open_batch(iota));
-            let composition = comp_mmcs.open_batch(iota);
+            let main = main_mmcs.open_batch(iota, &main_src);
+            let aux = aux_mmcs.as_ref().map(|m| m.open_batch(iota, &aux_src));
+            let composition = comp_mmcs.open_batch(iota, &comp_src);
 
             let mut precomputed = Vec::new();
             for idx in 0..num_airs {
@@ -4233,6 +4282,11 @@ pub trait IsStarkProver<
                 precomputed,
             });
         }
+
+        // Composition openings are done; release the composition-poly LDE (the
+        // borrowing source first, then the buffers) before assembling the proof.
+        drop(comp_src);
+        drop(round2s);
 
         // Per-table data (canonical epoch order). g·z pruning: carry the split
         // OOD (current-row block + pruned next-row block), the same shape the

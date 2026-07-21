@@ -87,8 +87,11 @@
 //! verifier MUST pass matrices and `heights` in the same per-epoch order. The
 //! single-matrix case is byte-identical to the existing per-table row-pair tree.
 
+use core::marker::PhantomData;
+
 use crypto::merkle_tree::proof::Proof;
 use crypto::merkle_tree::traits::IsMerkleTreeBackend;
+use math::fft::bit_reversing::reverse_index;
 use math::field::element::FieldElement;
 use math::field::traits::IsField;
 use math::traits::AsBytes;
@@ -96,30 +99,119 @@ use math::traits::AsBytes;
 use crate::config::{BatchedMerkleTreeBackend, Commitment};
 use crate::proof::stark::PolynomialOpenings;
 
-/// One committed matrix, kept so `open_batch` can serve its row pairs.
-struct MatrixEntry<E: IsField> {
-    /// Row-major, bit-reversed LDE evaluations. `data[r*width .. (r+1)*width]`
-    /// is row `r`.
-    data: Vec<FieldElement<E>>,
-    log_height: usize,
-    width: usize,
+/// On-demand supplier of committed matrix rows, so [`MixedMmcs`] builds its
+/// digests and serves openings WITHOUT owning a copy of the (large) LDE buffers.
+/// Both [`MixedMmcs::commit`] and [`MixedMmcs::open_batch`] read every leaf
+/// through this trait, so the root and opened rows are byte-identical to those a
+/// matrix-owning MMCS would produce — the prover keeps only the LDE buffers it
+/// already retains for DEEP, and each MMCS stores just digests.
+///
+/// Rows are addressed in each matrix's committed row-pair layout: `append_row(m,
+/// r, out)` appends matrix `m`'s row at **bit-reversed** LDE position `r` (its
+/// `width(m)` committed columns, in column order). This is the same `r`-indexing
+/// the module's "Tree layout" section uses; an implementor holding the
+/// natural-order LDE maps `r` to `reverse_index(r, 2^log_height(m))`.
+pub trait LeafSource<E: IsField> {
+    /// Number of committed matrices, in canonical input order.
+    fn num_matrices(&self) -> usize;
+    /// `log2` of matrix `m`'s row count. Row-pair leaves require `>= 1`.
+    fn log_height(&self, m: usize) -> usize;
+    /// Matrix `m`'s committed column count.
+    fn width(&self, m: usize) -> usize;
+    /// Append matrix `m`'s bit-reversed LDE row `bitrev_row` (its `width(m)`
+    /// committed columns) to `out`. `bitrev_row in [0, 2^log_height(m))`.
+    fn append_row(&self, m: usize, bitrev_row: usize, out: &mut Vec<FieldElement<E>>);
 }
 
-impl<E: IsField> MatrixEntry<E> {
-    #[inline]
-    fn row(&self, r: usize) -> &[FieldElement<E>] {
-        &self.data[r * self.width..(r + 1) * self.width]
+/// One committed matrix borrowed from a retained LDE buffer. Resolves each
+/// bit-reversed row on demand (mapping through `reverse_index`) so the MMCS owns
+/// no copy of the evaluations. See [`LeafSource`].
+pub enum BorrowedMatrix<'a, E: IsField> {
+    /// A `stride`-wide, row-major, NATURAL-order LDE buffer (the main / aux LDE
+    /// retained in `Round1::lde_trace`). This matrix occupies columns
+    /// `[col_start, col_start + width)`; its bit-reversed row `r` lives at
+    /// natural-order row `reverse_index(r, 2^log_height)`.
+    RowMajorNatural {
+        data: &'a [FieldElement<E>],
+        stride: usize,
+        col_start: usize,
+        width: usize,
+        log_height: usize,
+    },
+    /// Column-major NATURAL-order columns (the composition-poly LDE retained in
+    /// `Round2::lde_composition_poly_evaluations`): `cols[c][nat]` is column `c`
+    /// at natural-order row `nat`. Every committed column is used.
+    ColMajorNatural {
+        cols: &'a [Vec<FieldElement<E>>],
+        log_height: usize,
+    },
+}
+
+impl<E: IsField> BorrowedMatrix<'_, E> {
+    fn log_height(&self) -> usize {
+        match self {
+            BorrowedMatrix::RowMajorNatural { log_height, .. }
+            | BorrowedMatrix::ColMajorNatural { log_height, .. } => *log_height,
+        }
+    }
+
+    fn width(&self) -> usize {
+        match self {
+            BorrowedMatrix::RowMajorNatural { width, .. } => *width,
+            BorrowedMatrix::ColMajorNatural { cols, .. } => cols.len(),
+        }
+    }
+
+    fn append_row(&self, bitrev_row: usize, out: &mut Vec<FieldElement<E>>) {
+        match self {
+            BorrowedMatrix::RowMajorNatural {
+                data,
+                stride,
+                col_start,
+                width,
+                log_height,
+            } => {
+                let nat = reverse_index(bitrev_row, 1u64 << log_height);
+                let base = nat * stride + col_start;
+                out.extend_from_slice(&data[base..base + width]);
+            }
+            BorrowedMatrix::ColMajorNatural { cols, log_height } => {
+                let nat = reverse_index(bitrev_row, 1u64 << log_height);
+                for col in cols.iter() {
+                    out.push(col[nat].clone());
+                }
+            }
+        }
     }
 }
 
-/// A committed mixed-height, row-pair MMCS. Owns the matrices (to serve openings)
-/// and every digest layer (to serve the shared authentication path).
+impl<E: IsField> LeafSource<E> for Vec<BorrowedMatrix<'_, E>> {
+    fn num_matrices(&self) -> usize {
+        self.len()
+    }
+    fn log_height(&self, m: usize) -> usize {
+        self[m].log_height()
+    }
+    fn width(&self, m: usize) -> usize {
+        self[m].width()
+    }
+    fn append_row(&self, m: usize, bitrev_row: usize, out: &mut Vec<FieldElement<E>>) {
+        self[m].append_row(bitrev_row, out);
+    }
+}
+
+/// A committed mixed-height, row-pair MMCS. Stores ONLY the digest layers (to
+/// serve the shared authentication path) plus each matrix's `(log_height, width)`
+/// (to locate leaves). The row DATA is served on demand by the caller's
+/// [`LeafSource`] — the MMCS never owns a copy of the LDE.
 pub struct MixedMmcs<E: IsField> {
     root: Commitment,
     /// `layers[0]` is the base digest layer; `layers[h_max-1] == [root]`.
     layers: Vec<Vec<Commitment>>,
-    matrices: Vec<MatrixEntry<E>>,
+    /// Per committed matrix, in input order: `(log_height, width)`.
+    dims: Vec<(usize, usize)>,
     h_max: usize,
+    _marker: PhantomData<E>,
 }
 
 /// The opening of ALL matrices at one query index, authenticated by a single
@@ -142,17 +234,19 @@ pub struct MixedOpening<E: IsField> {
     pub per_matrix: Vec<PolynomialOpenings<E>>,
 }
 
-/// Hash the row pair `(row(2*leaf), row(2*leaf+1))` of every matrix in `group`
-/// (in the given order), all columns batched, into one digest.
-fn hash_group_leaf<E>(group: &[&MatrixEntry<E>], leaf: usize) -> Commitment
+/// Hash the row pair `(row(2*leaf), row(2*leaf+1))` of every matrix whose index
+/// is in `group` (in the given order), all columns batched, into one digest.
+/// Rows are pulled from `source` — the MMCS owns no copy.
+fn hash_group_leaf<E, S>(source: &S, group: &[usize], leaf: usize) -> Commitment
 where
     E: IsField,
+    S: LeafSource<E>,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     let mut buf: Vec<FieldElement<E>> = Vec::new();
-    for m in group {
-        buf.extend_from_slice(m.row(2 * leaf));
-        buf.extend_from_slice(m.row(2 * leaf + 1));
+    for &m in group {
+        source.append_row(m, 2 * leaf, &mut buf);
+        source.append_row(m, 2 * leaf + 1, &mut buf);
     }
     <BatchedMerkleTreeBackend<E> as IsMerkleTreeBackend>::hash_data(&buf)
 }
@@ -186,47 +280,42 @@ where
     E: IsField,
     FieldElement<E>: AsBytes + Sync + Send,
 {
-    /// Commit the given matrices into one mixed-height row-pair tree. See the
-    /// module docs for the exact leaf/injection layout.
-    pub fn commit(matrices: &[(Vec<FieldElement<E>>, usize, usize)]) -> Self {
+    /// Commit the matrices supplied by `source` into one mixed-height row-pair
+    /// tree, storing only the digest layers. See the module docs for the exact
+    /// leaf/injection layout. `source` provides each matrix's dimensions and its
+    /// bit-reversed rows on demand; no copy of the evaluations is retained.
+    pub fn commit<S: LeafSource<E>>(source: &S) -> Self {
+        let num_matrices = source.num_matrices();
         assert!(
-            !matrices.is_empty(),
+            num_matrices > 0,
             "MixedMmcs::commit requires at least one matrix"
         );
 
-        let entries: Vec<MatrixEntry<E>> = matrices
-            .iter()
-            .map(|(data, log_height, width)| {
+        let dims: Vec<(usize, usize)> = (0..num_matrices)
+            .map(|m| {
+                let log_height = source.log_height(m);
                 assert!(
-                    *log_height >= 1,
+                    log_height >= 1,
                     "log_height must be >= 1 (row-pair leaves need at least 2 rows)"
                 );
-                assert_eq!(
-                    data.len(),
-                    width << log_height,
-                    "matrix data length must equal width * 2^log_height"
-                );
-                MatrixEntry {
-                    data: data.clone(),
-                    log_height: *log_height,
-                    width: *width,
-                }
+                (log_height, source.width(m))
             })
             .collect();
 
-        let h_max = entries
+        let h_max = dims
             .iter()
-            .map(|m| m.log_height)
+            .map(|(log_height, _)| *log_height)
             .max()
-            .expect("entries is non-empty");
+            .expect("dims is non-empty");
         let n0 = 1usize << (h_max - 1);
 
         // Base digest layer: batch all tallest matrices' row pairs (input order).
-        let base_group: Vec<&MatrixEntry<E>> =
-            entries.iter().filter(|m| m.log_height == h_max).collect();
+        let base_group: Vec<usize> = (0..num_matrices).filter(|&m| dims[m].0 == h_max).collect();
 
         let mut layers: Vec<Vec<Commitment>> = Vec::with_capacity(h_max);
-        let base: Vec<Commitment> = (0..n0).map(|k| hash_group_leaf(&base_group, k)).collect();
+        let base: Vec<Commitment> = (0..n0)
+            .map(|k| hash_group_leaf(source, &base_group, k))
+            .collect();
         layers.push(base);
 
         // Climb, compressing pairs and injecting shorter matrices where the layer
@@ -235,16 +324,15 @@ where
         while layers[i].len() > 1 {
             let next_len = layers[i].len() / 2;
             let inject_h = h_max - 1 - i;
-            let inject_group: Vec<&MatrixEntry<E>> = entries
-                .iter()
-                .filter(|m| m.log_height == inject_h)
+            let inject_group: Vec<usize> = (0..num_matrices)
+                .filter(|&m| dims[m].0 == inject_h)
                 .collect();
 
             let mut next: Vec<Commitment> = Vec::with_capacity(next_len);
             for j in 0..next_len {
                 let mut parent = compress::<E>(&layers[i][2 * j], &layers[i][2 * j + 1]);
                 if !inject_group.is_empty() {
-                    let inj = hash_group_leaf(&inject_group, j);
+                    let inj = hash_group_leaf(source, &inject_group, j);
                     parent = compress::<E>(&parent, &inj);
                 }
                 next.push(parent);
@@ -258,8 +346,9 @@ where
         MixedMmcs {
             root,
             layers,
-            matrices: entries,
+            dims,
             h_max,
+            _marker: PhantomData,
         }
     }
 
@@ -269,22 +358,34 @@ where
     }
 
     /// Open all matrices at query `iota in [0, 2^(h_max-1))`, returning each
-    /// matrix's row pair plus one shared authentication path.
-    pub fn open_batch(&self, iota: usize) -> MixedOpening<E> {
+    /// matrix's row pair plus one shared authentication path. Row data is served
+    /// by `source`, which MUST describe the same matrices (same order and
+    /// dimensions) as the one passed to [`Self::commit`].
+    pub fn open_batch<S: LeafSource<E>>(&self, iota: usize, source: &S) -> MixedOpening<E> {
         let n0 = 1usize << (self.h_max - 1);
         assert!(iota < n0, "iota {iota} out of range (n0 = {n0})");
+        debug_assert_eq!(
+            source.num_matrices(),
+            self.dims.len(),
+            "leaf source matrix count must match the committed tree"
+        );
 
-        let per_matrix: Vec<PolynomialOpenings<E>> = self
-            .matrices
-            .iter()
+        let per_matrix: Vec<PolynomialOpenings<E>> = (0..self.dims.len())
             .map(|m| {
-                let k = iota >> (self.h_max - m.log_height);
+                let (log_height, width) = self.dims[m];
+                debug_assert_eq!(source.log_height(m), log_height);
+                debug_assert_eq!(source.width(m), width);
+                let k = iota >> (self.h_max - log_height);
+                let mut evaluations = Vec::with_capacity(width);
+                source.append_row(m, 2 * k, &mut evaluations);
+                let mut evaluations_sym = Vec::with_capacity(width);
+                source.append_row(m, 2 * k + 1, &mut evaluations_sym);
                 PolynomialOpenings {
                     proof: Proof {
                         merkle_path: Vec::new(),
                     },
-                    evaluations: m.row(2 * k).to_vec(),
-                    evaluations_sym: m.row(2 * k + 1).to_vec(),
+                    evaluations,
+                    evaluations_sym,
                 }
             })
             .collect();
@@ -387,11 +488,41 @@ where
 mod tests {
     use super::*;
     use crate::commitment::commit_bit_reversed;
-    use math::fft::bit_reversing::reverse_index;
     use math::field::element::FieldElement;
     use math::field::goldilocks::GoldilocksField;
 
     type FE = FieldElement<GoldilocksField>;
+
+    /// Reference [`LeafSource`] owning bit-reversed row-major matrices — the exact
+    /// row layout the pre-refactor `MixedMmcs` stored internally. Every existing
+    /// test commits/opens through this, so a byte-parity assertion against
+    /// `commit_bit_reversed` still pins the tree contract; the equivalence test
+    /// below cross-checks it against the borrowed (natural-order) sources the
+    /// prover actually uses.
+    struct OwnedMatrices<E: IsField> {
+        /// Each entry: `(bit-reversed row-major data, log_height, width)`.
+        mats: Vec<(Vec<FieldElement<E>>, usize, usize)>,
+    }
+
+    impl<E: IsField> LeafSource<E> for OwnedMatrices<E> {
+        fn num_matrices(&self) -> usize {
+            self.mats.len()
+        }
+        fn log_height(&self, m: usize) -> usize {
+            self.mats[m].1
+        }
+        fn width(&self, m: usize) -> usize {
+            self.mats[m].2
+        }
+        fn append_row(&self, m: usize, bitrev_row: usize, out: &mut Vec<FieldElement<E>>) {
+            let (data, _log_height, width) = &self.mats[m];
+            out.extend_from_slice(&data[bitrev_row * width..(bitrev_row + 1) * width]);
+        }
+    }
+
+    fn owned(mats: Vec<(Vec<FE>, usize, usize)>) -> OwnedMatrices<GoldilocksField> {
+        OwnedMatrices { mats }
+    }
 
     /// Build a row-major, bit-reversed flat vec from column-major natural-order
     /// `columns`, matching the layout the existing trace commit consumes: row `j`
@@ -404,6 +535,20 @@ mod tests {
             let br = reverse_index(r, num_rows as u64);
             for (c, col) in columns.iter().enumerate() {
                 chunk[c] = col[br];
+            }
+        }
+        out
+    }
+
+    /// Build a row-major flat vec in NATURAL order (no bit reversal): row `r` =
+    /// `[col_0[r], ..., col_{w-1}[r]]`. This is the layout the prover's
+    /// `BorrowedMatrix::RowMajorNatural` reads (the retained main/aux LDE buffer).
+    fn row_major_natural(columns: &[Vec<FE>], num_rows: usize) -> Vec<FE> {
+        let width = columns.len();
+        let mut out = vec![FE::from(0u64); num_rows * width];
+        for (r, chunk) in out.chunks_exact_mut(width).enumerate() {
+            for (c, col) in columns.iter().enumerate() {
+                chunk[c] = col[r];
             }
         }
         out
@@ -429,13 +574,14 @@ mod tests {
         let columns = make_columns(width, num_rows, 5);
         let data = row_major_bit_reversed(&columns, num_rows);
 
-        let mmcs = MixedMmcs::commit(&[(data.clone(), log_height, width)]);
+        let src = owned(vec![(data.clone(), log_height, width)]);
+        let mmcs = MixedMmcs::commit(&src);
         let heights = [log_height];
         let widths = [width];
         let n0 = 1usize << (log_height - 1);
 
         for iota in 0..n0 {
-            let opening = mmcs.open_batch(iota);
+            let opening = mmcs.open_batch(iota, &src);
             assert_eq!(opening.per_matrix.len(), 1);
             let k = iota;
             let row_2k = data[(2 * k) * width..(2 * k + 1) * width].to_vec();
@@ -451,7 +597,7 @@ mod tests {
             ));
         }
 
-        let mut opening = mmcs.open_batch(0);
+        let mut opening = mmcs.open_batch(0, &src);
         opening.per_matrix[0].evaluations[0] =
             &opening.per_matrix[0].evaluations[0] + &FE::from(1u64);
         assert!(!MixedMmcs::verify_batch(
@@ -474,7 +620,7 @@ mod tests {
             commit_bit_reversed(&columns, 2).expect("non-empty columns build a tree");
 
         let data = row_major_bit_reversed(&columns, num_rows);
-        let mmcs = MixedMmcs::commit(&[(data, log_height, width)]);
+        let mmcs = MixedMmcs::commit(&owned(vec![(data, log_height, width)]));
 
         assert_eq!(mmcs.root(), existing_root);
     }
@@ -488,11 +634,12 @@ mod tests {
         let b = row_major_bit_reversed(&make_columns(wb, 1 << hb, 2), 1 << hb);
         let c = row_major_bit_reversed(&make_columns(wc, 1 << hc, 3), 1 << hc);
 
-        let mmcs = MixedMmcs::commit(&[
+        let src = owned(vec![
             (a.clone(), ha, wa),
             (b.clone(), hb, wb),
             (c.clone(), hc, wc),
         ]);
+        let mmcs = MixedMmcs::commit(&src);
         let heights = [ha, hb, hc];
         let widths = [wa, wb, wc];
         let h_max = 5usize;
@@ -501,7 +648,7 @@ mod tests {
         let row = |data: &[FE], w: usize, r: usize| data[r * w..(r + 1) * w].to_vec();
 
         for iota in [0usize, 1, 2, 3, 7, 8, 13, n0 - 1] {
-            let opening = mmcs.open_batch(iota);
+            let opening = mmcs.open_batch(iota, &src);
             assert_eq!(opening.per_matrix.len(), 3);
 
             // Tall matrices open at k = iota >> 0 = iota.
@@ -529,7 +676,7 @@ mod tests {
         // Tamper the height-3 matrix's opened row -> rejection (proves the short
         // matrix is bound by the shared path via injection).
         let iota = 6usize;
-        let mut opening = mmcs.open_batch(iota);
+        let mut opening = mmcs.open_batch(iota, &src);
         opening.per_matrix[2].evaluations[0] =
             &opening.per_matrix[2].evaluations[0] + &FE::from(1u64);
         assert!(
@@ -538,7 +685,7 @@ mod tests {
         );
 
         // Tamper a tall-matrix row too -> rejection.
-        let mut opening2 = mmcs.open_batch(iota);
+        let mut opening2 = mmcs.open_batch(iota, &src);
         opening2.per_matrix[0].evaluations[0] =
             &opening2.per_matrix[0].evaluations[0] + &FE::from(1u64);
         assert!(
@@ -556,7 +703,8 @@ mod tests {
         let a_data = row_major_bit_reversed(&make_columns(2, 4, 3), 4);
         let b_data = row_major_bit_reversed(&make_columns(3, 2, 8), 2);
 
-        let mmcs = MixedMmcs::commit(&[(a_data.clone(), 2, 2), (b_data.clone(), 1, 3)]);
+        let src = owned(vec![(a_data.clone(), 2, 2), (b_data.clone(), 1, 3)]);
+        let mmcs = MixedMmcs::commit(&src);
 
         // Hand recomputation via the backend primitives, in the documented order.
         let arow = |r: usize| a_data[r * 2..(r + 1) * 2].to_vec();
@@ -587,11 +735,11 @@ mod tests {
         );
 
         // Determinism: a second commit over the same inputs yields the same root.
-        let mmcs2 = MixedMmcs::commit(&[(a_data, 2, 2), (b_data, 1, 3)]);
+        let mmcs2 = MixedMmcs::commit(&owned(vec![(a_data, 2, 2), (b_data, 1, 3)]));
         assert_eq!(mmcs.root(), mmcs2.root(), "commit must be deterministic");
 
         for iota in 0..2usize {
-            let opening = mmcs.open_batch(iota);
+            let opening = mmcs.open_batch(iota, &src);
             // heights {2, 1}, widths {2, 3}.
             assert!(MixedMmcs::verify_batch(
                 &mmcs.root(),
@@ -617,19 +765,20 @@ mod tests {
         let a = row_major_bit_reversed(&make_columns(wa, num_rows, 11), num_rows);
         let b = row_major_bit_reversed(&make_columns(wb, num_rows, 22), num_rows);
 
-        let mmcs = MixedMmcs::commit(&[(a, h, wa), (b, h, wb)]);
+        let src = owned(vec![(a, h, wa), (b, h, wb)]);
+        let mmcs = MixedMmcs::commit(&src);
         let heights = [h, h];
         let widths = [wa, wb];
 
         let iota = 0usize;
-        let opening = mmcs.open_batch(iota);
+        let opening = mmcs.open_batch(iota, &src);
         assert!(
             MixedMmcs::verify_batch(&mmcs.root(), iota, &opening, &heights, &widths),
             "honest opening must verify"
         );
 
         // Forge: lengthen A.evaluations by one element taken from A.evaluations_sym.
-        let mut forged = mmcs.open_batch(iota);
+        let mut forged = mmcs.open_batch(iota, &src);
         let moved = forged.per_matrix[0].evaluations_sym.remove(0);
         forged.per_matrix[0].evaluations.push(moved);
 
@@ -697,7 +846,10 @@ mod tests {
             }
         }
 
-        let mmcs = MixedMmcs::commit(&[(data, log_height, width)]);
+        let src = OwnedMatrices {
+            mats: vec![(data, log_height, width)],
+        };
+        let mmcs = MixedMmcs::commit(&src);
         assert_eq!(
             mmcs.root(),
             existing_root,
@@ -707,7 +859,7 @@ mod tests {
         let heights = [log_height];
         let widths = [width];
         for iota in 0..(1usize << (log_height - 1)) {
-            let opening = mmcs.open_batch(iota);
+            let opening = mmcs.open_batch(iota, &src);
             assert!(MixedMmcs::verify_batch(
                 &mmcs.root(),
                 iota,
@@ -717,7 +869,7 @@ mod tests {
             ));
         }
 
-        let mut opening = mmcs.open_batch(0);
+        let mut opening = mmcs.open_batch(0, &src);
         opening.per_matrix[0].evaluations[0] = &opening.per_matrix[0].evaluations[0] + &F3::one();
         assert!(!MixedMmcs::verify_batch(
             &mmcs.root(),
@@ -726,5 +878,130 @@ mod tests {
             &heights,
             &widths
         ));
+    }
+
+    /// Equivalence (the soundness contract the batched prover relies on): the
+    /// digest-only MMCS built from the prover's borrowed, NATURAL-order leaf
+    /// sources yields the SAME root and the SAME opened rows as the reference
+    /// owning source over the bit-reversed data — for the row-major (main / aux)
+    /// layout, the column-major (composition) layout, AND a main-split column
+    /// sub-range (`col_start > 0`). Only the leaf-byte source changes; nothing the
+    /// verifier sees does.
+    #[test]
+    fn borrowed_sources_match_owned_reference() {
+        // Mixed heights {5, 5, 3}; the height-3 matrix exercises injection.
+        let specs = [(5usize, 3usize, 100u64), (5, 1, 200), (3, 4, 300)];
+
+        // Column-major natural-order columns per matrix.
+        let cols: Vec<Vec<Vec<FE>>> = specs
+            .iter()
+            .map(|&(lh, w, seed)| make_columns(w, 1 << lh, seed))
+            .collect();
+
+        // Reference: owned, bit-reversed row-major (the pre-refactor layout).
+        let owned_src = owned(
+            specs
+                .iter()
+                .zip(cols.iter())
+                .map(|(&(lh, w, _), c)| (row_major_bit_reversed(c, 1 << lh), lh, w))
+                .collect(),
+        );
+
+        // Borrowed row-major NATURAL (the retained main / aux LDE buffer).
+        let rm_natural: Vec<Vec<FE>> = specs
+            .iter()
+            .zip(cols.iter())
+            .map(|(&(lh, _, _), c)| row_major_natural(c, 1 << lh))
+            .collect();
+        let rm_src: Vec<BorrowedMatrix<GoldilocksField>> = specs
+            .iter()
+            .zip(rm_natural.iter())
+            .map(|(&(lh, w, _), data)| BorrowedMatrix::RowMajorNatural {
+                data: data.as_slice(),
+                stride: w,
+                col_start: 0,
+                width: w,
+                log_height: lh,
+            })
+            .collect();
+
+        // Borrowed column-major NATURAL (the retained composition-poly LDE).
+        let cm_src: Vec<BorrowedMatrix<GoldilocksField>> = specs
+            .iter()
+            .zip(cols.iter())
+            .map(|(&(lh, _, _), c)| BorrowedMatrix::ColMajorNatural {
+                cols: c.as_slice(),
+                log_height: lh,
+            })
+            .collect();
+
+        let owned_mmcs = MixedMmcs::commit(&owned_src);
+        let rm_mmcs = MixedMmcs::commit(&rm_src);
+        let cm_mmcs = MixedMmcs::commit(&cm_src);
+        assert_eq!(
+            owned_mmcs.root(),
+            rm_mmcs.root(),
+            "row-major natural root must match the owned reference"
+        );
+        assert_eq!(
+            owned_mmcs.root(),
+            cm_mmcs.root(),
+            "column-major natural root must match the owned reference"
+        );
+
+        let n0 = 1usize << (5 - 1);
+        for iota in 0..n0 {
+            let o = owned_mmcs.open_batch(iota, &owned_src);
+            let rm = rm_mmcs.open_batch(iota, &rm_src);
+            let cm = cm_mmcs.open_batch(iota, &cm_src);
+            assert_eq!(o.proof.merkle_path, rm.proof.merkle_path);
+            assert_eq!(o.proof.merkle_path, cm.proof.merkle_path);
+            for i in 0..specs.len() {
+                assert_eq!(o.per_matrix[i].evaluations, rm.per_matrix[i].evaluations);
+                assert_eq!(
+                    o.per_matrix[i].evaluations_sym,
+                    rm.per_matrix[i].evaluations_sym
+                );
+                assert_eq!(o.per_matrix[i].evaluations, cm.per_matrix[i].evaluations);
+                assert_eq!(
+                    o.per_matrix[i].evaluations_sym,
+                    cm.per_matrix[i].evaluations_sym
+                );
+            }
+        }
+
+        // Main-split sub-range: a RowMajorNatural over a wider buffer with a
+        // leading prefix (`col_start = prefix`) must match an owned matrix built
+        // over ONLY the committed trailing columns.
+        let (lh, prefix, w) = (4usize, 2usize, 3usize);
+        let num_rows = 1usize << lh;
+        let full = make_columns(prefix + w, num_rows, 42);
+        let full_natural = row_major_natural(&full, num_rows);
+        let sub_cols: Vec<Vec<FE>> = full[prefix..].to_vec();
+        let sub_owned = owned(vec![(row_major_bit_reversed(&sub_cols, num_rows), lh, w)]);
+        let split_src: Vec<BorrowedMatrix<GoldilocksField>> =
+            vec![BorrowedMatrix::RowMajorNatural {
+                data: full_natural.as_slice(),
+                stride: prefix + w,
+                col_start: prefix,
+                width: w,
+                log_height: lh,
+            }];
+        let sub_owned_mmcs = MixedMmcs::commit(&sub_owned);
+        let split_mmcs = MixedMmcs::commit(&split_src);
+        assert_eq!(
+            sub_owned_mmcs.root(),
+            split_mmcs.root(),
+            "main-split (col_start>0) root must match the owned sub-range"
+        );
+        for iota in 0..(1usize << (lh - 1)) {
+            let a = sub_owned_mmcs.open_batch(iota, &sub_owned);
+            let b = split_mmcs.open_batch(iota, &split_src);
+            assert_eq!(a.per_matrix[0].evaluations, b.per_matrix[0].evaluations);
+            assert_eq!(
+                a.per_matrix[0].evaluations_sym,
+                b.per_matrix[0].evaluations_sym
+            );
+        }
     }
 }
