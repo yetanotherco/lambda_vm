@@ -117,6 +117,22 @@ fn main() {
                 print!("{r}");
             }
         }
+        "mainverify" => {
+            // Monolithic prove + verify (the wall workload), so the
+            // composition-resident change is checked end-to-end on the exact
+            // path measured, not only via continuation.
+            #[cfg(feature = "cuda")]
+            stark::stagebytes::reset();
+            let proof = lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
+                .expect("monolithic prove failed");
+            let ok = lambda_vm_prover::verify(&proof, &elf).expect("verify errored");
+            assert!(ok, "monolithic proof did NOT verify");
+            println!("main prove+verify ok");
+            #[cfg(feature = "cuda")]
+            if let Some(r) = stark::stagebytes::report() {
+                print!("{r}");
+            }
+        }
         "cont" => {
             let epoch_size_log2: u32 = args
                 .get(3)
