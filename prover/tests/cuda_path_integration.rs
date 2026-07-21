@@ -12,8 +12,9 @@ use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
     gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
-    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls,
-    gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_composition_device_only_calls, gpu_deep_calls, gpu_device_only_calls,
+    gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls, gpu_logup_calls,
+    gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
 
 /// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
@@ -94,6 +95,10 @@ fn gpu_path_fires_end_to_end() {
 
     // DEEP fires once per table that took the R1 GPU path.
     assert!(gpu_deep_calls() > 0, "R4 GPU DEEP composition did not fire");
+    assert!(
+        gpu_composition_device_only_calls() > 0,
+        "composition LDE device-only path did not fire"
+    );
 
     // FRI commit fires once per table (commit_phase_from_evaluations).
     assert!(gpu_fri_calls() > 0, "R4 GPU FRI commit did not fire");

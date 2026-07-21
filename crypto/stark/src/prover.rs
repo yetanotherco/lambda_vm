@@ -545,7 +545,9 @@ where
     pub(crate) fn host_evals(&self) -> &[Vec<FieldElement<F>>] {
         self.host_composition_lde
             .as_ref()
-            .expect("host composition LDE present (device-only paths must read the resident handle)")
+            .expect(
+                "host composition LDE present (device-only paths must read the resident handle)",
+            )
             .as_slice()
     }
 }
@@ -1169,6 +1171,7 @@ pub trait IsStarkProver<
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         #[cfg(feature = "cuda")] gpu_parts_out: &mut Option<math_cuda::lde::GpuLdeExt3>,
+        #[cfg(feature = "cuda")] retain_host_lde: bool,
     ) -> Vec<Vec<FieldElement<FieldExtension>>>
     where
         FieldElement<Field>: AsBytes + Sync + Send,
@@ -1206,7 +1209,7 @@ pub trait IsStarkProver<
         // `cuda` feature and a qualifying size. Falls through to CPU when not.
         #[cfg(feature = "cuda")]
         if let Some((lde_h0, lde_h1, handle)) =
-            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain)
+            crate::gpu_lde::try_extend_two_halves_gpu(&h0_evals, &h1_evals, domain, retain_host_lde)
         {
             // Hand the resident extended-LDE buffer to the session so the
             // composition Merkle commit and DEEP reuse it (mirrors the d>2 path).
@@ -1286,6 +1289,23 @@ pub trait IsStarkProver<
 
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
+        // Dropping the composition host LDE is safe only when DEEP has every
+        // trace input resident too. A composition handle alone is insufficient:
+        // some tables qualify for the R2 LDE but not for the R1 main/aux path.
+        #[cfg(feature = "cuda")]
+        let retain_host_composition_lde = {
+            let expected_lde_size = domain.lde_roots_of_unity_coset.len();
+            let main_resident = round_1_result.lde_trace.gpu_main().is_some_and(|h| {
+                h.m == round_1_result.lde_trace.num_main_cols() && h.lde_size == expected_lde_size
+            });
+            let aux_resident = round_1_result.lde_trace.num_aux_cols() == 0
+                || round_1_result.lde_trace.gpu_aux().is_some_and(|h| {
+                    h.m == round_1_result.lde_trace.num_aux_cols()
+                        && h.lde_size == expected_lde_size
+                });
+            crate::gpu_lde::retain_composition_host() || !main_resident || !aux_resident
+        };
+
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
@@ -1303,6 +1323,7 @@ pub trait IsStarkProver<
                     domain,
                     twiddles,
                     &mut gpu_composition_parts,
+                    retain_host_composition_lde,
                 )
             }
             #[cfg(not(feature = "cuda"))]
@@ -1416,8 +1437,21 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
 
+        let num_composition_parts = lde_composition_poly_parts_evaluations.len();
+        #[cfg(feature = "cuda")]
+        let composition_device_only = gpu_composition_parts.is_some()
+            && num_composition_parts > 0
+            && lde_composition_poly_parts_evaluations
+                .iter()
+                .all(Vec::is_empty);
+        #[cfg(feature = "cuda")]
+        if composition_device_only {
+            crate::gpu_lde::GPU_COMPOSITION_DEVICE_ONLY_CALLS
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
         // Fold the R2 device composition parts handle into the session (resident
-        // R2 to R4). The host evaluations stay in `Round2` for R4 openings.
+        // R2 to R4).
         #[cfg(feature = "cuda")]
         if let Some(handle) = gpu_composition_parts {
             // GPU_NO_RESIDENT_DEEP=1 withholds the handle so DEEP re-uploads
@@ -1427,9 +1461,17 @@ pub trait IsStarkProver<
             }
         }
 
-        let num_composition_parts = lde_composition_poly_parts_evaluations.len();
+        #[cfg(feature = "cuda")]
+        let host_composition_lde = if composition_device_only {
+            None
+        } else {
+            Some(lde_composition_poly_parts_evaluations)
+        };
+        #[cfg(not(feature = "cuda"))]
+        let host_composition_lde = Some(lde_composition_poly_parts_evaluations);
+
         Ok(Round2 {
-            host_composition_lde: Some(lde_composition_poly_parts_evaluations),
+            host_composition_lde,
             num_composition_parts,
             composition_poly_merkle_tree,
             composition_poly_root,
@@ -1462,33 +1504,32 @@ pub trait IsStarkProver<
         let comp_z_pow_n = z_power.pow(domain_size);
         let comp_inv_denoms = math::polynomial::barycentric_inv_denoms(&z_power, &dc.points);
 
-        let composition_poly_parts_ood_evaluation: Vec<_> = round_2_result
-            .host_evals()
-            .iter()
-            .map(|lde_evals| {
-                // Extract trace-size evaluations (stride = blowup_factor)
-                let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
-                    .map(|i| lde_evals[i * blowup_factor].clone())
-                    .collect();
-                math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
-                    &comp_z_pow_n,
-                    &dc.offset_pow_n,
-                    &dc.size_inv,
-                    &dc.offset_pow_n_inv,
-                    &dc.points,
-                    &evals,
-                    &comp_inv_denoms,
-                )
-            })
-            .collect();
+        let cpu_comp_ood = || -> Vec<FieldElement<FieldExtension>> {
+            round_2_result
+                .host_evals()
+                .iter()
+                .map(|lde_evals| {
+                    let evals: Vec<FieldElement<FieldExtension>> = (0..domain_size)
+                        .map(|i| lde_evals[i * blowup_factor].clone())
+                        .collect();
+                    math::polynomial::interpolate_coset_eval_ext_with_g_n_inv(
+                        &comp_z_pow_n,
+                        &dc.offset_pow_n,
+                        &dc.size_inv,
+                        &dc.offset_pow_n_inv,
+                        &dc.points,
+                        &evals,
+                        &comp_inv_denoms,
+                    )
+                })
+                .collect()
+        };
 
-        // Step C1: compute the same composition-parts OOD on the resident device
-        // handle and cross-check it against the CPU result above (host stays
-        // authoritative this stage). Proves the device path before C4 makes it
-        // the sole source and the host composition LDE is dropped.
         #[cfg(feature = "cuda")]
-        if let Some(handle) = round_1_result.lde_trace.gpu_composition_parts() {
-            if let Some(gpu_ood) =
+        let composition_poly_parts_ood_evaluation = round_1_result
+            .lde_trace
+            .gpu_composition_parts()
+            .and_then(|handle| {
                 crate::gpu_lde::try_barycentric_ext3_on_comp_handle::<Field, FieldExtension>(
                     handle,
                     blowup_factor,
@@ -1499,21 +1540,10 @@ pub trait IsStarkProver<
                     &comp_z_pow_n,
                     &comp_inv_denoms,
                 )
-            {
-                assert_eq!(
-                    gpu_ood.len(),
-                    composition_poly_parts_ood_evaluation.len(),
-                    "C1 composition OOD: GPU/CPU part count mismatch"
-                );
-                for (j, (g, c)) in gpu_ood
-                    .iter()
-                    .zip(composition_poly_parts_ood_evaluation.iter())
-                    .enumerate()
-                {
-                    assert_eq!(g, c, "C1 composition OOD: GPU != CPU at part {j}");
-                }
-            }
-        }
+            })
+            .unwrap_or_else(cpu_comp_ood);
+        #[cfg(not(feature = "cuda"))]
+        let composition_poly_parts_ood_evaluation = cpu_comp_ood();
 
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
@@ -1754,7 +1784,10 @@ pub trait IsStarkProver<
                     crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                         lde_trace,
                         lde_trace.gpu_composition_parts(),
-                        round_2_result.host_evals(),
+                        round_2_result
+                            .host_composition_lde
+                            .as_deref()
+                            .unwrap_or(&[]),
                         h_ood,
                         &trace_ood_columns,
                         composition_poly_gammas,
@@ -1790,7 +1823,10 @@ pub trait IsStarkProver<
                 crate::gpu_lde::try_deep_composition_gpu::<Field, FieldExtension>(
                     lde_trace,
                     lde_trace.gpu_composition_parts(),
-                    round_2_result.host_evals(),
+                    round_2_result
+                        .host_composition_lde
+                        .as_deref()
+                        .unwrap_or(&[]),
                     h_ood,
                     &trace_ood_columns,
                     composition_poly_gammas,
@@ -1812,6 +1848,11 @@ pub trait IsStarkProver<
         assert!(
             !lde_trace.host_trace_empty(),
             "R4 DEEP composition fell back to the host trace, but it is device-only (empty)"
+        );
+        #[cfg(feature = "cuda")]
+        assert!(
+            round_2_result.host_composition_lde.is_some(),
+            "R4 DEEP composition fell back to the host loop, but the composition LDE is device-only"
         );
 
         // OOD column compression (Plonky3-style): precompute one value per eval point,
@@ -2359,31 +2400,21 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &comp_dev_proofs {
-                        let host = Self::open_composition_poly_with_proof(
-                            proofs[qi].clone(),
-                            round_2_result.host_evals(),
-                            *index,
-                        );
-                        // C2 cross-check: the values gathered off the resident
-                        // handle must equal the host values (host authoritative).
-                        if let Some(dev_vals) = comp_dev_values.as_ref() {
-                            let num_parts_comp =
-                                round_2_result.num_composition_parts;
-                            let (even, odd) = Self::device_row_pair::<FieldExtension>(
-                                dev_vals,
-                                qi,
-                                num_parts_comp,
-                            );
-                            assert_eq!(
-                                even, host.evaluations,
-                                "C2 composition open: GPU != CPU (even) query {qi}"
-                            );
-                            assert_eq!(
-                                odd, host.evaluations_sym,
-                                "C2 composition open: GPU != CPU (sym) query {qi}"
-                            );
+                        match comp_dev_values.as_ref() {
+                            Some(dev_vals) => {
+                                let (even, odd) = Self::device_row_pair::<FieldExtension>(
+                                    dev_vals,
+                                    qi,
+                                    round_2_result.num_composition_parts,
+                                );
+                                Self::open_polys_from_values(proofs[qi].clone(), even, odd)
+                            }
+                            None => Self::open_composition_poly_with_proof(
+                                proofs[qi].clone(),
+                                round_2_result.host_evals(),
+                                *index,
+                            ),
                         }
-                        host
                     } else {
                         Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,

@@ -80,6 +80,7 @@ pub fn reset_all_gpu_call_counters() {
     GPU_COMPOSITION_CALLS.store(0, Ordering::Relaxed);
     GPU_OPENING_GATHER_CALLS.store(0, Ordering::Relaxed);
     GPU_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
+    GPU_COMPOSITION_DEVICE_ONLY_CALLS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) static GPU_EXTEND_HALVES_CALLS: AtomicU64 = AtomicU64::new(0);
@@ -122,6 +123,13 @@ pub fn gpu_opening_gather_calls() -> u64 {
 pub(crate) static GPU_DEVICE_ONLY_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_device_only_calls() -> u64 {
     GPU_DEVICE_ONLY_CALLS.load(Ordering::Relaxed)
+}
+
+/// Tables whose composition LDE skipped its host D2H because composition,
+/// main, and aux handles were all available for the device-only R3/R4 path.
+pub(crate) static GPU_COMPOSITION_DEVICE_ONLY_CALLS: AtomicU64 = AtomicU64::new(0);
+pub fn gpu_composition_device_only_calls() -> u64 {
+    GPU_COMPOSITION_DEVICE_ONLY_CALLS.load(Ordering::Relaxed)
 }
 
 /// Runtime override to force the GPU composition path off (→ CPU accumulation).
@@ -490,6 +498,7 @@ pub(crate) fn try_extend_two_halves_gpu<F, E>(
     h0: &[FieldElement<E>],
     h1: &[FieldElement<E>],
     domain: &Domain<F>,
+    retain_host_lde: bool,
 ) -> Option<(
     Vec<FieldElement<E>>,
     Vec<FieldElement<E>>,
@@ -543,42 +552,49 @@ where
         w *= &g_inv;
     }
 
-    // Pre-allocate outputs.
-    let mut lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
-    let mut lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
-
-    // Two ext3 columns (h0 + h1), each composed of 3 base-field components.
+    // Device-only avoids allocating and filling the two large host outputs.
+    let mut lde_h0: Vec<FieldElement<E>> = Vec::new();
+    let mut lde_h1: Vec<FieldElement<E>> = Vec::new();
     const NUM_COLS: usize = 2;
+    let ext3_len = lde_size
+        .checked_mul(3)
+        .expect("ext3 output length overflow");
     GPU_LDE_CALLS.fetch_add((NUM_COLS * 3) as u64, Ordering::Relaxed);
-    let handle = {
-        let inputs: [&[u64]; 2] = [&h0_raw, &h1_raw];
-        // View each output Vec<FieldElement<E>> as &mut [u64] of length 3*lde_size.
-        let out0_ptr = lde_h0.as_mut_ptr() as *mut u64;
-        let out1_ptr = lde_h1.as_mut_ptr() as *mut u64;
+    let inputs: [&[u64]; 2] = [&h0_raw, &h1_raw];
+    let handle = if retain_host_lde {
+        lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
+        lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
         // SAFETY: ext3 FieldElement is [u64; 3] in memory, and the Vec has len
         // = lde_size so the backing is 3*lde_size u64s.
-        let ext3_len = lde_size
-            .checked_mul(3)
-            .expect("ext3 output length overflow");
-        let out0_slice = unsafe { from_raw_parts_mut(out0_ptr, ext3_len) };
-        let out1_slice = unsafe { from_raw_parts_mut(out1_ptr, ext3_len) };
+        let out0_slice = unsafe { from_raw_parts_mut(lde_h0.as_mut_ptr() as *mut u64, ext3_len) };
+        let out1_slice = unsafe { from_raw_parts_mut(lde_h1.as_mut_ptr() as *mut u64, ext3_len) };
         let mut outputs: [&mut [u64]; 2] = [out0_slice, out1_slice];
-        // `_keep` fills the host `outputs` (still consumed by R4 openings) AND
-        // retains the device buffer as a handle, so the Merkle commit and DEEP
-        // reuse it instead of re-uploading the parts.
         let h = match math_cuda::lde::coset_lde_batch_ext3_into_keep(
             &inputs,
             n,
             blowup,
             &weights_u64,
             &mut outputs,
+            true,
         ) {
             Ok(h) => h,
             Err(_) => return None,
         };
-        // The host D2H the `_into`/`_keep` still performs for compatibility.
         math_cuda::stagebytes::add_comp_h01_lde_d2h((ext3_len * NUM_COLS) * 8);
         h
+    } else {
+        let mut outputs: [&mut [u64]; 0] = [];
+        match math_cuda::lde::coset_lde_batch_ext3_into_keep(
+            &inputs,
+            n,
+            blowup,
+            &weights_u64,
+            &mut outputs,
+            false,
+        ) {
+            Ok(h) => h,
+            Err(_) => return None,
+        }
     };
 
     Some((lde_h0, lde_h1, handle))
@@ -977,6 +993,19 @@ pub fn merkle_resident_disabled() -> bool {
             .map(|v| v == "1")
             .unwrap_or(false)
     })
+}
+
+/// Force the A+B behavior for measurement/debugging: retain the host copy of
+/// the composition LDE even when every consumer can use the resident handle.
+/// The pre-residency toggles also require the host copy for their fallbacks.
+pub fn retain_composition_host() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let explicit = *V.get_or_init(|| {
+        std::env::var("GPU_RETAIN_COMPOSITION_HOST")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
+    explicit || deep_resident_disabled() || merkle_resident_disabled()
 }
 
 /// R2 GPU dispatch: build the composition-polynomial Merkle tree directly from
@@ -1483,19 +1512,39 @@ where
     F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
 {
+    static DEEP_DIAG: OnceLock<bool> = OnceLock::new();
+    let diag = *DEEP_DIAG.get_or_init(|| {
+        std::env::var("GPU_DEEP_DIAG")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    });
+    macro_rules! reject {
+        ($reason:expr) => {{
+            if diag {
+                eprintln!("GPU_DEEP_DIAG reject: {}", $reason);
+            }
+            return None;
+        }};
+    }
+
     if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
-        return None;
+        reject!("base field is not Goldilocks");
     }
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
-        return None;
+        reject!("extension field is not Goldilocks ext3");
     }
-    let main = lde_trace.gpu_main()?;
+    let Some(main) = lde_trace.gpu_main() else {
+        reject!("main LDE has no device handle");
+    };
     let lde_size = main.lde_size;
     if lde_size < gpu_lde_threshold() {
-        return None;
+        reject!(format!(
+            "lde_size {lde_size} is below threshold {}",
+            gpu_lde_threshold()
+        ));
     }
     if !lde_size.is_power_of_two() {
-        return None;
+        reject!(format!("lde_size {lde_size} is not a power of two"));
     }
     let num_main = main.m;
     let aux_handle = lde_trace.gpu_aux();
@@ -1503,19 +1552,28 @@ where
     let num_total_cols = num_main + num_aux;
     let num_parts = composition_poly_gammas.len();
     if h_ood.len() != num_parts {
-        return None;
+        reject!(format!(
+            "h_ood length {} != num_parts {num_parts}",
+            h_ood.len()
+        ));
     }
     if trace_ood_columns.len() != num_total_cols
         || trace_ood_columns.iter().any(|c| c.len() != num_eval_points)
     {
-        return None;
+        reject!(format!(
+            "trace OOD shape mismatch: columns={}, expected_columns={num_total_cols}, eval_points={num_eval_points}",
+            trace_ood_columns.len()
+        ));
     }
     if trace_terms_gammas.len() != num_total_cols
         || trace_terms_gammas
             .iter()
             .any(|c| c.len() != num_eval_points)
     {
-        return None;
+        reject!(format!(
+            "trace gamma shape mismatch: columns={}, expected_columns={num_total_cols}, eval_points={num_eval_points}",
+            trace_terms_gammas.len()
+        ));
     }
     let expected_inv_denoms = lde_size.checked_mul(1 + num_eval_points)?;
     // The fully-resident `(Some(parts), Some(dev_inv))` arm ignores the
@@ -1527,22 +1585,35 @@ where
     // slicing an empty host buffer).
     let arm_needs_host_inv = !(parts_dev.is_some() && inv_denoms_dev.is_some());
     if arm_needs_host_inv && inv_denoms_host.len() != expected_inv_denoms {
-        return None;
+        reject!(format!(
+            "host inv_denoms length {} != expected {expected_inv_denoms} (parts_dev={}, inv_dev={})",
+            inv_denoms_host.len(),
+            parts_dev.is_some(),
+            inv_denoms_dev.is_some()
+        ));
     }
 
     // Validate the host parts when we don't have a device handle, since
     // the math-cuda call will assert these.
     if parts_dev.is_none() {
         if parts_host.len() != num_parts {
-            return None;
+            reject!(format!(
+                "host parts length {} != num_parts {num_parts}",
+                parts_host.len()
+            ));
         }
         if parts_host.iter().any(|p| p.len() != lde_size) {
-            return None;
+            reject!(format!(
+                "a host part length differs from lde_size {lde_size}"
+            ));
         }
     } else if let Some(p) = parts_dev
         && (p.m != num_parts || p.lde_size != lde_size)
     {
-        return None;
+        reject!(format!(
+            "device parts shape m={}, lde_size={} != expected m={num_parts}, lde_size={lde_size}",
+            p.m, p.lde_size
+        ));
     }
 
     // Pack host buffers. SAFETY for ext3 transmutes: E == Ext3 by TypeId check.
@@ -1577,6 +1648,16 @@ where
     //   2. Parts on device, inv_denoms on host.
     //   3. Both on host (fallback when R2 keep + denom-invert both missed).
     let parts_host_packed: Vec<u64>;
+    let arm = match (parts_dev.is_some(), inv_denoms_dev.is_some()) {
+        (true, true) => "device-parts+device-inv",
+        (true, false) => "device-parts+host-inv",
+        (false, _) => "host-parts+host-inv",
+    };
+    if diag {
+        eprintln!(
+            "GPU_DEEP_DIAG attempt: arm={arm} lde_size={lde_size} main={num_main} aux={num_aux} parts={num_parts} eval_points={num_eval_points}"
+        );
+    }
     let result = match (parts_dev, inv_denoms_dev) {
         (Some(parts), Some((inv_dev, stream))) => {
             math_cuda::deep::deep_composition_ext3_with_dev_parts_and_inv_denoms(
@@ -1665,8 +1746,20 @@ where
 
     let deep_raw = match result {
         Ok(v) => v,
-        Err(_) => return None,
+        Err(e) => {
+            if diag {
+                eprintln!(
+                    "GPU_DEEP_DIAG cuda-error: arm={arm} lde_size={lde_size} main={num_main} aux={num_aux} parts={num_parts} eval_points={num_eval_points}: {e:?}"
+                );
+            }
+            return None;
+        }
     };
+    if diag {
+        eprintln!(
+            "GPU_DEEP_DIAG success: arm={arm} lde_size={lde_size} main={num_main} aux={num_aux} parts={num_parts} eval_points={num_eval_points}"
+        );
+    }
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
     debug_assert_eq!(deep_raw.len(), lde_size * 3);
     Some(u64_to_ext3_vec::<E>(&deep_raw))
