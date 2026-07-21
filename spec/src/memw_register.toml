@@ -122,11 +122,11 @@ ref = "regw:c:write_val"
 name = "output"
 
 [[constraints.output]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["arr", ["cast", ["*", 2, "address"], "Word"], 0], ["arr", ["idx", "val", 0], ["idx", "val", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "old", 0], ["idx", "old", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = ["-", "μ_read"]
+kind = "template"
+tag = "REG"
+input = ["address", "val", "timestamp"]
+output = "old"
+cond = ["-", "μ_read"]
 
 [[constraints.output]]
 kind = "interaction"

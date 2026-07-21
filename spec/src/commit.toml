@@ -82,35 +82,35 @@ ref = "commit:c:receive_ecall"
 name = "read_input"
 
 [[constraints.read_input]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 11], "DWordWL"], ["arr", ["idx", "address", 0], ["idx", "address", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "address", 0], ["idx", "address", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "first"
+kind = "template"
+tag = "REG"
+input = [11, "address", "timestamp"]
+output = "address"
+cond = "first"
 ref = "commit:c:read_address"
 
 [[constraints.read_input]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 12], "DWordWL"], ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "first"
+kind = "template"
+tag = "REG"
+input = [12, "count", "timestamp"]
+output = "count"
+cond = "first"
 ref = "commit:c:read_count"
 
 [[constraints.read_input]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "count", 0], ["idx", "count", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", 1, 0, 0, 0, 0, 0, 0, 0]
-multiplicity = "first"
+kind = "template"
+tag = "REG"
+input = [10, "count", "timestamp"]
+output = ["cast", 1, "DWordWL"]
+cond = "first"
 ref = "commit:c:read_fd_write_count"
 
 [[constraints.read_input]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 254], "DWordWL"], ["arr", ["+", "index", ["cast", "count", "BaseField"]], 0, 0, 0, 0, 0, 0, 0], "timestamp", 0, 0, 0]
-output = ["arr", "index", 0, 0, 0, 0, 0, 0, 0]
-multiplicity = "first"
+kind = "template"
+tag = "REG"
+input = [254, ["arr", ["+", "index", ["cast", "count", "BaseField"]], 0], "timestamp"]
+output = ["arr", "index", 0]
+cond = "first"
 ref = "commit:c:read_index"
 
 

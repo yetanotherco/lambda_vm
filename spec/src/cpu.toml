@@ -421,11 +421,11 @@ multiplicity = "ALU"
 name = "mem"
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", "rv1", 0], ["idx", "rv1", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 0], 1, 0, 0]
-output = ["arr", ["idx", "rv1", 0], ["idx", "rv1", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "read_register1"
+kind = "template"
+tag = "REG"
+input = ["rs1", "rv1", ["+", "timestamp", 0]]
+output = "rv1"
+cond = "read_register1"
 ref = "cpu:c:read_rv1"
 
 [[constraints.mem]]
@@ -435,11 +435,11 @@ poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
 iter = ["i", 0, 1]
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", "rv2", 0], ["idx", "rv2", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 1], 1, 0, 0]
-output = ["arr", ["idx", "rv2", 0], ["idx", "rv2", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "read_register2"
+kind = "template"
+tag = "REG"
+input = ["rs2", "rv2", ["+", "timestamp", 1]]
+output = "rv2"
+cond = "read_register2"
 
 [[constraints.mem]]
 kind = "arith"

@@ -257,16 +257,11 @@ pad = 0
 name = "read_xG"
 
 [[constraints.read_xG]]
-kind = "interaction"
-tag = "MEMW"
-input = [
-    1, 
-    ["cast", ["*", 2, 11], "DWordWL"],
-    ["arr", ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    "timestamp", 
-    1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xG", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [11, ["cast", ["idx", "addr_xG", 0], "DWordWL"], "timestamp"]
+output = ["cast", ["idx", "addr_xG", 0], "DWordWL"]
+cond = "μ"
 ref = "ec:c:read_addr_xG"
 
 [[constraints.read_xG]]
@@ -483,16 +478,11 @@ ref = "ec:c:range_c1"
 name = "verify_k"
 
 [[constraints.verify_k]]
-kind = "interaction"
-tag = "MEMW"
-input = [
-    1, 
-    ["cast", ["*", 2, 12], "DWordWL"],
-    ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    ["+", "timestamp", 1],
-    1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [12, ["cast", ["idx", "addr_k", 0], "DWordWL"], ["+", "timestamp", 1]]
+output = ["cast", ["idx", "addr_k", 0], "DWordWL"]
+cond = "μ"
 ref = "ec:c:read_addr_k"
 
 [[constraints.verify_k]]
@@ -649,16 +639,11 @@ ref = "ec:c:xR_addition_overflows"
 name = "write_xR"
 
 [[constraints.write_xR]]
-kind = "interaction"
-tag = "MEMW"
-input = [
-    1, 
-    ["cast", ["*", 2, 10], "DWordWL"],
-    ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    ["+", "timestamp", 2],
-    1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [10, ["cast", ["idx", "addr_xR", 0], "DWordWL"], ["+", "timestamp", 2]]
+output = ["cast", ["idx", "addr_xR", 0], "DWordWL"]
+cond = "μ"
 ref = "ec:c:load_addr_xR"
 
 [[constraints.write_xR]]

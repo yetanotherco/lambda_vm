@@ -24,6 +24,7 @@
       ("sign.typ", [`SIGN` template], <sign>),
       ("add.typ", [`ADD`/`SUB` template], <add>),
       ("neg.typ", [`NEG` template], <neg>),
+      ("reg.typ", [`REG` template], <reg>),
     )),
     ("CPU", (
       ("decode.typ", [`DECODE` table], <decode>),

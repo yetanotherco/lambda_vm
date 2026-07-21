@@ -26,11 +26,10 @@ multiplicity = 1
 ref = "halt:c:zeroize_registers_lo"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["cast", 0, ["BaseField", 8]], ["-", ["^", 2, 32], 1], 1, 0, 0]
-output = ["cast", 0, ["BaseField", 8]]
-multiplicity = 1
+kind = "template"
+tag = "REG"
+input = [10, ["cast", 0, "DWordWL"], ["-", ["^", 2, 32], 1]]
+output = ["cast", 0, "DWordWL"]
 ref = "halt:c:read_zero_exit_code"
 
 [[constraints.all]]
