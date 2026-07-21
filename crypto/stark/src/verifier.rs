@@ -1347,8 +1347,10 @@ pub trait IsStarkVerifier<
                 .map(|(idx, _)| idx)
                 .collect();
 
-            // Instance sizes come from the proofs' trace lengths (nonzero was
-            // checked in Phase A); reject non-power-of-two outright.
+            // Instance sizes: interaction bits (a public function of the AIR,
+            // never the proof) + row bits from the proofs' trace lengths
+            // (nonzero was checked in Phase A); reject non-power-of-two.
+            let mut input_vars_by_instance = Vec::with_capacity(gkr_indices.len());
             let mut n_layers_by_instance = Vec::with_capacity(gkr_indices.len());
             for &idx in &gkr_indices {
                 let trace_length = trace_lengths[idx];
@@ -1356,7 +1358,10 @@ pub trait IsStarkVerifier<
                     error!("Table {idx}: trace length {trace_length} is not a power of two");
                     return false;
                 }
-                n_layers_by_instance.push(trace_length.trailing_zeros() as usize);
+                let input_vars =
+                    crate::logup_gkr::gkr_input_num_vars(airs[idx].bus_interactions().len());
+                input_vars_by_instance.push(input_vars);
+                n_layers_by_instance.push(input_vars + trace_length.trailing_zeros() as usize);
             }
 
             let (shared_point, per_instance_claims) =
@@ -1377,13 +1382,16 @@ pub trait IsStarkVerifier<
                     return false;
                 };
                 let (n_claim, d_claim) = &per_instance_claims[k];
+                let full_point = instance_eval_point(&shared_point, n_layers_by_instance[k]);
+                let (kappa, _rho) =
+                    crate::logup_gkr::split_input_point(&full_point, input_vars_by_instance[k]);
                 if !reconstruct_and_verify_gkr_claims(
                     n_claim,
                     d_claim,
                     claims,
                     airs[idx].bus_interactions(),
                     &lookup_challenges,
-                    n_layers_by_instance[k],
+                    kappa,
                 ) {
                     error!("Table {idx}: GKR column-claim reconstruction failed");
                     return false;
@@ -1406,14 +1414,17 @@ pub trait IsStarkVerifier<
                     .as_ref()
                     .expect("presence checked above");
                 let trace_length = trace_lengths[idx];
-                let random_point = instance_eval_point(&shared_point, n_layers_by_instance[k]);
+                let full_point = instance_eval_point(&shared_point, n_layers_by_instance[k]);
+                // ρ (the row part) is the random point for the kernel/bridge.
+                let (_kappa, rho) =
+                    crate::logup_gkr::split_input_point(&full_point, input_vars_by_instance[k]);
                 let mut challenges = lookup_challenges.clone();
                 extend_rap_challenges_with_bridge(
                     &mut challenges,
                     claims,
                     &gamma,
                     trace_length,
-                    &random_point,
+                    rho,
                 );
                 table_challenges[idx] = challenges;
             }

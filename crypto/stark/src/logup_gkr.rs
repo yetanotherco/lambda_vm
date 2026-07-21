@@ -77,6 +77,39 @@ pub const fn logup_random_point_start(num_columns: usize) -> usize {
 }
 
 // =============================================================================
+// Input-layer geometry (the linear input layer — see
+// thoughts/logup-gkr/input-layer-design.md)
+// =============================================================================
+// Each table is ONE GKR instance over K̂·N leaves indexed `i·K̂ + k`
+// (interaction bits LOW): leaf (i, k) = (±m_k(i), fp_k(i)) for k < K, the
+// fraction identity (0, 1) for padding. Leaves are LINEAR in the trace
+// columns, so the verifier reconstructs the input-layer claims exactly from
+// the column claims (no fail-open branch). By pair-level associativity of
+// fraction addition, the tree's layer at size N equals the cross-multiplied
+// per-row fractions bit-for-bit, so every layer from N up — and the root —
+// is unchanged.
+
+/// Number of padded interaction variables for a table: `log2(K̂)` where
+/// `K̂ = K.next_power_of_two()`. Zero for single-interaction tables (the
+/// instance degenerates to the per-row tree).
+pub fn gkr_input_num_vars(num_interactions: usize) -> usize {
+    debug_assert!(num_interactions > 0);
+    num_interactions.next_power_of_two().trailing_zeros() as usize
+}
+
+/// Split an instance's full evaluation point into `(κ, ρ)`: the low
+/// `input_num_vars` coordinates κ index the interaction bits (they weight the
+/// verifier's claim reconstruction), the remaining coordinates ρ index the
+/// rows (they are THE random point for the column claims and the
+/// kernel/bridge — same length `log2(N)` as a row-only point).
+pub fn split_input_point<E: IsField>(
+    point: &[FieldElement<E>],
+    input_num_vars: usize,
+) -> (&[FieldElement<E>], &[FieldElement<E>]) {
+    point.split_at(input_num_vars)
+}
+
+// =============================================================================
 // Column extraction
 // =============================================================================
 
@@ -194,8 +227,84 @@ where
     (numerators, denominators)
 }
 
-/// Compute the full GKR layer tree for one table's interactions: leaf
-/// fractions, then pairwise fraction-summation layers up to the root.
+/// Build the LINEAR input layer: `K̂·N` leaves indexed `i·K̂ + k`, leaf
+/// `(i, k) = (sign_k·m_k(i), fp_k(i))` for `k < K` and the fraction identity
+/// `(0, 1)` for padding. Row-parallel; rows are read in place from the
+/// row-major main table.
+fn compute_gkr_input_layer<F, E>(
+    interactions: &[BusInteraction],
+    main: &Table<F>,
+    trace_len: usize,
+    challenges: &[FieldElement<E>],
+) -> Layer<E>
+where
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
+    E: IsField + Send + Sync,
+{
+    assert!(
+        !interactions.is_empty(),
+        "the input layer requires at least one interaction"
+    );
+
+    let z = &challenges[LOGUP_CHALLENGE_Z];
+    let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
+    let max_bus_elements = interactions
+        .iter()
+        .map(|inter| inter.num_bus_elements())
+        .max()
+        .unwrap();
+    let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
+    let shifts = PackingShifts::<F>::new();
+    let k_hat = interactions.len().next_power_of_two();
+
+    let row_leaves = |row_idx: usize| -> Vec<(FieldElement<E>, FieldElement<E>)> {
+        let row = main.get_row(row_idx);
+        let mut leaves = Vec::with_capacity(k_hat);
+        for inter in interactions {
+            let fp = compute_fingerprint_at_row(inter, row, z, &alpha_powers, &shifts);
+            let m = inter.multiplicity.evaluate_from(|col| row[col].clone());
+            let n = if inter.is_sender {
+                m.to_extension()
+            } else {
+                (-m).to_extension()
+            };
+            leaves.push((n, fp));
+        }
+        // Padding: the fraction identity 0/1 (contributes nothing to any sum).
+        leaves.resize_with(k_hat, || {
+            (FieldElement::<E>::zero(), FieldElement::<E>::one())
+        });
+        leaves
+    };
+
+    #[cfg(feature = "parallel")]
+    let per_row: Vec<Vec<(FieldElement<E>, FieldElement<E>)>> =
+        (0..trace_len).into_par_iter().map(row_leaves).collect();
+    #[cfg(not(feature = "parallel"))]
+    let per_row: Vec<Vec<(FieldElement<E>, FieldElement<E>)>> =
+        (0..trace_len).map(row_leaves).collect();
+
+    let mut numerators = Vec::with_capacity(k_hat * trace_len);
+    let mut denominators = Vec::with_capacity(k_hat * trace_len);
+    for row in per_row {
+        for (n, d) in row {
+            numerators.push(n);
+            denominators.push(d);
+        }
+    }
+
+    Layer::LogUpGeneric {
+        numerators,
+        denominators,
+    }
+}
+
+/// Compute the full GKR layer tree for one table's interactions, from the
+/// LINEAR input layer (`K̂·N` per-interaction leaves) up to the root. The
+/// first `log2(K̂)` summation layers absorb the interaction sum; by pair
+/// associativity the layer at size N equals the cross-multiplied per-row
+/// fractions ([`compute_logup_leaf_fractions`]) bit-for-bit, and everything
+/// above — including the root — is unchanged from the row-only tree.
 pub fn compute_logup_layers<F, E>(
     interactions: &[BusInteraction],
     main: &Table<F>,
@@ -206,12 +315,12 @@ where
     F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
-    let (numerators, denominators) =
-        compute_logup_leaf_fractions(interactions, main, trace_len, challenges);
-    gen_layers(Layer::LogUpGeneric {
-        numerators,
-        denominators,
-    })
+    gen_layers(compute_gkr_input_layer(
+        interactions,
+        main,
+        trace_len,
+        challenges,
+    ))
 }
 
 // =============================================================================
@@ -471,36 +580,34 @@ impl<E: IsField> ClaimLookup<'_, E> {
     }
 }
 
-/// Verify a table's `column_claims` against the batch-GKR leaf claims
-/// `(n_claim, d_claim)`.
+/// Verify a table's `column_claims` against the batch-GKR input-layer claims
+/// `(n_claim, d_claim)` — the EXACT reconstruction the linear input layer
+/// affords (thoughts/logup-gkr/input-layer-design.md).
 ///
 /// Always enforced: the claim index set must EQUAL the canonical sorted
 /// distinct column set of the interactions (same indices, same order).
 ///
-/// For single-interaction tables and 0-layer (single-row) instances the leaf
-/// fraction is reconstructible from the column MLEs — single-interaction
-/// leaves are linear in the columns, and at the empty point the MLE is the row
-/// value itself — so the rational cross-check
-/// `n_recon·d_claim == n_claim·d_recon` is exact and enforced.
+/// The input-layer leaves `(±m_k(i), fp_k(i))` are LINEAR in the trace
+/// columns, so the leaf-vector MLEs at the instance point `(κ, ρ)` factor
+/// through the column MLEs at ρ (the `column_claims`, bound to the committed
+/// trace by the bridge constraint):
 ///
-/// # KNOWN SOUNDNESS GAP (multi-interaction tables)
+/// ```text
+/// n̂ = Σ_{k<K} eq(κ, bits(k)) · sign_k · m_k(ĉ)
+/// d̂ = Σ_{k<K} eq(κ, bits(k)) · fp_k(ĉ)  +  (1 − Σ_{k<K} eq(κ, bits(k)))
+/// ```
 ///
-/// For `interactions.len() > 1` with `n_layers > 0` this check is FAIL-OPEN:
-/// the leaf fraction is a nonlinear (cross-multiplied) function of the
-/// columns, MLE does not commute with products, and nothing else binds
-/// `(n_claim, d_claim)` to the committed trace — the bridge constraint binds
-/// only `column_claims`. A malicious prover can therefore run an honest GKR
-/// over fabricated leaves. Every production table is multi-interaction. The
-/// fix (a linear input layer or an input-layer sumcheck) is designed as the
-/// immediate follow-up — see `thoughts/logup-gkr/port-plan.md` §6. Do NOT
-/// treat GKR mode as production-sound until it lands.
+/// (the trailing term is the padding leaves' `d = 1`, via the eq kernel's
+/// partition of unity). Both are checked for EXACT equality against the
+/// transcript-derived claims — every table, every size, no fail-open branch.
+/// `kappa` is the κ part of the instance point (`split_input_point`).
 pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
     n_claim: &FieldElement<E>,
     d_claim: &FieldElement<E>,
     column_claims: &[(usize, FieldElement<E>)],
     interactions: &[BusInteraction],
     challenges: &[FieldElement<E>],
-    n_layers: usize,
+    kappa: &[FieldElement<E>],
 ) -> bool {
     // Structural binding: exact index-set (and order) equality with the
     // canonical column list. Subsumes presence checks and pins the transcript
@@ -517,6 +624,13 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
         return false;
     }
 
+    // κ must have exactly the padded-interaction bit count (a public function
+    // of the AIR, never proof-derived — the caller slices it off the
+    // transcript-derived instance point).
+    if kappa.len() != gkr_input_num_vars(interactions.len()) {
+        return false;
+    }
+
     let claims = ClaimLookup(column_claims);
     let z = &challenges[LOGUP_CHALLENGE_Z];
     let alpha = &challenges[LOGUP_CHALLENGE_ALPHA];
@@ -527,11 +641,14 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
         .unwrap_or(0);
     let alpha_powers = compute_alpha_powers(alpha, max_bus_elements);
 
-    // Reconstruct the leaf fraction from the column claims with the SAME
-    // cross-multiplication recurrence as `compute_logup_leaf_fractions`.
-    let mut running_n = FieldElement::<E>::zero();
-    let mut running_d = FieldElement::<E>::one();
-    for inter in interactions {
+    // eq(κ, bits(k)) weights over the padded interaction hypercube.
+    let eq_kappa = compute_lagrange_kernel(kappa);
+
+    // Per-interaction linear forms on the column claims, eq-weighted.
+    let mut n_recon = FieldElement::<E>::zero();
+    let mut d_recon = FieldElement::<E>::zero();
+    let mut eq_sum = FieldElement::<E>::zero();
+    for (k, inter) in interactions.iter().enumerate() {
         let mut lc = FieldElement::<E>::from(inter.bus_id);
         let mut alpha_offset = 1;
         for bv in &inter.values {
@@ -542,19 +659,18 @@ pub fn reconstruct_and_verify_gkr_claims<E: IsField>(
         }
         let fp = z - &lc;
         let m = inter.multiplicity.evaluate_from(|col| claims.get(col));
-        let cross = &m * &running_d;
-        let cross = if inter.is_sender { cross } else { -cross };
-        running_n = &running_n * &fp + cross;
-        running_d = &running_d * &fp;
-    }
+        let m = if inter.is_sender { m } else { -m };
 
-    if interactions.len() == 1 || n_layers == 0 {
-        // Rational cross-check: n_recon/d_recon == n_claim/d_claim.
-        &running_n * d_claim == n_claim * &running_d
-    } else {
-        // FAIL-OPEN — see the doc comment's KNOWN SOUNDNESS GAP.
-        true
+        let eq_k = &eq_kappa[k];
+        n_recon += eq_k * &m;
+        d_recon += eq_k * &fp;
+        eq_sum += eq_k.clone();
     }
+    // Padding leaves: n = 0 (nothing), d = 1 → Σ_{k≥K} eq(κ,k)·1, computed
+    // via partition of unity (Σ_all eq = 1).
+    d_recon += FieldElement::<E>::one() - eq_sum;
+
+    n_recon == *n_claim && d_recon == *d_claim
 }
 
 #[cfg(test)]
@@ -702,7 +818,7 @@ mod tests {
             &column_claims,
             &interactions,
             &challenges,
-            0,
+            &[],
         ));
 
         let tampered = FE::from(999u64);
@@ -712,7 +828,7 @@ mod tests {
             &column_claims,
             &interactions,
             &challenges,
-            0,
+            &[],
         ));
 
         // Missing claim → reject.
@@ -722,7 +838,7 @@ mod tests {
             &column_claims[..1],
             &interactions,
             &challenges,
-            0,
+            &[],
         ));
         // Extra claim → reject.
         let mut extra = column_claims.clone();
@@ -733,8 +849,54 @@ mod tests {
             &extra,
             &interactions,
             &challenges,
-            0,
+            &[],
         ));
+    }
+
+    /// Fact 1 of the input-layer design: by pair-level associativity of
+    /// fraction addition, the extended tree's layer at size N (after the
+    /// `log2(K̂)` interaction-summing layers) equals the cross-multiplied
+    /// per-row fractions of [`compute_logup_leaf_fractions`] BIT-FOR-BIT —
+    /// including with padding (K = 3 → K̂ = 4 exercises the (0,1) identity).
+    #[test]
+    fn extended_tree_n_layer_matches_cross_multiplied_fractions() {
+        let trace_len = 8usize;
+        let col0: Vec<FE> = (1..=8).map(|v| FE::from(v as u64)).collect();
+        let col1: Vec<FE> = (21..=28).map(|v| FE::from(v as u64)).collect();
+        let col2: Vec<FE> = [1u64, 0, 2, 1, 0, 3, 1, 1]
+            .iter()
+            .map(|&v| FE::from(v))
+            .collect();
+        let main = Table::from_columns(vec![col0, col1, col2]);
+
+        let interactions = vec![
+            BusInteraction::sender(3u64, Multiplicity::One, Packing::Direct.columns(&[0])),
+            BusInteraction::receiver(3u64, Multiplicity::Column(2), Packing::Direct.columns(&[1])),
+            BusInteraction::sender(5u64, Multiplicity::Column(2), Packing::Word2L.columns(&[0])),
+        ];
+        let challenges = vec![FE::from(0xDEAD_BEEFu64), FE::from(0x1234_5678u64)];
+
+        let (expected_n, expected_d) =
+            compute_logup_leaf_fractions::<F, F>(&interactions, &main, trace_len, &challenges);
+
+        let layers = compute_logup_layers::<F, F>(&interactions, &main, trace_len, &challenges);
+        let input_vars = gkr_input_num_vars(interactions.len());
+        assert_eq!(input_vars, 2, "K = 3 pads to K̂ = 4");
+        let n_layer = &layers[input_vars];
+        match n_layer {
+            Layer::LogUpGeneric {
+                numerators,
+                denominators,
+            } => {
+                assert_eq!(numerators.len(), trace_len);
+                assert_eq!(numerators, &expected_n, "numerators diverge at the N layer");
+                assert_eq!(
+                    denominators, &expected_d,
+                    "denominators diverge at the N layer"
+                );
+            }
+            other => panic!("unexpected layer variant: {other:?}"),
+        }
     }
 
     /// The cross-mode oracle: the GKR summation-tree ROOT must equal the
@@ -795,24 +957,43 @@ mod tests {
         assert_eq!(root_value, expected_l, "GKR root != standard-mode L");
     }
 
-    /// KNOWN SOUNDNESS GAP (`thoughts/logup-gkr/port-plan.md` §6): for
-    /// multi-interaction tables nothing binds the batch-GKR leaf claims
-    /// `(n̂, d̂)` to the committed columns — the leaf fraction is nonlinear in
-    /// the columns, so the reconstruction check is fail-open there. This test
-    /// asserts the DESIRED fail-closed behavior with fabricated leaf claims
-    /// and honest column claims; it is `#[ignore]`d because it FAILS today.
-    /// The input-layer binding fix un-ignores it.
+    /// The leaf-binding check (formerly the KNOWN SOUNDNESS GAP of
+    /// port-plan.md §6, closed by the linear input layer): fabricated
+    /// multi-interaction leaf claims are REJECTED, and the honest
+    /// reconstruction is accepted — exact equality, both n̂ and d̂.
     #[test]
-    #[ignore = "documents the multi-interaction leaf-binding gap (fail-open); the input-layer fix makes this pass"]
     fn reconstruct_multi_interaction_rejects_fabricated_leaf_claims() {
         let interactions = vec![
             BusInteraction::sender(1u64, Multiplicity::One, Packing::Direct.columns(&[0])),
             BusInteraction::receiver(2u64, Multiplicity::One, Packing::Direct.columns(&[1])),
         ];
         let challenges = vec![FE::from(1000u64), FE::from(7u64)];
-        // Honest-looking column claims, fabricated leaf claims that no leaf
-        // vector consistent with the columns could produce.
+        let alpha_powers = compute_alpha_powers(&challenges[1], 2);
         let column_claims = vec![(0usize, FE::from(5u64)), (1usize, FE::from(9u64))];
+        // K = 2 → K̂ = 2 → one κ coordinate.
+        let kappa = vec![FE::from(13u64)];
+
+        // Honest input-layer claims: eq-weighted linear forms on the claims.
+        let eq = compute_lagrange_kernel(&kappa);
+        let fp0 = challenges[0] - (FE::from(1u64) + FE::from(5u64) * alpha_powers[1]);
+        let fp1 = challenges[0] - (FE::from(2u64) + FE::from(9u64) * alpha_powers[1]);
+        let honest_n = eq[0] * FE::one() + eq[1] * (-FE::one());
+        let honest_d = eq[0] * fp0 + eq[1] * fp1;
+        assert!(
+            reconstruct_and_verify_gkr_claims(
+                &honest_n,
+                &honest_d,
+                &column_claims,
+                &interactions,
+                &challenges,
+                &kappa,
+            ),
+            "honest multi-interaction leaf claims must be accepted"
+        );
+
+        // Fabricated leaf claims that no leaf vector consistent with the
+        // columns could produce — must be rejected (this was the fail-open
+        // hole before the linear input layer).
         let fabricated_n = FE::from(0xBADu64);
         let fabricated_d = FE::from(0xC0DEu64);
         assert!(
@@ -822,9 +1003,22 @@ mod tests {
                 &column_claims,
                 &interactions,
                 &challenges,
-                3,
+                &kappa,
             ),
             "fabricated multi-interaction leaf claims must be rejected"
+        );
+
+        // A wrong-length κ (proof-shape confusion) must be rejected.
+        assert!(
+            !reconstruct_and_verify_gkr_claims(
+                &honest_n,
+                &honest_d,
+                &column_claims,
+                &interactions,
+                &challenges,
+                &[],
+            ),
+            "wrong κ length must be rejected"
         );
     }
 

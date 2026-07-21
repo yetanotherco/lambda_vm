@@ -629,12 +629,9 @@ fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
             .expect("GKR continuation bundle must verify");
 
     // Guest path: blob → archived verify+attest → consumer check.
-    let blob = recursion::encode_gkr_continuation_guest_input(
-        bundle,
-        &fib_elf_bytes,
-        &MIN_PROOF_OPTIONS,
-    )
-    .expect("encode_gkr_continuation_guest_input failed");
+    let blob =
+        recursion::encode_gkr_continuation_guest_input(bundle, &fib_elf_bytes, &MIN_PROOF_OPTIONS)
+            .expect("encode_gkr_continuation_guest_input failed");
     assert!(
         blob.len() <= executor::vm::memory::MAX_PRIVATE_INPUT_SIZE as usize,
         "GKR continuation input exceeds MAX_PRIVATE_INPUT_SIZE"

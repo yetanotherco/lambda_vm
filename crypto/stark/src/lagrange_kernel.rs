@@ -216,7 +216,7 @@ mod tests {
                 let mut expected = FE::one();
                 for (l, r_l) in r.iter().enumerate() {
                     let bit = (i >> l) & 1;
-                    expected *= if bit == 1 { *r_l } else { &one - r_l };
+                    expected *= if bit == 1 { *r_l } else { one - r_l };
                 }
                 assert_eq!(*v, expected, "kernel mismatch at n={n}, i={i}");
             }

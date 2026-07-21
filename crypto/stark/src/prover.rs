@@ -2689,8 +2689,15 @@ pub trait IsStarkProver<
             let results: Vec<LogUpGkrResult<FieldExtension>> =
                 crate::par::par_map_collect(0..gkr_indices.len(), |k| {
                     let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
-                    let n_vars = trace.num_rows().trailing_zeros() as usize;
-                    let random_point = instance_eval_point(&shared_point, n_vars);
+                    // Instance variables = interaction bits (low) + row bits;
+                    // ρ (the row part) is THE random point for column claims
+                    // and the kernel/bridge.
+                    let input_vars =
+                        crate::logup_gkr::gkr_input_num_vars(air.bus_interactions().len());
+                    let n_vars = input_vars + trace.num_rows().trailing_zeros() as usize;
+                    let full_point = instance_eval_point(&shared_point, n_vars);
+                    let (_kappa, rho) =
+                        crate::logup_gkr::split_input_point(&full_point, input_vars);
                     let (n_claim, d_claim) = final_claims[k];
                     let (root_n, root_d) = batch_gkr_proof.root_claims[k];
                     let table_contribution = root_n
@@ -2700,7 +2707,7 @@ pub trait IsStarkProver<
                     finalize_logup_gkr_result(
                         air.bus_interactions(),
                         &trace.main_table,
-                        random_point,
+                        rho.to_vec(),
                         n_claim,
                         d_claim,
                         table_contribution,
