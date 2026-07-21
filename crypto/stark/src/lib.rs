@@ -22,6 +22,7 @@ pub mod grinding;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 pub mod lagrange_kernel;
+pub mod logup_gkr;
 #[cfg(feature = "cuda")]
 pub mod logup_gpu;
 pub mod lookup;

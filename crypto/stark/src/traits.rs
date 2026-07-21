@@ -171,6 +171,20 @@ pub trait AIR: Send + Sync {
         0
     }
 
+    /// The table's bus interactions (empty when the AIR has none). The GKR
+    /// LogUp path reads these to build leaf fractions (prover) and reconstruct
+    /// claims (verifier).
+    fn bus_interactions(&self) -> &[crate::lookup::BusInteraction] {
+        &[]
+    }
+
+    /// How this AIR's LogUp sums are proven. Non-bus AIRs report the default
+    /// [`crate::lookup::LogUpMode::Standard`]; the prover and verifier require
+    /// every interacting table in a multi-proof to agree on the mode.
+    fn logup_mode(&self) -> crate::lookup::LogUpMode {
+        crate::lookup::LogUpMode::Standard
+    }
+
     /// Returns true if this AIR has preprocessed (precomputed) columns.
     ///
     /// Preprocessed tables have columns that are fully deterministic and known

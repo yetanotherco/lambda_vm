@@ -104,6 +104,21 @@ pub const LOGUP_CHALLENGE_ALPHA: usize = 1;
 /// Number of challenges required by the LogUp protocol.
 pub const LOGUP_NUM_CHALLENGES: usize = 2;
 
+/// How a table's LogUp bus sums are proven.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum LogUpMode {
+    /// Committed batched term columns + a circular accumulated column; the
+    /// per-table contribution `L` travels as a public input and the verifier
+    /// checks `Σ L == expected_bus_balance`.
+    #[default]
+    Standard,
+    /// Batch GKR over fraction-summation trees: two committed aux columns
+    /// (Lagrange kernel + bridge running sum) bind the GKR claims to the
+    /// trace; the bus balance is checked on the GKR root claims. See
+    /// [`crate::logup_gkr`].
+    Gkr,
+}
+
 /// Chunk size for fused chunk-local LogUp processing.
 /// Each chunk processes all interactions for CHUNK_SIZE rows, fitting in L2 cache.
 #[cfg(feature = "parallel")]
@@ -825,6 +840,13 @@ pub struct AirWithBuses<
     /// The LogUp layout: the framework generates the LogUp (extension)
     /// constraints from this and appends them after the `constraint_set` ones.
     logup: LogUpLayout,
+    /// How this table's LogUp sums are proven (default [`LogUpMode::Standard`];
+    /// switch with [`Self::with_logup_mode`]).
+    mode: LogUpMode,
+    /// GKR mode only: the sorted distinct main columns referenced by the
+    /// interactions ([`crate::logup_gkr::extract_column_indices`]); empty in
+    /// standard mode.
+    gkr_column_indices: Vec<usize>,
     /// Idx-ordered metadata for all transition constraints, DERIVED at
     /// construction: `constraint_set.meta()` (base prefix) followed by the
     /// LogUp emission's derived metadata (ext).
@@ -921,6 +943,8 @@ impl<
             trace_layout,
             constraint_set,
             logup,
+            mode: LogUpMode::Standard,
+            gkr_column_indices: Vec::new(),
             meta,
             num_base,
             constraint_program: std::sync::OnceLock::new(),
@@ -931,6 +955,44 @@ impl<
             name: None,
             max_bus_elements,
         }
+    }
+
+    /// Switch this table's LogUp mode, re-deriving every mode-dependent piece:
+    /// the auxiliary layout (⌈N/2⌉ term+acc columns vs the 2 GKR columns), the
+    /// appended LogUp constraint metadata, the context sizes, and the lazily
+    /// captured constraint program.
+    pub fn with_logup_mode(mut self, mode: LogUpMode) -> Self {
+        self.mode = mode;
+        let num_interactions = self.logup.interactions.len();
+        self.gkr_column_indices = match mode {
+            LogUpMode::Standard => Vec::new(),
+            LogUpMode::Gkr => crate::logup_gkr::extract_column_indices(&self.logup.interactions),
+        };
+        self.trace_layout.1 = if num_interactions == 0 {
+            0
+        } else {
+            match mode {
+                LogUpMode::Standard => self.logup.num_term_columns + 1,
+                LogUpMode::Gkr => crate::logup_gkr::GKR_NUM_AUX_COLUMNS,
+            }
+        };
+
+        let mut meta = self.constraint_set.meta();
+        let mut logup_mb = crate::constraints::builder::MetaBuilder::new();
+        emit_logup_for_mode::<F, E, _>(
+            &mut logup_mb,
+            mode,
+            &self.logup,
+            &self.gkr_column_indices,
+            self.num_base,
+        );
+        meta.extend(logup_mb.into_meta());
+        self.meta = meta;
+
+        self.context.trace_columns = self.trace_layout.0 + self.trace_layout.1;
+        self.context.num_transition_constraints = self.meta.len();
+        self.constraint_program = std::sync::OnceLock::new();
+        self
     }
 
     /// Marks this AIR as a preprocessed table with a hardcoded commitment.
@@ -1004,20 +1066,33 @@ where
     }
 
     fn trace_ood_next_row_columns(&self) -> Vec<usize> {
-        // The only transition constraint that reads the next row is the circular
-        // LogUp accumulator, and after forward accumulation it reads only the
-        // accumulated column there (all committed terms and absorbed operands
-        // read the current row). Its full-width index is the main width plus the
-        // accumulated column's aux index. No interactions => no next-row reads.
+        // The only transition constraint that reads the next row is the
+        // circular running-sum column — the LogUp accumulator in standard mode
+        // (forward accumulation reads only `acc` there), the bridge sum σ in
+        // GKR mode (the kernel and every main column read the current row).
+        // Its full-width index is the main width plus its aux index. No
+        // interactions => no next-row reads.
         if self.auxiliary_trace_build_data.interactions.is_empty() {
             Vec::new()
         } else {
-            vec![self.trace_layout.0 + self.logup.acc_column_idx]
+            let aux_idx = match self.mode {
+                LogUpMode::Standard => self.logup.acc_column_idx,
+                LogUpMode::Gkr => crate::logup_gkr::GKR_AUX_SIGMA_COL,
+            };
+            vec![self.trace_layout.0 + aux_idx]
         }
     }
 
     fn has_trace_interaction(&self) -> bool {
         !self.auxiliary_trace_build_data.interactions.is_empty()
+    }
+
+    fn bus_interactions(&self) -> &[BusInteraction] {
+        &self.auxiliary_trace_build_data.interactions
+    }
+
+    fn logup_mode(&self) -> LogUpMode {
+        self.mode
     }
 
     fn max_bus_elements(&self) -> usize {
@@ -1029,10 +1104,17 @@ where
         // once via `ConstraintSet::max_degree()`; the framework's LogUp
         // constraints contribute their own known max (batched terms degree 3,
         // accumulator `1 + absorbed`).
-        let max_degree = self
-            .constraint_set
-            .max_degree()
-            .max(logup_max_degree(&self.logup));
+        let logup_degree = if self.auxiliary_trace_build_data.interactions.is_empty() {
+            0
+        } else {
+            match self.mode {
+                LogUpMode::Standard => logup_max_degree(&self.logup),
+                // The bridge constraint `σ_next − σ_curr − l·batched + Δ` is
+                // degree 2 (`l` × trace columns).
+                LogUpMode::Gkr => 2,
+            }
+        };
+        let max_degree = self.constraint_set.max_degree().max(logup_degree);
         // The composition polynomial is the constraint QUOTIENT H = Σ βᵢ·Cᵢ/Zᵢ. Its degree is
         // deg(Cᵢ) − deg(Zᵢ) = (max_degree−1)·N − max_degree + eᵢ, so with the end-exemptions
         // eᵢ < max_degree (the max-degree LogUp constraints have eᵢ = 0) it fits in
@@ -1065,7 +1147,9 @@ where
         // by the base-constraint count).
         run_air_transition_prover(
             &self.constraint_set,
+            self.mode,
             &self.logup,
+            &self.gkr_column_indices,
             ctx,
             base_evals,
             ext_evals,
@@ -1078,7 +1162,9 @@ where
     ) -> Vec<FieldElement<Self::FieldExtension>> {
         run_air_transition_verifier(
             &self.constraint_set,
+            self.mode,
             &self.logup,
+            &self.gkr_column_indices,
             self.num_base,
             self.meta.len(),
             ctx,
@@ -1094,7 +1180,13 @@ where
         self.constraint_program.get_or_init(|| {
             let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
             self.constraint_set.eval(&mut cb);
-            emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+            emit_logup_for_mode(
+                &mut cb,
+                self.mode,
+                &self.logup,
+                &self.gkr_column_indices,
+                self.num_base,
+            );
             let (prog, _degrees) = cb.finish(self.num_base);
             prog
         })
@@ -1114,6 +1206,15 @@ where
         let num_interactions = self.auxiliary_trace_build_data.interactions.len();
 
         if num_interactions == 0 {
+            return None;
+        }
+
+        // GKR mode: fill the Lagrange-kernel and bridge-sum columns from the
+        // extended challenge vector (the batch GKR has already run — the
+        // bridge parameters and random point are in `challenges`). No bus
+        // public inputs travel: the balance check runs on the GKR root claims.
+        if self.mode == LogUpMode::Gkr {
+            crate::logup_gkr::build_gkr_aux_columns(trace, &self.gkr_column_indices, challenges);
             return None;
         }
 
@@ -1283,15 +1384,44 @@ where
     ) -> BoundaryConstraints<E> {
         let mut boundary_constraints = B::boundary_constraints(pub_inputs, rap_challenges);
 
-        // Pin acc[0] = 0 to remove the constant-shift degree of freedom in the
-        // circular transition constraint (forward accumulation starts at 0).
         if !self.auxiliary_trace_build_data.interactions.is_empty() {
-            let acc_col_idx = self.trace_layout.1 - 1; // last aux column = accumulated
-            boundary_constraints.push(BoundaryConstraint::new_aux(
-                acc_col_idx,
-                0,
-                FieldElement::zero(),
-            ));
+            match self.mode {
+                // Pin acc[0] = 0 to remove the constant-shift degree of freedom
+                // in the circular transition constraint (forward accumulation
+                // starts at 0).
+                LogUpMode::Standard => {
+                    let acc_col_idx = self.trace_layout.1 - 1; // last aux column = accumulated
+                    boundary_constraints.push(BoundaryConstraint::new_aux(
+                        acc_col_idx,
+                        0,
+                        FieldElement::zero(),
+                    ));
+                }
+                // Bind the Lagrange kernel column to the GKR random point via
+                // `l[0] = ∏(1 − r_j)` (its Σl² norm is checked by the bridge's
+                // γ^K term), and pin σ[0] = 0 as in standard mode.
+                LogUpMode::Gkr => {
+                    let rp_start =
+                        crate::logup_gkr::logup_random_point_start(self.gkr_column_indices.len());
+                    assert!(
+                        rap_challenges.len() > rp_start,
+                        "GKR-mode boundary constraints require the extended \
+                         challenge vector (got {} challenges, random point starts at {rp_start})",
+                        rap_challenges.len(),
+                    );
+                    let random_point = &rap_challenges[rp_start..];
+                    boundary_constraints.push(BoundaryConstraint::new_aux(
+                        crate::logup_gkr::GKR_AUX_KERNEL_COL,
+                        0,
+                        crate::logup_gkr::lagrange_l0(random_point),
+                    ));
+                    boundary_constraints.push(BoundaryConstraint::new_aux(
+                        crate::logup_gkr::GKR_AUX_SIGMA_COL,
+                        0,
+                        FieldElement::zero(),
+                    ));
+                }
+            }
         }
 
         BoundaryConstraints::from_constraints(boundary_constraints)
@@ -1406,6 +1536,36 @@ impl Multiplicity {
         row: usize,
     ) -> FieldElement<F> {
         self.evaluate_with(|col| main_segment_cols[col][row].clone())
+    }
+
+    /// Evaluate the multiplicity from an arbitrary column-value source (e.g.
+    /// the GKR column claims — MLE evaluations instead of trace rows).
+    #[inline]
+    pub fn evaluate_from<F, G>(&self, get_col: G) -> FieldElement<F>
+    where
+        F: IsField,
+        G: Fn(usize) -> FieldElement<F>,
+    {
+        self.evaluate_with(get_col)
+    }
+
+    /// Append every main-column index this multiplicity reads to `out`.
+    pub(crate) fn collect_columns(&self, out: &mut Vec<usize>) {
+        match self {
+            Multiplicity::One => {}
+            Multiplicity::Column(c) | Multiplicity::Negated(c) => out.push(*c),
+            Multiplicity::Sum(a, b) | Multiplicity::Diff(a, b) => out.extend([*a, *b]),
+            Multiplicity::Sum3(a, b, c) => out.extend([*a, *b, *c]),
+            Multiplicity::Linear(terms) => {
+                for term in terms {
+                    match term {
+                        LinearTerm::Column { column, .. }
+                        | LinearTerm::ColumnUnsigned { column, .. } => out.push(*column),
+                        LinearTerm::Constant(_) => {}
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1607,7 +1767,7 @@ where
 ///
 /// With `parallel`: chunked over rows via `par_chunks_mut`.
 /// Without `parallel`: processed as a single chunk.
-fn compute_logup_term_column<F, E>(
+pub(crate) fn compute_logup_term_column<F, E>(
     interactions: &[&BusInteraction],
     main_segment_cols: &[Vec<FieldElement<F>>],
     trace_len: usize,
@@ -2270,6 +2430,70 @@ where
     emit_logup_accumulated::<F, E, B>(b, layout, idx);
 }
 
+/// Emit the GKR-mode bridge running-sum constraint (the ONLY LogUp transition
+/// constraint in [`LogUpMode::Gkr`]):
+///
+/// `σ_next − σ_curr − l_curr·batched_curr + Δ = 0` (degree 2, every row)
+///
+/// with `batched = γ^K·l + Σ_j col_j·γ^j` over the table's distinct referenced
+/// main columns (canonical [`crate::logup_gkr::extract_column_indices`] order)
+/// and `Δ = target/N` from the challenge vector. Telescoped over the circular
+/// domain this proves `⟨l, col_j⟩ = c_j` for every claim (Schwartz-Zippel over
+/// γ) plus the kernel's `Σ l²` norm (the `γ^K` term). `σ_next` is the sole
+/// next-row read; `l` and every main column read the current row, preserving
+/// the 1-column pruned OOD next-row block.
+///
+/// γ powers and Δ are read as [`ConstraintBuilder::challenge`] leaves from the
+/// extended rap_challenges vector (layout in [`crate::logup_gkr`]) — no new
+/// context plumbing.
+pub fn emit_logup_gkr_constraints<F, E, B>(b: &mut B, column_indices: &[usize], idx_base: usize)
+where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    use crate::logup_gkr::{
+        GKR_AUX_KERNEL_COL, GKR_AUX_SIGMA_COL, LOGUP_BRIDGE_OFFSET_IDX, LOGUP_GAMMA_POWERS_START,
+    };
+
+    let k = column_indices.len();
+    let l = b.aux(0, GKR_AUX_KERNEL_COL);
+    let sigma_curr = b.aux(0, GKR_AUX_SIGMA_COL);
+    let sigma_next = b.aux(1, GKR_AUX_SIGMA_COL);
+
+    // γ^K·l first (an ExprE seed even for K = 0), then the column terms;
+    // col·γ is base×ext (base operand LEFT).
+    let mut batched = b.challenge(LOGUP_GAMMA_POWERS_START + k) * l.clone();
+    for (j, &col_idx) in column_indices.iter().enumerate() {
+        batched = batched + b.main(0, col_idx) * b.challenge(LOGUP_GAMMA_POWERS_START + j);
+    }
+    let delta = b.challenge(LOGUP_BRIDGE_OFFSET_IDX);
+    b.emit_ext(idx_base, sigma_next - sigma_curr - l * batched + delta);
+}
+
+/// Emit the LogUp transition constraints for the given mode: the standard
+/// batched-term/accumulated set, or the single GKR bridge constraint. Emits
+/// nothing when there are no interactions.
+fn emit_logup_for_mode<F, E, B>(
+    b: &mut B,
+    mode: LogUpMode,
+    layout: &LogUpLayout,
+    gkr_column_indices: &[usize],
+    idx_base: usize,
+) where
+    F: IsField,
+    E: IsField,
+    B: ConstraintBuilder<F, E>,
+{
+    if layout.interactions.is_empty() {
+        return;
+    }
+    match mode {
+        LogUpMode::Standard => emit_logup_constraints(b, layout, idx_base),
+        LogUpMode::Gkr => emit_logup_gkr_constraints(b, gkr_column_indices, idx_base),
+    }
+}
+
 /// Run an [`AirWithBuses`] table's transition constraints through the
 /// [`ProverEvalFolder`] in ONE pass: the constraint set's base-field body
 /// followed by the appended LogUp constraints (idx offset by `num_base`, the
@@ -2277,7 +2501,9 @@ where
 /// constraint count.
 fn run_air_transition_prover<F, E, CS>(
     constraint_set: &CS,
+    mode: LogUpMode,
     logup: &LogUpLayout,
+    gkr_column_indices: &[usize],
     ctx: &TransitionEvaluationContext<'_, F, E>,
     base_evals: &mut [FieldElement<F>],
     ext_evals: &mut [FieldElement<E>],
@@ -2289,7 +2515,7 @@ fn run_air_transition_prover<F, E, CS>(
     let num_base = base_evals.len();
     let mut folder = ProverEvalFolder::new(ctx, base_evals, ext_evals);
     constraint_set.eval(&mut folder);
-    emit_logup_constraints(&mut folder, logup, num_base);
+    emit_logup_for_mode(&mut folder, mode, logup, gkr_column_indices, num_base);
     folder.assert_all_emitted();
 }
 
@@ -2303,7 +2529,9 @@ fn run_air_transition_prover<F, E, CS>(
 /// base-prefix results.
 fn run_air_transition_verifier<F, E, CS>(
     constraint_set: &CS,
+    mode: LogUpMode,
     logup: &LogUpLayout,
+    gkr_column_indices: &[usize],
     num_base: usize,
     num_constraints: usize,
     ctx: &TransitionEvaluationContext<'_, F, E>,
@@ -2318,14 +2546,14 @@ where
         TransitionEvaluationContext::Verifier { .. } => {
             let mut folder = VerifierEvalFolder::new(ctx, &mut ext_evals);
             constraint_set.eval(&mut folder);
-            emit_logup_constraints(&mut folder, logup, num_base);
+            emit_logup_for_mode(&mut folder, mode, logup, gkr_column_indices, num_base);
             folder.assert_all_emitted();
         }
         TransitionEvaluationContext::Prover { .. } => {
             let mut base_evals = vec![FieldElement::<F>::zero(); num_base];
             let mut folder = ProverEvalFolder::new(ctx, &mut base_evals, &mut ext_evals);
             constraint_set.eval(&mut folder);
-            emit_logup_constraints(&mut folder, logup, num_base);
+            emit_logup_for_mode(&mut folder, mode, logup, gkr_column_indices, num_base);
             folder.assert_all_emitted();
             // Promote the base-prefix results into the extension slots.
             for (slot, base) in ext_evals.iter_mut().zip(base_evals) {
@@ -2433,12 +2661,12 @@ mod logup_single_source_tests {
         for i in 0..n_rows {
             let mut row_sum = Fp3::zero();
             for col in &term_columns {
-                row_sum = row_sum + &col[i];
+                row_sum += col[i];
             }
             let acc_i = *trace.get_aux(i, acc_col_idx);
             let acc_next = *trace.get_aux((i + 1) % n_rows, acc_col_idx);
-            let lhs = (acc_next - acc_i) * &n_fe;
-            let rhs = row_sum * &n_fe - &l;
+            let lhs = (acc_next - acc_i) * n_fe;
+            let rhs = row_sum * n_fe - l;
             assert_eq!(lhs, rhs, "forward circular recurrence broken at row {i}");
         }
     }
@@ -2706,6 +2934,132 @@ mod logup_single_source_tests {
         assert_eq!(layout.absorbed().len(), 2);
         assert_eq!(layout.num_constraints(), 3); // 2 batched terms + accumulated
         check_layout("two_committed_pairs", &layout, 8);
+    }
+
+    /// The GKR bridge constraint run three ways from ONE definition
+    /// ([`emit_logup_gkr_constraints`]): derived meta is a single ext
+    /// constraint, capture measures degree 2, and on random frames
+    /// [`ProverEvalFolder`] == capture→[`eval_program`] ==
+    /// [`VerifierEvalFolder`] == capture→[`eval_program_verifier`] bit-for-bit
+    /// (the GPU-contract parity the standard emission gets from
+    /// [`check_layout`]).
+    fn check_gkr_bridge(label: &str, interactions: Vec<BusInteraction>, num_main_cols: usize) {
+        use crate::logup_gkr::{
+            GKR_NUM_AUX_COLUMNS, extract_column_indices, logup_random_point_start,
+        };
+
+        let column_indices = extract_column_indices(&interactions);
+        let k = column_indices.len();
+        let n_base = 0usize;
+        let n = 1usize; // the bridge constraint alone
+
+        let meta = {
+            let mut mb = crate::constraints::builder::MetaBuilder::new();
+            emit_logup_gkr_constraints::<Gl, Ext3, _>(&mut mb, &column_indices, n_base);
+            mb.into_meta()
+        };
+        assert_eq!(meta.len(), n, "[{label}] one bridge constraint");
+        assert_eq!(meta[0].kind, RootKind::Ext, "[{label}] bridge is ext");
+        assert_eq!(meta[0].end_exemptions, 0, "[{label}] bridge is circular");
+
+        let mut cb = CaptureBuilder::<Gl, Ext3>::new();
+        emit_logup_gkr_constraints(&mut cb, &column_indices, n_base);
+        let (prog, degrees) = cb.finish(0);
+        assert_eq!(degrees.len(), n, "[{label}] one emit");
+        assert_eq!(degrees[0], (0, 2), "[{label}] bridge measures degree 2");
+
+        // Random rap_challenges covering the full extended layout (γ powers,
+        // Δ, and a fake 3-var random point — parity only reads the leaves).
+        let rp_len = 3usize;
+        let n_challenges = logup_random_point_start(k) + rp_len;
+
+        for trial in 0..TRIALS {
+            let mut rng = SplitMix64::new(0x6B12_0000_u64 ^ (label.len() as u64) ^ trial as u64);
+            let mk_step = |rng: &mut SplitMix64| {
+                let main: Vec<Fp> = (0..num_main_cols)
+                    .map(|_| Fp::from(rng.next_u64()))
+                    .collect();
+                let aux: Vec<Fp3> = (0..GKR_NUM_AUX_COLUMNS).map(|_| rand_fp3(rng)).collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let frame = Frame::<Gl, Ext3>::new(vec![mk_step(&mut rng), mk_step(&mut rng)]);
+            let rap_challenges: Vec<Fp3> = (0..n_challenges).map(|_| rand_fp3(&mut rng)).collect();
+            let alpha_powers: Vec<Fp3> = (0..4).map(|_| rand_fp3(&mut rng)).collect();
+            let table_offset = rand_fp3(&mut rng);
+
+            let prover_ctx = TransitionEvaluationContext::new_prover(
+                frame.as_row_frame(),
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+            );
+
+            let mut base_out = vec![Fp::zero(); n_base];
+            let mut ext_out = vec![Fp3::zero(); n];
+            let mut folder = ProverEvalFolder::new(&prover_ctx, &mut base_out, &mut ext_out);
+            emit_logup_gkr_constraints(&mut folder, &column_indices, n_base);
+            folder.assert_all_emitted();
+
+            let mut ir_base = vec![Fp::zero(); n_base];
+            let mut ir_ext = vec![Fp3::zero(); n];
+            eval_program(&prog, &prover_ctx, &mut ir_base, &mut ir_ext);
+            assert_eq!(
+                ext_out[0], ir_ext[0],
+                "[{label}] prover folder vs interpreter mismatch, trial {trial}"
+            );
+
+            let embed_step = |step: &TableView<Gl, Ext3>| -> TableView<Ext3, Ext3> {
+                let main: Vec<Fp3> = (0..num_main_cols)
+                    .map(|c| step.get_main_evaluation_element(0, c).to_extension())
+                    .collect();
+                let aux: Vec<Fp3> = (0..GKR_NUM_AUX_COLUMNS)
+                    .map(|c| *step.get_aux_evaluation_element(0, c))
+                    .collect();
+                TableView::new(vec![main], vec![aux])
+            };
+            let vframe: Frame<Ext3, Ext3> = Frame::new(vec![
+                embed_step(frame.get_evaluation_step(0)),
+                embed_step(frame.get_evaluation_step(1)),
+            ]);
+            let vctx = TransitionEvaluationContext::<Gl, Ext3>::new_verifier(
+                &vframe,
+                &rap_challenges,
+                &alpha_powers,
+                &table_offset,
+            );
+
+            let mut vext_out = vec![Fp3::zero(); n];
+            let mut vfolder = VerifierEvalFolder::new(&vctx, &mut vext_out);
+            emit_logup_gkr_constraints(&mut vfolder, &column_indices, n_base);
+            vfolder.assert_all_emitted();
+
+            let mut ir_vext = vec![Fp3::zero(); n];
+            eval_program_verifier(&prog, &vctx, &mut ir_vext);
+            assert_eq!(
+                vext_out[0], ir_vext[0],
+                "[{label}] verifier folder vs interpreter mismatch, trial {trial}"
+            );
+            assert_eq!(
+                ext_out[0], vext_out[0],
+                "[{label}] prover vs verifier folder mismatch, trial {trial}"
+            );
+        }
+    }
+
+    #[test]
+    fn logup_gkr_bridge_single_interaction() {
+        check_gkr_bridge("gkr_single", vec![direct_sender(7)], 4);
+    }
+
+    #[test]
+    fn logup_gkr_bridge_multi_interaction() {
+        // Shared and distinct columns across interactions + a multiplicity
+        // column: exercises dedup and the multi-term batched sum.
+        check_gkr_bridge(
+            "gkr_multi",
+            vec![direct_sender(7), column_receiver(11), direct_sender(13)],
+            6,
+        );
     }
 
     #[test]
