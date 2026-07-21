@@ -324,8 +324,8 @@ mod tests {
         let mut result = FE::zero();
         let mut power = FE::one();
         for c in coeffs {
-            result = &result + &(c * &power);
-            power = &power * x;
+            result += c * power;
+            power *= x;
         }
         result
     }
@@ -619,8 +619,8 @@ mod tests {
         let p1 = &proof.round_polys[0].evals()[1];
         // p(t) = p0*(1-t) + p1*t = p0 + (p1 - p0)*t
         let slope = p1 - p0;
-        let p2_expected = p0 + &(&slope * &FE::from(2u64));
-        let p3_expected = p0 + &(&slope * &FE::from(3u64));
+        let p2_expected = p0 + (slope * FE::from(2u64));
+        let p3_expected = p0 + (slope * FE::from(3u64));
         assert_eq!(proof.round_polys[0].evals()[2], p2_expected);
         assert_eq!(proof.round_polys[0].evals()[3], p3_expected);
 
@@ -675,12 +675,12 @@ mod tests {
         let r2 = &challenges[1];
         // f(r1, r2) = f(0,0)*(1-r1)*(1-r2) + f(1,0)*r1*(1-r2) + f(0,1)*(1-r1)*r2 + f(1,1)*r1*r2
         let one = FE::one();
-        let one_minus_r1 = &one - r1;
-        let one_minus_r2 = &one - r2;
-        let f_at_r = &(&(&evals[0] * &one_minus_r1) * &one_minus_r2)
-            + &(&(&evals[1] * r1) * &one_minus_r2)
-            + &(&(&evals[2] * &one_minus_r1) * r2)
-            + &(&(&evals[3] * r1) * r2);
+        let one_minus_r1 = one - r1;
+        let one_minus_r2 = one - r2;
+        let f_at_r = ((evals[0] * one_minus_r1) * one_minus_r2)
+            + ((evals[1] * r1) * one_minus_r2)
+            + ((evals[2] * one_minus_r1) * r2)
+            + ((evals[3] * r1) * r2);
 
         // The last round poly evaluated at the last challenge should give f(r1, r2)
         let last_round_eval = proof.round_polys[1].evaluate(&challenges[1]);
@@ -771,7 +771,7 @@ mod tests {
             FE::from(3u64), // f(0,1,1) = 0*1 + 1 + 2 = 3
             FE::from(4u64), // f(1,1,1) = 1*1 + 1 + 2 = 4
         ];
-        let claimed_sum: FE = evals.iter().fold(FE::zero(), |acc, v| &acc + v); // = 22
+        let claimed_sum: FE = evals.iter().fold(FE::zero(), |acc, v| acc + v); // = 22
 
         // Prove
         let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAB]);
@@ -815,12 +815,12 @@ mod tests {
         let r1 = &challenges[0];
         let r2 = &challenges[1];
         let one = FE::one();
-        let one_minus_r1 = &one - r1;
-        let one_minus_r2 = &one - r2;
-        let mle_at_r = &(&(&evals[0] * &one_minus_r1) * &one_minus_r2)
-            + &(&(&evals[1] * r1) * &one_minus_r2)
-            + &(&(&evals[2] * &one_minus_r1) * r2)
-            + &(&(&evals[3] * r1) * r2);
+        let one_minus_r1 = one - r1;
+        let one_minus_r2 = one - r2;
+        let mle_at_r = ((evals[0] * one_minus_r1) * one_minus_r2)
+            + ((evals[1] * r1) * one_minus_r2)
+            + ((evals[2] * one_minus_r1) * r2)
+            + ((evals[3] * r1) * r2);
 
         assert_eq!(
             final_eval, mle_at_r,

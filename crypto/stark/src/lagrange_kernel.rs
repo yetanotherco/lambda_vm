@@ -209,7 +209,7 @@ mod tests {
         assert_eq!(s[3], FE::from(21u64));
 
         // Verify partition of unity: sum = 12 + (-18) + (-14) + 21 = 1
-        let sum = &(&(&s[0] + &s[1]) + &s[2]) + &s[3];
+        let sum = ((s[0] + s[1]) + s[2]) + s[3];
         assert_eq!(sum, FE::one());
     }
 
@@ -229,7 +229,7 @@ mod tests {
 
             let mut sum = FE::zero();
             for val in &s {
-                sum = &sum + val;
+                sum = sum + val;
             }
             assert_eq!(
                 sum,

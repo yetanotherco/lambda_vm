@@ -2252,7 +2252,7 @@ mod tests {
         // Check: 1136/384 = 71/24 (both sides: 1136*24 = 27264, 71*384 = 27264)
         let root_n = &tree[2].numerators[0];
         let root_d = &tree[2].denominators[0];
-        assert_eq!(root_n * &FE::from(24u64), &FE::from(71u64) * root_d);
+        assert_eq!(root_n * FE::from(24u64), FE::from(71u64) * root_d);
     }
 
     #[test]
@@ -2281,8 +2281,8 @@ mod tests {
         let root_n = &tree[3].numerators[0];
         let root_d = &tree[3].denominators[0];
         assert_eq!(
-            root_n * &acc.denominator,
-            &acc.numerator * root_d,
+            root_n * acc.denominator,
+            acc.numerator * root_d,
             "Tree root must equal sequential sum as a fraction"
         );
     }
@@ -2348,17 +2348,17 @@ mod tests {
         assert_eq!(evals.len(), 4);
 
         let one = FE::one();
-        let one_minus_r0 = &one - &r0;
-        let one_minus_r1 = &one - &r1;
+        let one_minus_r0 = one - r0;
+        let one_minus_r1 = one - r1;
 
         // Index 0 = (b0=0, b1=0): (1-r0)*(1-r1)
-        assert_eq!(evals[0], &one_minus_r0 * &one_minus_r1);
+        assert_eq!(evals[0], one_minus_r0 * one_minus_r1);
         // Index 1 = (b0=1, b1=0): r0*(1-r1)
-        assert_eq!(evals[1], &r0 * &one_minus_r1);
+        assert_eq!(evals[1], r0 * one_minus_r1);
         // Index 2 = (b0=0, b1=1): (1-r0)*r1
-        assert_eq!(evals[2], &one_minus_r0 * &r1);
+        assert_eq!(evals[2], one_minus_r0 * r1);
         // Index 3 = (b0=1, b1=1): r0*r1
-        assert_eq!(evals[3], &r0 * &r1);
+        assert_eq!(evals[3], r0 * r1);
     }
 
     #[test]
@@ -2419,7 +2419,7 @@ mod tests {
             gkr_prove(&tree, &mut transcript).unwrap();
 
         // claimed_sum = 68/55
-        let expected_sum = &FE::from(68u64) * &FE::from(55u64).inv().unwrap();
+        let expected_sum = FE::from(68u64) * FE::from(55u64).inv().unwrap();
         assert_eq!(proof.claimed_sum, expected_sum);
 
         // Should have 1 layer proof (root -> leaves)
@@ -2441,8 +2441,8 @@ mod tests {
         // n_MLE(eta) = 3*(1-eta) + 7*eta = 3 + 4*eta
         // d_MLE(eta) = 5*(1-eta) + 11*eta = 5 + 6*eta
         let eta = &final_point[0];
-        let expected_n = &FE::from(3u64) * &(&FE::one() - eta) + &(&FE::from(7u64) * eta);
-        let expected_d = &FE::from(5u64) * &(&FE::one() - eta) + &(&FE::from(11u64) * eta);
+        let expected_n = FE::from(3u64) * (FE::one() - eta) + (FE::from(7u64) * eta);
+        let expected_d = FE::from(5u64) * (FE::one() - eta) + (FE::from(11u64) * eta);
         assert_eq!(final_n_claim, expected_n);
         assert_eq!(final_d_claim, expected_d);
     }
@@ -2471,7 +2471,7 @@ mod tests {
             gkr_prove(&tree, &mut transcript).unwrap();
 
         // claimed_sum = root_n / root_d = 1136 / 384
-        let expected_sum = &FE::from(1136u64) * &FE::from(384u64).inv().unwrap();
+        let expected_sum = FE::from(1136u64) * FE::from(384u64).inv().unwrap();
         assert_eq!(proof.claimed_sum, expected_sum);
 
         // Should have 2 layer proofs
@@ -2519,7 +2519,7 @@ mod tests {
 
         let root_n = &tree[2].numerators[0];
         let root_d = &tree[2].denominators[0];
-        let expected_sum = root_n * &root_d.inv().unwrap();
+        let expected_sum = root_n * root_d.inv().unwrap();
 
         let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
         let (proof, _, _, _) = gkr_prove(&tree, &mut transcript).unwrap();
@@ -2665,7 +2665,7 @@ mod tests {
 
         for (layer_idx, lp) in proof.layer_proofs.iter().enumerate() {
             let lambda: FE = replay.sample_field_element();
-            let combined_claim = &n_claim + &(&lambda * &d_claim);
+            let combined_claim = n_claim + (lambda * d_claim);
 
             if lp.sumcheck_proof.round_polys.is_empty() {
                 // Trivial layer: verify gate equation directly
@@ -2673,7 +2673,7 @@ mod tests {
                 let nr = &lp.child_claims[1];
                 let dl = &lp.child_claims[2];
                 let dr = &lp.child_claims[3];
-                let gate_val = &(nl * dr) + &(nr * dl) + &(&lambda * &(dl * dr));
+                let gate_val = (nl * dr) + (nr * dl) + (lambda * (dl * dr));
                 assert_eq!(
                     combined_claim, gate_val,
                     "Gate equation failed at trivial layer {}",
@@ -2705,9 +2705,9 @@ mod tests {
             let eta: FE = replay.sample_field_element();
 
             // Update claims for next layer
-            let one_minus_eta = &FE::one() - &eta;
-            n_claim = &(&lp.child_claims[0] * &one_minus_eta) + &(&lp.child_claims[1] * &eta);
-            d_claim = &(&lp.child_claims[2] * &one_minus_eta) + &(&lp.child_claims[3] * &eta);
+            let one_minus_eta = FE::one() - eta;
+            n_claim = (lp.child_claims[0] * one_minus_eta) + (lp.child_claims[1] * eta);
+            d_claim = (lp.child_claims[2] * one_minus_eta) + (lp.child_claims[3] * eta);
         }
     }
 
@@ -2843,7 +2843,7 @@ mod tests {
         let (mut proof, _, _, _) = gkr_prove(&tree, &mut prover_transcript).unwrap();
 
         // Tamper with the claimed_sum
-        proof.claimed_sum = &proof.claimed_sum + &FE::one();
+        proof.claimed_sum += FE::one();
 
         // Verify with the tampered proof
         let mut verifier_transcript = DefaultTranscript::<GoldilocksField>::new(&[0xAA]);
