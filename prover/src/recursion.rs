@@ -276,10 +276,10 @@ pub fn encode_continuation_guest_input(
 /// [`crate::continuation::continuation_precomputed_commitments`] over the
 /// bundle it holds — the touched-page set is bundle-dependent, unlike the
 /// monolithic path's ELF-only page set. The archive is bytecheck-validated,
-/// then verified zero-copy via
-/// [`crate::continuation::verify_continuation_archived`] — no owned
-/// deserialize of the (large) bundle, same as [`crate::verify_recursion_blob`]
-/// for the monolithic proof.
+/// then verified via [`crate::continuation::verify_continuation_archived`]. The
+/// batched proof format has no zero-copy `ContinuationProofView` yet, so that
+/// bridge materializes the bundle before verifying (a deserialize cost only —
+/// it adds no transcript/Merkle hashing); a zero-copy view is future work.
 pub fn verify_continuation_and_attest(
     blob: &[u8],
     proof_options: &ProofOptions,
@@ -304,8 +304,9 @@ pub fn verify_continuation_and_attest(
     let archived = rkyv::access::<ArchivedContinuationGuestInput, RkyvError>(archive)
         .map_err(|e| Error::Execution(format!("continuation blob validation failed: {e}")))?;
 
-    // Only small metadata here; the bundle's proofs stay in the archive (read
-    // in place by `verify_continuation_archived`).
+    // Only small metadata deserialized here; the (large) bundle is materialized
+    // inside `verify_continuation_archived` (no zero-copy view on the batched
+    // format yet).
     let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
         Vec<(u64, Commitment)>,
         RkyvError,
