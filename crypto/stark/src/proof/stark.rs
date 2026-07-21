@@ -5,7 +5,8 @@ use math::field::{
 };
 
 use crate::{
-    config::Commitment, fri::fri_decommit::FriDecommitment, lookup::BusPublicInputs, table::Table,
+    config::Commitment, fri::fri_decommit::FriDecommitment, gkr::BatchGkrProof,
+    lookup::BusPublicInputs, table::Table,
 };
 
 // The proof types below intentionally derive both serde and rkyv. rkyv is the
@@ -126,4 +127,36 @@ pub struct StarkProof<F: IsSubFieldOf<E>, E: IsField, PI> {
 #[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
 pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
+}
+
+/// A multi-table proof under [`crate::lookup::LogUpMode::Gkr`]: the per-table
+/// STARK proofs plus the LogUp-GKR artifacts.
+///
+/// This is a SEPARATE top-level wire type on purpose: standard-mode proofs
+/// keep the exact [`MultiProof`] rkyv/serde layout (byte-identical to a
+/// GKR-unaware build), and GKR mode is purely additive on the wire. Everything
+/// else GKR-related is transcript-derived by the verifier (random points,
+/// instance claims) or recomputed (bridge parameters) — only the batch proof
+/// and the per-table column claims travel.
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
+#[serde(bound = "PI: serde::Serialize + serde::de::DeserializeOwned")]
+pub struct GkrMultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
+    /// The per-table STARK proofs (same layout as standard mode; their
+    /// `bus_public_inputs` are `None` — the balance check runs on the GKR
+    /// root claims instead).
+    pub multi: MultiProof<F, E, PI>,
+    /// The batch GKR proof across every interacting table's summation tree.
+    pub batch_gkr_proof: BatchGkrProof<E>,
+    /// Per-table column claims, aligned with `multi.proofs`: `None` for
+    /// non-interacting tables, else `(column_index, ⟨l, col⟩ MLE claim)` in
+    /// canonical [`crate::logup_gkr::extract_column_indices`] order.
+    pub column_claims_by_table: Vec<Option<Vec<(usize, FieldElement<E>)>>>,
 }

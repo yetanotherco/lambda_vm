@@ -141,7 +141,15 @@ pub fn gen_layers<E: IsField>(input_layer: Layer<E>) -> Vec<Layer<E>> {
 /// Proof for a single layer in a batch GKR reduction.
 ///
 /// Contains the shared sumcheck proof and per-instance child claims (masks).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct BatchGkrLayerProof<E: IsField> {
     /// Shared sumcheck proof for this layer (combined across all active instances).
@@ -154,7 +162,15 @@ pub struct BatchGkrLayerProof<E: IsField> {
 /// Complete batch GKR proof for multiple fractional summation trees.
 ///
 /// All instances share one sumcheck per layer via random linear combination.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct BatchGkrProof<E: IsField> {
     /// Per-instance root claims as (numerator, denominator) pairs.
@@ -1936,6 +1952,14 @@ pub fn gkr_verify_batch<E: IsField>(
 
     let max_layers = *n_layers_by_instance.iter().max().unwrap();
 
+    // The 2^n_unused doubling factor below is computed as a u64 shift; layer
+    // counts are log2(trace_length) so this bound is never near in practice.
+    if max_layers >= 64 {
+        return Err(GkrError::InvalidTree {
+            reason: format!("max_layers {max_layers} out of range"),
+        });
+    }
+
     if proof.layer_proofs.len() != max_layers {
         return Err(GkrError::InvalidTree {
             reason: format!(
@@ -1944,6 +1968,22 @@ pub fn gkr_verify_batch<E: IsField>(
                 proof.layer_proofs.len(),
             ),
         });
+    }
+
+    // Deserialization bypasses `RoundPoly::new`; reject wrong-shaped round
+    // polynomials before any `sum_at_binary`/`evaluate` call can assert. The
+    // batch gate is degree 3, so every round polynomial has exactly 4 evals.
+    for (layer_idx, layer_proof) in proof.layer_proofs.iter().enumerate() {
+        for rp in &layer_proof.sumcheck_proof.round_polys {
+            if rp.num_evals() != 4 {
+                return Err(GkrError::InvalidTree {
+                    reason: format!(
+                        "layer {layer_idx}: round polynomial has {} evals, expected 4",
+                        rp.num_evals(),
+                    ),
+                });
+            }
+        }
     }
 
     // Track per-instance state
@@ -3060,6 +3100,55 @@ mod tests {
         let (v_point, v_claims) = result.unwrap();
         assert_eq!(v_point, shared_point);
         assert_eq!(v_claims, final_claims);
+    }
+
+    /// The wire format: a batch proof survives an rkyv roundtrip and still
+    /// verifies; a malformed round polynomial smuggled in through
+    /// deserialization (bypassing `RoundPoly::new`) is REJECTED, not a panic.
+    #[test]
+    fn test_batch_gkr_rkyv_roundtrip_and_malformed_round_poly_rejected() {
+        let instances: Vec<Vec<Layer<GoldilocksField>>> =
+            (0..2).map(|_| gen_layers(make_generic_leaf(2))).collect();
+        let mut prover_transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+        let (proof, _, _) = gkr_prove_batch(instances, &mut prover_transcript);
+        let n_layers = vec![2usize, 2];
+
+        // rkyv roundtrip → verifies.
+        let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&proof).unwrap();
+        let deserialized: BatchGkrProof<GoldilocksField> =
+            rkyv::from_bytes::<_, rkyv::rancor::Error>(&bytes).unwrap();
+        let mut vt = DefaultTranscript::<GoldilocksField>::new(&[]);
+        assert!(
+            gkr_verify_batch(&deserialized, &n_layers, &mut vt).is_ok(),
+            "rkyv-roundtripped batch proof must verify"
+        );
+
+        // serde roundtrip → verifies (examples-CLI compatibility path).
+        let cbor = serde_cbor::to_vec(&proof).unwrap();
+        let from_cbor: BatchGkrProof<GoldilocksField> = serde_cbor::from_slice(&cbor).unwrap();
+        let mut vt = DefaultTranscript::<GoldilocksField>::new(&[]);
+        assert!(gkr_verify_batch(&from_cbor, &n_layers, &mut vt).is_ok());
+
+        // A wrong-shaped round polynomial (2 evals instead of 4) must be
+        // rejected with an error before any evaluation helper can assert.
+        let mut malformed = proof.clone();
+        let layer = malformed
+            .layer_proofs
+            .iter_mut()
+            .find(|lp| !lp.sumcheck_proof.round_polys.is_empty())
+            .expect("some layer has sumcheck rounds");
+        layer.sumcheck_proof.round_polys[0] = RoundPoly::new(vec![FE::from(1u64), FE::from(2u64)]);
+        let mut vt = DefaultTranscript::<GoldilocksField>::new(&[]);
+        assert!(
+            gkr_verify_batch(&malformed, &n_layers, &mut vt).is_err(),
+            "wrong-shaped round polynomial must be rejected"
+        );
+
+        // Wrong layer count must be rejected.
+        let mut truncated = proof.clone();
+        truncated.layer_proofs.pop();
+        let mut vt = DefaultTranscript::<GoldilocksField>::new(&[]);
+        assert!(gkr_verify_batch(&truncated, &n_layers, &mut vt).is_err());
     }
 
     #[test]

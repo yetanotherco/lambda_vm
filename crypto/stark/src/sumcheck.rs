@@ -11,10 +11,23 @@ use math::field::{element::FieldElement, traits::IsField};
 /// - The prover constructs the polynomial by evaluating it at small integer points.
 /// - The verifier only needs to check p(0) + p(1) and evaluate at a random challenge.
 /// - Lagrange interpolation over integer nodes is cheap (small denominators).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct RoundPoly<E: IsField> {
     /// Evaluations at x = 0, 1, ..., d where d = evals.len() - 1.
+    ///
+    /// Deserialization bypasses [`RoundPoly::new`]'s non-empty assert, so
+    /// consumers of untrusted proofs MUST length-check via
+    /// [`RoundPoly::num_evals`] before calling [`RoundPoly::sum_at_binary`] or
+    /// [`RoundPoly::evaluate`] (the batch GKR verifier rejects wrong shapes).
     evals: Vec<FieldElement<E>>,
 }
 
@@ -124,7 +137,15 @@ impl<E: IsField> RoundPoly<E> {
 }
 
 /// Proof produced by the sumcheck prover: one round polynomial per variable.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug,
+    Clone,
+    serde::Serialize,
+    serde::Deserialize,
+    rkyv::Archive,
+    rkyv::Serialize,
+    rkyv::Deserialize,
+)]
 #[serde(bound = "")]
 pub struct SumcheckProof<E: IsField> {
     pub round_polys: Vec<RoundPoly<E>>,
