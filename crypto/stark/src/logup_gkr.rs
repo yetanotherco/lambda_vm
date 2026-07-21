@@ -19,7 +19,7 @@
 
 use math::field::{
     element::FieldElement,
-    traits::{IsFFTField, IsField, IsPrimeField, IsSubFieldOf},
+    traits::{IsFFTField, IsField, IsSubFieldOf},
 };
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
@@ -149,7 +149,7 @@ pub fn compute_logup_leaf_fractions<F, E>(
     challenges: &[FieldElement<E>],
 ) -> (Vec<FieldElement<E>>, Vec<FieldElement<E>>)
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     assert!(
@@ -207,7 +207,7 @@ pub fn compute_logup_layers<F, E>(
     challenges: &[FieldElement<E>],
 ) -> Vec<Layer<E>>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     let (numerators, denominators) =
@@ -252,7 +252,7 @@ pub fn finalize_logup_gkr_result<F, E>(
     table_contribution: FieldElement<E>,
 ) -> LogUpGkrResult<E>
 where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     let col_indices = extract_column_indices(interactions);
@@ -363,7 +363,7 @@ pub(crate) fn build_gkr_aux_columns<F, E>(
     column_indices: &[usize],
     challenges: &[FieldElement<E>],
 ) where
-    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    F: IsFFTField + IsSubFieldOf<E> + Send + Sync,
     E: IsField + Send + Sync,
 {
     let trace_len = trace.num_rows();
@@ -760,6 +760,39 @@ mod tests {
         };
         let root_value = root_n * root_d.inv().expect("nonzero root denominator");
         assert_eq!(root_value, expected_l, "GKR root != standard-mode L");
+    }
+
+    /// KNOWN SOUNDNESS GAP (`thoughts/logup-gkr/port-plan.md` §6): for
+    /// multi-interaction tables nothing binds the batch-GKR leaf claims
+    /// `(n̂, d̂)` to the committed columns — the leaf fraction is nonlinear in
+    /// the columns, so the reconstruction check is fail-open there. This test
+    /// asserts the DESIRED fail-closed behavior with fabricated leaf claims
+    /// and honest column claims; it is `#[ignore]`d because it FAILS today.
+    /// The input-layer binding fix un-ignores it.
+    #[test]
+    #[ignore = "documents the multi-interaction leaf-binding gap (fail-open); the input-layer fix makes this pass"]
+    fn reconstruct_multi_interaction_rejects_fabricated_leaf_claims() {
+        let interactions = vec![
+            BusInteraction::sender(1u64, Multiplicity::One, Packing::Direct.columns(&[0])),
+            BusInteraction::receiver(2u64, Multiplicity::One, Packing::Direct.columns(&[1])),
+        ];
+        let challenges = vec![FE::from(1000u64), FE::from(7u64)];
+        // Honest-looking column claims, fabricated leaf claims that no leaf
+        // vector consistent with the columns could produce.
+        let column_claims = vec![(0usize, FE::from(5u64)), (1usize, FE::from(9u64))];
+        let fabricated_n = FE::from(0xBADu64);
+        let fabricated_d = FE::from(0xC0DEu64);
+        assert!(
+            !reconstruct_and_verify_gkr_claims(
+                &fabricated_n,
+                &fabricated_d,
+                &column_claims,
+                &interactions,
+                &challenges,
+                3,
+            ),
+            "fabricated multi-interaction leaf claims must be rejected"
+        );
     }
 
     /// Bridge parameters: Δ·N == Σ γʲ·cⱼ + γᴷ·norm_claim, and the kernel norm

@@ -129,6 +129,10 @@ pub struct MultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     pub proofs: Vec<StarkProof<F, E, PI>>,
 }
 
+/// One table's GKR column claims: `(column_index, ⟨l, col⟩ MLE claim)` pairs
+/// in canonical [`crate::logup_gkr::extract_column_indices`] order.
+pub type GkrColumnClaims<E> = Vec<(usize, FieldElement<E>)>;
+
 /// A multi-table proof under [`crate::lookup::LogUpMode::Gkr`]: the per-table
 /// STARK proofs plus the LogUp-GKR artifacts.
 ///
@@ -156,7 +160,6 @@ pub struct GkrMultiProof<F: IsSubFieldOf<E>, E: IsField, PI> {
     /// The batch GKR proof across every interacting table's summation tree.
     pub batch_gkr_proof: BatchGkrProof<E>,
     /// Per-table column claims, aligned with `multi.proofs`: `None` for
-    /// non-interacting tables, else `(column_index, ⟨l, col⟩ MLE claim)` in
-    /// canonical [`crate::logup_gkr::extract_column_indices`] order.
-    pub column_claims_by_table: Vec<Option<Vec<(usize, FieldElement<E>)>>>,
+    /// non-interacting tables, else the table's [`GkrColumnClaims`].
+    pub column_claims_by_table: Vec<Option<GkrColumnClaims<E>>>,
 }

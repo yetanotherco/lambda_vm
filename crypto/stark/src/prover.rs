@@ -27,8 +27,13 @@ use rayon::prelude::{
 #[cfg(feature = "debug-checks")]
 use crate::debug::validate_trace;
 use crate::fri;
-use crate::lookup::LOGUP_NUM_CHALLENGES;
-use crate::proof::stark::{DeepPolynomialOpenings, PolynomialOpenings};
+use crate::gkr::{BatchGkrProof, gkr_prove_batch, instance_eval_point};
+use crate::logup_gkr::{
+    LogUpGkrResult, compute_logup_layers, extend_rap_challenges_with_bridge,
+    finalize_logup_gkr_result,
+};
+use crate::lookup::{LOGUP_NUM_CHALLENGES, LogUpMode};
+use crate::proof::stark::{DeepPolynomialOpenings, GkrMultiProof, PolynomialOpenings};
 #[cfg(feature = "disk-spill")]
 use crate::storage_mode::StorageMode;
 use crate::table::Table;
@@ -54,6 +59,13 @@ type AirTracePair<'a, Field, FieldExtension, PI> = (
     &'a mut TraceTable<Field, FieldExtension>,
     &'a PI,
 );
+
+/// GKR-mode artifacts produced by round 1's batch GKR phase, destined for the
+/// [`GkrMultiProof`] wrapper.
+struct GkrProverArtifacts<FieldExtension: IsField> {
+    batch_gkr_proof: BatchGkrProof<FieldExtension>,
+    column_claims_by_table: Vec<Option<crate::proof::stark::GkrColumnClaims<FieldExtension>>>,
+}
 
 /// A default STARK prover implementing `IsStarkProver`.
 pub struct Prover<
@@ -807,6 +819,12 @@ pub trait IsStarkProver<
         //    empty constraint set makes `all(end_exemptions == 0)` vacuously
         //    true here but `is_uniform()` false downstream (0 groups).
         if !air.has_aux_trace() || air.constraints_meta().is_empty() {
+            return false;
+        }
+        // GKR mode runs the CPU composition/aux paths (the GPU LogUp builders
+        // and the fused composition's challenge plumbing encode the standard
+        // term/acc layout); device-only would strand round 2 without host LDEs.
+        if air.logup_mode() != LogUpMode::Standard {
             return false;
         }
         let lde_size = domain.interpolation_domain_size * domain.blowup_factor;
@@ -2317,10 +2335,84 @@ pub trait IsStarkProver<
     ///
     /// The transcript must be safely initialized before passing it to this method.
     fn multi_prove(
-        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
         transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        let (multi, gkr_artifacts) = Self::multi_prove_impl(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        if gkr_artifacts.is_some() {
+            return Err(ProvingError::WrongParameter(
+                "AIRs in LogUpMode::Gkr must be proven with multi_prove_gkr".to_string(),
+            ));
+        }
+        Ok(multi)
+    }
+
+    /// [`Self::multi_prove`] for [`LogUpMode::Gkr`] tables: same round
+    /// structure with the batch GKR phase active, returning the
+    /// [`GkrMultiProof`] wrapper (per-table proofs + batch GKR proof + column
+    /// claims). Every interacting AIR must be in GKR mode.
+    fn multi_prove_gkr(
+        air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<GkrMultiProof<Field, FieldExtension, PI>, ProvingError>
+    where
+        FieldElement<Field>: AsBytes,
+        FieldElement<FieldExtension>: AsBytes,
+        PI: Send + Sync + Clone,
+        Field: Copy + 'static,
+        FieldExtension: Copy + 'static,
+        <Field as IsField>::BaseType: SpillSafe,
+        <FieldExtension as IsField>::BaseType: SpillSafe,
+    {
+        let (multi, gkr_artifacts) = Self::multi_prove_impl(
+            air_trace_pairs,
+            transcript,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )?;
+        let artifacts = gkr_artifacts.ok_or_else(|| {
+            ProvingError::WrongParameter(
+                "multi_prove_gkr requires at least one AIR in LogUpMode::Gkr".to_string(),
+            )
+        })?;
+        Ok(GkrMultiProof {
+            multi,
+            batch_gkr_proof: artifacts.batch_gkr_proof,
+            column_claims_by_table: artifacts.column_claims_by_table,
+        })
+    }
+
+    /// Shared driver behind [`Self::multi_prove`] / [`Self::multi_prove_gkr`]:
+    /// the artifacts component is `Some` exactly when the tables run in
+    /// [`LogUpMode::Gkr`].
+    #[allow(clippy::type_complexity)]
+    fn multi_prove_impl(
+        mut air_trace_pairs: Vec<AirTracePair<'_, Field, FieldExtension, PI>>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone + Send),
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<
+        (
+            MultiProof<Field, FieldExtension, PI>,
+            Option<GkrProverArtifacts<FieldExtension>>,
+        ),
+        ProvingError,
+    >
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
@@ -2530,6 +2622,116 @@ pub trait IsStarkProver<
         };
 
         // =====================================================================
+        // Round 1, Phase B′/B″ (GKR mode): batch GKR, column claims, γ
+        // =====================================================================
+        // In LogUpMode::Gkr the per-table LogUp sums are proven here by ONE
+        // batch GKR on the SHARED transcript (before forking): summation trees
+        // over every interacting table's leaf fractions, then every table's
+        // column claims are absorbed and γ is sampled, and each table's
+        // challenge vector is extended with its bridge parameters. In standard
+        // mode `table_challenges` stays the shared `[z, α]` pair.
+        let gkr_mode = air_trace_pairs
+            .iter()
+            .any(|(air, _, _)| air.logup_mode() == LogUpMode::Gkr);
+        if gkr_mode
+            && air_trace_pairs.iter().any(|(air, _, _)| {
+                air.has_trace_interaction() && air.logup_mode() != LogUpMode::Gkr
+            })
+        {
+            // Prover and verifier derive expectations from the AIR config; a
+            // mix of modes across interacting tables has no coherent transcript.
+            return Err(ProvingError::WrongParameter(
+                "all interacting tables must share LogUpMode::Gkr".to_string(),
+            ));
+        }
+        let mut table_challenges: Vec<Vec<FieldElement<FieldExtension>>> =
+            vec![lookup_challenges.clone(); num_airs];
+        let mut gkr_artifacts: Option<GkrProverArtifacts<FieldExtension>> = None;
+        if gkr_mode {
+            let gkr_indices: Vec<usize> = air_trace_pairs
+                .iter()
+                .enumerate()
+                .filter(|(_, (air, _, _))| air.has_trace_interaction())
+                .map(|(idx, _)| idx)
+                .collect();
+
+            // Leaf fractions + summation trees per instance (parallel).
+            // Transient: consumed by the batch prove below, freed before the
+            // aux/LDE phases — this transience is where GKR's memory win over
+            // committed term columns lives.
+            let layers_per_instance: Vec<Vec<crate::gkr::Layer<FieldExtension>>> =
+                crate::par::par_map_collect(0..gkr_indices.len(), |k| {
+                    let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
+                    compute_logup_layers(
+                        air.bus_interactions(),
+                        &trace.columns_main(),
+                        trace.num_rows(),
+                        &lookup_challenges,
+                    )
+                });
+
+            let (batch_gkr_proof, shared_point, final_claims) =
+                gkr_prove_batch(layers_per_instance, transcript);
+
+            // Per-instance finalize (parallel): column-claim MLE evaluations at
+            // the instance random point (the per-column ⟨l, col⟩ inner products
+            // are the heavy part).
+            let results: Vec<LogUpGkrResult<FieldExtension>> =
+                crate::par::par_map_collect(0..gkr_indices.len(), |k| {
+                    let (air, trace, _) = &air_trace_pairs[gkr_indices[k]];
+                    let n_vars = trace.num_rows().trailing_zeros() as usize;
+                    let random_point = instance_eval_point(&shared_point, n_vars);
+                    let (n_claim, d_claim) = final_claims[k];
+                    let (root_n, root_d) = batch_gkr_proof.root_claims[k];
+                    let table_contribution = root_n
+                        * root_d
+                            .inv()
+                            .expect("honest GKR root denominator is nonzero");
+                    finalize_logup_gkr_result(
+                        air.bus_interactions(),
+                        &trace.columns_main(),
+                        random_point,
+                        n_claim,
+                        d_claim,
+                        table_contribution,
+                    )
+                });
+
+            // Phase B″: bind every table's column claims into the shared
+            // transcript, THEN sample γ — the claims must precede the challenge
+            // that batches them.
+            for result in &results {
+                for (_, claim) in &result.column_claims {
+                    transcript.append_field_element(claim);
+                }
+            }
+            let gamma: FieldElement<FieldExtension> = transcript.sample_field_element();
+
+            let mut column_claims_by_table: Vec<
+                Option<crate::proof::stark::GkrColumnClaims<FieldExtension>>,
+            > = vec![None; num_airs];
+            for (k, result) in results.into_iter().enumerate() {
+                let idx = gkr_indices[k];
+                let trace_len = air_trace_pairs[idx].1.num_rows();
+                let mut challenges = lookup_challenges.clone();
+                extend_rap_challenges_with_bridge(
+                    &mut challenges,
+                    &result.column_claims,
+                    &gamma,
+                    trace_len,
+                    &result.random_point,
+                );
+                table_challenges[idx] = challenges;
+                column_claims_by_table[idx] = Some(result.column_claims);
+            }
+
+            gkr_artifacts = Some(GkrProverArtifacts {
+                batch_gkr_proof,
+                column_claims_by_table,
+            });
+        }
+
+        // =====================================================================
         // Phase C + Rounds 2-4: Forked per table
         // =====================================================================
         // Each table gets an independent transcript fork (cloned from the shared
@@ -2571,13 +2773,16 @@ pub trait IsStarkProver<
         }
 
         #[cfg(feature = "parallel")]
-        let aux_iter = air_trace_pairs.par_iter_mut();
+        let aux_iter = air_trace_pairs.par_iter_mut().enumerate();
         #[cfg(not(feature = "parallel"))]
-        let aux_iter = air_trace_pairs.iter_mut();
+        let aux_iter = air_trace_pairs.iter_mut().enumerate();
+        // Per-table challenge vectors: the shared [z, α] pair in standard mode,
+        // the bridge-extended vector in GKR mode (the GKR aux build reads its
+        // γ powers, Δ and random point from it).
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
-            .map(|(air, trace, _)| {
+            .map(|(idx, (air, trace, _))| {
                 if air.has_aux_trace() {
-                    air.build_auxiliary_trace(*trace, &lookup_challenges)
+                    air.build_auxiliary_trace(*trace, &table_challenges[idx])
                 } else {
                     None
                 }
@@ -2852,8 +3057,10 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "cuda"))]
         let main_iter = main_commits.into_iter().zip(main_ldes);
 
-        for ((main_pack, aux_full), bus_public_inputs) in
-            main_iter.zip(aux_results).zip(bus_inputs_vec)
+        for (((main_pack, aux_full), bus_public_inputs), rap_challenges) in main_iter
+            .zip(aux_results)
+            .zip(bus_inputs_vec)
+            .zip(table_challenges)
         {
             #[cfg(feature = "cuda")]
             let ((main_commit, main_lde), gpu_main) = main_pack;
@@ -2866,7 +3073,7 @@ pub trait IsStarkProver<
             commitments.push(Round1Commitments {
                 main: main_commit,
                 aux: aux_commit,
-                rap_challenges: lookup_challenges.clone(),
+                rap_challenges,
                 bus_public_inputs,
             });
             #[cfg(feature = "cuda")]
@@ -3012,7 +3219,7 @@ pub trait IsStarkProver<
             });
         }
 
-        Ok(MultiProof { proofs })
+        Ok((MultiProof { proofs }, gkr_artifacts))
     }
 
     /// Generate a STARK proof for a single AIR/trace.
