@@ -2877,17 +2877,15 @@ pub trait IsStarkProver<
 
                         #[cfg(feature = "instruments")]
                         let aux_lde_dur = t_sub.elapsed();
+                        // Batched path: aux columns are opened from the ONE shared
+                        // aux MMCS and the per-table aux root is not absorbed (the
+                        // shared MMCS root replaces it), so the per-table aux tree
+                        // is never read — skip building it (mirrors the main-tree
+                        // skip in `commit_main_trace`). This closure runs only on
+                        // the batched path.
+                        let commit = TableCommit::plain_no_main_tree();
                         #[cfg(feature = "instruments")]
-                        let t_sub = Instant::now();
-                        #[allow(unused_mut)]
-                        let (mut tree, root) =
-                            Self::commit_rows_bit_reversed(&aux_data, total_cols)
-                                .ok_or(ProvingError::EmptyCommitment)?;
-                        #[cfg(feature = "disk-spill")]
-                        Self::spill_tree(&mut tree, storage_mode, "aux Merkle tree")?;
-                        let commit = TableCommit::plain(tree, root);
-                        #[cfg(feature = "instruments")]
-                        crate::instruments::accum_r1_aux(aux_lde_dur, t_sub.elapsed());
+                        crate::instruments::accum_r1_aux(aux_lde_dur, Duration::ZERO);
 
                         #[cfg(feature = "cuda")]
                         return Ok((Some(commit), (aux_data, total_cols), None));
