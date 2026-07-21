@@ -284,7 +284,12 @@ where
     /// tree, storing only the digest layers. See the module docs for the exact
     /// leaf/injection layout. `source` provides each matrix's dimensions and its
     /// bit-reversed rows on demand; no copy of the evaluations is retained.
-    pub fn commit<S: LeafSource<E>>(source: &S) -> Self {
+    ///
+    /// Leaf hashing (the base layer and each injected climb layer) is parallel
+    /// across leaves via [`crate::par::par_map_collect`]; the per-level output is
+    /// index-ordered, so the root and layers are byte-identical to a sequential
+    /// build. `S: Sync` lets leaf closures read `source` from worker threads.
+    pub fn commit<S: LeafSource<E> + Sync>(source: &S) -> Self {
         let num_matrices = source.num_matrices();
         assert!(
             num_matrices > 0,
@@ -313,13 +318,16 @@ where
         let base_group: Vec<usize> = (0..num_matrices).filter(|&m| dims[m].0 == h_max).collect();
 
         let mut layers: Vec<Vec<Commitment>> = Vec::with_capacity(h_max);
-        let base: Vec<Commitment> = (0..n0)
-            .map(|k| hash_group_leaf(source, &base_group, k))
-            .collect();
+        // Base layer: 2^(h_max-1) independent group-leaf hashes — the bulk of the
+        // tree's hashing (half of all nodes). Parallel across leaves.
+        let base: Vec<Commitment> =
+            crate::par::par_map_collect(0..n0, |k| hash_group_leaf(source, &base_group, k));
         layers.push(base);
 
         // Climb, compressing pairs and injecting shorter matrices where the layer
-        // width matches their leaf count.
+        // width matches their leaf count. Each level's nodes are independent
+        // (they read only the previous, already-materialized layer), so parallel
+        // across nodes; levels stay sequential.
         let mut i = 0usize;
         while layers[i].len() > 1 {
             let next_len = layers[i].len() / 2;
@@ -328,15 +336,15 @@ where
                 .filter(|&m| dims[m].0 == inject_h)
                 .collect();
 
-            let mut next: Vec<Commitment> = Vec::with_capacity(next_len);
-            for j in 0..next_len {
-                let mut parent = compress::<E>(&layers[i][2 * j], &layers[i][2 * j + 1]);
+            let cur = &layers[i];
+            let next: Vec<Commitment> = crate::par::par_map_collect(0..next_len, |j| {
+                let mut parent = compress::<E>(&cur[2 * j], &cur[2 * j + 1]);
                 if !inject_group.is_empty() {
                     let inj = hash_group_leaf(source, &inject_group, j);
                     parent = compress::<E>(&parent, &inj);
                 }
-                next.push(parent);
-            }
+                parent
+            });
             layers.push(next);
             i += 1;
         }

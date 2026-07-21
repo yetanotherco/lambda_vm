@@ -3136,24 +3136,39 @@ pub trait IsStarkProver<
 
         // Round 3: per-table OOD at the shared z; absorb all tables' OOD before
         // round 4 (round 4 needs the full post-OOD transcript state).
+        //
+        // The OOD evaluation is a pure function of each table's round-1/2 state
+        // and the shared z — independent across tables and the expensive part
+        // (barycentric evals over every column). Compute all tables' OOD in
+        // parallel (index-ordered), THEN absorb into the shared transcript
+        // sequentially in canonical order, so the Fiat-Shamir byte sequence is
+        // byte-identical to the serial version. Chunked by `table_parallelism()`
+        // so at most K tables' barycentric scratch is co-resident at once.
+        let k_ood = table_parallelism().min(num_airs).max(1);
         let mut round3s: Vec<Round3<FieldExtension>> = Vec::with_capacity(num_airs);
+        for chunk_start in (0..num_airs).step_by(k_ood) {
+            let chunk_end = (chunk_start + k_ood).min(num_airs);
+            let chunk: Vec<Round3<FieldExtension>> =
+                crate::par::par_map_collect(chunk_start..chunk_end, |idx| {
+                    Self::round_3_evaluate_polynomials_in_out_of_domain_element(
+                        air_trace_pairs[idx].0,
+                        &domains[idx],
+                        &round1s[idx],
+                        &round2s[idx],
+                        &z,
+                    )
+                });
+            round3s.extend(chunk);
+        }
         for idx in 0..num_airs {
             let air = air_trace_pairs[idx].0;
-            let domain = &domains[idx];
-            let round_3_result = Self::round_3_evaluate_polynomials_in_out_of_domain_element(
-                air,
-                domain,
-                &round1s[idx],
-                &round2s[idx],
-                &z,
-            );
             // >>>> Send values: t_j(z g^k). g·z pruning: split the full OOD table
             // into the current-row block (all columns) and the pruned next-row
             // block (transition-window columns only), and absorb only the
             // surviving values in that order — the verifier absorbs the identical
             // two blocks. Mirrors the non-batched round-3 absorption exactly.
             let (ood_block0, ood_block1) =
-                Self::ood_layout(air).split_full(&round_3_result.trace_ood_evaluations);
+                Self::ood_layout(air).split_full(&round3s[idx].trace_ood_evaluations);
             for block in [&ood_block0, &ood_block1] {
                 for col in block.columns().iter() {
                     for elem in col.iter() {
@@ -3162,10 +3177,9 @@ pub trait IsStarkProver<
                 }
             }
             // >>>> Send values: H_i(z^N)
-            for element in round_3_result.composition_poly_parts_ood_evaluation.iter() {
+            for element in round3s[idx].composition_poly_parts_ood_evaluation.iter() {
                 transcript.append_field_element(element);
             }
-            round3s.push(round_3_result);
         }
 
         // Per-table FRI heights (lde_log_height), canonical order — the batched
@@ -4214,20 +4228,35 @@ pub trait IsStarkProver<
         let gamma = transcript.sample_field_element();
 
         // Per-table DEEP codewords (bit-reversed) paired with lde_log_height.
+        // Each table's codeword is independent (reads only its own round state
+        // plus the shared z/gamma), so compute them in parallel across tables —
+        // mirroring the per-table path, which runs DEEP inside its parallel
+        // rounds-2-4 loop. Chunked by `table_parallelism()` so at most K tables'
+        // DEEP scratch is co-resident at once (bounding the round-4 memory peak,
+        // where every main/aux/comp LDE is still live for the openings below),
+        // matching the per-table path's chunked memory profile. `par_map_collect`
+        // is index-ordered and chunks are appended in order, so `deep_inputs`
+        // keeps canonical epoch order (the batched-FRI / histogram binding key).
+        let k_deep = table_parallelism().min(num_airs).max(1);
         let mut deep_inputs: Vec<(Vec<FieldElement<FieldExtension>>, usize)> =
             Vec::with_capacity(num_airs);
-        for idx in 0..num_airs {
-            let air = air_trace_pairs[idx].0;
-            let codeword = Self::batched_table_deep_codeword(
-                air,
-                &domains[idx],
-                &round1s[idx],
-                &round2s[idx],
-                &round3s[idx],
-                &z,
-                &gamma,
-            );
-            deep_inputs.push((codeword, heights[idx]));
+        for chunk_start in (0..num_airs).step_by(k_deep) {
+            let chunk_end = (chunk_start + k_deep).min(num_airs);
+            let chunk: Vec<(Vec<FieldElement<FieldExtension>>, usize)> =
+                crate::par::par_map_collect(chunk_start..chunk_end, |idx| {
+                    let air = air_trace_pairs[idx].0;
+                    let codeword = Self::batched_table_deep_codeword(
+                        air,
+                        &domains[idx],
+                        &round1s[idx],
+                        &round2s[idx],
+                        &round3s[idx],
+                        &z,
+                        &gamma,
+                    );
+                    (codeword, heights[idx])
+                });
+            deep_inputs.extend(chunk);
         }
 
         // `round2s` (every table's composition-poly LDE) is now the leaf source
