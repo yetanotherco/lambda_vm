@@ -115,42 +115,27 @@
   }
 }
 
-/// Fowler-Noll-Vo (FNV) 64-bit hash function, version 1a
-/// Src: https://en.wikipedia.org/wiki/Fowler-Noll-Vo_hash_function
+/// Fowler-Noll-Vo (FNV) 32-bit hash function, the alternative algorithm
+/// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html
 /// 
 /// Note: this is a non-cryptographic hash function; it is optimized
 /// for speed at the expense of unpredictability.
-/// 
-/// This implementation operates on two 32-bit limbs, rather than a single 
-/// 64-bit limb, since Typst does not support u64s.
-#let FNV64-1a(bytes) = {
-  // FNV_prime := 0x00000100000001B3
-  let prime = (0x000001B3, 0x00000100)
+#let FNV32-1a(bytes) = {
+  let PRIME = 0x01000193
 
-  // hash := FNV_offset_basis = 0xCBF29CE484222325
-  let (lo, hi) = (0x84222325, 0xCBF29CE4)
+  let hash = 0x811C9DC5
   for b in bytes {
-    // hash := hash XOR byte_of_data
-    // hash := hash × FNV_prime
-    (lo, hi) = (
-      lo.bit-xor(b) * prime.at(0), 
-      lo * prime.at(1) + hi * prime.at(0)
-    )
-    
-    // Carry result
-    let carry = lo.bit-rshift(32, logical: true)
-    lo = lo.bit-and(0xFFFFFFFF)
-    hi = (hi + carry).bit-and(0xFFFFFFFF)
+    hash = (hash.bit-xor(b) * PRIME).bit-and(0xFFFFFFFF)
   }
 
-  (lo + hi.bit-lshift(32)).to-bytes()
+  hash.to-bytes().slice(0, 4)
 }
 
-// 32-bit FNV, derived from FNV64-1a through XOR-folding.
-// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html#xor-fold
-#let FNV32-1a(inp) = {
-  let a64 = array(FNV64-1a(inp))
-  return bytes(a64.zip(a64.slice(4)).map(((lhs,rhs)) => lhs.bit-xor(rhs)))
+/// FNV24-1a, derived from FNV32-1a through XOR-folding.
+/// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html#xor-fold
+#let FNV24-1a(inp) = {
+  let a64 = array(FNV32-1a(inp))
+  return bytes((a64.at(0).bit-xor(a64.at(3)), a64.at(1), a64.at(2)))
 }
 
 // Recursively map nested object to bytes
@@ -177,8 +162,8 @@
 /// Tag constraints with an identifier
 #let _add_constraint_ids(chip) = {
 
-  /// A 32-bit NON-CRYPTOGRAPHIC hash function.
-  let nchf(bytes) = FNV32-1a(bytes)
+  /// A 24-bit NON-CRYPTOGRAPHIC hash function.
+  let nchf(bytes) = FNV24-1a(bytes)
 
   /// Digests an object
   let digest(obj, leaf-transform: bytes) = nchf(to-bytes(leaf-transform, obj))
@@ -188,7 +173,7 @@
   let ID_CHAR_SET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
 
   // Constants
-  let DIGEST_BITSIZE = 32;
+  let DIGEST_BITSIZE = 24;
   let LOG_ID_RADIX = 5
   let RADIX = calc.pow(2, LOG_ID_RADIX)
   assert(ID_CHAR_SET.len() == RADIX, message: "ID_CHAR_SET <> RADIX mismatch")
