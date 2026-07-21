@@ -997,6 +997,7 @@ where
         &handle.buf,
         handle.m,
         handle.lde_size,
+        handle.ready.as_deref(),
     )
     .ok()?;
     debug_assert_eq!(dev_tree.leaves_len, handle.lde_size / 2);
@@ -1169,6 +1170,61 @@ where
     };
     GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
 
+    let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
+    Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
+}
+
+/// R3 OOD for the composition parts on the resident composition LDE handle.
+/// Same barycentric core as [`try_barycentric_ext3_on_handle`] but reads an
+/// explicit `GpuLdeExt3` (the composition parts) instead of the aux trace, so
+/// R3 evaluates each part at `z^num_parts` on device. Returns one ext3 value per
+/// part, or `None` to fall through to the CPU path. (Step C1: the caller keeps
+/// the CPU result authoritative and cross-checks this against it.)
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_barycentric_ext3_on_comp_handle<F, E>(
+    handle: &math_cuda::lde::GpuLdeExt3,
+    row_stride: usize,
+    coset_points: &[FieldElement<F>],
+    coset_offset_pow_n: &FieldElement<F>,
+    n_inv: &FieldElement<F>,
+    g_n_inv: &FieldElement<F>,
+    z_pow_n: &FieldElement<E>,
+    inv_denoms_host: &[FieldElement<E>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + IsSubFieldOf<E> + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let num_cols = handle.m;
+    if num_cols == 0 {
+        return Some(Vec::new());
+    }
+    let n = coset_points.len();
+    if !n.is_power_of_two() || n < gpu_bary_threshold() {
+        return None;
+    }
+    if handle.lde_size != n.checked_mul(row_stride)? {
+        return None;
+    }
+    if inv_denoms_host.len() != n {
+        return None;
+    }
+    let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
+    let inv_denoms_len = n.checked_mul(3).expect("inv_denoms u64 len overflow");
+    let inv_denoms_raw: &[u64] =
+        unsafe { from_raw_parts(inv_denoms_host.as_ptr() as *const u64, inv_denoms_len) };
+    let sums_raw =
+        match math_cuda::barycentric::barycentric_ext3_on_device(handle, row_stride, points_raw, inv_denoms_raw, n) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+    GPU_BARY_CALLS.fetch_add(1, Ordering::Relaxed);
     let scalar = ood_ext3_scalar::<F, E>(coset_offset_pow_n, n_inv, g_n_inv, z_pow_n);
     Some(apply_ext3_scalar::<E>(&sums_raw, scalar, num_cols))
 }

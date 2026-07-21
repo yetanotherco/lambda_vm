@@ -109,6 +109,7 @@ fn run_ext3(log_trace: u32, blowup: usize, num_cols: usize, seed: u64) {
         m: num_cols,
         lde_size,
         tree: None,
+        ready: None,
     };
 
     // Pre-strided buffer for non-strided reference.

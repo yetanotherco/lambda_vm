@@ -476,6 +476,7 @@ pub fn build_comp_poly_tree_from_dev_buf(
     buf: &CudaSlice<u64>,
     m: usize,
     lde_size: usize,
+    ready: Option<&cudarc::driver::CudaEvent>,
 ) -> Result<crate::lde::GpuMerkleTree> {
     assert!(lde_size.is_power_of_two() && lde_size >= 2);
     assert!(
@@ -484,6 +485,11 @@ pub fn build_comp_poly_tree_from_dev_buf(
     );
     let be = backend()?;
     let stream = be.next_stream();
+    // Order this (different) stream against the producer's fill of `buf`. A no-op
+    // while the producer still `synchronize()`s; the real barrier at Step C4.
+    if let Some(ev) = ready {
+        stream.wait(ev)?;
+    }
     let num_leaves = lde_size / 2;
     let nodes_dev = comp_poly_leaves_and_tree(buf, m, lde_size, &stream)?;
     let mut root = [0u8; 32];
@@ -535,7 +541,7 @@ pub fn build_comp_poly_tree_from_host_parts_via_dev_buf(
     pack_ext3_to_pinned_slabs(parts_interleaved, &mut host, lde_size);
     let buf = stream.clone_htod(&host)?;
     stream.synchronize()?;
-    build_comp_poly_tree_from_dev_buf(&buf, m, lde_size)
+    build_comp_poly_tree_from_dev_buf(&buf, m, lde_size, None)
 }
 
 /// Test-only parity harness: build a FRI layer Merkle tree on device from an

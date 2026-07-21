@@ -88,6 +88,11 @@ pub fn deep_composition_ext3_with_dev_parts(
 ) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
+    // Order this stream against the producer's fill of the composition LDE
+    // (no-op while the producer still `synchronize()`s; real barrier at C4).
+    if let Some(ev) = h_parts_dev.ready.as_deref() {
+        stream.wait(ev)?;
+    }
     deep_composition_ext3_impl(
         &stream,
         main_lde,
@@ -173,6 +178,12 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     }
 
     let be = backend()?;
+
+    // Order the caller's stream against the producer's fill of the composition
+    // LDE (no-op while the producer still `synchronize()`s; real barrier at C4).
+    if let Some(ev) = h_parts_dev.ready.as_deref() {
+        stream.wait(ev)?;
+    }
 
     // H2D only the small scalars on the caller's stream.
     let h_ood_dev = stream.clone_htod(h_ood)?;

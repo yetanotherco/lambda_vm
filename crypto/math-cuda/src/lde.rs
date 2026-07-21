@@ -625,6 +625,9 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        // This path already `synchronize()`s the fill before returning, so no
+        // cross-stream event is needed.
+        ready: None,
     };
     Ok((handle, lde_out))
 }
@@ -656,6 +659,9 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        // This path already `synchronize()`s the fill before returning, so no
+        // cross-stream event is needed.
+        ready: None,
     };
     Ok((handle, lde_out))
 }
@@ -692,6 +698,13 @@ pub struct GpuLdeExt3 {
     /// Optionally the aux or composition Merkle tree kept resident on device
     /// (the keep path), so R4 openings gather paths on device. None otherwise.
     pub tree: Option<GpuMerkleTree>,
+    /// "LDE ready" event recorded on the producer stream after the NTT that
+    /// fills `buf`. A consumer on a different stream must `stream.wait(ready)`
+    /// before reading `buf`. `Some` only when the producer left a resident buffer
+    /// without a host-side `synchronize()` barrier (the composition path headed
+    /// for device-only openings); `None` when a `synchronize()` already ordered
+    /// the fill (all current paths), so waiting is unnecessary.
+    pub ready: Option<Arc<cudarc::driver::CudaEvent>>,
 }
 
 /// Merkle tree kept resident on device after a commit, so query openings gather
@@ -1459,6 +1472,8 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             m,
             lde_size,
             tree: None,
+            // d>2 path: still `synchronize()`s the fill above; no event needed.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1662,11 +1677,17 @@ fn coset_lde_batch_ext3_into_inner(
     if keep_device_buf {
         // Same slab layout the comp-poly Merkle kernel and DEEP expect:
         // `buf[(c*3 + k) * lde_size + r]`.
+        // Record an "LDE ready" event on the producer stream so a consumer on
+        // another stream can order its reads of `buf` against the fill. Today a
+        // `synchronize()` above already orders it (belt-and-suspenders); it
+        // becomes the real barrier once Step C4 drops that host D2H+sync.
+        let ready = Some(std::sync::Arc::new(stream.record_event(None)?));
         Ok(Some(GpuLdeExt3 {
             buf: std::sync::Arc::new(buf),
             m,
             lde_size,
             tree: None,
+            ready,
         }))
     } else {
         drop(buf);

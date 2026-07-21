@@ -1456,6 +1456,39 @@ pub trait IsStarkProver<
             })
             .collect();
 
+        // Step C1: compute the same composition-parts OOD on the resident device
+        // handle and cross-check it against the CPU result above (host stays
+        // authoritative this stage). Proves the device path before C4 makes it
+        // the sole source and the host composition LDE is dropped.
+        #[cfg(feature = "cuda")]
+        if let Some(handle) = round_1_result.lde_trace.gpu_composition_parts() {
+            if let Some(gpu_ood) =
+                crate::gpu_lde::try_barycentric_ext3_on_comp_handle::<Field, FieldExtension>(
+                    handle,
+                    blowup_factor,
+                    &dc.points,
+                    &dc.offset_pow_n,
+                    &dc.size_inv,
+                    &dc.offset_pow_n_inv,
+                    &comp_z_pow_n,
+                    &comp_inv_denoms,
+                )
+            {
+                assert_eq!(
+                    gpu_ood.len(),
+                    composition_poly_parts_ood_evaluation.len(),
+                    "C1 composition OOD: GPU/CPU part count mismatch"
+                );
+                for (j, (g, c)) in gpu_ood
+                    .iter()
+                    .zip(composition_poly_parts_ood_evaluation.iter())
+                    .enumerate()
+                {
+                    assert_eq!(g, c, "C1 composition OOD: GPU != CPU at part {j}");
+                }
+            }
+        }
+
         // === Trace polynomials: barycentric evaluation via LDE ===
         let trace_ood_evaluations = crate::trace::get_trace_evaluations_from_lde(
             &round_1_result.lde_trace,
@@ -2228,6 +2261,34 @@ pub trait IsStarkProver<
                 })
             });
 
+        // Step C2: gather the composition parts' query row-pairs off the resident
+        // handle (same `query_rows`, same lde_size as the trace). Cross-checked
+        // against the host `open_composition_poly_with_proof` values per query in
+        // the loop below (host authoritative this stage); becomes the sole source
+        // at C4 when the host composition LDE is dropped.
+        #[cfg(feature = "cuda")]
+        let comp_dev_values: Option<Vec<FieldElement<FieldExtension>>> =
+            comp_dev_proofs.as_ref().and_then(|_| {
+                round_1_result.lde_trace.gpu_composition_parts().and_then(|h| {
+                    Self::gather_query_rows_device(
+                        lde_trace,
+                        "composition",
+                        |stream| {
+                            math_cuda::barycentric::gather_rows_ext3_on_device(
+                                h,
+                                &query_rows,
+                                stream,
+                            )
+                        },
+                        |raw| {
+                            crate::constraint_ir::gpu_interp::ext3_u64_to_field::<FieldExtension>(
+                                raw,
+                            )
+                        },
+                    )
+                })
+            });
+
         for (qi, index) in indexes_to_open.iter().enumerate() {
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
@@ -2272,11 +2333,31 @@ pub trait IsStarkProver<
                 #[cfg(feature = "cuda")]
                 {
                     if let Some(proofs) = &comp_dev_proofs {
-                        Self::open_composition_poly_with_proof(
+                        let host = Self::open_composition_poly_with_proof(
                             proofs[qi].clone(),
                             &round_2_result.lde_composition_poly_evaluations,
                             *index,
-                        )
+                        );
+                        // C2 cross-check: the values gathered off the resident
+                        // handle must equal the host values (host authoritative).
+                        if let Some(dev_vals) = comp_dev_values.as_ref() {
+                            let num_parts_comp =
+                                round_2_result.lde_composition_poly_evaluations.len();
+                            let (even, odd) = Self::device_row_pair::<FieldExtension>(
+                                dev_vals,
+                                qi,
+                                num_parts_comp,
+                            );
+                            assert_eq!(
+                                even, host.evaluations,
+                                "C2 composition open: GPU != CPU (even) query {qi}"
+                            );
+                            assert_eq!(
+                                odd, host.evaluations_sym,
+                                "C2 composition open: GPU != CPU (sym) query {qi}"
+                            );
+                        }
+                        host
                     } else {
                         Self::open_composition_poly(
                             &round_2_result.composition_poly_merkle_tree,

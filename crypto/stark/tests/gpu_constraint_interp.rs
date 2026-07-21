@@ -206,6 +206,7 @@ fn check_program(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
         m: aux_cols,
         lde_size,
         tree: None,
+        ready: None,
     };
 
     // GPU: launch the interpreter over every row.
@@ -421,6 +422,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         m: aux_cols,
         lde_size,
         tree: None,
+        ready: None,
     };
 
     let inputs = CompositionInputs {
