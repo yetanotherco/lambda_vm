@@ -2,6 +2,7 @@
 compile-programs compile-recursion-elfs clean-asm clean-rust clean-bench clean-shared \
 clean-recursion-elfs clean test test-asm \
 test-rust test-ethrex test-executor test-syscalls test-flamegraph flamegraph-prover test-profile-recursion test-profile-recursion-single test-profile-recursion-multi \
+test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
@@ -56,13 +57,21 @@ RECURSION_GUESTS := empty fibonacci
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # The recursion verifier itself (bench_vs/lambda/recursion) requires picking
-# exactly one of its `min`/`blowup8` Cargo features at build time (fixes the
-# inner ProofOptions — see main.rs). Each preset builds its own distinctly
-# named [[bin]] (recursion-<preset>-bench) to its own artifact, via the
-# define/foreach/eval below rather than the generic %.elf pattern rule. The
-# distinct bin names also make the two `cp`s race-free under `make -j`.
-RECURSION_VERIFIER_PRESETS := min blowup8
-RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS)))
+# exactly one of its preset Cargo features at build time (fixes the inner
+# ProofOptions — see main.rs). Each preset builds its own distinctly named
+# [[bin]] (recursion-<preset>-bench) to its own artifact, via the
+# define/foreach/eval below rather than the generic %.elf pattern rule.
+# `required-features` is a subset match, so e.g. `--features "continuation min"`
+# also satisfies plain `recursion-min-bench`'s `required-features = ["min"]`,
+# racing a concurrent `make -j` build of `recursion-min.elf` for the same
+# shared-target-dir path. `--bin $(2)` in build_guest_elf pins each invocation
+# to its one target bin.
+RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
+# `continuation` feature: verify a multi-epoch ContinuationProof bundle instead
+# of a monolithic VmProof. Only the presets the benchmarks actually measure.
+RECURSION_CONT_PRESETS := min blowup2 blowup4
+RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -191,6 +200,7 @@ cd $(1) && \
 		-Z build-std=core,alloc,std,compiler_builtins,panic_abort \
 		-Z build-std-features=compiler-builtins-mem \
 		-Z json-target-spec \
+		--bin $(2) \
 		$(3)
 cp $(SHARED_TARGET_DIR)/riscv64im-lambda-vm-elf/release/$(2) $@
 endef
@@ -215,26 +225,25 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
 
-# The recursion verifier's `min`/`blowup8` presets: same crate dir, one
-# differently named [[bin]] per preset (recursion-<preset>-bench, gated on that
-# preset's Cargo feature) -> a differently named artifact. Generated per preset
-# from RECURSION_VERIFIER_PRESETS via define/foreach/eval rather than a pattern
-# rule (the stem "recursion-min" wouldn't match the crate dir "recursion") and
-# rather than copy-paste (the presets list is the single source of truth).
+# One differently named [[bin]] per preset (recursion-<preset>-bench, gated on
+# that preset's Cargo feature) -> a differently named artifact. define/foreach/
+# eval rather than a pattern rule (stem "recursion-min" wouldn't match crate
+# dir "recursion") or copy-paste (presets list is the single source of truth).
 # $(1) is the preset; the recipe uses $$ so `$$(call build_guest_elf,...)`
-# survives the $(call ...) expansion and is expanded at recipe-run time (where
-# $@ is defined). Because the two bins have distinct filenames the post-build
-# `cp`s read different files, so the `make -j` cp race is gone structurally and
-# no `.NOTPARALLEL` is needed: cargo's target-dir lock already serializes the
-# compiles, and `.NOTPARALLEL` with prerequisites was wrong on every make
-# version anyway (it serializes the whole build on GNU make <= 4.3 — macOS ships
-# 3.81, ubuntu-latest 4.3 — and on >= 4.4 serializes only the listed targets'
-# own prerequisites, never the two ELF targets against each other).
+# expands at recipe-run time (where $@ is defined).
 define recursion_verifier_rule
 $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
+
+# Continuation variants: same crate, `continuation` feature on top of the preset
+# feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
+define recursion_cont_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+endef
+$(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)
@@ -277,6 +286,27 @@ test-profile-recursion-single: compile-recursion-elfs
 
 test-profile-recursion-multi: compile-recursion-elfs
 	cargo test --package lambda-vm-prover --lib test_recursion_profile_multiquery -- --ignored --nocapture
+
+# Pre-proved continuation input for test_recursion_profile_blowup4_block: proving
+# a real ethrex block is real prover work, not the verifier-guest cost the test
+# profiles, so it's built ONCE here rather than re-proven on every test run.
+# Epoch=2^21 matches scripts/bench_recursion_scaling.sh's default.
+RECURSION_PROFILE_BLOCK_INPUT := $(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-block4.bin
+
+recursion-profile-block-input: $(RECURSION_PROFILE_BLOCK_INPUT)
+
+$(RECURSION_PROFILE_BLOCK_INPUT): $(RUST_ARTIFACTS_DIR)/ethrex.elf executor/tests/ethrex_bench_4.bin | $(RECURSION_ARTIFACTS_DIR)
+	rm -f /tmp/recursion_input.bin /tmp/recursion_input.bin.expected
+	RECURSION_DUMP_PRESET=blowup4 RECURSION_DUMP_EPOCH_LOG2=21 \
+		RECURSION_DUMP_INNER_ELF=$(CURDIR)/$(RUST_ARTIFACTS_DIR)/ethrex.elf \
+		RECURSION_DUMP_INNER_INPUT=$(CURDIR)/executor/tests/ethrex_bench_4.bin \
+		cargo test --release -p lambda-vm-prover --lib test_dump_recursion_input -- --ignored --nocapture
+	mv /tmp/recursion_input.bin $@
+	mv /tmp/recursion_input.bin.expected $@.expected
+
+# Real-block profile (ethrex, blowup=4/4 transfers), via the `continuation` guest.
+test-profile-recursion-block: compile-recursion-elfs $(RECURSION_PROFILE_BLOCK_INPUT)
+	cargo test --package lambda-vm-prover --lib --release test_recursion_profile_blowup4_block -- --ignored --nocapture
 
 # Regenerate the committed ethrex block fixtures (see tooling/ethrex-fixtures).
 # Run after bumping the ethrex rev; README checksums are refreshed automatically.
