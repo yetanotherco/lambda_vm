@@ -34,6 +34,7 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
+use stark::lookup::LogUpMode;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
@@ -175,6 +176,24 @@ pub struct VmProof {
     /// Number of PAGE tables that hold private input data.
     /// These pages are NOT preprocessed — the verifier reconstructs them
     /// as non-preprocessed tables starting at `PRIVATE_INPUT_START_INDEX`.
+    pub num_private_input_pages: usize,
+}
+
+/// A complete VM proof bundle under [`LogUpMode::Gkr`] (experimental): the
+/// [`stark::proof::stark::GkrMultiProof`] wrapper plus the same verifier
+/// metadata as [`VmProof`]. A separate type on purpose — the standard
+/// [`VmProof`] wire format is untouched by the GKR experiment.
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GkrVmProof {
+    /// The multi-table STARK proofs plus the batch GKR artifacts.
+    pub proof: stark::proof::stark::GkrMultiProof<F, E, ()>,
+    /// See [`VmProof::runtime_page_ranges`].
+    pub runtime_page_ranges: Vec<RuntimePageRange>,
+    /// See [`VmProof::table_counts`].
+    pub table_counts: TableCounts,
+    /// See [`VmProof::public_output`].
+    pub public_output: Vec<u8>,
+    /// See [`VmProof::num_private_input_pages`].
     pub num_private_input_pages: usize,
 }
 
@@ -672,6 +691,7 @@ impl VmAirs {
     /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
     /// callers must bind identity externally (see `recursion::check_attestation`).
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -684,45 +704,103 @@ impl VmAirs {
         page_commitments: Option<&[(u64, Commitment)]>,
         register_preprocessed: Option<(Commitment, usize)>,
     ) -> Self {
+        Self::new_with_logup_mode(
+            elf,
+            proof_options,
+            minimal_bitwise,
+            page_configs,
+            table_counts,
+            decode_commitment,
+            include_halt,
+            register_init,
+            page_commitments,
+            register_preprocessed,
+            LogUpMode::Standard,
+        )
+    }
+
+    /// [`Self::new`] with an explicit LogUp mode: [`LogUpMode::Gkr`] switches
+    /// every table to the batch-GKR LogUp path (2 aux columns, bridge
+    /// constraint). Prover and verifier must construct their `VmAirs` with the
+    /// same mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_logup_mode(
+        elf: &Elf,
+        proof_options: &ProofOptions,
+        minimal_bitwise: bool,
+        page_configs: &[crate::tables::page::PageConfig],
+        table_counts: &TableCounts,
+        decode_commitment: Option<Commitment>,
+        include_halt: bool,
+        register_init: Option<&[u32]>,
+        page_commitments: Option<&[(u64, Commitment)]>,
+        register_preprocessed: Option<(Commitment, usize)>,
+        logup_mode: LogUpMode,
+    ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
             .map(|i| {
-                Box::new(create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i))) as VmAir
+                Box::new(
+                    create_cpu_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("CPU[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let bitwise: VmAir = if minimal_bitwise {
-            Box::new(create_bitwise_air(proof_options))
+            Box::new(create_bitwise_air(proof_options).with_logup_mode(logup_mode))
         } else {
-            Box::new(create_bitwise_air(proof_options).with_preprocessed(
-                bitwise::preprocessed_commitment(proof_options),
-                bitwise::NUM_PRECOMPUTED_COLS,
-            ))
+            Box::new(
+                create_bitwise_air(proof_options)
+                    .with_logup_mode(logup_mode)
+                    .with_preprocessed(
+                        bitwise::preprocessed_commitment(proof_options),
+                        bitwise::NUM_PRECOMPUTED_COLS,
+                    ),
+            )
         };
         let lts: Vec<_> = (0..table_counts.lt)
             .map(|i| {
-                Box::new(create_lt_air(proof_options).with_name(&format!("LT[{}]", i))) as VmAir
+                Box::new(
+                    create_lt_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("LT[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let shifts: Vec<_> = (0..table_counts.shift)
             .map(|i| {
-                Box::new(create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
-                    as VmAir
+                Box::new(
+                    create_shift_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("SHIFT[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let memws: Vec<_> = (0..table_counts.memw)
             .map(|i| {
-                Box::new(create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i))) as VmAir
+                Box::new(
+                    create_memw_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("MEMW[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
             .map(|i| {
                 Box::new(
-                    create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)),
+                    create_memw_aligned_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("MEMW_A[{}]", i)),
                 ) as VmAir
             })
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
             .map(|i| {
-                Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
+                Box::new(
+                    create_load_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("LOAD[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let decode_root = decode_commitment.unwrap_or_else(|| {
@@ -731,48 +809,70 @@ impl VmAirs {
         });
         let decode: VmAir = Box::new(
             create_decode_air(proof_options)
+                .with_logup_mode(logup_mode)
                 .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS),
         );
         let muls: Vec<_> = (0..table_counts.mul)
             .map(|i| {
-                Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
+                Box::new(
+                    create_mul_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("MUL[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let dvrms: Vec<_> = (0..table_counts.dvrm)
             .map(|i| {
-                Box::new(create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i))) as VmAir
+                Box::new(
+                    create_dvrm_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("DVRM[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let branches: Vec<_> = (0..table_counts.branch)
             .map(|i| {
-                Box::new(create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
-                    as VmAir
+                Box::new(
+                    create_branch_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("BRANCH[{}]", i)),
+                ) as VmAir
             })
             .collect();
-        let halt: VmAir = Box::new(create_halt_air(proof_options));
-        let commit: VmAir = Box::new(create_commit_air(proof_options));
-        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
-        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
-        let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
-            tables::keccak_rc::preprocessed_commitment(proof_options),
-            tables::keccak_rc::NUM_PRECOMPUTED_COLS,
-        ));
-        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
-        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
+        let halt: VmAir = Box::new(create_halt_air(proof_options).with_logup_mode(logup_mode));
+        let commit: VmAir = Box::new(create_commit_air(proof_options).with_logup_mode(logup_mode));
+        let keccak: VmAir = Box::new(create_keccak_air(proof_options).with_logup_mode(logup_mode));
+        let keccak_rnd: VmAir =
+            Box::new(create_keccak_rnd_air(proof_options).with_logup_mode(logup_mode));
+        let keccak_rc: VmAir = Box::new(
+            create_keccak_rc_air(proof_options)
+                .with_logup_mode(logup_mode)
+                .with_preprocessed(
+                    tables::keccak_rc::preprocessed_commitment(proof_options),
+                    tables::keccak_rc::NUM_PRECOMPUTED_COLS,
+                ),
+        );
+        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options).with_logup_mode(logup_mode));
+        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options).with_logup_mode(logup_mode));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
                     create_register_air(proof_options)
+                        .with_logup_mode(logup_mode)
                         .with_preprocessed(commitment, num_preprocessed_cols),
                 )
             } else {
                 let register_init = register_init
                     .map(<[u32]>::to_vec)
                     .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
-                Box::new(create_register_air(proof_options).with_preprocessed(
-                    register::preprocessed_commitment(proof_options, &register_init),
-                    register::NUM_PREPROCESSED_COLS,
-                ))
+                Box::new(
+                    create_register_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_preprocessed(
+                            register::preprocessed_commitment(proof_options, &register_init),
+                            register::NUM_PREPROCESSED_COLS,
+                        ),
+                )
             };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
@@ -785,7 +885,8 @@ impl VmAirs {
         let pages: Vec<VmAir> = page_configs
             .iter()
             .map(|config| -> VmAir {
-                let air = create_page_air(proof_options, config.page_base);
+                let air =
+                    create_page_air(proof_options, config.page_base).with_logup_mode(logup_mode);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
@@ -815,31 +916,46 @@ impl VmAirs {
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
             .map(|i| {
                 Box::new(
-                    create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)),
+                    create_memw_register_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("MEMW_R[{}]", i)),
                 ) as VmAir
             })
             .collect();
         let eqs: Vec<_> = (0..table_counts.eq)
             .map(|i| {
-                Box::new(create_eq_air(proof_options).with_name(&format!("EQ[{}]", i))) as VmAir
+                Box::new(
+                    create_eq_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("EQ[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let bytewises: Vec<_> = (0..table_counts.bytewise)
             .map(|i| {
-                Box::new(create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
-                    as VmAir
+                Box::new(
+                    create_bytewise_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("BYTEWISE[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let stores: Vec<_> = (0..table_counts.store)
             .map(|i| {
-                Box::new(create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
-                    as VmAir
+                Box::new(
+                    create_store_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("STORE[{}]", i)),
+                ) as VmAir
             })
             .collect();
         let cpu32s: Vec<_> = (0..table_counts.cpu32)
             .map(|i| {
-                Box::new(create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
-                    as VmAir
+                Box::new(
+                    create_cpu32_air(proof_options)
+                        .with_logup_mode(logup_mode)
+                        .with_name(&format!("CPU32[{}]", i)),
+                ) as VmAir
             })
             .collect();
 
@@ -1206,6 +1322,178 @@ pub fn prove_with_options_and_inputs(
         public_output: traces.public_output_bytes.clone(),
         num_private_input_pages,
     })
+}
+
+/// [`prove_with_options_and_inputs`] under [`LogUpMode::Gkr`] (experimental):
+/// every table proves its LogUp sums with the batch GKR instead of committed
+/// term/acc columns (2 aux columns per table). Returns the [`GkrVmProof`]
+/// bundle; verify with [`verify_gkr_with_options`].
+pub fn prove_gkr_with_options_and_inputs(
+    elf_bytes: &[u8],
+    private_inputs: &[u8],
+    proof_options: &ProofOptions,
+    max_rows: &MaxRowsConfig,
+) -> Result<GkrVmProof, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let executor = Executor::new(&program, private_inputs.to_vec())
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+    let result = executor
+        .run()
+        .map_err(|e| Error::Execution(format!("{e}")))?;
+
+    #[cfg(feature = "disk-spill")]
+    let storage_mode = {
+        let lengths = count_table_lengths(&program, &result.logs, max_rows, private_inputs)?;
+        auto_storage::decide(&lengths, proof_options.blowup_factor)
+    };
+
+    let mut traces = Traces::from_elf_and_logs(
+        &program,
+        &result.logs,
+        max_rows,
+        private_inputs,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )?;
+    drop(result);
+
+    let table_counts = traces.table_counts();
+    let airs = VmAirs::new_with_logup_mode(
+        &program,
+        proof_options,
+        false,
+        &traces.page_configs,
+        &table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+        LogUpMode::Gkr,
+    );
+
+    let runtime_page_ranges = traces.runtime_page_ranges();
+    let num_private_input_pages = traces
+        .page_configs
+        .iter()
+        .filter(|c| c.is_private_input)
+        .count();
+
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_bytes,
+        &traces.public_output_bytes,
+        &table_counts,
+        num_private_input_pages,
+        &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+
+    let proof = Prover::multi_prove_gkr(
+        airs.air_trace_pairs(&mut traces),
+        &mut transcript,
+        #[cfg(feature = "disk-spill")]
+        storage_mode,
+    )
+    .map_err(|e| Error::Prover(format!("{e:?}")))?;
+
+    Ok(GkrVmProof {
+        proof,
+        runtime_page_ranges,
+        table_counts,
+        public_output: traces.public_output_bytes.clone(),
+        num_private_input_pages,
+    })
+}
+
+/// Verify a [`GkrVmProof`] ([`LogUpMode::Gkr`] tables) with caller-specified
+/// proof options. The GKR analogue of [`verify_with_options`].
+pub fn verify_gkr_with_options(
+    gkr_proof: &GkrVmProof,
+    elf_bytes: &[u8],
+    proof_options: &ProofOptions,
+) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
+
+    gkr_proof.table_counts.validate()?;
+    {
+        let max_pages = crate::tables::page::max_private_input_pages();
+        if gkr_proof.num_private_input_pages > max_pages {
+            return Err(Error::InvalidTableCounts(format!(
+                "num_private_input_pages ({}) exceeds max ({max_pages})",
+                gkr_proof.num_private_input_pages,
+            )));
+        }
+    }
+
+    let page_configs = Traces::page_configs_from_elf_and_runtime(
+        &program,
+        &gkr_proof.runtime_page_ranges,
+        gkr_proof.num_private_input_pages,
+    );
+
+    let expected_proof_count =
+        gkr_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    if expected_proof_count != gkr_proof.proof.multi.proofs.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
+            gkr_proof.table_counts.total(),
+            page_configs.len(),
+            expected_proof_count,
+            gkr_proof.proof.multi.proofs.len(),
+        )));
+    }
+
+    let airs = VmAirs::new_with_logup_mode(
+        &program,
+        proof_options,
+        false,
+        &page_configs,
+        &gkr_proof.table_counts,
+        None,
+        true,
+        None,
+        None,
+        None,
+        LogUpMode::Gkr,
+    );
+    let air_refs = airs.air_refs();
+
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement_with_digest(
+        &mut transcript,
+        StatementKind::Monolithic,
+        &elf_digest,
+        &gkr_proof.public_output,
+        &gkr_proof.table_counts,
+        gkr_proof.num_private_input_pages,
+        &gkr_proof.runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+
+    // The COMMIT output bus stays an external receiver in GKR mode: the same
+    // verifier-computed target, checked against the GKR root claims.
+    let mut transcript_for_replay = transcript.clone();
+    let expected_bus_balance = match compute_expected_commit_bus_balance_view(
+        &air_refs,
+        MultiProofView::Owned(&gkr_proof.proof.multi),
+        &gkr_proof.public_output,
+        0,
+        &mut transcript_for_replay,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
+
+    Ok(Verifier::multi_verify_gkr(
+        &air_refs,
+        &gkr_proof.proof,
+        &mut transcript,
+        &expected_bus_balance,
+    ))
 }
 
 /// Verify a proof produced by [`prove`] using default proof options.

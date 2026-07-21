@@ -142,6 +142,22 @@ where
     )
 }
 
+/// [`multi_prove_ram`] for [`stark::lookup::LogUpMode::Gkr`] tables.
+pub fn multi_prove_gkr_ram<PI>(
+    air_trace_pairs: Vec<GoldilocksPair<'_, PI>>,
+    transcript: &mut (impl IsStarkTranscript<E, F> + Clone + Send),
+) -> Result<stark::proof::stark::GkrMultiProof<F, E, PI>, ProvingError>
+where
+    PI: Send + Sync + Clone,
+{
+    Prover::<F, E, PI>::multi_prove_gkr(
+        air_trace_pairs,
+        transcript,
+        #[cfg(feature = "disk-spill")]
+        StorageMode::Ram,
+    )
+}
+
 // =============================================================================
 // Soundness regression helpers (negative AIR tests)
 // =============================================================================

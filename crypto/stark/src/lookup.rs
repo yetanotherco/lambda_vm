@@ -1403,8 +1403,10 @@ where
                 LogUpMode::Gkr => {
                     let rp_start =
                         crate::logup_gkr::logup_random_point_start(self.gkr_column_indices.len());
+                    // == is the single-row case: n_vars = 0, empty random
+                    // point, l = [1] (kernel of the empty point), l[0] = 1.
                     assert!(
-                        rap_challenges.len() > rp_start,
+                        rap_challenges.len() >= rp_start,
                         "GKR-mode boundary constraints require the extended \
                          challenge vector (got {} challenges, random point starts at {rp_start})",
                         rap_challenges.len(),
