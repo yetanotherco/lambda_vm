@@ -285,9 +285,13 @@ measure_ref() {
   # them. A ref predating #807 still builds a `cli` that runs, but prints no
   # `Keccak calls:` line — the parse in step 2d would then fail late with an opaque
   # message. Refuse up front (before the expensive blob dump), matching the other
-  # "ref predates X" guards below. The default baseline origin/main always has #807, so
-  # normal PR-vs-main runs never hit this; it only bites a deliberately old baseline.
-  if ! grep -q "Keccak calls:" "$wt/bin/cli/src/main.rs" 2>/dev/null; then
+  # "ref predates X" guards below (which likewise grep the ref's source recursively). We
+  # search the whole cli source tree, not just main.rs, so relocating the counter println
+  # into another module doesn't trip a false rejection; the literal stays coupled to the
+  # step-2d parser (/^Keccak calls:/), so a genuine output-format change fails here AND
+  # there in lockstep. The default baseline origin/main always has #807, so normal
+  # PR-vs-main runs never hit this; it only bites a deliberately old baseline.
+  if ! grep -rq "Keccak calls:" "$wt/bin/cli/src/" 2>/dev/null; then
     echo "ERROR: [$role] ref $ref ($sha8) predates the execute --cycles keccak/ecsm counters (#807, 7dbbb1ff): its CLI emits no 'Keccak calls:' line, so guest cycles/keccak are not measurable. Use a baseline at or after #807." >&2
     exit 1
   fi
