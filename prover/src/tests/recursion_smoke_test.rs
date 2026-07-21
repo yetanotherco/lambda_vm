@@ -602,14 +602,19 @@ fn run_recursion_pipeline(
 #[test]
 fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
     let root = workspace_root();
-    let empty_elf_bytes = read_guest_elf(&root, "empty");
+    let fib_elf_bytes = read_guest_elf(&root, "fibonacci");
+    let inner_input = 10u64.to_le_bytes();
 
-    // Epoch 2^3 = 8 cycles: small enough that `empty` splits into several
-    // epochs, exercising the cross-epoch GKR batches (the standard
-    // continuation tests use 2^3 with the same fixture).
-    let bundle =
-        crate::continuation::prove_continuation_gkr(&empty_elf_bytes, &[], 3, &MIN_PROOF_OPTIONS)
-            .expect("GKR continuation prove should succeed");
+    // fibonacci(10) at 2^4-cycle epochs splits into several epochs (same
+    // fixture as the standard continuation roundtrip test), exercising the
+    // cross-epoch GKR batches.
+    let bundle = crate::continuation::prove_continuation_gkr(
+        &fib_elf_bytes,
+        &inner_input,
+        4,
+        &MIN_PROOF_OPTIONS,
+    )
+    .expect("GKR continuation prove should succeed");
     assert!(
         bundle.num_epochs() > 1,
         "fixture must split into multiple epochs to exercise the cross-epoch path \
@@ -619,14 +624,14 @@ fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
 
     // Host verify (owned path, full ELF-root recompute).
     let expected_output =
-        crate::continuation::verify_continuation_gkr(&empty_elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
+        crate::continuation::verify_continuation_gkr(&fib_elf_bytes, &bundle, &MIN_PROOF_OPTIONS)
             .expect("verify_continuation_gkr errored")
             .expect("GKR continuation bundle must verify");
 
     // Guest path: blob → archived verify+attest → consumer check.
     let blob = recursion::encode_gkr_continuation_guest_input(
         bundle,
-        &empty_elf_bytes,
+        &fib_elf_bytes,
         &MIN_PROOF_OPTIONS,
     )
     .expect("encode_gkr_continuation_guest_input failed");
@@ -653,13 +658,13 @@ fn test_gkr_continuation_blob_decodes_and_verifies_on_host() {
         rkyv::deserialize::<_, rkyv::rancor::Error>(&archived.bundle).expect("bundle deserializes");
     let (expected_decode, expected_pages) =
         crate::continuation::continuation_precomputed_commitments(
-            &empty_elf_bytes,
+            &fib_elf_bytes,
             owned_bundle.base(),
             &MIN_PROOF_OPTIONS,
         )
         .expect("continuation_precomputed_commitments errored");
     let expected_id =
-        recursion::program_id_from_elf(&empty_elf_bytes, &expected_decode, &expected_pages)
+        recursion::program_id_from_elf(&fib_elf_bytes, &expected_decode, &expected_pages)
             .expect("program_id_from_elf errored");
     assert_eq!(id, expected_id, "attested program_id mismatch");
 }
