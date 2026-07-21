@@ -122,10 +122,13 @@ pub(crate) struct TableCommit<F: IsField>
 where
     FieldElement<F>: AsBytes,
 {
-    /// Merkle tree over the trace columns (multiplicities only for preprocessed tables).
-    pub(crate) tree: Arc<BatchedMerkleTree<F>>,
-    /// Root of `tree`.
-    pub(crate) root: Commitment,
+    /// Merkle tree over the trace columns (multiplicities only for preprocessed
+    /// tables). `None` for the batched path's main commits: there every table's
+    /// main columns are opened from the ONE shared main MMCS, so the per-table
+    /// tree is never built (see [`build_main_tree`](IsStarkProver::commit_main_trace)).
+    pub(crate) tree: Option<Arc<BatchedMerkleTree<F>>>,
+    /// Root of `tree`. `None` exactly when `tree` is `None`.
+    pub(crate) root: Option<Commitment>,
     /// Preprocessed tables only: Merkle tree over precomputed columns.
     pub(crate) precomputed_tree: Option<Arc<BatchedMerkleTree<F>>>,
     /// Preprocessed tables only: root of `precomputed_tree`.
@@ -141,8 +144,8 @@ where
     /// Build a `TableCommit` for a plain (non-preprocessed) table.
     fn plain(tree: BatchedMerkleTree<F>, root: Commitment) -> Self {
         Self {
-            tree: Arc::new(tree),
-            root,
+            tree: Some(Arc::new(tree)),
+            root: Some(root),
             precomputed_tree: None,
             precomputed_root: None,
             num_precomputed_cols: 0,
@@ -158,8 +161,38 @@ where
         num_precomputed_cols: usize,
     ) -> Self {
         Self {
-            tree: Arc::new(tree),
-            root,
+            tree: Some(Arc::new(tree)),
+            root: Some(root),
+            precomputed_tree: Some(Arc::new(precomputed_tree)),
+            precomputed_root: Some(precomputed_root),
+            num_precomputed_cols,
+        }
+    }
+
+    /// Build a `TableCommit` for a plain table WITHOUT its main Merkle tree — the
+    /// batched path, where the main columns are opened from the shared main MMCS.
+    fn plain_no_main_tree() -> Self {
+        Self {
+            tree: None,
+            root: None,
+            precomputed_tree: None,
+            precomputed_root: None,
+            num_precomputed_cols: 0,
+        }
+    }
+
+    /// Build a `TableCommit` for a preprocessed table WITHOUT its main-split
+    /// (multiplicity) Merkle tree — the batched path. The precomputed tree/root
+    /// are still committed: they carry the AIR-hardcoded binding and are opened
+    /// separately (outside the shared main MMCS).
+    fn preprocessed_no_main_tree(
+        precomputed_tree: BatchedMerkleTree<F>,
+        precomputed_root: Commitment,
+        num_precomputed_cols: usize,
+    ) -> Self {
+        Self {
+            tree: None,
+            root: None,
             precomputed_tree: Some(Arc::new(precomputed_tree)),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
@@ -169,7 +202,7 @@ where
     /// Cheap clone. Only bumps Arc refcounts, no tree data is copied.
     fn share(&self) -> Self {
         Self {
-            tree: Arc::clone(&self.tree),
+            tree: self.tree.as_ref().map(Arc::clone),
             root: self.root,
             precomputed_tree: self.precomputed_tree.as_ref().map(Arc::clone),
             precomputed_root: self.precomputed_root,
@@ -869,12 +902,22 @@ pub trait IsStarkProver<
     /// `precomputed`: if present, the leading `num_cols` columns are committed
     /// as a separate Merkle tree (the precomputed split for preprocessed
     /// tables) and the root is checked against the AIR-hardcoded commitment.
+    ///
+    /// `build_main_tree`: the per-table Merkle tree over the main (or main-split)
+    /// columns. The reference per-table path opens it directly, so it passes
+    /// `true`. The batched path opens every table's main columns from ONE shared
+    /// main MMCS instead and never touches the per-table tree, so it passes
+    /// `false` — skipping the tree build entirely (CPU path) and leaving
+    /// `TableCommit::{tree, root}` `None`. The precomputed tree/root are still
+    /// built and checked either way. (The cuda fused pipeline always builds the
+    /// tree on-device; the skip applies to the host commit path.)
     #[allow(clippy::type_complexity)]
     fn commit_main_trace(
         trace: &TraceTable<Field, FieldExtension>,
         domain: &Domain<Field>,
         twiddles: &LdeTwiddles<Field>,
         precomputed: Option<(Commitment, usize)>,
+        build_main_tree: bool,
         #[cfg(feature = "cuda")] device_only: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<MainCommitTuple<Field>, ProvingError>
@@ -965,6 +1008,11 @@ pub trait IsStarkProver<
         let t_sub = Instant::now();
 
         let commit = match precomputed {
+            None if !build_main_tree => {
+                // Batched path: the main columns are opened from the shared main
+                // MMCS, so skip the dead per-table main tree entirely.
+                TableCommit::plain_no_main_tree()
+            }
             None => {
                 #[allow(unused_mut)]
                 let (mut tree, root) = Self::commit_rows_bit_reversed(&main_data, total_cols)
@@ -983,33 +1031,44 @@ pub trait IsStarkProver<
                         num_precomputed,
                     )
                     .ok_or(ProvingError::EmptyCommitment)?;
-                #[allow(unused_mut)]
-                let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
-                    &main_data,
-                    total_cols,
-                    num_precomputed,
-                    total_cols,
-                )
-                .ok_or(ProvingError::EmptyCommitment)?;
                 if precomputed_root != expected_precomputed_root {
                     return Err(ProvingError::PrecomputedCommitmentMismatch);
                 }
                 #[cfg(feature = "disk-spill")]
-                {
-                    Self::spill_tree(
-                        &mut precomputed_tree,
-                        storage_mode,
-                        "precomputed Merkle tree",
-                    )?;
+                Self::spill_tree(
+                    &mut precomputed_tree,
+                    storage_mode,
+                    "precomputed Merkle tree",
+                )?;
+
+                if !build_main_tree {
+                    // Batched path: keep the precomputed tree (its root is the
+                    // AIR-hardcoded binding and is opened separately) but skip the
+                    // dead main-split (multiplicity) tree.
+                    TableCommit::preprocessed_no_main_tree(
+                        precomputed_tree,
+                        precomputed_root,
+                        num_precomputed,
+                    )
+                } else {
+                    #[allow(unused_mut)]
+                    let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
+                        &main_data,
+                        total_cols,
+                        num_precomputed,
+                        total_cols,
+                    )
+                    .ok_or(ProvingError::EmptyCommitment)?;
+                    #[cfg(feature = "disk-spill")]
                     Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
+                    TableCommit::preprocessed(
+                        mult_tree,
+                        mult_root,
+                        precomputed_tree,
+                        precomputed_root,
+                        num_precomputed,
+                    )
                 }
-                TableCommit::preprocessed(
-                    mult_tree,
-                    mult_root,
-                    precomputed_tree,
-                    precomputed_root,
-                    num_precomputed,
-                )
             }
         };
 
@@ -2269,9 +2328,15 @@ pub trait IsStarkProver<
             #[cfg(not(feature = "cuda"))]
             let _ = qi;
             // For preprocessed tables, open the main split (multiplicities only);
-            // for normal tables, open all main columns.
+            // for normal tables, open all main columns. The reference per-table
+            // path always commits the per-table main tree (batched opens the
+            // shared MMCS instead and never reaches this code).
+            let main_tree = main_commit
+                .tree
+                .as_ref()
+                .expect("per-table path commits the main tree");
             let main_trace_opening = if is_preprocessed {
-                Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                Self::open_polys_with(domain, main_tree, *index, |row| {
                     lde_trace.gather_main_row_range(row, num_precomputed_cols, total_cols)
                 })
             } else {
@@ -2282,7 +2347,7 @@ pub trait IsStarkProver<
                         lde_trace,
                         main_dev_proofs.as_ref(),
                         main_dev_values.as_ref(),
-                        &main_commit.tree,
+                        main_tree,
                         qi,
                         *index,
                         total_cols,
@@ -2292,7 +2357,7 @@ pub trait IsStarkProver<
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &main_commit.tree, *index, |row| {
+                    Self::open_polys_with(domain, main_tree, *index, |row| {
                         lde_trace.gather_main_row(row)
                     })
                 }
@@ -2333,6 +2398,7 @@ pub trait IsStarkProver<
             };
 
             let aux_trace_polys = round_1_result.aux.as_ref().map(|aux| {
+                let aux_tree = aux.tree.as_ref().expect("aux commit builds its tree");
                 #[cfg(feature = "cuda")]
                 {
                     Self::open_trace_polys_device(
@@ -2340,7 +2406,7 @@ pub trait IsStarkProver<
                         lde_trace,
                         aux_dev_proofs.as_ref(),
                         aux_dev_values.as_ref(),
-                        &aux.tree,
+                        aux_tree,
                         qi,
                         *index,
                         lde_trace.num_aux_cols(),
@@ -2350,7 +2416,7 @@ pub trait IsStarkProver<
                 }
                 #[cfg(not(feature = "cuda"))]
                 {
-                    Self::open_polys_with(domain, &aux.tree, *index, |row| {
+                    Self::open_polys_with(domain, aux_tree, *index, |row| {
                         lde_trace.gather_aux_row(row)
                     })
                 }
@@ -2517,6 +2583,9 @@ pub trait IsStarkProver<
                         domain,
                         twiddles,
                         precomputed,
+                        // Batched path: main columns are opened from the shared
+                        // main MMCS, so skip the dead per-table main tree.
+                        false,
                         // The batched MMCS below is built from the host LDE
                         // copies, so the R1 device-only D2H skip is never valid
                         // on this path.
@@ -3326,6 +3395,8 @@ pub trait IsStarkProver<
                         domain,
                         twiddles,
                         precomputed,
+                        // Reference per-table path opens the per-table main tree.
+                        true,
                         #[cfg(feature = "cuda")]
                         device_only,
                         #[cfg(feature = "disk-spill")]
@@ -3342,7 +3413,8 @@ pub trait IsStarkProver<
                 if let Some(ref pre_root) = commit.precomputed_root {
                     transcript.append_bytes(pre_root);
                 }
-                transcript.append_bytes(&commit.root);
+                transcript
+                    .append_bytes(&commit.root.expect("per-table path commits the main tree"));
                 main_commits.push(commit);
                 main_ldes.push(cached_main);
                 #[cfg(feature = "cuda")]
@@ -3673,7 +3745,8 @@ pub trait IsStarkProver<
                 // Tuple shape is cfg-gated; `.0` is the optional TableCommit
                 // in both variants.
                 if let Some(ref c) = aux_full.0 {
-                    table_transcripts[chunk_start + j].append_bytes(&c.root);
+                    table_transcripts[chunk_start + j]
+                        .append_bytes(&c.root.expect("aux commit builds its tree"));
                 }
                 aux_results.push(aux_full);
             }
@@ -3996,9 +4069,12 @@ pub trait IsStarkProver<
 
         Ok(StarkProof {
             // [t]
-            lde_trace_main_merkle_root: round_1_result.main.root,
+            lde_trace_main_merkle_root: round_1_result
+                .main
+                .root
+                .expect("per-table path commits the main tree"),
             // [t]
-            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().map(|x| x.root),
+            lde_trace_aux_merkle_root: round_1_result.aux.as_ref().and_then(|x| x.root),
             // For preprocessed tables: commitment to precomputed columns only
             lde_trace_precomputed_merkle_root: round_1_result.main.precomputed_root,
             // tⱼ(zgᵏ): current-row block + pruned next-row block.
@@ -4372,6 +4448,9 @@ pub trait IsStarkProver<
             &l2g_domain,
             &l2g_tw,
             None,
+            // L2G is its own commitment lane (own tree + own FRI); it opens the
+            // per-table main tree directly.
+            true,
             // L2G openings read the host LDE, so the device-only D2H skip is
             // never valid on this lane.
             false,
@@ -4384,12 +4463,19 @@ pub trait IsStarkProver<
             &l2g_domain,
             &l2g_tw,
             None,
+            // L2G is its own commitment lane (own tree + own FRI); it opens the
+            // per-table main tree directly.
+            true,
             #[cfg(feature = "disk-spill")]
             storage_mode,
         )?;
 
         // (3) Canonical transcript order: L2G main root FIRST.
-        transcript.append_bytes(&l2g_main_commit.root);
+        transcript.append_bytes(
+            &l2g_main_commit
+                .root
+                .expect("L2G lane commits its own main tree"),
+        );
 
         // (4) VM rounds 1-3 on the main transcript (absorbs the VM roots + the
         // shared LogUp challenge; ends at the round-4 seam, post-OOD).
@@ -4447,7 +4533,7 @@ pub trait IsStarkProver<
         // non-batched per-table fork convention used by `multi_prove`).
         let mut l2g_fork = transcript.clone();
         if let Some(aux) = l2g_round1.aux.as_ref() {
-            l2g_fork.append_bytes(&aux.root);
+            l2g_fork.append_bytes(&aux.root.expect("aux commit builds its tree"));
         }
         if let Some(bpi) = l2g_round1.bus_public_inputs.as_ref() {
             l2g_fork.append_field_element(&bpi.table_contribution);
