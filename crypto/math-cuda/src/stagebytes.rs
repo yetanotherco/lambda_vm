@@ -13,6 +13,8 @@
 //!   * `comp_h01_lde_d2h`— D2H of the extended H₀/H₁ LDE result back to host
 //!   * `comp_merkle_h2d` — H2D re-upload of those parts for the Merkle commit
 //!   * `comp_deep_h2d`   — H2D re-upload of composition parts for DEEP fallback
+//!   * `deep_out_d2h`    — D2H of the completed DEEP codeword before FRI
+//!   * `fri_initial_h2d` — H2D of that codeword when GPU FRI starts
 //!   * `fri_layer_d2h`   — D2H of every FRI layer's evaluations
 //!   * `query_gather`    — D2H of Merkle paths during query openings
 
@@ -24,6 +26,8 @@ static COMP_H01_H2D: AtomicU64 = AtomicU64::new(0);
 static COMP_H01_LDE_D2H: AtomicU64 = AtomicU64::new(0);
 static COMP_MERKLE_H2D: AtomicU64 = AtomicU64::new(0);
 static COMP_DEEP_H2D: AtomicU64 = AtomicU64::new(0);
+static DEEP_OUT_D2H: AtomicU64 = AtomicU64::new(0);
+static FRI_INITIAL_H2D: AtomicU64 = AtomicU64::new(0);
 static FRI_LAYER_D2H: AtomicU64 = AtomicU64::new(0);
 static QUERY_GATHER: AtomicU64 = AtomicU64::new(0);
 
@@ -59,6 +63,12 @@ pub fn add_comp_merkle_h2d(bytes: usize) {
 pub fn add_comp_deep_h2d(bytes: usize) {
     add(&COMP_DEEP_H2D, bytes);
 }
+pub fn add_deep_out_d2h(bytes: usize) {
+    add(&DEEP_OUT_D2H, bytes);
+}
+pub fn add_fri_initial_h2d(bytes: usize) {
+    add(&FRI_INITIAL_H2D, bytes);
+}
 pub fn add_fri_layer_d2h(bytes: usize) {
     add(&FRI_LAYER_D2H, bytes);
 }
@@ -74,6 +84,8 @@ pub fn reset() {
         &COMP_H01_LDE_D2H,
         &COMP_MERKLE_H2D,
         &COMP_DEEP_H2D,
+        &DEEP_OUT_D2H,
+        &FRI_INITIAL_H2D,
         &FRI_LAYER_D2H,
         &QUERY_GATHER,
     ] {
@@ -93,6 +105,7 @@ pub fn report() -> Option<String> {
         + mb(&COMP_H01_LDE_D2H)
         + mb(&COMP_MERKLE_H2D)
         + mb(&COMP_DEEP_H2D);
+    let deep_fri_bridge = mb(&DEEP_OUT_D2H) + mb(&FRI_INITIAL_H2D);
     let fri = mb(&FRI_LAYER_D2H);
     let q = mb(&QUERY_GATHER);
     let mut s = String::from("GPU stage bytes (host<->device, MB):\n");
@@ -117,11 +130,23 @@ pub fn report() -> Option<String> {
         mb(&COMP_DEEP_H2D)
     ));
     s.push_str(&format!("  composition SUBTOTAL      {:>10.1}\n", comp));
+    s.push_str(&format!(
+        "  DEEP output           D2H {:>10.1}\n",
+        mb(&DEEP_OUT_D2H)
+    ));
+    s.push_str(&format!(
+        "  FRI initial codeword  H2D {:>10.1}\n",
+        mb(&FRI_INITIAL_H2D)
+    ));
+    s.push_str(&format!(
+        "  DEEP->FRI bridge TOTAL    {:>10.1}\n",
+        deep_fri_bridge
+    ));
     s.push_str(&format!("  FRI layer evals D2H       {:>10.1}\n", fri));
     s.push_str(&format!("  query gather D2H          {:>10.1}\n", q));
     s.push_str(&format!(
         "  TOTAL (counted)           {:>10.1}\n",
-        comp + fri + q
+        comp + deep_fri_bridge + fri + q
     ));
     Some(s)
 }

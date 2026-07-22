@@ -1022,6 +1022,31 @@ pub fn retain_fri_host() -> bool {
     })
 }
 
+/// Enable the direct DEEP->FRI device handoff. It is the production default;
+/// `GPU_DEEP_FRI_RESIDENT=0` restores the legacy D2H -> CPU bit-reverse -> H2D
+/// bridge and is retained as an A/B control.
+pub fn deep_fri_resident_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_DEEP_FRI_RESIDENT")
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
+}
+
+/// Run the legacy host bridge against a cloned transcript and require roots,
+/// terminal coefficients, and transcript state to match the direct handoff.
+/// Disabled by default after parity and end-to-end validation; set
+/// `GPU_DEEP_FRI_CROSSCHECK=1` to run both paths and compare them.
+pub fn deep_fri_crosscheck() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_DEEP_FRI_CROSSCHECK")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// R2 GPU dispatch: build the composition-polynomial Merkle tree directly from
 /// the device-resident extended-LDE handle (the `_keep` extend buffer), skipping
 /// the host re-upload that [`try_build_comp_poly_tree_gpu`] performs. Same slab
@@ -1499,12 +1524,20 @@ where
     out
 }
 
+/// GPU DEEP output. The host copy remains authoritative while the direct FRI
+/// handoff is cross-checked; `device` is present only for the fully-resident
+/// parts + inverse-denominators arm.
+pub(crate) struct DeepGpuOutput<E: IsField> {
+    pub host: Vec<FieldElement<E>>,
+    pub device: Option<math_cuda::deep::GpuDeepEvals>,
+}
+
 /// R4 GPU dispatch: per-row DEEP composition over the full LDE domain.
 /// Reuses the device-resident main + (optional) aux LDE handles from R1
 /// and, when supplied, the device-resident composition-parts LDE handle
 /// from the R2 `_keep` path.
 ///
-/// Returns the `lde_size` ext3 evaluations of the DEEP polynomial on
+/// Returns the `lde_size` ext3 evaluations plus an optional resident handle on
 /// success, or `None` to let the caller run its existing CPU loop. The
 /// caller's `inv_denoms` must be `inv_denoms[0..lde_size]` for the H-term
 /// and `inv_denoms[(1+k)*lde_size..(2+k)*lde_size]` for trace term k
@@ -1521,7 +1554,8 @@ pub(crate) fn try_deep_composition_gpu<F, E>(
     inv_denoms_host: &[FieldElement<E>],
     inv_denoms_dev: Option<(&CudaSlice<u64>, &Arc<CudaStream>)>,
     num_eval_points: usize,
-) -> Option<Vec<FieldElement<E>>>
+    retain_fully_resident_host: bool,
+) -> Option<DeepGpuOutput<E>>
 where
     F: IsField + IsSubFieldOf<E> + 'static,
     E: IsField + 'static,
@@ -1674,7 +1708,11 @@ where
     }
     let result = match (parts_dev, inv_denoms_dev) {
         (Some(parts), Some((inv_dev, stream))) => {
-            math_cuda::deep::deep_composition_ext3_with_dev_parts_and_inv_denoms(
+            // Keep the host codeword for the committed path and while the
+            // direct handoff is being cross-checked. In measured device-only
+            // mode FRI consumes `deep_out` on this same stream, so the D2H and
+            // its synchronisation are unnecessary.
+            math_cuda::deep::deep_composition_ext3_with_dev_parts_and_inv_denoms_keep(
                 stream,
                 main,
                 aux_handle,
@@ -1690,7 +1728,9 @@ where
                 num_eval_points,
                 row_stride_kernel,
                 domain_size_kernel,
+                retain_fully_resident_host,
             )
+            .map(|out| (out.host, Some(out.device)))
         }
         (Some(parts), None) => {
             let inv_h_raw: &[u64] =
@@ -1715,6 +1755,7 @@ where
                 row_stride_kernel,
                 domain_size_kernel,
             )
+            .map(|host| (host, None))
         }
         (None, _) => {
             // De-interleave each ext3 part column into 3 contiguous base-field
@@ -1755,10 +1796,11 @@ where
                 row_stride_kernel,
                 domain_size_kernel,
             )
+            .map(|host| (host, None))
         }
     };
 
-    let deep_raw = match result {
+    let (deep_raw, deep_device) = match result {
         Ok(v) => v,
         Err(e) => {
             if diag {
@@ -1775,8 +1817,11 @@ where
         );
     }
     GPU_DEEP_CALLS.fetch_add(1, Ordering::Relaxed);
-    debug_assert_eq!(deep_raw.len(), lde_size * 3);
-    Some(u64_to_ext3_vec::<E>(&deep_raw))
+    debug_assert!(deep_raw.is_empty() || deep_raw.len() == lde_size * 3);
+    Some(DeepGpuOutput {
+        host: u64_to_ext3_vec::<E>(&deep_raw),
+        device: deep_device,
+    })
 }
 
 /// Build `inv_denoms[k*n + i] = 1 / (lift(coset_base[i]) - z_scalars[k])`
@@ -2007,6 +2052,7 @@ where
 #[allow(clippy::type_complexity)]
 pub(crate) fn try_fri_commit_gpu<F, E, T>(
     evals: &[FieldElement<E>],
+    deep_device: Option<math_cuda::deep::GpuDeepEvals>,
     transcript: &mut T,
     coset_offset: &FieldElement<F>,
     domain_size: usize,
@@ -2033,7 +2079,10 @@ where
     if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
         return None;
     }
-    let n0 = evals.len();
+    // A resident DEEP codeword deliberately has no host `evals` in the
+    // measured path. Its typed handle is therefore authoritative for both
+    // length and storage.
+    let n0 = deep_device.as_ref().map_or(evals.len(), |deep| deep.len);
     if n0 != domain_size || !n0.is_power_of_two() || n0 < 2 {
         return None;
     }
@@ -2053,10 +2102,15 @@ where
         inv_tw_u64.push(v);
     }
 
-    // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
-    let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
-
-    let mut state = match math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0) {
+    let state_result = match deep_device {
+        Some(deep) => math_cuda::fri::FriCommitState::from_deep(deep, &inv_tw_u64, n0),
+        None => {
+            // SAFETY: E == Ext3; FieldElement<Ext3> backing is [u64; 3].
+            let evals_u64: &[u64] = unsafe { ext3_slice_to_u64::<E>(evals) };
+            math_cuda::fri::FriCommitState::new(evals_u64, &inv_tw_u64, n0)
+        }
+    };
+    let mut state = match state_result {
         Ok(s) => s,
         Err(_) => return None,
     };

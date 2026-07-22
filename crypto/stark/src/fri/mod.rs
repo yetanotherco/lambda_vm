@@ -62,6 +62,7 @@ where
         // the CPU path below then runs as if the GPU had never been tried.
         if let Some(result) = crate::gpu_lde::try_fri_commit_gpu::<F, E, T>(
             &evals,
+            None,
             transcript,
             coset_offset,
             domain_size,

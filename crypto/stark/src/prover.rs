@@ -577,6 +577,15 @@ pub(crate) struct Round4<F: IsSubFieldOf<E>, E: IsField> {
     nonce: Option<u64>,
 }
 
+/// Natural-order DEEP evaluations plus the optional device handle produced by
+/// the fully-resident GPU arm. The host vector remains present during the
+/// cross-check stage and is removed only after the direct FRI path is proven.
+struct DeepCompositionOutput<E: IsField> {
+    host: Vec<FieldElement<E>>,
+    #[cfg(feature = "cuda")]
+    device: Option<math_cuda::deep::GpuDeepEvals>,
+}
+
 /// Returns the evaluations of the polynomial `p` over the lde domain defined by the given
 /// `blowup_factor`, `domain_size` and `offset`. The number of evaluations returned is `domain_size
 /// * blowup_factor`. The domain generator used is the one given by the implementation of `F` as `IsFFTField`.
@@ -1620,10 +1629,35 @@ pub trait IsStarkProver<
         // <<<< Receive challenges: 𝛾ⱼ, 𝛾ⱼ'
         let gammas = deep_composition_coefficients;
 
+        let domain_size = domain.lde_roots_of_unity_coset.len();
+
+        // A valid FRI configuration may intentionally perform no folds (for
+        // example, a tiny trace or a terminal degree clamped to the full
+        // codeword). Keep the host DEEP output in those cases: the direct
+        // handoff is only authoritative when the GPU FRI dispatcher can
+        // actually consume it.
+        #[cfg(feature = "cuda")]
+        let direct_handoff_configured = {
+            let layout = crate::fri::terminal::FriFoldLayout::new(
+                domain_size.trailing_zeros(),
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+            );
+            crate::gpu_lde::deep_fri_resident_enabled()
+                && layout.total_folds > 0
+                && layout.terminal_len >= 2
+        };
+        #[cfg(feature = "cuda")]
+        let crosscheck_direct = crate::gpu_lde::deep_fri_crosscheck();
+        #[cfg(feature = "cuda")]
+        let retain_fully_resident_host = !direct_handoff_configured || crosscheck_direct;
+        #[cfg(not(feature = "cuda"))]
+        let retain_fully_resident_host = true;
+
         // Compute p₀ (deep composition polynomial) as N evaluations on trace-size coset
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let deep_evals = Self::compute_deep_composition_poly_evaluations(
+        let deep_output = Self::compute_deep_composition_poly_evaluations(
             &round_1_result.lde_trace,
             round_2_result,
             round_3_result,
@@ -1632,23 +1666,113 @@ pub trait IsStarkProver<
             &domain.trace_primitive_root,
             &gammas,
             &trace_term_coeffs,
+            retain_fully_resident_host,
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
 
-        // DEEP evaluations are already at 2N LDE points — just bit-reverse for FRI.
-        // No iFFT+FFT extension needed (Plonky3-style direct LDE computation).
-        let domain_size = domain.lde_roots_of_unity_coset.len();
+        #[cfg(feature = "cuda")]
+        let deep_device = deep_output.device;
+
+        // DEEP evaluations are already at 2N LDE points. The legacy bridge
+        // bit-reverses them on CPU; the resident bridge folds that permutation
+        // into the first GPU FRI kernel and never materialises a host codeword.
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
-        let mut lde_evals = deep_evals;
-        in_place_bit_reverse_permute(&mut lde_evals);
+        let mut lde_evals = deep_output.host;
+        #[cfg(feature = "cuda")]
+        let direct_requested = direct_handoff_configured && deep_device.is_some();
+
+        #[cfg(feature = "cuda")]
+        let needs_host_bridge = !direct_requested || crosscheck_direct;
+        #[cfg(not(feature = "cuda"))]
+        let needs_host_bridge = true;
+
+        if needs_host_bridge {
+            assert_eq!(
+                lde_evals.len(),
+                domain_size,
+                "R4 DEEP host codeword missing while the host FRI bridge is required"
+            );
+            in_place_bit_reverse_permute(&mut lde_evals);
+        }
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
 
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
+        #[cfg(feature = "cuda")]
+        let direct_fri = if direct_requested {
+            let deep = deep_device.expect("direct DEEP->FRI requested without a device handle");
+            let transcript_before = transcript.clone();
+            let result = crate::gpu_lde::try_fri_commit_gpu::<Field, FieldExtension, _>(
+                &lde_evals,
+                Some(deep),
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+            );
+            Some((transcript_before, result))
+        } else {
+            None
+        };
+
+        #[cfg(feature = "cuda")]
+        let direct_fri = direct_fri.and_then(|(transcript_before, result)| {
+            result.map(|direct| (transcript_before, direct))
+        });
+
+        #[cfg(feature = "cuda")]
+        let (fri_final_poly_coeffs, fri_layers) = if let Some((transcript_before, direct)) =
+            direct_fri
+        {
+            if crosscheck_direct {
+                let mut reference_transcript = transcript_before;
+                let reference = fri::commit_phase_from_evaluations(
+                    lde_evals.clone(),
+                    &mut reference_transcript,
+                    &coset_offset,
+                    domain_size,
+                    domain.blowup_factor.trailing_zeros(),
+                    air.options().fri_final_poly_log_degree as u32,
+                );
+                let direct_roots: Vec<_> = direct.1.iter().map(|l| l.merkle_tree.root).collect();
+                let reference_roots: Vec<_> =
+                    reference.1.iter().map(|l| l.merkle_tree.root).collect();
+                assert_eq!(
+                    direct.0, reference.0,
+                    "DEEP->FRI terminal coefficients mismatch"
+                );
+                assert_eq!(
+                    direct_roots, reference_roots,
+                    "DEEP->FRI layer roots mismatch"
+                );
+                assert_eq!(
+                    transcript.state(),
+                    reference_transcript.state(),
+                    "DEEP->FRI transcript state mismatch"
+                );
+            }
+            direct
+        } else {
+            assert!(
+                !direct_requested || crosscheck_direct,
+                "device-only DEEP->FRI handoff failed; refusing a host fallback without a host codeword"
+            );
+            fri::commit_phase_from_evaluations(
+                lde_evals,
+                transcript,
+                &coset_offset,
+                domain_size,
+                domain.blowup_factor.trailing_zeros(),
+                air.options().fri_final_poly_log_degree as u32,
+            )
+        };
+
+        #[cfg(not(feature = "cuda"))]
         let (fri_final_poly_coeffs, fri_layers) = fri::commit_phase_from_evaluations(
             lde_evals,
             transcript,
@@ -1671,12 +1795,20 @@ pub trait IsStarkProver<
             transcript.append_bytes(&nonce_value.to_be_bytes());
             nonce = Some(nonce_value);
         }
+        #[cfg(feature = "instruments")]
+        let grinding_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let number_of_queries = air.options().fri_number_of_queries;
         let iotas = Self::sample_query_indexes(number_of_queries, domain, transcript);
 
         let query_list = fri::query_phase(&fri_layers, &iotas);
+        #[cfg(feature = "instruments")]
+        let fri_query_dur = t_sub.elapsed();
 
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
         let fri_layers_merkle_roots: Vec<_> = fri_layers
             .iter()
             .map(|layer| layer.merkle_tree.root)
@@ -1687,8 +1819,15 @@ pub trait IsStarkProver<
 
         #[cfg(feature = "instruments")]
         {
-            let queries_dur = t_sub.elapsed();
-            crate::instruments::store_r4_sub(r4_fft_dur, r4_merkle_dur, other_dur_1, queries_dur);
+            let openings_dur = t_sub.elapsed();
+            crate::instruments::store_r4_sub(
+                r4_fft_dur,
+                r4_merkle_dur,
+                other_dur_1,
+                grinding_dur,
+                fri_query_dur,
+                openings_dur,
+            );
         }
 
         Round4 {
@@ -1730,11 +1869,15 @@ pub trait IsStarkProver<
         primitive_root: &FieldElement<Field>,
         composition_poly_gammas: &[FieldElement<FieldExtension>],
         trace_terms_gammas: &[Vec<FieldElement<FieldExtension>>],
-    ) -> Vec<FieldElement<FieldExtension>>
+        retain_fully_resident_host: bool,
+    ) -> DeepCompositionOutput<FieldExtension>
     where
         FieldElement<Field>: AsBytes,
         FieldElement<FieldExtension>: AsBytes,
     {
+        #[cfg(not(feature = "cuda"))]
+        let _ = retain_fully_resident_host;
+
         let num_parts = round_2_result.num_composition_parts;
         let z_power = z.pow(num_parts); // pole for H terms
 
@@ -1795,9 +1938,13 @@ pub trait IsStarkProver<
                         &[],
                         Some((&inv_dev, &stream)),
                         num_eval_points,
+                        retain_fully_resident_host,
                     )
             {
-                return deep_evals;
+                return DeepCompositionOutput {
+                    host: deep_evals.host,
+                    device: deep_evals.device,
+                };
             }
         }
 
@@ -1834,9 +1981,13 @@ pub trait IsStarkProver<
                     &denoms,
                     None,
                     num_eval_points,
+                    true,
                 )
             {
-                return deep_evals;
+                return DeepCompositionOutput {
+                    host: deep_evals.host,
+                    device: deep_evals.device,
+                };
             }
         }
 
@@ -1892,7 +2043,7 @@ pub trait IsStarkProver<
             })
             .collect();
 
-        crate::par::par_map_collect(0..lde_size, |i| {
+        let host = crate::par::par_map_collect(0..lde_size, |i| {
             let mut result = FieldElement::<FieldExtension>::zero();
 
             // H terms
@@ -1917,7 +2068,12 @@ pub trait IsStarkProver<
             }
 
             result
-        })
+        });
+        DeepCompositionOutput {
+            host,
+            #[cfg(feature = "cuda")]
+            device: None,
+        }
     }
 
     /// Computes values and validity proofs of the evaluations of the composition polynomial parts
@@ -3336,17 +3492,25 @@ pub trait IsStarkProver<
             let zero = Duration::ZERO;
             let (r2_constraints, r2_fft, r2_merkle) =
                 crate::instruments::take_r2_sub().unwrap_or((zero, zero, zero));
-            let (r4_fft, r4_merkle, r4_deep_comp, r4_queries) =
-                crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero));
+            let (
+                r4_bit_reverse,
+                r4_fri_commit,
+                r4_deep_comp,
+                r4_grinding,
+                r4_fri_query,
+                r4_openings,
+            ) = crate::instruments::take_r4_sub().unwrap_or((zero, zero, zero, zero, zero, zero));
             crate::instruments::store_round_sub_ops(crate::instruments::TableSubOps {
                 constraints: r2_constraints,
                 comp_decompose: r2_fft,
                 comp_commit: r2_merkle,
                 ood: round_3_dur,
                 deep_comp: r4_deep_comp,
-                deep_extend: r4_fft,
-                fri_commit: r4_merkle,
-                queries: r4_queries,
+                deep_extend: r4_bit_reverse,
+                fri_commit: r4_fri_commit,
+                grinding: r4_grinding,
+                fri_query: r4_fri_query,
+                openings: r4_openings,
             });
         }
 

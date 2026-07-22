@@ -3,8 +3,9 @@
 //! The host loop (in the stark crate) samples each layer's `zeta` from the
 //! transcript and feeds it in. This module keeps the folded evaluations,
 //! twiddles, and per-layer Merkle trees on device, only D2H'ing each
-//! layer's root (to append to the transcript), plus its full evals and
-//! tree nodes (to plug into `FriLayer` for the query phase).
+//! layer's root (to append to the transcript). Folded evals and Merkle nodes
+//! remain resident for the query phase; the terminal codeword alone returns
+//! to the host for coefficient extraction.
 //!
 //! Mirrors `commit_phase_from_evaluations` at
 //! `crypto/stark/src/fri/mod.rs`.
@@ -68,6 +69,9 @@ pub struct FriCommitState {
     pub current_n: usize,
     /// Which buffer holds the current layer's input. Toggles each fold.
     a_is_input: bool,
+    /// The direct DEEP handoff arrives in natural LDE order. Only the first
+    /// fold needs bit-reversed reads; its output has the ordinary FRI layout.
+    first_input_natural: bool,
 }
 
 impl FriCommitState {
@@ -87,6 +91,7 @@ impl FriCommitState {
         let mut evals_a = unsafe { stream.alloc::<u64>(3 * n0) }?;
         let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
         stream.memcpy_htod(evals_host, &mut evals_a)?;
+        crate::stagebytes::add_fri_initial_h2d(core::mem::size_of_val(evals_host));
         let inv_tw = stream.clone_htod(inv_tw_host)?;
 
         Ok(Self {
@@ -96,6 +101,41 @@ impl FriCommitState {
             inv_tw,
             current_n: n0,
             a_is_input: true,
+            first_input_natural: false,
+        })
+    }
+
+    /// Start FRI by taking ownership of a natural-order DEEP codeword already
+    /// resident on device. No D2H, CPU bit-reverse, H2D, or D2D staging pass is
+    /// performed. The first fold applies the legacy bit-reverse mapping while
+    /// loading; subsequent folds use the normal contiguous-pair kernel.
+    pub fn from_deep(
+        deep: crate::deep::GpuDeepEvals,
+        inv_tw_host: &[u64],
+        n0: usize,
+    ) -> Result<Self> {
+        assert!(n0 >= 2 && n0.is_power_of_two());
+        assert_eq!(deep.len, n0);
+        assert_eq!(deep.buf.len(), 3 * n0);
+        assert_eq!(inv_tw_host.len(), n0 / 2);
+
+        let crate::deep::GpuDeepEvals {
+            buf: evals_a,
+            len: _,
+            stream,
+        } = deep;
+        // SAFETY: the first fold writes every output slot before evals_b is read.
+        let evals_b = unsafe { stream.alloc::<u64>(3 * n0) }?;
+        let inv_tw = stream.clone_htod(inv_tw_host)?;
+
+        Ok(Self {
+            stream,
+            evals_a,
+            evals_b,
+            inv_tw,
+            current_n: n0,
+            a_is_input: true,
+            first_input_natural: true,
         })
     }
 
@@ -147,15 +187,31 @@ impl FriCommitState {
         } else {
             (&self.evals_b, &mut self.evals_a)
         };
-        unsafe {
-            self.stream
-                .launch_builder(&be.fri_fold_ext3)
-                .arg(input_evals)
-                .arg(&n_out_u64)
-                .arg(&self.inv_tw)
-                .arg(&zeta_dev)
-                .arg(output_evals)
-                .launch(cfg)?;
+        if self.first_input_natural {
+            let log_n_in = n_in.trailing_zeros() as u64;
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_fold_ext3_from_natural)
+                    .arg(input_evals)
+                    .arg(&n_out_u64)
+                    .arg(&log_n_in)
+                    .arg(&self.inv_tw)
+                    .arg(&zeta_dev)
+                    .arg(output_evals)
+                    .launch(cfg)?;
+            }
+            self.first_input_natural = false;
+        } else {
+            unsafe {
+                self.stream
+                    .launch_builder(&be.fri_fold_ext3)
+                    .arg(input_evals)
+                    .arg(&n_out_u64)
+                    .arg(&self.inv_tw)
+                    .arg(&zeta_dev)
+                    .arg(output_evals)
+                    .launch(cfg)?;
+            }
         }
 
         // SAFETY: keccak_fri_leaves_ext3 writes the leaves [num_leaves-1, 2*num_leaves-1)

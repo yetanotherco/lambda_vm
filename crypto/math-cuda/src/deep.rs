@@ -16,6 +16,21 @@ use crate::Result;
 use crate::device::backend;
 use crate::lde::{GpuLdeBase, GpuLdeExt3};
 
+/// Natural-order DEEP codeword kept on the producer stream for direct FRI
+/// consumption. `len` counts ext3 elements; `buf` contains `3 * len` u64s.
+pub struct GpuDeepEvals {
+    pub buf: CudaSlice<u64>,
+    pub len: usize,
+    pub stream: Arc<CudaStream>,
+}
+
+/// Result of the retaining DEEP entry point. `host` is empty when the caller
+/// elects device-only handoff; the device handle is always populated.
+pub struct DeepCompositionKeep {
+    pub host: Vec<u64>,
+    pub device: GpuDeepEvals,
+}
+
 /// Compute deep-composition evaluations on device.
 ///
 /// `num_eval_points = trace_terms_gammas_interleaved.len() / ((num_main +
@@ -143,6 +158,51 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    Ok(deep_composition_ext3_with_dev_parts_and_inv_denoms_keep(
+        stream,
+        main_lde,
+        aux_lde,
+        h_parts_dev,
+        inv_denoms_dev,
+        h_ood,
+        trace_ood,
+        gammas_h,
+        gammas_tr,
+        num_parts,
+        num_main,
+        num_aux,
+        num_eval_points,
+        row_stride,
+        domain_size,
+        true,
+    )?
+    .host)
+}
+
+/// Retaining variant of
+/// [`deep_composition_ext3_with_dev_parts_and_inv_denoms`]. When
+/// `retain_host` is false it does not synchronize or copy the codeword to the
+/// host; the returned handle remains bound to the producer stream so FRI can
+/// consume it in FIFO order.
+#[allow(clippy::too_many_arguments)]
+pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms_keep(
+    stream: &Arc<CudaStream>,
+    main_lde: &GpuLdeBase,
+    aux_lde: Option<&GpuLdeExt3>,
+    h_parts_dev: &GpuLdeExt3,
+    inv_denoms_dev: &CudaSlice<u64>,
+    h_ood: &[u64],
+    trace_ood: &[u64],
+    gammas_h: &[u64],
+    gammas_tr: &[u64],
+    num_parts: usize,
+    num_main: usize,
+    num_aux: usize,
+    num_eval_points: usize,
+    row_stride: usize,
+    domain_size: usize,
+    retain_host: bool,
+) -> Result<DeepCompositionKeep> {
     assert_eq!(main_lde.m, num_main);
     assert_eq!(h_parts_dev.m, num_parts);
     assert_eq!(h_parts_dev.lde_size, main_lde.lde_size);
@@ -243,9 +303,22 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&deep_out)?;
-    stream.synchronize()?;
-    Ok(out)
+    let host = if retain_host {
+        let out = stream.clone_dtoh(&deep_out)?;
+        crate::stagebytes::add_deep_out_d2h(core::mem::size_of_val(out.as_slice()));
+        stream.synchronize()?;
+        out
+    } else {
+        Vec::new()
+    };
+    Ok(DeepCompositionKeep {
+        host,
+        device: GpuDeepEvals {
+            buf: deep_out,
+            len: domain_size,
+            stream: Arc::clone(stream),
+        },
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -370,6 +443,7 @@ fn deep_composition_ext3_impl(
     }
 
     let out = stream.clone_dtoh(&deep_out)?;
+    crate::stagebytes::add_deep_out_d2h(core::mem::size_of_val(out.as_slice()));
     stream.synchronize()?;
     Ok(out)
 }
