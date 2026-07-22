@@ -1008,6 +1008,20 @@ pub fn retain_composition_host() -> bool {
     explicit || deep_resident_disabled() || merkle_resident_disabled()
 }
 
+/// Whether to keep the host copy of the FRI layer evaluations (Step F2). Default
+/// drops it (device-only): the query phase gathers opened values off the resident
+/// per-layer eval buffers. `GPU_RETAIN_FRI_HOST=1` keeps the host copy (the F0+F1
+/// behavior, and the ABBA baseline). Committed layers honor this; the terminal
+/// fold always retains (its evals become the final-poly coefficients).
+pub fn retain_fri_host() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("GPU_RETAIN_FRI_HOST")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
+
 /// R2 GPU dispatch: build the composition-polynomial Merkle tree directly from
 /// the device-resident extended-LDE handle (the `_keep` extend buffer), skipping
 /// the host re-upload that [`try_build_comp_poly_tree_gpu`] performs. Same slab
@@ -2080,7 +2094,7 @@ where
         let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
         let (layer_evals_u64, dev_tree, dev_evals) =
-            match state.fold_and_commit_layer(zeta_raw, true) {
+            match state.fold_and_commit_layer(zeta_raw, true, retain_fri_host()) {
                 Ok(v) => v,
                 Err(_) => {
                     *transcript = transcript_snapshot.clone();
@@ -2111,14 +2125,14 @@ where
     let zeta_ptr = &zeta_final as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let (terminal_evals_u64, _tree, _dev_evals) = match state.fold_and_commit_layer(zeta_raw, false)
-    {
-        Ok(v) => v,
-        Err(_) => {
-            *transcript = transcript_snapshot;
-            return None;
-        }
-    };
+    let (terminal_evals_u64, _tree, _dev_evals) =
+        match state.fold_and_commit_layer(zeta_raw, false, true) {
+            Ok(v) => v,
+            Err(_) => {
+                *transcript = transcript_snapshot;
+                return None;
+            }
+        };
     debug_assert_eq!(terminal_evals_u64.len(), layout.terminal_len * 3);
     let terminal_codeword = u64_to_ext3_vec::<E>(&terminal_evals_u64);
 
@@ -2179,18 +2193,54 @@ where
         .next_stream();
     let num_layers = fri_layers.len();
 
-    // Batched gather: one call per layer over all queries.
+    // Batched gather per layer over all queries:
+    //   * auth paths from the resident tree (proof_pos = (iota >> l) >> 1)
+    //   * opened values from the resident evals (value_pos = (iota >> l) ^ 1),
+    //     scattered into one contiguous scratch and D2H'd once per layer (a
+    //     single small D2H of `queries * 3` u64 — NOT the full-layer D2H).
     let mut per_layer_proofs: Vec<Vec<Proof<Commitment>>> = Vec::with_capacity(num_layers);
+    let mut per_layer_values: Vec<Vec<FieldElement<E>>> = Vec::with_capacity(num_layers);
     for (l, layer) in fri_layers.iter().enumerate() {
         let tree = layer
             .gpu_tree
             .as_ref()
             .expect("FRI layers are device-resident as a group");
-        let positions: Vec<usize> = iotas.iter().map(|&iota| (iota >> l) >> 1).collect();
+        let proof_positions: Vec<usize> = iotas.iter().map(|&iota| (iota >> l) >> 1).collect();
         per_layer_proofs.push(
-            gather_proofs_dev(tree, &positions, &stream)
+            gather_proofs_dev(tree, &proof_positions, &stream)
                 .expect("device FRI-layer gather failed; resident tree has no host fallback"),
         );
+
+        let dev = layer
+            .gpu_evals
+            .as_ref()
+            .expect("resident FRI layer missing gpu_evals");
+        let nq = iotas.len();
+        let mut scratch = stream
+            .alloc_zeros::<u64>(nq * 3)
+            .expect("FRI value-gather scratch alloc");
+        for (q, &iota) in iotas.iter().enumerate() {
+            let value_pos = (iota >> l) ^ 1;
+            assert!(
+                value_pos < dev.len,
+                "FRI value_pos {value_pos} out of layer len {}",
+                dev.len
+            );
+            let base = value_pos * 3;
+            stream
+                .memcpy_dtod(
+                    &dev.buf.slice(base..base + 3),
+                    &mut scratch.slice_mut(q * 3..q * 3 + 3),
+                )
+                .expect("FRI value-gather D2D scatter");
+        }
+        let raw: Vec<u64> = stream
+            .clone_dtoh(&scratch)
+            .expect("FRI value-gather D2H (resident, no host fallback)");
+        // Count the batched query-value gather (it replaces the full-layer D2H);
+        // otherwise the FRI stage-byte counter would omit it and look like ~0.
+        math_cuda::stagebytes::add_query_gather(raw.len() * 8);
+        per_layer_values.push(u64_to_ext3_vec::<E>(&raw));
     }
 
     // Reassemble per-query decommitments, matching the host walk's order.
@@ -2206,33 +2256,17 @@ where
             let mut index = iota;
             for (l, layer) in fri_layers.iter().enumerate() {
                 let value_pos = index ^ 1;
-                let host_val = layer.evaluation[value_pos].clone();
-                // F1 cross-check: gather the same value off the resident device
-                // evals (ext3 interleaved: 3 u64 at `3 * value_pos`) and assert it
-                // equals the host value. Host stays authoritative this stage; F2
-                // makes the device gather the sole source and drops the host Vec.
-                // Residency is all-or-nothing (asserted above), so a resident layer
-                // MUST carry its evals — `expect`, not a silent skip, or a missing
-                // handle would pass the test on the host path.
-                let dev = layer
-                    .gpu_evals
-                    .as_ref()
-                    .expect("resident FRI layer missing gpu_evals");
-                assert!(
-                    value_pos < dev.len,
-                    "FRI value_pos {value_pos} out of layer len {}",
-                    dev.len
-                );
-                let base = value_pos * 3;
-                let raw: Vec<u64> = stream
-                    .clone_dtoh(&dev.buf.slice(base..base + 3))
-                    .expect("FRI device eval gather (resident, no host fallback)");
-                let dev_val = fri_ext3_from_raw::<E>(&raw);
-                assert_eq!(
-                    dev_val, host_val,
-                    "F1 FRI eval: GPU != host, layer {l} value_pos {value_pos}"
-                );
-                layers_evaluations_sym.push(host_val);
+                // Device-gathered opened value (authoritative; F2 drops the host
+                // Vec). When the host evals are still retained
+                // (`GPU_RETAIN_FRI_HOST`), cross-check the device value against them.
+                let dev_val = per_layer_values[l][q].clone();
+                if !layer.evaluation.is_empty() {
+                    assert_eq!(
+                        dev_val, layer.evaluation[value_pos],
+                        "FRI eval: GPU != host, layer {l} value_pos {value_pos}"
+                    );
+                }
+                layers_evaluations_sym.push(dev_val);
                 layers_auth_paths.push(per_layer_proofs[l][q].clone());
                 index >>= 1;
             }
@@ -2243,18 +2277,4 @@ where
         })
         .collect();
     Some(decommits)
-}
-
-/// Build one ext3 `FieldElement<E>` from 3 interleaved u64 limbs `[a, b, c]`.
-/// `E` must be the degree-3 Goldilocks extension (holds on the GPU FRI path).
-#[cfg(feature = "cuda")]
-fn fri_ext3_from_raw<E>(raw: &[u64]) -> FieldElement<E>
-where
-    E: IsField + 'static,
-{
-    debug_assert_eq!(raw.len(), 3);
-    u64_to_ext3_vec::<E>(raw)
-        .into_iter()
-        .next()
-        .expect("one ext3 element from 3 limbs")
 }

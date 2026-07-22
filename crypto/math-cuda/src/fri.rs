@@ -110,6 +110,7 @@ impl FriCommitState {
         &mut self,
         zeta_raw: [u64; 3],
         retain_evals: bool,
+        retain_host: bool,
     ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree, Option<GpuFriEvals>)> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
@@ -224,9 +225,17 @@ impl FriCommitState {
         } else {
             self.evals_a.slice(0..3 * n_out)
         };
-        // Host copy — still authoritative until Step F2 routes openings to device.
-        let layer_evals: Vec<u64> = self.stream.clone_dtoh(&out_view)?;
-        crate::stagebytes::add_fri_layer_d2h(layer_evals.len() * 8);
+        // Host copy of the folded evals. Under device-only (F2) `retain_host` is
+        // false for committed layers and this big D2H is skipped (query openings
+        // are gathered on device); kept when `retain_host` (GPU_RETAIN_FRI_HOST,
+        // and always the terminal fold whose evals become the final-poly coeffs).
+        let layer_evals: Vec<u64> = if retain_host {
+            let v = self.stream.clone_dtoh(&out_view)?;
+            crate::stagebytes::add_fri_layer_d2h(v.len() * 8);
+            v
+        } else {
+            Vec::new()
+        };
         // F0: for committed (queried) layers, retain the folded evals on device in
         // a fresh buffer (the ping-pong scratch `evals_a`/`evals_b` is overwritten
         // by later folds) so the query phase can gather opened values on device.
