@@ -22,7 +22,7 @@
 
 We introduce a set of chips for faster processing of numbers mod the native goldilocks prime,
 or a degree three extension field thereof.
-Our approach is to offer an arithmetic black box, consisting of the #fma and #zero chips,
+Our approach is to offer an arithmetic black box (ABB), consisting of the #fma and #zero chips,
 that operates on a separate memory domain, and the #load chip to bridge the gap
 from normal byte-addressed RAM memory to this separate field-storage.
 As noted in @memory, we reserve the domain separator values $3$, $4$ and $5$ for field-storage.
@@ -77,8 +77,11 @@ We express this chip using #nr_variables variables spanning #nr_columns columns 
 #render_chip_padding_table(fmachip, config)
 
 = The #zero chip
+#let nr_variables = total_nr_variables(zerochip)
+#let nr_columns = total_nr_instantiated_columns(zerochip, config)
+#let nr_interactions = compute_nr_interactions(zerochip)
 
-This chip asserts that a field extension element in the ABB is zero.
+This chip asserts that a field extension element in the ABB, passed in the `A0` register, is zero.
 It uses #nr_variables variables spanning #nr_columns columns and #nr_interactions interactions.
 
 == Variables
@@ -86,6 +89,8 @@ It uses #nr_variables variables spanning #nr_columns columns and #nr_interaction
 #render_chip_variable_table(zerochip, config)
 
 == Constraints
+
+Read the field element address from the `A0` register, and then assert that the field memory reads a zero.
 
 #render_constraint_table(zerochip, config)
 
