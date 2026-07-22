@@ -18,9 +18,10 @@ use crate::device::backend;
 use crate::lde::{GpuLdeBase, GpuLdeExt3};
 
 const BLOCK_DIM: u32 = 256;
-/// Cap on total threads (grid × block). Each thread owns `num_nodes` ext3 slots
-/// in the global value scratch (`num_nodes × MAX_THREADS × 24 B`), so a fixed
-/// cap bounds that buffer regardless of LDE size; threads grid-stride over the
+/// Cap on total threads (grid × block). Each thread owns the program's packed
+/// value slots in the global scratch (`val_offsets[num_nodes] × MAX_THREADS ×
+/// 8 B` — one `u64` slot per base node, three per ext node), so a fixed cap
+/// bounds that buffer regardless of LDE size; threads grid-stride over the
 /// remaining rows. 65536 mirrors OpenVM's quotient `TASK_SIZE`.
 const MAX_THREADS: u32 = 1 << 16;
 
@@ -32,6 +33,8 @@ const MAX_THREADS: u32 = 1 << 16;
 ///
 /// Inputs (all raw limbs, matching the crate's u64 device convention):
 /// - `nodes`: 2 `u64` per IR node (`op | a<<32`, then `b | dim<<32`).
+/// - `val_offsets`: `num_nodes + 1` prefix sums of the packed per-thread
+///   scratch (1 slot per base node, 3 per ext node; see `DeviceProgram`).
 /// - `base_consts`: one `u64` per base constant.
 /// - `ext_consts`, `rap_challenges`, `alpha_powers`: 3 `u64` per element.
 /// - `table_offset`: exactly 3 `u64`.
@@ -42,6 +45,7 @@ const MAX_THREADS: u32 = 1 << 16;
 pub fn eval_constraints_on_device(
     nodes: &[u64],
     num_nodes: usize,
+    val_offsets: &[u64],
     base_consts: &[u64],
     ext_consts: &[u64],
     roots: &[u64],
@@ -58,6 +62,7 @@ pub fn eval_constraints_on_device(
         return Ok(vec![0u64; num_roots * num_rows * 3]);
     }
     debug_assert_eq!(nodes.len(), 2 * num_nodes, "2 u64 per node");
+    debug_assert_eq!(val_offsets.len(), num_nodes + 1, "prefix sums + total");
     debug_assert_eq!(table_offset.len(), 3, "table_offset is one ext3 element");
 
     let be = backend()?;
@@ -66,6 +71,7 @@ pub fn eval_constraints_on_device(
     // Upload the program + uniforms (the column data never crosses PCIe — it is
     // already resident in `main.buf` / `aux.buf`).
     let d_nodes = stream.clone_htod(nodes)?;
+    let d_val_offsets = stream.clone_htod(val_offsets)?;
     let d_base_consts = stream.clone_htod(base_consts)?;
     let d_ext_consts = stream.clone_htod(ext_consts)?;
     let d_roots = stream.clone_htod(roots)?;
@@ -78,8 +84,10 @@ pub fn eval_constraints_on_device(
     let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
-    // Per-thread value scratch ([num_nodes * num_threads] ext3) and output.
-    let mut d_values = stream.alloc_zeros::<u64>(num_nodes * num_threads * 3)?;
+    // Per-thread packed value scratch ([val_offsets[num_nodes] * num_threads]
+    // u64) and output.
+    let total_slots = *val_offsets.last().expect("non-empty prefix sums") as usize;
+    let mut d_values = stream.alloc_zeros::<u64>((total_slots * num_threads).max(1))?;
     let mut d_evals = stream.alloc_zeros::<u64>(num_roots * num_rows * 3)?;
 
     let num_nodes_u64 = num_nodes as u64;
@@ -100,6 +108,7 @@ pub fn eval_constraints_on_device(
             .arg(&mut d_evals)
             .arg(&d_nodes)
             .arg(&num_nodes_u64)
+            .arg(&d_val_offsets)
             .arg(&d_base_consts)
             .arg(&d_ext_consts)
             .arg(&d_roots)
@@ -157,6 +166,7 @@ pub struct CompositionAccum<'a> {
 pub fn eval_composition_on_device(
     nodes: &[u64],
     num_nodes: usize,
+    val_offsets: &[u64],
     base_consts: &[u64],
     ext_consts: &[u64],
     roots: &[u64],
@@ -174,6 +184,7 @@ pub fn eval_composition_on_device(
         return Ok(Vec::new());
     }
     debug_assert_eq!(nodes.len(), 2 * num_nodes, "2 u64 per node");
+    debug_assert_eq!(val_offsets.len(), num_nodes + 1, "prefix sums + total");
     debug_assert_eq!(accum.beta_trans.len(), num_roots * 3, "β per root");
     let num_boundary = accum.b_col.len();
     debug_assert_eq!(accum.b_z_inv.len(), num_boundary, "z_b_inv per boundary");
@@ -199,6 +210,7 @@ pub fn eval_composition_on_device(
     let stream = be.next_stream();
 
     let d_nodes = stream.clone_htod(nodes)?;
+    let d_val_offsets = stream.clone_htod(val_offsets)?;
     let d_base_consts = stream.clone_htod(base_consts)?;
     let d_ext_consts = stream.clone_htod(ext_consts)?;
     let d_roots = stream.clone_htod(roots)?;
@@ -224,7 +236,8 @@ pub fn eval_composition_on_device(
     let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
-    let mut d_values = stream.alloc_zeros::<u64>(num_nodes * num_threads * 3)?;
+    let total_slots = *val_offsets.last().expect("non-empty prefix sums") as usize;
+    let mut d_values = stream.alloc_zeros::<u64>((total_slots * num_threads).max(1))?;
     let mut d_h = stream.alloc_zeros::<u64>(num_rows * 3)?;
 
     let num_nodes_u64 = num_nodes as u64;
@@ -247,6 +260,7 @@ pub fn eval_composition_on_device(
             .arg(&mut d_h)
             .arg(&d_nodes)
             .arg(&num_nodes_u64)
+            .arg(&d_val_offsets)
             .arg(&d_base_consts)
             .arg(&d_ext_consts)
             .arg(&d_roots)

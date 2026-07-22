@@ -135,6 +135,7 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
 struct LoweredCall {
     dev: DeviceProgram,
     nodes: Vec<u64>,
+    val_offsets: Vec<u64>,
     ext_consts: Vec<u64>,
     roots: Vec<u64>,
     rap: Vec<u64>,
@@ -170,6 +171,7 @@ where
 
     let dev = DeviceProgram::lower(prog);
     let nodes = pack_nodes(&dev);
+    let val_offsets: Vec<u64> = dev.val_offsets.iter().map(|&v| v as u64).collect();
     let ext_consts = flatten_ext3(&dev.ext_consts);
     let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
 
@@ -181,6 +183,7 @@ where
     Some(LoweredCall {
         dev,
         nodes,
+        val_offsets,
         ext_consts,
         roots,
         rap,
@@ -212,6 +215,7 @@ where
     let LoweredCall {
         dev,
         nodes,
+        val_offsets,
         ext_consts,
         roots,
         rap,
@@ -246,6 +250,7 @@ where
     let result = math_cuda::constraint_interp::eval_composition_on_device(
         &nodes,
         dev.nodes.len(),
+        &val_offsets,
         &dev.base_consts,
         &ext_consts,
         &roots,
@@ -290,6 +295,7 @@ where
     let LoweredCall {
         dev,
         nodes,
+        val_offsets,
         ext_consts,
         roots,
         rap,
@@ -300,6 +306,7 @@ where
     let result = math_cuda::constraint_interp::eval_constraints_on_device(
         &nodes,
         dev.nodes.len(),
+        &val_offsets,
         &dev.base_consts,
         &ext_consts,
         &roots,

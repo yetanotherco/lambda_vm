@@ -12,8 +12,10 @@
 //!
 //! - [`DeviceProgram::lower`] — serialize a `ConstraintProgram<Goldilocks,
 //!   GoldilocksExt3>` into flat, device-uploadable arrays: a `#[repr(C)]`
-//!   [`DeviceNode`] list, `u64` / `[u64; 3]` constant tables, `roots`, and
-//!   `num_base`. Field constants become raw limbs via `FieldElement::to_raw`,
+//!   [`DeviceNode`] list (with *normalized* dim tags), `u64` / `[u64; 3]`
+//!   constant tables, `roots`, `num_base`, and the packed per-thread scratch
+//!   layout `val_offsets` (base node = 1 `u64` slot, ext node = 3) the kernel's
+//!   dim-split walk addresses. Field constants become raw limbs via `FieldElement::to_raw`,
 //!   which is byte-identical to how [`crate::gpu_lde`] already hands Goldilocks
 //!   elements to the device (a `#[repr(transparent)]` `u64` / `[u64; 3]`).
 //!
@@ -117,24 +119,38 @@ pub struct DeviceProgram {
     /// Number of leading ([`DIM_BASE`]-rooted) constraints written to
     /// `base_evals`; the rest go to `ext_evals`.
     pub num_base: u32,
+    /// Per-node scratch slot offsets (prefix sums, `nodes.len() + 1` entries):
+    /// a [`DIM_BASE`] node owns 1 `u64` slot, a [`DIM_EXT`] node owns 3, so
+    /// node `i`'s value lives at slots `val_offsets[i]..val_offsets[i+1]` of
+    /// the kernel's per-thread scratch and an operand's width is the offset
+    /// delta. Consistent with the (normalized) `dim` tags by construction.
+    pub val_offsets: Vec<u32>,
 }
 
 impl DeviceProgram {
     /// Lower a concrete-Goldilocks [`ConstraintProgram`] to its flat device
     /// form. Pure serialization — no field arithmetic, no device access.
+    ///
+    /// Dim tags are *normalized*: a node's wire `dim` is [`DIM_BASE`] iff its
+    /// value is statically base — an inherently base leaf (base constant,
+    /// main-trace read) or a `Base`-tagged arithmetic node whose operands are
+    /// all base. The builder's typing join already guarantees this shape, so
+    /// normalization is an identity in practice; re-deriving it here turns
+    /// `DIM_BASE` into a wire-format guarantee the kernel's split base
+    /// arithmetic can rely on. A hypothetical mismatched `Base` tag degrades to
+    /// [`DIM_EXT`], which evaluates identically — the same fallback
+    /// [`eval_device_program`]'s dynamic rule applies.
     pub fn lower(prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension>) -> Self {
+        let mut is_base: Vec<bool> = Vec::with_capacity(prog.nodes.len());
         let nodes = prog
             .nodes
             .iter()
             .zip(prog.dims.iter())
             .map(|(op, dim)| {
-                let dim = match dim {
-                    Dim::Base => DIM_BASE,
-                    Dim::Ext => DIM_EXT,
-                };
-                let (op, a, b) = match *op {
-                    Op::ConstBase(idx) => (OP_CONST_BASE, idx, 0),
-                    Op::ConstExt(idx) => (OP_CONST_EXT, idx, 0),
+                let tagged_base = matches!(dim, Dim::Base);
+                let (op, a, b, base) = match *op {
+                    Op::ConstBase(idx) => (OP_CONST_BASE, idx, 0, true),
+                    Op::ConstExt(idx) => (OP_CONST_EXT, idx, 0, false),
                     Op::Var {
                         main,
                         offset,
@@ -142,20 +158,50 @@ impl DeviceProgram {
                         col,
                     } => {
                         let (a, b) = pack_var(main, offset, row, col);
-                        (OP_VAR, a, b)
+                        (OP_VAR, a, b, main)
                     }
-                    Op::RapChallenge { idx } => (OP_RAP_CHALLENGE, idx as u32, 0),
-                    Op::AlphaPow { idx } => (OP_ALPHA_POW, idx as u32, 0),
-                    Op::TableOffset => (OP_TABLE_OFFSET, 0, 0),
-                    Op::Add(a, b) => (OP_ADD, a, b),
-                    Op::Sub(a, b) => (OP_SUB, a, b),
-                    Op::Mul(a, b) => (OP_MUL, a, b),
-                    Op::Neg(a) => (OP_NEG, a, 0),
-                    Op::Embed(a) => (OP_EMBED, a, 0),
+                    Op::RapChallenge { idx } => (OP_RAP_CHALLENGE, idx as u32, 0, false),
+                    Op::AlphaPow { idx } => (OP_ALPHA_POW, idx as u32, 0, false),
+                    Op::TableOffset => (OP_TABLE_OFFSET, 0, 0, false),
+                    Op::Add(a, b) => (
+                        OP_ADD,
+                        a,
+                        b,
+                        tagged_base && is_base[a as usize] && is_base[b as usize],
+                    ),
+                    Op::Sub(a, b) => (
+                        OP_SUB,
+                        a,
+                        b,
+                        tagged_base && is_base[a as usize] && is_base[b as usize],
+                    ),
+                    Op::Mul(a, b) => (
+                        OP_MUL,
+                        a,
+                        b,
+                        tagged_base && is_base[a as usize] && is_base[b as usize],
+                    ),
+                    Op::Neg(a) => (OP_NEG, a, 0, tagged_base && is_base[a as usize]),
+                    Op::Embed(a) => (OP_EMBED, a, 0, false),
                 };
-                DeviceNode { op, a, b, dim }
+                is_base.push(base);
+                DeviceNode {
+                    op,
+                    a,
+                    b,
+                    dim: if base { DIM_BASE } else { DIM_EXT },
+                }
             })
             .collect();
+
+        // Packed scratch layout: base nodes take 1 u64 slot, ext nodes 3.
+        let mut val_offsets = Vec::with_capacity(is_base.len() + 1);
+        let mut off = 0u32;
+        for &base in &is_base {
+            val_offsets.push(off);
+            off += if base { 1 } else { 3 };
+        }
+        val_offsets.push(off);
 
         let base_consts = prog.base_consts.iter().map(|c| *c.value()).collect();
         let ext_consts = prog.ext_consts.iter().map(encode_ext).collect();
@@ -166,6 +212,7 @@ impl DeviceProgram {
             ext_consts,
             roots: prog.roots.clone(),
             num_base: prog.num_base as u32,
+            val_offsets,
         }
     }
 }
@@ -408,6 +455,105 @@ mod tests {
         b.emit(2, ext_root2);
 
         b.finish(1) // 1 base root, 2 ext roots
+    }
+
+    #[test]
+    fn lower_val_offsets_and_dims_are_consistent() {
+        let prog = all_ops_program();
+        let dev = DeviceProgram::lower(&prog);
+
+        // Prefix sums: one u64 slot per DIM_BASE node, three per DIM_EXT node.
+        assert_eq!(dev.val_offsets.len(), dev.nodes.len() + 1);
+        let mut off = 0u32;
+        for (i, n) in dev.nodes.iter().enumerate() {
+            assert_eq!(dev.val_offsets[i], off, "offset of node {i}");
+            off += if n.dim == DIM_BASE { 1 } else { 3 };
+        }
+        assert_eq!(*dev.val_offsets.last().unwrap(), off, "total slots");
+
+        // Builder programs are already well-tagged: normalization is an
+        // identity, so wire dims match the builder dims.
+        for (n, dim) in dev.nodes.iter().zip(prog.dims.iter()) {
+            let expected = match dim {
+                Dim::Base => DIM_BASE,
+                Dim::Ext => DIM_EXT,
+            };
+            assert_eq!(n.dim, expected);
+        }
+
+        // Root widths: root 0 is base (1 slot), roots 1 and 2 are ext (3).
+        let width = |id: u32| dev.val_offsets[id as usize + 1] - dev.val_offsets[id as usize];
+        assert_eq!(width(dev.roots[0]), 1);
+        assert_eq!(width(dev.roots[1]), 3);
+        assert_eq!(width(dev.roots[2]), 3);
+    }
+
+    #[test]
+    fn lower_normalizes_mismatched_base_dim() {
+        // Hand-crafted mismatch (unreachable via IrBuilder's typing join): an
+        // Add tagged `Base` whose second operand is an aux (Ext) read. `lower`
+        // must degrade the wire dim to DIM_EXT (3-slot scratch) so the kernel's
+        // base arithmetic never sees an ext operand, and the walk must still
+        // match the generic interpreter, whose dynamic rule applies the same
+        // ext fallback.
+        let prog = ConstraintProgram::<Gl, Ext> {
+            nodes: vec![
+                Op::Var {
+                    main: true,
+                    offset: 0,
+                    row: 0,
+                    col: 0,
+                },
+                Op::Var {
+                    main: false,
+                    offset: 0,
+                    row: 0,
+                    col: 0,
+                },
+                Op::Add(0, 1),
+            ],
+            dims: vec![Dim::Base, Dim::Ext, Dim::Base],
+            base_consts: vec![],
+            ext_consts: vec![],
+            roots: vec![2],
+            num_base: 0,
+        };
+        let dev = DeviceProgram::lower(&prog);
+        assert_eq!(dev.nodes[0].dim, DIM_BASE);
+        assert_eq!(dev.nodes[1].dim, DIM_EXT);
+        assert_eq!(dev.nodes[2].dim, DIM_EXT, "mismatched Base tag degrades");
+        assert_eq!(dev.val_offsets, vec![0, 1, 4, 7]);
+
+        let mut rng = SplitMix64(0xFEED_FACE_0BAD_F00D);
+        for _ in 0..100 {
+            let m = fp(rng.next_u64());
+            let a = rng.ext();
+
+            let steps = vec![TableView::<Gl, Ext>::new(vec![vec![m]], vec![vec![a]])];
+            let frame = Frame::<Gl, Ext>::new(steps);
+            let table_offset = Ext3E::zero();
+            let ctx = TransitionEvaluationContext::new_prover(
+                frame.as_row_frame(),
+                &[],
+                &[],
+                &table_offset,
+            );
+            let mut ext_ref = vec![Ext3E::zero(); 1];
+            eval_program(&prog, &ctx, &mut [], &mut ext_ref);
+
+            let mut ext_dev = vec![[0u64; 3]; 1];
+            eval_device_program(
+                &dev,
+                &[vec![*m.value()]],
+                &[vec![encode_ext(&a)]],
+                &[],
+                &[],
+                [0, 0, 0],
+                &mut [],
+                &mut ext_dev,
+            );
+            assert_eq!(ext_dev[0], encode_ext(&ext_ref[0]));
+        }
     }
 
     #[test]
