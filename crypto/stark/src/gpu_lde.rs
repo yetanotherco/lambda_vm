@@ -2079,22 +2079,25 @@ where
         let zeta_ptr = &zeta as *const FieldElement<E> as *const u64;
         let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-        let (layer_evals_u64, dev_tree) = match state.fold_and_commit_layer(zeta_raw) {
-            Ok(v) => v,
-            Err(_) => {
-                *transcript = transcript_snapshot.clone();
-                return None;
-            }
-        };
+        let (layer_evals_u64, dev_tree, dev_evals) =
+            match state.fold_and_commit_layer(zeta_raw, true) {
+                Ok(v) => v,
+                Err(_) => {
+                    *transcript = transcript_snapshot.clone();
+                    return None;
+                }
+            };
 
         // Build the FriLayer: ext3 evals and a root only host tree. The layer
         // tree stays resident on device in `gpu_tree`; query openings gather
-        // paths from it via `gather_proofs_dev`.
+        // paths from it via `gather_proofs_dev`. The folded evals also stay
+        // resident in `gpu_evals` (Step F) so opened values are gathered on device.
         let evaluation = u64_to_ext3_vec::<E>(&layer_evals_u64);
         let root = dev_tree.root;
         let merkle_tree = MerkleTree::<FriLayerMerkleTreeBackend<E>>::from_root(root);
         let mut layer = FriLayer::new(&evaluation, merkle_tree);
         layer.gpu_tree = Some(dev_tree);
+        layer.gpu_evals = dev_evals;
         fri_layer_list.push(layer);
 
         // >>>> Send commitment: [p_k]
@@ -2108,7 +2111,8 @@ where
     let zeta_ptr = &zeta_final as *const FieldElement<E> as *const u64;
     let zeta_raw: [u64; 3] = unsafe { [*zeta_ptr, *zeta_ptr.add(1), *zeta_ptr.add(2)] };
 
-    let (terminal_evals_u64, _tree) = match state.fold_and_commit_layer(zeta_raw) {
+    let (terminal_evals_u64, _tree, _dev_evals) = match state.fold_and_commit_layer(zeta_raw, false)
+    {
         Ok(v) => v,
         Err(_) => {
             *transcript = transcript_snapshot;
@@ -2148,7 +2152,7 @@ pub(crate) fn try_fri_query_phase_gpu<E>(
     iotas: &[usize],
 ) -> Option<Vec<FriDecommitment<E>>>
 where
-    E: IsField,
+    E: IsField + 'static,
     FieldElement<E>: AsBytes + Sync + Send,
 {
     if fri_layers.is_empty() {
@@ -2190,6 +2194,9 @@ where
     }
 
     // Reassemble per-query decommitments, matching the host walk's order.
+    // For each (query, layer) the opened symmetric value is at
+    //   value_pos = (iota >> l) ^ 1
+    // (distinct from the proof position `(iota >> l) >> 1` gathered above).
     let decommits = iotas
         .iter()
         .enumerate()
@@ -2198,7 +2205,34 @@ where
             let mut layers_auth_paths = Vec::with_capacity(num_layers);
             let mut index = iota;
             for (l, layer) in fri_layers.iter().enumerate() {
-                layers_evaluations_sym.push(layer.evaluation[index ^ 1].clone());
+                let value_pos = index ^ 1;
+                let host_val = layer.evaluation[value_pos].clone();
+                // F1 cross-check: gather the same value off the resident device
+                // evals (ext3 interleaved: 3 u64 at `3 * value_pos`) and assert it
+                // equals the host value. Host stays authoritative this stage; F2
+                // makes the device gather the sole source and drops the host Vec.
+                // Residency is all-or-nothing (asserted above), so a resident layer
+                // MUST carry its evals — `expect`, not a silent skip, or a missing
+                // handle would pass the test on the host path.
+                let dev = layer
+                    .gpu_evals
+                    .as_ref()
+                    .expect("resident FRI layer missing gpu_evals");
+                assert!(
+                    value_pos < dev.len,
+                    "FRI value_pos {value_pos} out of layer len {}",
+                    dev.len
+                );
+                let base = value_pos * 3;
+                let raw: Vec<u64> = stream
+                    .clone_dtoh(&dev.buf.slice(base..base + 3))
+                    .expect("FRI device eval gather (resident, no host fallback)");
+                let dev_val = fri_ext3_from_raw::<E>(&raw);
+                assert_eq!(
+                    dev_val, host_val,
+                    "F1 FRI eval: GPU != host, layer {l} value_pos {value_pos}"
+                );
+                layers_evaluations_sym.push(host_val);
                 layers_auth_paths.push(per_layer_proofs[l][q].clone());
                 index >>= 1;
             }
@@ -2209,4 +2243,18 @@ where
         })
         .collect();
     Some(decommits)
+}
+
+/// Build one ext3 `FieldElement<E>` from 3 interleaved u64 limbs `[a, b, c]`.
+/// `E` must be the degree-3 Goldilocks extension (holds on the GPU FRI path).
+#[cfg(feature = "cuda")]
+fn fri_ext3_from_raw<E>(raw: &[u64]) -> FieldElement<E>
+where
+    E: IsField + 'static,
+{
+    debug_assert_eq!(raw.len(), 3);
+    u64_to_ext3_vec::<E>(raw)
+        .into_iter()
+        .next()
+        .expect("one ext3 element from 3 limbs")
 }

@@ -40,6 +40,17 @@ fn check_fault_injection() -> Result<()> {
     Ok(())
 }
 
+/// A FRI layer's folded evaluations kept resident on device. `buf` is the
+/// layer's ext3 evals **interleaved** (`3 * len` u64, `[a0,b0,c0, a1,b1,c1, …]`),
+/// and `len` is the number of ext3 evals in the layer (`n_out`), carried
+/// explicitly so the query phase has the metadata even once the host `Vec` is
+/// dropped (Step F2). Freed when the `buf` Arc drops.
+#[derive(Clone)]
+pub struct GpuFriEvals {
+    pub buf: Arc<CudaSlice<u64>>,
+    pub len: usize,
+}
+
 /// Device-side state across FRI commit iterations. Owns two ext3 eval
 /// buffers (flip-flopped as layer input / output) and the inv_twiddles
 /// buffer. Freed when dropped.
@@ -98,7 +109,8 @@ impl FriCommitState {
     pub fn fold_and_commit_layer(
         &mut self,
         zeta_raw: [u64; 3],
-    ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree)> {
+        retain_evals: bool,
+    ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree, Option<GpuFriEvals>)> {
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
@@ -206,15 +218,28 @@ impl FriCommitState {
         // Sync and D2H.
         self.stream.synchronize()?;
 
-        // Layer evals: 3 * n_out u64 from the output buffer.
-        let layer_evals: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+        // The folded output buffer for this layer (3 * n_out ext3 u64).
+        let out_view = if self.a_is_input {
+            self.evals_b.slice(0..3 * n_out)
         } else {
-            let view = self.evals_a.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+            self.evals_a.slice(0..3 * n_out)
         };
+        // Host copy — still authoritative until Step F2 routes openings to device.
+        let layer_evals: Vec<u64> = self.stream.clone_dtoh(&out_view)?;
         crate::stagebytes::add_fri_layer_d2h(layer_evals.len() * 8);
+        // F0: for committed (queried) layers, retain the folded evals on device in
+        // a fresh buffer (the ping-pong scratch `evals_a`/`evals_b` is overwritten
+        // by later folds) so the query phase can gather opened values on device.
+        // The terminal fold is never queried, so `retain_evals` is false there and
+        // this D2D copy is skipped.
+        let retained_evals = if retain_evals {
+            Some(GpuFriEvals {
+                buf: Arc::new(self.stream.clone_dtod(&out_view)?),
+                len: n_out,
+            })
+        } else {
+            None
+        };
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
         // R4 query openings gather paths on device instead of copying the tree.
@@ -231,6 +256,9 @@ impl FriCommitState {
             leaves_len: num_leaves,
             root,
         };
-        Ok((layer_evals, tree))
+        Ok((layer_evals, tree, retained_evals))
     }
+
+    // (retained_evals is `Some` only when `retain_evals` is passed for a
+    // committed layer; the terminal fold passes false and gets `None`.)
 }
