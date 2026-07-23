@@ -73,10 +73,10 @@ with the claimed commitments in its own domain separated part of memory, with do
 ]
 This chip then checks that the same value as the one being committed is then found at the corresponding address.
 In doing this, we enforce that all values being committed match the claimed commitment,
-and the verifier can additionally check that register 254 contains the correct value to ensure
+and the verifier should additionally check that register 254 contains the correct value to ensure
 the correct amount of bytes have been committed.#footnote[
   We additionally note here that for very large commitments (with index $>= 2^32$),
-  the address can potentially become denormalized, but since no other chips or systems interact with
+  the (commit space) address can potentially become denormalized, but since no other chips or systems interact with
   this memory domain, there is no issue.
   The usual consistency guarantee from the LogUp argument and correct initialization as for general addresses applies.
 ]
