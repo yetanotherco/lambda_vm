@@ -48,6 +48,7 @@
 //! and ELF alone (`prove_and_verify_continuation` is a thin wrapper over both).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use executor::elf::Elf;
@@ -251,10 +252,10 @@ fn global_memory_air(
 /// and verifier iterate the identical sequence — `multi_verify` matches AIRs to sub-proofs
 /// positionally. Carries page bases ONLY: no cell values, so private-input bytes never
 /// enter the bundle (unlike the full `CellBoundary`, whose `init.value` is a private byte).
-fn touched_page_bases(boundaries: &[Vec<CellBoundary>]) -> Vec<u64> {
+fn touched_page_bases(boundaries: &[Arc<Vec<CellBoundary>>]) -> Vec<u64> {
     boundaries
         .iter()
-        .flatten()
+        .flat_map(|epoch| epoch.iter())
         .map(|b| page::page_base_for_address(b.address))
         .collect::<std::collections::BTreeSet<u64>>()
         .into_iter()
@@ -384,12 +385,16 @@ struct EpochStart<'a> {
 /// One epoch's proving inputs, fully derived from execution (register init,
 /// traces, boundary — no dependency on any previous epoch's *proof*), so the
 /// preparation of epoch i+1 can run on a producer thread while epoch i proves.
+///
+/// `boundary` is shared (`Arc`): the same per-epoch boundary feeds both this
+/// epoch's prove and the cross-epoch global prove, which starts as soon as the
+/// producer has prepared the last epoch (see `prove_continuation`).
 struct PreparedEpoch {
     index: u64,
     register_init: Vec<u32>,
     label: u64,
     traces: Traces,
-    boundary: Vec<CellBoundary>,
+    boundary: Arc<Vec<CellBoundary>>,
     is_final: bool,
 }
 
@@ -839,7 +844,7 @@ fn verify_epoch(
 /// The bus balances iff every `fini` matches the next epoch's `init` and every genesis
 /// matches its source (the ELF for ELF/runtime pages).
 fn prove_global(
-    boundaries: &[Vec<CellBoundary>],
+    boundaries: &[Arc<Vec<CellBoundary>>],
     elf_bytes: &[u8],
     init_page_data: &HashMap<u64, Vec<u8>>,
     page_bases: &[u64],
@@ -849,7 +854,7 @@ fn prove_global(
     // Each cell's final state (boundaries are in epoch order, so the last fini wins).
     let mut final_state: global_memory::FiniStateMap = HashMap::new();
     for epoch in boundaries {
-        for b in epoch {
+        for b in epoch.iter() {
             final_state.insert(
                 b.address,
                 global_memory::FiniState {
@@ -869,7 +874,7 @@ fn prove_global(
 
     let mut l2g_traces: Vec<TraceTable<F, E>> = boundaries
         .iter()
-        .map(|epoch| local_to_global::generate_local_to_global_trace(epoch))
+        .map(|epoch| local_to_global::generate_local_to_global_trace(epoch.as_slice()))
         .collect();
     let mut gm_traces: Vec<TraceTable<F, E>> = gm_configs
         .iter()
@@ -1045,7 +1050,14 @@ pub fn prove_continuation(
     // final-state). Deliberately NOT stored in `EpochProof`/the bundle — `CellBoundary`
     // holds cell values (private-input bytes for private reads); only the value-free
     // page-base set is shipped (see `touched_page_bases`).
-    let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
+    //
+    // The producer publishes each epoch's boundary (an `Arc` share of the one it
+    // sends to the epoch provers) on this dedicated channel, in epoch order. The
+    // global-prove thread drains it until the producer hangs up (last epoch
+    // prepared) — the global proof depends only on these execution artifacts,
+    // never on an epoch *proof*, so it overlaps the epoch proves' tail instead
+    // of serializing after them. Proof bytes are unchanged — only the schedule.
+    let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
     // Two-stage epoch pipeline: a producer thread prepares epoch i+1 (execute +
     // trace build + boundary — all pure execution artifacts) while this thread
@@ -1073,7 +1085,7 @@ pub fn prove_continuation(
         .filter(|&k| k >= 1)
         .unwrap_or(3);
     let rx = std::sync::Mutex::new(rx);
-    type EpochResult = (u64, EpochProof, Vec<CellBoundary>);
+    type EpochResult = (u64, EpochProof);
     let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     let prove_worker = |worker: usize| {
@@ -1105,12 +1117,7 @@ pub fn prove_continuation(
                 opts,
                 decode_commitment,
             ) {
-                Ok(epoch) => {
-                    results
-                        .lock()
-                        .unwrap()
-                        .push((prepared.index, epoch, prepared.boundary))
-                }
+                Ok(epoch) => results.lock().unwrap().push((prepared.index, epoch)),
                 Err(e) => {
                     first_err.lock().unwrap().get_or_insert(e);
                     return;
@@ -1118,6 +1125,11 @@ pub fn prove_continuation(
             }
         }
     };
+    // The global prove's result, produced by its own scoped thread. `None` only
+    // if that thread never ran to completion (a panic — surfaced by the scope).
+    type GlobalResult = (MultiProof<F, E, ()>, Vec<u64>, usize);
+    let global_result: std::sync::Mutex<Option<Result<GlobalResult, Error>>> =
+        std::sync::Mutex::new(None);
     std::thread::scope(|scope| -> Result<(), Error> {
         let elf_ref = &elf;
         let producer = scope.spawn(move || {
@@ -1187,11 +1199,14 @@ pub fn prove_continuation(
                         #[cfg(feature = "disk-spill")]
                         stark::storage_mode::StorageMode::Ram,
                     )?;
-                    let boundary = local_to_global::epoch_boundary(
+                    let boundary = Arc::new(local_to_global::epoch_boundary(
                         &mut provenance,
                         label,
                         &traces.touched_memory_cells,
-                    );
+                    ));
+                    // Publish this epoch's boundary for the global prove (in
+                    // epoch order; the channel closes when the producer ends).
+                    let _ = boundary_tx.send(Arc::clone(&boundary));
 
                     // R_{i+1} from the committed REGISTER trace — the exact value
                     // `prove_epoch` reads (`fini_from_trace`) and binds.
@@ -1199,7 +1214,7 @@ pub fn prove_continuation(
 
                     // Carry the image forward: this epoch's fini is the next
                     // epoch's init.
-                    for cell in &boundary {
+                    for cell in boundary.iter() {
                         image.set(cell.address, (cell.fini.value & 0xFF) as u8);
                     }
 
@@ -1224,6 +1239,37 @@ pub fn prove_continuation(
                 // side is already gone the error there wins.
                 let _ = tx.send(Err(e));
             }
+        });
+
+        // Global prove, overlapped: drain the boundary channel until the
+        // producer hangs up (last epoch prepared), then prove the cross-epoch
+        // global memory argument WHILE the tail epochs are still proving. The
+        // global proof consumes only execution artifacts (boundaries, ELF,
+        // genesis pages) — never an epoch proof — so this is pure schedule.
+        let global_result_ref = &global_result;
+        let init_page_data_ref = &init_page_data;
+        scope.spawn(move || {
+            let mut all: Vec<Arc<Vec<CellBoundary>>> = Vec::new();
+            while let Ok(b) = boundary_rx.recv() {
+                all.push(b);
+            }
+            let run = || -> Result<GlobalResult, Error> {
+                let num_private_input_pages = page::private_input_page_count(private_inputs);
+                // SINGLE source of truth: the same page-base list drives the
+                // committed GLOBAL_MEMORY tables and is shipped in the bundle,
+                // so the two can never diverge in set or order.
+                let touched = touched_page_bases(&all);
+                let global = prove_global(
+                    &all,
+                    elf_bytes,
+                    init_page_data_ref,
+                    &touched,
+                    num_private_input_pages,
+                    opts,
+                )?;
+                Ok((global, touched, num_private_input_pages))
+            };
+            *global_result_ref.lock().unwrap() = Some(run());
         });
 
         // Prove epochs concurrently. Epoch proofs are mutually independent —
@@ -1254,26 +1300,18 @@ pub fn prove_continuation(
         return Err(e);
     }
     let mut results = results.into_inner().unwrap();
-    results.sort_by_key(|(index, _, _)| *index);
-    for (_, epoch, boundary) in results {
+    results.sort_by_key(|(index, _)| *index);
+    for (_, epoch) in results {
         epochs.push(epoch);
-        all_boundaries.push(boundary);
     }
 
-    // One global LogUp over all the (kept) local-to-global tables. `all_boundaries` was
-    // accumulated locally in the loop (never round-tripped through the bundle).
-    let num_private_input_pages = page::private_input_page_count(private_inputs);
-    // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
-    // tables and is shipped in the bundle, so the two can never diverge in set or order.
-    let touched_page_bases = touched_page_bases(&all_boundaries);
-    let global = prove_global(
-        &all_boundaries,
-        elf_bytes,
-        &init_page_data,
-        &touched_page_bases,
-        num_private_input_pages,
-        opts,
-    )?;
+    // One global LogUp over all the (kept) local-to-global tables — proven
+    // concurrently by the scoped thread above; collect its result here. The
+    // scope guarantees the thread finished, so `None` is unreachable.
+    let (global, touched_page_bases, num_private_input_pages) =
+        global_result.into_inner().unwrap().ok_or_else(|| {
+            Error::ContinuationInvariant("global prove thread produced no result".to_string())
+        })??;
 
     // GPU device timeline accumulated across every epoch + global prove
     // (collected only when LAMBDA_VM_GPU_TIMELINE[_JSON] is set).
