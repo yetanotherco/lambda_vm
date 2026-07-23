@@ -5,7 +5,7 @@ test-rust test-ethrex test-executor test-syscalls test-flamegraph flamegraph-pro
 test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
-bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
+bench-math-cuda bench-prover bench-prover-cuda profile-gpu build check clippy fmt lint regen-ethrex-fixtures \
 update-ethrex-fixture-checksums check-ethrex-fixture-checksums
 
 UNAME := $(shell uname)
@@ -410,6 +410,12 @@ bench-prover:
 # Needs an NVIDIA GPU + CUDA toolkit/driver.
 bench-prover-cuda:
 	cargo test -p lambda-vm-prover --release --features cuda --test bench_single -- --ignored --nocapture
+
+# nsys timeline of the proving section (ethrex 5-tx block by default; TX_COUNT=n
+# to scale). Needs an NVIDIA GPU; no sudo required (see scripts/profile_gpu.sh
+# and docs/gpu_profiling.md).
+profile-gpu:
+	bash scripts/profile_gpu.sh
 
 # Build all
 build:

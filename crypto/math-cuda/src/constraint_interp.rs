@@ -53,6 +53,7 @@ pub fn eval_constraints_on_device(
     next_step: usize,
     num_rows: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:eval_constraints_on_device");
     let num_roots = roots.len();
     if num_rows == 0 || num_roots == 0 || num_nodes == 0 {
         return Ok(vec![0u64; num_roots * num_rows * 3]);
@@ -62,16 +63,24 @@ pub fn eval_constraints_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:eval_constraints_on_device");
+    main.wait_ready_on(&stream)?;
+    aux.wait_ready_on(&stream)?;
 
     // Upload the program + uniforms (the column data never crosses PCIe — it is
     // already resident in `main.buf` / `aux.buf`).
-    let d_nodes = stream.clone_htod(nodes)?;
-    let d_base_consts = stream.clone_htod(base_consts)?;
-    let d_ext_consts = stream.clone_htod(ext_consts)?;
-    let d_roots = stream.clone_htod(roots)?;
-    let d_rap = stream.clone_htod(rap_challenges)?;
-    let d_alpha = stream.clone_htod(alpha_powers)?;
-    let d_offset = stream.clone_htod(table_offset)?;
+    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = {
+        crate::nvtx_range!("desc_up");
+        (
+            stream.clone_htod(nodes)?,
+            stream.clone_htod(base_consts)?,
+            stream.clone_htod(ext_consts)?,
+            stream.clone_htod(roots)?,
+            stream.clone_htod(rap_challenges)?,
+            stream.clone_htod(alpha_powers)?,
+            stream.clone_htod(table_offset)?,
+        )
+    };
 
     // Fixed thread count, grid-stride over rows.
     let max_grid = MAX_THREADS / BLOCK_DIM;
@@ -95,6 +104,7 @@ pub fn eval_constraints_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.constraint_interp_kernel)
             .arg(&mut d_evals)
@@ -116,8 +126,19 @@ pub fn eval_constraints_on_device(
             .arg(&mut d_values)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&d_evals)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        let pending = crate::device::async_dtoh_via(
+            &stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &d_evals,
+            d_evals.len(),
+        )?;
+        let mut out = vec![0u64; d_evals.len()];
+        pending.wait_into_u64(&mut out)?;
+        out
+    };
     Ok(out)
 }
 
@@ -169,6 +190,7 @@ pub fn eval_composition_on_device(
     num_rows: usize,
     accum: &CompositionAccum,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:eval_composition_on_device");
     let num_roots = roots.len();
     if num_rows == 0 {
         return Ok(Vec::new());
@@ -197,27 +219,43 @@ pub fn eval_composition_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:eval_composition_on_device");
+    main.wait_ready_on(&stream)?;
+    aux.wait_ready_on(&stream)?;
 
-    let d_nodes = stream.clone_htod(nodes)?;
-    let d_base_consts = stream.clone_htod(base_consts)?;
-    let d_ext_consts = stream.clone_htod(ext_consts)?;
-    let d_roots = stream.clone_htod(roots)?;
-    let d_rap = stream.clone_htod(rap_challenges)?;
-    let d_alpha = stream.clone_htod(alpha_powers)?;
-    let d_offset = stream.clone_htod(table_offset)?;
+    let (d_nodes, d_base_consts, d_ext_consts, d_roots, d_rap, d_alpha, d_offset) = {
+        crate::nvtx_range!("desc_up");
+        (
+            stream.clone_htod(nodes)?,
+            stream.clone_htod(base_consts)?,
+            stream.clone_htod(ext_consts)?,
+            stream.clone_htod(roots)?,
+            stream.clone_htod(rap_challenges)?,
+            stream.clone_htod(alpha_powers)?,
+            stream.clone_htod(table_offset)?,
+        )
+    };
 
-    let d_beta_trans = stream.clone_htod(accum.beta_trans)?;
-    let d_z_inv = stream.clone_htod(accum.z_inv)?;
-    let d_b_col = stream.clone_htod(accum.b_col)?;
-    let d_b_is_aux = stream.clone_htod(accum.b_is_aux)?;
-    let d_b_value = stream.clone_htod(accum.b_value)?;
-    let d_b_beta = stream.clone_htod(accum.b_beta)?;
+    let (d_beta_trans, d_z_inv, d_b_col, d_b_is_aux, d_b_value, d_b_beta) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(accum.beta_trans)?,
+            stream.clone_htod(accum.z_inv)?,
+            stream.clone_htod(accum.b_col)?,
+            stream.clone_htod(accum.b_is_aux)?,
+            stream.clone_htod(accum.b_value)?,
+            stream.clone_htod(accum.b_beta)?,
+        )
+    };
     // Per-slice upload straight from the caller's per-constraint vectors into
     // the flat `b * num_rows + row` device layout — no flattened host copy.
     let mut d_b_z_inv = stream.alloc_zeros::<u64>((num_boundary * num_rows).max(1))?;
-    for (b, slice) in accum.b_z_inv.iter().enumerate() {
-        let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
-        stream.memcpy_htod(*slice, &mut dst)?;
+    {
+        crate::nvtx_range!("h2d");
+        for (b, slice) in accum.b_z_inv.iter().enumerate() {
+            let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
+            stream.memcpy_htod(*slice, &mut dst)?;
+        }
     }
 
     let max_grid = MAX_THREADS / BLOCK_DIM;
@@ -242,6 +280,7 @@ pub fn eval_composition_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.constraint_composition_kernel)
             .arg(&mut d_h)
@@ -272,7 +311,13 @@ pub fn eval_composition_on_device(
             .arg(&mut d_values)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&d_h)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        let pending =
+            crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &d_h, d_h.len())?;
+        let mut out = vec![0u64; d_h.len()];
+        pending.wait_into_u64(&mut out)?;
+        out
+    };
     Ok(out)
 }

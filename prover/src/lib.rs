@@ -1165,6 +1165,11 @@ pub fn prove_with_options_and_inputs(
     // Phase 4: Prove (multi_prove)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
+    // Open the external-profiler capture window here so an
+    // `nsys profile -c cudaProfilerApi` run records only the proving section
+    // (excludes execution + trace build). No-op without an attached profiler.
+    #[cfg(feature = "cuda")]
+    stark::gpu_lde::profiler_range_start();
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
@@ -1172,6 +1177,8 @@ pub fn prove_with_options_and_inputs(
         storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(feature = "cuda")]
+    stark::gpu_lde::profiler_range_stop();
     #[cfg(feature = "instruments")]
     drop(__sp);
 
@@ -1196,6 +1203,16 @@ pub fn prove_with_options_and_inputs(
         if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
             let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
             println!("[timeline] wrote {path}");
+        }
+        // GPU device timeline (CUDA events; collected only when
+        // LAMBDA_VM_GPU_TIMELINE=1 or LAMBDA_VM_GPU_TIMELINE_JSON is set).
+        #[cfg(feature = "cuda")]
+        if let Some(gpu_tl) = stark::gpu_lde::gpu_timeline_drain() {
+            instruments::print_gpu_report(&gpu_tl);
+            if let Ok(path) = std::env::var("LAMBDA_VM_GPU_TIMELINE_JSON") {
+                let _ = std::fs::write(&path, instruments::chrome_trace_json(&spans, &gpu_tl));
+                println!("[gpu-timeline] wrote {path}");
+            }
         }
     }
 

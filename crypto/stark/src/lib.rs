@@ -43,3 +43,22 @@ pub mod tests;
 
 /// Configurations of the Prover available in compile time
 pub mod config;
+
+/// Opens a thread-scoped NVTX range (dynamic label allowed) that closes at the
+/// end of the enclosing scope, for nsys timelines. Statement position:
+/// `crate::nvtx_range!("r1_commit:{}", table_name);`
+#[cfg(feature = "nvtx")]
+#[macro_export]
+macro_rules! nvtx_range {
+    ($($tt:tt)*) => {
+        ::nvtx::range_push!($($tt)*);
+        let _nvtx_guard = $crate::instruments::NvtxPopGuard;
+    };
+}
+
+/// No-op without the `nvtx` feature — arguments are not evaluated.
+#[cfg(not(feature = "nvtx"))]
+#[macro_export]
+macro_rules! nvtx_range {
+    ($($tt:tt)*) => {};
+}

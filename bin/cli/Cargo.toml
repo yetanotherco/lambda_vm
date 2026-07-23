@@ -19,3 +19,4 @@ env_logger = "0.11"
 jemalloc-stats = ["dep:tikv-jemalloc-ctl"]
 disk-spill = ["prover/disk-spill"]
 instruments = ["prover/instruments", "stark/instruments"]
+nvtx = ["prover/nvtx", "stark/nvtx", "instruments"]

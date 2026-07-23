@@ -15,6 +15,8 @@ pub mod lde;
 pub mod logup;
 pub mod merkle;
 pub mod ntt;
+pub mod profiling;
+pub mod timing;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

@@ -194,6 +194,7 @@ fn check_program(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
     stream.synchronize().expect("sync uploads");
 
     let main = GpuLdeBase {
+        ready: None,
         buf: Arc::new(base_dev),
         m: main_cols,
         lde_size,
@@ -202,6 +203,7 @@ fn check_program(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) {
         trace_rows: 0,
     };
     let aux = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(aux_dev),
         m: aux_cols,
         lde_size,
@@ -409,6 +411,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     let aux_dev = stream.clone_htod(&aux_flat).expect("upload aux");
     stream.synchronize().expect("sync");
     let main = GpuLdeBase {
+        ready: None,
         buf: Arc::new(base_dev),
         m: main_cols,
         lde_size,
@@ -417,6 +420,7 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         trace_rows: 0,
     };
     let aux = GpuLdeExt3 {
+        ready: None,
         buf: Arc::new(aux_dev),
         m: aux_cols,
         lde_size,

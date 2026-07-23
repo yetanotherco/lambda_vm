@@ -51,6 +51,7 @@ fn check_inverse_fault_injection() -> Result<()> {
 /// containing the inverses. Used by the parity-test suite; production
 /// callers should prefer `batch_inverse_ext3_dev` to avoid the D2H.
 pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:batch_inverse_ext3");
     assert!(a.len().is_multiple_of(3));
     let n = a.len() / 3;
     if n == 0 {
@@ -65,10 +66,18 @@ pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:batch_inverse_ext3");
     let input_dev = stream.clone_htod(a)?;
     let out_dev = batch_inverse_ext3_dev(&input_dev, n, &stream)?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    // Result download (3 * n u64s): async D2H through the per-worker pinned
+    // slab instead of a blocking pageable copy. The labelled sync keeps its
+    // host-block measurement (now covering the kernels plus the DMA); the
+    // pending wait after it is instant.
+    let pending =
+        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &out_dev, 3 * n)?;
+    crate::timing::timed_sync(&stream, "gpu:batch_inverse_ext3")?;
+    let mut out = vec![0u64; 3 * n];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
 }
 
@@ -83,6 +92,8 @@ pub fn batch_inverse_ext3_dev(
     n: usize,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    crate::nvtx_range!("gpu:batch_inverse_ext3_dev");
+    crate::gpu_span!(stream, "gpu:batch_inverse_ext3_dev");
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
     // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
     // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
@@ -98,7 +109,7 @@ pub fn batch_inverse_ext3_dev(
         // Single element: D2H, host invert, H2D. Avoids running the
         // scan + combine machinery for a degenerate case.
         let host_view: Vec<u64> = stream.clone_dtoh(&input.slice(0..3))?;
-        stream.synchronize()?;
+        crate::timing::timed_sync(stream, "gpu:batch_inverse_ext3_dev")?;
         let inv = invert_ext3_host([host_view[0], host_view[1], host_view[2]])?;
         let mut out = unsafe { stream.alloc::<u64>(3) }?;
         stream.memcpy_htod(&inv, &mut out)?;
@@ -113,15 +124,27 @@ pub fn batch_inverse_ext3_dev(
     let mut prefix = unsafe { stream.alloc::<u64>(3 * n) }?;
     let mut suffix = unsafe { stream.alloc::<u64>(3 * n) }?;
 
-    scan_into_fwd(stream, be, input, &mut prefix, n)?;
-    scan_into_rev(stream, be, input, &mut suffix, n)?;
+    {
+        crate::nvtx_range!("scan");
+        scan_into_fwd(stream, be, input, &mut prefix, n)?;
+        scan_into_rev(stream, be, input, &mut suffix, n)?;
+    }
 
     // total = prefix[n-1] = suffix[0]. Invert on host (one Fermat per batch).
-    let last_host: Vec<u64> = stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))?;
-    stream.synchronize()?;
+    let last_host: Vec<u64> = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&prefix.slice((n - 1) * 3..n * 3))?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:batch_inverse_ext3_dev")?;
+    }
     let inv_total = invert_ext3_host([last_host[0], last_host[1], last_host[2]])?;
     let mut inv_total_dev = unsafe { stream.alloc::<u64>(3) }?;
-    stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
+    {
+        crate::nvtx_range!("h2d");
+        stream.memcpy_htod(&inv_total, &mut inv_total_dev)?;
+    }
 
     // Combine: out[i] = prefix[i-1] * inv_total * suffix[i+1].
     // SAFETY: the combine kernel writes every slot before any read.
@@ -133,6 +156,7 @@ pub fn batch_inverse_ext3_dev(
     };
     let n_u64 = n as u64;
     unsafe {
+        crate::nvtx_range!("combine");
         stream
             .launch_builder(&be.batch_inverse_combine_ext3)
             .arg(&prefix)
@@ -173,6 +197,8 @@ pub fn compute_and_invert_denoms_ext3_dev(
     sign: DenomSign,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    crate::nvtx_range!("gpu:compute_and_invert_denoms");
+    crate::gpu_span!(stream, "gpu:compute_and_invert_denoms");
     #[cfg(feature = "test-faults")]
     check_inverse_fault_injection()?;
     assert_eq!(z_scalars_host.len(), k_scalars * 3);
@@ -191,7 +217,10 @@ pub fn compute_and_invert_denoms_ext3_dev(
         ));
     }
 
-    let z_dev = stream.clone_htod(z_scalars_host)?;
+    let z_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(z_scalars_host)?
+    };
     // SAFETY: the compute_denoms_ext3 kernel writes every output slot.
     let mut denoms = unsafe { stream.alloc::<u64>(3 * total) }?;
     let n_u64 = n as u64;
@@ -208,6 +237,7 @@ pub fn compute_and_invert_denoms_ext3_dev(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("denoms");
         stream
             .launch_builder(&be.compute_denoms_ext3)
             .arg(x_lde_dev)

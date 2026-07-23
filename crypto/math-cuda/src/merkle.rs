@@ -37,6 +37,7 @@ pub fn keccak_leaves_base(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
+    crate::nvtx_range!("gpu:keccak_leaves_base");
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
@@ -57,7 +58,11 @@ pub fn keccak_leaves_base(
     assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
+    crate::gpu_span!(&stream, "gpu:keccak_leaves_base");
+    let cols_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(&columns[..total])?
+    };
     let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
     let launch = if rows_per_leaf == 2 {
         launch_keccak_base_row_pair
@@ -72,8 +77,14 @@ pub fn keccak_leaves_base(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:keccak_leaves_base")?;
+    }
     Ok(out)
 }
 
@@ -87,6 +98,7 @@ pub fn keccak_leaves_ext3(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
+    crate::nvtx_range!("gpu:keccak_leaves_ext3");
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
@@ -108,7 +120,11 @@ pub fn keccak_leaves_ext3(
     assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
+    crate::gpu_span!(&stream, "gpu:keccak_leaves_ext3");
+    let cols_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(&columns[..total])?
+    };
     let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
     let launch = if rows_per_leaf == 2 {
         launch_keccak_ext3_row_pair
@@ -123,8 +139,14 @@ pub fn keccak_leaves_ext3(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:keccak_leaves_ext3")?;
+    }
     Ok(out)
 }
 
@@ -158,6 +180,7 @@ pub(crate) fn build_inner_tree_levels(
     nodes_dev: &mut CudaSlice<u8>,
     leaves_len: usize,
 ) -> Result<()> {
+    crate::nvtx_range!("tree_levels");
     let mut level_begin: u64 = (leaves_len - 1) as u64;
     while level_begin != 0 {
         let new_begin = level_begin / 2;
@@ -184,6 +207,7 @@ pub(crate) fn launch_keccak_base(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
+    crate::nvtx_range!("keccak_leaves");
     // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
     // for `log_num_rows == 0` (single-row trees are degenerate anyway).
     debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");
@@ -216,6 +240,7 @@ pub(crate) fn launch_keccak_base_row_pair(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
+    crate::nvtx_range!("keccak_leaves");
     debug_assert!(
         num_rows >= 2,
         "keccak row-pair leaf kernel: num_rows must be >= 2"
@@ -249,6 +274,7 @@ pub(crate) fn launch_keccak_ext3_row_pair(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
+    crate::nvtx_range!("keccak_leaves");
     debug_assert!(
         num_rows >= 2,
         "keccak row-pair leaf kernel: num_rows must be >= 2"
@@ -283,6 +309,7 @@ pub(crate) fn launch_keccak_ext3_row_pair(
 ///
 /// `leaves_len` must be a power of two and >= 2.
 pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
+    crate::nvtx_range!("gpu:build_merkle_tree");
     assert!(hashed_leaves.len().is_multiple_of(32));
     let leaves_len = hashed_leaves.len() / 32;
     assert!(leaves_len >= 2, "tree needs at least two leaves");
@@ -294,6 +321,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     let total_nodes = 2 * leaves_len - 1;
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:build_merkle_tree");
 
     // Allocate the full node buffer without zero-fill. We overwrite the
     // leaf half via H2D immediately, and every inner node is written by the
@@ -305,6 +333,7 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
     // SAFETY: target slice `nodes_dev[leaves_offset_bytes..]` has exactly
     // `leaves_len * 32 == hashed_leaves.len()` bytes capacity.
     {
+        crate::nvtx_range!("h2d");
         let mut slice =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + hashed_leaves.len());
         stream.memcpy_htod(hashed_leaves, &mut slice)?;
@@ -312,8 +341,14 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&nodes_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:build_merkle_tree")?;
+    }
     Ok(out)
 }
 
@@ -330,6 +365,8 @@ pub fn gather_merkle_paths_dev(
     positions: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u8>> {
+    crate::nvtx_range!("gpu:gather_merkle_paths");
+    crate::gpu_span!(stream, "gpu:gather_merkle_paths");
     let num_queries = positions.len();
     if num_queries == 0 {
         return Ok(Vec::new());
@@ -373,8 +410,17 @@ pub fn gather_merkle_paths_dev(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    // Async drain via the pinned-hashes slot (path nodes are hash output):
+    // enqueued without blocking, then the host waits only on the copy's event
+    // (which also covers the gather kernel queued before it) instead of a
+    // full stream sync.
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_hashes(), &be.ctx, &out, out.len())?;
+    let mut host = vec![0u8; out.len()];
+    {
+        crate::nvtx_range!("d2h");
+        pending.wait_into_bytes(&mut host)?;
+    }
     Ok(host)
 }
 
@@ -418,14 +464,18 @@ fn build_comp_poly_tree_nodes_dev(
     // below read the device `buf`, not `pinned`). Synchronize first so the
     // async H2D has consumed `pinned` before it is freed/reused.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
-    stream.synchronize()?;
+    {
+        crate::nvtx_range!("h2d");
+        stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+        stream.synchronize()?;
+    }
     drop(staging);
 
     // Leaves into tail of a tight node buffer.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
     let leaves_offset_bytes = (num_leaves - 1) * 32;
     {
+        crate::nvtx_range!("keccak_leaves");
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
         let col_stride_u64 = lde_size as u64;
@@ -457,10 +507,12 @@ fn build_comp_poly_tree_nodes_dev(
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
 ) -> Result<crate::lde::GpuMerkleTree> {
+    crate::nvtx_range!("gpu:comp_poly_tree_keep");
     let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
+    crate::gpu_span!(&stream, "gpu:comp_poly_tree_keep");
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
-    stream.synchronize()?;
+    crate::timing::timed_sync(&stream, "gpu:comp_poly_tree_keep")?;
     Ok(crate::lde::GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
@@ -475,6 +527,7 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep(
 /// consecutive ext3 values; `num_leaves = evals.len() / 6`. Returns the
 /// `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
 pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
+    crate::nvtx_range!("gpu:fri_layer_tree");
     assert!(
         evals.len().is_multiple_of(6),
         "evals must hold whole pair-leaves"
@@ -486,6 +539,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:fri_layer_tree");
 
     let evals_dev = stream.clone_htod(evals)?;
     let mut nodes_dev = unsafe { stream.alloc::<u8>(tight_total_nodes * 32) }?;
@@ -493,6 +547,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     // Leaf kernel: num_leaves threads, one leaf each.
     let leaves_offset_bytes = (num_leaves - 1) * 32;
     {
+        crate::nvtx_range!("keccak_leaves");
         let mut leaves_view =
             nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
         let num_leaves_u64 = num_leaves as u64;
@@ -510,7 +565,7 @@ pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
     let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
+    crate::timing::timed_sync(&stream, "gpu:fri_layer_tree")?;
     Ok(out)
 }
 
@@ -522,6 +577,7 @@ pub(crate) fn launch_keccak_ext3(
     num_rows: u64,
     out_dev: &mut CudaViewMut<'_, u8>,
 ) -> Result<()> {
+    crate::nvtx_range!("keccak_leaves");
     // The kernel computes `__brevll(tid) >> (64 - log_num_rows)`, which is UB
     // for `log_num_rows == 0` (single-row trees are degenerate anyway).
     debug_assert!(num_rows >= 2, "keccak leaf kernel: num_rows must be >= 2");

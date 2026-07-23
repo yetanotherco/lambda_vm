@@ -275,3 +275,145 @@ pub fn print_report(
         eprintln!();
     }
 }
+
+/// GPU device-time report from the CUDA-event timeline (feature `cuda` +
+/// `LAMBDA_VM_GPU_TIMELINE=1`). Complements the wall-clock tree: wall says how
+/// long each phase took on the host; this says what the device actually did.
+#[cfg(feature = "cuda")]
+pub fn print_gpu_report(tl: &stark::gpu_lde::GpuTimeline) {
+    if tl.spans.is_empty() {
+        eprintln!("=== GPU TIMING === (enabled but no spans recorded)");
+        return;
+    }
+    let t0 = tl.spans.iter().map(|s| s.start_ms).fold(f64::MAX, f64::min);
+    let t1 = tl.spans.iter().map(|s| s.end_ms).fold(f64::MIN, f64::max);
+    let window = t1 - t0;
+
+    // Busy = union of span intervals (device-wide). Spans nest/overlap across
+    // streams, so this is coverage, not a sum.
+    let mut iv: Vec<(f64, f64)> = tl.spans.iter().map(|s| (s.start_ms, s.end_ms)).collect();
+    iv.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut busy = 0.0;
+    let mut last_end = f64::MIN;
+    for (s, e) in iv {
+        if s > last_end {
+            busy += e - s;
+            last_end = e;
+        } else if e > last_end {
+            busy += e - last_end;
+            last_end = e;
+        }
+    }
+
+    let mut streams: Vec<u64> = tl.spans.iter().map(|s| s.stream).collect();
+    streams.sort_unstable();
+    streams.dedup();
+
+    // Per-label totals (sum of durations; a label's spans rarely self-overlap).
+    let mut by_label: BTreeMap<&str, (f64, usize)> = BTreeMap::new();
+    for s in &tl.spans {
+        let e = by_label.entry(s.label.as_str()).or_insert((0.0, 0));
+        e.0 += s.end_ms - s.start_ms;
+        e.1 += 1;
+    }
+    let mut rows: Vec<(&str, f64, usize)> =
+        by_label.into_iter().map(|(l, (d, n))| (l, d, n)).collect();
+    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+
+    eprintln!("=== GPU TIMING (CUDA events) ===");
+    eprintln!(
+        "  window {:.2}s  covered {:.2}s ({:.0}%)  streams {}  spans {}",
+        window / 1e3,
+        busy / 1e3,
+        100.0 * busy / window.max(1e-9),
+        streams.len(),
+        tl.spans.len(),
+    );
+    eprintln!("  {:<44} {:>9} {:>7}", "Op", "dev ms", "spans");
+    eprintln!("  {}", "─".repeat(64));
+    for (label, ms, n) in rows.iter().take(24) {
+        eprintln!("  {:<44} {:>9.1} {:>7}", label, ms, n);
+    }
+    if rows.len() > 24 {
+        eprintln!("  ({} more labels)", rows.len() - 24);
+    }
+
+    if !tl.syncs.is_empty() {
+        let mut by_sync: BTreeMap<&str, (u64, usize)> = BTreeMap::new();
+        for s in &tl.syncs {
+            let e = by_sync.entry(s.label).or_insert((0, 0));
+            e.0 += s.wall_ns;
+            e.1 += 1;
+        }
+        let mut rows: Vec<(&str, u64, usize)> =
+            by_sync.into_iter().map(|(l, (d, n))| (l, d, n)).collect();
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+        eprintln!("  ── host blocked in synchronize() ──");
+        for (label, ns, n) in rows.iter().take(12) {
+            eprintln!("  {:<44} {:>9.1} {:>7}", label, *ns as f64 / 1e6, n);
+        }
+    }
+    eprintln!("  {}", "─".repeat(64));
+    eprintln!();
+}
+
+/// Combined host+device Chrome trace (open in Perfetto / chrome://tracing).
+/// Host spans on pid 0; each CUDA stream is a tid under pid 1.
+#[cfg(feature = "cuda")]
+pub fn chrome_trace_json(
+    host_spans: &[stark::instruments::SpanRecord],
+    tl: &stark::gpu_lde::GpuTimeline,
+) -> String {
+    use std::fmt::Write;
+    let dev_base = |ms: f64| -> u128 { tl.host_epoch_ns + (ms.max(0.0) * 1e6) as u128 };
+    let mut base_ns = u128::MAX;
+    for s in host_spans {
+        base_ns = base_ns.min(s.start_ns);
+    }
+    if let Some(s) = tl.spans.first() {
+        base_ns = base_ns.min(dev_base(s.start_ms));
+    }
+    if base_ns == u128::MAX {
+        base_ns = 0;
+    }
+    let us = |ns: u128| (ns - base_ns) as f64 / 1e3;
+
+    let mut streams: Vec<u64> = tl.spans.iter().map(|s| s.stream).collect();
+    streams.sort_unstable();
+    streams.dedup();
+    let tid_of = |raw: u64| streams.iter().position(|&s| s == raw).unwrap_or(0) + 1;
+
+    let mut out = String::with_capacity(1 << 20);
+    out.push('[');
+    out.push_str(r#"{"name":"process_name","ph":"M","pid":0,"args":{"name":"host"}},"#);
+    out.push_str(r#"{"name":"process_name","ph":"M","pid":1,"args":{"name":"gpu"}}"#);
+    for (i, _) in streams.iter().enumerate() {
+        let _ = write!(
+            out,
+            r#",{{"name":"thread_name","ph":"M","pid":1,"tid":{},"args":{{"name":"stream {}"}}}}"#,
+            i + 1,
+            i + 1
+        );
+    }
+    for s in host_spans {
+        let _ = write!(
+            out,
+            r#",{{"name":"{}","ph":"X","pid":0,"tid":0,"ts":{:.1},"dur":{:.1}}}"#,
+            s.label,
+            us(s.start_ns),
+            s.wall.as_nanos() as f64 / 1e3
+        );
+    }
+    for s in &tl.spans {
+        let _ = write!(
+            out,
+            r#",{{"name":"{}","ph":"X","pid":1,"tid":{},"ts":{:.1},"dur":{:.1}}}"#,
+            s.label.replace('"', "'"),
+            tid_of(s.stream),
+            us(dev_base(s.start_ms)),
+            (s.end_ms - s.start_ms) * 1e3
+        );
+    }
+    out.push(']');
+    out
+}

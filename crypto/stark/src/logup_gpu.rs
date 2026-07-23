@@ -373,6 +373,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:logup_terms m{} n{trace_len}", main_cols.len());
     // main trace -> column-major u64. SAFETY: F == Goldilocks (repr(u64)).
     let num_cols = main_cols.len();
     desc.assert_columns_in_bounds(num_cols);
@@ -443,6 +444,7 @@ where
     }
 
     let num_cols = main_cols.len();
+    crate::nvtx_range!("gpu:logup_aux m{num_cols} n{trace_len}");
     desc.assert_columns_in_bounds(num_cols);
     // Reuse the resident main trace from the R1 main LDE (column-major
     // `[col*trace_len + row]`, same column order as `main_cols`) when it matches

@@ -64,12 +64,14 @@ impl FriCommitState {
     /// initial inv_twiddles (base field, n0/2 u64). `n0` must be a power of
     /// two and >= 2.
     pub fn new(evals_host: &[u64], inv_tw_host: &[u64], n0: usize) -> Result<Self> {
+        crate::nvtx_range!("gpu:fri_commit_new");
         assert!(n0 >= 2 && n0.is_power_of_two());
         assert_eq!(evals_host.len(), 3 * n0);
         assert_eq!(inv_tw_host.len(), n0 / 2);
 
         let be = backend()?;
         let stream = be.next_stream();
+        crate::gpu_span!(&stream, "gpu:fri_commit_new");
 
         // SAFETY: every byte of evals_a is overwritten by the H2D below.
         // evals_b is written by the first fold before it is read.
@@ -99,10 +101,13 @@ impl FriCommitState {
         &mut self,
         zeta_raw: [u64; 3],
     ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree)> {
+        crate::nvtx_range!("gpu:fri_fold_and_commit_layer");
+        crate::gpu_span!(&self.stream, "gpu:fri_layer");
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;
         let n_in = self.current_n;
+        crate::nvtx_range!("fri_layer:{}", n_in);
         let n_out = n_in / 2;
         // n_out == 1 (terminal_len < 2) never reaches this path: `try_fri_commit_gpu`
         // filters it out and returns None so the CPU fallback handles it.
@@ -116,7 +121,10 @@ impl FriCommitState {
         let tight_total_nodes = 2 * num_leaves - 1;
 
         // H2D zeta.
-        let zeta_dev = self.stream.clone_htod(&zeta_raw)?;
+        let zeta_dev = {
+            crate::nvtx_range!("h2d");
+            self.stream.clone_htod(&zeta_raw)?
+        };
 
         let cfg = LaunchConfig {
             grid_dim: ((n_out as u32).div_ceil(128), 1, 1),
@@ -135,6 +143,7 @@ impl FriCommitState {
             (&self.evals_b, &mut self.evals_a)
         };
         unsafe {
+            crate::nvtx_range!("fold");
             self.stream
                 .launch_builder(&be.fri_fold_ext3)
                 .arg(input_evals)
@@ -151,6 +160,7 @@ impl FriCommitState {
         let mut nodes_dev = unsafe { self.stream.alloc::<u8>(tight_total_nodes * 32) }?;
         let leaves_offset_bytes = (num_leaves - 1) * 32;
         {
+            crate::nvtx_range!("keccak_leaves");
             let mut leaves_view =
                 nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
             let num_leaves_u64 = num_leaves as u64;
@@ -176,7 +186,10 @@ impl FriCommitState {
                     .launch(kcfg)?;
             }
         }
-        build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        {
+            crate::nvtx_range!("tree_levels");
+            build_inner_tree_levels(self.stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        }
 
         // Update inv_twiddles for the next layer: `new[j] = old[2j]^2` for
         // j in 0..n_out/2. (If n_out == 1, skip; no next fold.) Writes into
@@ -184,6 +197,7 @@ impl FriCommitState {
         // version had (thread j reads old[2j] while thread 2j writes old[2j]).
         let tw_next = n_out / 2;
         if tw_next > 0 {
+            crate::nvtx_range!("tw_update");
             let mut tw_out = unsafe { self.stream.alloc::<u64>(tw_next) }?;
             let grid = (tw_next as u32).div_ceil(128);
             let cfg = LaunchConfig {
@@ -204,23 +218,43 @@ impl FriCommitState {
         }
 
         // Sync and D2H.
-        self.stream.synchronize()?;
+        {
+            crate::nvtx_range!("sync");
+            crate::timing::timed_sync(&self.stream, "gpu:fri_layer")?;
+        }
 
-        // Layer evals: 3 * n_out u64 from the output buffer.
-        let layer_evals: Vec<u64> = if self.a_is_input {
-            let view = self.evals_b.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
-        } else {
-            let view = self.evals_a.slice(0..3 * n_out);
-            self.stream.clone_dtoh(&view)?
+        // Layer evals: 3 * n_out u64 from the output buffer, staged through
+        // the per-worker pinned slab (async DMA) instead of a blocking
+        // pageable copy. The wait is deferred past the root copy below.
+        let n_evals = 3 * n_out;
+        let pending = {
+            crate::nvtx_range!("d2h");
+            let output_evals: &CudaSlice<u64> = if self.a_is_input {
+                &self.evals_b
+            } else {
+                &self.evals_a
+            };
+            crate::device::async_dtoh_via(
+                &self.stream,
+                be.pinned_staging(),
+                &be.ctx,
+                output_evals,
+                n_evals,
+            )?
         };
 
         // Keep the layer tree resident on device; copy only the 32-byte root so
         // R4 query openings gather paths on device instead of copying the tree.
+        // This pageable copy drains the stream (including the evals DMA above),
+        // so the pending wait after it is instant — one block covers both.
         let mut root = [0u8; 32];
-        self.stream
-            .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
-        self.stream.synchronize()?;
+        {
+            crate::nvtx_range!("d2h");
+            self.stream
+                .memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+        }
+        let mut layer_evals = vec![0u64; n_evals];
+        pending.wait_into_u64(&mut layer_evals)?;
 
         self.a_is_input = !self.a_is_input;
         self.current_n = n_out;

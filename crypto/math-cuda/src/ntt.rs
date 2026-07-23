@@ -48,6 +48,7 @@ fn powers_of(base: u64, count: usize) -> Vec<u64> {
 /// Forward NTT on a slice of `n = 2^log_n` Goldilocks coefficients. Takes
 /// natural-order input and returns natural-order evaluations.
 pub fn forward(coeffs: &[u64]) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:ntt_forward");
     ntt_inplace(coeffs, /*forward=*/ true)
 }
 
@@ -55,6 +56,7 @@ pub fn forward(coeffs: &[u64]) -> Result<Vec<u64>> {
 /// natural-order evaluations and returns natural-order coefficients. Includes
 /// the 1/n scaling.
 pub fn inverse(evals: &[u64]) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:ntt_inverse");
     ntt_inplace(evals, /*forward=*/ false)
 }
 
@@ -75,24 +77,38 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(
+        &stream,
+        "gpu:ntt_{}",
+        if forward { "forward" } else { "inverse" }
+    );
 
-    let mut x_dev = stream.clone_htod(input)?;
-    let tw_dev = if forward {
-        be.fwd_twiddles_for(log_n)?
-    } else {
-        be.inv_twiddles_for(log_n)?
+    let mut x_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(input)?
+    };
+    let tw_dev = {
+        crate::nvtx_range!("twiddles");
+        if forward {
+            be.fwd_twiddles_for(log_n)?
+        } else {
+            be.inv_twiddles_for(log_n)?
+        }
     };
 
     let n_u64 = n as u64;
 
     // 1. Bit-reverse: natural → bit-reversed.
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut x_dev)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    {
+        crate::nvtx_range!("bit_rev");
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute)
+                .arg(&mut x_dev)
+                .arg(&n_u64)
+                .arg(&log_n)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
     }
 
     // 2. DIT butterfly levels. For log_n >= 8 we fuse 8 levels per kernel via
@@ -114,8 +130,21 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
         }
     }
 
-    let out = stream.clone_dtoh(&x_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&x_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(
+            &stream,
+            if forward {
+                "gpu:ntt_forward"
+            } else {
+                "gpu:ntt_inverse"
+            },
+        )?;
+    }
     Ok(out)
 }
 
@@ -128,6 +157,7 @@ pub(crate) fn run_ntt_body(
     n: u64,
     log_n: u64,
 ) -> Result<()> {
+    crate::nvtx_range!("ntt");
     let be = backend()?;
     // Levels 0..min(log_n, 8): one shmem-fused launch. Loads are fully
     // coalesced (base_step=0 → `row = tid`) and 8 butterfly rounds stay on
@@ -189,6 +219,7 @@ pub(crate) fn run_ntt_body(
 
 /// Pointwise multiply: `x[i] *= w[i]`.
 pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:pointwise_mul");
     assert_eq!(x.len(), w.len());
     let n = x.len();
     if n == 0 {
@@ -196,6 +227,7 @@ pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
     }
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:pointwise_mul");
 
     let mut x_dev = stream.clone_htod(x)?;
     let w_dev = stream.clone_htod(w)?;
@@ -211,6 +243,6 @@ pub fn pointwise_mul(x: &[u64], w: &[u64]) -> Result<Vec<u64>> {
     }
 
     let out = stream.clone_dtoh(&x_dev)?;
-    stream.synchronize()?;
+    crate::timing::timed_sync(&stream, "gpu:pointwise_mul")?;
     Ok(out)
 }

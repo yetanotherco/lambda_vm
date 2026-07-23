@@ -14,6 +14,15 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use math_cuda::{CudaSlice, CudaStream};
 
+// External-profiler capture window (nsys -c cudaProfilerApi); re-exported so
+// the prover crate can bracket the proving section without a math-cuda dep.
+pub use math_cuda::profiling::{profiler_range_start, profiler_range_stop};
+
+// In-process GPU event timeline (feature `instruments` + LAMBDA_VM_GPU_TIMELINE=1);
+// re-exported so the prover can drain and report it without a math-cuda dep.
+#[cfg(feature = "instruments")]
+pub use math_cuda::timing::{DevSpan, GpuTimeline, drain_timeline as gpu_timeline_drain};
+
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::proof::Proof;
@@ -445,6 +454,7 @@ where
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
     let num_columns = columns.len();
+    crate::nvtx_range!("gpu:lde_batch_base x{num_columns}");
 
     // SAFETY: the `Run` arm of `check_base_layout::<F, E>` (matched above)
     // guarantees `E == GoldilocksField` and `F == GoldilocksField`.
@@ -512,6 +522,7 @@ where
         return None;
     }
     GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
+    crate::nvtx_range!("gpu:extend_halves_d2");
     // Weights are built from `g = domain.coset_offset` directly: the
     // CPU caller previously passed `g²` redundantly. See the
     // `g^(-k) / N` weight loop below.
@@ -608,6 +619,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:commit_row_major m{m} lde{lde_size}");
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
@@ -678,6 +690,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:commit_ext3_row_major m{m} lde{lde_size}");
     // Fp3 = [u64; 3] in memory — reinterpret as flat u64 slice (m3 = m*3).
     let m3 = m * 3;
     let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m3) };
@@ -743,6 +756,7 @@ where
         LayoutDispatch::Run { n, lde_size } => (n, lde_size),
     };
     let num_columns = columns.len();
+    crate::nvtx_range!("gpu:lde_batch_ext3 x{num_columns}");
 
     // SAFETY: layout-checked above.
     let raw_columns = unsafe { columns_to_u64_ext3::<E>(columns) };
@@ -918,6 +932,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:comp_poly_tree lde{lde_size}");
     // SAFETY: E == Ext3 per TypeId check. FieldElement<Ext3> backing is
     // `[FieldElement<Gl>; 3]`, layout-equivalent to `[u64; 3]`.
     let raw_parts: Vec<&[u64]> = lde_parts
@@ -988,6 +1003,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:bary_base m{num_cols}");
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<Gl> is
     // #[repr(transparent)] over u64.
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
@@ -1070,6 +1086,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:bary_ext3 m{num_cols}");
     let points_raw: &[u64] = unsafe { from_raw_parts(coset_points.as_ptr() as *const u64, n) };
 
     let sums_raw = match r3_ctx {
@@ -1186,6 +1203,7 @@ where
         return None;
     }
     let m = parts_coefs.len();
+    crate::nvtx_range!("gpu:parts_lde x{m} lde{lde_size}");
 
     let mut weights_u64 = Vec::with_capacity(domain_size);
     let mut w = FieldElement::<F>::one();
@@ -1273,6 +1291,7 @@ where
     {
         return None;
     }
+    crate::nvtx_range!("gpu:commit_ext3_resident m{}", ra.num_aux_cols);
     let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
 
     GPU_LDE_CALLS.fetch_add((ra.num_aux_cols * 3) as u64, Ordering::Relaxed);
@@ -1287,6 +1306,14 @@ where
         &weights_u64,
         retain_host_lde,
     )
+    .inspect_err(|e| {
+        // This path has no CPU fallback (the host aux trace is empty), so the
+        // caller hard-aborts; surface the swallowed driver error (e.g. OOM).
+        eprintln!(
+            "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
+            ra.num_rows, ra.num_aux_cols, blowup_factor
+        );
+    })
     .ok()?;
 
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1420,6 +1447,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:deep lde{lde_size}");
     // Pack host buffers. SAFETY for ext3 transmutes: E == Ext3 by TypeId check.
     let h_ood_raw: &[u64] = unsafe { ext3_slice_to_u64::<E>(h_ood) };
 
@@ -1582,6 +1610,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:inv_denoms n{n} k{k_scalars}");
     // SAFETY: F == Goldilocks per TypeId check; FieldElement<F> is
     // #[repr(transparent)] over u64.
     let coset_u64: &[u64] = unsafe { from_raw_parts(coset_base.as_ptr() as *const u64, n) };
@@ -1657,6 +1686,7 @@ pub(crate) fn gather_proofs_dev(
         positions.iter().all(|&p| p <= u32::MAX as usize),
         "gather_proofs_dev: position exceeds u32 range"
     );
+    crate::nvtx_range!("gpu:gather_proofs q{}", positions.len());
     let positions_u32: Vec<u32> = positions.iter().map(|&p| p as u32).collect();
     let bytes = math_cuda::merkle::gather_merkle_paths_dev(
         &tree.nodes,
@@ -1726,6 +1756,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:r3_prep n{n} k{k_scalars}");
     // Per-table session stream when provided (shares the queue with R4 DEEP for
     // this table); otherwise a pool stream.
     let stream = match bound_stream {
@@ -1807,6 +1838,7 @@ where
         return None;
     }
 
+    crate::nvtx_range!("gpu:fri_commit n{n0}");
     // Pre-compute inv_twiddles on CPU (matches commit_phase_from_evaluations)
     // and pack to u64 before any transcript mutation, so on H2D / state
     // construction failure the caller's transcript is untouched.
@@ -1852,7 +1884,8 @@ where
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
         Vec::with_capacity(num_committed);
 
-    for _ in 0..num_committed {
+    for _layer_idx in 0..num_committed {
+        crate::nvtx_range!("fri_layer:{_layer_idx}");
         // <<<< Receive challenge zeta_k
         let zeta: FieldElement<E> = transcript.sample_field_element();
         // SAFETY: E == Ext3.
@@ -1950,6 +1983,7 @@ where
     if !first_resident {
         return None;
     }
+    crate::nvtx_range!("gpu:fri_query q{}", iotas.len());
     let stream = math_cuda::device::backend()
         .expect("cuda backend for device-resident FRI query")
         .next_stream();

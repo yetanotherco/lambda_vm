@@ -41,8 +41,10 @@ pub fn deep_composition_ext3(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:deep_composition_ext3");
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:deep_composition_ext3");
     deep_composition_ext3_impl(
         &stream,
         main_lde,
@@ -86,8 +88,10 @@ pub fn deep_composition_ext3_with_dev_parts(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:deep_composition_ext3_dev_parts");
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:deep_composition_ext3_dev_parts");
     deep_composition_ext3_impl(
         &stream,
         main_lde,
@@ -138,6 +142,13 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:deep_composition_ext3_dev_parts_inv");
+    crate::gpu_span!(stream, "gpu:deep_composition_ext3_dev_parts_inv");
+    main_lde.wait_ready_on(stream)?;
+    if let Some(aux) = aux_lde {
+        aux.wait_ready_on(stream)?;
+    }
+    h_parts_dev.wait_ready_on(stream)?;
     assert_eq!(main_lde.m, num_main);
     assert_eq!(h_parts_dev.m, num_parts);
     assert_eq!(h_parts_dev.lde_size, main_lde.lde_size);
@@ -175,10 +186,15 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     let be = backend()?;
 
     // H2D only the small scalars on the caller's stream.
-    let h_ood_dev = stream.clone_htod(h_ood)?;
-    let trace_ood_dev = stream.clone_htod(trace_ood)?;
-    let gammas_h_dev = stream.clone_htod(gammas_h)?;
-    let gammas_tr_dev = stream.clone_htod(gammas_tr)?;
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(h_ood)?,
+            stream.clone_htod(trace_ood)?,
+            stream.clone_htod(gammas_h)?,
+            stream.clone_htod(gammas_tr)?,
+        )
+    };
 
     // Slice the inv_denoms buffer into the H-term and trace-term views.
     let inv_h_view = inv_denoms_dev.slice(0..ext3_size);
@@ -210,6 +226,7 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.deep_composition_ext3_row)
             .arg(main_lde.buf.as_ref())
@@ -232,8 +249,26 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&deep_out)?;
-    stream.synchronize()?;
+    // DEEP output (domain_size * 3 u64s, ~50 MB): async D2H through the
+    // per-worker pinned slab instead of a blocking pageable copy. The
+    // labelled sync keeps its host-block measurement (now covering the
+    // kernels plus the DMA); the pending wait after it is instant.
+    let pending = {
+        crate::nvtx_range!("d2h");
+        crate::device::async_dtoh_via(
+            stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &deep_out,
+            domain_size * 3,
+        )?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:deep_composition_ext3_dev_parts_inv")?;
+    }
+    let mut out = vec![0u64; domain_size * 3];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
 }
 
@@ -257,6 +292,13 @@ fn deep_composition_ext3_impl(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    main_lde.wait_ready_on(stream)?;
+    if let Some(aux) = aux_lde {
+        aux.wait_ready_on(stream)?;
+    }
+    if let Some(parts) = h_parts_dev {
+        parts.wait_ready_on(stream)?;
+    }
     assert_eq!(main_lde.m, num_main);
     if let Some(a) = aux_lde {
         assert_eq!(a.m, num_aux);
@@ -293,12 +335,17 @@ fn deep_composition_ext3_impl(
 
     let be = backend()?;
 
-    let h_ood_dev = stream.clone_htod(h_ood)?;
-    let trace_ood_dev = stream.clone_htod(trace_ood)?;
-    let gammas_h_dev = stream.clone_htod(gammas_h)?;
-    let gammas_tr_dev = stream.clone_htod(gammas_tr)?;
-    let inv_h_dev = stream.clone_htod(inv_h)?;
-    let inv_t_dev = stream.clone_htod(inv_t)?;
+    let (h_ood_dev, trace_ood_dev, gammas_h_dev, gammas_tr_dev, inv_h_dev, inv_t_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(h_ood)?,
+            stream.clone_htod(trace_ood)?,
+            stream.clone_htod(gammas_h)?,
+            stream.clone_htod(gammas_tr)?,
+            stream.clone_htod(inv_h)?,
+            stream.clone_htod(inv_t)?,
+        )
+    };
 
     let h_lde_host_dev;
     let dummy_aux;
@@ -317,6 +364,7 @@ fn deep_composition_ext3_impl(
     let h_lde_slice = if let Some(h) = h_parts_dev {
         h.buf.as_ref()
     } else {
+        crate::nvtx_range!("h2d");
         h_lde_host_dev = stream.clone_htod(h_parts_host)?;
         &h_lde_host_dev
     };
@@ -336,6 +384,7 @@ fn deep_composition_ext3_impl(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.deep_composition_ext3_row)
             .arg(main_lde.buf.as_ref())
@@ -358,7 +407,25 @@ fn deep_composition_ext3_impl(
             .launch(cfg)?;
     }
 
-    let out = stream.clone_dtoh(&deep_out)?;
-    stream.synchronize()?;
+    // DEEP output (domain_size * 3 u64s, ~50 MB): async D2H through the
+    // per-worker pinned slab instead of a blocking pageable copy. The
+    // labelled sync keeps its host-block measurement (now covering the
+    // kernels plus the DMA); the pending wait after it is instant.
+    let pending = {
+        crate::nvtx_range!("d2h");
+        crate::device::async_dtoh_via(
+            stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &deep_out,
+            domain_size * 3,
+        )?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:deep_composition_ext3")?;
+    }
+    let mut out = vec![0u64; domain_size * 3];
+    pending.wait_into_u64(&mut out)?;
     Ok(out)
 }

@@ -31,10 +31,20 @@ cudarc = { version = "0.19", default-features = false, features = [
 math = { path = "../math" }
 rayon = "1.7"
 
+# NVTX ranges for nsys timelines — vendors the NVTX3 headers (header-only C),
+# builds with plain `cc`, no CUDA toolkit needed. No-op unless a profiler is
+# attached, so the ranges cost ~ns in normal runs.
+nvtx = { version = "1.3", optional = true }
+
 [features]
 # Test-only fault injection in FriCommitState. Production builds leave this
 # off so the fault check is fully elided at compile time.
 test-faults = []
+# NVTX phase ranges for profiling with Nsight Systems (see docs/gpu_profiling.md).
+nvtx = ["dep:nvtx"]
+# In-process GPU phase timing via CUDA events (crate::gpu_span!). Collection is
+# additionally gated at runtime by LAMBDA_VM_GPU_TIMELINE=1.
+instruments = []
 
 [dev-dependencies]
 crypto = { path = "../crypto" }

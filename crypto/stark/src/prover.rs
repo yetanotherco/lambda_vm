@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
@@ -139,18 +139,20 @@ where
         }
     }
 
-    /// Build a `TableCommit` for a preprocessed table.
+    /// Build a `TableCommit` for a preprocessed table. The precomputed tree
+    /// arrives as an `Arc` because it may be shared from the process-wide
+    /// cache (see [`precomputed_tree_cache_get`]).
     fn preprocessed(
         tree: BatchedMerkleTree<F>,
         root: Commitment,
-        precomputed_tree: BatchedMerkleTree<F>,
+        precomputed_tree: Arc<BatchedMerkleTree<F>>,
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
         Self {
             tree: Arc::new(tree),
             root,
-            precomputed_tree: Some(Arc::new(precomputed_tree)),
+            precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
         }
@@ -170,6 +172,47 @@ where
     fn is_preprocessed(&self) -> bool {
         self.precomputed_tree.is_some()
     }
+}
+
+/// Process-wide cache of precomputed-column Merkle trees, keyed by their
+/// commitment root. The root fully determines the tree (column content,
+/// domain, blowup and leaf layout all feed the hash), so a hit needs no
+/// re-verification: the lookup key IS the root a rebuild would be checked
+/// against. This is what makes continuation epochs stop re-committing the
+/// same DECODE/BITWISE/range tables once per epoch — those trees are
+/// execution-independent; only the multiplicity columns change per run.
+/// Type-erased so one static serves every field instantiation.
+fn precomputed_tree_cache()
+-> &'static Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn precomputed_tree_cache_get<F: IsField + 'static>(
+    root: &Commitment,
+) -> Option<Arc<BatchedMerkleTree<F>>>
+where
+    FieldElement<F>: AsBytes,
+{
+    let cache = precomputed_tree_cache().lock().unwrap();
+    cache
+        .get(root)
+        .cloned()
+        .and_then(|any| any.downcast::<BatchedMerkleTree<F>>().ok())
+}
+
+fn precomputed_tree_cache_put<F: IsField + 'static>(
+    root: Commitment,
+    tree: Arc<BatchedMerkleTree<F>>,
+) where
+    FieldElement<F>: AsBytes,
+{
+    precomputed_tree_cache()
+        .lock()
+        .unwrap()
+        .insert(root, tree as Arc<dyn std::any::Any + Send + Sync>);
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
@@ -936,15 +979,47 @@ pub trait IsStarkProver<
                 TableCommit::plain(tree, root)
             }
             Some((expected_precomputed_root, num_precomputed)) => {
-                #[allow(unused_mut)]
-                let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_rows_bit_reversed_subset(
-                        &main_data,
-                        total_cols,
-                        0,
-                        num_precomputed,
-                    )
-                    .ok_or(ProvingError::EmptyCommitment)?;
+                // Only the multiplicity columns depend on the execution; the
+                // precomputed-columns tree is a pure function of (content,
+                // domain) already pinned by `expected_precomputed_root`, so it
+                // is reused from the process cache when this exact commitment
+                // was built before — across epochs and across proves. Bypassed
+                // in disk-spill Disk mode, where trees are spilled (mutated).
+                #[cfg(feature = "disk-spill")]
+                let cache_ok = storage_mode != StorageMode::Disk;
+                #[cfg(not(feature = "disk-spill"))]
+                let cache_ok = true;
+                let precomputed_tree = match cache_ok
+                    .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                    .flatten()
+                {
+                    // Cache key == the root a rebuild would be verified
+                    // against, so a hit needs no re-check.
+                    Some(tree) => tree,
+                    None => {
+                        #[allow(unused_mut)]
+                        let (mut tree, root) = Self::commit_rows_bit_reversed_subset(
+                            &main_data,
+                            total_cols,
+                            0,
+                            num_precomputed,
+                        )
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                        if root != expected_precomputed_root {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
+                        let tree = Arc::new(tree);
+                        if cache_ok {
+                            precomputed_tree_cache_put::<Field>(
+                                expected_precomputed_root,
+                                Arc::clone(&tree),
+                            );
+                        }
+                        tree
+                    }
+                };
                 #[allow(unused_mut)]
                 let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
                     &main_data,
@@ -953,23 +1028,13 @@ pub trait IsStarkProver<
                     total_cols,
                 )
                 .ok_or(ProvingError::EmptyCommitment)?;
-                if precomputed_root != expected_precomputed_root {
-                    return Err(ProvingError::PrecomputedCommitmentMismatch);
-                }
                 #[cfg(feature = "disk-spill")]
-                {
-                    Self::spill_tree(
-                        &mut precomputed_tree,
-                        storage_mode,
-                        "precomputed Merkle tree",
-                    )?;
-                    Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
-                }
+                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 TableCommit::preprocessed(
                     mult_tree,
                     mult_root,
                     precomputed_tree,
-                    precomputed_root,
+                    expected_precomputed_root,
                     num_precomputed,
                 )
             }
@@ -2406,6 +2471,13 @@ pub trait IsStarkProver<
         #[cfg(not(feature = "cuda"))]
         let vram_budget = u64::MAX;
 
+        // NOTE: an earlier revision published prove-wide pinned-staging size
+        // hints here (`set_staging_size_hints`) so slabs allocated once at
+        // final size. Measured on a 5090 it BACKFIRED: every worker slot then
+        // pays a max-size cuMemHostAlloc (~160ms avg, 7.5s total vs 4.2s of
+        // ladder churn), and those allocations convoy the driver lock. Left
+        // out until a shared-slab design bounds the number of allocations.
+
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.
         let main_chunks = {
@@ -2467,6 +2539,7 @@ pub trait IsStarkProver<
             let chunk_results: Vec<Result<_, ProvingError>> =
                 crate::par::par_map_collect(chunk_range, |idx| {
                     let (air, trace, _) = &air_trace_pairs[idx];
+                    crate::nvtx_range!("r1_main:{}", air.name());
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
@@ -2576,6 +2649,7 @@ pub trait IsStarkProver<
         let aux_iter = air_trace_pairs.iter_mut();
         let bus_inputs_vec: Vec<Option<BusPublicInputs<FieldExtension>>> = aux_iter
             .map(|(air, trace, _)| {
+                crate::nvtx_range!("r1_aux_build:{}", air.name());
                 if air.has_aux_trace() {
                     air.build_auxiliary_trace(*trace, &lookup_challenges)
                 } else {
@@ -2683,6 +2757,7 @@ pub trait IsStarkProver<
             let chunk_aux: Vec<Result<AuxResult<FieldExtension>, ProvingError>> =
                 crate::par::par_map_collect(chunk_range, |idx| {
                     let (air, trace, _) = &air_trace_pairs[idx];
+                    crate::nvtx_range!("r1_aux_commit:{}", air.name());
                     let domain = &domains[idx];
                     let twiddles = &twiddle_caches[idx];
 
@@ -2942,6 +3017,7 @@ pub trait IsStarkProver<
                     let idx = chunk_start + j;
                     let (air, trace, pub_inputs) = &air_trace_pairs[idx];
                     let _ = trace; // used by instruments
+                    crate::nvtx_range!("r2to4:{}", air.name());
                     let domain = &domains[idx];
 
                     #[cfg(feature = "instruments")]
@@ -3064,6 +3140,12 @@ pub trait IsStarkProver<
         // ==========|   Round 2   |==========
         // ===================================
 
+        #[cfg(feature = "nvtx")]
+        let __nvtx_r2 = {
+            nvtx::range_push!("round2");
+            crate::instruments::NvtxPopGuard
+        };
+
         // <<<< Receive challenge: 𝛽
         let beta = transcript.sample_field_element();
         let trace_length = domain.interpolation_domain_size;
@@ -3101,9 +3183,18 @@ pub trait IsStarkProver<
         // >>>> Send commitments: [H₁], [H₂]
         transcript.append_bytes(&round_2_result.composition_poly_root);
 
+        #[cfg(feature = "nvtx")]
+        drop(__nvtx_r2);
+
         // ===================================
         // ==========|   Round 3   |==========
         // ===================================
+
+        #[cfg(feature = "nvtx")]
+        let __nvtx_r3 = {
+            nvtx::range_push!("round3");
+            crate::instruments::NvtxPopGuard
+        };
 
         // <<<< Receive challenge: z
         let z = transcript.sample_z_ood(
@@ -3142,9 +3233,18 @@ pub trait IsStarkProver<
             transcript.append_field_element(element);
         }
 
+        #[cfg(feature = "nvtx")]
+        drop(__nvtx_r3);
+
         // ===================================
         // ==========|   Round 4   |==========
         // ===================================
+
+        #[cfg(feature = "nvtx")]
+        let __nvtx_r4 = {
+            nvtx::range_push!("round4");
+            crate::instruments::NvtxPopGuard
+        };
 
         // Part of this round is running FRI, which is an interactive
         // protocol on its own. Therefore we pass it the transcript
@@ -3158,6 +3258,9 @@ pub trait IsStarkProver<
             &z,
             transcript,
         );
+
+        #[cfg(feature = "nvtx")]
+        drop(__nvtx_r4);
 
         #[cfg(feature = "instruments")]
         {

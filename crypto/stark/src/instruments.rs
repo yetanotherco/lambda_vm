@@ -36,6 +36,18 @@ thread_local! {
     static SPAN_DEPTH: std::cell::Cell<u16> = const { std::cell::Cell::new(0) };
 }
 
+/// Ends the current thread's innermost NVTX range on drop. Created by
+/// [`crate::nvtx_range!`]; not meant to be used directly.
+#[cfg(feature = "nvtx")]
+pub struct NvtxPopGuard;
+
+#[cfg(feature = "nvtx")]
+impl Drop for NvtxPopGuard {
+    fn drop(&mut self) {
+        nvtx::range_pop!();
+    }
+}
+
 #[must_use]
 pub struct SpanGuard {
     label: &'static str,
@@ -57,6 +69,8 @@ pub fn span(label: &'static str) -> SpanGuard {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    #[cfg(feature = "nvtx")]
+    nvtx::range_push!("{}", label);
     SpanGuard {
         label,
         depth,
@@ -69,6 +83,8 @@ pub fn span(label: &'static str) -> SpanGuard {
 impl Drop for SpanGuard {
     fn drop(&mut self) {
         let wall = self.start.elapsed();
+        #[cfg(feature = "nvtx")]
+        nvtx::range_pop!();
         SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         if let Ok(mut t) = TIMELINE.lock() {
             t.push(SpanRecord {

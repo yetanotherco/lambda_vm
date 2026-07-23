@@ -29,6 +29,7 @@ pub fn barycentric_base(
     n: usize,
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_base");
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * col_stride);
@@ -44,10 +45,16 @@ pub fn barycentric_base(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:barycentric_base");
 
-    let cols_dev = stream.clone_htod(&columns[..num_cols * col_stride])?;
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (cols_dev, points_dev, inv_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(&columns[..num_cols * col_stride])?,
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -58,6 +65,7 @@ pub fn barycentric_base(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_base_batched)
             .arg(&cols_dev)
@@ -68,8 +76,14 @@ pub fn barycentric_base(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:barycentric_base")?;
+    }
     Ok(out)
 }
 
@@ -84,6 +98,7 @@ pub fn barycentric_ext3(
     n: usize,
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_ext3");
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * 3 * col_stride);
@@ -99,10 +114,16 @@ pub fn barycentric_ext3(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:barycentric_ext3");
 
-    let cols_dev = stream.clone_htod(&columns[..num_cols * 3 * col_stride])?;
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (cols_dev, points_dev, inv_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(&columns[..num_cols * 3 * col_stride])?,
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -113,6 +134,7 @@ pub fn barycentric_ext3(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_ext3_batched)
             .arg(&cols_dev)
@@ -123,8 +145,14 @@ pub fn barycentric_ext3(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:barycentric_ext3")?;
+    }
     Ok(out)
 }
 
@@ -139,6 +167,7 @@ pub fn barycentric_base_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_base_on_device");
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = main_handle.m;
@@ -149,9 +178,16 @@ pub fn barycentric_base_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:barycentric_base_on_device");
+    main_handle.wait_ready_on(&stream)?;
 
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (points_dev, inv_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -163,6 +199,7 @@ pub fn barycentric_base_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_base_batched_strided)
             .arg(main_handle.buf.as_ref())
@@ -174,8 +211,14 @@ pub fn barycentric_base_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:barycentric_base_on_device")?;
+    }
     Ok(out)
 }
 
@@ -197,6 +240,9 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_base_dev_inv_denoms");
+    crate::gpu_span!(stream, "gpu:barycentric_base_dev_inv_denoms");
+    main_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -222,6 +268,7 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_base_batched_strided)
             .arg(main_handle.buf.as_ref())
@@ -233,8 +280,14 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:barycentric_base_dev_inv_denoms")?;
+    }
     Ok(out)
 }
 
@@ -247,6 +300,7 @@ pub fn barycentric_ext3_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_ext3_on_device");
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = aux_handle.m;
@@ -257,9 +311,16 @@ pub fn barycentric_ext3_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    crate::gpu_span!(&stream, "gpu:barycentric_ext3_on_device");
+    aux_handle.wait_ready_on(&stream)?;
 
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (points_dev, inv_dev) = {
+        crate::nvtx_range!("h2d");
+        (
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -271,6 +332,7 @@ pub fn barycentric_ext3_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_ext3_batched_strided)
             .arg(aux_handle.buf.as_ref())
@@ -282,8 +344,14 @@ pub fn barycentric_ext3_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(&stream, "gpu:barycentric_ext3_on_device")?;
+    }
     Ok(out)
 }
 
@@ -297,6 +365,9 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:barycentric_ext3_dev_inv_denoms");
+    crate::gpu_span!(stream, "gpu:barycentric_ext3_dev_inv_denoms");
+    aux_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -322,6 +393,7 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("eval");
         stream
             .launch_builder(&be.barycentric_ext3_batched_strided)
             .arg(aux_handle.buf.as_ref())
@@ -333,8 +405,14 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out_dev)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:barycentric_ext3_dev_inv_denoms")?;
+    }
     Ok(out)
 }
 
@@ -347,12 +425,18 @@ pub fn gather_rows_base_on_device(
     rows: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:gather_rows_base");
+    crate::gpu_span!(stream, "gpu:gather_rows_base");
+    main.wait_ready_on(stream)?;
     let num_cols = main.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());
     }
     let be = backend()?;
-    let rows_dev = stream.clone_htod(rows)?;
+    let rows_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(rows)?
+    };
     let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols)?;
     let col_stride = main.lde_size as u64;
     let num_cols_u64 = num_cols as u64;
@@ -363,6 +447,7 @@ pub fn gather_rows_base_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("gather");
         stream
             .launch_builder(&be.gather_rows_base)
             .arg(main.buf.as_ref())
@@ -373,8 +458,14 @@ pub fn gather_rows_base_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    let host = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:gather_rows_base")?;
+    }
     Ok(host)
 }
 
@@ -385,12 +476,18 @@ pub fn gather_rows_ext3_on_device(
     rows: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
+    crate::nvtx_range!("gpu:gather_rows_ext3");
+    crate::gpu_span!(stream, "gpu:gather_rows_ext3");
+    aux.wait_ready_on(stream)?;
     let num_cols = aux.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());
     }
     let be = backend()?;
-    let rows_dev = stream.clone_htod(rows)?;
+    let rows_dev = {
+        crate::nvtx_range!("h2d");
+        stream.clone_htod(rows)?
+    };
     let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols * 3)?;
     let col_stride = aux.lde_size as u64;
     let num_cols_u64 = num_cols as u64;
@@ -401,6 +498,7 @@ pub fn gather_rows_ext3_on_device(
         shared_mem_bytes: 0,
     };
     unsafe {
+        crate::nvtx_range!("gather");
         stream
             .launch_builder(&be.gather_rows_ext3)
             .arg(aux.buf.as_ref())
@@ -411,7 +509,13 @@ pub fn gather_rows_ext3_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    let host = {
+        crate::nvtx_range!("d2h");
+        stream.clone_dtoh(&out)?
+    };
+    {
+        crate::nvtx_range!("sync");
+        crate::timing::timed_sync(stream, "gpu:gather_rows_ext3")?;
+    }
     Ok(host)
 }
