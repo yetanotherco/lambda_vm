@@ -24,6 +24,12 @@ and are therefore handled simultaneously.
 #footnote[
   While RAM is byte addressed, we do choose to store registers as a `DWordWL` over two word addresses.
 ]
+In particular, our memory addressing scheme will consist of two parts: a domain separator, and an address within the domain.
+For specific domains and domain separators, we use the following assignment.
+
+/ RAM memory: $0$
+/ Registers: $1$
+/ Committed values: $2$
 
 On a high level, we ensure memory consistency by an interacting system of
 reads and writes to a lookup argument, combined with an initialization and finalization scheme.
@@ -64,7 +70,7 @@ The $i$th possible memory access in cycle $c$ will obtain as timestamp the value
 For simplicity, we will always reserve a timestamp for every possible memory access, and leave the timestamp unused if an instruction does not use it.
 
 
-#aside[Note on "simultaneous" memory accesses][
+#aside(ref: <memory:aside:granularity>)[Note on "simultaneous" memory accesses][
   For reasons of completeness (since temporal integrity as discussed below is a security necessity),
   we cannot deal with multiple accesses to the same address at identical timestamps.
   However, if multiple accesses are guaranteed to be independent (that is, to different addresses), they can still share a timestamp
@@ -105,7 +111,7 @@ to have a strictly greater timestamp than the consumed token.
 This raises the question of how to represent timestamps and cleanly perform this check,
 as over a finite field the “less than” relation is ill-defined
 (though it is common and natural to consider it as the less than relation over the natural lift of the field into the integers).
-We choose to represent timestamps as machine words, using the existing `LT` chip (@lt) functionality for comparisons.
+We choose to represent timestamps as 32-bit words, using the existing `LT` chip (@lt) functionality for comparisons.
 The full implementation of the timestamp system can be seen in the `timestamp` column of the `CPU` (@cpu) and `MEMW` chips (@memw).
 The `CPU` merely passes in the current timestamp, while `MEMW` can recall the previously written timestamp and constrain the correct sequencing.
 
@@ -153,25 +159,8 @@ This table then feeds into the LogUp system in the normal way,
 emitting the initial tokens for all addresses in a page, without consuming any tokens.
 Since the `offset` column is always the same, it can be reused across all paged initialization and finalization tables.
 
-Concretely, each page gets an associated `PAGE` table, consisting of #total_nr_variables(chip) variables
-over #total_nr_instantiated_columns(chip, config) columns.
-For each such table, the `page` variable is instantiated as the constant base address of the page.
-The `offset` column is preprocessed, which helps the verifier ensure that each page has a single fixed size,
-but the verifier should still check that no pages overlap and all `page` values are page-aligned.
-
-== Page initialization
-
-#rj[check whether we need `fini` to be range-checked]
-We present here a set of constraints on the `PAGE` table that
-
-+ enforces the initial and final values of each address are bytes
-+ adds the initial and final interaction to the LogUp argument
-
-For zero-initialized pages, `init` can be a constant `0`,
-and hence doesn't need a column, nor a range check.
-
-#render_chip_variable_table(chip, config)
-#render_constraint_table(chip, config)
+Due to its interaction with the epoch-based proving system from @streaming,
+we defer a concrete instantiation and description of this scheme as an AIR table until then.
 
 
 #aside[Note on alternatives and trade-offs][
@@ -228,4 +217,3 @@ add the required balancing terms to the LogUp sum.
 = Future topics of interest
 
 - Optimize memory systems after determining factual bottlenecks (e.g. taking inspiration from Twist and Shout, or other recent research)
-- Double check whether IS_BYTE constraints are needed for fini

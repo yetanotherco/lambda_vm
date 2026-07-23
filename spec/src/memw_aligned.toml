@@ -23,7 +23,7 @@ pad = 0
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp at which this memory access is said to occur"
 pad = 0
 
@@ -58,7 +58,7 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "old_timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp at which the address was last accessed"
 pad = 0
 
@@ -116,8 +116,7 @@ desc = "`IS_BIT<write8>`"
 desc = "`IS_BIT<write2 + write4 + write8>`"
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 
 [[constraint_groups]]
 name = "assumptions"
@@ -174,7 +173,7 @@ poly = ["*", "w2", ["not", "μ_sum"]]
 [[constraints.consistency]]
 kind = "interaction"
 tag = "ALU"
-input = ["old_timestamp", "timestamp", ["opsel", "LT"]]
+input = [["arr", "old_timestamp", 0], ["arr", "timestamp", 0], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 multiplicity = "μ_sum"
 

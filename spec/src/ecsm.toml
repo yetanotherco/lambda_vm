@@ -2,7 +2,7 @@ name = "ECSM"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "timestamp at which this operation is executed"
 pad = 0
 
@@ -489,7 +489,7 @@ input = [
     1, 
     ["cast", ["*", 2, 12], "DWordWL"],
     ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    ["+", "timestamp", ["cast", 1, "DWordWL"]],
+    ["+", "timestamp", 1],
     1, 0, 0]
 output = ["arr", ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_k", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
@@ -535,7 +535,7 @@ input = [
         ["idx", "byte_k", ["+", ["*", 8, "i"], 6]],
         ["idx", "byte_k", ["+", ["*", 8, "i"], 7]],
     ],
-    ["+", "timestamp", ["cast", 1, "DWordWL"]],
+    ["+", "timestamp", 1],
     0, 0, 1
 ]
 output = ["arr",
@@ -655,7 +655,7 @@ input = [
     1, 
     ["cast", ["*", 2, 10], "DWordWL"],
     ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0],
-    ["+", "timestamp", ["cast", 2, "DWordWL"]],
+    ["+", "timestamp", 2],
     1, 0, 0]
 output = ["arr", ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 0], ["idx", ["cast", ["idx", "addr_xR", 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
 multiplicity = "μ"
@@ -694,7 +694,7 @@ input = [
         ["idx", "xR", ["+", ["*", 8, "i"], 6]],
         ["idx", "xR", ["+", ["*", 8, "i"], 7]],
     ],
-    ["+", "timestamp", ["cast", 2, "DWordWL"]],
+    ["+", "timestamp", 2],
     0, 0, 1
 ]
 iter = ["i", 0, 3]

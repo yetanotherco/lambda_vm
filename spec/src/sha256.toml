@@ -3,7 +3,7 @@ code = "SHA"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "Timestamp at which the ECALL is invoked. Used as unique identifier for this invocation."
 pad = 0
 
@@ -136,7 +136,7 @@ input = [
       ["idx", "out", ["+", ["*", 8, "i"], 6]],
       ["idx", "out", ["+", ["*", 8, "i"], 5]],
       ["idx", "out", ["+", ["*", 8, "i"], 4]]],
-  ["+", "timestamp", ["cast", 1, "DWordWL"]],
+  ["+", "timestamp", 1],
   0, 0, 1
 ]
 output = ["arr",

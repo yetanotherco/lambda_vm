@@ -3,7 +3,7 @@ code = "SHD"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp/identifier for this execution of the round function"
 pad = 0
 

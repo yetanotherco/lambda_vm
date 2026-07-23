@@ -23,7 +23,7 @@ pad = 0
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp at which this memory access occurs"
 pad = 0
 
@@ -64,7 +64,7 @@ pad = 0
 
 [[variables.auxiliary]]
 name = "old_timestamp"
-type = ["DWordWL", 8]
+type = ["Word", 8]
 desc = "The timestamp at which address `base_address + i` was last accessed"
 pad = 0
 
@@ -128,8 +128,7 @@ desc = "`IS_BIT<write8>`"
 desc = "`IS_BIT<write2 + write4 + write8>`"
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 
 [[constraint_groups]]
 name = "assumptions"
@@ -186,21 +185,21 @@ iter = ["i", 0, 6]
 [[constraints.consistency]]
 kind = "interaction"
 tag = "ALU"
-input = [["idx", "old_timestamp", 0], "timestamp", ["opsel", "LT"]]
+input = [["arr", ["idx", "old_timestamp", 0], 0], ["arr", "timestamp", 0], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 multiplicity = "μ_sum"
 
 [[constraints.consistency]]
 kind = "interaction"
 tag = "ALU"
-input = [["idx", "old_timestamp", 1], "timestamp", ["opsel", "LT"]]
+input = [["arr", ["idx", "old_timestamp", 1], 0], ["arr", "timestamp", 0], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 multiplicity = "w2"
 
 [[constraints.consistency]]
 kind = "interaction"
 tag = "ALU"
-input = [["idx", "old_timestamp", "i"], "timestamp", ["opsel", "LT"]]
+input = [["arr", ["idx", "old_timestamp", "i"], 0], ["arr", "timestamp", 0], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 iter = ["i", 2, 3]
 multiplicity = "w4"
@@ -208,7 +207,7 @@ multiplicity = "w4"
 [[constraints.consistency]]
 kind = "interaction"
 tag = "ALU"
-input = [["idx", "old_timestamp", "i"], "timestamp", ["opsel", "LT"]]
+input = [["arr", ["idx", "old_timestamp", "i"], 0], ["arr", "timestamp", 0], ["opsel", "LT"]]
 output = ["arr", 1, 0]
 iter = ["i", 4, 7]
 multiplicity = "write8"

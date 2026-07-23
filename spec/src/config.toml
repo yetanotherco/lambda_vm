@@ -166,8 +166,8 @@ desc = """\
 
 [[variables.types]]
 label = "Timestamp"
-subtypes = ["DWordWL"]
-desc = "A preprocessed column holding timestamps as `DWordWL`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip (@cpu), see there for more details about the magic number."
+subtypes = ["Word"]
+desc = "A preprocessed column holding timestamps as `Word`. Row `i` of the column contains the value $2^2 dot (i + 1)$. Used in the CPU chip (@cpu), see there for more details about the magic number."
 preprocessed = true
 
 [[variables.types]]

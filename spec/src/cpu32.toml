@@ -2,7 +2,7 @@ name = "CPU32"
 
 [[variables.input]]
 name = "timestamp"
-type = "DWordWL"
+type = "Word"
 desc = "The timestamp for the CPU row"
 pad = 0
 
@@ -171,8 +171,7 @@ desc = ""
 pad = 0
 
 [[assumptions]]
-desc = "`IS_WORD[timestamp[i]]`"
-iter = ["i", 0, 1]
+desc = "`IS_WORD[timestamp]`"
 
 [[assumptions]]
 desc = "`IS_WORD[pc[i]]`"
@@ -315,7 +314,7 @@ name = "mem"
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 0, "DWordWL"]], 1, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 0], 1, 0, 0]
 output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register1"
 
@@ -328,7 +327,7 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 1, "DWordWL"]], 1, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 1], 1, 0, 0]
 output = ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0]
 multiplicity = "read_register2"
 
@@ -341,7 +340,7 @@ iter = ["i", 0, 2]
 [[constraints.mem]]
 kind = "interaction"
 tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", ["cast", 2, "DWordWL"]], 1, 0, 0]
+input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 2], 1, 0, 0]
 multiplicity = "write_register"
 
 [[constraint_groups]]
