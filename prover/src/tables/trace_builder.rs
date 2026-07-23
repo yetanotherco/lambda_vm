@@ -2614,16 +2614,13 @@ fn generate_page_tables<I: ImageSource>(
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
     let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
-    // Build final state map from memory_state. When `exclude_touched` (continuation
-    // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
-    // cancels them (init == fini, ts == 0) and the local-to-global table owns their
-    // Memory-bus init/fini instead.
-    let final_state: FinalStateMap = memory_state
-        .cells
-        .iter()
-        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
-        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
-        .collect();
+    // The per-page final `(value, timestamp)` is read straight from the dense
+    // `memory_state.cells` store (one indexed read per offset) rather than routing
+    // through a sparse `FinalStateMap` whose per-page (mostly-miss) lookups dominated
+    // PAGE generation. `exclude_touched` (continuation epoch with L2G bookend) drops
+    // runtime-written cells (ts > 0) so PAGE self-cancels them (init == fini, ts == 0)
+    // and the local-to-global table owns their Memory-bus init/fini instead — applied
+    // per offset inside `generate_page_trace_from_dense`.
 
     // Generate PAGE tables and configs
     let mut pages = Vec::new();
@@ -2643,7 +2640,8 @@ fn generate_page_tables<I: ImageSource>(
             PageConfig::zero_init(page_base)
         };
 
-        let trace = page::generate_page_trace(&config, &final_state);
+        let final_page = memory_state.cells.page_data(page_base);
+        let trace = page::generate_page_trace_from_dense(&config, final_page, exclude_touched);
         pages.push(trace);
         page_configs.push(config);
     }

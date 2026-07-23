@@ -284,6 +284,64 @@ pub fn generate_page_trace(
     trace
 }
 
+/// Like [`generate_page_trace`] but reads each offset's final `(value, timestamp)`
+/// straight from the dense per-page memory store ([`crate::paged_mem::PagedMem::page_data`])
+/// — one indexed read per offset, no hashing. Equivalent to looking each byte up in a
+/// `FinalStateMap` built from the same cells, but avoids the sparse map and its
+/// `page_size` (mostly-miss) lookups per page — the dominant cost of PAGE generation.
+///
+/// `final_page` is `None` for a page with no runtime cells (every offset falls back to
+/// init, ts 0). `exclude_touched` drops runtime-written cells (ts > 0) so PAGE
+/// self-cancels them — the continuation-epoch case where the L2G table owns them.
+///
+/// `ts == 0` marks an offset that is either untouched or an initial-image byte; either
+/// way its final value equals its init value, so we emit `(init, 0)` (matching the
+/// `FinalStateMap`-miss branch of [`generate_page_trace`]).
+pub fn generate_page_trace_from_dense(
+    config: &PageConfig,
+    final_page: Option<&[(u8, u64)]>,
+    exclude_touched: bool,
+) -> TraceTable<GoldilocksField, GoldilocksExtension> {
+    let page_size = DEFAULT_PAGE_SIZE;
+    assert!(
+        config.page_base.is_multiple_of(page_size as u64),
+        "Page base must be page-aligned"
+    );
+    if let Some(page) = final_page {
+        debug_assert_eq!(page.len(), page_size, "dense page slice must span the page");
+    }
+
+    let num_rows = page_size;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
+        cols::NUM_COLUMNS,
+        1,
+    );
+    let table = &mut trace.main_table;
+
+    for offset in 0..page_size {
+        table.set_u64(offset, cols::OFFSET, offset as u64);
+
+        let init_value = config
+            .init_values
+            .as_ref()
+            .and_then(|v| v.get(offset).copied())
+            .unwrap_or(0);
+        table.set_byte(offset, cols::INIT, init_value);
+
+        let (value, timestamp) = final_page.map_or((0u8, 0u64), |p| p[offset]);
+        let (fini_value, timestamp) = if timestamp == 0 || (exclude_touched && timestamp > 0) {
+            (init_value, 0)
+        } else {
+            (value, timestamp)
+        };
+        table.set_byte(offset, cols::FINI, fini_value);
+        table.set_dword_wl(offset, cols::TIMESTAMP_LO, timestamp);
+    }
+
+    trace
+}
+
 // =========================================================================
 // Preprocessed commitment
 // =========================================================================

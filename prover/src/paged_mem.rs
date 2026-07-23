@@ -103,6 +103,17 @@ impl<T: Copy> PagedMem<T> {
         self.pages.iter().map(|(b, _)| *b)
     }
 
+    /// The dense per-offset data slice for the page at `base` (page-aligned), or
+    /// `None` if that page holds no `set` cell. One indexed read per offset (no
+    /// hashing) — lets PAGE trace generation read each offset's final value
+    /// straight from the store instead of a sparse `FinalStateMap` lookup.
+    pub fn page_data(&self, base: u64) -> Option<&[T]> {
+        match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
+            Ok(i) => Some(&self.pages[i].1.data),
+            Err(_) => None,
+        }
+    }
+
     /// Number of cells that were explicitly `set`.
     pub fn len(&self) -> usize {
         self.pages
