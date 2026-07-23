@@ -28,13 +28,13 @@ use math_cuda::lde::{GpuLdeBase, GpuLdeExt3};
 use super::device::DeviceProgram;
 use super::ir::ConstraintProgram;
 
-/// Pack the lowered node list into 2 `u64` per node (`op | a<<32`, `b | dim<<32`),
+/// Pack the lowered node list into 2 `u64` per node (`op | a<<32`, `b | res<<32`),
 /// the encoding the kernel's `load_node` decodes.
 fn pack_nodes(dev: &DeviceProgram) -> Vec<u64> {
     let mut out = Vec::with_capacity(dev.nodes.len() * 2);
     for n in &dev.nodes {
         out.push(n.op as u64 | ((n.a as u64) << 32));
-        out.push(n.b as u64 | ((n.dim as u64) << 32));
+        out.push(n.b as u64 | ((n.res as u64) << 32));
     }
     out
 }
@@ -246,6 +246,8 @@ where
     let result = math_cuda::constraint_interp::eval_composition_on_device(
         &nodes,
         dev.nodes.len(),
+        dev.num_base_slots as usize,
+        dev.num_ext_slots as usize,
         &dev.base_consts,
         &ext_consts,
         &roots,
@@ -300,6 +302,8 @@ where
     let result = math_cuda::constraint_interp::eval_constraints_on_device(
         &nodes,
         dev.nodes.len(),
+        dev.num_base_slots as usize,
+        dev.num_ext_slots as usize,
         &dev.base_consts,
         &ext_consts,
         &roots,

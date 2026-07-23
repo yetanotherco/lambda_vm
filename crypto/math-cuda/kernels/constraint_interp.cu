@@ -2,29 +2,38 @@
 //
 // Evaluates a captured `ConstraintProgram` (lowered to the flat device blob by
 // `crypto/stark/src/constraint_ir/device.rs`) over every row of a
-// device-resident LDE, producing the per-constraint evaluations. It is a
-// transliteration of the CPU walker `eval_device_program` (same module), with
-// `FieldElement` arithmetic replaced by `goldilocks.cuh` / `ext3.cuh` — the two
-// are asserted bit-for-bit equal by the pre-GPU parity test, so this kernel's
-// output equals the compiled prover folder.
+// device-resident LDE. It is a transliteration of the CPU walker
+// `eval_device_program` (same module), with `FieldElement` arithmetic replaced
+// by `goldilocks.cuh` / `ext3.cuh` — the two are asserted bit-for-bit equal by
+// the pre-GPU parity test, so this kernel's output equals the compiled prover
+// folder.
 //
-// Design (v1, "stripped" — mirrors OpenVM's GLOBAL=true quotient kernel):
+// Design (v2, dim-split + liveness slots):
 //   * One thread per LDE row, grid-stride over all rows (fixed launch, any size).
-//   * Per-thread value array in GLOBAL memory, strided by thread for coalescing:
-//     node `i` for this thread lives at `d_values[task_offset + i*num_threads]`.
-//   * ALL values are carried as ext3 `Fe3` (a base value `x` is the embedding
-//     `{x,0,0}`). Because embedding is a ring homomorphism and the device field
-//     arithmetic is bit-identical to the CPU path, doing every op in ext3 yields
-//     outputs bit-identical to the dim-split CPU walk — the per-node `dim` tag
-//     is therefore unused here and reserved for the base/ext-split optimization
-//     (Phase 6). `Op::Embed` is consequently the identity.
+//   * The lowering assigns every node a slot in one of two per-thread scratch
+//     classes — base (`u64`) or ext (`Fe3`) — with liveness reuse, so scratch
+//     is sized by the program's max-live-set, not its node count. Slots are
+//     strided by thread for coalescing: base slot `s` for this thread is
+//     `vb[s * num_threads + tid]`; ext slot `s` keeps its three components at
+//     `ve[(s*3 + k) * num_threads + tid]`.
+//   * Operands are encoded as `kind << 29 | payload` (see `OPK_*`): a slot in
+//     either class, or a direct reference into the tiny uniform tables
+//     (constants, RAP challenges, alpha powers, table offset) — uniform leaves
+//     never touch scratch.
+//   * Base-dim arithmetic runs in the base field (1 mul vs 9 for ext3), and
+//     mixed base×ext ops use shortcuts (`mul_base`, componentwise add/sub)
+//     that are bit-identical to the full ext op on the embedded operand:
+//     embedding is a ring homomorphism, `gl::add(x,0) == x == gl::sub(x,0)`,
+//     and `dot3` with zero products reduces to `gl::mul`. Where an identity
+//     is NOT guaranteed bitwise (negating an embedded zero limb), the full
+//     form is kept (`gl::sub(0, y)`, never `gl::neg(y)`).
 //
 // Output is the per-constraint eval matrix `d_evals[c*num_rows + row]` (Fe3;
-// base-rooted constraints carry their value in `.a`). Fusing the
-// `z*Σ(Cᵢ·βᵢ) + boundary` accumulation into this kernel (to avoid a D2H of the
-// matrix — the actual data-residency win) is the pipeline-integration follow-on.
+// base-rooted constraints carry their value in `.a`). The composition kernel
+// below fuses the `z*Σ(Cᵢ·βᵢ) + boundary` accumulation instead, avoiding the
+// matrix entirely.
 //
-// Op tags and the `Var` packing MUST stay in sync with
+// Op tags, operand kinds and the `res`/root packing MUST stay in sync with
 // `crypto/stark/src/constraint_ir/device.rs`.
 
 #include "goldilocks.cuh"
@@ -45,12 +54,27 @@ using ext3::Fe3;
 #define OP_NEG 9u
 #define OP_EMBED 10u
 
+// -- operand kinds (mirror device.rs OPK_*): enc = kind << 29 | payload --
+#define OPK_SHIFT 29u
+#define OPK_PAYLOAD_MASK 0x1FFFFFFFu
+#define OPK_BASE_SLOT 0u
+#define OPK_EXT_SLOT 1u
+#define OPK_BASE_CONST 2u
+#define OPK_EXT_CONST 3u
+#define OPK_RAP 4u
+#define OPK_ALPHA 5u
+#define OPK_OFFSET 6u
+
+// -- res / root packing: bit 31 = ext slot class, low bits = slot index --
+#define RES_EXT_BIT 0x80000000u
+#define RES_SLOT_MASK 0x7FFFFFFFu
+
 // A flat IR node. Packed into two u64 words for a pure-u64 upload (matching the
 // crate's device-buffer convention):
-//   word0 = op | (a << 32) ; word1 = b | (dim << 32)
-// This mirrors the `#[repr(C)] DeviceNode { op, a, b, dim: u32 }` payload.
+//   word0 = op | (a << 32) ; word1 = b | (res << 32)
+// This mirrors the `#[repr(C)] DeviceNode { op, a, b, res: u32 }` payload.
 struct Node {
-    uint32_t op, a, b, dim;
+    uint32_t op, a, b, res;
 };
 
 __device__ __forceinline__ Node load_node(const uint64_t *d_nodes, uint64_t i) {
@@ -60,8 +84,81 @@ __device__ __forceinline__ Node load_node(const uint64_t *d_nodes, uint64_t i) {
     n.op = (uint32_t)(w0 & 0xFFFFFFFFull);
     n.a = (uint32_t)(w0 >> 32);
     n.b = (uint32_t)(w1 & 0xFFFFFFFFull);
-    n.dim = (uint32_t)(w1 >> 32);
+    n.res = (uint32_t)(w1 >> 32);
     return n;
+}
+
+// The per-proof uniform tables an operand can reference directly.
+struct Uniforms {
+    const uint64_t *base_consts;
+    const Fe3 *ext_consts;
+    const Fe3 *rap;
+    const Fe3 *alpha;
+    Fe3 offset;
+};
+
+// Whether an encoded operand holds a base-field value (slot or constant).
+__device__ __forceinline__ bool opk_is_base(uint32_t enc) {
+    uint32_t kind = enc >> OPK_SHIFT;
+    return kind == OPK_BASE_SLOT || kind == OPK_BASE_CONST;
+}
+
+// Load a base-field operand (kind must be a base kind).
+__device__ __forceinline__ uint64_t load_base_operand(uint32_t enc, const uint64_t *vb,
+                                                      uint64_t vstride, const Uniforms &u) {
+    uint32_t payload = enc & OPK_PAYLOAD_MASK;
+    return (enc >> OPK_SHIFT) == OPK_BASE_SLOT ? vb[(uint64_t)payload * vstride]
+                                               : u.base_consts[payload];
+}
+
+// Load any operand as ext3, embedding base values as {x, 0, 0}.
+__device__ __forceinline__ Fe3 load_ext_operand(uint32_t enc, const uint64_t *vb, const uint64_t *ve,
+                                                uint64_t vstride, const Uniforms &u) {
+    uint32_t kind = enc >> OPK_SHIFT;
+    uint32_t payload = enc & OPK_PAYLOAD_MASK;
+    switch (kind) {
+    case OPK_BASE_SLOT:
+        return ext3::make(vb[(uint64_t)payload * vstride], 0, 0);
+    case OPK_EXT_SLOT: {
+        const uint64_t *p = ve + (uint64_t)payload * 3 * vstride;
+        return ext3::make(p[0], p[vstride], p[2 * vstride]);
+    }
+    case OPK_BASE_CONST:
+        return ext3::make(u.base_consts[payload], 0, 0);
+    case OPK_EXT_CONST:
+        return u.ext_consts[payload];
+    case OPK_RAP:
+        return u.rap[payload];
+    case OPK_ALPHA:
+        return u.alpha[payload];
+    default: // OPK_OFFSET
+        return u.offset;
+    }
+}
+
+__device__ __forceinline__ void store_base_slot(uint64_t *vb, uint64_t vstride, uint32_t slot,
+                                                uint64_t v) {
+    vb[(uint64_t)slot * vstride] = v;
+}
+
+__device__ __forceinline__ void store_ext_slot(uint64_t *ve, uint64_t vstride, uint32_t slot,
+                                               const Fe3 &v) {
+    uint64_t *p = ve + (uint64_t)slot * 3 * vstride;
+    p[0] = v.a;
+    p[vstride] = v.b;
+    p[2 * vstride] = v.c;
+}
+
+// Read a root value as ext3 (base roots embed as {x, 0, 0}).
+__device__ __forceinline__ Fe3 load_root(uint64_t root_enc, const uint64_t *vb, const uint64_t *ve,
+                                         uint64_t vstride) {
+    uint32_t enc = (uint32_t)root_enc;
+    uint32_t slot = enc & RES_SLOT_MASK;
+    if (enc & RES_EXT_BIT) {
+        const uint64_t *p = ve + (uint64_t)slot * 3 * vstride;
+        return ext3::make(p[0], p[vstride], p[2 * vstride]);
+    }
+    return ext3::make(vb[(uint64_t)slot * vstride], 0, 0);
 }
 
 // Resolve an `Op::Var` leaf against the device-resident LDE columns.
@@ -69,85 +166,149 @@ __device__ __forceinline__ Node load_node(const uint64_t *d_nodes, uint64_t i) {
 // Base (main) columns are column-major `d_main[col*main_stride + r]`; ext (aux)
 // columns store component k at `d_aux[(col*3 + k)*aux_stride + r]` (GpuLdeExt3).
 // The frame `offset` selects row `r = (row + offset*next_step) mod num_rows`.
-__device__ __forceinline__ Fe3 read_var(uint32_t a, uint32_t b, uint64_t row, uint64_t next_step,
-                                        uint64_t num_rows, const uint64_t *d_main,
-                                        uint64_t main_stride, const uint64_t *d_aux,
-                                        uint64_t aux_stride) {
-    uint32_t col = a & 0xFFFFu;
-    bool is_main = ((b >> 16) & 1u) != 0u;
+__device__ __forceinline__ uint64_t var_row(uint32_t b, uint64_t row, uint64_t next_step,
+                                            uint64_t num_rows) {
     uint32_t offset = (b >> 8) & 0xFFu;
-
     uint64_t r = row + (uint64_t)offset * next_step;
     if (r >= num_rows) {
         r -= num_rows; // wrap; offset*next_step < num_rows by construction
     }
-
-    if (is_main) {
-        uint64_t x = d_main[(uint64_t)col * main_stride + r];
-        return ext3::make(x, 0, 0);
-    }
-    uint64_t base = (uint64_t)col * 3;
-    uint64_t a0 = d_aux[(base + 0) * aux_stride + r];
-    uint64_t a1 = d_aux[(base + 1) * aux_stride + r];
-    uint64_t a2 = d_aux[(base + 2) * aux_stride + r];
-    return ext3::make(a0, a1, a2);
+    return r;
 }
 
 // Shared forward pass: evaluate every IR node of the program for one LDE row
-// into the per-thread value scratch (node `i`'s value at `vals[i * vstride]`;
-// id `i` references only nodes `< i`). The single home of the op semantics —
-// both kernels below run this exact walk, so an op change stays in lockstep
-// with `constraint_ir/device.rs` in one place.
+// into the per-thread slot scratch. The single home of the op semantics — both
+// kernels below run this exact walk, so an op change stays in lockstep with
+// `constraint_ir/device.rs` in one place.
+//
+// Every mixed-op shortcut below must be bit-identical to the full ext3 op on
+// the embedded operand; see the file header for the argument.
 __device__ __forceinline__ void eval_program_row(
-    Fe3 *vals, uint64_t vstride, const uint64_t *d_nodes, uint64_t num_nodes,
-    const uint64_t *d_base_consts, const Fe3 *d_ext_consts, const Fe3 *d_rap_challenges,
-    const Fe3 *d_alpha_powers, Fe3 table_offset, uint64_t row, uint64_t next_step,
-    uint64_t num_rows, const uint64_t *d_main, uint64_t main_stride, const uint64_t *d_aux,
-    uint64_t aux_stride) {
+    uint64_t *vb, uint64_t *ve, uint64_t vstride, const uint64_t *d_nodes, uint64_t num_nodes,
+    const Uniforms &u, uint64_t row, uint64_t next_step, uint64_t num_rows,
+    const uint64_t *d_main, uint64_t main_stride, const uint64_t *d_aux, uint64_t aux_stride) {
     for (uint64_t i = 0; i < num_nodes; i++) {
         Node nd = load_node(d_nodes, i);
-        Fe3 v;
+        uint32_t slot = nd.res & RES_SLOT_MASK;
+        bool res_ext = (nd.res & RES_EXT_BIT) != 0;
         switch (nd.op) {
-        case OP_CONST_BASE:
-            v = ext3::make(d_base_consts[nd.a], 0, 0);
-            break;
-        case OP_CONST_EXT:
-            v = d_ext_consts[nd.a];
-            break;
-        case OP_VAR:
-            v = read_var(nd.a, nd.b, row, next_step, num_rows, d_main, main_stride, d_aux,
-                         aux_stride);
-            break;
-        case OP_RAP_CHALLENGE:
-            v = d_rap_challenges[nd.a];
-            break;
-        case OP_ALPHA_POW:
-            v = d_alpha_powers[nd.a];
-            break;
-        case OP_TABLE_OFFSET:
-            v = table_offset;
-            break;
-        case OP_ADD:
-            v = ext3::add(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-            break;
-        case OP_SUB:
-            v = ext3::sub(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-            break;
-        case OP_MUL:
-            v = ext3::mul(vals[(uint64_t)nd.a * vstride], vals[(uint64_t)nd.b * vstride]);
-            break;
-        case OP_NEG:
-            v = ext3::neg(vals[(uint64_t)nd.a * vstride]);
-            break;
-        case OP_EMBED:
-            // All-ext representation: the base operand is already {x,0,0}.
-            v = vals[(uint64_t)nd.a * vstride];
-            break;
-        default:
-            v = ext3::zero();
+        case OP_VAR: {
+            uint64_t r = var_row(nd.b, row, next_step, num_rows);
+            uint32_t col = nd.a & 0xFFFFu;
+            bool is_main = ((nd.b >> 16) & 1u) != 0u;
+            if (is_main) {
+                store_base_slot(vb, vstride, slot, d_main[(uint64_t)col * main_stride + r]);
+            } else {
+                uint64_t base = (uint64_t)col * 3;
+                store_ext_slot(ve, vstride, slot,
+                               ext3::make(d_aux[(base + 0) * aux_stride + r],
+                                          d_aux[(base + 1) * aux_stride + r],
+                                          d_aux[(base + 2) * aux_stride + r]));
+            }
             break;
         }
-        vals[i * vstride] = v;
+        case OP_ADD: {
+            if (!res_ext) {
+                store_base_slot(vb, vstride, slot,
+                                goldilocks::add(load_base_operand(nd.a, vb, vstride, u),
+                                                load_base_operand(nd.b, vb, vstride, u)));
+            } else if (opk_is_base(nd.a)) {
+                // {x,0,0} + y = {add(x,y.a), y.b, y.c} (add(0,v) == v).
+                uint64_t x = load_base_operand(nd.a, vb, vstride, u);
+                Fe3 y = load_ext_operand(nd.b, vb, ve, vstride, u);
+                store_ext_slot(ve, vstride, slot, ext3::make(goldilocks::add(x, y.a), y.b, y.c));
+            } else if (opk_is_base(nd.b)) {
+                Fe3 x = load_ext_operand(nd.a, vb, ve, vstride, u);
+                uint64_t y = load_base_operand(nd.b, vb, vstride, u);
+                store_ext_slot(ve, vstride, slot, ext3::make(goldilocks::add(x.a, y), x.b, x.c));
+            } else {
+                store_ext_slot(ve, vstride, slot,
+                               ext3::add(load_ext_operand(nd.a, vb, ve, vstride, u),
+                                         load_ext_operand(nd.b, vb, ve, vstride, u)));
+            }
+            break;
+        }
+        case OP_SUB: {
+            if (!res_ext) {
+                store_base_slot(vb, vstride, slot,
+                                goldilocks::sub(load_base_operand(nd.a, vb, vstride, u),
+                                                load_base_operand(nd.b, vb, vstride, u)));
+            } else if (opk_is_base(nd.a)) {
+                // {x,0,0} - y = {sub(x,y.a), sub(0,y.b), sub(0,y.c)}; sub(0,·)
+                // is kept literal — it is NOT bitwise `neg` on non-canonical
+                // limbs.
+                uint64_t x = load_base_operand(nd.a, vb, vstride, u);
+                Fe3 y = load_ext_operand(nd.b, vb, ve, vstride, u);
+                store_ext_slot(ve, vstride, slot,
+                               ext3::make(goldilocks::sub(x, y.a), goldilocks::sub(0, y.b),
+                                          goldilocks::sub(0, y.c)));
+            } else if (opk_is_base(nd.b)) {
+                // x - {y,0,0} = {sub(x.a,y), x.b, x.c} (sub(v,0) == v).
+                Fe3 x = load_ext_operand(nd.a, vb, ve, vstride, u);
+                uint64_t y = load_base_operand(nd.b, vb, vstride, u);
+                store_ext_slot(ve, vstride, slot, ext3::make(goldilocks::sub(x.a, y), x.b, x.c));
+            } else {
+                store_ext_slot(ve, vstride, slot,
+                               ext3::sub(load_ext_operand(nd.a, vb, ve, vstride, u),
+                                         load_ext_operand(nd.b, vb, ve, vstride, u)));
+            }
+            break;
+        }
+        case OP_MUL: {
+            if (!res_ext) {
+                store_base_slot(vb, vstride, slot,
+                                goldilocks::mul(load_base_operand(nd.a, vb, vstride, u),
+                                                load_base_operand(nd.b, vb, vstride, u)));
+            } else if (opk_is_base(nd.a)) {
+                // {x,0,0} * y = mul_base(y, x): dot3 with zero products
+                // reduces to gl::mul exactly.
+                uint64_t x = load_base_operand(nd.a, vb, vstride, u);
+                Fe3 y = load_ext_operand(nd.b, vb, ve, vstride, u);
+                store_ext_slot(ve, vstride, slot, ext3::mul_base(y, x));
+            } else if (opk_is_base(nd.b)) {
+                Fe3 x = load_ext_operand(nd.a, vb, ve, vstride, u);
+                uint64_t y = load_base_operand(nd.b, vb, vstride, u);
+                store_ext_slot(ve, vstride, slot, ext3::mul_base(x, y));
+            } else {
+                store_ext_slot(ve, vstride, slot,
+                               ext3::mul(load_ext_operand(nd.a, vb, ve, vstride, u),
+                                         load_ext_operand(nd.b, vb, ve, vstride, u)));
+            }
+            break;
+        }
+        case OP_NEG: {
+            if (!res_ext) {
+                store_base_slot(vb, vstride, slot,
+                                goldilocks::neg(load_base_operand(nd.a, vb, vstride, u)));
+            } else {
+                store_ext_slot(ve, vstride, slot,
+                               ext3::neg(load_ext_operand(nd.a, vb, ve, vstride, u)));
+            }
+            break;
+        }
+        case OP_EMBED: {
+            store_ext_slot(ve, vstride, slot, load_ext_operand(nd.a, vb, ve, vstride, u));
+            break;
+        }
+        // Uniform leaves materialize only when they are constraint roots.
+        case OP_CONST_BASE:
+            store_base_slot(vb, vstride, slot, u.base_consts[nd.a]);
+            break;
+        case OP_CONST_EXT:
+            store_ext_slot(ve, vstride, slot, u.ext_consts[nd.a]);
+            break;
+        case OP_RAP_CHALLENGE:
+            store_ext_slot(ve, vstride, slot, u.rap[nd.a]);
+            break;
+        case OP_ALPHA_POW:
+            store_ext_slot(ve, vstride, slot, u.alpha[nd.a]);
+            break;
+        case OP_TABLE_OFFSET:
+            store_ext_slot(ve, vstride, slot, u.offset);
+            break;
+        default:
+            break;
+        }
     }
 }
 
@@ -159,7 +320,7 @@ extern "C" __global__ void constraint_interp_kernel(
     uint64_t num_nodes,
     const uint64_t *__restrict__ d_base_consts,
     const Fe3 *__restrict__ d_ext_consts,
-    const uint64_t *__restrict__ d_roots,
+    const uint64_t *__restrict__ d_roots, // slot | ext_bit<<31, one per constraint
     uint64_t num_roots,
     // per-proof uniforms
     const Fe3 *__restrict__ d_rap_challenges,
@@ -173,24 +334,31 @@ extern "C" __global__ void constraint_interp_kernel(
     uint64_t next_step,
     // sizing
     uint64_t num_rows,
-    // scratch: per-thread value array, [num_nodes * num_threads]
-    Fe3 *__restrict__ d_values) {
+    // scratch: per-thread slot files, [num_base_slots * num_threads] and
+    // [num_ext_slots * 3 * num_threads]
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
     uint64_t task_offset = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
 
-    Fe3 *vals = d_values + task_offset;
+    uint64_t *vb = d_vals_base + task_offset;
+    uint64_t *ve = d_vals_ext + task_offset;
     uint64_t vstride = num_threads;
-    Fe3 table_offset = *d_table_offset;
+
+    Uniforms u;
+    u.base_consts = d_base_consts;
+    u.ext_consts = d_ext_consts;
+    u.rap = d_rap_challenges;
+    u.alpha = d_alpha_powers;
+    u.offset = *d_table_offset;
 
     for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
-        eval_program_row(vals, vstride, d_nodes, num_nodes, d_base_consts, d_ext_consts,
-                         d_rap_challenges, d_alpha_powers, table_offset, row, next_step, num_rows,
-                         d_main, main_stride, d_aux, aux_stride);
+        eval_program_row(vb, ve, vstride, d_nodes, num_nodes, u, row, next_step, num_rows, d_main,
+                         main_stride, d_aux, aux_stride);
 
-        // Emit each constraint root.
+        // Emit each constraint root (base roots embed as {x, 0, 0}).
         for (uint64_t c = 0; c < num_roots; c++) {
-            uint64_t root = d_roots[c];
-            d_evals[c * num_rows + row] = vals[root * vstride];
+            d_evals[c * num_rows + row] = load_root(d_roots[c], vb, ve, vstride);
         }
     }
 }
@@ -204,9 +372,10 @@ extern "C" __global__ void constraint_interp_kernel(
 //   H(row) = z_inv[row % z_len] * Σ_c beta_trans[c] * C_c(row)          (transition)
 //          + Σ_b z_b_inv[b*num_rows + row] * beta_bnd[b] * (trace_b - value_b)
 //
-// where a base-rooted C_c is carried as the embedding {C,0,0} (all-ext, exactly
-// as the interpreter), z_inv is the cyclic base transition-zerofier inverse, and
-// the boundary term reads the resident trace at column `b_col[b]` (main or aux).
+// where a base-rooted C_c contributes via `mul_base` (bit-identical to the
+// full mul on its embedding), z_inv is the cyclic base transition-zerofier
+// inverse, and the boundary term reads the resident trace at column `b_col[b]`
+// (main or aux).
 extern "C" __global__ void constraint_composition_kernel(
     // output: one H(row) per LDE row
     Fe3 *__restrict__ d_h,
@@ -239,25 +408,40 @@ extern "C" __global__ void constraint_composition_kernel(
     const Fe3 *__restrict__ d_b_value,       // [num_boundary]
     const Fe3 *__restrict__ d_b_beta,        // [num_boundary]
     const uint64_t *__restrict__ d_b_z_inv,  // [num_boundary * num_rows]
-    // scratch value array, [num_nodes * num_threads]
-    Fe3 *__restrict__ d_values) {
+    // scratch: per-thread slot files
+    uint64_t *__restrict__ d_vals_base,
+    uint64_t *__restrict__ d_vals_ext) {
     uint64_t task_offset = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t num_threads = (uint64_t)gridDim.x * blockDim.x;
 
-    Fe3 *vals = d_values + task_offset;
+    uint64_t *vb = d_vals_base + task_offset;
+    uint64_t *ve = d_vals_ext + task_offset;
     uint64_t vstride = num_threads;
-    Fe3 table_offset = *d_table_offset;
+
+    Uniforms u;
+    u.base_consts = d_base_consts;
+    u.ext_consts = d_ext_consts;
+    u.rap = d_rap_challenges;
+    u.alpha = d_alpha_powers;
+    u.offset = *d_table_offset;
 
     for (uint64_t row = task_offset; row < num_rows; row += num_threads) {
-        eval_program_row(vals, vstride, d_nodes, num_nodes, d_base_consts, d_ext_consts,
-                         d_rap_challenges, d_alpha_powers, table_offset, row, next_step, num_rows,
-                         d_main, main_stride, d_aux, aux_stride);
+        eval_program_row(vb, ve, vstride, d_nodes, num_nodes, u, row, next_step, num_rows, d_main,
+                         main_stride, d_aux, aux_stride);
 
-        // Transition: z_inv * Σ_c beta_c * C_c.
+        // Transition: z_inv * Σ_c beta_c * C_c. Base roots use mul_base —
+        // bit-identical to mul(beta, {v,0,0}).
         Fe3 sum = ext3::zero();
         for (uint64_t c = 0; c < num_roots; c++) {
-            Fe3 cval = vals[(uint64_t)d_roots[c] * vstride];
-            sum = ext3::add(sum, ext3::mul(d_beta_trans[c], cval));
+            uint32_t enc = (uint32_t)d_roots[c];
+            uint32_t slot = enc & RES_SLOT_MASK;
+            if (enc & RES_EXT_BIT) {
+                const uint64_t *p = ve + (uint64_t)slot * 3 * vstride;
+                Fe3 cval = ext3::make(p[0], p[vstride], p[2 * vstride]);
+                sum = ext3::add(sum, ext3::mul(d_beta_trans[c], cval));
+            } else {
+                sum = ext3::add(sum, ext3::mul_base(d_beta_trans[c], vb[(uint64_t)slot * vstride]));
+            }
         }
         Fe3 h = ext3::mul_base(sum, d_z_inv[row % z_len]);
 

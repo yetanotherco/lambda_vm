@@ -6,6 +6,13 @@
 //! handles, uploads the program + per-proof uniforms, launches the interpreter
 //! over every LDE row, and returns the per-constraint eval matrix.
 //!
+//! The lowering dim-splits the per-thread value scratch into a base (`u64`)
+//! and an ext (`3 × u64`) slot class with liveness-reused slots, so the
+//! scratch here is sized by the program's max-live-set
+//! (`num_base_slots`/`num_ext_slots`), not its node count. Both buffers are
+//! allocated uninitialized: the topological walk writes every slot before any
+//! read.
+//!
 //! Layering note: this crate cannot see `stark`'s `DeviceProgram` type (stark
 //! depends on math-cuda, not the reverse), so the caller flattens the program
 //! into the raw `u64` slices below. The stark-side dispatch
@@ -18,9 +25,9 @@ use crate::device::backend;
 use crate::lde::{GpuLdeBase, GpuLdeExt3};
 
 const BLOCK_DIM: u32 = 256;
-/// Cap on total threads (grid × block). Each thread owns `num_nodes` ext3 slots
-/// in the global value scratch (`num_nodes × MAX_THREADS × 24 B`), so a fixed
-/// cap bounds that buffer regardless of LDE size; threads grid-stride over the
+/// Cap on total threads (grid × block). Each thread owns `num_base_slots` u64
+/// plus `num_ext_slots` ext3 slots of global value scratch, so a fixed cap
+/// bounds those buffers regardless of LDE size; threads grid-stride over the
 /// remaining rows. 65536 mirrors OpenVM's quotient `TASK_SIZE`.
 const MAX_THREADS: u32 = 1 << 16;
 
@@ -31,17 +38,21 @@ const MAX_THREADS: u32 = 1 << 16;
 /// Base-rooted constraints carry their value in component 0.
 ///
 /// Inputs (all raw limbs, matching the crate's u64 device convention):
-/// - `nodes`: 2 `u64` per IR node (`op | a<<32`, then `b | dim<<32`).
+/// - `nodes`: 2 `u64` per IR node (`op | a<<32`, then `b | res<<32`).
+/// - `num_base_slots` / `num_ext_slots`: per-thread scratch sizes of the two
+///   slot classes (from the lowering's liveness scan).
 /// - `base_consts`: one `u64` per base constant.
 /// - `ext_consts`, `rap_challenges`, `alpha_powers`: 3 `u64` per element.
 /// - `table_offset`: exactly 3 `u64`.
-/// - `roots`: one `u64` node id per constraint.
+/// - `roots`: one `u64` per constraint (`slot | ext_bit<<31`).
 /// - `main`/`aux`: device-resident LDE handles; `next_step` is the LDE row
 ///   stride for a frame-offset step; `num_rows` is the number of LDE rows.
 #[allow(clippy::too_many_arguments)]
 pub fn eval_constraints_on_device(
     nodes: &[u64],
     num_nodes: usize,
+    num_base_slots: usize,
+    num_ext_slots: usize,
     base_consts: &[u64],
     ext_consts: &[u64],
     roots: &[u64],
@@ -84,9 +95,11 @@ pub fn eval_constraints_on_device(
     let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
-    // Per-thread value scratch ([num_nodes * num_threads] ext3) and output.
-    let mut d_values = stream.alloc_zeros::<u64>(num_nodes * num_threads * 3)?;
-    let mut d_evals = stream.alloc_zeros::<u64>(num_roots * num_rows * 3)?;
+    // Per-thread slot scratch, uninitialized (the walk writes before reading).
+    let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
+    let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    // Output: every (constraint, row) cell is written by the emit loop.
+    let mut d_evals = unsafe { stream.alloc::<u64>(num_roots * num_rows * 3) }?;
 
     let num_nodes_u64 = num_nodes as u64;
     let num_roots_u64 = num_roots as u64;
@@ -119,7 +132,8 @@ pub fn eval_constraints_on_device(
             .arg(&aux_stride)
             .arg(&next_step_u64)
             .arg(&num_rows_u64)
-            .arg(&mut d_values)
+            .arg(&mut d_vals_base)
+            .arg(&mut d_vals_ext)
             .launch(cfg)?;
     }
     let out = {
@@ -173,6 +187,8 @@ pub struct CompositionAccum<'a> {
 pub fn eval_composition_on_device(
     nodes: &[u64],
     num_nodes: usize,
+    num_base_slots: usize,
+    num_ext_slots: usize,
     base_consts: &[u64],
     ext_consts: &[u64],
     roots: &[u64],
@@ -239,8 +255,9 @@ pub fn eval_composition_on_device(
         )
     };
     // Per-slice upload straight from the caller's per-constraint vectors into
-    // the flat `b * num_rows + row` device layout — no flattened host copy.
-    let mut d_b_z_inv = stream.alloc_zeros::<u64>((num_boundary * num_rows).max(1))?;
+    // the flat `b * num_rows + row` device layout — no flattened host copy, no
+    // zeroing (the slice uploads cover every element the kernel reads).
+    let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
     {
         for (b, slice) in accum.b_z_inv.iter().enumerate() {
             let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
@@ -252,8 +269,11 @@ pub fn eval_composition_on_device(
     let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
-    let mut d_values = stream.alloc_zeros::<u64>(num_nodes * num_threads * 3)?;
-    let mut d_h = stream.alloc_zeros::<u64>(num_rows * 3)?;
+    // Per-thread slot scratch, uninitialized (the walk writes before reading).
+    let mut d_vals_base = unsafe { stream.alloc::<u64>((num_base_slots * num_threads).max(1)) }?;
+    let mut d_vals_ext = unsafe { stream.alloc::<u64>((num_ext_slots * 3 * num_threads).max(1)) }?;
+    // Output: every row is written by the grid-stride loop.
+    let mut d_h = unsafe { stream.alloc::<u64>(num_rows * 3) }?;
 
     let num_nodes_u64 = num_nodes as u64;
     let num_roots_u64 = num_roots as u64;
@@ -297,7 +317,8 @@ pub fn eval_composition_on_device(
             .arg(&d_b_value)
             .arg(&d_b_beta)
             .arg(&d_b_z_inv)
-            .arg(&mut d_values)
+            .arg(&mut d_vals_base)
+            .arg(&mut d_vals_ext)
             .launch(cfg)?;
     }
     let out = {
