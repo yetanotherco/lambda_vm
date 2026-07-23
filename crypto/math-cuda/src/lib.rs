@@ -16,6 +16,7 @@ pub mod lde;
 pub mod logup;
 pub mod merkle;
 pub mod ntt;
+pub mod precompile;
 pub mod trace_cpu;
 pub mod trace_ops;
 pub mod trace_walk;

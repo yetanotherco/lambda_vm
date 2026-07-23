@@ -880,13 +880,27 @@ pub trait IsStarkProver<
             } else {
                 0
             };
-            crate::gpu_lde::try_lde_row_major_no_merkle::<Field, Field>(
-                trace_data,
-                rows,
-                total_cols,
-                domain.blowup_factor,
-                &twiddles.coset_weights,
-            )
+            // A1: an on-GPU-built preprocessed table (e.g. device PAGE) carries its main matrix as a
+            // resident device buffer (the host `trace_data` is a zeroed placeholder). LDE that device
+            // buffer directly — no host round-trip — then the 2-tree subset split below runs on the
+            // LDE result exactly as the host path. Otherwise LDE the host trace.
+            if let Some(dev) = trace.main_input_dev() {
+                crate::gpu_lde::try_lde_row_major_no_merkle_dev::<Field, Field>(
+                    dev,
+                    rows,
+                    total_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
+            } else {
+                crate::gpu_lde::try_lde_row_major_no_merkle::<Field, Field>(
+                    trace_data,
+                    rows,
+                    total_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                )
+            }
         } else {
             None
         };

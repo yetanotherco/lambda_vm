@@ -32,7 +32,7 @@ use std::collections::HashSet;
 use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
-use executor::vm::memory::U64HashMap;
+use executor::vm::memory::{PrecompileInputs, U64HashMap};
 #[cfg(feature = "parallel")]
 use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
@@ -80,7 +80,7 @@ type MemoryCell = (u8, u64);
 type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
-struct MemoryState {
+pub(crate) struct MemoryState {
     /// Per byte-address `(value, timestamp)`, as a dense per-page store. This is
     /// the hot structure — `read_byte`/`write_byte` hit it on every memory access
     /// during the replay, and it's rebuilt each epoch — so a per-page array (small
@@ -101,12 +101,35 @@ impl MemoryState {
     /// Pre-populates all starting bytes with timestamp=0 so that when MEMW first
     /// accesses an address, it gets the correct initial value for `old_value`.
     /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
-    fn from_image<I: ImageSource>(image: &I) -> Self {
+    pub(crate) fn from_image<I: ImageSource>(image: &I) -> Self {
         let mut cells = PagedMem::new((0, 0));
         for (addr, value) in image.image_iter() {
             cells.set(addr, (value, 0));
         }
         Self { cells }
+    }
+
+    /// Reconstruct the final memory state from the initial-memory image plus the
+    /// device memory-walk snapshot (per-byte final `(value, timestamp)`). Starts from
+    /// [`from_image`] (image bytes @ ts=0) then overwrites every touched byte with the
+    /// snapshot's final `(value, ts)`. The snapshot is byte-granular and validated
+    /// cell-identical to the sequential CPU replay (`diag_memw_ls_device_vs_cpu`), so
+    /// the reconstructed state matches the CPU `MemoryState` byte-for-byte — feeding it
+    /// to the SAME PAGE / ARE_BYTES generators yields identical tables. Used on the
+    /// device-memory path (`LAMBDA_VM_GPU_MEMORY=1`) to build PAGE-FINI + ARE_BYTES
+    /// off the GPU-computed final memory state while the CPU replay still runs.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn from_image_and_snapshot<I: ImageSource>(
+        image: &I,
+        snap_addr: &[u64],
+        snap_val: &[u64],
+        snap_ts: &[u64],
+    ) -> Self {
+        let mut state = Self::from_image(image);
+        for ((&addr, &val), &ts) in snap_addr.iter().zip(snap_val).zip(snap_ts) {
+            state.cells.set(addr, (val as u8, ts));
+        }
+        state
     }
 
     /// Number of distinct pages that contain at least one cell.
@@ -124,6 +147,13 @@ impl MemoryState {
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
         self.cells.get(address)
+    }
+
+    /// Iterate every stored cell `(address, (value, timestamp))` (diagnostics: final-memory-snapshot
+    /// parity against the device memory walk).
+    #[cfg(test)]
+    pub(crate) fn iter_cells(&self) -> impl Iterator<Item = (u64, MemoryCell)> + '_ {
+        self.cells.iter()
     }
 
     /// Write a byte to memory with the given timestamp.
@@ -236,7 +266,7 @@ impl RegisterState {
     ///
     /// Returns a map from register Word address to final (timestamp, value).
     /// Each register uses 2 Word addresses (reg_addr = 2 * reg_idx, then +0, +1).
-    fn to_final_state_map(&self) -> FinalRegisterStateMap {
+    pub(crate) fn to_final_state_map(&self) -> FinalRegisterStateMap {
         let mut map = FinalRegisterStateMap::new();
 
         for reg_idx in 0..32u8 {
@@ -343,6 +373,12 @@ fn collect_cpu_ops(
     // per-cycle slots for M1/M3/M5 register accesses and the inline PC read.
     // Exactly 4 so that inline PC's prev_ts = timestamp - 3 = 1 on the first row,
     // matching the REGISTER table's initial PC token at timestamp 1 (per spec/memory.typ).
+    //
+    // NOTE (measured, ethrex_5tx): this ~138ms is memory-bandwidth-bound (building the ~480MB
+    // `Vec<CpuOperation>`), NOT compute-bound — the split is ~62% host decode-lookup + ~38% `from_log`
+    // arithmetic, and rayon-parallelizing it measured SLOWER (155ms, coordination over a bandwidth-
+    // saturated build). A GPU `from_log` could only remove the ~38% arithmetic and needs the full
+    // cpu_ops-backbone rewrite (soundness-critical) + marshalling, so it's not worth it. Left serial.
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
@@ -403,8 +439,8 @@ fn classify_memw(op: &MemwOperation) -> MemwRoute {
 pub(crate) struct MemwBuckets {
     /// Compact register rows (filled directly into the MEMW_R columns).
     pub(crate) register_rows: Vec<RegRow>,
-    aligned: Vec<MemwOperation>,
-    general: Vec<MemwOperation>,
+    pub(crate) aligned: Vec<MemwOperation>,
+    pub(crate) general: Vec<MemwOperation>,
 }
 
 impl MemwBuckets {
@@ -546,15 +582,124 @@ fn build_reg_fallback(
 /// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7),
 ///   already routed into their MEMW_R / MEMW_A / MEMW buckets (see [`MemwBuckets`])
 /// - LOAD ops (memory loads with sign/zero extension)
+/// Register-addressed accesses generated by the ecall precompiles (COMMIT/KECCAK/ECSM),
+/// captured as walk events so the device register walk can incorporate them (P1-ecall).
+#[derive(Default)]
+pub(crate) struct EcallAccesses {
+    /// Register-addressed ecall accesses in per-op generation order.
+    pub(crate) reg: Vec<RegAccess>,
+    /// The cpu-op index each `reg` access belongs to (parallel to `reg`). Non-decreasing.
+    /// Lets the device emit INTERLEAVE each op's ecall accesses right after its regular
+    /// accesses, so the walk's stable-by-bin (input-order) predecessor chain stays in timeline
+    /// order (the register walk does NOT ts-sort within a bin).
+    pub(crate) reg_op_index: Vec<u32>,
+    /// Memory-addressed ecall accesses, expanded to per-byte events (parallel arrays, in per-op
+    /// generation order). Interleaved into the device MEMORY walk's byte-access stream (same
+    /// input-order requirement — the radix walk preserves within-address input order).
+    pub(crate) mem_addr: Vec<u64>,
+    pub(crate) mem_ts: Vec<u64>,
+    pub(crate) mem_val: Vec<u64>, // byte value in [0, 255]
+    pub(crate) mem_op_index: Vec<u32>,
+    /// Per ecall MEMORY op (NOT per byte) — Option A2. Enough to reassemble the MEMW row post-walk
+    /// from the device-resolved old-state: `flat_start` is the offset of this op's first byte in the
+    /// per-byte arrays above (and in the device-returned `ecall_old_ts`/`ecall_old_val`). The row's
+    /// `value[b]` = `mem_val[flat_start + b]`; `old[b]`/`old_timestamp[b]` come from the device walk.
+    pub(crate) mem_ops: Vec<EcallMemOp>,
+}
+
+/// Metadata for one ecall memory MEMW op (Option A2), captured so the row can be rebuilt post-walk
+/// without a `memory_state` replay. Mixed width across precompiles (commit=1, keccak/ecsm=8), which
+/// the per-byte `mem_*` arrays alone cannot recover.
+#[derive(Clone, Copy)]
+pub(crate) struct EcallMemOp {
+    pub(crate) base: u64,
+    pub(crate) width: u8,
+    pub(crate) is_read: bool,
+    /// Offset of this op's first byte into the parallel per-byte arrays.
+    pub(crate) flat_start: u32,
+}
+
+/// Convert the ecall `MemwOperation`s into walk events tagged with their cpu-op index, so the device
+/// emit can INTERLEAVE each op's ecall accesses right after its regular accesses (the walks preserve
+/// within-key input order, NOT ts order). Register ops → one `RegAccess`; memory ops → `width`
+/// per-byte events `(base+b, ts, value[b])`. Values are already-resolved by the collectors from the
+/// threaded state. `emits_row = false` / non-emitting (Option Z): their MEMW rows are produced on CPU.
+/// Push an ecall's MEMW operations to the CPU register/memory sink. On the device register path the
+/// WIDTH-2 register accesses are walked/routed/filled on GPU (captured into `ecall_accesses` and fed
+/// to [`build_device_memw_register`]), so they must NOT also be collected here. Everything else stays
+/// on the CPU: the ecall MEMORY byte accesses (device memory walk is a later phase) AND any WIDTH-1
+/// register access — notably x254, the commit index, whose single-word (width-1, old_timestamps=[ts,0])
+/// MEMW_A row the width-2 device walk cannot reproduce. Off the device path, every op is pushed.
+fn push_ecall_memw_ops(
+    memw: &mut MemwBuckets,
+    ops: Vec<MemwOperation>,
+    device_registers: bool,
+    device_memory_drop: bool,
+) {
+    for op in ops {
+        // The device REGISTER walk owns the width-2 register accesses.
+        if device_registers && op.is_register && op.width == 2 {
+            continue;
+        }
+        // A2 drop mode: the device MEMORY walk owns the ecall MEMORY rows (assembled post-walk from
+        // the device old-state), so don't push them here — only the ecall REGISTER rows stay CPU-side.
+        if device_memory_drop && !op.is_register {
+            continue;
+        }
+        memw.push(op);
+    }
+}
+
+fn capture_ecall_reg_accesses(ops: &[MemwOperation], op_idx: u32, acc: &mut EcallAccesses) {
+    for op in ops {
+        if op.is_register {
+            // Only WIDTH-2 register accesses feed the device walk. A width-1 register access (x254,
+            // the commit index) has a single-word MEMW_A encoding the width-2 walk can't reproduce, so
+            // leave it for the CPU sink (see `push_ecall_memw_ops`) — do NOT capture it here.
+            if op.width == 2 {
+                acc.reg.push(RegAccess {
+                    reg_addr: op.base_address,
+                    timestamp: op.timestamp,
+                    value: (op.value[0] as u64) | ((op.value[1] as u64) << 32),
+                    is_read: op.is_read,
+                    emits_row: false,
+                });
+                acc.reg_op_index.push(op_idx);
+            }
+        } else {
+            // Option A2: record per-op metadata (base/width/is_read + flat offset) so the ecall MEMW
+            // row can be rebuilt post-walk from the device-resolved old-state, without memory_state.
+            acc.mem_ops.push(EcallMemOp {
+                base: op.base_address,
+                width: op.width,
+                is_read: op.is_read,
+                flat_start: acc.mem_addr.len() as u32,
+            });
+            for b in 0..op.width as u64 {
+                acc.mem_addr.push(op.base_address.wrapping_add(b));
+                acc.mem_ts.push(op.timestamp);
+                acc.mem_val.push((op.value[b as usize] & 0xFF) as u64);
+                acc.mem_op_index.push(op_idx);
+            }
+        }
+    }
+}
+
 /// - LT ops (from SLT/BLT instructions)
 /// - Bitwise lookups (from CPU operations)
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
 /// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
-/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
+/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops, ecall_accesses)
+///
+/// `ecall_accesses` captures the COMMIT/KECCAK/ECSM-generated register accesses as walk
+/// events (P1-ecall): they are needed to feed the DEVICE register walk so the *regular*
+/// MEMW_R rows get correct `old_ts` across the ecall interleaving (an ecall register write
+/// advances the register cell timeline). Captured always (a handful of accesses); the
+/// resident walk consumes them, the CPU path ignores them.
 #[allow(clippy::type_complexity)]
-fn collect_ops_from_cpu(
+pub(crate) fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
@@ -570,17 +715,81 @@ fn collect_ops_from_cpu(
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
     Vec<ecdas::EcdasOperation>,
+    EcallAccesses,
 ) {
+    collect_ops_from_cpu_inner(
+        cpu_ops,
+        None,
+        memory_state,
+        register_state,
+        device_registers,
+        false,
+        false,
+        false,
+    )
+}
+
+/// Option A: when `precompile_inputs` is `Some`, the precompile chip operations
+/// (KECCAK/ECSM/COMMIT) build their INPUT values from the executor-recorded bytes instead of
+/// reading a replayed `memory_state` (the recording == the replay, so output is byte-identical).
+/// `memory_state` is still threaded for the ecall/regular MEMW rows' old-state + writes (A1 keeps
+/// it; A2 removes it). `None` = the legacy path (read inputs from `memory_state`), used by
+/// continuation epochs / tests. Recordings are matched to ecall ops by an in-order per-type cursor.
+#[allow(clippy::too_many_arguments)]
+fn collect_ops_from_cpu_inner(
+    cpu_ops: &[CpuOperation],
+    precompile_inputs: Option<&PrecompileInputs>,
+    memory_state: &mut MemoryState,
+    register_state: &mut RegisterState,
+    device_registers: bool,
+    // Option A2 full drop (`LAMBDA_VM_GPU_MEMORY_DROP=1`): skip building the regular MEMW rows and
+    // pushing the ecall MEMW rows (device provides both), and skip the regular memory_state replay —
+    // regular loads emit only their LOAD op + bitwise. `memory_state` is left init-only (untouched by
+    // regular ops); the ecall collectors still run against it (tiny, and their mem rows are discarded).
+    device_memory_drop: bool,
+    // FR6 (gpu_full): the WHOLE in-walk BITWISE histogram is built on device (`gpu_bitwise_hist_full`),
+    // so the CPU need not build the ~28M `bitwise_ops` (in-walk per-op range checks + LOAD MSB8). When
+    // set, skip them entirely (empty Vec) — `cpu_bitwise_sources` is false in `build_traces` so they'd
+    // be dropped uncounted anyway. Same GPU-mandatory contract as `device_memory_drop`.
+    skip_bitwise: bool,
+    // Step B (gpu_full): under the fully-resident pipeline the chip TABLES are built on device from the
+    // resident `devops` seam and the whole BITWISE histogram is device-derived, so the host op-vecs that
+    // feed neither anymore are DEAD — `load_ops`, `lt_ops`, `shift_ops` here (and `branch/eq/bytewise/
+    // store` + the dvrm→lt/memw→lt `lt_ops` in `collect_all_ops`/Phase 3). When set, skip building them.
+    // `mul_ops`/`dvrm_ops`/`cpu32_ops` are KEPT (the MSB16 dedup tail + cpu32→mul/dvrm derivations still
+    // read them on host). Gated by e2e: an empty dead op-vec that were actually consumed would unbalance
+    // its chip bus and fail verification.
+    skip_opvec: bool,
+) -> (
+    MemwBuckets,
+    Vec<LoadOperation>,
+    Vec<LtOperation>,
+    Vec<ShiftOperation>,
+    Vec<BitwiseOperation>,
+    Vec<CommitOperation>,
+    Vec<KeccakOperation>,
+    Vec<cpu32::Cpu32Operation>,
+    Vec<ecsm::EcsmOperation>,
+    Vec<ecdas::EcdasOperation>,
+    EcallAccesses,
+) {
+    // Option A per-type recording cursors (advanced in ecall execution order, matching the
+    // executor's recording order).
+    let mut keccak_cursor = 0usize;
+    let mut ecsm_cursor = 0usize;
+    let mut commit_cursor = 0usize;
     let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
-    let mut bitwise_ops = Vec::with_capacity(cpu_ops.len() * 4);
+    let mut bitwise_ops =
+        Vec::with_capacity(if skip_bitwise { 0 } else { cpu_ops.len() * 4 });
     let mut commit_ops = Vec::new();
     let mut keccak_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
+    let mut ecall_accesses = EcallAccesses::default();
     // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
     // continuation epoch indexes its commits globally, matching the x254 the
     // register binding transports across epochs. Resetting to 0 here would drift
@@ -589,7 +798,8 @@ fn collect_ops_from_cpu(
     let mut current_commit_index = start_commit_index;
     let mut commit_ecall_count = 0u32;
 
-    for op in cpu_ops {
+    for (op_idx, op) in cpu_ops.iter().enumerate() {
+        let op_idx = op_idx as u32;
         // Word (`*W`) instructions delegate to the CPU32 table (built in program
         // order; its register accesses are still emitted via the shared register
         // collector below so the MEMW table balances).
@@ -599,13 +809,34 @@ fn collect_ops_from_cpu(
 
         // --- MEMW and LOAD (require state tracking, order matters) ---
 
-        // Collect memory operations for Load/Store instructions
+        // Collect memory operations for Load/Store instructions. In A2 drop mode the device walk
+        // produces the regular MEMW rows, so build only the LOAD op + bitwise (no memw row, no
+        // memory_state replay); stores contribute nothing here (their row is device-built; their
+        // ARE_BYTES bitwise derives from cpu_ops in `collect_all_ops`).
         if op.decode.fields.is_load() {
-            let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
-            memw.push(memw_op);
-            load_ops.push(load_op);
-            bitwise_ops.extend(lookups);
-        } else if op.decode.fields.is_store() {
+            if device_memory_drop {
+                // Under gpu_full skip_opvec && skip_bitwise are both set → the whole LOAD op + its
+                // MSB8 bitwise are device-derived; avoid the wasted build entirely.
+                if !(skip_opvec && skip_bitwise) {
+                    let (load_op, lookups) = build_load_op_and_bitwise(op);
+                    if !skip_opvec {
+                        load_ops.push(load_op);
+                    }
+                    if !skip_bitwise {
+                        bitwise_ops.extend(lookups);
+                    }
+                }
+            } else {
+                let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
+                memw.push(memw_op);
+                if !skip_opvec {
+                    load_ops.push(load_op);
+                }
+                if !skip_bitwise {
+                    bitwise_ops.extend(lookups);
+                }
+            }
+        } else if op.decode.fields.is_store() && !device_memory_drop {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
             memw.push(memw_op);
         }
@@ -622,13 +853,20 @@ fn collect_ops_from_cpu(
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
+            let recorded = precompile_inputs.map(|pi| {
+                let r = pi.commit[commit_cursor].as_slice();
+                commit_cursor += 1;
+                r
+            });
             commit_ops.extend(expand_commit_operations_for_ecall(
                 op,
+                recorded,
                 memory_state,
                 current_commit_index as u64,
             ));
-            let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw.extend_ops(reg_commit_ops);
+            let reg_commit_ops = collect_commit_memw_ops(op, recorded, register_state, memory_state);
+            capture_ecall_reg_accesses(&reg_commit_ops, op_idx, &mut ecall_accesses);
+            push_ecall_memw_ops(&mut memw, reg_commit_ops, device_registers, device_memory_drop);
             let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
@@ -644,27 +882,41 @@ fn collect_ops_from_cpu(
         // Collect KeccakPermute ECALL operations
         if op.ecall_keccak {
             let state_addr = op.keccak_state_addr;
-            let mut input = [0u64; 25];
-            for (i, lane) in input.iter_mut().enumerate() {
-                let addr = state_addr
-                    .checked_add(i as u64 * 8)
-                    .expect("keccak state address range must be validated by the executor");
-                let mut val = 0u64;
-                for b in 0..8 {
-                    let byte_addr = addr
-                        .checked_add(b as u64)
-                        .expect("keccak state address range must be validated by the executor");
-                    let (byte_val, _ts) = memory_state.read_byte(byte_addr);
-                    val |= (byte_val as u64) << (b * 8);
+            // Option A: use the executor-recorded input state when available; otherwise read it
+            // from the replayed memory_state (legacy path). Reads don't advance memory_state, so
+            // skipping them leaves the timeline (and thus the MEMW rows below) unchanged.
+            let input: [u64; 25] = match precompile_inputs {
+                Some(pi) => {
+                    let rec = pi.keccak[keccak_cursor];
+                    keccak_cursor += 1;
+                    rec
                 }
-                *lane = val;
-            }
+                None => {
+                    let mut input = [0u64; 25];
+                    for (i, lane) in input.iter_mut().enumerate() {
+                        let addr = state_addr
+                            .checked_add(i as u64 * 8)
+                            .expect("keccak state address range must be validated by the executor");
+                        let mut val = 0u64;
+                        for b in 0..8 {
+                            let byte_addr = addr.checked_add(b as u64).expect(
+                                "keccak state address range must be validated by the executor",
+                            );
+                            let (byte_val, _ts) = memory_state.read_byte(byte_addr);
+                            val |= (byte_val as u64) << (b * 8);
+                        }
+                        *lane = val;
+                    }
+                    input
+                }
+            };
             let mut output = input;
             executor::vm::instruction::execution::keccak_f1600(&mut output);
             // collect_keccak_memw_ops handles memory_state + register_state updates
             let keccak_memw_ops =
                 collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
-            memw.extend_ops(keccak_memw_ops);
+            capture_ecall_reg_accesses(&keccak_memw_ops, op_idx, &mut ecall_accesses);
+            push_ecall_memw_ops(&mut memw, keccak_memw_ops, device_registers, device_memory_drop);
             keccak_ops.push(KeccakOperation {
                 timestamp: op.timestamp,
                 state_addr,
@@ -675,9 +927,15 @@ fn collect_ops_from_cpu(
 
         // Collect ECSM ecall operations (memory I/O + the two table row sets)
         if op.ecall_ecsm {
+            let recorded = precompile_inputs.map(|pi| {
+                let r = pi.ecsm[ecsm_cursor];
+                ecsm_cursor += 1;
+                r
+            });
             let (ecsm_memw, ecsm_op, ecdas_rows) =
-                collect_ecsm_ops(op, memory_state, register_state);
-            memw.extend_ops(ecsm_memw);
+                collect_ecsm_ops(op, recorded, memory_state, register_state);
+            capture_ecall_reg_accesses(&ecsm_memw, op_idx, &mut ecall_accesses);
+            push_ecall_memw_ops(&mut memw, ecsm_memw, device_registers, device_memory_drop);
             ecsm_ops.push(ecsm_op);
             ecdas_ops.extend(ecdas_rows);
         }
@@ -690,7 +948,7 @@ fn collect_ops_from_cpu(
         if !f.word_instr {
             // LT: SLT / BLT / BGE, dispatched on the unified ALU bus. `invert`
             // (BGE/BGEU) is applied inside the LT chip (`out = lt XOR invert`).
-            if f.is_lt() {
+            if f.is_lt() && !skip_opvec {
                 lt_ops.push(LtOperation::new_with_invert(
                     op.rv1,
                     op.arg2,
@@ -701,7 +959,7 @@ fn collect_ops_from_cpu(
             // SHIFT: SLL/SRL/SRA. direction = invert bit (0 = left, 1 = right).
             // The full arg2 goes on the ALU bus as in2; the chip uses its low
             // byte for the (mod 32/64) computation.
-            if f.is_shift() {
+            if f.is_shift() && !skip_opvec {
                 shift_ops.push(ShiftOperation::new(
                     op.rv1,
                     op.arg2,
@@ -715,7 +973,10 @@ fn collect_ops_from_cpu(
         // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
         // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
         // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
-        bitwise_ops.extend(op.collect_bitwise_ops());
+        // FR6: skipped entirely under gpu_full (the device histogram builds these in-walk).
+        if !skip_bitwise {
+            bitwise_ops.extend(op.collect_bitwise_ops());
+        }
     }
 
     // Each ecall generates count+1 operations (count real rows + 1 end row).
@@ -737,6 +998,7 @@ fn collect_ops_from_cpu(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        ecall_accesses,
     )
 }
 
@@ -802,6 +1064,39 @@ fn collect_load_op_from_cpu(
     (memw_op, load_op, bitwise_ops)
 }
 
+/// Option A2 (drop mode): build just the LOAD operation + its bitwise lookups from the op, with NO
+/// MEMW row and NO `memory_state` touch. The MEMW row (with old-state) is produced by the device
+/// walk; the LOAD table + bitwise depend only on the op's own fields (`res` = address, `rvd` =
+/// loaded value), so they need no memory replay. Byte-identical to [`collect_load_op_from_cpu`]'s
+/// `load_op`/`bitwise_ops`.
+fn build_load_op_and_bitwise(op: &CpuOperation) -> (LoadOperation, Vec<BitwiseOperation>) {
+    let base_address = op.res;
+    let (byte_count, signed) = cpu_op_to_bytes_and_signed(op);
+    let loaded_value = op.rvd;
+    let mut value_bytes = [0u32; 8];
+    for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
+        *byte = ((loaded_value >> (j * 8)) & 0xFF) as u32;
+    }
+    let mut res_bytes = value_bytes;
+    if byte_count < 8 {
+        let msb = value_bytes[byte_count - 1];
+        let sign_bit = (msb >> 7) & 1;
+        let fill = if signed && sign_bit == 1 { 0xFF } else { 0 };
+        for byte in res_bytes.iter_mut().skip(byte_count) {
+            *byte = fill;
+        }
+    }
+    let load_op = LoadOperation::new(
+        base_address,
+        op.timestamp,
+        byte_count as u8,
+        signed,
+        res_bytes.map(u64::from),
+    );
+    let bitwise_ops = load_op.collect_bitwise_ops();
+    (load_op, bitwise_ops)
+}
+
 /// Collects a STORE operation as a MEMW write from CpuOperation.
 ///
 /// Returns: memw_op
@@ -856,6 +1151,7 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
 #[allow(clippy::needless_range_loop)]
 fn collect_ecsm_ops(
     op: &CpuOperation,
+    recorded: Option<([u8; 32], [u8; 32])>,
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
@@ -868,16 +1164,37 @@ fn collect_ecsm_ops(
     let addr_xg = register_state.read(11).0;
     let addr_k = register_state.read(12).0;
 
-    // Read the xG and k operands (32 little-endian bytes each) from memory.
-    let mut xg = [0u8; 32];
-    let mut k = [0u8; 32];
-    for i in 0..32 {
-        xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
-        k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
-    }
+    // Read the xG and k operands (32 little-endian bytes each). Option A: use the executor-recorded
+    // operands when available; otherwise read them from the replayed memory_state (legacy path).
+    // Reads don't advance memory_state, so this only changes where the witness inputs come from.
+    let (xg, k) = match recorded {
+        Some(rec) => rec,
+        None => {
+            let mut xg = [0u8; 32];
+            let mut k = [0u8; 32];
+            for i in 0..32 {
+                xg[i] = memory_state.read_byte(addr_xg.wrapping_add(i as u64)).0;
+                k[i] = memory_state.read_byte(addr_k.wrapping_add(i as u64)).0;
+            }
+            (xg, k)
+        }
+    };
 
-    let witness = ::ecsm::compute_witness(&k, &xg)
-        .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
+    // Step C: under gpu_full, skip the ~190ms per-step ECDAS carry convolutions on the CPU — the
+    // device `ecdas_carries` kernel recomputes them (bit-exact) from the point + quotient limbs. The
+    // carries are filled back into `ecdas_ops` in `build_traces` before any consumer reads them (the
+    // bitwise collector + the table fill). Off gpu_full, compute the full witness on CPU as before.
+    #[cfg(feature = "cuda")]
+    let ecsm_carryless = crate::tables::gpu_trace::gpu_full_enabled()
+        && !crate::tables::gpu_trace::gpu_trace_disabled();
+    #[cfg(not(feature = "cuda"))]
+    let ecsm_carryless = false;
+    let witness = if ecsm_carryless {
+        ::ecsm::compute_witness_carryless(&k, &xg)
+    } else {
+        ::ecsm::compute_witness(&k, &xg)
+    }
+    .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
     let mut memw_ops = Vec::with_capacity(15);
 
@@ -1212,7 +1529,7 @@ pub(crate) fn collect_register_ops_parallel<S: MemwSink>(
 
 /// Register word-address bucket count for the device walk: `2*255` (PC) `< 512`.
 #[cfg(feature = "cuda")]
-const REG_WALK_NBINS: u32 = 512;
+pub(crate) const REG_WALK_NBINS: u32 = 512;
 
 /// Whether the device register walk (option A) may replace the CPU register walk for
 /// this op stream. OPT-IN (`LAMBDA_VM_GPU_REGISTERS=1`): the device walk is correct and
@@ -1225,11 +1542,52 @@ const REG_WALK_NBINS: u32 = 512;
 fn device_registers_eligible(cpu_ops: &[CpuOperation]) -> bool {
     #[cfg(all(feature = "cuda", not(feature = "disk-spill")))]
     {
-        std::env::var("LAMBDA_VM_GPU_REGISTERS").is_ok_and(|v| v == "1")
+        // Precompile register accesses (COMMIT/KECCAK/ECSM — ECDAS is internal to ECSM) are captured
+        // into `ecall_accesses` and interleaved into the device walk, so precompile runs are eligible.
+        let _ = cpu_ops;
+        (std::env::var("LAMBDA_VM_GPU_REGISTERS").is_ok_and(|v| v == "1")
+            || crate::tables::gpu_trace::gpu_full_enabled())
             && !crate::tables::gpu_trace::gpu_trace_disabled()
-            && cpu_ops
-                .iter()
-                .all(|op| !op.ecall_commit && !op.ecall_keccak && !op.ecall_ecsm)
+    }
+    #[cfg(not(all(feature = "cuda", not(feature = "disk-spill"))))]
+    {
+        let _ = cpu_ops;
+        false
+    }
+}
+
+/// Whether the device memory walk (option B) may build the memory-side tables for this op
+/// stream. OPT-IN (`LAMBDA_VM_GPU_MEMORY=1`). Unlike the register path this does NOT drop the
+/// CPU memory replay (precompiles read `memory_state` mid-execution), so it is a completeness
+/// milestone, not a speed win: the device walk's aligned/general rows + final snapshot feed the
+/// SAME validated MEMW / PAGE-FINI / ARE_BYTES downstream. Always false without `cuda`, or under
+/// `disk-spill`. Independent of `device_registers` — the two compose.
+fn device_memory_eligible(cpu_ops: &[CpuOperation]) -> bool {
+    #[cfg(all(feature = "cuda", not(feature = "disk-spill")))]
+    {
+        let _ = cpu_ops;
+        (std::env::var("LAMBDA_VM_GPU_MEMORY").is_ok_and(|v| v == "1") || device_memory_drop_eligible(cpu_ops))
+            && !crate::tables::gpu_trace::gpu_trace_disabled()
+    }
+    #[cfg(not(all(feature = "cuda", not(feature = "disk-spill"))))]
+    {
+        let _ = cpu_ops;
+        false
+    }
+}
+
+/// Option A2 full drop (`LAMBDA_VM_GPU_MEMORY_DROP=1`): as [`device_memory_eligible`] but ALSO drops
+/// the CPU `memory_state` replay — collect builds no regular MEMW rows and no ecall MEMW rows (device
+/// provides both: regular via the walk, ecall assembled post-walk from the device old-state), and
+/// regular loads emit only their LOAD op + bitwise. The final memory state comes from the device
+/// snapshot (B1). Implies `device_memory` (the device walk must run). Opt-in, GPU-required.
+fn device_memory_drop_eligible(cpu_ops: &[CpuOperation]) -> bool {
+    #[cfg(all(feature = "cuda", not(feature = "disk-spill")))]
+    {
+        let _ = cpu_ops;
+        (std::env::var("LAMBDA_VM_GPU_MEMORY_DROP").is_ok_and(|v| v == "1")
+            || crate::tables::gpu_trace::gpu_full_enabled())
+            && !crate::tables::gpu_trace::gpu_trace_disabled()
     }
     #[cfg(not(all(feature = "cuda", not(feature = "disk-spill"))))]
     {
@@ -1243,7 +1601,7 @@ fn device_registers_eligible(cpu_ops: &[CpuOperation]) -> bool {
 /// [`RegisterState::from_init`], so the device walk's first `old` per bucket matches
 /// the sequential walk's seed.
 #[cfg(feature = "cuda")]
-fn walk_seed_from_register_init(register_init: &[u32]) -> Vec<u64> {
+pub(crate) fn walk_seed_from_register_init(register_init: &[u32]) -> Vec<u64> {
     let word = |pos: usize| register_init.get(pos).copied().unwrap_or(0) as u64;
     let mut seed = vec![0u64; REG_WALK_NBINS as usize];
     for reg in 0..32usize {
@@ -1253,16 +1611,24 @@ fn walk_seed_from_register_init(register_init: &[u32]) -> Vec<u64> {
     seed
 }
 
-/// Result of the on-device MEMW_R build (option A): resident chunk tables plus the
-/// host-side artifacts the remaining CPU consumers still need.
+/// Result of the on-device register walk: the routed MEMW_R rows (fed to the SAME downstream as the
+/// sequential walk — `gen_memw_registers` builds the tables, `mrr` builds the IS_HALF histogram) plus
+/// the rare out-of-range accesses already routed to aligned / general. The point is to REPLACE the
+/// CPU register walk while leaving every downstream consumer byte-for-byte on its validated path.
 #[cfg(feature = "cuda")]
 struct DeviceMemwRegister {
-    tables: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
-    /// IS_HALFWORD ts-delta counts (`[65536]`) to merge into the BITWISE histogram.
-    is_half_counts: Vec<u64>,
+    rows: Vec<RegRow>,
+    /// Device-resident MEMW_R chunk tables, built DIRECTLY from the walk (no row download / host
+    /// RegRow build). `Some` under `want_tables` (gpu_full); then `rows` is empty and these feed
+    /// `gen_memw_registers` directly (via `device_memw_tables`). `None` on the legacy rows path.
+    tables: Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>>,
     /// Rare out-of-range register accesses, already routed to aligned / general.
     aligned_fallback: Vec<MemwOperation>,
     general_fallback: Vec<MemwOperation>,
+    /// The MEMW_R IS_HALFWORD ts-delta histogram (65536 bins) computed as a byproduct of the walk
+    /// (`want_tables` path only; empty otherwise). Fed to the BITWISE merge so the histogram does NOT
+    /// re-walk the ~13M register accesses a second time (fix (a): walk-once).
+    is_half: Vec<u64>,
 }
 
 /// Run the device register walk + route + fill for the BODY register accesses (halt
@@ -1275,69 +1641,275 @@ fn build_device_memw_register(
     cpu_ops: &[CpuOperation],
     register_init: &[u32],
     max_rows: usize,
+    ecall_accesses: &EcallAccesses,
+    want_tables: bool,
 ) -> Option<DeviceMemwRegister> {
-    let mut accesses = Vec::with_capacity(cpu_ops.len() * 4);
-    for op in cpu_ops {
-        emit_register_accesses(op, &mut accesses);
-    }
-    let reg_addr: Vec<u32> = accesses.iter().map(|a| a.reg_addr as u32).collect();
-    let ts: Vec<u64> = accesses.iter().map(|a| a.timestamp).collect();
-    let value: Vec<u64> = accesses.iter().map(|a| a.value).collect();
-    let is_read: Vec<u8> = accesses.iter().map(|a| u8::from(a.is_read)).collect();
-    let emits: Vec<u8> = accesses.iter().map(|a| u8::from(a.emits_row)).collect();
     let seed = walk_seed_from_register_init(register_init);
+    // Run the register memory-model walk on GPU (regular accesses + interleaved ecall accesses; empty
+    // ecall arrays on a precompile-free run). This DROPS the CPU register walk. Under `want_tables`
+    // (gpu_full) the walk fills the MEMW_R chunk tables DIRECTLY on device (no row download / host
+    // RegRow build); otherwise it returns the routed MEMW_R rows (legacy path → validated
+    // `gpu_build_memw_register_tables` in p5). Both return the aligned/general fallback subset.
+    let n = cpu_ops.len();
+    let mut packed = Vec::with_capacity(n);
+    let mut rv1 = Vec::with_capacity(n);
+    let mut rv2 = Vec::with_capacity(n);
+    let mut rvd = Vec::with_capacity(n);
+    let mut next_pc = Vec::with_capacity(n);
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        rvd.push(op.rvd);
+        next_pc.push(op.next_pc);
+    }
+    let e_oi: Vec<u32> = ecall_accesses.reg_op_index.clone();
+    let e_addr: Vec<u32> = ecall_accesses.reg.iter().map(|a| a.reg_addr as u32).collect();
+    let e_ts: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.timestamp).collect();
+    let e_val: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.value).collect();
+    let e_ir: Vec<u8> = ecall_accesses.reg.iter().map(|a| u8::from(a.is_read)).collect();
+    // Route a fallback subset (`[reg_addr, ts, value, old_value, old_ts, is_read]`, emit order) into
+    // aligned / general MEMW exactly as the walk would — shared by both paths.
+    let route_fallback = |fallback: &[[u64; 6]]| {
+        let mut aligned = Vec::new();
+        let mut general = Vec::new();
+        for r in fallback {
+            let [reg_addr, ts, value, old_value, old_ts, is_read] = *r;
+            let val = [(value & 0xFFFF_FFFF) as u32, (value >> 32) as u32];
+            let old = [(old_value & 0xFFFF_FFFF) as u32, (old_value >> 32) as u32];
+            let op = build_reg_fallback(reg_addr, val, old, ts, old_ts, is_read != 0);
+            match classify_memw(&op) {
+                MemwRoute::Aligned => aligned.push(op),
+                MemwRoute::General => general.push(op),
+                MemwRoute::Register => unreachable!("device register fallback must not be MEMW_R"),
+            }
+        }
+        (aligned, general)
+    };
 
-    let (bufs, num_rows, is_half_counts, fallback) =
-        math_cuda::trace_walk::gpu_walk_route_memw_register_chunked(
-            &reg_addr,
-            &ts,
-            &value,
-            &is_read,
-            &emits,
-            &seed,
-            1,
-            REG_WALK_NBINS,
-            max_rows,
+    // MANDATE (gpu_full): fill the MEMW_R chunk tables DIRECTLY on device from the walk — no 447MB row
+    // download, no 9.3M host `RegRow` build. `rows` stays empty (the tables feed `gen_memw_registers`
+    // via `device_memw_tables`; under gpu_full the IS_HALF histogram comes from the resident walk
+    // histogram). The MEMW_R memory bus is partition-invariant across chunks.
+    if want_tables {
+        let (tables, fallback, is_half) =
+            crate::tables::gpu_trace::gpu_build_memw_register_tables_from_walk(
+                &packed, &rv1, &rv2, &rvd, &next_pc, &e_oi, &e_addr, &e_ts, &e_val, &e_ir, &seed, 1,
+                REG_WALK_NBINS, max_rows,
+            )?;
+        let (aligned_fallback, general_fallback) = route_fallback(&fallback);
+        return Some(DeviceMemwRegister {
+            rows: Vec::new(),
+            tables: Some(tables),
+            aligned_fallback,
+            general_fallback,
+            is_half,
+        });
+    }
+
+    // Legacy rows path (device-registers without gpu_full): download the rows + build RegRows on host
+    // → the validated `gpu_build_memw_register_tables` fills the tables in p5.
+    let (rows, fallback) = math_cuda::trace_walk::gpu_walk_route_memw_register_ecall_rows_host(
+        &packed, &rv1, &rv2, &rvd, &next_pc, &e_oi, &e_addr, &e_ts, &e_val, &e_ir, &seed, 1,
+        REG_WALK_NBINS,
+    )
+    .ok()?;
+    // Flat device rows → RegRows (fed into `memw_register_rows`, exactly what the CPU walk produced).
+    let reg_rows: Vec<RegRow> = rows
+        .iter()
+        .map(|r| {
+            let [reg_addr, ts, value, old_value, old_ts, is_read] = *r;
+            RegRow::new(
+                reg_addr,
+                ts,
+                (value & 0xFFFF_FFFF) as u32,
+                (value >> 32) as u32,
+                (old_value & 0xFFFF_FFFF) as u32,
+                (old_value >> 32) as u32,
+                old_ts,
+                is_read != 0,
+            )
+        })
+        .collect();
+    let (aligned_fallback, general_fallback) = route_fallback(&fallback);
+    Some(DeviceMemwRegister {
+        rows: reg_rows,
+        tables: None,
+        aligned_fallback,
+        general_fallback,
+        is_half: Vec::new(), // legacy rows path: histogram walks separately (mrr path)
+    })
+}
+
+/// Result of the on-device memory walk (option B). `state` is the final memory state
+/// reconstructed from the initial image + the device snapshot — it feeds the PAGE-FINI +
+/// ARE_BYTES generators in place of the CPU `memory_state`. `aligned`/`general` are the REGULAR
+/// load/store MEMW_A / MEMW rows (register + ecall rows stay CPU-side), unpacked from the device
+/// walk's packed output; they replace the CPU-emitted regular rows (which are null-sinked in
+/// `collect_ops_from_cpu` under `device_memory`). Validated bit-exact by `diag_memw_ls_device_vs_cpu`.
+#[cfg(feature = "cuda")]
+struct DeviceMemwLs {
+    state: MemoryState,
+    aligned: Vec<MemwOperation>,
+    general: Vec<MemwOperation>,
+    /// A2 drop mode: the ecall MEMORY rows, assembled from the captured op-metadata + the device
+    /// walk's resolved old-state (so the CPU need not replay `memory_state` for them). Empty/unused
+    /// in Option B (there the CPU still produces the ecall rows). Routed aligned / general.
+    ecall_aligned: Vec<MemwOperation>,
+    ecall_general: Vec<MemwOperation>,
+    /// FR4a: the PAGE ARE_BYTES `[NUM_ROWS*NUM_LOOKUP_TYPES]` histogram, computed on-device from the
+    /// image + snapshot (binary search per byte) instead of the ~1s host `build_page_bitwise_arrays`.
+    /// `Some` only when `want_page_hist` (gpu_full) and the device call succeeds; merged in p4 in
+    /// place of the host `(init, fini)` scatter. Bit-identical to `collect_bitwise_from_page`.
+    page_hist: Option<Vec<u64>>,
+    /// A1: the resident PAGE trace tables (one per page, ascending page_bases), built on device from
+    /// the snapshot + image. `Some` under gpu_full (device success) → `gen_pages` returns them
+    /// directly and builds only the (cheap) configs on host, skipping the ~285ms host column fill.
+    page_tables: Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>>,
+    /// LT-resident-table (session 5): the device-generated `memw→lt` operand pairs (lhs=old_timestamp,
+    /// rhs=timestamp) for the REGULAR walk rows (`aligned` ⊕ `general`) — the device analog of
+    /// `collect_lt_from_memw`/`_aligned` over those rows. `Some` under gpu_full. Consumed in p3 (LT):
+    /// the regular-row memw→lt is fed from here (device-derived); the host `collect_lt_from_memw` runs
+    /// only over the ecall + retained rows to avoid double-count.
+    memw_lt_pairs: Option<(Vec<u64>, Vec<u64>)>,
+}
+
+/// Run the device memory-model walk (regular load/store byte-accesses + interleaved ecall
+/// memory bytes) and reconstruct the final memory state from its snapshot. The snapshot is
+/// validated cell-identical to the sequential replay (`diag_memw_ls_device_vs_cpu`), so the
+/// reconstructed state matches the CPU `MemoryState` byte-for-byte. Returns `None` if the GPU
+/// is unavailable at runtime (caller keeps the CPU state). Does NOT drop the CPU replay.
+#[cfg(feature = "cuda")]
+fn build_device_memw_ls<I: ImageSource>(
+    cpu_ops: &[CpuOperation],
+    image: &I,
+    ecall_accesses: &EcallAccesses,
+    want_page_hist: bool,
+) -> Option<DeviceMemwLs> {
+    let n = cpu_ops.len();
+    let mut packed = Vec::with_capacity(n);
+    let mut res = Vec::with_capacity(n);
+    let mut rvd = Vec::with_capacity(n);
+    let mut rv2 = Vec::with_capacity(n);
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        res.push(op.res);
+        rvd.push(op.rvd);
+        rv2.push(op.rv2);
+    }
+    // Sorted initial-memory image (byte addr → value) seeds the walk's `old` per address,
+    // matching `MemoryState::from_image`.
+    let mut pairs: Vec<(u64, u64)> = image.image_iter().map(|(a, v)| (a, v as u64)).collect();
+    pairs.sort_by_key(|&(a, _)| a);
+    let img_addr: Vec<u64> = pairs.iter().map(|&(a, _)| a).collect();
+    let img_val: Vec<u64> = pairs.iter().map(|&(_, v)| v).collect();
+
+    let (pa, na, pg, ng, snap_addr, snap_val, snap_ts, ecall_old_ts, ecall_old_val) =
+        math_cuda::trace_walk::gpu_build_memw_ls_resident_ecall(
+            &packed,
+            &res,
+            &rvd,
+            &rv2,
+            &img_addr,
+            &img_val,
+            &ecall_accesses.mem_op_index,
+            &ecall_accesses.mem_addr,
+            &ecall_accesses.mem_ts,
+            &ecall_accesses.mem_val,
         )
         .ok()?;
 
-    // Wrap each resident chunk buffer into a MEMW_R trace table (matrix stays on
-    // device, fed to the LDE with no upload). Heights mirror the CPU chunk tables.
-    let ncols = memw_register::cols::NUM_COLUMNS;
-    let mut tables = Vec::with_capacity(bufs.len());
-    for (c, buf) in bufs.into_iter().enumerate() {
-        let lo = c * max_rows;
-        let hi = ((c + 1) * max_rows).min(num_rows);
-        let height = (hi - lo).next_power_of_two().max(4);
-        let mut trace = TraceTable::new_main(
-            crate::tables::types::zeroed_fe_vec(height * ncols),
-            ncols,
-            1,
-        );
-        trace.set_main_input_dev(std::sync::Arc::new(buf));
-        tables.push(trace);
-    }
+    // Unpack the REGULAR aligned/general MEMW rows (register rows stay CPU-side).
+    let aligned: Vec<MemwOperation> = pa
+        .chunks_exact(math_cuda::trace_cpu::MEMW_ALIGNED_STRIDE)
+        .map(|c| crate::tables::gpu_trace::unpack_memw_aligned(c.try_into().unwrap()))
+        .collect();
+    let general: Vec<MemwOperation> = pg
+        .chunks_exact(math_cuda::trace_cpu::MEMW_STRIDE)
+        .map(|c| crate::tables::gpu_trace::unpack_memw(c.try_into().unwrap()))
+        .collect();
+    debug_assert_eq!(aligned.len(), na, "device MEMW_A row count mismatch");
+    debug_assert_eq!(general.len(), ng, "device MEMW general row count mismatch");
 
-    // Route the fallback subset into aligned / general exactly as the walk would.
-    let mut aligned_fallback = Vec::new();
-    let mut general_fallback = Vec::new();
-    for r in &fallback {
-        let [reg_addr, ts, value, old_value, old_ts, is_read] = *r;
-        let val = [(value & 0xFFFF_FFFF) as u32, (value >> 32) as u32];
-        let old = [(old_value & 0xFFFF_FFFF) as u32, (old_value >> 32) as u32];
-        let op = build_reg_fallback(reg_addr, val, old, ts, old_ts, is_read != 0);
+    // A2 drop mode: assemble the ecall MEMORY rows from the captured op-metadata + the device
+    // walk's resolved old-state, and route aligned/general — reproducing exactly the rows the CPU
+    // ecall collectors would build (device old-state validated bit-exact by
+    // `diag_ecall_oldstate_device_vs_cpu`). Cheap (a few thousand ecall ops); only used under drop.
+    let mut ecall_aligned = Vec::new();
+    let mut ecall_general = Vec::new();
+    for mo in &ecall_accesses.mem_ops {
+        let f = mo.flat_start as usize;
+        let w = mo.width as usize;
+        let ts = ecall_accesses.mem_ts[f];
+        let mut value = [0u32; 8];
+        let mut old = [0u32; 8];
+        let mut old_ts = [0u64; 8];
+        for b in 0..w {
+            value[b] = (ecall_accesses.mem_val[f + b] & 0xFF) as u32;
+            old[b] = (ecall_old_val[f + b] & 0xFF) as u32;
+            old_ts[b] = ecall_old_ts[f + b];
+        }
+        let op = MemwOperation::new(false, mo.base, value, ts, mo.width, mo.is_read).with_old(old, old_ts);
         match classify_memw(&op) {
-            MemwRoute::Aligned => aligned_fallback.push(op),
-            MemwRoute::General => general_fallback.push(op),
-            MemwRoute::Register => unreachable!("device register fallback must not be MEMW_R"),
+            MemwRoute::Aligned => ecall_aligned.push(op),
+            MemwRoute::General => ecall_general.push(op),
+            MemwRoute::Register => unreachable!("ecall memory op must not classify as MEMW_R"),
         }
     }
 
-    Some(DeviceMemwRegister {
-        tables,
-        is_half_counts,
-        aligned_fallback,
-        general_fallback,
+    let state = MemoryState::from_image_and_snapshot(image, &snap_addr, &snap_val, &snap_ts);
+
+    // FR4a + A1: compute the PAGE ARE_BYTES histogram AND the PAGE trace TABLES on-device from the
+    // image + snapshot (both already built here) — replacing the ~1s host `build_page_bitwise_arrays`
+    // (FR4a) and the ~285ms host PAGE column fill (A1). page_bases come from the reconstructed state
+    // (tiny: DEFAULT_PAGE_SIZE=256KiB → ~18 pages for ethrex_5tx). Only under gpu_full; a device
+    // failure falls back (`None`) to the host page path.
+    let (page_hist, page_tables) = if want_page_hist {
+        let page_bases: Vec<u64> = state.cells.page_bases().collect();
+        let hist = math_cuda::bitwise_hist::gpu_bitwise_hist_page_snapshot(
+            &page_bases,
+            page::DEFAULT_PAGE_SIZE as u64,
+            &img_addr,
+            &img_val,
+            &snap_addr,
+            &snap_val,
+            bitwise::NUM_ROWS,
+            bitwise::NUM_LOOKUP_TYPES,
+        )
+        .ok();
+        // A1 NO-GO (2026-07-21 s3): building the PAGE table on device + downloading it VERIFIES
+        // (bit-correct), but is a net LOSS — `gen_pages` (~285ms) is PARALLEL-HIDDEN in the p5 rayon
+        // scope (p5 wall ~300ms is bounded by other tables), so removing it saves ~0 wall, while the
+        // device fill + 189MB download adds ~103ms serially (trace_build 3398→3463ms). Kept OFF; the
+        // device PAGE fill (`gpu_build_page_tables_from_snapshot`/`page_fill_snapshot`) + the 2-tree
+        // device-commit path (`try_lde_row_major_no_merkle_dev`, which VERIFIES past the commit) are
+        // retained as ready infra. The remaining blocker for a FULLY-resident device preprocessed
+        // table is the R2 aux build reading the host `main_table`.
+        let _ = &snap_ts;
+        let tables = None;
+        (hist, tables)
+    } else {
+        (None, None)
+    };
+
+    // LT-resident-table (session 5): device `memw→lt` operand pairs for the REGULAR rows (`pa`/`pg`,
+    // = `aligned`/`general`). Derived on device from the packed rows' timestamp/old_timestamp columns
+    // (`gpu_memw_lt_pairs`), replacing the host `collect_lt_from_memw`/`_aligned` over those rows.
+    let memw_lt_pairs = if want_page_hist {
+        math_cuda::trace_walk::gpu_memw_lt_pairs(&pa, na, &pg, ng).ok()
+    } else {
+        None
+    };
+
+    Some(DeviceMemwLs {
+        state,
+        aligned,
+        general,
+        ecall_aligned,
+        ecall_general,
+        page_hist,
+        page_tables,
+        memw_lt_pairs,
     })
 }
 
@@ -1351,27 +1923,11 @@ fn build_device_memw_register(
 fn gpu_bitwise_hist_sources(
     cpu_ops: &[CpuOperation],
     memw_register_rows: &[RegRow],
+    page_init: &[u8],
+    page_fini: &[u8],
+    devops: Option<&math_cuda::trace_ops::DeviceCpuOpsResident>,
 ) -> Option<Vec<u64>> {
     let n = cpu_ops.len();
-    let mut rs1 = Vec::with_capacity(n);
-    let mut rs2 = Vec::with_capacity(n);
-    let mut rd = Vec::with_capacity(n);
-    let mut hil = Vec::with_capacity(n);
-    let mut alu = Vec::with_capacity(n);
-    let mut mem = Vec::with_capacity(n);
-    let mut res = Vec::with_capacity(n);
-    let mut word = Vec::with_capacity(n);
-    for op in cpu_ops {
-        let f = &op.decode.fields;
-        rs1.push(f.rs1);
-        rs2.push(f.rs2);
-        rd.push(f.rd);
-        hil.push(f.half_instruction_length);
-        alu.push(f.alu_flags);
-        mem.push(f.mem_flags);
-        res.push(op.res);
-        word.push(u8::from(f.word_instr));
-    }
     let mut memw_ts = Vec::with_capacity(memw_register_rows.len());
     let mut memw_old_ts = Vec::with_capacity(memw_register_rows.len());
     for r in memw_register_rows {
@@ -1379,22 +1935,204 @@ fn gpu_bitwise_hist_sources(
         memw_ts.push(ts);
         memw_old_ts.push(ots);
     }
-    let fields = math_cuda::bitwise_hist::CpuOpFields {
-        rs1: &rs1,
-        rs2: &rs2,
-        rd: &rd,
-        hil: &hil,
-        alu_flags: &alu,
-        mem_flags: &mem,
-        res: &res,
-        word: &word,
-    };
-    math_cuda::bitwise_hist::gpu_bitwise_hist(
-        &fields,
+    // RESIDENT in-walk: when the device cpu_ops seam is present, read `packed`/`res` from it directly
+    // (no ~64 MiB re-upload — the biggest source becomes upload-free). Otherwise upload `packed`+`res`.
+    if let Some(d) = devops {
+        return math_cuda::bitwise_hist::gpu_bitwise_hist_resident_devops(
+            &d.packed,
+            &d.res,
+            n,
+            &memw_ts,
+            &memw_old_ts,
+            page_init,
+            page_fini,
+            bitwise::NUM_ROWS,
+            bitwise::NUM_LOOKUP_TYPES,
+        )
+        .ok();
+    }
+    // in-walk via upload: the device kernel unpacks the decode fields from `packed` itself, so we
+    // upload only `packed`+`res` (2 arrays) rather than the 8 `CpuOpFields`.
+    let mut packed = Vec::with_capacity(n);
+    let mut res = Vec::with_capacity(n);
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        res.push(op.res);
+    }
+    math_cuda::bitwise_hist::gpu_bitwise_hist_resident_upload(
+        &packed,
+        &res,
         &memw_ts,
         &memw_old_ts,
+        page_init,
+        page_fini,
         bitwise::NUM_ROWS,
         bitwise::NUM_LOOKUP_TYPES,
+    )
+    .ok()
+}
+
+/// FR3: the WHOLE resident BITWISE histogram in ONE device buffer + ONE reduce/download —
+/// in_walk (resident `packed`/`res`) + all op-vec sources + page + memw_reg (resident register walk).
+/// Assembles the op-vec SoA + memw_reg walk inputs from the host op vectors, then calls
+/// `gpu_bitwise_hist_full`. Returns the `[NUM_ROWS*NUM_LOOKUP_TYPES]` counter array (bit-identical to
+/// the sum of `gpu_opvec_hist` + `gpu_bitwise_hist` (in_walk+page) + `gpu_memw_reg_hist`), or `None`
+/// on runtime GPU failure. The caller then merges only the tiny EC/precompile + mul/dvrm-dedup CPU tail.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn gpu_bitwise_hist_full_sources(
+    devops: &math_cuda::trace_ops::DeviceCpuOpsResident,
+    cpu_ops: &[CpuOperation],
+    lt_ops: &[LtOperation],
+    memw_lt_lhs: &[u64],
+    memw_lt_rhs: &[u64],
+    store_ops: &[store::StoreOperation],
+    bytewise_ops: &[bytewise::BytewiseOperation],
+    eq_ops: &[eq::EqOperation],
+    branch_ops: &[BranchOperation],
+    shift_ops: &[ShiftOperation],
+    cpu32_ops: &[cpu32::Cpu32Operation],
+    load_ops: &[LoadOperation],
+    memw_aligned_ops: &[MemwOperation],
+    mul_ops: &[(MulOperation, bool)],
+    dvrm_ops: &[(DvrmOperation, bool)],
+    ecall_accesses: &EcallAccesses,
+    register_init: &[u32],
+    page_init: &[u8],
+    page_fini: &[u8],
+    // Fix (a) walk-once: skip the histogram's internal register walk (the register-table walk already
+    // produced the MEMW_R IS_HALF counts, merged via `device_is_half`).
+    skip_memw_reg: bool,
+) -> Option<Vec<u64>> {
+    // op-vec SoA (same layout as the standalone `gpu_opvec_hist` assembly).
+    // STEP 2A: the LT histogram's instruction+dvrm→lt parts are scattered ON-DEVICE (key gathers inside
+    // `gpu_bitwise_hist_full`); `OpVecSources.lt` carries ONLY the memw→lt pairs (device-derived, passed in).
+    let _ = lt_ops;
+    let lt_lhs: &[u64] = memw_lt_lhs;
+    let lt_rhs: &[u64] = memw_lt_rhs;
+    // FR4b: STORE / EQ / BYTEWISE are computed ON-DEVICE from the resident packed/rv1/rv2/arg2 seam
+    // (`bitwise_hist_opvec_packed` inside `gpu_bitwise_hist_full`) — no host SoA build/upload. Left
+    // empty in `OpVecSources` so `scatter_opvec` skips them. `store_ops`/`bytewise_ops`/`eq_ops` are
+    // still passed (unused here; they feed their chip tables elsewhere).
+    // S3: BRANCH + LOAD + CPU32 are computed ON-DEVICE from the resident seam
+    // (`bitwise_hist_branch_load_packed` + the reused CPU32 op-build, inside `gpu_bitwise_hist_full`)
+    // — no host SoA build. Left empty in `OpVecSources` so `scatter_opvec` skips them. (`cpu32_ops` is
+    // still built on host for the derived cpu32→shift/mul/dvrm op-vecs, not yet device-resident.)
+    let _ = (store_ops, bytewise_ops, eq_ops, branch_ops, load_ops, cpu32_ops);
+    let store_val: &[u64] = &[];
+    let byw_a: &[u64] = &[];
+    let byw_b: &[u64] = &[];
+    let byw_op: &[u8] = &[];
+    let eq_a: &[u64] = &[];
+    let eq_b: &[u64] = &[];
+    let br_npc: &[u64] = &[];
+    let br_unm: &[u64] = &[];
+    let ld_res: &[u64] = &[];
+    let ld_width: &[u32] = &[];
+    let c32_hil: &[u8] = &[];
+    let c32_alu: &[u8] = &[];
+    let c32_rs1: &[u8] = &[];
+    let c32_rs2: &[u8] = &[];
+    let c32_rd: &[u8] = &[];
+    let c32_rv1: &[u64] = &[];
+    let c32_rv2: &[u64] = &[];
+    let c32_res: &[u64] = &[];
+    // S3: SHIFT is computed ON-DEVICE from the resident SHIFT op-build (instruction ⊕ cpu32-derived)
+    // inside `gpu_bitwise_hist_full` — no host SoA. Left empty so `scatter_opvec` skips it.
+    let _ = shift_ops;
+    let sh_val: &[u64] = &[];
+    let sh_shift: &[u8] = &[];
+    let sh_amount: &[u64] = &[];
+    let sh_flags: &[u32] = &[];
+    let ma_base: Vec<u64> = memw_aligned_ops.iter().map(|o| o.base_address).collect();
+    let ma_width: Vec<u32> = memw_aligned_ops.iter().map(|o| o.width as u32).collect();
+    let ma_flag: Vec<u32> = vec![1u32; memw_aligned_ops.len()];
+    // S3: MUL per-op is computed ON-DEVICE from the merged MUL key stream (all 4 sources) inside
+    // `gpu_bitwise_hist_full` — no host SoA. Left empty so `scatter_opvec` skips it. (`mul_ops` stays:
+    // the chunk-deduped MSB16 tail `collect_bitwise_from_mul_dedup` reads it on host.)
+    let _ = &mul_ops;
+    let mul_lhs: &[u64] = &[];
+    let mul_rhs: &[u64] = &[];
+    let mul_flags: &[u32] = &[];
+    // S3: DVRM per-op is computed ON-DEVICE from the merged DVRM key stream inside
+    // `gpu_bitwise_hist_full` — no host SoA. Left empty so `scatter_opvec` skips it. (`dvrm_ops` stays:
+    // the chunk-deduped MSB16/NEG-ZERO tail `collect_bitwise_from_dvrm_dedup` reads it on host.)
+    let _ = &dvrm_ops;
+    let dvrm_n: &[u64] = &[];
+    let dvrm_d: &[u64] = &[];
+    let dvrm_flags: &[u32] = &[];
+    let src = math_cuda::bitwise_hist::OpVecSources {
+        lt_lhs,
+        lt_rhs,
+        store_val,
+        bytewise_a: byw_a,
+        bytewise_b: byw_b,
+        bytewise_op: byw_op,
+        eq_a,
+        eq_b,
+        load_res: ld_res,
+        load_width: ld_width,
+        cpu32_hil: c32_hil,
+        cpu32_alu: c32_alu,
+        cpu32_rs1: c32_rs1,
+        cpu32_rs2: c32_rs2,
+        cpu32_rd: c32_rd,
+        cpu32_rv1: c32_rv1,
+        cpu32_rv2: c32_rv2,
+        cpu32_res: c32_res,
+        branch_next_pc: br_npc,
+        branch_unmasked: br_unm,
+        shift_value: sh_val,
+        shift_shift: sh_shift,
+        shift_amount: sh_amount,
+        shift_flags: sh_flags,
+        memw_aligned_base: &ma_base,
+        memw_aligned_width: &ma_width,
+        memw_aligned_flag: &ma_flag,
+        mul_lhs,
+        mul_rhs,
+        mul_flags,
+        dvrm_n,
+        dvrm_d,
+        dvrm_flags,
+    };
+    // memw_reg resident-walk inputs (rv1/rv2/rvd/next_pc + ecall accesses + seed) — packed/res come
+    // from the resident `devops` seam (reused for the walk, no re-upload).
+    let n = cpu_ops.len();
+    // rv1/rv2/rvd come from the resident cpu_ops seam (no re-upload); only next_pc is host-built.
+    let next_pc: Vec<u64> = cpu_ops.iter().map(|o| o.next_pc).collect();
+    let e_oi: Vec<u32> = ecall_accesses.reg_op_index.clone();
+    let e_addr: Vec<u32> = ecall_accesses.reg.iter().map(|a| a.reg_addr as u32).collect();
+    let e_ts: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.timestamp).collect();
+    let e_val: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.value).collect();
+    let e_ir: Vec<u8> = ecall_accesses.reg.iter().map(|a| u8::from(a.is_read)).collect();
+    let seed = walk_seed_from_register_init(register_init);
+    math_cuda::bitwise_hist::gpu_bitwise_hist_full(
+        &devops.packed,
+        &devops.res,
+        n,
+        &devops.rv1,
+        &devops.rv2,
+        &devops.arg2,
+        &devops.rvd,
+        &devops.pc,
+        &devops.imm,
+        &devops.flags,
+        &next_pc,
+        &e_oi,
+        &e_addr,
+        &e_ts,
+        &e_val,
+        &e_ir,
+        &seed,
+        1,
+        REG_WALK_NBINS,
+        page_init,
+        page_fini,
+        &src,
+        bitwise::NUM_ROWS,
+        bitwise::NUM_LOOKUP_TYPES,
+        skip_memw_reg,
     )
     .ok()
 }
@@ -1495,7 +2233,7 @@ fn cpu32_res(c: &cpu32::Cpu32Operation, arg1: u64, arg2: u64) -> u64 {
 
 /// Builds the CPU32 row for a word (`*W`) instruction. `op.rv1/rv2/rvd` carry the
 /// real register values (the main CPU delegate row zeroes its own columns).
-fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
+pub(crate) fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
     let f = &op.decode.fields;
     let mut c = cpu32::Cpu32Operation {
         timestamp: op.timestamp,
@@ -1525,7 +2263,7 @@ fn build_cpu32_op(op: &CpuOperation) -> cpu32::Cpu32Operation {
 /// 8×IS_HALF (rv1/rv2 low-word halves + the 4 res halves), 1×BYTE_ALU (extracts
 /// the signed bit from `alu_flags`), and the MSB16 sign bits: `res` always, plus
 /// `rv1`/`rv2` only when `signed` (their MSB16 is gated by the `signed` column).
-fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
     let mut ops = Vec::with_capacity(17);
     let half = |v: u64, sh: u32| ((v >> sh) & 0xFFFF) as u16;
     let push_half = |ops: &mut Vec<BitwiseOperation>, kind, h: u16| {
@@ -1573,7 +2311,7 @@ fn collect_cpu32_bitwise(c: &cpu32::Cpu32Operation) -> Vec<BitwiseOperation> {
 /// The ALU-chip op a word ALU instruction dispatches (SHIFT/MUL/DVRM). ADDW/SUBW
 /// are the CPU32 ADD/SUB fast-path (no external chip), returning `None`.
 #[allow(clippy::type_complexity)]
-fn cpu32_chip_op(
+pub(crate) fn cpu32_chip_op(
     c: &cpu32::Cpu32Operation,
     shift_ops: &mut Vec<ShiftOperation>,
     mul_ops: &mut Vec<(MulOperation, bool)>,
@@ -1619,6 +2357,7 @@ fn cpu32_chip_op(
 /// Returns: Vec of MEMW operations
 fn collect_commit_memw_ops(
     op: &CpuOperation,
+    recorded: Option<&[u8]>,
     register_state: &mut RegisterState,
     memory_state: &mut MemoryState,
 ) -> Vec<MemwOperation> {
@@ -1694,10 +2433,14 @@ fn collect_commit_memw_ops(
         register_state.write_index(new_index, ts);
     }
 
-    // Memory byte reads at ts
+    // Memory byte reads at ts. Option A: the committed byte VALUE comes from the executor recording
+    // when available (identical to the replayed value, but valid even when the memory_state replay is
+    // dropped in A2); the old_timestamp still tracks the memory timeline (correct under the full
+    // replay; the device supplies it post-walk when the replay is dropped, and this row is discarded).
     for i in 0..count {
         let addr = buf_addr.wrapping_add(i);
-        let (byte_val, old_ts) = memory_state.read_byte(addr);
+        let (ms_val, old_ts) = memory_state.read_byte(addr);
+        let byte_val = recorded.map_or(ms_val, |b| b[i as usize]);
         let value = [byte_val as u32, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
         let memw_op =
@@ -2015,7 +2758,7 @@ fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
 /// Collects bitwise lookups from LT operations (MSB16 and IS_HALFWORD).
 ///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_lt(lt_ops: &[LtOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(lt_ops.len() * 8);
 
     for op in lt_ops {
@@ -2333,6 +3076,109 @@ pub(crate) fn collect_bitwise_from_dvrm(
     bitwise_ops
 }
 
+/// P4b: the CHUNK-DEDUP tail of `collect_bitwise_from_mul` ONLY (the per-chunk-unique signed-operand
+/// MSB16 lookups). The per-op bulk (IS_HALF ×20 + IS_B20 ×4) is scattered on device
+/// (`bitwise_hist_mul_perop`); this small, chunk-boundary-dependent remainder stays on CPU.
+pub(crate) fn collect_bitwise_from_mul_dedup(
+    mul_ops: &[(MulOperation, bool)],
+    max_rows_mul: usize,
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::new();
+    for chunk in mul_ops.chunks(max_rows_mul) {
+        let mut msb16_seen = std::collections::HashSet::new();
+        for (op, _wants_hi) in chunk {
+            if msb16_seen.insert((op.lhs, op.lhs_signed, op.rhs, op.rhs_signed)) {
+                if op.lhs_signed {
+                    let lhs_3 = ((op.lhs >> 48) & 0xFFFF) as u16;
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::Msb16,
+                        (lhs_3 & 0xFF) as u8,
+                        (lhs_3 >> 8) as u8,
+                    ));
+                }
+                if op.rhs_signed {
+                    let rhs_3 = ((op.rhs >> 48) & 0xFFFF) as u16;
+                    bitwise_ops.push(BitwiseOperation::halfword(
+                        BitwiseOperationType::Msb16,
+                        (rhs_3 & 0xFF) as u8,
+                        (rhs_3 >> 8) as u8,
+                    ));
+                }
+            }
+        }
+    }
+    bitwise_ops
+}
+
+/// P4b: the CHUNK-DEDUP tail of `collect_bitwise_from_dvrm` ONLY (per-chunk-unique signed MSB16 +
+/// the NEG-template ZERO lookups). The per-op bulk (IS_HALF ×20 + ZERO ×2) is scattered on device
+/// (`bitwise_hist_dvrm_perop`); this small remainder stays on CPU.
+pub(crate) fn collect_bitwise_from_dvrm_dedup(
+    dvrm_ops: &[(DvrmOperation, bool)],
+    max_rows_dvrm: usize,
+) -> Vec<BitwiseOperation> {
+    let mut bitwise_ops = Vec::new();
+    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
+        let mut msb16_seen = std::collections::HashSet::new();
+        for (op, _wants_remainder) in chunk {
+            if op.signed && msb16_seen.insert(op.clone()) {
+                let r = op.compute_remainder();
+                let n_3 = ((op.n >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (n_3 & 0xFF) as u8,
+                    (n_3 >> 8) as u8,
+                ));
+                let r_3 = ((r >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (r_3 & 0xFF) as u8,
+                    (r_3 >> 8) as u8,
+                ));
+                let d_3 = ((op.d >> 48) & 0xFFFF) as u16;
+                bitwise_ops.push(BitwiseOperation::halfword(
+                    BitwiseOperationType::Msb16,
+                    (d_3 & 0xFF) as u8,
+                    (d_3 >> 8) as u8,
+                ));
+            }
+        }
+    }
+    for chunk in dvrm_ops.chunks(max_rows_dvrm) {
+        let mut zero_seen = std::collections::HashSet::new();
+        for (op, _wants_remainder) in chunk {
+            if zero_seen.insert(op.clone()) {
+                if op.sign_r() {
+                    let r = op.compute_remainder();
+                    let r_halves: [u32; 4] = [
+                        (r & 0xFFFF) as u32,
+                        ((r >> 16) & 0xFFFF) as u32,
+                        ((r >> 32) & 0xFFFF) as u32,
+                        ((r >> 48) & 0xFFFF) as u32,
+                    ];
+                    bitwise_ops.push(BitwiseOperation::zero(r_halves[0] + r_halves[1]));
+                    bitwise_ops.push(BitwiseOperation::zero(
+                        r_halves[0] + r_halves[1] + r_halves[2] + r_halves[3],
+                    ));
+                }
+                if op.sign_d() {
+                    let d_halves: [u32; 4] = [
+                        (op.d & 0xFFFF) as u32,
+                        ((op.d >> 16) & 0xFFFF) as u32,
+                        ((op.d >> 32) & 0xFFFF) as u32,
+                        ((op.d >> 48) & 0xFFFF) as u32,
+                    ];
+                    bitwise_ops.push(BitwiseOperation::zero(d_halves[0] + d_halves[1]));
+                    bitwise_ops.push(BitwiseOperation::zero(
+                        d_halves[0] + d_halves[1] + d_halves[2] + d_halves[3],
+                    ));
+                }
+            }
+        }
+    }
+    bitwise_ops
+}
+
 /// Collects bitwise lookups from BRANCH operations.
 ///
 /// BRANCH sends:
@@ -2341,7 +3187,7 @@ pub(crate) fn collect_bitwise_from_dvrm(
 /// - IS_HALFWORD[next_pc_high[0..3]] - range checks for bits 16-63
 ///
 /// Returns: Vec of bitwise lookups
-fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOperation> {
+pub(crate) fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOperation> {
     let mut bitwise_ops = Vec::with_capacity(branch_ops.len() * 5);
 
     for op in branch_ops {
@@ -2531,6 +3377,43 @@ pub(crate) fn build_init_page_data<I: ImageSource>(image: &I) -> HashMap<u64, Ve
     init_page_data
 }
 
+/// Build the PAGE source's per-byte `(init, fini)` arrays — the same bytes `collect_bitwise_from_page`
+/// bumps as ARE_BYTES[init, fini], but stored for the device scatter (`bitwise_hist_page`) instead of
+/// counted on host. Same order/set of bytes, so the multiplicities match (the bus is
+/// permutation-invariant). Returns `(init, fini)` each of length `num_pages * page_size`.
+#[cfg(feature = "cuda")]
+fn build_page_bitwise_arrays<I: ImageSource>(
+    image: &I,
+    memory_state: &MemoryState,
+    exclude_touched: bool,
+) -> (Vec<u8>, Vec<u8>) {
+    use std::collections::BTreeSet;
+
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let init_page_data = build_init_page_data(image);
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
+    let final_state: FinalStateMap = memory_state
+        .cells
+        .iter()
+        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
+        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .collect();
+
+    let mut init = Vec::with_capacity(page_bases.len() * page_size);
+    let mut fini = Vec::with_capacity(page_bases.len() * page_size);
+    for &page_base in &page_bases {
+        let init_data = init_page_data.get(&page_base);
+        for offset in 0..page_size {
+            let addr = page_base + offset as u64;
+            let iv = init_data.map_or(0u8, |data| data.get(offset).copied().unwrap_or(0));
+            let fv = final_state.get(&addr).map_or(iv, |state| state.value);
+            init.push(iv);
+            fini.push(fv);
+        }
+    }
+    (init, fini)
+}
+
 fn collect_bitwise_from_page<I: ImageSource>(
     image: &I,
     memory_state: &MemoryState,
@@ -2591,6 +3474,7 @@ fn collect_bitwise_from_page<I: ImageSource>(
 /// at the moment the ECALL executes.
 fn expand_commit_operations_for_ecall(
     ecall: &CpuOperation,
+    recorded: Option<&[u8]>,
     memory_state: &MemoryState,
     start_index: u64,
 ) -> Vec<CommitOperation> {
@@ -2604,8 +3488,12 @@ fn expand_commit_operations_for_ecall(
         let remaining = count - i;
         let is_end = remaining == 0;
         let value = if !is_end {
-            let (byte_val, _ts) = memory_state.read_byte(buf_addr.wrapping_add(i));
-            byte_val
+            // Option A: use the executor-recorded committed bytes when available; otherwise read
+            // from the replayed memory_state (legacy path).
+            match recorded {
+                Some(bytes) => bytes[i as usize],
+                None => memory_state.read_byte(buf_addr.wrapping_add(i)).0,
+            }
         } else {
             0
         };
@@ -3070,6 +3958,34 @@ fn generate_page_tables<I: ImageSource>(
     (pages, page_configs)
 }
 
+/// A1: build ONLY the `PageConfig`s (the cheap part of [`generate_page_tables`]) — the per-page
+/// metadata the Memory bus needs — WITHOUT the ~285ms per-byte trace fill (that is done on device
+/// via `gpu_build_page_tables_from_snapshot`). Same page_bases order (BTreeSet) as the device tables.
+#[cfg(feature = "cuda")]
+fn build_page_configs<I: ImageSource>(
+    image: &I,
+    memory_state: &MemoryState,
+    private_input: &[u8],
+) -> Vec<PageConfig> {
+    use std::collections::BTreeSet;
+    let init_page_data = build_init_page_data(image);
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
+    let num_private_input_pages = page::private_input_page_count(private_input);
+    let mut page_configs = Vec::with_capacity(page_bases.len());
+    for &page_base in &page_bases {
+        let config = if page::is_private_input_page(page_base, num_private_input_pages) {
+            let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
+            PageConfig::with_private_input(page_base, init_data)
+        } else if let Some(init_data) = init_page_data.get(&page_base) {
+            PageConfig::with_data(page_base, init_data.clone())
+        } else {
+            PageConfig::zero_init(page_base)
+        };
+        page_configs.push(config);
+    }
+    page_configs
+}
+
 // =============================================================================
 // Trace Generation
 // =============================================================================
@@ -3184,6 +4100,8 @@ struct CollectedOps {
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    // Ecall-generated register/memory accesses (for the resident walks; P1-ecall/residency).
+    ecall_accesses: EcallAccesses,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
@@ -3238,8 +4156,16 @@ fn collect_all_ops(
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
+    ecall_accesses: EcallAccesses,
     register_state: &mut RegisterState,
     is_final: bool,
+    // FR6 (gpu_full): the device histogram covers CPU32 BITWISE too — skip the host `bitwise_ops` extend.
+    skip_bitwise: bool,
+    // Step B (gpu_full): `branch_ops`/`eq_ops`/`bytewise_ops`/`store_ops` and the dvrm→lt `lt_ops` push
+    // are DEAD under the resident pipeline (their chip tables build from `devops`, the histogram is
+    // device-derived). Skip building them. `mul_ops`/`dvrm_ops` + the cpu32→mul/dvrm derivations are KEPT
+    // (the host MSB16 dedup tail still reads them). See `collect_ops_from_cpu_inner`'s `skip_opvec`.
+    skip_opvec: bool,
 ) -> CollectedOps {
     // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
@@ -3261,19 +4187,24 @@ fn collect_all_ops(
         general: memw_ops,
     } = memw;
 
-    // Collect BRANCH operations from CPU ops where branch_cond = true
-    let branch_ops: Vec<BranchOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.branch_cond)
-        .map(|op| {
-            BranchOperation::new(
-                op.decode.pc,
-                op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
-                op.rv1,        // register value must match the CPU's BRANCH bus signature
-                op.decode.fields.jalr(),
-            )
-        })
-        .collect();
+    // Collect BRANCH operations from CPU ops where branch_cond = true.
+    // Step B: dead under gpu_full (resident BRANCH table + device histogram) → skip.
+    let branch_ops: Vec<BranchOperation> = if skip_opvec {
+        Vec::new()
+    } else {
+        cpu_ops
+            .iter()
+            .filter(|op| op.branch_cond)
+            .map(|op| {
+                BranchOperation::new(
+                    op.decode.pc,
+                    op.decode.imm, // offset as full 64-bit DWordWL (already sign-extended)
+                    op.rv1,        // register value must match the CPU's BRANCH bus signature
+                    op.decode.fields.jalr(),
+                )
+            })
+            .collect()
+    };
 
     // Collect MUL operations from non-word MUL instructions. lhs_signed = `signed`
     // (alu_flags bit 5); rhs_signed = `signed2` (bit 6); wants_hi = `muldiv` (bit 7).
@@ -3304,36 +4235,49 @@ fn collect_all_ops(
 
     // Collect the ALU/MEMORY chip ops (non-word rows).
     // EQ: BEQ/BNE (invert = alu_flags bit 6). BYTEWISE: AND/OR/XOR (op = alu_op).
-    let eq_ops: Vec<eq::EqOperation> = cpu_ops
-        .iter()
-        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
-        .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
-        .collect();
-    let bytewise_ops: Vec<bytewise::BytewiseOperation> = cpu_ops
-        .iter()
-        .filter(|op| {
-            let f = &op.decode.fields;
-            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
-        })
-        .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
-        .collect();
+    // Step B: eq/bytewise/store are dead under gpu_full (resident tables + device histogram) → skip.
+    let eq_ops: Vec<eq::EqOperation> = if skip_opvec {
+        Vec::new()
+    } else {
+        cpu_ops
+            .iter()
+            .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+            .map(|op| eq::EqOperation::new(op.rv1, op.arg2, op.decode.fields.alu_signed2_or_invert()))
+            .collect()
+    };
+    let bytewise_ops: Vec<bytewise::BytewiseOperation> = if skip_opvec {
+        Vec::new()
+    } else {
+        cpu_ops
+            .iter()
+            .filter(|op| {
+                let f = &op.decode.fields;
+                !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+            })
+            .map(|op| bytewise::BytewiseOperation::new(op.rv1, op.arg2, op.decode.fields.alu_op()))
+            .collect()
+    };
     // STORE: receives MEMORY(memory_op=1) from the CPU and sends the MEMW write
     // at timestamp+1 (mirrors `collect_store_op_from_cpu`, which records the MEMW
     // table row).
-    let store_ops: Vec<store::StoreOperation> = cpu_ops
-        .iter()
-        .filter(|op| op.decode.fields.is_store())
-        .map(|op| {
-            // The MEMORY bus and the STORE chip's MEMW write share the base
-            // timestamp (spec store.toml uses one `timestamp` for both).
-            store::StoreOperation::new(
-                op.res,
-                op.timestamp,
-                op.rv2,
-                op.decode.fields.mem_bytes() as u8,
-            )
-        })
-        .collect();
+    let store_ops: Vec<store::StoreOperation> = if skip_opvec {
+        Vec::new()
+    } else {
+        cpu_ops
+            .iter()
+            .filter(|op| op.decode.fields.is_store())
+            .map(|op| {
+                // The MEMORY bus and the STORE chip's MEMW write share the base
+                // timestamp (spec store.toml uses one `timestamp` for both).
+                store::StoreOperation::new(
+                    op.res,
+                    op.timestamp,
+                    op.rv2,
+                    op.decode.fields.mem_bytes() as u8,
+                )
+            })
+            .collect()
+    };
 
     // CPU32 (word `*W`) dispatch: each CPU32 row that uses the full ALU sends to
     // the SHIFT/MUL/DVRM chips (ADDW/SUBW are the CPU32 ADD/SUB fast-path). These
@@ -3341,12 +4285,17 @@ fn collect_all_ops(
     // internal consistency lookups. CPU32 also sends its own BITWISE range checks.
     for c in &cpu32_ops {
         cpu32_chip_op(c, &mut shift_ops, &mut mul_ops, &mut dvrm_ops);
-        bitwise_ops.extend(collect_cpu32_bitwise(c));
+        if !skip_bitwise {
+            bitwise_ops.extend(collect_cpu32_bitwise(c));
+        }
     }
 
-    // Collect LT operations from DVRM: |r| < |d| (unsigned comparison)
-    for (op, _wants_remainder) in &dvrm_ops {
-        lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+    // Collect LT operations from DVRM: |r| < |d| (unsigned comparison).
+    // Step B: dead under gpu_full (resident LT table merges dvrm→lt on device; histogram device-derived).
+    if !skip_opvec {
+        for (op, _wants_remainder) in &dvrm_ops {
+            lt_ops.push(LtOperation::new(op.abs_r(), op.abs_d(), false));
+        }
     }
 
     // Collect MUL operations from DVRM: d * q = n_sub_r (C13 lo, C14 hi)
@@ -3380,6 +4329,7 @@ fn collect_all_ops(
         cpu32_ops,
         ecsm_ops,
         ecdas_ops,
+        ecall_accesses,
     }
 }
 
@@ -3391,6 +4341,7 @@ fn collect_all_ops(
 #[allow(clippy::too_many_arguments)]
 fn build_traces<I: ImageSource + Sync>(
     ops: CollectedOps,
+    logs: &[Log],
     initial_image: Option<&I>,
     memory_state: &MemoryState,
     register_init: &[u32],
@@ -3403,9 +4354,11 @@ fn build_traces<I: ImageSource + Sync>(
     is_final: bool,
     l2g_memory_bookend: bool,
     device_registers: bool,
+    device_memory: bool,
+    device_memory_drop: bool,
 ) -> Result<Traces, Error> {
     #[cfg(not(feature = "cuda"))]
-    let _ = device_registers;
+    let _ = (device_registers, device_memory, device_memory_drop, logs);
     let CollectedOps {
         cpu_ops,
         #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
@@ -3428,7 +4381,9 @@ fn build_traces<I: ImageSource + Sync>(
         store_ops,
         cpu32_ops,
         ecsm_ops,
-        ecdas_ops,
+        #[cfg_attr(not(feature = "cuda"), allow(unused_mut))]
+        mut ecdas_ops,
+        ecall_accesses,
     } = ops;
 
     // Device MEMW_R build (option A): on a precompile-free GPU run the register walk +
@@ -3437,24 +4392,52 @@ fn build_traces<I: ImageSource + Sync>(
     // deltas merge into the BITWISE histogram, and its rare fallbacks route into
     // aligned/general (below, before Phase 3 so they get timestamp LT checks). If the
     // GPU is unavailable at runtime, recompute the register rows on CPU.
+    // The device register walk (below) feeds `memw_register_rows` directly (legacy), OR — under
+    // gpu_full — fills the MEMW_R chunk tables DIRECTLY on device (`device_memw_tables = Some`, rows
+    // empty), which `gen_memw_registers` returns as-is. The IS_HALF histogram flows via the resident
+    // walk histogram (gpu_full) or the `mrr` path.
     #[cfg(feature = "cuda")]
-    let mut device_memw_tables: Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> =
-        None;
+    let mut device_memw_tables: Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> = None;
+    // Fix (a) walk-once: the device register walk (below) already computes the MEMW_R IS_HALF ts-delta
+    // histogram as a byproduct. Capture it here so the BITWISE merge uses it (via `device_is_half`) and
+    // `gpu_bitwise_hist_full` SKIPS a redundant SECOND walk over the ~13M register accesses.
     #[cfg(feature = "cuda")]
     let mut device_is_half: Option<Vec<u64>> = None;
+    // gpu_full → build MEMW_R tables directly on device from the walk (skip the 447MB row download +
+    // 9.3M host RegRow build). Otherwise the legacy rows path.
+    #[cfg(feature = "cuda")]
+    let want_memw_reg_tables = crate::tables::gpu_trace::gpu_full_enabled()
+        && !crate::tables::gpu_trace::gpu_trace_disabled();
     #[cfg(feature = "cuda")]
     if device_registers {
-        if let Some(dm) =
-            build_device_memw_register(&cpu_ops, register_init, max_rows.memw_register)
-        {
+        if let Some(dm) = build_device_memw_register(
+            &cpu_ops,
+            register_init,
+            max_rows.memw_register,
+            &ecall_accesses,
+            want_memw_reg_tables,
+        ) {
+            // Device walk REPLACES the CPU register walk. Under gpu_full its MEMW_R chunk TABLES are
+            // built on device (`dm.tables = Some`, `dm.rows` empty) and returned directly by
+            // `gen_memw_registers`; otherwise its routed MEMW_R rows become `memw_register_rows`
+            // (→ gen_memw_registers + mrr IS_HALF). Rare fallbacks route to aligned/general either way.
+            device_memw_tables = dm.tables;
+            memw_register_rows = dm.rows;
             memw_aligned_ops.extend(dm.aligned_fallback);
             memw_ops.extend(dm.general_fallback);
-            device_is_half = Some(dm.is_half_counts);
-            device_memw_tables = Some(dm.tables);
+            // Walk-once: feed the walk's IS_HALF histogram to the BITWISE merge (`device_is_half`
+            // below) so the histogram doesn't re-walk. Empty on the legacy rows path (→ mrr walk).
+            if !dm.is_half.is_empty() {
+                device_is_half = Some(dm.is_half);
+            }
         } else {
-            // No runtime GPU backend: the null-sink walk left `memw_register_rows`
-            // empty, so recompute the body register rows + fallbacks on CPU (halt was
+            // No runtime GPU backend: recompute the body register rows + fallbacks on CPU (halt was
             // already routed by `collect_all_ops`).
+            // NOTE: the ecall register accesses are NOT reconstructed here — `walk_register_accesses`
+            // only models x0-x31+PC, not the high precompile registers (e.g. x254 commit index), so a
+            // precompile run that loses the GPU at runtime would need a full sequential re-collect.
+            // This corner is only reachable with `LAMBDA_VM_GPU_REGISTERS=1` (opt-in) AND a mid-run GPU
+            // failure.
             let init = RegisterState::from_init(register_init);
             let mut buckets = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
             collect_register_ops_parallel(&cpu_ops, &init, &mut buckets);
@@ -3464,11 +4447,123 @@ fn build_traces<I: ImageSource + Sync>(
         }
     }
 
+    // Device memory walk (option B, `LAMBDA_VM_GPU_MEMORY=1`): reconstruct the final
+    // memory state from the initial image + the device walk's snapshot and feed it to the
+    // PAGE / ARE_BYTES generators below in place of the CPU `memory_state`. The snapshot is
+    // validated cell-identical to the sequential replay (`diag_memw_ls_device_vs_cpu`), so
+    // PAGE-FINI + ARE_BYTES come out byte-identical. The CPU `memory_state` replay still
+    // runs (precompiles read it mid-execution) — this is completeness, not a walk drop. On
+    // GPU-unavailable the reconstruction is `None` and the CPU state is used unchanged.
+    // FR4a: the device-computed PAGE ARE_BYTES histogram (built inside `build_device_memw_ls` from
+    // the image + snapshot when gpu_full), captured here to merge in p4 in place of the ~1s host
+    // `build_page_bitwise_arrays`.
+    #[cfg(feature = "cuda")]
+    let mut device_page_hist: Option<Vec<u64>> = None;
+    // A1: device-built PAGE trace tables (from the snapshot), used by `gen_pages` in place of the
+    // ~285ms host column fill.
+    #[cfg(feature = "cuda")]
+    let mut device_page_tables: Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> = None;
+    // LT-resident-table (session 5): device-generated memw→lt pairs for the REGULAR walk rows, and the
+    // [lo, lo+n) slices those rows occupy in the memw buckets (so the host `collect_lt_from_memw` runs
+    // only over the retained + ecall rows — the device covers the regular rows, no double-count).
+    #[cfg(feature = "cuda")]
+    let mut device_memw_lt_pairs: Option<(Vec<u64>, Vec<u64>)> = None;
+    #[cfg(feature = "cuda")]
+    let (mut reg_a_lo, mut reg_a_n, mut reg_g_lo, mut reg_g_n) = (0usize, 0usize, 0usize, 0usize);
+    #[cfg(feature = "cuda")]
+    let want_page_hist = crate::tables::gpu_trace::gpu_full_enabled()
+        && !crate::tables::gpu_trace::gpu_trace_disabled();
+    #[cfg(feature = "cuda")]
+    let device_state: Option<MemoryState> = if device_memory {
+        match initial_image
+            .and_then(|image| build_device_memw_ls(&cpu_ops, image, &ecall_accesses, want_page_hist))
+        {
+            Some(mut d) => {
+                device_page_hist = d.page_hist.take();
+                device_page_tables = d.page_tables.take();
+                device_memw_lt_pairs = d.memw_lt_pairs.take();
+                // Opt-in path confirmation (`LAMBDA_VM_GPU_MEMORY=1`): the memory-side tables below —
+                // MEMW_A/MEMW rows and the PAGE-FINI + ARE_BYTES final state — come from the device
+                // walk, not the CPU replay. The CPU replay still runs (precompiles read `memory_state`
+                // mid-execution); its REGULAR load/store rows are dropped here and replaced by the
+                // device rows. Register rows (`is_register`) and ecall-memory rows (at ecall op
+                // timestamps) are produced CPU-side and kept — same split as `diag_memw_ls_device_vs_cpu`.
+                eprintln!(
+                    "[gpu-memory] MEMW_A/MEMW rows + PAGE-FINI/ARE_BYTES built from device walk (aligned={} general={}, drop={device_memory_drop})",
+                    d.aligned.len(),
+                    d.general.len()
+                );
+                let ecall_ts: std::collections::HashSet<u64> =
+                    ecall_accesses.mem_ts.iter().copied().collect();
+                let keep = |o: &MemwOperation| o.is_register || ecall_ts.contains(&o.timestamp);
+                memw_aligned_ops.retain(&keep);
+                memw_ops.retain(&keep);
+                // The device-regular rows land contiguously right after the retained rows; record
+                // their [lo, lo+n) span so the host memw→lt collect can skip them (device covers them).
+                reg_a_lo = memw_aligned_ops.len();
+                reg_g_lo = memw_ops.len();
+                reg_a_n = d.aligned.len();
+                reg_g_n = d.general.len();
+                memw_aligned_ops.extend(d.aligned);
+                memw_ops.extend(d.general);
+                if device_memory_drop {
+                    // A2 drop mode: the CPU did NOT push the ecall MEMORY rows (only regular loads'
+                    // LOAD op + bitwise + register rows stay CPU-side) — splice the device-assembled
+                    // ecall rows so the memory bus balances without any memory_state replay.
+                    memw_aligned_ops.extend(d.ecall_aligned);
+                    memw_ops.extend(d.ecall_general);
+                }
+                Some(d.state)
+            }
+            // No runtime GPU backend: keep the CPU-collected regular rows + CPU `memory_state`.
+            None => None,
+        }
+    } else {
+        None
+    };
+    #[cfg(feature = "cuda")]
+    let memory_state: &MemoryState = device_state.as_ref().unwrap_or(memory_state);
+
     // =====================================================================
     // PHASE 3: MEMW → LT (timestamp ordering and overflow checks)
     // =====================================================================
-    lt_ops.extend(collect_lt_from_memw(&memw_ops));
-    lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    // LT-resident-table (session 5): under gpu_full the REGULAR-row memw→lt operands are DERIVED ON
+    // DEVICE (`device_memw_lt_pairs`, bit-exact multiset vs `collect_lt_from_memw` over those rows —
+    // see `gpu_memw_lt_parity`); the host collect then runs ONLY over the retained + ecall rows (the
+    // regular rows occupy `[reg_*_lo, reg_*_lo+reg_*_n)`, skipped here) → no double-count, full coverage.
+    // STEP 2A: also capture the FULL memw→lt operand pairs (device-regular ⊕ host ecall/retained) so
+    // the histogram's LT memw source reads them directly (`OpVecSources.lt`), while the LT TABLE keeps
+    // reading `lt_ops`. (device_memw_lt_pairs is Some only under gpu_full.)
+    #[cfg(feature = "cuda")]
+    let (mut memw_lt_lhs, mut memw_lt_rhs): (Vec<u64>, Vec<u64>) = (Vec::new(), Vec::new());
+    #[cfg(feature = "cuda")]
+    {
+        if let Some((lhs, rhs)) = device_memw_lt_pairs.take() {
+            // This branch is entered ONLY under gpu_full (device pairs are produced by the resident
+            // memw_ls walk). Step B: the LT TABLE is built RESIDENT from the memw_lt pairs and the
+            // histogram reads the pairs too, so `lt_ops` is DEAD here — build ONLY the memw_lt pairs
+            // (device-regular ⊕ host ecall/retained), not the dead host `lt_ops`.
+            memw_lt_lhs.extend(lhs);
+            memw_lt_rhs.extend(rhs);
+            // ecall + retained rows' memw→lt on host (tiny) → into the pairs (histogram + resident table).
+            let mut ecall_lt = collect_lt_from_memw(&memw_ops[..reg_g_lo]);
+            ecall_lt.extend(collect_lt_from_memw(&memw_ops[reg_g_lo + reg_g_n..]));
+            ecall_lt.extend(collect_lt_from_memw_aligned(&memw_aligned_ops[..reg_a_lo]));
+            ecall_lt.extend(collect_lt_from_memw_aligned(&memw_aligned_ops[reg_a_lo + reg_a_n..]));
+            for op in &ecall_lt {
+                memw_lt_lhs.push(op.lhs);
+                memw_lt_rhs.push(op.rhs);
+            }
+        } else {
+            lt_ops.extend(collect_lt_from_memw(&memw_ops));
+            lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        lt_ops.extend(collect_lt_from_memw(&memw_ops));
+        lt_ops.extend(collect_lt_from_memw_aligned(&memw_aligned_ops));
+    }
 
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
@@ -3531,40 +4626,238 @@ fn build_traces<I: ImageSource + Sync>(
     // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
     // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
     // independent of accumulation order.
+    // p5 single-build resident cpu_ops seam, built HERE (before p4) so the in-walk BITWISE histogram
+    // source reads `packed`/`res` from it directly (no ~64 MiB re-upload) AND the p5 chip closures
+    // share the same device buffers. `None` when the resident-chips flag is off.
+    #[cfg(feature = "cuda")]
+    let shared_devops = crate::tables::gpu_trace::build_shared_devops(&cpu_ops, logs);
+    #[cfg(feature = "cuda")]
+    let shared_devops_ref = shared_devops.as_ref();
+    // FR3 full-resident BITWISE path: when `LAMBDA_VM_GPU_FULL=1` and the resident cpu_ops seam is
+    // present, build the ENTIRE histogram (in_walk + op-vec + page + memw_reg) in ONE device buffer via
+    // `gpu_bitwise_hist_full_sources` and merge it once — instead of the 3 separate device histograms.
+    // Gates those 3 blocks off + the CPU skip flags on (below).
+    #[cfg(feature = "cuda")]
+    let gpu_full = crate::tables::gpu_trace::gpu_full_enabled()
+        && shared_devops_ref.is_some()
+        && !crate::tables::gpu_trace::gpu_trace_disabled();
+    #[cfg(not(feature = "cuda"))]
+    let gpu_full = false;
+
+    // Step C: the ECSM witness was built CARRYLESS under gpu_full (the ~190ms per-step `conv` carries
+    // skipped on CPU); recompute `c0/c1/c2` ON DEVICE now — BEFORE the bitwise collector
+    // (`collect_bitwise_from_ecdas`) and the ECDAS table fill read them. Gated IDENTICALLY to
+    // `ecsm_carryless` in `collect_ecsm_ops` (gpu_full_enabled + !disabled, NOT the local `gpu_full`
+    // which also requires shared_devops) so the two can never disagree. Mandatory: a failure here would
+    // leave the carryless zero carries in place, so it asserts rather than silently degrading.
+    #[cfg(feature = "cuda")]
+    if crate::tables::gpu_trace::gpu_full_enabled()
+        && !crate::tables::gpu_trace::gpu_trace_disabled()
+        && !ecdas_ops.is_empty()
+    {
+        assert!(
+            crate::tables::gpu_trace::fill_ecdas_carries_device(&mut ecdas_ops),
+            "LAMBDA_VM_GPU_FULL: device ecdas_carries failed (ECSM witness was built carryless)"
+        );
+    }
+
+    // FR4a: use the device-computed PAGE ARE_BYTES histogram (skip the ~1s host `build_page_bitwise_arrays`
+    // + the CPU/host-array page scatter). Only under gpu_full, and only if the device call succeeded.
+    // (Referenced only in cuda-gated code below.)
+    #[cfg(feature = "cuda")]
+    let use_device_page = gpu_full && device_page_hist.is_some();
+
     type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
     let mul_chunk = max_rows.mul;
     let dvrm_chunk = max_rows.dvrm;
     // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
     // split into row-ranges in the parallel path below) stays a single whole-source collector.
+    // P4b: when the GPU op-vec histogram is on (`LAMBDA_VM_GPU_BITWISE`), the 6 fully-covered op-vec
+    // sources (lt, branch, shift, bytewise, eq, store) are scattered on device (see `gpu_opvec_hist`
+    // below) and their CPU collectors are skipped. MUL/DVRM stay on CPU (their per-chunk MSB16 dedup
+    // is not in the per-op kernel); cpu32/load stay on CPU (coupled to the in-walk recompute path).
+    // Compute the device op-vec histogram FIRST (fed the real op vectors), so the CPU-collector skip
+    // is gated on its ACTUAL success — a runtime GPU failure falls back to the CPU collectors (no gap).
+    #[cfg(feature = "cuda")]
+    let gpu_opvec_hist: Option<Vec<u64>> = if !gpu_full
+        && (std::env::var("LAMBDA_VM_GPU_BITWISE").is_ok_and(|v| v == "1")
+            || crate::tables::gpu_trace::gpu_full_enabled())
+        && !crate::tables::gpu_trace::gpu_trace_disabled()
+    {
+        let lt_lhs: Vec<u64> = lt_ops.iter().map(|o| o.lhs).collect();
+        let lt_rhs: Vec<u64> = lt_ops.iter().map(|o| o.rhs).collect();
+        let store_val: Vec<u64> = store_ops.iter().map(|o| o.value).collect();
+        let byw_a: Vec<u64> = bytewise_ops.iter().map(|o| o.a).collect();
+        let byw_b: Vec<u64> = bytewise_ops.iter().map(|o| o.b).collect();
+        let byw_op: Vec<u8> = bytewise_ops.iter().map(|o| o.op).collect();
+        let eq_a: Vec<u64> = eq_ops.iter().map(|o| o.a).collect();
+        let eq_b: Vec<u64> = eq_ops.iter().map(|o| o.b).collect();
+        let br_npc: Vec<u64> = branch_ops.iter().map(|o| o.compute_next_pc()).collect();
+        let br_unm: Vec<u64> = branch_ops.iter().map(|o| o.compute_next_pc_unmasked()).collect();
+        let sh_val: Vec<u64> = shift_ops
+            .iter()
+            .map(|o| {
+                (o.in_halves[0] as u64)
+                    | ((o.in_halves[1] as u64) << 16)
+                    | ((o.in_halves[2] as u64) << 32)
+                    | ((o.in_halves[3] as u64) << 48)
+            })
+            .collect();
+        let sh_shift: Vec<u8> = shift_ops.iter().map(|o| o.shift).collect();
+        let sh_amount: Vec<u64> = shift_ops.iter().map(|o| o.shift_amount).collect();
+        let sh_flags: Vec<u32> = shift_ops
+            .iter()
+            .map(|o| (o.direction as u32) | ((o.signed as u32) << 1) | ((o.word_instr as u32) << 2))
+            .collect();
+        // CPU32 range checks + LOAD MSB8 (the two the in-walk device kernel doesn't emit) go on device
+        // here instead of the CPU recompute below; memw_aligned moves off its CPU collector too.
+        let c32_hil: Vec<u8> = cpu32_ops.iter().map(|c| c.half_instruction_length).collect();
+        let c32_alu: Vec<u8> = cpu32_ops.iter().map(|c| c.alu_flags).collect();
+        let c32_rs1: Vec<u8> = cpu32_ops.iter().map(|c| c.rs1).collect();
+        let c32_rs2: Vec<u8> = cpu32_ops.iter().map(|c| c.rs2).collect();
+        let c32_rd: Vec<u8> = cpu32_ops.iter().map(|c| c.rd).collect();
+        let c32_rv1: Vec<u64> = cpu32_ops.iter().map(|c| c.rv1).collect();
+        let c32_rv2: Vec<u64> = cpu32_ops.iter().map(|c| c.rv2).collect();
+        let c32_res: Vec<u64> = cpu32_ops.iter().map(|c| c.res).collect();
+        let mut ld_res: Vec<u64> = Vec::with_capacity(load_ops.len() * 8);
+        for lo in &load_ops {
+            ld_res.extend_from_slice(&lo.res);
+        }
+        let ld_width: Vec<u32> = load_ops.iter().map(|lo| lo.width as u32).collect();
+        let ma_base: Vec<u64> = memw_aligned_ops.iter().map(|o| o.base_address).collect();
+        let ma_width: Vec<u32> = memw_aligned_ops.iter().map(|o| o.width as u32).collect();
+        let ma_flag: Vec<u32> = vec![1u32; memw_aligned_ops.len()];
+        // MUL/DVRM per-op parts on device; their chunk-deduped MSB16/NEG-ZERO tail stays on CPU.
+        let mul_lhs: Vec<u64> = mul_ops.iter().map(|(o, _)| o.lhs).collect();
+        let mul_rhs: Vec<u64> = mul_ops.iter().map(|(o, _)| o.rhs).collect();
+        let mul_flags: Vec<u32> = mul_ops
+            .iter()
+            .map(|(o, _)| (o.lhs_signed as u32) | ((o.rhs_signed as u32) << 1))
+            .collect();
+        let dvrm_n: Vec<u64> = dvrm_ops.iter().map(|(o, _)| o.n).collect();
+        let dvrm_d: Vec<u64> = dvrm_ops.iter().map(|(o, _)| o.d).collect();
+        let dvrm_flags: Vec<u32> = dvrm_ops.iter().map(|(o, _)| o.signed as u32).collect();
+        let src = math_cuda::bitwise_hist::OpVecSources {
+            lt_lhs: &lt_lhs,
+            lt_rhs: &lt_rhs,
+            store_val: &store_val,
+            bytewise_a: &byw_a,
+            bytewise_b: &byw_b,
+            bytewise_op: &byw_op,
+            eq_a: &eq_a,
+            eq_b: &eq_b,
+            load_res: &ld_res,
+            load_width: &ld_width,
+            cpu32_hil: &c32_hil,
+            cpu32_alu: &c32_alu,
+            cpu32_rs1: &c32_rs1,
+            cpu32_rs2: &c32_rs2,
+            cpu32_rd: &c32_rd,
+            cpu32_rv1: &c32_rv1,
+            cpu32_rv2: &c32_rv2,
+            cpu32_res: &c32_res,
+            branch_next_pc: &br_npc,
+            branch_unmasked: &br_unm,
+            shift_value: &sh_val,
+            shift_shift: &sh_shift,
+            shift_amount: &sh_amount,
+            shift_flags: &sh_flags,
+            memw_aligned_base: &ma_base,
+            memw_aligned_width: &ma_width,
+            memw_aligned_flag: &ma_flag,
+            mul_lhs: &mul_lhs,
+            mul_rhs: &mul_rhs,
+            mul_flags: &mul_flags,
+            dvrm_n: &dvrm_n,
+            dvrm_d: &dvrm_d,
+            dvrm_flags: &dvrm_flags,
+        };
+        math_cuda::bitwise_hist::gpu_bitwise_hist_opvec(
+            &src,
+            bitwise::NUM_ROWS,
+            bitwise::NUM_LOOKUP_TYPES,
+        )
+        .ok()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_opvec_hist: Option<Vec<u64>> = None;
+    // Under `gpu_full` the device full-histogram covers the op-vec sources, so skip their CPU collectors.
+    let gpu_opvec = gpu_opvec_hist.is_some() || gpu_full;
+
     let mut collectors: Vec<Collector> = vec![
-        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
-        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
-        Box::new(|h| {
-            for op in &bytewise_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| {
-            for op in &eq_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| {
-            for op in &store_ops {
-                h.add_ops(&op.collect_bitwise_ops());
-            }
-        }),
-        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
         Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
         Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
     ];
-    if let Some(image) = initial_image
+    // MUL/DVRM: when the GPU covers their per-op bulk, keep only the chunk-deduped MSB16/NEG-ZERO tail
+    // on CPU; otherwise the full collector.
+    if gpu_opvec {
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_mul_dedup(&mul_ops, mul_chunk))));
+        collectors
+            .push(Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm_dedup(&dvrm_ops, dvrm_chunk))));
+    } else {
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))));
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))));
+    }
+    if !gpu_opvec {
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))));
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))));
+        collectors.push(Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))));
+        collectors.push(Box::new(|h| {
+            for op in &bytewise_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+        collectors.push(Box::new(|h| {
+            for op in &eq_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+        collectors.push(Box::new(|h| {
+            for op in &store_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }));
+        collectors.push(Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))));
+    }
+    // Decide the GPU BITWISE path up front so the big PAGE source (one unsplit CPU unit — the
+    // long pole when in_walk is peeled off) can be routed to the device too, and skipped on CPU.
+    // Opt-in (`LAMBDA_VM_GPU_BITWISE=1`). Default = parallel CPU histogram (no change).
+    #[cfg(feature = "cuda")]
+    let use_gpu_bitwise = (std::env::var("LAMBDA_VM_GPU_BITWISE").is_ok_and(|v| v == "1")
+        || crate::tables::gpu_trace::gpu_full_enabled())
+        && !crate::tables::gpu_trace::gpu_trace_disabled();
+    // PAGE per-byte (init, fini) arrays for the device scatter — built only when the device path
+    // will consume them (guard matches the CPU page collector: image present, not a bookend epoch).
+    // FR4a: skip the ~1s host `build_page_bitwise_arrays` when the device page histogram is used.
+    #[cfg(feature = "cuda")]
+    let gpu_page_arrays: Option<(Vec<u8>, Vec<u8>)> =
+        if use_gpu_bitwise && !l2g_memory_bookend && !use_device_page {
+            initial_image
+                .map(|image| build_page_bitwise_arrays(image, memory_state, l2g_memory_bookend))
+        } else {
+            None
+        };
+    // The CPU counts PAGE only when the device did NOT take it.
+    let cpu_page = {
+        #[cfg(feature = "cuda")]
+        {
+            // FR4a: the device page histogram (`use_device_page`) already covers PAGE ARE_BYTES, so
+            // the CPU must NOT also collect it (would double-count). Otherwise CPU counts PAGE only
+            // when the host `(init, fini)` device-scatter arrays were not built.
+            gpu_page_arrays.is_none() && !use_device_page
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            true
+        }
+    };
+    if cpu_page
+        && let Some(image) = initial_image
         && !l2g_memory_bookend
     {
         collectors.push(Box::new(move |h| {
@@ -3572,25 +4865,110 @@ fn build_traces<I: ImageSource + Sync>(
         }));
     }
 
-    // GPU BITWISE histogram (in-walk source, ~half of all bumps): compute the per-op
-    // ARE_BYTES/IS_HALF multiplicities on device via atomics and merge below, skipping
-    // the CPU `add_ops(bitwise_ops)` scatter. Falls back to CPU if no runtime GPU.
-    // Opt-in (`LAMBDA_VM_GPU_BITWISE=1`): scatter the big BITWISE sources (in-walk +
-    // MEMW_R, ~70% of bumps) on device (replicated atomics → reduce) and merge below;
-    // the CPU then counts only the remaining collectors. Default = parallel CPU histogram.
+    // RESIDENT memw_reg source: compute the MEMW_R IS_HALF ts-delta histogram from the RESIDENT
+    // register walk (with ecall accesses interleaved + reg_ts_delta fallback routed to MEMW_A/MEMW),
+    // instead of uploading `memw_register_rows` ts/old_ts. Bit-identical to the sequential
+    // `collect_bitwise_from_memw_register`. Gated on `use_gpu_bitwise`; falls back (None) to the
+    // uploaded path on a runtime GPU failure. (Correctness milestone; the cpu_op-SoA upload it still
+    // pays is eliminated once the walk reads the resident seam directly.)
+    // OPT-IN (`LAMBDA_VM_GPU_MEMW_REG_RESIDENT=1`, default OFF): compute memw_reg IS_HALF from the
+    // resident walk (histogram only — the cpu_op SoA still uploads). Bit-exact vs the sequential
+    // `memw_register_rows` histogram (validated by `diag_memw_reg_resident_vs_cpu_{regular,ecall}`).
+    // Superseded by `device_registers` (`LAMBDA_VM_GPU_REGISTERS=1`), which builds the MEMW_R TABLES
+    // on device and returns the same IS_HALF via `device_is_half` — so skip this to avoid double count.
+    // Under `LAMBDA_VM_GPU_FULL` the memw_reg IS_HALF comes from the register-TABLE walk (fix (a):
+    // `device_is_half`, computed once by `build_device_memw_register`), and `gpu_bitwise_hist_full`
+    // SKIPS its own register walk (`skip_memw_reg`). So this opt-in stays `None` under gpu_full — the
+    // single memw_reg source is `device_is_half`, no double count. Otherwise keep the legacy opt-in
+    // (`MEMW_REG_RESIDENT=1`, only when the CPU register walk is used).
     #[cfg(feature = "cuda")]
-    let gpu_bitwise_hist: Option<Vec<u64>> = if std::env::var("LAMBDA_VM_GPU_BITWISE")
-        .is_ok_and(|v| v == "1")
-        && !crate::tables::gpu_trace::gpu_trace_disabled()
+    let gpu_memw_reg_hist: Option<Vec<u64>> = if use_gpu_bitwise
+        && !gpu_full
+        && (!device_registers
+            && std::env::var("LAMBDA_VM_GPU_MEMW_REG_RESIDENT").is_ok_and(|v| v == "1"))
     {
-        gpu_bitwise_hist_sources(&cpu_ops, &memw_register_rows)
+        let n = cpu_ops.len();
+        let mut packed = Vec::with_capacity(n);
+        let mut rv1 = Vec::with_capacity(n);
+        let mut rv2 = Vec::with_capacity(n);
+        let mut rvd = Vec::with_capacity(n);
+        let mut next_pc = Vec::with_capacity(n);
+        for op in &cpu_ops {
+            packed.push(op.decode.fields.pack());
+            rv1.push(op.rv1);
+            rv2.push(op.rv2);
+            rvd.push(op.rvd);
+            next_pc.push(op.next_pc);
+        }
+        let e_oi: Vec<u32> = ecall_accesses.reg_op_index.clone();
+        let e_addr: Vec<u32> = ecall_accesses.reg.iter().map(|a| a.reg_addr as u32).collect();
+        let e_ts: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.timestamp).collect();
+        let e_val: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.value).collect();
+        let e_ir: Vec<u8> = ecall_accesses.reg.iter().map(|a| u8::from(a.is_read)).collect();
+        let seed = walk_seed_from_register_init(register_init);
+        math_cuda::bitwise_hist::gpu_memw_reg_hist_resident_ecall(
+            &packed, &rv1, &rv2, &rvd, &next_pc, &e_oi, &e_addr, &e_ts, &e_val, &e_ir, &seed, 1,
+            REG_WALK_NBINS, bitwise::NUM_ROWS, bitwise::NUM_LOOKUP_TYPES,
+        )
+        .ok()
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_memw_reg_hist: Option<Vec<u64>> = {
+        let _ = &ecall_accesses; // consumed by the resident memw_reg walk under `cuda`
+        None
+    };
+
+    // GPU BITWISE histogram: scatter the big sources (in-walk + MEMW_R + PAGE, ~92% of bumps) on
+    // device (replicated atomics → reduce) and merge below; the CPU then counts only the small
+    // remaining collectors (op-vecs + tiny precompiles) — no big unsplit unit left to unbalance it.
+    // When `gpu_memw_reg_hist` covers MEMW_R (resident walk), pass an EMPTY row slice so this path
+    // does in-walk + page only (no memw_reg double-count).
+    #[cfg(feature = "cuda")]
+    let gpu_bitwise_hist: Option<Vec<u64>> = if use_gpu_bitwise && !gpu_full {
+        let (pi, pf): (&[u8], &[u8]) = match &gpu_page_arrays {
+            Some((i, f)) => (i, f),
+            None => (&[], &[]),
+        };
+        let mrr: &[RegRow] = if gpu_memw_reg_hist.is_some() { &[] } else { &memw_register_rows };
+        gpu_bitwise_hist_sources(&cpu_ops, mrr, pi, pf, shared_devops_ref)
     } else {
         None
     };
     #[cfg(not(feature = "cuda"))]
     let gpu_bitwise_hist: Option<Vec<u64>> = None;
-    // The CPU counts the in-walk + MEMW_R lookups only when the GPU did not.
-    let cpu_bitwise_sources = gpu_bitwise_hist.is_none();
+
+    // FR3: the WHOLE resident BITWISE histogram (in_walk + op-vec + page + memw_reg) in ONE device
+    // buffer with ONE reduce/download — replaces the 3 separate device histograms above. Required
+    // under `gpu_full` (opt-in, GPU mandatory), so a runtime failure surfaces rather than silently
+    // gapping (the CPU op-vec/in-walk collectors are already skipped via `gpu_opvec` / below).
+    #[cfg(feature = "cuda")]
+    let gpu_full_hist: Option<Vec<u64>> = if gpu_full {
+        let (pi, pf): (&[u8], &[u8]) = match &gpu_page_arrays {
+            Some((i, f)) => (i, f),
+            None => (&[], &[]),
+        };
+        // Fix (a) walk-once: if the register-table walk already produced the MEMW_R IS_HALF counts
+        // (`device_is_half`), tell the histogram to SKIP its own register walk — those counts are
+        // merged separately below via `device_is_half`.
+        let skip_memw_reg = device_is_half.is_some();
+        shared_devops_ref.map(|d| {
+            gpu_bitwise_hist_full_sources(
+                d, &cpu_ops, &lt_ops, &memw_lt_lhs, &memw_lt_rhs, &store_ops, &bytewise_ops, &eq_ops,
+                &branch_ops, &shift_ops, &cpu32_ops, &load_ops, &memw_aligned_ops, &mul_ops, &dvrm_ops,
+                &ecall_accesses, register_init, pi, pf, skip_memw_reg,
+            )
+            .expect("LAMBDA_VM_GPU_FULL: resident full BITWISE histogram failed")
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "cuda"))]
+    let gpu_full_hist: Option<Vec<u64>> = None;
+
+    // The CPU counts the in-walk + MEMW_R lookups only when neither GPU path did.
+    let cpu_bitwise_sources = gpu_bitwise_hist.is_none() && !gpu_full;
 
     let mut base = bitwise::BitwiseHistogram::new();
 
@@ -3618,6 +4996,26 @@ fn build_traces<I: ImageSource + Sync>(
                     memw_register::collect_bitwise_from_memw_register(slice, h)
                 }));
             }
+        } else if !gpu_opvec {
+            // The GPU histogram covers the in-walk PER-CPU-OP checks + MEMW_R, but `bitwise_ops`
+            // ALSO folded in the LOAD MSB8 lookups (`collect_load_op_from_cpu`) and the CPU32
+            // range checks (`collect_cpu32_bitwise`), which the device in-walk kernel does not
+            // emit. Recompute exactly those from `load_ops`/`cpu32_ops` so the multiplicities
+            // still balance (same lookups, order-independent bus). Skipped when the GPU op-vec
+            // histogram already covered LOAD MSB8 + CPU32 (`gpu_opvec`).
+            let ld_chunk = load_ops.len().div_ceil(cap).max(1);
+            for slice in load_ops.chunks(ld_chunk) {
+                units.push(Box::new(move |h| {
+                    for lo in slice {
+                        h.add_ops(&lo.collect_bitwise_ops());
+                    }
+                }));
+            }
+            units.push(Box::new(|h| {
+                for c in &cpu32_ops {
+                    h.add_ops(&collect_cpu32_bitwise(c));
+                }
+            }));
         }
         units.extend(collectors);
 
@@ -3647,6 +5045,16 @@ fn build_traces<I: ImageSource + Sync>(
         if cpu_bitwise_sources {
             base.add_ops(&bitwise_ops);
             memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
+        } else if !gpu_opvec {
+            // GPU covered in-walk per-op + MEMW_R; recompute the LOAD MSB8 + CPU32 checks that
+            // `bitwise_ops` also held but the device in-walk kernel does not emit. Skipped when the
+            // GPU op-vec histogram already covered LOAD MSB8 + CPU32.
+            for lo in &load_ops {
+                base.add_ops(&lo.collect_bitwise_ops());
+            }
+            for c in &cpu32_ops {
+                base.add_ops(&collect_cpu32_bitwise(c));
+            }
         }
         for f in &collectors {
             f(&mut base);
@@ -3657,6 +5065,30 @@ fn build_traces<I: ImageSource + Sync>(
     // `[NUM_ROWS * NUM_LOOKUP_TYPES]` layout) — the same lookups the CPU
     // `add_ops(bitwise_ops)` + `collect_bitwise_from_memw_register` would have counted.
     if let Some(counts) = &gpu_bitwise_hist {
+        base.add_raw_counts(counts);
+    }
+    // FR3: the ONE combined device histogram (in_walk + op-vec + page + memw_reg) — merged once,
+    // replacing the three separate merges above/below (all None under `gpu_full`). NOTE: under
+    // FR4a the PAGE source is EXCLUDED from `gpu_full_hist` (empty page arrays passed) and merged
+    // separately via `device_page_hist` below.
+    if let Some(counts) = &gpu_full_hist {
+        base.add_raw_counts(counts);
+    }
+    // FR4a: the device-computed PAGE ARE_BYTES histogram (from image + snapshot, no ~1s host build).
+    // Same lookups `collect_bitwise_from_page` / the host `(init, fini)` scatter would have counted.
+    #[cfg(feature = "cuda")]
+    if use_device_page && let Some(counts) = &device_page_hist {
+        base.add_raw_counts(counts);
+    }
+    // P4b: merge the device op-vec histogram (lt/branch/shift/bytewise/eq/store) — the same lookups
+    // the 6 skipped CPU collectors would have counted (order-independent bus).
+    if let Some(counts) = &gpu_opvec_hist {
+        base.add_raw_counts(counts);
+    }
+    // Residency: merge the resident-walk memw_reg histogram (MEMW_R IS_HALF ts-deltas) — the same
+    // lookups `collect_bitwise_from_memw_register(&memw_register_rows)` would have counted; the
+    // ~202 reg_ts_delta fallback rows it excludes are still counted via the CPU aligned/general path.
+    if let Some(counts) = &gpu_memw_reg_hist {
         base.add_raw_counts(counts);
     }
     // Device path: MEMW_R rows were built on GPU, so their IS_HALFWORD ts-delta
@@ -3713,12 +5145,37 @@ fn build_traces<I: ImageSource + Sync>(
         (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
     };
 
+    // C2-c (wiring): under gpu_full derive the REGISTER final-state map ON DEVICE (regs+pc snapshot +
+    // x254 commit-index scan), replacing the host `to_final_state_map` (which needs the sequential
+    // advance). Falls back to the host map if the device path is off/unavailable. The e2e proof
+    // re-verifies it (a wrong map unbalances the REGISTER table → verify fails).
+    #[cfg(feature = "cuda")]
+    let register_final_state = {
+        // Mirror the caller's PC (x255) finalization (line above): HALT sets pc=1 at
+        // `halt_timestamp + 4*num_padding_rows + 1`. Non-final epochs keep the last write_pc.
+        let pc_final = if is_final {
+            Some((1u64, halt_timestamp + 4 * num_padding_rows as u64 + 1))
+        } else {
+            None
+        };
+        crate::tables::gpu_trace::device_register_final_state(
+            &cpu_ops,
+            &ecall_accesses,
+            register_init,
+            is_final,
+            pc_final,
+        )
+        .unwrap_or_else(|| register_state.to_final_state_map())
+    };
+    #[cfg(not(feature = "cuda"))]
     let register_final_state = register_state.to_final_state_map();
 
     // Each build below reads disjoint op lists and writes its own table, so
     // they all run in one rayon scope. Disk-spill stays sequential: its
     // generate→spill order keeps trace memory bounded.
     let cpu_ops_ref = &cpu_ops;
+    // `shared_devops` / `shared_devops_ref` are built ABOVE (before p4) so the in-walk BITWISE
+    // histogram + the p5 chip closures share the ONE device cpu_op SoA upload.
     let gen_cpus = || {
         // On-GPU CPU-table build (cuda, kill-switch off): the matrix is born
         // resident on device and feeds the LDE with no host upload. Falls back
@@ -3869,6 +5326,16 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             };
             if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_load_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.load,
+                )
+            {
+                return Ok(tables);
+            }
+            if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_load_tables(&load_ops, max_rows.load)
             {
@@ -3896,6 +5363,20 @@ fn build_traces<I: ImageSource + Sync>(
                     true
                 }
             };
+            // STEP 2B: under gpu_full, build the FULL LT table RESIDENT (instruction ⊕ dvrm→lt ⊕
+            // memw→lt) on device — the last chip table to go resident. Chunked to max_rows.lt.
+            if use_gpu
+                && gpu_full
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_lt_resident_tables_from_devops(
+                    devops,
+                    &memw_lt_lhs,
+                    &memw_lt_rhs,
+                    max_rows.lt,
+                )
+            {
+                return Ok(tables);
+            }
             if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_lt_tables(&lt_ops, max_rows.lt)
@@ -3925,6 +5406,16 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             };
             if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_shift_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.shift,
+                )
+            {
+                return Ok(tables);
+            }
+            if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_shift_tables(&shift_ops, max_rows.shift)
             {
@@ -3952,6 +5443,16 @@ fn build_traces<I: ImageSource + Sync>(
                     true
                 }
             };
+            if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_mul_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.mul,
+                )
+            {
+                return Ok(tables);
+            }
             if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_mul_tables(&mul_ops, max_rows.mul)
@@ -3981,6 +5482,16 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             };
             if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_dvrm_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.dvrm,
+                )
+            {
+                return Ok(tables);
+            }
+            if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_dvrm_tables(&dvrm_ops, max_rows.dvrm)
             {
@@ -4008,6 +5519,16 @@ fn build_traces<I: ImageSource + Sync>(
                     true
                 }
             };
+            if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_branch_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.branch,
+                )
+            {
+                return Ok(tables);
+            }
             if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_branch_tables(&branch_ops, max_rows.branch)
@@ -4040,6 +5561,16 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             };
             if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_eq_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.eq,
+                )
+            {
+                return Ok(tables);
+            }
+            if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_eq_tables(&eq_ops, max_rows.eq)
             {
@@ -4067,6 +5598,16 @@ fn build_traces<I: ImageSource + Sync>(
                     true
                 }
             };
+            if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_bytewise_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.bytewise,
+                )
+            {
+                return Ok(tables);
+            }
             if use_gpu
                 && let Some(tables) = crate::tables::gpu_trace::gpu_build_bytewise_tables(
                     &bytewise_ops,
@@ -4098,6 +5639,16 @@ fn build_traces<I: ImageSource + Sync>(
                 }
             };
             if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_store_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.store,
+                )
+            {
+                return Ok(tables);
+            }
+            if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_store_tables(&store_ops, max_rows.store)
             {
@@ -4125,6 +5676,19 @@ fn build_traces<I: ImageSource + Sync>(
                     true
                 }
             };
+            // Resident path (opt-in): build the CPU32 table on device straight from the
+            // resident cpu_ops (no host CPU32-op build/pack). Falls through to the host-op
+            // device path / CPU generator on None.
+            if use_gpu
+                && let Some(devops) = shared_devops_ref
+                && let Some(tables) = crate::tables::gpu_trace::build_cpu32_resident_tables_from_devops(
+                    cpu_ops_ref,
+                    devops,
+                    max_rows.cpu32,
+                )
+            {
+                return Ok(tables);
+            }
             if use_gpu
                 && let Some(tables) =
                     crate::tables::gpu_trace::gpu_build_cpu32_tables(&cpu32_ops, max_rows.cpu32)
@@ -4156,9 +5720,31 @@ fn build_traces<I: ImageSource + Sync>(
         decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
         decode
     };
-    let gen_commit = || commit::generate_commit_trace(&commit_ops);
-    let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
+    let gen_commit = || {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(t) = crate::tables::gpu_trace::build_commit_resident_table(&commit_ops) {
+                return t;
+            }
+        }
+        commit::generate_commit_trace(&commit_ops)
+    };
+    let gen_keccak = || {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(t) = crate::tables::gpu_trace::build_keccak_resident_table(&keccak_ops) {
+                return t;
+            }
+        }
+        keccak::generate_keccak_trace(&keccak_ops)
+    };
     let gen_keccak_rnd = || {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(t) = crate::tables::gpu_trace::build_keccak_rnd_resident_table(&keccak_ops) {
+                return t;
+            }
+        }
         let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
             .iter()
             .map(|op| KeccakRoundOperation {
@@ -4174,11 +5760,18 @@ fn build_traces<I: ImageSource + Sync>(
         keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
         keccak_rc_trace
     };
-    let gen_pages = || match initial_image {
+    let gen_pages = move || match initial_image {
         // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
         // every touched cell's Memory init/fini, and every untouched PAGE row
         // self-cancels (init==fini, ts=0), so PAGE contributes nothing here.
         Some(image) if !l2g_memory_bookend => {
+            // A1: use the device-built PAGE tables (from the snapshot) + build only the (cheap)
+            // configs on host, skipping the ~285ms host column fill.
+            #[cfg(feature = "cuda")]
+            if let Some(tables) = device_page_tables {
+                let configs = build_page_configs(image, memory_state, private_input);
+                return (tables, configs);
+            }
             generate_page_tables(image, memory_state, private_input, l2g_memory_bookend)
         }
         _ => (Vec::new(), Vec::new()),
@@ -4186,8 +5779,24 @@ fn build_traces<I: ImageSource + Sync>(
     let gen_register = || register::generate_register_trace(&register_final_state, register_init);
     let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
     // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
-    let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
-    let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
+    let gen_ecsm = || {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(t) = crate::tables::gpu_trace::build_ecsm_resident_table(&ecsm_ops) {
+                return t;
+            }
+        }
+        ecsm::generate_ecsm_trace(&ecsm_ops)
+    };
+    let gen_ecdas = || {
+        #[cfg(feature = "cuda")]
+        {
+            if let Some(t) = crate::tables::gpu_trace::build_ecdas_resident_table(&ecdas_ops) {
+                return t;
+            }
+        }
+        ecdas::generate_ecdas_trace(&ecdas_ops)
+    };
 
     let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
         (None, None, None, None);
@@ -4530,7 +6139,7 @@ pub fn count_table_lengths(
                 .checked_add(1)
                 .ok_or_else(|| Error::Execution("commit_count overflows usize".into()))?;
             let reg_commit_ops =
-                collect_commit_memw_ops(&cpu_op, &mut register_state, &mut memory_state);
+                collect_commit_memw_ops(&cpu_op, None, &mut register_state, &mut memory_state);
             for memw_op in &reg_commit_ops {
                 partition_memw(
                     memw_op,
@@ -5010,13 +6619,37 @@ impl Traces {
         private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        Self::from_elf_and_logs_with_precompiles(
+            elf,
+            logs,
+            None,
+            max_rows,
+            private_input,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Like [`from_elf_and_logs`], but with the executor-recorded precompile inputs (Option A).
+    /// When `precompile_inputs` is `Some`, the precompile chip ops are built from the recordings
+    /// instead of replaying `memory_state` for their inputs (byte-identical). The monolithic prove
+    /// path passes `Some`; `from_elf_and_logs` passes `None` (legacy replay path).
+    pub fn from_elf_and_logs_with_precompiles(
+        elf: &Elf,
+        logs: &[Log],
+        precompile_inputs: Option<&PrecompileInputs>,
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
         let initial_image = build_initial_image(elf, private_input);
         let register_init = register::register_init_from_entry_point(elf.entry_point);
-        Self::from_image_and_logs(
+        Self::from_image_and_logs_inner(
             elf,
             &initial_image,
             &register_init,
             logs,
+            precompile_inputs,
             max_rows,
             private_input,
             true,
@@ -5044,6 +6677,37 @@ impl Traces {
         initial_image: &I,
         register_init: &[u32],
         logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        Self::from_image_and_logs_inner(
+            elf,
+            initial_image,
+            register_init,
+            logs,
+            None,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Inner builder for one epoch, with the optional executor-recorded precompile inputs
+    /// (Option A). `precompile_inputs = None` is the legacy `memory_state`-replay path (used by
+    /// continuation epochs / tests); `Some` sources precompile chip-op inputs from the recordings.
+    #[allow(clippy::too_many_arguments)]
+    fn from_image_and_logs_inner<I: ImageSource + Sync>(
+        elf: &Elf,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        precompile_inputs: Option<&PrecompileInputs>,
         max_rows: &super::MaxRowsConfig,
         private_input: &[u8],
         is_final: bool,
@@ -5082,6 +6746,22 @@ impl Traces {
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p2a_collect_cpu");
         let device_registers = device_registers_eligible(&cpu_ops);
+        let device_memory = device_memory_eligible(&cpu_ops);
+        let device_memory_drop = device_memory_drop_eligible(&cpu_ops);
+        // FR6: under gpu_full the whole in-walk BITWISE histogram is built on device, so skip building
+        // the ~28M host `bitwise_ops` (dropped uncounted otherwise). GPU-mandatory, like memory-drop.
+        #[cfg(feature = "cuda")]
+        let skip_bitwise = crate::tables::gpu_trace::gpu_full_enabled()
+            && !crate::tables::gpu_trace::gpu_trace_disabled();
+        #[cfg(not(feature = "cuda"))]
+        let skip_bitwise = false;
+        // Step B: under gpu_full the dead host op-vecs (load/lt/shift/branch/eq/bytewise/store) are not
+        // built — the resident chip tables + device histogram cover them. Same gate as `skip_bitwise`.
+        #[cfg(feature = "cuda")]
+        let skip_opvec = crate::tables::gpu_trace::gpu_full_enabled()
+            && !crate::tables::gpu_trace::gpu_trace_disabled();
+        #[cfg(not(feature = "cuda"))]
+        let skip_opvec = false;
         let (
             memw_ops,
             load_ops,
@@ -5093,11 +6773,16 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
-        ) = collect_ops_from_cpu(
+            ecall_accesses,
+        ) = collect_ops_from_cpu_inner(
             &cpu_ops,
+            precompile_inputs,
             &mut memory_state,
             &mut register_state,
             device_registers,
+            device_memory_drop,
+            skip_bitwise,
+            skip_opvec,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5116,8 +6801,11 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecall_accesses,
             &mut register_state,
             is_final,
+            skip_bitwise,
+            skip_opvec,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5127,6 +6815,7 @@ impl Traces {
         let __sp = stark::instruments::span("p3to5_build_traces");
         let result = build_traces(
             ops,
+            logs,
             Some(initial_image),
             &memory_state,
             register_init,
@@ -5140,6 +6829,8 @@ impl Traces {
             is_final,
             l2g_memory_bookend,
             device_registers,
+            device_memory,
+            device_memory_drop,
         );
         #[cfg(feature = "instruments")]
         drop(__sp);
@@ -5166,6 +6857,7 @@ impl Traces {
         let register_init = register::register_init_from_entry_point(entry_point);
         let mut register_state = RegisterState::new(entry_point);
         let device_registers = device_registers_eligible(&cpu_ops);
+        let device_memory = device_memory_eligible(&cpu_ops);
         let (
             memw_ops,
             load_ops,
@@ -5177,6 +6869,7 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecall_accesses,
         ) = collect_ops_from_cpu(
             &cpu_ops,
             &mut memory_state,
@@ -5196,8 +6889,13 @@ impl Traces {
             cpu32_ops,
             ecsm_ops,
             ecdas_ops,
+            ecall_accesses,
             &mut register_state,
             true,
+            // `from_logs` builds `bitwise_ops` on host (wrapper skip_bitwise=false), so don't skip here.
+            false,
+            // `from_logs` (legacy, no gpu_full) keeps building all host op-vecs.
+            false,
         );
 
         // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
@@ -5206,6 +6904,7 @@ impl Traces {
         // Phases 3-5 (elf=None → empty PAGE tables)
         build_traces(
             ops,
+            logs,
             None::<&HashMap<u64, u8>>,
             &memory_state,
             &register_init,
@@ -5219,6 +6918,9 @@ impl Traces {
             true,
             false,
             device_registers,
+            device_memory,
+            // from_logs has no initial image → the device memory path can't run; keep the CPU replay.
+            false,
         )
     }
 }

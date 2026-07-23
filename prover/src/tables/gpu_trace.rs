@@ -10,16 +10,22 @@
 
 use std::sync::{Arc, OnceLock};
 
+use executor::vm::logs::Log;
 use stark::trace::TraceTable;
 
 use std::collections::HashMap;
 
 use super::branch::{self, BranchOperation};
 use super::bytewise::{self, BytewiseOperation};
+use super::commit;
 use super::cpu::{self, CpuOperation};
 use super::cpu32::{self, Cpu32Operation};
 use super::dvrm::{self, DvrmOperation};
+use super::ecdas;
+use super::ecsm;
 use super::eq::{self, EqOperation};
+use super::keccak;
+use super::keccak_rnd;
 use super::load::{self, LoadOperation};
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
@@ -41,6 +47,975 @@ pub(crate) fn gpu_trace_disabled() -> bool {
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(false)
     })
+}
+
+/// Master switch (`LAMBDA_VM_GPU_FULL=1`): enable the WHOLE resident trace-gen pipeline at once —
+/// resident chips + device register walk + memory_state-drop + bitwise histogram + resident memw_reg.
+/// Each individual gate ORs this in, so one flag turns everything on. Read once and cached. The
+/// `LAMBDA_VM_CPU_TRACE=1` kill-switch still overrides (all-CPU).
+pub(crate) fn gpu_full_enabled() -> bool {
+    static FULL: OnceLock<bool> = OnceLock::new();
+    *FULL.get_or_init(|| std::env::var("LAMBDA_VM_GPU_FULL").is_ok_and(|v| v == "1"))
+}
+
+/// When set (`LAMBDA_VM_GPU_RESIDENT_CHIPS=1`), p5 builds the eligible chip tables via the
+/// fully-resident device→device chains (cpu_op fields → device op-build → device fill), instead
+/// of building the chip ops on the host and uploading them. Opt-in: warm-measured ~flat/slightly
+/// slower than the multicore-CPU chip build (no net win until the WHOLE pipeline is resident), so it
+/// stays opt-in rather than default. Read once and cached.
+pub(crate) fn gpu_resident_chips_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("LAMBDA_VM_GPU_RESIDENT_CHIPS").is_ok_and(|v| v == "1") || gpu_full_enabled()
+    })
+}
+
+/// Build the CPU32 trace table via the resident device chain fed directly from the resident
+/// `cpu_ops` (no host CPU32-op build/pack). Single table (CPU32 is per-row, one source), so
+/// returns `None` if it would exceed `max_rows` (falls back to the host-op device path or CPU).
+/// Byte-identical to `gpu_build_cpu32_tables` (validated by gpu_cpu32_parity).
+pub(crate) fn build_cpu32_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let rows = cpu_ops.iter().filter(|op| op.decode.fields.word_instr).count();
+    if rows > max_rows {
+        return None; // chunking not yet supported in the resident path
+    }
+    let num_rows = rows.next_power_of_two().max(4);
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut rv2, mut imm, mut pc) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        imm.push(op.decode.imm);
+        pc.push(op.decode.pc);
+    }
+    let dev = math_cuda::trace_ops::gpu_build_cpu32_resident_dev(
+        &packed, &rv1, &rv2, &imm, &pc, num_rows,
+    )
+    .ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * cpu32::cols::NUM_COLUMNS),
+        cpu32::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the LOAD trace table via the resident device chain fed from the resident `cpu_ops`
+/// (no host LOAD-op build/pack). Per-row, single chunk — `None` if it would exceed `max_rows`.
+/// Byte-identical to `gpu_build_load_tables` (validated by gpu_load_parity).
+pub(crate) fn build_load_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let rows = cpu_ops.iter().filter(|op| op.decode.fields.is_load()).count();
+    if rows > max_rows {
+        return None;
+    }
+    let num_rows = rows.next_power_of_two().max(4);
+    let n = cpu_ops.len();
+    let (mut packed, mut res, mut rvd) =
+        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        res.push(op.res);
+        rvd.push(op.rvd);
+    }
+    let dev = math_cuda::trace_ops::gpu_build_load_resident_dev(&packed, &res, &rvd, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * load::cols::NUM_COLUMNS),
+        load::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the STORE trace table via the resident device chain fed from the resident `cpu_ops`.
+/// Per-row, single chunk — `None` if it would exceed `max_rows`. Byte-identical to
+/// `gpu_build_store_tables` (validated by gpu_resident_chips).
+pub(crate) fn build_store_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let rows = cpu_ops.iter().filter(|op| op.decode.fields.is_store()).count();
+    if rows > max_rows {
+        return None;
+    }
+    let num_rows = rows.next_power_of_two().max(4);
+    let n = cpu_ops.len();
+    let (mut packed, mut res, mut rv2) =
+        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        res.push(op.res);
+        rv2.push(op.rv2);
+    }
+    let dev = math_cuda::trace_ops::gpu_build_store_resident_dev(&packed, &res, &rv2, num_rows).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * store::cols::NUM_COLUMNS),
+        store::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the SHIFT trace table via the resident device chain fed from the resident `cpu_ops`
+/// (merges instruction-driven + cpu32-derived shifts on device). Per-row, single chunk —
+/// `None` if it would exceed `max_rows`. Byte-identical to `gpu_build_shift_tables`.
+pub(crate) fn build_shift_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let rows: usize = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            (!f.word_instr && f.is_shift()) || (f.word_instr && !f.add && !f.sub && f.is_shift())
+        })
+        .count();
+    if rows > max_rows {
+        return None;
+    }
+    let num_rows = rows.next_power_of_two().max(4);
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut rv2, mut arg2, mut imm) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        arg2.push(op.arg2);
+        imm.push(op.decode.imm);
+    }
+    let dev =
+        math_cuda::trace_ops::gpu_build_shift_full_resident_dev(&packed, &rv1, &rv2, &arg2, &imm, num_rows)
+            .ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * shift::cols::NUM_COLUMNS),
+        shift::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the EQ trace table via the resident device chain (auto-sized to the device-computed
+/// unique count). Global dedup ⇒ single table; returns `None` if the raw is_eq op count exceeds
+/// `max_rows` (the CPU path would chunk with per-chunk dedup, which global dedup can't match).
+/// Multiset-equal to `gpu_build_eq_tables` (sorted vs HashMap row order — both valid traces).
+pub(crate) fn build_eq_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (packed, rv1, arg2) = alu_soa(cpu_ops);
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_eq_resident_dev(&packed, &rv1, &arg2).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * eq::cols::NUM_COLUMNS),
+        eq::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the BYTEWISE trace table via the resident device chain (auto-sized). Same
+/// single-chunk / multiset semantics as `build_eq_resident_tables`.
+pub(crate) fn build_bytewise_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (packed, rv1, arg2) = alu_soa(cpu_ops);
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_bytewise_resident_dev(&packed, &rv1, &arg2).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * bytewise::cols::NUM_COLUMNS),
+        bytewise::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the DVRM trace table via the resident device chain (instruction ⊕ cpu32 sources,
+/// auto-sized). Single-chunk guard on the raw dvrm op count. Multiset-equal to
+/// `gpu_build_dvrm_tables`.
+pub(crate) fn build_dvrm_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            (!f.word_instr && f.is_divrem()) || (f.word_instr && !f.add && !f.sub && f.is_divrem())
+        })
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut rv2, mut arg2, mut imm) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        arg2.push(op.arg2);
+        imm.push(op.decode.imm);
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_dvrm_full_resident_dev(&packed, &rv1, &rv2, &arg2, &imm).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * dvrm::cols::NUM_COLUMNS),
+        dvrm::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the MUL trace table via the resident device chain — ALL four sources (instruction ⊕
+/// instruction-dvrm→mul ⊕ cpu32 ⊕ cpu32-dvrm→mul), auto-sized. Single-chunk guard on the raw
+/// mul-op count. Multiset-equal to `gpu_build_mul_tables`.
+pub(crate) fn build_mul_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw: usize = cpu_ops
+        .iter()
+        .map(|op| {
+            let f = &op.decode.fields;
+            let elig = if f.word_instr { !f.add && !f.sub } else { true };
+            if !elig {
+                0
+            } else if f.is_mul() {
+                1 // MUL op
+            } else if f.is_divrem() {
+                2 // dvrm→mul C13 + C14
+            } else {
+                0
+            }
+        })
+        .sum();
+    if raw > max_rows {
+        return None;
+    }
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut rv2, mut arg2, mut imm) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        arg2.push(op.arg2);
+        imm.push(op.decode.imm);
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_mul_full_resident_dev(&packed, &rv1, &rv2, &arg2, &imm).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * mul::cols::NUM_COLUMNS),
+        mul::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+/// Build the BRANCH trace table via the resident device chain (dedup4, auto-sized). Single
+/// source (branch_cond). Multiset-equal to `gpu_build_branch_tables`.
+pub(crate) fn build_branch_resident_tables(
+    cpu_ops: &[CpuOperation],
+    max_rows: usize,
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops.iter().filter(|op| op.branch_cond).count();
+    if raw > max_rows {
+        return None;
+    }
+    let n = cpu_ops.len();
+    let (mut packed, mut flags, mut pc, mut imm, mut rv1) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        flags.push(op.branch_cond as u8);
+        pc.push(op.decode.pc);
+        imm.push(op.decode.imm);
+        rv1.push(op.rv1);
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_branch_resident_dev(&packed, &flags, &pc, &imm, &rv1).ok()?;
+    let mut trace = TraceTable::new_main(
+        crate::tables::types::zeroed_fe_vec(num_rows * branch::cols::NUM_COLUMNS),
+        branch::cols::NUM_COLUMNS,
+        1,
+    );
+    trace.set_main_input_dev(Arc::new(dev));
+    Some(vec![trace])
+}
+
+// ── p5 single-build seam ──────────────────────────────────────────────────────────────────
+// Build the device-resident cpu_ops ONCE (`build_shared_devops`) and let every chip's
+// `*_from_devops` table builder read the SAME device buffers in place — no per-chip SoA
+// extraction or upload. Each builder keeps its own cheap host-side row count only for the
+// single-chunk `max_rows` guard (returning `None` ⇒ p5 falls back to the per-chip path/CPU).
+
+/// Extract the full cpu_op field SoA (packed/imm/pc/rv1/rv2/arg2/res/rvd/flags) ONCE and upload
+/// it into a resident device buffer set shared by all chip builders. Returns `None` when the GPU
+/// path is disabled or the resident-chips flag is off (so p5 skips the single-build entirely).
+pub(crate) fn build_shared_devops(
+    cpu_ops: &[CpuOperation],
+    logs: &[Log],
+) -> Option<math_cuda::trace_ops::DeviceCpuOpsResident> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = cpu_ops.len();
+
+    // Step A (device cpu_ops seam): under gpu_full, RECOMPUTE the `from_log` fields
+    // (rv1/rv2/arg2/res/rvd/next_pc/branch_cond + ecall metadata) ON DEVICE from the raw Log SoA
+    // + the decode SoA, instead of extracting the host-computed `CpuOperation` fields and
+    // uploading them. Only the decode SoA (packed/imm/pc — already decoded in p1) is extracted
+    // from `cpu_ops`; the raw log fields come straight from `logs`. Bit-exact with the host
+    // `from_log` (parity: `gpu_cpu_ops_parity`, 4.03M cycles). Falls back to the upload path when
+    // gpu_full is off (resident-chips-only mode) or if the log/op lengths ever disagree.
+    if gpu_full_enabled() && logs.len() == n {
+        let (mut packed, mut imm, mut pc) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for op in cpu_ops {
+            packed.push(op.decode.fields.pack());
+            imm.push(op.decode.imm);
+            pc.push(op.decode.pc);
+        }
+        let (mut cpc, mut npc, mut s1, mut s2, mut dv) = (
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+            Vec::with_capacity(n),
+        );
+        for log in logs {
+            cpc.push(log.current_pc);
+            npc.push(log.next_pc);
+            s1.push(log.src1_val);
+            s2.push(log.src2_val);
+            dv.push(log.dst_val);
+        }
+        return math_cuda::trace_ops::gpu_build_cpu_ops_resident(
+            &cpc, &npc, &s1, &s2, &dv, &pc, &imm, &packed,
+        )
+        .ok();
+    }
+
+    let (mut packed, mut imm, mut pc, mut rv1, mut rv2, mut arg2, mut res, mut rvd, mut flags) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::<u8>::with_capacity(n),
+    );
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        imm.push(op.decode.imm);
+        pc.push(op.decode.pc);
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        arg2.push(op.arg2);
+        res.push(op.res);
+        rvd.push(op.rvd);
+        flags.push(op.branch_cond as u8);
+    }
+    math_cuda::trace_ops::gpu_upload_cpu_ops_resident(
+        &packed, &imm, &pc, &rv1, &rv2, &arg2, &res, &rvd, &flags,
+    )
+    .ok()
+}
+
+/// C2-c (wiring): the REGISTER table's final-state map, derived ON DEVICE (regs 0-31 + PC via the
+/// register access-stream snapshot; x254 via the commit-index scan) instead of the host
+/// `RegisterState::to_final_state_map` (which needs the 4M-op sequential advance). Layout is
+/// bit-identical to `to_final_state_map`. `None` when the GPU path is off (→ caller keeps the host map).
+/// Parity-validated standalone (`gpu_reg_final_parity`); wired under gpu_full so the e2e proof itself
+/// re-verifies it (a wrong map ⇒ the REGISTER table unbalances ⇒ verify fails).
+pub(crate) fn device_register_final_state(
+    cpu_ops: &[CpuOperation],
+    ecall_accesses: &super::trace_builder::EcallAccesses,
+    register_init: &[u32],
+    is_final: bool,
+    // The REGISTER table's PC (x255) final token is finalized by the caller (HALT: pc=1 at
+    // `halt_ts + 4*padding + 1`), NOT by the register walk. When `Some((value, ts))`, use it for
+    // addrs 510/511 instead of the device snapshot's last PC access.
+    pc_final: Option<(u64, u64)>,
+) -> Option<super::register::FinalRegisterStateMap> {
+    use super::register::{FinalRegisterWordState, register_base_address};
+    if gpu_trace_disabled() || !gpu_full_enabled() {
+        return None;
+    }
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut rv2, mut rvd, mut next_pc) = (
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+        Vec::with_capacity(n),
+    );
+    let (mut commit_flag, mut commit_count) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        rv2.push(op.rv2);
+        rvd.push(op.rvd);
+        next_pc.push(op.next_pc);
+        commit_flag.push(u8::from(op.ecall_commit));
+        commit_count.push(op.commit_count);
+    }
+    let e_oi = ecall_accesses.reg_op_index.clone();
+    let e_addr: Vec<u32> = ecall_accesses.reg.iter().map(|a| a.reg_addr as u32).collect();
+    let e_ts: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.timestamp).collect();
+    let e_val: Vec<u64> = ecall_accesses.reg.iter().map(|a| a.value).collect();
+    let e_ir: Vec<u8> = ecall_accesses.reg.iter().map(|a| u8::from(a.is_read)).collect();
+    let seed = super::trace_builder::walk_seed_from_register_init(register_init);
+    let start_commit_index =
+        register_init.get(super::register::X254_INDEX).copied().unwrap_or(0) as u64;
+
+    let (val, ts) = math_cuda::trace_walk::gpu_register_final_snapshot(
+        &packed, &rv1, &rv2, &rvd, &next_pc, &e_oi, &e_addr, &e_ts, &e_val, &e_ir, &seed, 1,
+        &commit_flag, &commit_count, start_commit_index,
+    )
+    .ok()?;
+
+    let mut map = super::register::FinalRegisterStateMap::new();
+    for r in 0..32u8 {
+        let a = (2 * r) as usize;
+        // HALT finalization (is_final): x1-x31 are written 0 at ts=u64::MAX (see `collect_halt_ops`),
+        // which the device walk (regular+ecall accesses only) doesn't see. x0 is never written (stays
+        // init). Mirror the post-halt host state here.
+        let (v, t) = if is_final && r >= 1 {
+            (0u64, u64::MAX)
+        } else {
+            (val[a], ts[a])
+        };
+        let base = register_base_address(r);
+        map.insert(base, FinalRegisterWordState { timestamp: t, value: (v & 0xFFFF_FFFF) as u32 });
+        map.insert(base + 1, FinalRegisterWordState { timestamp: t, value: (v >> 32) as u32 });
+    }
+    // x254 (508, single word) — not affected by HALT.
+    map.insert(508, FinalRegisterWordState { timestamp: ts[508], value: val[508] as u32 });
+    // PC (510/511): the caller-finalized token when provided (HALT), else the device snapshot's last PC.
+    let (pv, pt) = pc_final.unwrap_or((val[510], ts[510]));
+    map.insert(510, FinalRegisterWordState { timestamp: pt, value: (pv & 0xFFFF_FFFF) as u32 });
+    map.insert(511, FinalRegisterWordState { timestamp: pt, value: (pv >> 32) as u32 });
+    Some(map)
+}
+
+/// Wrap an autosized `(device buffer, num_rows)` resident-chip result into a single main
+/// `TraceTable` with `ncols` columns (device-input; the host main is a zeroed placeholder).
+fn devops_table(
+    dev: math_cuda::CudaSlice<u64>,
+    num_rows: usize,
+    ncols: usize,
+) -> Vec<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    let mut trace =
+        TraceTable::new_main(crate::tables::types::zeroed_fe_vec(num_rows * ncols), ncols, 1);
+    trace.set_main_input_dev(Arc::new(dev));
+    vec![trace]
+}
+
+type Devops = math_cuda::trace_ops::DeviceCpuOpsResident;
+type Tables = Vec<TraceTable<GoldilocksField, GoldilocksExtension>>;
+
+/// LT-resident-table STEP 2B: the FULL LT table (instruction ⊕ dvrm→lt ⊕ memw→lt) built resident on
+/// device, CHUNKED to `max_rows` rows/table (LT dedups poorly → multiple chunks). `memw_lt_lhs/rhs` are
+/// the device-derived memw→lt operand pairs. Replaces the host `gpu_build_lt_tables(&lt_ops)` under
+/// gpu_full → no host `lt_ops`. Each chunk is a device-input main table (`set_main_input_dev`).
+pub(crate) fn build_lt_resident_tables_from_devops(
+    devops: &Devops,
+    memw_lt_lhs: &[u64],
+    memw_lt_rhs: &[u64],
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let chunks = math_cuda::trace_ops::gpu_build_lt_full_resident_from_devops(
+        devops, memw_lt_lhs, memw_lt_rhs, max_rows,
+    )
+    .ok()?;
+    let mut tables = Vec::with_capacity(chunks.len());
+    for (dev, num_rows) in chunks {
+        let mut trace = TraceTable::new_main(
+            crate::tables::types::zeroed_fe_vec(num_rows * lt::cols::NUM_COLUMNS),
+            lt::cols::NUM_COLUMNS,
+            1,
+        );
+        trace.set_main_input_dev(Arc::new(dev));
+        tables.push(trace);
+    }
+    Some(tables)
+}
+
+pub(crate) fn build_cpu32_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops.iter().filter(|op| op.decode.fields.word_instr).count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_cpu32_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, cpu32::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_load_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops.iter().filter(|op| op.decode.fields.is_load()).count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_load_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, load::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_store_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops.iter().filter(|op| op.decode.fields.is_store()).count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_store_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, store::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_shift_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw: usize = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            (!f.word_instr && f.is_shift()) || (f.word_instr && !f.add && !f.sub && f.is_shift())
+        })
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_shift_full_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, shift::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_eq_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| !op.decode.fields.word_instr && op.decode.fields.is_eq())
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_eq_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, eq::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_bytewise_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            !f.word_instr && (f.is_and() || f.is_or() || f.is_xor())
+        })
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_bytewise_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, bytewise::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_dvrm_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops
+        .iter()
+        .filter(|op| {
+            let f = &op.decode.fields;
+            (!f.word_instr && f.is_divrem()) || (f.word_instr && !f.add && !f.sub && f.is_divrem())
+        })
+        .count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_dvrm_full_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, dvrm::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_mul_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw: usize = cpu_ops
+        .iter()
+        .map(|op| {
+            let f = &op.decode.fields;
+            let elig = if f.word_instr { !f.add && !f.sub } else { true };
+            if !elig {
+                0
+            } else if f.is_mul() {
+                1
+            } else if f.is_divrem() {
+                2
+            } else {
+                0
+            }
+        })
+        .sum();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) =
+        math_cuda::trace_ops::gpu_build_mul_full_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, mul::cols::NUM_COLUMNS))
+}
+
+pub(crate) fn build_branch_resident_tables_from_devops(
+    cpu_ops: &[CpuOperation],
+    devops: &Devops,
+    max_rows: usize,
+) -> Option<Tables> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let raw = cpu_ops.iter().filter(|op| op.branch_cond).count();
+    if raw > max_rows {
+        return None;
+    }
+    let (dev, num_rows) = math_cuda::trace_ops::gpu_build_branch_resident_from_devops(devops).ok()?;
+    Some(devops_table(dev, num_rows, branch::cols::NUM_COLUMNS))
+}
+
+/// Build the COMMIT (ECALL) trace table via the device fill (Phase 6, precompiles). The commit
+/// ops are collected on host (they read memory); this moves the per-byte recursive fill to device.
+/// Single table (never chunked, like `commit::generate_commit_trace`). `None` when the GPU path is
+/// disabled / the resident flag is off. Byte-identical to the CPU generator.
+pub(crate) fn build_commit_resident_table(
+    commit_ops: &[commit::CommitOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = commit_ops.len();
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::COMMIT_STRIDE);
+    for op in commit_ops {
+        flat.push(op.timestamp);
+        flat.push(op.index);
+        flat.push(op.address);
+        flat.push(op.count);
+        flat.push(op.first as u64);
+        flat.push(op.end as u64);
+        flat.push(op.value as u64);
+    }
+    let (dev, num_rows) = math_cuda::precompile::gpu_build_commit_trace_dev(&flat, n).ok()?;
+    Some(devops_table(dev, num_rows, commit::cols::NUM_COLUMNS).pop().unwrap())
+}
+
+/// Build the main KECCAK (permute) trace table via the device fill (Phase 6). The keccak ops are
+/// collected on host (input read from memory, output = `keccak_f1600`); this moves the per-op fill
+/// (ts / addr bytes / input+output state bytes / state_ptr halfwords) to device. `None` when the
+/// GPU path is disabled / the resident flag is off. Byte-identical to `keccak::generate_keccak_trace`.
+pub(crate) fn build_keccak_resident_table(
+    keccak_ops: &[keccak::KeccakOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = keccak_ops.len();
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::KECCAK_TBL_STRIDE);
+    for op in keccak_ops {
+        flat.push(op.timestamp);
+        flat.push(op.state_addr);
+        flat.extend_from_slice(&op.input);
+        flat.extend_from_slice(&op.output);
+    }
+    let (dev, num_rows) = math_cuda::precompile::gpu_build_keccak_trace_dev(&flat, n).ok()?;
+    Some(devops_table(dev, num_rows, keccak::cols::NUM_COLUMNS).pop().unwrap())
+}
+
+/// Step C: recompute the per-step ECDAS carries (`c0/c1/c2`) ON DEVICE and write them back into
+/// `ops` — which arrived carryless from `ecsm::compute_witness_carryless` (the ~190ms `conv`
+/// limb-convolution bulk skipped on CPU). Packs the point + quotient limbs (same layout the ecdas
+/// fill reads) and runs the `ecdas_carries` kernel (bit-exact with the CPU `carries_lambda/xr/yr`,
+/// parity: `gpu_ecdas_carries_parity`). Returns `false` if the GPU path is unavailable — the caller
+/// (under gpu_full) treats that as fatal, since the carryless steps would otherwise keep zero carries.
+pub(crate) fn fill_ecdas_carries_device(ops: &mut [ecdas::EcdasOperation]) -> bool {
+    if gpu_trace_disabled() || ops.is_empty() {
+        return false;
+    }
+    let n = ops.len();
+    let mut bytes = Vec::with_capacity(n * math_cuda::precompile::ECDAS_BSTRIDE);
+    for op in ops.iter() {
+        let s = &op.step;
+        bytes.extend_from_slice(&s.x_g);
+        bytes.extend_from_slice(&s.y_g);
+        bytes.extend_from_slice(&s.x_a);
+        bytes.extend_from_slice(&s.y_a);
+        bytes.push(s.round);
+        bytes.push(s.op);
+        bytes.extend_from_slice(&s.x_r);
+        bytes.extend_from_slice(&s.y_r);
+        bytes.extend_from_slice(&s.lambda);
+        bytes.extend_from_slice(&s.q0);
+        bytes.extend_from_slice(&s.q1);
+        bytes.extend_from_slice(&s.q2);
+        bytes.push(s.next_op);
+    }
+    let carries = match math_cuda::precompile::gpu_build_ecdas_carries(&bytes, n) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let cs = math_cuda::precompile::ECDAS_CSTRIDE;
+    for (i, op) in ops.iter_mut().enumerate() {
+        let base = i * cs;
+        op.step.c0.copy_from_slice(&carries[base..base + 64]);
+        op.step.c1.copy_from_slice(&carries[base + 64..base + 128]);
+        op.step.c2.copy_from_slice(&carries[base + 128..base + 192]);
+    }
+    true
+}
+
+/// Build the ECDAS trace table via the device fill (Phase 6). Pure formatting of the precomputed
+/// witness (byte coords + signed carries); the EC/modular math ran on CPU during execution. `None`
+/// when the GPU path is disabled / the resident flag is off. Byte-identical to the CPU generator.
+pub(crate) fn build_ecdas_resident_table(
+    ops: &[ecdas::EcdasOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = ops.len();
+    let mut bytes = Vec::with_capacity(n * math_cuda::precompile::ECDAS_BSTRIDE);
+    let mut carries = Vec::with_capacity(n * math_cuda::precompile::ECDAS_CSTRIDE);
+    let mut ts = Vec::with_capacity(n);
+    for op in ops {
+        let s = &op.step;
+        bytes.extend_from_slice(&s.x_g);
+        bytes.extend_from_slice(&s.y_g);
+        bytes.extend_from_slice(&s.x_a);
+        bytes.extend_from_slice(&s.y_a);
+        bytes.push(s.round);
+        bytes.push(s.op);
+        bytes.extend_from_slice(&s.x_r);
+        bytes.extend_from_slice(&s.y_r);
+        bytes.extend_from_slice(&s.lambda);
+        bytes.extend_from_slice(&s.q0);
+        bytes.extend_from_slice(&s.q1);
+        bytes.extend_from_slice(&s.q2);
+        bytes.push(s.next_op);
+        carries.extend_from_slice(&s.c0);
+        carries.extend_from_slice(&s.c1);
+        carries.extend_from_slice(&s.c2);
+        ts.push(op.timestamp);
+    }
+    let (dev, num_rows) =
+        math_cuda::precompile::gpu_build_ecdas_trace_dev(&bytes, &carries, &ts, n).ok()?;
+    Some(devops_table(dev, num_rows, ecdas::cols::NUM_COLUMNS).pop().unwrap())
+}
+
+/// Build the ECSM trace table via the device fill (Phase 6). Pure formatting of the precomputed
+/// witness (byte coords, k bits, halfwords, signed carries). `None` when the GPU path is disabled /
+/// the resident flag is off. Byte-identical to the CPU generator.
+pub(crate) fn build_ecsm_resident_table(
+    ops: &[ecsm::EcsmOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = ops.len();
+    let mut bytes = Vec::with_capacity(n * math_cuda::precompile::ECSM_BSTRIDE);
+    let mut carries = Vec::with_capacity(n * math_cuda::precompile::ECSM_CSTRIDE);
+    let mut addrs = Vec::with_capacity(n * math_cuda::precompile::ECSM_ASTRIDE);
+    for op in ops {
+        let wt = &op.witness;
+        bytes.extend_from_slice(&wt.x_r);
+        bytes.extend_from_slice(&wt.y_r);
+        bytes.extend_from_slice(&wt.k);
+        bytes.extend_from_slice(&wt.x_g);
+        bytes.extend_from_slice(&wt.y_g);
+        bytes.extend_from_slice(&wt.x2);
+        bytes.extend_from_slice(&wt.q0);
+        bytes.extend_from_slice(&wt.q1);
+        bytes.extend_from_slice(&wt.x_g_sub_p);
+        bytes.extend_from_slice(&wt.k_sub_n);
+        bytes.extend_from_slice(&wt.x_r_sub_p);
+        bytes.push(wt.len_k);
+        carries.extend_from_slice(&wt.c0);
+        carries.extend_from_slice(&wt.c1);
+        addrs.push(op.timestamp);
+        addrs.push(op.addr_xg);
+        addrs.push(op.addr_k);
+        addrs.push(op.addr_xr);
+    }
+    let (dev, num_rows) =
+        math_cuda::precompile::gpu_build_ecsm_trace_dev(&bytes, &carries, &addrs, n).ok()?;
+    Some(devops_table(dev, num_rows, ecsm::cols::NUM_COLUMNS).pop().unwrap())
+}
+
+/// Build the KECCAK_RND (per-round) trace table via the device fill (Phase 6) — recomputes the 24
+/// permutation rounds per op on device. `keccak_ops` are the same KeccakOperations that drive the
+/// main keccak table; only `input`+`timestamp` are used (rounds recompute the rest). `None` when the
+/// GPU path is disabled / resident flag off. Byte-identical to `keccak_rnd::generate_keccak_rnd_trace`.
+pub(crate) fn build_keccak_rnd_resident_table(
+    keccak_ops: &[keccak::KeccakOperation],
+) -> Option<TraceTable<GoldilocksField, GoldilocksExtension>> {
+    if gpu_trace_disabled() || !gpu_resident_chips_enabled() {
+        return None;
+    }
+    let n = keccak_ops.len();
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::KECCAK_RND_STRIDE);
+    for op in keccak_ops {
+        flat.push(op.timestamp);
+        flat.extend_from_slice(&op.input);
+    }
+    let (dev, num_rows) = math_cuda::precompile::gpu_build_keccak_rnd_trace_dev(&flat, n).ok()?;
+    Some(devops_table(dev, num_rows, keccak_rnd::cols::NUM_COLUMNS).pop().unwrap())
+}
+
+/// Extract the (packed decode, rv1, arg2) SoA the resident ALU chip chains read from cpu_ops.
+fn alu_soa(cpu_ops: &[CpuOperation]) -> (Vec<u64>, Vec<u64>, Vec<u64>) {
+    let n = cpu_ops.len();
+    let (mut packed, mut rv1, mut arg2) =
+        (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+    for op in cpu_ops {
+        packed.push(op.decode.fields.pack());
+        rv1.push(op.rv1);
+        arg2.push(op.arg2);
+    }
+    (packed, rv1, arg2)
 }
 
 /// Shared GPU table-build dispatcher. Mirrors `chunk_and_generate`'s chunking
@@ -210,6 +1185,104 @@ pub(crate) fn gpu_build_memw_register_tables(
     gpu_build_tables(rows, max_rows, build_memw_register_chunk)
 }
 
+/// Build the MEMW_R chunk tables DIRECTLY on device from the register walk (no 447MB row
+/// download + 9.3M host `RegRow` build). Runs `gpu_walk_route_memw_register_ecall_chunked` — one
+/// device walk fills every capped chunk table resident (via `fill_chunk_on`) — then wraps each
+/// resident `[height*NCOLS]` buffer into a `TraceTable` (placeholder host matrix + `set_main_input_dev`,
+/// exactly like `build_memw_register_chunk`). Returns the tables + the rare fallback subset
+/// `[reg_addr, ts, value, old_value, old_ts, is_read]` (emit order) for the host to route to
+/// aligned/general. The MEMW_R memory bus is partition-invariant across chunks, so the multi-chunk
+/// split is correct regardless of which chunk a row lands in. `None` on GPU failure.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gpu_build_memw_register_tables_from_walk(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    ecall_op_index: &[u32],
+    ecall_reg_addr: &[u32],
+    ecall_ts: &[u64],
+    ecall_value: &[u64],
+    ecall_is_read: &[u8],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    max_rows: usize,
+) -> Option<(Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Vec<[u64; 6]>, Vec<u64>)> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    // `is_half` is the MEMW_R IS_HALFWORD ts-delta histogram (65536 bins) the walk already computes as
+    // a byproduct. Surfaced here so the caller can feed it to the BITWISE merge and SKIP the redundant
+    // second register walk inside `gpu_bitwise_hist_full` (fix (a): walk-once).
+    let (bufs, num_rows, is_half, fallback) =
+        math_cuda::trace_walk::gpu_walk_route_memw_register_ecall_chunked(
+            packed, rv1, rv2, rvd, next_pc, ecall_op_index, ecall_reg_addr, ecall_ts, ecall_value,
+            ecall_is_read, init_value, init_ts, nbins, max_rows,
+        )
+        .ok()?;
+    let ncols = memw_register::cols::NUM_COLUMNS;
+    let tables: Vec<_> = bufs
+        .into_iter()
+        .enumerate()
+        .map(|(c, buf)| {
+            let lo = c * max_rows;
+            let hi = ((c + 1) * max_rows).min(num_rows);
+            // Match `fill_chunk_on`'s height exactly (empty walk → one height-4 table).
+            let height = (hi.saturating_sub(lo)).next_power_of_two().max(4);
+            let mut trace = TraceTable::new_main(
+                crate::tables::types::zeroed_fe_vec(height * ncols),
+                ncols,
+                1,
+            );
+            trace.set_main_input_dev(Arc::new(buf));
+            trace
+        })
+        .collect();
+    Some((tables, fallback, is_half))
+}
+
+/// A1 — build the resident PAGE trace tables (one per page, ascending `page_bases`) DIRECTLY on
+/// device from the initial image + the device final-memory snapshot, retiring the ~285ms host
+/// `generate_page_trace_from_dense` column fill. Each `[page_size*5]` resident buffer is wrapped in
+/// a `TraceTable` (placeholder host matrix + `set_main_input_dev`, like the resident chips).
+/// Bit-identical to the host page trace (exclude_touched=false). `None` on GPU failure.
+/// A1 NO-GO (kept as ready infra, currently OFF): device PAGE tables VERIFY (device fill → host
+/// matrix → preprocessed commit), but `gen_pages` is parallel-hidden in p5 so this is a net loss
+/// (see trace_builder.rs "A1 NO-GO"). Retained for a future fully-resident preprocessed path.
+#[allow(dead_code)]
+pub(crate) fn gpu_build_page_tables_from_snapshot(
+    page_bases: &[u64],
+    img_addr: &[u64],
+    img_val: &[u64],
+    snap_addr: &[u64],
+    snap_val: &[u64],
+    snap_ts: &[u64],
+) -> Option<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>> {
+    if gpu_trace_disabled() {
+        return None;
+    }
+    let page_size = crate::tables::page::DEFAULT_PAGE_SIZE;
+    let ncols = crate::tables::page::cols::NUM_COLUMNS;
+    let bufs = math_cuda::trace_cpu::gpu_page_fill_snapshot(
+        page_bases, page_size as u64, img_addr, img_val, snap_addr, snap_val, snap_ts, ncols,
+    )
+    .ok()?;
+    // Each `buf` is a row-major `[page_size*ncols]` canonical-u64 PAGE table filled on device and
+    // downloaded. Wrap it as a REAL host trace matrix (not a resident device buffer): PAGE is a
+    // preprocessed 2-tree table whose commit AND R2 aux build both read the host matrix, so the
+    // device buffer must be materialized here. Bit-identical to `generate_page_trace_from_dense`.
+    let tables = bufs
+        .into_iter()
+        .map(|buf| {
+            debug_assert_eq!(buf.len(), page_size * ncols);
+            TraceTable::new_main(crate::tables::types::fe_vec_from_u64(buf), ncols, 1)
+        })
+        .collect();
+    Some(tables)
+}
+
 // =============================================================================
 // MEMW_A (aligned memory — the biggest remaining uploader, ~2M rows on ethrex)
 // =============================================================================
@@ -238,6 +1311,30 @@ pub(crate) fn pack_memw_aligned_op(
         o[4] as u64 | ((o[5] as u64) << 32),
         o[6] as u64 | ((o[7] as u64) << 32),
     ]
+}
+
+/// Inverse of [`pack_memw_aligned_op`]: reconstruct a `MemwOperation` from a device MEMW_A row
+/// (option B). The 12-stride carries only `old_timestamp[0]` — aligned ops share one timestamp
+/// across all bytes (`is_aligned_op`), and both the MEMW_A fill and `collect_lt_from_memw_aligned`
+/// read only index 0 — so the remaining `old_timestamp[1..8]` are semantically absent and left 0.
+pub(crate) fn unpack_memw_aligned(r: &[u64; math_cuda::trace_cpu::MEMW_ALIGNED_STRIDE]) -> MemwOperation {
+    let flags = r[0];
+    let is_register = (flags & 1) != 0;
+    let is_read = (flags & 2) != 0;
+    let width = ((flags >> 8) & 0xFF) as u8;
+    let unpack4 = |lo: usize| {
+        let mut b = [0u32; 8];
+        for k in 0..4 {
+            b[2 * k] = (r[lo + k] & 0xFFFF_FFFF) as u32;
+            b[2 * k + 1] = (r[lo + k] >> 32) as u32;
+        }
+        b
+    };
+    let value = unpack4(4);
+    let old = unpack4(8);
+    let mut old_timestamp = [0u64; 8];
+    old_timestamp[0] = r[3];
+    MemwOperation::new(is_register, r[1], value, r[2], width, is_read).with_old(old, old_timestamp)
 }
 
 /// Build one MEMW_A trace-table chunk on device: pack the walked ops → GPU fill →
@@ -795,6 +1892,33 @@ pub(crate) fn pack_memw_op(op: &MemwOperation) -> [u64; math_cuda::trace_cpu::ME
         ot[6],
         ot[7],
     ]
+}
+
+/// Inverse of [`pack_memw_op`]: reconstruct a `MemwOperation` from a device MEMW (general) row
+/// (option B). The 19-stride captures the entire struct (all 8 old bytes + all 8 old_timestamps),
+/// so this is fully lossless. The device walk zeros old_value/old_timestamp BEYOND the access
+/// width (don't-care per store.toml — those bytes are not on the memory bus), matching the walk's
+/// validated output; within-width fields are bit-exact vs the CPU.
+pub(crate) fn unpack_memw(r: &[u64; math_cuda::trace_cpu::MEMW_STRIDE]) -> MemwOperation {
+    let flags = r[0];
+    let is_register = (flags & 1) != 0;
+    let is_read = (flags & 2) != 0;
+    let width = ((flags >> 8) & 0xFF) as u8;
+    let unpack4 = |lo: usize| {
+        let mut b = [0u32; 8];
+        for k in 0..4 {
+            b[2 * k] = (r[lo + k] & 0xFFFF_FFFF) as u32;
+            b[2 * k + 1] = (r[lo + k] >> 32) as u32;
+        }
+        b
+    };
+    let value = unpack4(3);
+    let old = unpack4(7);
+    let mut old_timestamp = [0u64; 8];
+    for (j, slot) in old_timestamp.iter_mut().enumerate() {
+        *slot = r[11 + j];
+    }
+    MemwOperation::new(is_register, r[1], value, r[2], width, is_read).with_old(old, old_timestamp)
 }
 
 /// Build one MEMW (general) trace-table chunk on device: pack the walked ops → GPU

@@ -866,9 +866,12 @@ pub fn prove_with_options_and_inputs(
         auto_storage::decide(&lengths, proof_options.blowup_factor)
     };
 
-    let mut traces = Traces::from_elf_and_logs(
+    // Option A: feed the executor-recorded precompile inputs so the KECCAK/ECSM/COMMIT chip
+    // collectors build from them instead of replaying `memory_state` for their inputs.
+    let mut traces = Traces::from_elf_and_logs_with_precompiles(
         &program,
         &result.logs,
+        Some(&result.precompile_inputs),
         max_rows,
         private_inputs,
         #[cfg(feature = "disk-spill")]

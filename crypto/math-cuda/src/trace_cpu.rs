@@ -774,6 +774,60 @@ pub fn gpu_fill_memw_register(
     Ok(buf)
 }
 
+/// A1 — build all resident PAGE tables on device from the initial image + the device final-memory
+/// snapshot (with timestamps). One row-major `[page_size*ncols]` buffer per page (`page_bases`
+/// ascending, one `page_fill_snapshot` launch each), left resident for the LDE. The sorted image +
+/// snapshot upload ONCE. Bit-identical to `generate_page_trace_from_dense` (exclude_touched=false) —
+/// replaces the ~285ms host PAGE column-fill.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_page_fill_snapshot(
+    page_bases: &[u64],
+    page_size: u64,
+    img_addr: &[u64],
+    img_val: &[u64],
+    snap_addr: &[u64],
+    snap_val: &[u64],
+    snap_ts: &[u64],
+    ncols: usize,
+) -> Result<Vec<Vec<u64>>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let ia = stream.clone_htod(img_addr)?;
+    let iv = stream.clone_htod(img_val)?;
+    let sa = stream.clone_htod(snap_addr)?;
+    let sv = stream.clone_htod(snap_val)?;
+    let st = stream.clone_htod(snap_ts)?;
+    let img_n = img_addr.len() as u64;
+    let snap_n = snap_addr.len() as u64;
+    let ncols_u32 = ncols as u32;
+    // Fill each page's row-major table on device, then download to a host row-major `[row*ncols+col]`
+    // matrix (the preprocessed commit + the R2 aux build both read the host matrix). Device fill
+    // (~63ms) + download replaces the ~285ms host column fill; the LDE re-uploads in the commit phase.
+    let mut bufs = Vec::with_capacity(page_bases.len());
+    for &pb in page_bases {
+        let mut buf = stream.alloc_zeros::<u64>(page_size as usize * ncols)?;
+        unsafe {
+            stream
+                .launch_builder(&be.page_fill_snapshot)
+                .arg(&pb)
+                .arg(&page_size)
+                .arg(&ia)
+                .arg(&iv)
+                .arg(&img_n)
+                .arg(&sa)
+                .arg(&sv)
+                .arg(&st)
+                .arg(&snap_n)
+                .arg(&ncols_u32)
+                .arg(&mut buf)
+                .launch(LaunchConfig::for_num_elems(page_size as u32))?;
+        }
+        bufs.push(stream.clone_dtoh(&buf)?);
+    }
+    stream.synchronize()?;
+    Ok(bufs)
+}
+
 /// Host-returning wrapper over [`gpu_fill_memw_register`] for byte-parity tests.
 #[allow(clippy::too_many_arguments)]
 pub fn gpu_fill_memw_register_host(
@@ -972,4 +1026,306 @@ fn walk_and_fill_memw_register_on(
             .launch(LaunchConfig::for_num_elems(n as u32))?;
     }
     Ok(buf)
+}
+
+/// P2: FULLY-RESIDENT register MEMW_R build — emit the register accesses on device from the resident
+/// cpu_op fields (P1 `emit_register_accesses_dev`), walk them (`walk_core`), and fill the MEMW_R
+/// table, all on one stream with NO host collection or per-access upload (only the cpu_op SoA + the
+/// tiny `init_value[nbins]` are uploaded). Returns the residency-ready `[row*NCOLS+col]` buffer.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let n = packed.len();
+    let pk_d = stream.clone_htod(packed)?;
+    let rv1_d = stream.clone_htod(rv1)?;
+    let rv2_d = stream.clone_htod(rv2)?;
+    let rvd_d = stream.clone_htod(rvd)?;
+    let npc_d = stream.clone_htod(next_pc)?;
+
+    let (reg_addr_d, ts_d, value_d, is_read_d, row_index_d, total) =
+        crate::trace_walk::emit_register_accesses_dev(
+            be, &stream, &pk_d, &rv1_d, &rv2_d, &rvd_d, &npc_d, n,
+        )?;
+
+    let mut buf = stream.alloc_zeros::<u64>(num_rows * MEMW_REGISTER_NCOLS)?;
+    if total == 0 {
+        stream.synchronize()?;
+        return Ok(buf);
+    }
+    let init_value_d = stream.clone_htod(init_value)?;
+    let (old_value_d, old_ts_d) = crate::trace_walk::walk_core(
+        be, &stream, &reg_addr_d, &ts_d, &value_d, &init_value_d, init_ts, total, nbins,
+    )?;
+    let n_u64 = total as u64;
+    let ncols_u32 = MEMW_REGISTER_NCOLS as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.memw_register_fill)
+            .arg(&n_u64)
+            .arg(&reg_addr_d)
+            .arg(&ts_d)
+            .arg(&value_d)
+            .arg(&is_read_d)
+            .arg(&row_index_d)
+            .arg(&old_value_d)
+            .arg(&old_ts_d)
+            .arg(&ncols_u32)
+            .arg(&mut buf)
+            .launch(LaunchConfig::for_num_elems(total as u32))?;
+    }
+    stream.synchronize()?;
+    Ok(buf)
+}
+
+/// P1-ecall: resident register walk that INJECTS extra (host-captured) register accesses as
+/// NON-EMITTING timeline events. Emits the regular accesses on device from the cpu_op fields
+/// (`emit_register_accesses_dev`), concatenates the injected `(reg_addr, ts, value, is_read)` with
+/// `row_index = -1` (they advance the per-register timeline so REGULAR rows get correct old_ts across
+/// the ecall interleaving, but emit no MEMW_R row — Option Z), walks the combined stream, and fills.
+/// Byte-identical to `gpu_walk_and_fill_memw_register_host` fed the same combined stream. The injected
+/// accesses' upload is tiny (ecall counts are small). `num_rows` is sized for the regular emitting rows.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident_injected(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    inj_reg_addr: &[u32],
+    inj_ts: &[u64],
+    inj_value: &[u64],
+    inj_is_read: &[u8],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let m = inj_reg_addr.len();
+    debug_assert!(
+        [inj_ts.len(), inj_value.len(), inj_is_read.len()].iter().all(|&l| l == m),
+        "injected access arrays must be equal length"
+    );
+    let be = backend()?;
+    let stream = be.next_stream();
+    let n = packed.len();
+    let pk_d = stream.clone_htod(packed)?;
+    let rv1_d = stream.clone_htod(rv1)?;
+    let rv2_d = stream.clone_htod(rv2)?;
+    let rvd_d = stream.clone_htod(rvd)?;
+    let npc_d = stream.clone_htod(next_pc)?;
+
+    let (reg_addr_e, ts_e, value_e, is_read_e, row_index_e, total_e) =
+        crate::trace_walk::emit_register_accesses_dev(
+            be, &stream, &pk_d, &rv1_d, &rv2_d, &rvd_d, &npc_d, n,
+        )?;
+
+    let total = total_e + m;
+    let mut buf = stream.alloc_zeros::<u64>(num_rows * MEMW_REGISTER_NCOLS)?;
+    if total == 0 {
+        stream.synchronize()?;
+        return Ok(buf);
+    }
+
+    // Combined access arrays: [emitted regular | injected ecall (row_index = -1)].
+    let mut reg_addr = stream.alloc_zeros::<u32>(total)?;
+    let mut ts = stream.alloc_zeros::<u64>(total)?;
+    let mut value = stream.alloc_zeros::<u64>(total)?;
+    let mut is_read = stream.alloc_zeros::<u8>(total)?;
+    let mut row_index = stream.alloc_zeros::<i64>(total)?;
+    if total_e > 0 {
+        stream.memcpy_dtod(&reg_addr_e.slice(0..total_e), &mut reg_addr.slice_mut(0..total_e))?;
+        stream.memcpy_dtod(&ts_e.slice(0..total_e), &mut ts.slice_mut(0..total_e))?;
+        stream.memcpy_dtod(&value_e.slice(0..total_e), &mut value.slice_mut(0..total_e))?;
+        stream.memcpy_dtod(&is_read_e.slice(0..total_e), &mut is_read.slice_mut(0..total_e))?;
+        stream.memcpy_dtod(&row_index_e.slice(0..total_e), &mut row_index.slice_mut(0..total_e))?;
+    }
+    if m > 0 {
+        stream.memcpy_htod(inj_reg_addr, &mut reg_addr.slice_mut(total_e..total))?;
+        stream.memcpy_htod(inj_ts, &mut ts.slice_mut(total_e..total))?;
+        stream.memcpy_htod(inj_value, &mut value.slice_mut(total_e..total))?;
+        stream.memcpy_htod(inj_is_read, &mut is_read.slice_mut(total_e..total))?;
+        stream.memcpy_htod(&vec![-1i64; m], &mut row_index.slice_mut(total_e..total))?;
+    }
+
+    let init_value_d = stream.clone_htod(init_value)?;
+    let (old_value_d, old_ts_d) = crate::trace_walk::walk_core(
+        be, &stream, &reg_addr, &ts, &value, &init_value_d, init_ts, total, nbins,
+    )?;
+    let n_u64 = total as u64;
+    let ncols_u32 = MEMW_REGISTER_NCOLS as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.memw_register_fill)
+            .arg(&n_u64)
+            .arg(&reg_addr)
+            .arg(&ts)
+            .arg(&value)
+            .arg(&is_read)
+            .arg(&row_index)
+            .arg(&old_value_d)
+            .arg(&old_ts_d)
+            .arg(&ncols_u32)
+            .arg(&mut buf)
+            .launch(LaunchConfig::for_num_elems(total as u32))?;
+    }
+    stream.synchronize()?;
+    Ok(buf)
+}
+
+/// Host-returning wrapper over [`gpu_walk_fill_memw_register_resident_injected`] for parity tests.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident_injected_host(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    inj_reg_addr: &[u32],
+    inj_ts: &[u64],
+    inj_value: &[u64],
+    inj_is_read: &[u8],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let buf = gpu_walk_fill_memw_register_resident_injected(
+        packed, rv1, rv2, rvd, next_pc, inj_reg_addr, inj_ts, inj_value, inj_is_read, init_value,
+        init_ts, nbins, num_rows,
+    )?;
+    let be = backend()?;
+    let stream = be.next_stream();
+    let host = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// P1-ecall: fully-resident register MEMW_R build that INTERLEAVES the ecall accesses at their op's
+/// timeline position (via `emit_register_accesses_with_ecall_dev`), so the regular MEMW_R rows get
+/// correct `old_ts`/`old_value` across the ecall interleaving. The ecall accesses are non-emitting
+/// (their MEMW rows are produced on CPU per Option Z). Only the tiny ecall arrays + cpu_op SoA +
+/// `init_value` are uploaded. `num_rows` is sized for the regular emitting rows.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident_ecall(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    ecall_op_index: &[u32],
+    ecall_reg_addr: &[u32],
+    ecall_ts: &[u64],
+    ecall_value: &[u64],
+    ecall_is_read: &[u8],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let n = packed.len();
+    let pk_d = stream.clone_htod(packed)?;
+    let rv1_d = stream.clone_htod(rv1)?;
+    let rv2_d = stream.clone_htod(rv2)?;
+    let rvd_d = stream.clone_htod(rvd)?;
+    let npc_d = stream.clone_htod(next_pc)?;
+
+    let (reg_addr_d, ts_d, value_d, is_read_d, row_index_d, total) =
+        crate::trace_walk::emit_register_accesses_with_ecall_dev(
+            be, &stream, &pk_d, &rv1_d, &rv2_d, &rvd_d, &npc_d, n, ecall_op_index, ecall_reg_addr,
+            ecall_ts, ecall_value, ecall_is_read,
+        )?;
+
+    let mut buf = stream.alloc_zeros::<u64>(num_rows * MEMW_REGISTER_NCOLS)?;
+    if total == 0 {
+        stream.synchronize()?;
+        return Ok(buf);
+    }
+    let init_value_d = stream.clone_htod(init_value)?;
+    let (old_value_d, old_ts_d) = crate::trace_walk::walk_core(
+        be, &stream, &reg_addr_d, &ts_d, &value_d, &init_value_d, init_ts, total, nbins,
+    )?;
+    let n_u64 = total as u64;
+    let ncols_u32 = MEMW_REGISTER_NCOLS as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.memw_register_fill)
+            .arg(&n_u64)
+            .arg(&reg_addr_d)
+            .arg(&ts_d)
+            .arg(&value_d)
+            .arg(&is_read_d)
+            .arg(&row_index_d)
+            .arg(&old_value_d)
+            .arg(&old_ts_d)
+            .arg(&ncols_u32)
+            .arg(&mut buf)
+            .launch(LaunchConfig::for_num_elems(total as u32))?;
+    }
+    stream.synchronize()?;
+    Ok(buf)
+}
+
+/// Host-returning wrapper over [`gpu_walk_fill_memw_register_resident_ecall`] for parity tests.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident_ecall_host(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    ecall_op_index: &[u32],
+    ecall_reg_addr: &[u32],
+    ecall_ts: &[u64],
+    ecall_value: &[u64],
+    ecall_is_read: &[u8],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let buf = gpu_walk_fill_memw_register_resident_ecall(
+        packed, rv1, rv2, rvd, next_pc, ecall_op_index, ecall_reg_addr, ecall_ts, ecall_value,
+        ecall_is_read, init_value, init_ts, nbins, num_rows,
+    )?;
+    let be = backend()?;
+    let stream = be.next_stream();
+    let host = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Host-returning wrapper over [`gpu_walk_fill_memw_register_resident`] for parity tests.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_fill_memw_register_resident_host(
+    packed: &[u64],
+    rv1: &[u64],
+    rv2: &[u64],
+    rvd: &[u64],
+    next_pc: &[u64],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let buf = gpu_walk_fill_memw_register_resident(
+        packed, rv1, rv2, rvd, next_pc, init_value, init_ts, nbins, num_rows,
+    )?;
+    let be = backend()?;
+    let stream = be.next_stream();
+    let host = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(host)
 }

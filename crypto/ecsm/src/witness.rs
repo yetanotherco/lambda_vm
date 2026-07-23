@@ -275,6 +275,23 @@ fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &
 /// Computes the full ECSM/ECDAS witness for `k·G` over secp256k1, given `k` and `xG` as
 /// little-endian 32-byte values. This is the prover's entry point.
 pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
+    compute_witness_impl(k_le, xg_le, true)
+}
+
+/// Like [`compute_witness`] but SKIPS the per-step ECDAS carry convolutions (`c0/c1/c2` left zero),
+/// leaving only the EC replay + quotients on the CPU. The carries (the ~190ms `conv` limb-convolution
+/// bulk) are recomputed on the GPU from the per-step point + quotient limbs (`ecdas_carries` kernel,
+/// bit-exact). The per-ecall `x2`/`yG` carries (`EcsmWitness::c0/c1`) are still computed (cheap). Only
+/// safe when the caller fills `steps[*].c{0,1,2}` from the device before they are consumed.
+pub fn compute_witness_carryless(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness, EcsmError> {
+    compute_witness_impl(k_le, xg_le, false)
+}
+
+fn compute_witness_impl(
+    k_le: &[u8; 32],
+    xg_le: &[u8; 32],
+    step_carries: bool,
+) -> Result<EcsmWitness, EcsmError> {
     let (k, g) = prepare(k_le, xg_le)?;
 
     let p_big = BigInt::from(p());
@@ -327,7 +344,7 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
 
     let steps = steps_pts
         .iter()
-        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
+        .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp, step_carries))
         .collect();
 
     Ok(EcsmWitness {
@@ -356,6 +373,9 @@ fn build_step(
     r_big: &BigInt,
     r_ext: &[i128; 64],
     pp: &[i128; 64],
+    // When false, the `conv` limb-convolution carries `c0/c1/c2` are LEFT ZERO (the GPU recomputes
+    // them from the point + quotient limbs). Quotients are always computed (the GPU needs them).
+    step_carries: bool,
 ) -> EcdasStep {
     // λ is precomputed (batched) during the double-and-add replay.
     let lam_b = to_le_32(&s.lambda);
@@ -365,16 +385,6 @@ fn build_step(
     let yg_b = to_le_32(&s.g.y);
     let xr_b = to_le_32(&s.r.x);
     let yr_b = to_le_32(&s.r.y);
-
-    let (lam_ext, xa_ext, ya_ext, xg_ext, yg_ext, xr_ext, yr_ext) = (
-        ext64(&lam_b),
-        ext64(&xa_b),
-        ext64(&ya_b),
-        ext64(&xg_b),
-        ext64(&yg_b),
-        ext64(&xr_b),
-        ext64(&yr_b),
-    );
 
     let lam_i = BigInt::from(s.lambda.clone());
     let xa_i = BigInt::from(s.a.x.clone());
@@ -406,37 +416,26 @@ fn build_step(
     let q2_big = shifted_quotient("yR", &num2, p_big, r_big);
     let q2_b = to_le_33("yR", &q2_big);
 
-    let c0 = carries_lambda(
-        s.op,
-        &lam_ext,
-        &xg_ext,
-        &xa_ext,
-        &ya_ext,
-        &yg_ext,
-        r_ext,
-        pp,
-        &ext64(&q0_b),
-    );
-    let c1 = carries_xr(
-        s.op,
-        &lam_ext,
-        &xa_ext,
-        &xg_ext,
-        &xr_ext,
-        r_ext,
-        pp,
-        &ext64(&q1_b),
-    );
-    let c2 = carries_yr(
-        &lam_ext,
-        &xa_ext,
-        &xr_ext,
-        &ya_ext,
-        &yr_ext,
-        r_ext,
-        pp,
-        &ext64(&q2_b),
-    );
+    // The `conv` limb-convolution carries — the ~190ms bulk. Skipped (left zero) when the GPU will
+    // recompute them from the point + quotient limbs (`step_carries = false`).
+    let (c0, c1, c2) = if step_carries {
+        let (lam_ext, xa_ext, ya_ext, xg_ext, yg_ext, xr_ext, yr_ext) = (
+            ext64(&lam_b),
+            ext64(&xa_b),
+            ext64(&ya_b),
+            ext64(&xg_b),
+            ext64(&yg_b),
+            ext64(&xr_b),
+            ext64(&yr_b),
+        );
+        (
+            carries_lambda(s.op, &lam_ext, &xg_ext, &xa_ext, &ya_ext, &yg_ext, r_ext, pp, &ext64(&q0_b)),
+            carries_xr(s.op, &lam_ext, &xa_ext, &xg_ext, &xr_ext, r_ext, pp, &ext64(&q1_b)),
+            carries_yr(&lam_ext, &xa_ext, &xr_ext, &ya_ext, &yr_ext, r_ext, pp, &ext64(&q2_b)),
+        )
+    } else {
+        ([0i64; 64], [0i64; 64], [0i64; 64])
+    };
 
     EcdasStep {
         x_a: xa_b,

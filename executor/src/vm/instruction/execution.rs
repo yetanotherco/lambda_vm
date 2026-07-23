@@ -412,6 +412,9 @@ impl Instruction {
                                 .ok_or(ExecutionError::KeccakStateAddressOverflow(state_addr))?;
                             *lane = memory.load_doubleword(lane_addr)?;
                         }
+                        // Option A: record the input state so the prover's KECCAK collector
+                        // need not re-read it from a replayed memory_state.
+                        memory.record_keccak_input(state);
                         keccak_f1600(&mut state);
                         for (i, &lane) in state.iter().enumerate() {
                             let lane_addr = state_addr
@@ -447,6 +450,9 @@ impl Instruction {
                         }
                         let xg = load_u256_le(memory, addr_xg)?;
                         let k = load_u256_le(memory, addr_k)?;
+                        // Option A: record the input operands so the prover's ECSM collector
+                        // need not re-read them from a replayed memory_state.
+                        memory.record_ecsm_input(xg, k);
                         let xr = ecsm::scalar_mul_x(&k, &xg)?;
                         store_u256_le(memory, addr_xr, &xr)?;
                         // Carry addr_xG/addr_k in the CPU log; addr_xR is recovered from x10

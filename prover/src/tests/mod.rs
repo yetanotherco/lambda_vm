@@ -49,6 +49,48 @@ pub mod eq_tests;
 #[cfg(all(test, feature = "cuda"))]
 pub mod gpu_cpu_ops_parity;
 #[cfg(all(test, feature = "cuda"))]
+pub mod gpu_alu_chipops_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_mem_walk_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_cpu32_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_load_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_resident_chips;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_dedup_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_lt_resident_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_dedup2_resident_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_memw_routing_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_memw_fill_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_cpu32_pipeline_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_resident_seam_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_resident_e2e;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_resident_bench;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_bitwise_resident_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_bitwise_opvec_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_memw_lt_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_keccak_f1600_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_reg_emit_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_ecdas_carries_parity;
+#[cfg(all(test, feature = "cuda"))]
+pub mod gpu_reg_final_parity;
+#[cfg(all(test, feature = "cuda"))]
 pub mod gpu_fill_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;

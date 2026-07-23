@@ -8,7 +8,7 @@ use crate::{
             execution::ExecutionError,
         },
         logs::Log,
-        memory::{Memory, MemoryError, U64HashMap},
+        memory::{Memory, MemoryError, PrecompileInputs, U64HashMap},
         registers::Registers,
     },
 };
@@ -25,6 +25,9 @@ pub struct ExecutionResult {
     /// Predecoded instructions map (pc -> instruction)
     /// Use this to look up instructions by their PC from the logs
     pub instructions: U64HashMap<Instruction>,
+    /// Precompile input bytes recorded during execution (Option A). Lets the prover
+    /// build precompile chip ops without re-reading a replayed `memory_state`.
+    pub precompile_inputs: PrecompileInputs,
 }
 
 /// Size of each log chunk - balances memory usage vs callback overhead
@@ -159,10 +162,13 @@ impl Executor {
             logs.extend_from_slice(chunk);
         }
 
+        let return_values = self.get_return_values()?;
+        let precompile_inputs = self.memory.take_precompile_inputs();
         Ok(ExecutionResult {
-            return_values: self.get_return_values()?,
+            return_values,
             logs,
             instructions: self.instructions.into_instruction_map(),
+            precompile_inputs,
         })
     }
 

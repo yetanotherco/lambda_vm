@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use crate::tables::cpu::CpuOperation;
 use crate::tables::memw::MemwOperation;
 use crate::tables::{
-    branch, bytewise, cpu, cpu32, dvrm, eq, load, lt, memw, memw_aligned, memw_register, mul,
-    shift, store,
+    branch, bytewise, commit, cpu, cpu32, dvrm, ecdas, eq, keccak, keccak_rnd, load, lt, memw,
+    memw_aligned, memw_register, mul, shift, store,
 };
 
 /// CPU-table device fill must be byte-identical to `cpu::generate_cpu_trace`.
@@ -1000,5 +1000,377 @@ fn gpu_memw_fill_matches_cpu() {
     assert_eq!(
         gpu_u64, cpu_u64,
         "device MEMW table must be byte-identical to the CPU fill"
+    );
+}
+
+/// COMMIT (ECALL) device fill must be byte-identical to `commit::generate_commit_trace`.
+/// Phase 6: the per-byte recursive commit rows fill on device from the packed CommitOperation
+/// SoA. Synthetic commit sequences (first/middle/end rows, hi-word addresses, varying counts) +
+/// forced padding rows (which need count=1 / address_incr[0]=1, not zeros). Skips with no GPU.
+#[test]
+fn gpu_commit_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_commit_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let mut ops: Vec<commit::CommitOperation> = Vec::new();
+    let mut index = 0u64;
+    for seq in 0..7u64 {
+        let ts = 4 * seq + 100;
+        // Alternate high-word addresses to exercise the DWordWL/DWordHL splits.
+        let addr0 = 0x1_0000_0000u64 * (seq % 2) + 0x1000 + seq * 0x40;
+        let count0 = 2 + seq;
+        for k in 0..count0 {
+            ops.push(commit::CommitOperation {
+                timestamp: ts,
+                index,
+                address: addr0 + k,
+                count: count0 - k,
+                first: k == 0,
+                end: false,
+                value: (index.wrapping_mul(31).wrapping_add(k) & 0xFF) as u8,
+            });
+            index += 1;
+        }
+        // end row: count == 0, no byte committed
+        ops.push(commit::CommitOperation {
+            timestamp: ts,
+            index,
+            address: addr0 + count0,
+            count: 0,
+            first: false,
+            end: true,
+            value: 0,
+        });
+    }
+    let n = ops.len();
+
+    let cpu = commit::generate_commit_trace(&ops);
+    let (cpu_fe, w) = cpu.main_data_row_major();
+    assert_eq!(w, math_cuda::precompile::COMMIT_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::COMMIT_STRIDE);
+    for op in &ops {
+        flat.push(op.timestamp);
+        flat.push(op.index);
+        flat.push(op.address);
+        flat.push(op.count);
+        flat.push(op.first as u64);
+        flat.push(op.end as u64);
+        flat.push(op.value as u64);
+    }
+    let gpu = math_cuda::precompile::gpu_build_commit_trace(&flat, n).expect("device commit build");
+
+    assert_eq!(gpu.len(), cpu_u64.len());
+    assert_eq!(
+        gpu, cpu_u64,
+        "device COMMIT table must be byte-identical to the CPU fill"
+    );
+    println!("gpu_commit_fill OK: {n} commit rows byte-identical to CPU generate_commit_trace");
+}
+
+/// Main KECCAK (permute) device fill must be byte-identical to `keccak::generate_keccak_trace`.
+/// Phase 6: per-op fill of timestamp / addr bytes / input+output state bytes / state_ptr
+/// halfwords (state_addr + 8*lane). The keccak computation (input→output) is independent; here
+/// input/output are synthetic. Forced padding rows exercise the state_ptr[lane][0]=8*lane pad.
+#[test]
+fn gpu_keccak_table_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_keccak_table_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let mut ops: Vec<keccak::KeccakOperation> = Vec::new();
+    for i in 0..10u64 {
+        let mut input = [0u64; 25];
+        let mut output = [0u64; 25];
+        for j in 0..25usize {
+            input[j] = (i * 100 + j as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            output[j] = input[j] ^ 0xABCD_1234_5678_9EF0;
+        }
+        ops.push(keccak::KeccakOperation {
+            timestamp: 4 * i + 100,
+            // alternate high-word addresses to exercise the halfword splits
+            state_addr: 0x1_0000_0000u64 * (i % 2) + 0x2000 + i * 0x200,
+            input,
+            output,
+        });
+    }
+    let n = ops.len();
+
+    let cpu = keccak::generate_keccak_trace(&ops);
+    let (cpu_fe, w) = cpu.main_data_row_major();
+    assert_eq!(w, math_cuda::precompile::KECCAK_TBL_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::KECCAK_TBL_STRIDE);
+    for op in &ops {
+        flat.push(op.timestamp);
+        flat.push(op.state_addr);
+        flat.extend_from_slice(&op.input);
+        flat.extend_from_slice(&op.output);
+    }
+    let gpu = math_cuda::precompile::gpu_build_keccak_trace(&flat, n).expect("device keccak build");
+
+    assert_eq!(gpu.len(), cpu_u64.len());
+    assert_eq!(
+        gpu, cpu_u64,
+        "device KECCAK table must be byte-identical to the CPU fill"
+    );
+    println!("gpu_keccak_table_fill OK: {n} keccak rows byte-identical to CPU generate_keccak_trace");
+}
+
+/// ECDAS (EC double-and-add) device fill must be byte-identical to `ecdas::generate_ecdas_trace`.
+/// Phase 6: pure formatting of the precomputed witness (byte coords, signed carries → Goldilocks,
+/// padding OP=1). No EC/modular math on the fill path. Synthetic steps incl. negative carries.
+#[test]
+fn gpu_ecdas_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_ecdas_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let b32 = |seed: u64, off: u64| -> [u8; 32] {
+        let mut a = [0u8; 32];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (seed.wrapping_add(off).wrapping_add(i as u64).wrapping_mul(31) & 0xFF) as u8;
+        }
+        a
+    };
+    let b33 = |seed: u64, off: u64| -> [u8; 33] {
+        let mut a = [0u8; 33];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (seed.wrapping_add(off).wrapping_add(i as u64).wrapping_mul(37) & 0xFF) as u8;
+        }
+        a
+    };
+    let c64 = |off: i64| -> [i64; 64] {
+        let mut a = [0i64; 64];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (i as i64 - 30) * 5 + off; // bounded, includes negatives
+        }
+        a
+    };
+    let mut ops: Vec<ecdas::EcdasOperation> = Vec::new();
+    for i in 0..6u64 {
+        let seed = i * 1000 + 1;
+        ops.push(ecdas::EcdasOperation {
+            timestamp: 4 * i + 100,
+            step: ecsm::EcdasStep {
+                x_a: b32(seed, 1),
+                y_a: b32(seed, 2),
+                x_g: b32(seed, 3),
+                y_g: b32(seed, 4),
+                round: (seed & 0xFF) as u8,
+                op: (seed % 2) as u8,
+                next_op: ((seed + 1) % 2) as u8,
+                lambda: b32(seed, 5),
+                x_r: b32(seed, 6),
+                y_r: b32(seed, 7),
+                q0: b33(seed, 8),
+                q1: b33(seed, 9),
+                q2: b33(seed, 10),
+                c0: c64(i as i64),
+                c1: c64(i as i64 + 1),
+                c2: c64(i as i64 + 2),
+            },
+        });
+    }
+    let n = ops.len();
+
+    let cpu = ecdas::generate_ecdas_trace(&ops);
+    let (cpu_fe, w) = cpu.main_data_row_major();
+    assert_eq!(w, math_cuda::precompile::ECDAS_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut bytes = Vec::with_capacity(n * math_cuda::precompile::ECDAS_BSTRIDE);
+    let mut carries = Vec::with_capacity(n * math_cuda::precompile::ECDAS_CSTRIDE);
+    let mut ts = Vec::with_capacity(n);
+    for op in &ops {
+        let s = &op.step;
+        bytes.extend_from_slice(&s.x_g);
+        bytes.extend_from_slice(&s.y_g);
+        bytes.extend_from_slice(&s.x_a);
+        bytes.extend_from_slice(&s.y_a);
+        bytes.push(s.round);
+        bytes.push(s.op);
+        bytes.extend_from_slice(&s.x_r);
+        bytes.extend_from_slice(&s.y_r);
+        bytes.extend_from_slice(&s.lambda);
+        bytes.extend_from_slice(&s.q0);
+        bytes.extend_from_slice(&s.q1);
+        bytes.extend_from_slice(&s.q2);
+        bytes.push(s.next_op);
+        carries.extend_from_slice(&s.c0);
+        carries.extend_from_slice(&s.c1);
+        carries.extend_from_slice(&s.c2);
+        ts.push(op.timestamp);
+    }
+    let gpu = math_cuda::precompile::gpu_build_ecdas_trace(&bytes, &carries, &ts, n)
+        .expect("device ecdas build");
+
+    assert_eq!(gpu.len(), cpu_u64.len());
+    assert_eq!(gpu, cpu_u64, "device ECDAS table must be byte-identical to the CPU fill");
+    println!("gpu_ecdas_fill OK: {n} ecdas rows byte-identical to CPU generate_ecdas_trace");
+}
+
+/// ECSM (k·G core) device fill must be byte-identical to `ecsm::generate_ecsm_trace`. Phase 6:
+/// formatting of the precomputed witness — k → 256 bit cols, *_sub_p → 16 halfwords, signed
+/// carries → Goldilocks. Synthetic witness (empty steps; the fill ignores them). `ecsm` = the
+/// crypto crate (EcsmWitness); the prover table module is `crate::tables::ecsm`.
+#[test]
+fn gpu_ecsm_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_ecsm_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let b32 = |seed: u64, off: u64| -> [u8; 32] {
+        let mut a = [0u8; 32];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (seed.wrapping_add(off).wrapping_add(i as u64).wrapping_mul(41) & 0xFF) as u8;
+        }
+        a
+    };
+    let b33 = |seed: u64, off: u64| -> [u8; 33] {
+        let mut a = [0u8; 33];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (seed.wrapping_add(off).wrapping_add(i as u64).wrapping_mul(43) & 0xFF) as u8;
+        }
+        a
+    };
+    let c64 = |off: i64| -> [i64; 64] {
+        let mut a = [0i64; 64];
+        for (i, x) in a.iter_mut().enumerate() {
+            *x = (i as i64 - 28) * 4 + off; // bounded, includes negatives
+        }
+        a
+    };
+    let mut ops: Vec<crate::tables::ecsm::EcsmOperation> = Vec::new();
+    for i in 0..5u64 {
+        let seed = i * 777 + 3;
+        ops.push(crate::tables::ecsm::EcsmOperation {
+            timestamp: 4 * i + 100,
+            addr_xg: 0x1000 + i * 0x100,
+            addr_k: 0x2000 + i * 0x100,
+            addr_xr: 0x1_0000_0000 + i * 0x100,
+            witness: ecsm::EcsmWitness {
+                x_g: b32(seed, 1),
+                y_g: b32(seed, 2),
+                k: b32(seed, 3),
+                x2: b32(seed, 4),
+                q0: b32(seed, 5),
+                c0: c64(i as i64),
+                q1: b33(seed, 6),
+                c1: c64(i as i64 + 1),
+                x_g_sub_p: b32(seed, 7),
+                k_sub_n: b32(seed, 8),
+                x_r_sub_p: b32(seed, 9),
+                len_k: (seed & 0xFF) as u8,
+                x_r: b32(seed, 10),
+                y_r: b32(seed, 11),
+                steps: Vec::new(),
+            },
+        });
+    }
+    let n = ops.len();
+
+    let cpu = crate::tables::ecsm::generate_ecsm_trace(&ops);
+    let (cpu_fe, w) = cpu.main_data_row_major();
+    assert_eq!(w, math_cuda::precompile::ECSM_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut bytes = Vec::with_capacity(n * math_cuda::precompile::ECSM_BSTRIDE);
+    let mut carries = Vec::with_capacity(n * math_cuda::precompile::ECSM_CSTRIDE);
+    let mut addrs = Vec::with_capacity(n * math_cuda::precompile::ECSM_ASTRIDE);
+    for op in &ops {
+        let wt = &op.witness;
+        bytes.extend_from_slice(&wt.x_r);
+        bytes.extend_from_slice(&wt.y_r);
+        bytes.extend_from_slice(&wt.k);
+        bytes.extend_from_slice(&wt.x_g);
+        bytes.extend_from_slice(&wt.y_g);
+        bytes.extend_from_slice(&wt.x2);
+        bytes.extend_from_slice(&wt.q0);
+        bytes.extend_from_slice(&wt.q1);
+        bytes.extend_from_slice(&wt.x_g_sub_p);
+        bytes.extend_from_slice(&wt.k_sub_n);
+        bytes.extend_from_slice(&wt.x_r_sub_p);
+        bytes.push(wt.len_k);
+        carries.extend_from_slice(&wt.c0);
+        carries.extend_from_slice(&wt.c1);
+        addrs.push(op.timestamp);
+        addrs.push(op.addr_xg);
+        addrs.push(op.addr_k);
+        addrs.push(op.addr_xr);
+    }
+    let gpu = math_cuda::precompile::gpu_build_ecsm_trace(&bytes, &carries, &addrs, n)
+        .expect("device ecsm build");
+
+    assert_eq!(gpu.len(), cpu_u64.len());
+    assert_eq!(gpu, cpu_u64, "device ECSM table must be byte-identical to the CPU fill");
+    println!("gpu_ecsm_fill OK: {n} ecsm rows byte-identical to CPU generate_ecsm_trace");
+}
+
+/// KECCAK_RND (per-round) device fill must be byte-identical to `keccak_rnd::generate_keccak_rnd_trace`.
+/// Phase 6, the most intricate fill: one thread per op recomputes 24 rounds (theta Cxz-chain + HWSL
+/// rotate, rho HWSL, pi, chi, iota) and writes all 1480 cols/round. The fill uses only input+ts
+/// (output is recomputed). Synthetic mixed inputs; padding rows stay zero.
+#[test]
+fn gpu_keccak_rnd_fill_matches_cpu() {
+    if math_cuda::device::backend().is_err() {
+        eprintln!("skipping gpu_keccak_rnd_fill_matches_cpu: no CUDA backend");
+        return;
+    }
+    let mut ops: Vec<keccak_rnd::KeccakRoundOperation> = Vec::new();
+    for i in 0..4u64 {
+        let mut input = [0u64; 25];
+        for (j, lane) in input.iter_mut().enumerate() {
+            *lane = (i * 100 + j as u64)
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                ^ ((j as u64) << 40);
+        }
+        ops.push(keccak_rnd::KeccakRoundOperation {
+            timestamp: 4 * i + 100,
+            input,
+            output: [0u64; 25], // ignored by the fill
+        });
+    }
+    let n = ops.len();
+
+    let cpu = keccak_rnd::generate_keccak_rnd_trace(&ops);
+    let (cpu_fe, w) = cpu.main_data_row_major();
+    assert_eq!(w, math_cuda::precompile::KECCAK_RND_NCOLS);
+    let cpu_u64: Vec<u64> = cpu_fe
+        .iter()
+        .map(|e| unsafe { *(e.value() as *const u64) })
+        .collect();
+
+    let mut flat = Vec::with_capacity(n * math_cuda::precompile::KECCAK_RND_STRIDE);
+    for op in &ops {
+        flat.push(op.timestamp);
+        flat.extend_from_slice(&op.input);
+    }
+    let gpu = math_cuda::precompile::gpu_build_keccak_rnd_trace(&flat, n)
+        .expect("device keccak_rnd build");
+
+    assert_eq!(gpu.len(), cpu_u64.len());
+    assert_eq!(
+        gpu, cpu_u64,
+        "device KECCAK_RND table must be byte-identical to the CPU fill"
+    );
+    println!(
+        "gpu_keccak_rnd_fill OK: {n} ops ({} rows) byte-identical to CPU generate_keccak_rnd_trace",
+        n * 24
     );
 }

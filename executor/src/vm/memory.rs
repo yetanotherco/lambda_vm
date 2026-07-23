@@ -57,6 +57,22 @@ pub const PRIVATE_INPUT_START_INDEX: u64 = 0xFF000000;
 /// for every page-span computation over the private-input region.
 pub const PRIVATE_INPUT_LENGTH_PREFIX_BYTES: usize = size_of::<u32>();
 
+/// Input bytes each precompile reads from memory during execution, captured in
+/// execution order (one entry per ecall of that kind). The prover uses these to
+/// build the precompile chip operations (`KeccakOperation`/`EcsmOperation`/
+/// `CommitOperation`) WITHOUT replaying a `memory_state` up to the ecall's
+/// timestamp — the executor already read exactly these bytes. See the GPU
+/// trace-gen Option A re-architecture.
+#[derive(Default, Debug, Clone)]
+pub struct PrecompileInputs {
+    /// Keccak input state (25 lanes = 200 bytes) read at each KeccakPermute ecall.
+    pub keccak: Vec<[u64; 25]>,
+    /// ECSM `(xG, k)` 32-byte operands read at each Ecsm ecall.
+    pub ecsm: Vec<([u8; 32], [u8; 32])>,
+    /// Committed buffer bytes read at each Commit ecall.
+    pub commit: Vec<Vec<u8>>,
+}
+
 #[derive(Default, Debug, Clone)]
 pub struct Memory {
     cells: U64HashMap<[u8; 4]>,
@@ -65,6 +81,9 @@ pub struct Memory {
     /// onto the Commit bus by `index`), so this buffer is purely the
     /// executor's view used by `read_return_value` and CLI display.
     public_output: Vec<u8>,
+    /// Precompile input bytes recorded during execution (Option A). Accumulated
+    /// across the whole run; extracted into `ExecutionResult` by `Executor::run`.
+    precompile_inputs: PrecompileInputs,
 }
 
 impl Memory {
@@ -216,7 +235,25 @@ impl Memory {
         }
         let bytes = self.load_bytes(address, length)?;
         self.public_output.extend_from_slice(&bytes);
+        // Option A: record the committed bytes so the prover's COMMIT collector need not
+        // re-read them from a replayed memory_state.
+        self.precompile_inputs.commit.push(bytes);
         Ok(())
+    }
+
+    /// Option A recorders — capture the precompile input bytes the executor read from
+    /// memory, in execution order, for the prover to reuse (see [`PrecompileInputs`]).
+    pub(crate) fn record_keccak_input(&mut self, state: [u64; 25]) {
+        self.precompile_inputs.keccak.push(state);
+    }
+
+    pub(crate) fn record_ecsm_input(&mut self, xg: [u8; 32], k: [u8; 32]) {
+        self.precompile_inputs.ecsm.push((xg, k));
+    }
+
+    /// Take the accumulated precompile inputs, leaving the buffer empty.
+    pub fn take_precompile_inputs(&mut self) -> PrecompileInputs {
+        std::mem::take(&mut self.precompile_inputs)
     }
 
     pub fn read_return_value(&self) -> Result<Vec<u8>, MemoryError> {

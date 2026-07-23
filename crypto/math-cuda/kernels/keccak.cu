@@ -95,6 +95,25 @@ __device__ __forceinline__ void keccak_f1600(uint64_t st[25]) {
     }
 }
 
+// Batched Keccak-f[1600] permutation for the KeccakPermute PRECOMPILE (Phase 6): one thread
+// permutes one 25-lane state in place. `states[i*25 + j]` is lane j of permutation i. Reuses the
+// same `keccak_f1600` the Merkle tree uses (already validated bit-for-bit vs the CPU permutation),
+// so a precompile can compute its 25-lane output on device instead of the host `keccak_f1600`.
+extern "C" __global__ void keccak_f1600_batch(uint64_t n, uint64_t *states) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= n)
+        return;
+    uint64_t st[25];
+    uint64_t *s = states + idx * 25;
+#pragma unroll
+    for (int i = 0; i < 25; ++i)
+        st[i] = s[i];
+    keccak_f1600(st);
+#pragma unroll
+    for (int i = 0; i < 25; ++i)
+        s[i] = st[i];
+}
+
 // ---------------------------------------------------------------------------
 // Helper: absorb one 8-byte lane (already byte-swapped from BE serialisation
 // into Keccak's LE lane form) into the sponge at `rate_pos` (in bytes).

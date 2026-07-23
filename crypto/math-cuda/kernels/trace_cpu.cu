@@ -239,6 +239,477 @@ extern "C" __global__ void load_fill(const uint64_t *ops, uint64_t n,
     out[base + 17] = 1u;                      // MU (active row)
 }
 
+// On-GPU COMMIT (ECALL) trace fill (19 cols). Mirrors
+// `prover/src/tables/commit.rs::generate_commit_trace`. One thread per row. Packed stride
+// COMMIT_STRIDE: [0]=timestamp [1]=index [2]=address [3]=count [4]=first [5]=end [6]=value.
+// Padding rows (r>=n) are NOT zero: they need count=1 + address_incr[0]=1 so the unconditional
+// ADD/SUB template carries are valid (count_decr=0, address_incr=1).
+#define COMMIT_NCOLS 19u
+#define COMMIT_STRIDE 7u
+
+extern "C" __global__ void commit_fill(const uint64_t *ops, uint64_t n, uint64_t num_rows,
+                                       uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * COMMIT_NCOLS;
+    if (r >= n) {
+        out[base + 9] = 1u; // COUNT_0 = 1
+        out[base + 5] = 1u; // ADDRESS_INCR_0 = 1 (address 0 → address+1 = 1)
+        return;
+    }
+    const uint64_t *op = ops + r * COMMIT_STRIDE;
+    uint64_t ts = op[0], index = op[1], addr = op[2], count = op[3];
+    uint64_t first = op[4], end = op[5], value = op[6];
+
+    out[base + 0] = ts & 0xFFFFFFFFu;  // TIMESTAMP_0
+    out[base + 1] = ts >> 32;          // TIMESTAMP_1
+    out[base + 2] = index;             // INDEX
+    out[base + 3] = addr & 0xFFFFFFFFu; // ADDRESS_0
+    out[base + 4] = addr >> 32;         // ADDRESS_1
+
+    uint64_t ai = addr + 1ull; // address_incr = address + 1 (wrapping), as 4 halfwords
+    out[base + 5] = ai & 0xFFFFu;
+    out[base + 6] = (ai >> 16) & 0xFFFFu;
+    out[base + 7] = (ai >> 32) & 0xFFFFu;
+    out[base + 8] = (ai >> 48) & 0xFFFFu;
+
+    out[base + 9] = count & 0xFFFFFFFFu;  // COUNT_0
+    out[base + 10] = count >> 32;         // COUNT_1
+
+    uint64_t cd = (count == 0ull) ? 0xFFFFFFFFFFFFFFFFull : (count - 1ull); // count_decr, 4 halfwords
+    out[base + 11] = cd & 0xFFFFu;
+    out[base + 12] = (cd >> 16) & 0xFFFFu;
+    out[base + 13] = (cd >> 32) & 0xFFFFu;
+    out[base + 14] = (cd >> 48) & 0xFFFFu;
+
+    out[base + 15] = first; // FIRST
+    out[base + 16] = end;   // END
+    out[base + 17] = value; // VALUE
+    out[base + 18] = 1u;    // MU
+}
+
+// On-GPU KECCAK (main permute) trace fill (511 cols). Mirrors
+// `prover/src/tables/keccak.rs::generate_keccak_trace`. One thread per row. Packed stride
+// KECCAK_TBL_STRIDE: [0]=timestamp [1]=state_addr [2..27]=input[25] [27..52]=output[25].
+// Cols: TIMESTAMP(dword_wl,0..2) ADDR(8 bytes,2..10) INPUT_STATE(200,10..210)
+// OUTPUT_STATE(200,210..410) STATE_PTR(25 lanes*4 hw,410..510) MU(510). Padding rows
+// (r>=n) set state_ptr[lane][0] = 8*lane (per keccak.toml pad).
+#define KECCAK_TBL_NCOLS 511u
+#define KECCAK_TBL_STRIDE 52u
+
+extern "C" __global__ void keccak_table_fill(const uint64_t *ops, uint64_t n, uint64_t num_rows,
+                                             uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * KECCAK_TBL_NCOLS;
+    if (r >= n) {
+        for (int lane = 0; lane < 25; ++lane)
+            out[base + 410 + lane * 4] = (uint64_t)(8 * lane);
+        return;
+    }
+    const uint64_t *op = ops + r * KECCAK_TBL_STRIDE;
+    uint64_t ts = op[0];
+    uint64_t addr = op[1];
+
+    out[base + 0] = ts & 0xFFFFFFFFu; // TIMESTAMP_0
+    out[base + 1] = ts >> 32;         // TIMESTAMP_1
+    for (int b = 0; b < 8; ++b)
+        out[base + 2 + b] = (addr >> (8 * b)) & 0xFFu; // ADDR bytes
+
+    for (int lane = 0; lane < 25; ++lane) {
+        uint64_t v = op[2 + lane]; // input lane
+        for (int b = 0; b < 8; ++b)
+            out[base + 10 + lane * 8 + b] = (v >> (8 * b)) & 0xFFu;
+    }
+    for (int lane = 0; lane < 25; ++lane) {
+        uint64_t v = op[27 + lane]; // output lane
+        for (int b = 0; b < 8; ++b)
+            out[base + 210 + lane * 8 + b] = (v >> (8 * b)) & 0xFFu;
+    }
+    for (int lane = 0; lane < 25; ++lane) {
+        uint64_t ptr = addr + (uint64_t)(8 * lane); // state_ptr = addr + 8*lane, 4 halfwords
+        out[base + 410 + lane * 4 + 0] = ptr & 0xFFFFu;
+        out[base + 410 + lane * 4 + 1] = (ptr >> 16) & 0xFFFFu;
+        out[base + 410 + lane * 4 + 2] = (ptr >> 32) & 0xFFFFu;
+        out[base + 410 + lane * 4 + 3] = (ptr >> 48) & 0xFFFFu;
+    }
+    out[base + 510] = 1u; // MU
+}
+
+// On-GPU ECDAS (EC double-and-add step) trace fill (521 cols). Mirrors
+// `prover/src/tables/ecdas.rs::generate_ecdas_trace` — pure FORMATTING of the precomputed
+// witness (no EC/modular math; that ran on CPU during execution). Compact inputs:
+//   bytes[r*326]: x_g[32] y_g[32] x_a[32] y_a[32] round op x_r[32] y_r[32] lambda[32]
+//                 q0[33] q1[33] q2[33] next_op
+//   carries[r*192] (i64): c0[64] c1[64] c2[64]   ts[r]: timestamp
+// Signed carries → Goldilocks via ec_fe. Padding rows (r>=n): OP=1, rest 0.
+#define ECDAS_NCOLS 521u
+#define ECDAS_BSTRIDE 326u
+#define ECDAS_CSTRIDE 192u
+#define GOLDP 0xFFFFFFFF00000001ull
+__device__ __forceinline__ uint64_t ec_fe(long long c) {
+    return c >= 0 ? (uint64_t)c : (GOLDP - (uint64_t)(-c));
+}
+
+// -----------------------------------------------------------------------------
+// On-GPU ECDAS per-step CARRY WITNESS (the `conv` limb-convolution math that the CPU
+// `ecsm::witness::build_step` did — ~190ms/proof for ethrex_5tx, moved to device). The EC
+// scalar-mult (`replay_double_and_add`, k256) and the tiny quotients stay on CPU; this kernel
+// derives ONLY the per-step carries `c0/c1/c2` from the packed point+quotient bytes. Bit-exact
+// with `carries_lambda/xr/yr` + `limb_carries` (int arithmetic, no field/curve ops). Input `bytes`
+// layout matches `ecdas_fill` (ECDAS_BSTRIDE=326); output `out[r*192]` = c0[64] c1[64] c2[64] (i64).
+// secp256k1 p and 3p as 64 zero-extended 8-bit limbs (little-endian); only [0..32]/[0..33] nonzero.
+__device__ const long EC_PP[64] = {
+    0x2F, 0xFC, 0xFF, 0xFF, 0xFE, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+__device__ const long EC_R3P[64] = {
+    0x8D, 0xF4, 0xFF, 0xFF, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+
+typedef __int128 eci128;
+
+// conv(a,b,i) = Σ_{j=0..i} a[j]·b[i-j]  (Rust `conv`).
+__device__ __forceinline__ eci128 ec_conv(const long *a, const long *b, int i) {
+    eci128 s = 0;
+    for (int j = 0; j <= i; ++j)
+        s += (eci128)a[j] * (eci128)b[i - j];
+    return s;
+}
+
+// limb_carries: 2^8·c_i = c_{i-1} + terms_i, c_{-1}=0 (Rust `limb_carries`). For valid inputs each
+// partial sum is divisible by 256, so the arithmetic shift equals the exact division.
+__device__ __forceinline__ void ec_limb_carries(const eci128 *terms, long long *out) {
+    eci128 carry = 0;
+    for (int i = 0; i < 64; ++i) {
+        eci128 s = carry + terms[i];
+        carry = s >> 8;
+        out[i] = (long long)carry;
+    }
+}
+
+// Zero-extend `len` little-endian 8-bit limbs to 64 longs (Rust `ext64`).
+__device__ __forceinline__ void ec_load(long *arr, const uint8_t *b, int len) {
+    for (int i = 0; i < 64; ++i)
+        arr[i] = (i < len) ? (long)b[i] : 0L;
+}
+
+extern "C" __global__ void ecdas_carries(const uint8_t *bytes, uint64_t n, long long *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= n)
+        return;
+    const uint8_t *b = bytes + r * ECDAS_BSTRIDE;
+    long xg[64], yg[64], xa[64], ya[64], xr[64], yr[64], lam[64], q0[64], q1[64], q2[64];
+    ec_load(xg, b + 0, 32);
+    ec_load(yg, b + 32, 32);
+    ec_load(xa, b + 64, 32);
+    ec_load(ya, b + 96, 32);
+    uint8_t op = b[129];
+    ec_load(xr, b + 130, 32);
+    ec_load(yr, b + 162, 32);
+    ec_load(lam, b + 194, 32);
+    ec_load(q0, b + 226, 33);
+    ec_load(q1, b + 259, 33);
+    ec_load(q2, b + 292, 33);
+
+    long long *c = out + r * ECDAS_CSTRIDE;
+    eci128 terms[64];
+
+    // c0 = carries_lambda: op·(Σ λ_j(xG−xA)_{i-j} + (yA−yG)_i) + (1−op)·Σ(2λ_j yA − 3xA_j xA)_{i-j}
+    //      + conv(3p,p,i) − conv(q0,p,i)
+    for (int i = 0; i < 64; ++i) {
+        eci128 s;
+        if (op == 1) {
+            s = (eci128)ya[i] - (eci128)yg[i];
+            for (int j = 0; j <= i; ++j)
+                s += (eci128)lam[j] * ((eci128)xg[i - j] - (eci128)xa[i - j]);
+        } else {
+            s = 0;
+            for (int j = 0; j <= i; ++j)
+                s += (eci128)2 * lam[j] * ya[i - j] - (eci128)3 * xa[j] * xa[i - j];
+        }
+        terms[i] = s + ec_conv(EC_R3P, EC_PP, i) - ec_conv(q0, EC_PP, i);
+    }
+    ec_limb_carries(terms, c);
+
+    // c1 = carries_xr: λ² − xA − xG − xR − (1−op)(xA−xG) + conv(3p,p,i) − conv(q1,p,i)
+    for (int i = 0; i < 64; ++i) {
+        eci128 op_term = (op == 0) ? ((eci128)xa[i] - (eci128)xg[i]) : (eci128)0;
+        terms[i] = ec_conv(lam, lam, i) - (eci128)xa[i] - (eci128)xg[i] - (eci128)xr[i] - op_term +
+                   ec_conv(EC_R3P, EC_PP, i) - ec_conv(q1, EC_PP, i);
+    }
+    ec_limb_carries(terms, c + 64);
+
+    // c2 = carries_yr: Σ λ_j(xA−xR)_{i-j} − yA − yR + conv(3p,p,i) − conv(q2,p,i)
+    for (int i = 0; i < 64; ++i) {
+        eci128 conv_lam = 0;
+        for (int j = 0; j <= i; ++j)
+            conv_lam += (eci128)lam[j] * ((eci128)xa[i - j] - (eci128)xr[i - j]);
+        terms[i] = conv_lam - (eci128)ya[i] - (eci128)yr[i] + ec_conv(EC_R3P, EC_PP, i) -
+                   ec_conv(q2, EC_PP, i);
+    }
+    ec_limb_carries(terms, c + 128);
+}
+
+extern "C" __global__ void ecdas_fill(const uint8_t *bytes, const long long *carries,
+                                      const uint64_t *ts, uint64_t n, uint64_t num_rows,
+                                      uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * ECDAS_NCOLS;
+    if (r >= n) {
+        out[base + 131] = 1u; // OP = 1 (add) on padding rows
+        return;
+    }
+    const uint8_t *b = bytes + r * ECDAS_BSTRIDE;
+    const long long *c = carries + r * ECDAS_CSTRIDE;
+    uint64_t t = ts[r];
+    out[base + 0] = t & 0xFFFFFFFFu;
+    out[base + 1] = t >> 32;
+    int o = 0;
+    for (int i = 0; i < 32; ++i) out[base + 2 + i] = b[o++];   // XG
+    for (int i = 0; i < 32; ++i) out[base + 34 + i] = b[o++];  // YG
+    for (int i = 0; i < 32; ++i) out[base + 66 + i] = b[o++];  // XA
+    for (int i = 0; i < 32; ++i) out[base + 98 + i] = b[o++];  // YA
+    out[base + 130] = b[o++];                                  // ROUND
+    out[base + 131] = b[o++];                                  // OP
+    for (int i = 0; i < 32; ++i) out[base + 132 + i] = b[o++]; // XR
+    for (int i = 0; i < 32; ++i) out[base + 164 + i] = b[o++]; // YR
+    for (int i = 0; i < 32; ++i) out[base + 196 + i] = b[o++]; // LAMBDA
+    for (int i = 0; i < 33; ++i) out[base + 228 + i] = b[o++]; // Q0
+    for (int i = 0; i < 33; ++i) out[base + 325 + i] = b[o++]; // Q1
+    for (int i = 0; i < 33; ++i) out[base + 422 + i] = b[o++]; // Q2
+    out[base + 519] = b[o++];                                  // NEXT_OP
+    for (int i = 0; i < 64; ++i) out[base + 261 + i] = ec_fe(c[i]);        // C0
+    for (int i = 0; i < 64; ++i) out[base + 358 + i] = ec_fe(c[64 + i]);   // C1
+    for (int i = 0; i < 64; ++i) out[base + 455 + i] = ec_fe(c[128 + i]);  // C2
+    out[base + 520] = 1u;                                      // MU
+}
+
+// On-GPU ECSM (k·G core) trace fill (667 cols). Mirrors
+// `prover/src/tables/ecsm.rs::generate_ecsm_trace` — pure FORMATTING of the precomputed witness
+// (no EC/modular math). Compact inputs:
+//   bytes[r*354]: x_r[32] y_r[32] k[32] x_g[32] y_g[32] x2[32] q0[32] q1[33]
+//                 x_g_sub_p[32] k_sub_n[32] x_r_sub_p[32] len_k
+//   carries[r*128] (i64): c0[64] c1[64]   addrs[r*4]: ts, addr_xg, addr_k, addr_xr
+// k → 256 bit columns; *_sub_p → 16 LE halfwords; signed carries → Goldilocks (ec_fe).
+// Padding rows (r>=n): all zero (generate_ecsm_trace writes nothing for padding).
+#define ECSM_NCOLS 667u
+#define ECSM_BSTRIDE 354u
+#define ECSM_CSTRIDE 128u
+#define ECSM_ASTRIDE 4u
+
+extern "C" __global__ void ecsm_fill(const uint8_t *bytes, const long long *carries,
+                                     const uint64_t *addrs, uint64_t n, uint64_t num_rows,
+                                     uint64_t *out) {
+    uint64_t r = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (r >= num_rows)
+        return;
+    uint64_t base = r * ECSM_NCOLS;
+    if (r >= n)
+        return; // padding all-zero
+    const uint8_t *b = bytes + r * ECSM_BSTRIDE;
+    const long long *c = carries + r * ECSM_CSTRIDE;
+    const uint64_t *a = addrs + r * ECSM_ASTRIDE;
+
+    out[base + 0] = a[0] & 0xFFFFFFFFu;  // TIMESTAMP
+    out[base + 1] = a[0] >> 32;
+    out[base + 2] = a[1] & 0xFFFFFFFFu;  // ADDR_XG
+    out[base + 3] = a[1] >> 32;
+    out[base + 4] = a[2] & 0xFFFFFFFFu;  // ADDR_K
+    out[base + 5] = a[2] >> 32;
+    out[base + 6] = a[3] & 0xFFFFFFFFu;  // ADDR_XR
+    out[base + 7] = a[3] >> 32;
+
+    int o = 0;
+    for (int i = 0; i < 32; ++i) out[base + 8 + i] = b[o++];  // XR
+    for (int i = 0; i < 32; ++i) out[base + 40 + i] = b[o++]; // YR
+    const uint8_t *kb = b + o;                                // K: 32 bytes → 256 bits
+    o += 32;
+    for (int bit = 0; bit < 256; ++bit)
+        out[base + 72 + bit] = (uint64_t)((kb[bit >> 3] >> (bit & 7)) & 1u);
+    for (int i = 0; i < 32; ++i) out[base + 329 + i] = b[o++]; // XG
+    for (int i = 0; i < 32; ++i) out[base + 361 + i] = b[o++]; // YG
+    for (int i = 0; i < 32; ++i) out[base + 393 + i] = b[o++]; // X2
+    for (int i = 0; i < 32; ++i) out[base + 425 + i] = b[o++]; // Q0
+    for (int i = 0; i < 33; ++i) out[base + 521 + i] = b[o++]; // Q1
+    const uint8_t *xgsp = b + o;
+    o += 32;
+    for (int j = 0; j < 16; ++j) out[base + 618 + j] = (uint64_t)xgsp[2 * j] | ((uint64_t)xgsp[2 * j + 1] << 8);
+    const uint8_t *ksn = b + o;
+    o += 32;
+    for (int j = 0; j < 16; ++j) out[base + 634 + j] = (uint64_t)ksn[2 * j] | ((uint64_t)ksn[2 * j + 1] << 8);
+    const uint8_t *xrsp = b + o;
+    o += 32;
+    for (int j = 0; j < 16; ++j) out[base + 650 + j] = (uint64_t)xrsp[2 * j] | ((uint64_t)xrsp[2 * j + 1] << 8);
+    out[base + 328] = b[o++]; // LEN_K
+
+    for (int i = 0; i < 64; ++i) out[base + 457 + i] = ec_fe(c[i]);      // C0
+    for (int i = 0; i < 64; ++i) out[base + 554 + i] = ec_fe(c[64 + i]); // C1
+    out[base + 666] = 1u;                                                // MU
+}
+
+// On-GPU KECCAK_RND (per-round) trace fill (1480 cols, 24 rows/op). Mirrors
+// `prover/src/tables/keccak_rnd.rs::generate_keccak_rnd_trace`. ONE THREAD PER OP: the state
+// evolves round-to-round, so each thread runs all 24 rounds sequentially and writes 24 rows.
+// Packed stride 26: [ts, input[25]] (output is recomputed as chi/iota, not read). Padding rows
+// (row >= n*24) stay zero.
+#define KRND_NCOLS 1480u
+#define KRND_STRIDE 26u
+__device__ __constant__ uint32_t KRND_RHO[25] = {
+    0, 36, 3, 41, 18, 1, 44, 10, 45, 2, 62, 6, 43, 15, 61,
+    28, 55, 25, 21, 56, 27, 20, 39, 8, 14};
+__device__ __constant__ uint64_t KRND_RC[24] = {
+    0x0000000000000001ull, 0x0000000000008082ull, 0x800000000000808Aull, 0x8000000080008000ull,
+    0x000000000000808Bull, 0x0000000080000001ull, 0x8000000080008081ull, 0x8000000000008009ull,
+    0x000000000000008Aull, 0x0000000000000088ull, 0x0000000080008009ull, 0x000000008000000Aull,
+    0x000000008000808Bull, 0x800000000000008Bull, 0x8000000000008089ull, 0x8000000000008003ull,
+    0x8000000000008002ull, 0x8000000000000080ull, 0x000000000000800Aull, 0x800000008000000Aull,
+    0x8000000080008081ull, 0x8000000000008080ull, 0x0000000080000001ull, 0x8000000080008008ull};
+
+__device__ __forceinline__ void hwsl_dev(uint16_t hw, uint32_t shift, uint16_t *shifted,
+                                         uint16_t *carry) {
+    if (shift == 0) {
+        *shifted = hw;
+        *carry = 0;
+    } else {
+        *shifted = (uint16_t)(hw << shift);
+        *carry = (uint16_t)(hw >> (16 - shift));
+    }
+}
+
+extern "C" __global__ void keccak_rnd_fill(const uint64_t *ops, uint64_t n, uint64_t num_rows,
+                                           uint64_t *out) {
+    uint64_t opi = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (opi >= n)
+        return;
+    const uint64_t *op = ops + opi * KRND_STRIDE;
+    uint64_t ts = op[0];
+    uint64_t state[25];
+    for (int i = 0; i < 25; ++i)
+        state[i] = op[1 + i];
+
+    for (int round = 0; round < 24; ++round) {
+        uint64_t base = (opi * 24 + (uint64_t)round) * KRND_NCOLS;
+        out[base + 0] = ts & 0xFFFFFFFFu;
+        out[base + 1] = ts >> 32;
+        out[base + 2] = (uint64_t)round;
+        for (int lane = 0; lane < 25; ++lane)
+            for (int b = 0; b < 8; ++b)
+                out[base + 3 + lane * 8 + b] = (state[lane] >> (8 * b)) & 0xFFu; // START
+
+        // theta: Cxz chain → c_bytes
+        uint8_t c_bytes[5][8];
+        for (int x = 0; x < 5; ++x) {
+            uint8_t cxz[4][8];
+            for (int b = 0; b < 8; ++b)
+                cxz[0][b] = (uint8_t)((state[x] >> (8 * b)) ^ (state[x + 5] >> (8 * b)));
+            for (int b = 0; b < 8; ++b)
+                out[base + 203 + (x * 4 + 0) * 8 + b] = cxz[0][b];
+            for (int stage = 1; stage < 4; ++stage) {
+                int y = stage + 1;
+                for (int b = 0; b < 8; ++b)
+                    cxz[stage][b] = (uint8_t)(cxz[stage - 1][b] ^ (state[x + 5 * y] >> (8 * b)));
+                for (int b = 0; b < 8; ++b)
+                    out[base + 203 + (x * 4 + stage) * 8 + b] = cxz[stage][b];
+            }
+            for (int b = 0; b < 8; ++b)
+                c_bytes[x][b] = cxz[3][b];
+        }
+        // rotate C left 1 (HWSL) → cxz_left / cxz_right bits → rotated_c
+        uint8_t rotated_c[5][8];
+        for (int x = 0; x < 5; ++x) {
+            uint8_t cxz_left[8];
+            uint8_t cxz_right[4];
+            for (int hw = 0; hw < 4; ++hw) {
+                uint16_t halfword = (uint16_t)c_bytes[x][2 * hw] | ((uint16_t)c_bytes[x][2 * hw + 1] << 8);
+                uint16_t sh, cy;
+                hwsl_dev(halfword, 1, &sh, &cy);
+                cxz_left[2 * hw] = sh & 0xFF;
+                cxz_left[2 * hw + 1] = sh >> 8;
+                cxz_right[hw] = (uint8_t)cy;
+            }
+            for (int b = 0; b < 8; ++b)
+                out[base + 363 + x * 8 + b] = cxz_left[b]; // CXZ_LEFT
+            for (int hw = 0; hw < 4; ++hw)
+                out[base + 403 + x * 4 + hw] = cxz_right[hw]; // CXZ_RIGHT
+            for (int b = 0; b < 8; ++b) {
+                uint8_t rc_contrib = (b % 2 == 0) ? cxz_right[(b / 2 + 3) % 4] : 0;
+                rotated_c[x][b] = (uint8_t)(cxz_left[b] + rc_contrib);
+            }
+        }
+        // D
+        uint8_t d_bytes[5][8];
+        for (int x = 0; x < 5; ++x) {
+            for (int b = 0; b < 8; ++b)
+                d_bytes[x][b] = (uint8_t)(c_bytes[(x + 4) % 5][b] ^ rotated_c[(x + 1) % 5][b]);
+            for (int b = 0; b < 8; ++b)
+                out[base + 423 + x * 8 + b] = d_bytes[x][b]; // DXZ
+        }
+        // theta lanes
+        uint64_t theta_lanes[25];
+        for (int x = 0; x < 5; ++x) {
+            uint64_t d_lane = 0;
+            for (int b = 0; b < 8; ++b)
+                d_lane |= ((uint64_t)d_bytes[x][b]) << (8 * b);
+            for (int y = 0; y < 5; ++y) {
+                theta_lanes[x + 5 * y] = state[x + 5 * y] ^ d_lane;
+                for (int b = 0; b < 8; ++b)
+                    out[base + 463 + (x + 5 * y) * 8 + b] = (theta_lanes[x + 5 * y] >> (8 * b)) & 0xFFu;
+            }
+        }
+        // rho (HWSL by rnc = rho%16) → rot_left / rot_right
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y) {
+                uint32_t rnc = KRND_RHO[x * 5 + y] % 16;
+                uint64_t tl = theta_lanes[x + 5 * y];
+                for (int hw = 0; hw < 4; ++hw) {
+                    uint16_t halfword = (uint16_t)((tl >> (16 * hw)) & 0xFFFF);
+                    uint16_t sh, cy;
+                    hwsl_dev(halfword, rnc, &sh, &cy);
+                    out[base + 663 + (x + 5 * y) * 8 + 2 * hw] = sh & 0xFF;
+                    out[base + 663 + (x + 5 * y) * 8 + 2 * hw + 1] = sh >> 8;
+                    out[base + 863 + (x + 5 * y) * 8 + 2 * hw] = cy & 0xFF;
+                    out[base + 863 + (x + 5 * y) * 8 + 2 * hw + 1] = cy >> 8;
+                }
+            }
+        // pi
+        uint64_t pi_lanes[25];
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y) {
+                uint32_t rho = KRND_RHO[x * 5 + y];
+                uint64_t t = theta_lanes[x + 5 * y];
+                uint64_t rotated = (rho == 0) ? t : ((t << rho) | (t >> (64 - rho)));
+                pi_lanes[y + 5 * ((2 * x + 3 * y) % 5)] = rotated;
+            }
+        // chi + iota
+        uint64_t chi_lanes[25];
+        for (int x = 0; x < 5; ++x)
+            for (int y = 0; y < 5; ++y) {
+                uint64_t and_val = (~pi_lanes[(x + 1) % 5 + 5 * y]) & pi_lanes[(x + 2) % 5 + 5 * y];
+                chi_lanes[x + 5 * y] = pi_lanes[x + 5 * y] ^ and_val;
+                for (int b = 0; b < 8; ++b)
+                    out[base + 1063 + (x + 5 * y) * 8 + b] = (and_val >> (8 * b)) & 0xFFu;
+                for (int b = 0; b < 8; ++b)
+                    out[base + 1263 + (x + 5 * y) * 8 + b] = (chi_lanes[x + 5 * y] >> (8 * b)) & 0xFFu;
+            }
+        uint64_t rc_val = KRND_RC[round];
+        uint64_t iota_lane = chi_lanes[0] ^ rc_val;
+        for (int b = 0; b < 8; ++b)
+            out[base + 1463 + b] = (rc_val >> (8 * b)) & 0xFFu;
+        for (int b = 0; b < 8; ++b)
+            out[base + 1471 + b] = (iota_lane >> (8 * b)) & 0xFFu;
+        out[base + 1479] = 1u; // MU
+        chi_lanes[0] = iota_lane;
+        for (int i = 0; i < 25; ++i)
+            state[i] = chi_lanes[i];
+    }
+}
+
 // On-GPU STORE trace fill (16 cols). Mirrors
 // `prover/src/tables/store.rs::generate_store_trace`. Packed stride STORE_STRIDE:
 //   [0]=flags (bit0 write2, bit1 write4, bit2 write8) [1]=base_address
@@ -983,4 +1454,49 @@ extern "C" __global__ void memw_register_fill(
     buf[base + 7] = ot & 0xFFFFFFFFull;
     buf[base + 8] = is_read[i] ? 1ull : 0ull;
     buf[base + 9] = is_read[i] ? 0ull : 1ull;
+}
+
+// A1 — RESIDENT PAGE table fill: one thread per byte of a page, fill the 5 PAGE columns
+// (OFFSET=0, INIT=1, FINI=2, TIMESTAMP_LO=3, TIMESTAMP_HI=4) directly on device from the sorted
+// initial image + the device final-memory snapshot (with timestamps). Bit-identical to
+// `generate_page_trace_from_dense` (exclude_touched=false): INIT = image byte (0 if absent); a byte
+// present in the snapshot uses (snap_val, snap_ts); otherwise (init, ts=0). Row-major
+// `buf[off*ncols + col]`, canonical-u64 field reprs (all values < 2^32). One kernel launch per page.
+__device__ __forceinline__ uint64_t pf_bsearch(const uint64_t *keys, uint64_t n, uint64_t key,
+                                               bool *found) {
+    uint64_t lo = 0, hi = n, idx = 0;
+    *found = false;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2;
+        uint64_t m = keys[mid];
+        if (m == key) { idx = mid; *found = true; break; }
+        else if (m < key) { lo = mid + 1; }
+        else { hi = mid; }
+    }
+    return idx;
+}
+extern "C" __global__ void page_fill_snapshot(
+    uint64_t page_base, uint64_t page_size, const uint64_t *img_addr, const uint64_t *img_val,
+    uint64_t img_n, const uint64_t *snap_addr, const uint64_t *snap_val, const uint64_t *snap_ts,
+    uint64_t snap_n, uint32_t ncols, uint64_t *buf) {
+    uint64_t off = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (off >= page_size)
+        return;
+    uint64_t addr = page_base + off;
+    bool f;
+    uint64_t ii = pf_bsearch(img_addr, img_n, addr, &f);
+    uint64_t iv = f ? (img_val[ii] & 0xFFull) : 0ull;
+    uint64_t si = pf_bsearch(snap_addr, snap_n, addr, &f);
+    uint64_t fv = f ? (snap_val[si] & 0xFFull) : iv;
+    uint64_t ts = f ? snap_ts[si] : 0ull;
+    // Match `generate_page_trace_from_dense` exactly: ts==0 emits (init, 0) — an untouched or
+    // initial-image byte's final value equals its init value (NOT the stored snapshot value).
+    if (ts == 0ull)
+        fv = iv;
+    uint64_t base = off * (uint64_t)ncols;
+    buf[base + 0] = off;
+    buf[base + 1] = iv;
+    buf[base + 2] = fv;
+    buf[base + 3] = ts & 0xFFFFFFFFull;
+    buf[base + 4] = ts >> 32;
 }

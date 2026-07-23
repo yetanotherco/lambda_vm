@@ -686,6 +686,70 @@ pub fn coset_lde_row_major_no_merkle(
     Ok(out)
 }
 
+/// Like [`coset_lde_row_major_no_merkle`] but the row-major trace is ALREADY on device
+/// (`input_dev`, `[row*total_cols+col]`). Copies it device-to-device into the padded LDE buffer
+/// (no host round-trip), runs the identical iNTT → coset → NTT, and returns the row-major LDE.
+/// For the **preprocessed-table** commit path fed by an on-GPU-built table (e.g. A1 PAGE): the
+/// caller builds the two subset Merkle trees on host. Same LDE math as
+/// [`coset_lde_row_major_no_merkle`], so the row-major output is bit-identical.
+pub fn coset_lde_row_major_no_merkle_dev(
+    input_dev: &CudaSlice<u64>,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+) -> Result<Vec<u64>> {
+    assert_eq!(input_dev.len(), n * total_cols);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_no_merkle_dev lde_size");
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = total_cols as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // Zero-padded lde_size*total_cols buffer; first n*total_cols rows carry the device trace
+    // (device-to-device copy — no host round-trip).
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
+    stream.memcpy_dtod(input_dev, &mut buf.slice_mut(0..n * total_cols))?;
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        cols_u64,
+    )?;
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        cols_u64,
+    )?;
+
+    let out = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(out)
+}
+
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.
 ///
 /// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is

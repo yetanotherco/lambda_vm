@@ -24,7 +24,7 @@ mod tests;
 use num_bigint::BigUint;
 
 pub use curve::{AffinePoint, recover_y_canonical, replay_double_and_add};
-pub use witness::{EcdasStep, EcsmWitness, compute_witness};
+pub use witness::{EcdasStep, EcsmWitness, compute_witness, compute_witness_carryless};
 
 /// secp256k1 curve coefficient `b`.
 pub const B: u64 = 7;

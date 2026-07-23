@@ -679,6 +679,56 @@ where
     Some(lde_out)
 }
 
+/// Like [`try_lde_row_major_no_merkle`] but the row-major trace is ALREADY on device
+/// (`input_dev`, `[row*m+col]`) — the preprocessed-table commit path fed by an on-GPU-built table
+/// (A1 PAGE). LDEs the device buffer directly (no host upload) and returns the row-major LDE; the
+/// caller builds the two subset Merkle trees on host. No size-threshold decline (there is no valid
+/// CPU fallback — the host trace is a zeroed placeholder), matching the device-resident seam.
+pub(crate) fn try_lde_row_major_no_merkle_dev<F, E>(
+    input_dev: &math_cuda::CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+) -> Option<Vec<FieldElement<E>>>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if input_dev.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+
+    let lde_u64 = math_cuda::lde::coset_lde_row_major_no_merkle_dev(
+        input_dev,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+    )
+    .ok()?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
+    };
+    Some(lde_out)
+}
+
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.

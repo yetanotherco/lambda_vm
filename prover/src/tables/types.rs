@@ -75,6 +75,20 @@ pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
     unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
 }
 
+/// Reinterpret a `Vec<u64>` of CANONICAL Goldilocks field values as `Vec<FE>` (zero-copy, reusing the
+/// allocation) — the same `from_raw_parts` reinterpret as [`zeroed_fe_vec`], for host trace matrices
+/// produced as raw `u64` on device (e.g. the A1 device PAGE fill downloaded to host). Each `u64` must
+/// be a canonical field element (`< GOLD_P`), which every device fill writes.
+pub fn fe_vec_from_u64(v: Vec<u64>) -> Vec<FE> {
+    const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
+    const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
+    let mut v = core::mem::ManuallyDrop::new(v);
+    // SAFETY: identical to `zeroed_fe_vec` — `FE` is repr-transparent over `u64` with equal
+    // size/alignment (asserted), Goldilocks has no Montgomery form so a canonical `u64` is a valid
+    // `FE` bit pattern, and `len`/`capacity` (element counts) carry over unchanged.
+    unsafe { Vec::from_raw_parts(v.as_mut_ptr() as *mut FE, v.len(), v.capacity()) }
+}
+
 #[cfg(test)]
 mod zeroed_fe_vec_tests {
     use super::*;

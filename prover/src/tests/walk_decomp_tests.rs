@@ -18,9 +18,51 @@ use crate::tables::cpu::CpuOperation;
 use crate::tables::memw_register::RegRow;
 use crate::tables::trace_builder::{
     MemwBuckets, PC_WORD_ADDR, RegAccess, RegisterState, collect_register_ops_from_cpu,
-    collect_register_ops_parallel, walk_register_accesses,
+    collect_register_ops_parallel, emit_register_accesses, walk_register_accesses,
 };
 use crate::tables::types::{DecodeEntry, ShrunkDecode};
+
+/// DIAGNOSTIC (P1-ecall/P4b): how often does a REGULAR register access fall back to MEMW_A/MEMW
+/// (reg_ts_delta > 2^16) on ethrex? If ~0, the resident register walk (which doesn't model the
+/// fallback) matches the sequential register table and its memw_reg histogram source is correct.
+/// Pure CPU; run with the bench env (--ignored --nocapture).
+#[test]
+#[ignore = "requires LAMBDA_VM_BENCH_ELF (ethrex); run --ignored --nocapture"]
+fn register_fallback_rate_ethrex() {
+    use executor::elf::Elf;
+    use executor::vm::execution::Executor;
+
+    let path = std::env::var("LAMBDA_VM_BENCH_ELF").expect("set LAMBDA_VM_BENCH_ELF");
+    let bytes = std::fs::read(&path).expect("read ELF");
+    let elf = Elf::load(&bytes).expect("load ELF");
+    let input = std::env::var("LAMBDA_VM_BENCH_INPUT")
+        .ok()
+        .map(|p| std::fs::read(p).expect("read input"))
+        .unwrap_or_default();
+    let executor = Executor::new(&elf, input).expect("executor");
+    let result = executor.run().expect("run");
+    let instructions = crate::tables::decode::instructions_from_elf(&elf).expect("decode");
+
+    let mut accesses = Vec::new();
+    for (i, log) in result.logs.iter().enumerate() {
+        let instr = *instructions.get(&log.current_pc).expect("instruction");
+        let op = CpuOperation::from_log_and_instruction(log, (i as u64) * 4 + 4, instr);
+        emit_register_accesses(&op, &mut accesses);
+    }
+    let emitting = accesses.iter().filter(|a| a.emits_row).count();
+
+    // Seed all registers at ts=1 (matches the walk's init_ts); fallback depends on ts-deltas.
+    let init = RegisterState::from_init(&vec![0u32; 600]);
+    let mut buckets = MemwBuckets::with_register_capacity(accesses.len());
+    walk_register_accesses(&accesses, &init, &mut buckets);
+    let in_memw_r = buckets.register_rows.len();
+    let fallback = emitting - in_memw_r;
+    println!(
+        "register_fallback_rate: {emitting} emitting register accesses -> {in_memw_r} MEMW_R + \
+         {fallback} FALLBACK (to MEMW_A/MEMW) = {:.4}%",
+        100.0 * fallback as f64 / emitting as f64
+    );
+}
 
 /// Walk a hand-built access list into a fresh `MemwBuckets` seeded from `init`.
 fn walk(accesses: &[RegAccess], init: &RegisterState) -> MemwBuckets {
