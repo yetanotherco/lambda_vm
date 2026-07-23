@@ -227,7 +227,7 @@ input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "start", "x"], 0], "z"], ["id
 output = ["idx", ["idx", ["idx", "Cxz", "x"], 0], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
-ref = "keccak:c:theta_cxz_start"
+ref = "keccak:c:inline_theta_cxz_start"
 
 [[constraints.theta]]
 kind = "interaction"
@@ -236,7 +236,7 @@ input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 2]], 
 output = ["idx", ["idx", ["idx", "Cxz", "x"], ["-", "y", 1]], "z"]
 iters = [["x", 0, 4], ["y", 2, 4], ["z", 0, 7]]
 multiplicity = "μ"
-ref = "keccak:c:theta_cxz"
+ref = "keccak:c:inline_theta_cxz"
 
 # Inlined θ rotate-by-1 (replaces the HWSL interaction of the original spec).
 # A shift by 1 is linear: 2 · C = carry · 2^16 + left, with the halfword `left`
@@ -279,7 +279,7 @@ input = [["opsel", "XOR"], ["idx", ["idx", ["idx", "Cxz", ["mod", ["-", "x", 1],
 output = ["idx", ["idx", "Dxz", "x"], "z"]
 iters = [["x", 0, 4], ["z", 0, 7]]
 multiplicity = "μ"
-ref = "keccak:c:Dxz"
+ref = "keccak:c:inline_Dxz"
 
 [[constraints.theta]]
 kind = "interaction"
@@ -309,7 +309,7 @@ poly = ["*", "μ", ["-",
     ],
 ]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 3]]
-ref = "keccak:c:rho_rotation"
+ref = "keccak:c:inline_rho_rotation"
 
 # Note: these IS_BYTE checks are LOAD-BEARING in this variant. Together with
 # the linear identity above they pin (rot_left, rot_right) to the unique
@@ -322,7 +322,7 @@ tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_left", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 cond = "μ"
-ref = "keccak:c:range_rot_left"
+ref = "keccak:c:inline_range_rot_left"
 
 [[constraints.rho]]
 kind = "template"
@@ -330,7 +330,7 @@ tag = "IS_BYTE"
 input = [["idx", ["idx", ["idx", "rot_right", "x"], "y"], "z"]]
 iters = [["x", 0, 4], ["y", 0, 4], ["z", 0, 7]]
 cond = "μ"
-ref = "keccak:c:range_rot_right"
+ref = "keccak:c:inline_range_rot_right"
 
 [[constraint_groups]]
 name = "chi"
