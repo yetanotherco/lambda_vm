@@ -1056,6 +1056,8 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     stark::instruments::reset_timeline();
     #[cfg(feature = "instruments")]
+    stark::instruments::reset_intervals();
+    #[cfg(feature = "instruments")]
     let __root = stark::instruments::span("prove_total");
     #[cfg(feature = "instruments")]
     let heap_before = stark::instruments::heap_bytes();
@@ -1196,6 +1198,26 @@ pub fn prove_with_options_and_inputs(
         if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
             let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
             println!("[timeline] wrote {path}");
+        }
+        // Concurrency-aware per-op attribution of rounds 2-4 (union-wall vs the
+        // work-sum sub-timers above). Perfetto JSON when GPU_INTERVAL_TRACE is set.
+        let intervals = stark::instruments::take_intervals();
+        if !intervals.is_empty() {
+            print!("{}", stark::instruments::format_intervals(&intervals));
+            if let Ok(path) = std::env::var("GPU_INTERVAL_TRACE") {
+                if path != "0" && !path.is_empty() {
+                    let out = if path == "1" {
+                        "interval_trace.json".to_string()
+                    } else {
+                        path
+                    };
+                    let _ = std::fs::write(
+                        &out,
+                        stark::instruments::intervals_perfetto_json(&intervals),
+                    );
+                    println!("[interval-trace] wrote {out}");
+                }
+            }
         }
     }
 

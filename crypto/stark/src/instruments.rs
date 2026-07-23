@@ -373,3 +373,275 @@ pub fn store_round_sub_ops(data: TableSubOps) {
 pub fn take_round_sub_ops() -> Option<TableSubOps> {
     ROUND_SUB_OPS.with(|cell| cell.borrow_mut().take())
 }
+
+// ── Concurrency-aware interval recorder (rounds_2to4 attribution) ────────────
+//
+// The `span()` timeline above is main-thread, nested, non-overlapping — a true
+// latency tree. The `store_r2_sub`/`store_r4_sub` sub-timers, by contrast, are
+// summed across rayon workers ("work sum") and can exceed wall, so they cannot
+// tell how much wall an op actually occupies.
+//
+// This recorder closes that gap. Rounds 2-4 run one table per rayon worker in
+// parallel; each sub-op wraps its region with `iv_now()` / `iv_push(op, start)`.
+// Timestamps are ns from a single monotonic `Instant` epoch, comparable across
+// threads. From the resulting intervals we report, per op:
+//   * work_sum   — Σ(end-start): total worker time (can exceed wall)
+//   * union_wall — length of the temporal union of intervals: the wall the op
+//                  really occupies (overlapping tables merged) ← decision metric
+//   * concurrency— max simultaneous intervals (how parallel the op ran)
+// A Chrome-Trace/Perfetto JSON (one lane per worker) is emitted when the caller
+// asks for it (GPU_INTERVAL_TRACE=1), for visual inspection.
+
+#[derive(Clone, Copy)]
+pub struct IntervalRecord {
+    pub op: &'static str,
+    pub start_ns: u64,
+    pub end_ns: u64,
+    /// Rayon worker slot — a stable proxy for the table processed in parallel.
+    pub lane: u64,
+}
+
+static INTERVAL_EPOCH: Mutex<Option<Instant>> = Mutex::new(None);
+static INTERVALS: Mutex<Vec<IntervalRecord>> = Mutex::new(Vec::new());
+static NEXT_LANE: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static LANE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+fn lane() -> u64 {
+    LANE.with(|c| {
+        c.get().unwrap_or_else(|| {
+            let v = NEXT_LANE.fetch_add(1, Ordering::Relaxed);
+            c.set(Some(v));
+            v
+        })
+    })
+}
+
+/// Start a fresh interval epoch and drop any prior records. Call once per prove.
+pub fn reset_intervals() {
+    if let Ok(mut e) = INTERVAL_EPOCH.lock() {
+        *e = Some(Instant::now());
+    }
+    if let Ok(mut v) = INTERVALS.lock() {
+        v.clear();
+    }
+}
+
+/// Nanoseconds since the interval epoch (0 if none set — recorder disabled).
+fn iv_now() -> u64 {
+    INTERVAL_EPOCH
+        .lock()
+        .ok()
+        .and_then(|e| *e)
+        .map(|e| e.elapsed().as_nanos() as u64)
+        .unwrap_or(0)
+}
+
+/// Record an interval ending ~now with the measured `dur`. Pairs with the
+/// existing `let x_dur = t_sub.elapsed();` sub-timers (one line per op, anchored
+/// on the unique duration variable — no need to touch the ambiguous start line).
+pub fn iv_push_dur(op: &'static str, dur: Duration) {
+    let end_ns = iv_now();
+    let start_ns = end_ns.saturating_sub(dur.as_nanos() as u64);
+    let lane = lane();
+    if let Ok(mut v) = INTERVALS.lock() {
+        v.push(IntervalRecord {
+            op,
+            start_ns,
+            end_ns,
+            lane,
+        });
+    }
+}
+
+/// Drain the recorded intervals.
+pub fn take_intervals() -> Vec<IntervalRecord> {
+    INTERVALS
+        .lock()
+        .map(|mut v| std::mem::take(&mut *v))
+        .unwrap_or_default()
+}
+
+/// Union length (s) and max concurrency of a set of `[start,end)` intervals,
+/// via a sweep line. At equal timestamps, opens are processed before closes so
+/// touching intervals merge (union) and count as overlapping (concurrency).
+fn union_and_concurrency(intervals: &[(u64, u64)]) -> (f64, usize) {
+    let mut evts: Vec<(u64, i32)> = Vec::with_capacity(intervals.len() * 2);
+    for &(s, e) in intervals {
+        if e > s {
+            evts.push((s, 1));
+            evts.push((e, -1));
+        }
+    }
+    evts.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+    let (mut depth, mut max_c, mut union, mut cur_start) = (0i32, 0i32, 0u64, 0u64);
+    for (t, d) in evts {
+        if depth == 0 && d == 1 {
+            cur_start = t;
+        }
+        depth += d;
+        max_c = max_c.max(depth);
+        if depth == 0 {
+            union += t.saturating_sub(cur_start);
+        }
+    }
+    (union as f64 / 1e9, max_c as usize)
+}
+
+/// Per-op attribution table with three wall metrics that bracket the true
+/// recoverable wall (ops overlap across tables, so no single number is exact):
+///   * union_wall  — wall where ≥1 interval of the op is active (UPPER bound)
+///   * weighted    — each instant's wall split evenly among all active
+///                   intervals; Σ over ops = span. This is an ACTIVITY-share
+///                   heuristic, NOT literal recoverable wall: removing an op need
+///                   not recover its share (freed capacity may be refilled, or
+///                   the op may never be the critical path).
+///   * exclusive   — wall where ONLY this op is active anywhere (LOWER bound)
+/// Sorted by `weighted` desc. Also reports peak/avg global concurrency. Note the
+/// concurrency here counts instrumented intervals (GPU waits included), so it is
+/// NOT a measure of CPU-core utilization.
+pub fn format_intervals(records: &[IntervalRecord]) -> String {
+    use std::collections::HashMap;
+    use std::fmt::Write;
+    if records.is_empty() {
+        return String::new();
+    }
+
+    // Stable op indexing (first-seen order).
+    let mut op_idx: HashMap<&'static str, usize> = HashMap::new();
+    let mut ops: Vec<&'static str> = Vec::new();
+    for r in records {
+        if !op_idx.contains_key(r.op) {
+            op_idx.insert(r.op, ops.len());
+            ops.push(r.op);
+        }
+    }
+    let n_ops = ops.len();
+
+    // Per-op interval lists (for union + work_sum + count).
+    let mut per_op: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n_ops];
+    for r in records {
+        if r.end_ns > r.start_ns {
+            per_op[op_idx[r.op]].push((r.start_ns, r.end_ns));
+        }
+    }
+
+    // Global sweep for weighted, exclusive, and concurrency.
+    let mut evts: Vec<(u64, i32, usize)> = Vec::with_capacity(records.len() * 2);
+    for r in records {
+        if r.end_ns > r.start_ns {
+            let oi = op_idx[r.op];
+            evts.push((r.start_ns, 1, oi));
+            evts.push((r.end_ns, -1, oi));
+        }
+    }
+    evts.sort_by(|a, b| a.0.cmp(&b.0).then(b.1.cmp(&a.1)));
+
+    let mut weighted = vec![0f64; n_ops];
+    let mut exclusive = vec![0f64; n_ops];
+    let mut active = vec![0i32; n_ops];
+    let mut total = 0i32;
+    let mut peak = 0i32;
+    let mut conc_area = 0f64; // Σ dt*total  → avg concurrency = conc_area/span
+    let mut prev_t = evts.first().map(|e| e.0).unwrap_or(0);
+    for (t, d, oi) in evts {
+        if t > prev_t && total > 0 {
+            let dt = (t - prev_t) as f64;
+            for (op, &a) in active.iter().enumerate() {
+                if a > 0 {
+                    weighted[op] += dt * a as f64 / total as f64;
+                }
+            }
+            if total == 1 {
+                if let Some(op) = active.iter().position(|&a| a > 0) {
+                    exclusive[op] += dt;
+                }
+            }
+            conc_area += dt * total as f64;
+        }
+        active[oi] += d;
+        total += d;
+        peak = peak.max(total);
+        prev_t = t;
+    }
+
+    let span_lo = records.iter().map(|r| r.start_ns).min().unwrap_or(0);
+    let span_hi = records.iter().map(|r| r.end_ns).max().unwrap_or(0);
+    let span_s = span_hi.saturating_sub(span_lo) as f64 / 1e9;
+
+    let mut rows: Vec<(&'static str, f64, f64, f64, f64, usize, usize)> = (0..n_ops)
+        .map(|i| {
+            let work_sum = per_op[i]
+                .iter()
+                .map(|&(s, e)| e.saturating_sub(s))
+                .sum::<u64>() as f64
+                / 1e9;
+            let (union, conc) = union_and_concurrency(&per_op[i]);
+            (
+                ops[i],
+                work_sum,
+                union,
+                weighted[i] / 1e9,
+                exclusive[i] / 1e9,
+                conc,
+                per_op[i].len(),
+            )
+        })
+        .collect();
+    rows.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+
+    let avg_conc = if span_s > 0.0 {
+        conc_area / 1e9 / span_s
+    } else {
+        0.0
+    };
+    let mut out = String::from("=== INTERVAL ATTRIBUTION (rounds_2to4, concurrency-aware) ===\n");
+    let _ = writeln!(
+        out,
+        "  {:<24} {:>9} {:>10} {:>10} {:>10} {:>5} {:>4}",
+        "op", "work_sum", "union", "weighted", "exclusive", "conc", "n"
+    );
+    let (mut sum_union, mut sum_weighted) = (0.0, 0.0);
+    for (op, ws, uw, ww, ex, conc, n) in &rows {
+        sum_union += uw;
+        sum_weighted += ww;
+        let _ = writeln!(
+            out,
+            "  {op:<24} {ws:>8.3}s {uw:>9.3}s {ww:>9.3}s {ex:>9.3}s {conc:>5} {n:>4}"
+        );
+    }
+    let _ = writeln!(
+        out,
+        "  span {span_s:.3}s (≈ rounds_2to4) · Σweighted {sum_weighted:.3}s (=span, true decomposition) \
+         · Σunion {sum_union:.3}s · concurrency peak {peak} avg {avg_conc:.1}"
+    );
+    let _ = writeln!(
+        out,
+        "  → weighted = activity-share heuristic (Σ=span), NOT literal recoverable wall; \
+         union=upper bound, exclusive=lower bound. concurrency = instrumented intervals \
+         (GPU waits included), not CPU-core utilization."
+    );
+    out
+}
+
+/// Chrome-Trace / Perfetto JSON: one complete ("X") event per interval, µs
+/// units, `tid` = worker lane. Load in chrome://tracing or ui.perfetto.dev.
+pub fn intervals_perfetto_json(records: &[IntervalRecord]) -> String {
+    let mut out = String::from("[");
+    for (i, r) in records.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        let name = r.op.replace('\\', "\\\\").replace('"', "\\\"");
+        let ts = r.start_ns as f64 / 1000.0;
+        let dur = r.end_ns.saturating_sub(r.start_ns) as f64 / 1000.0;
+        out.push_str(&format!(
+            "{{\"name\":\"{name}\",\"ph\":\"X\",\"ts\":{ts:.3},\"dur\":{dur:.3},\"pid\":1,\"tid\":{},\"cat\":\"r2to4\"}}",
+            r.lane
+        ));
+    }
+    out.push(']');
+    out
+}

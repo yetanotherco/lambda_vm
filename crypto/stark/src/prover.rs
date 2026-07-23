@@ -1190,6 +1190,9 @@ pub trait IsStarkProver<
         let n = two_n / 2;
         debug_assert_eq!(two_n, n * 2);
 
+        #[cfg(feature = "instruments")]
+        let __t_dec = std::time::Instant::now();
+
         // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
         // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
         // Compute entirely in base field — mixed F×E multiplication when used with extension values.
@@ -1210,6 +1213,13 @@ pub trait IsStarkProver<
             // F × E → E (base field scalar on left for mixed multiplication)
             (&two_inv * &sum, &inv_2x[i] * &diff)
         });
+        // R2_decompose_cpu: batch-inverse + pointwise H0/H1 (CPU work that Step D
+        // would move to the device). Followed by R2_extend_gpu (H2D + LDE, of
+        // which only the H2D is eliminable; the LDE stays).
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R2_decompose_cpu", __t_dec.elapsed());
+        #[cfg(feature = "instruments")]
+        let __t_ext = std::time::Instant::now();
 
         // Step 3: Extend each part from n evals on the g²-coset to 2n evals on the
         // g-coset (the full LDE domain).
@@ -1223,6 +1233,8 @@ pub trait IsStarkProver<
             // Hand the resident extended-LDE buffer to the session so the
             // composition Merkle commit and DEEP reuse it (mirrors the d>2 path).
             *gpu_parts_out = Some(handle);
+            #[cfg(feature = "instruments")]
+            crate::instruments::iv_push_dur("R2_extend_gpu", __t_ext.elapsed());
             return vec![lde_h0, lde_h1];
         }
 
@@ -1231,6 +1243,8 @@ pub trait IsStarkProver<
             || Self::extend_half_to_lde(&h0_evals, composition_twiddles),
             || Self::extend_half_to_lde(&h1_evals, composition_twiddles),
         );
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R2_extend_gpu", __t_ext.elapsed());
         vec![lde_h0, lde_h1]
     }
 
@@ -1295,6 +1309,8 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let constraints_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R2_constraints", constraints_dur);
 
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
@@ -1391,6 +1407,10 @@ pub trait IsStarkProver<
         };
         #[cfg(feature = "instruments")]
         let fft_dur = t_sub.elapsed();
+        // R2_extend is split into R2_decompose_cpu + R2_extend_gpu inside
+        // decompose_and_extend_d2; recording the parent too would double-count
+        // (nested intervals inflate concurrency), so it is intentionally omitted
+        // from the interval recorder. `fft_dur` still feeds the work-sum sub-timer.
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -1442,6 +1462,8 @@ pub trait IsStarkProver<
             .ok_or(ProvingError::EmptyCommitment)?;
         #[cfg(feature = "instruments")]
         let merkle_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R2_commit", merkle_dur);
 
         #[cfg(feature = "instruments")]
         crate::instruments::store_r2_sub(constraints_dur, fft_dur, merkle_dur);
@@ -1670,6 +1692,8 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let other_dur_1 = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R4_deep_comp", other_dur_1);
 
         #[cfg(feature = "cuda")]
         let deep_device = deep_output.device;
@@ -1698,6 +1722,8 @@ pub trait IsStarkProver<
         }
         #[cfg(feature = "instruments")]
         let r4_fft_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R4_bit_reverse", r4_fft_dur);
 
         // FRI commit phase from pre-computed evaluations
         #[cfg(feature = "instruments")]
@@ -1783,6 +1809,8 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R4_fri_commit", r4_merkle_dur);
 
         // grinding: generate nonce and append it to the transcript
         #[cfg(feature = "instruments")]
@@ -1797,6 +1825,8 @@ pub trait IsStarkProver<
         }
         #[cfg(feature = "instruments")]
         let grinding_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R4_grinding", grinding_dur);
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -1806,6 +1836,8 @@ pub trait IsStarkProver<
         let query_list = fri::query_phase(&fri_layers, &iotas);
         #[cfg(feature = "instruments")]
         let fri_query_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R4_fri_query", fri_query_dur);
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
@@ -1820,6 +1852,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         {
             let openings_dur = t_sub.elapsed();
+            crate::instruments::iv_push_dur("R4_openings", openings_dur);
             crate::instruments::store_r4_sub(
                 r4_fft_dur,
                 r4_merkle_dur,
@@ -3450,6 +3483,8 @@ pub trait IsStarkProver<
         );
         #[cfg(feature = "instruments")]
         let round_3_dur = t_r3.elapsed();
+        #[cfg(feature = "instruments")]
+        crate::instruments::iv_push_dur("R3_ood", round_3_dur);
 
         // >>>> Send values: tⱼ(zgᵏ). g·z pruning: split the full OOD table into
         // the current-row block (all columns) and the pruned next-row block
