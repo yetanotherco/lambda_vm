@@ -41,6 +41,7 @@ pub fn deep_composition_ext3(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("deep_comp[n={domain_size} parts={num_parts}]"));
     let be = backend()?;
     let stream = be.next_stream();
     deep_composition_ext3_impl(
@@ -86,6 +87,8 @@ pub fn deep_composition_ext3_with_dev_parts(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("deep_comp_dev[n={domain_size} parts={num_parts}]"));
     let be = backend()?;
     let stream = be.next_stream();
     deep_composition_ext3_impl(
@@ -138,6 +141,8 @@ pub fn deep_composition_ext3_with_dev_parts_and_inv_denoms(
     row_stride: usize,
     domain_size: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("deep_comp_dev2[n={domain_size} parts={num_parts}]"));
     assert_eq!(main_lde.m, num_main);
     assert_eq!(h_parts_dev.m, num_parts);
     assert_eq!(h_parts_dev.lde_size, main_lde.lde_size);

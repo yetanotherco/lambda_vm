@@ -43,9 +43,36 @@ pub struct SpanGuard {
     order: u32,
     start: Instant,
     start_ns: u128,
+    /// This span gates an nsys capture range (LAMBDA_VM_NSYS_CAPTURE_SPAN).
+    #[cfg(feature = "nvtx")]
+    capture: bool,
+}
+
+/// Label of the span that brackets an `nsys --capture-range=cudaProfilerApi`
+/// session, from `LAMBDA_VM_NSYS_CAPTURE_SPAN` (e.g. `rounds_2to4`, or
+/// `proving` to capture one epoch of a continuations run). None = never.
+#[cfg(feature = "nvtx")]
+fn capture_span_label() -> Option<&'static str> {
+    static LABEL: OnceLock<Option<String>> = OnceLock::new();
+    LABEL
+        .get_or_init(|| std::env::var("LAMBDA_VM_NSYS_CAPTURE_SPAN").ok())
+        .as_deref()
+}
+
+/// NVTX-only range with a runtime-formatted name (e.g. `epoch[i=3]`), for
+/// callers that need per-instance identity on Nsight timelines. Instruments
+/// spans require `'static` labels, so repeated phases (continuation epochs)
+/// are told apart by instance order in the JSON timeline and by one of these
+/// ranges in nsys. The closure only runs when a profiler-visible NVTX
+/// library is loaded.
+#[cfg(feature = "nvtx")]
+pub fn nvtx_range_fmt<F: FnOnce() -> String>(label: F) -> math_cuda::nvtx::Range {
+    math_cuda::nvtx::Range::fmt(label)
 }
 
 /// Open a wall-clock span; records elapsed time when the guard drops.
+/// Under the `nvtx` feature the span is mirrored as an NVTX range so Nsight
+/// timelines carry the same phase names as the instruments tree.
 pub fn span(label: &'static str) -> SpanGuard {
     let depth = SPAN_DEPTH.with(|d| {
         let v = d.get();
@@ -57,17 +84,35 @@ pub fn span(label: &'static str) -> SpanGuard {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
+    #[cfg(feature = "nvtx")]
+    let capture = {
+        math_cuda::nvtx::range_push(label);
+        let capture = capture_span_label() == Some(label);
+        if capture {
+            math_cuda::nvtx::profiler_start();
+        }
+        capture
+    };
     SpanGuard {
         label,
         depth,
         order,
         start: Instant::now(),
         start_ns,
+        #[cfg(feature = "nvtx")]
+        capture,
     }
 }
 
 impl Drop for SpanGuard {
     fn drop(&mut self) {
+        #[cfg(feature = "nvtx")]
+        {
+            if self.capture {
+                math_cuda::nvtx::profiler_stop();
+            }
+            math_cuda::nvtx::range_pop();
+        }
         let wall = self.start.elapsed();
         SPAN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
         if let Ok(mut t) = TIMELINE.lock() {

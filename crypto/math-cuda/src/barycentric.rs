@@ -29,6 +29,7 @@ pub fn barycentric_base(
     n: usize,
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_base[n={n} cols={num_cols}]"));
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * col_stride);
@@ -84,6 +85,7 @@ pub fn barycentric_ext3(
     n: usize,
     num_cols: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_ext3[n={n} cols={num_cols}]"));
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     assert!(columns.len() >= num_cols * 3 * col_stride);
@@ -139,6 +141,7 @@ pub fn barycentric_base_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_base_dev[n={n} cols={}]", main_handle.m));
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = main_handle.m;
@@ -197,6 +200,7 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_base_dev2[n={n} cols={}]", main_handle.m));
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -247,6 +251,7 @@ pub fn barycentric_ext3_on_device(
     inv_denoms_ext3: &[u64],
     n: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_ext3_dev[n={n} cols={}]", aux_handle.m));
     assert_eq!(coset_points.len(), n);
     assert_eq!(inv_denoms_ext3.len(), 3 * n);
     let num_cols = aux_handle.m;
@@ -297,6 +302,7 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     inv_offset_u64: usize,
     n: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_ext3_dev2[n={n} cols={}]", aux_handle.m));
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -347,6 +353,7 @@ pub fn gather_rows_base_on_device(
     rows: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("gather_rows_base[q={}]", rows.len()));
     let num_cols = main.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());
@@ -385,6 +392,7 @@ pub fn gather_rows_ext3_on_device(
     rows: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("gather_rows_ext3[q={}]", rows.len()));
     let num_cols = aux.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());

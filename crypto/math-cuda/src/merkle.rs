@@ -37,6 +37,9 @@ pub fn keccak_leaves_base(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!("keccak_leaves_base[rows={num_rows} cols={num_cols} rpl={rows_per_leaf}]")
+    });
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
@@ -87,6 +90,9 @@ pub fn keccak_leaves_ext3(
     num_rows: usize,
     rows_per_leaf: usize,
 ) -> Result<Vec<u8>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!("keccak_leaves_ext3[rows={num_rows} cols={num_cols} rpl={rows_per_leaf}]")
+    });
     assert!(num_rows.is_power_of_two());
     assert!(rows_per_leaf == 1 || rows_per_leaf == 2);
     assert!(
@@ -283,6 +289,8 @@ pub(crate) fn launch_keccak_ext3_row_pair(
 ///
 /// `leaves_len` must be a power of two and >= 2.
 pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("merkle_tree[leaves={}]", hashed_leaves.len() / 32));
     assert!(hashed_leaves.len().is_multiple_of(32));
     let leaves_len = hashed_leaves.len() / 32;
     assert!(leaves_len >= 2, "tree needs at least two leaves");
@@ -330,6 +338,7 @@ pub fn gather_merkle_paths_dev(
     positions: &[u32],
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u8>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("merkle_paths[q={}]", positions.len()));
     let num_queries = positions.len();
     if num_queries == 0 {
         return Ok(Vec::new());
@@ -457,6 +466,8 @@ fn build_comp_poly_tree_nodes_dev(
 pub fn build_comp_poly_tree_from_evals_ext3_keep(
     parts_interleaved: &[&[u64]],
 ) -> Result<crate::lde::GpuMerkleTree> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("comp_poly_tree[parts={}]", parts_interleaved.len()));
     let (nodes_dev, num_leaves, stream) = build_comp_poly_tree_nodes_dev(parts_interleaved)?;
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
@@ -475,6 +486,7 @@ pub fn build_comp_poly_tree_from_evals_ext3_keep(
 /// consecutive ext3 values; `num_leaves = evals.len() / 6`. Returns the
 /// `(2*num_leaves - 1) * 32`-byte node buffer in standard layout.
 pub fn build_fri_layer_tree_from_evals_ext3(evals: &[u64]) -> Result<Vec<u8>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("fri_layer_tree[n={}]", evals.len() / 3));
     assert!(
         evals.len().is_multiple_of(6),
         "evals must hold whole pair-leaves"

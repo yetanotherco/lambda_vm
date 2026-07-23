@@ -1009,6 +1009,11 @@ pub fn prove_continuation(
         ))
     })?;
 
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_continuation_total");
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -1047,6 +1052,14 @@ pub fn prove_continuation(
                 local_to_global::MAX_EPOCHS
             )));
         }
+        // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
+        // instruments spans below carry static labels and are told apart by
+        // instance order (phase_table.py reports them per instance).
+        #[cfg(feature = "nvtx")]
+        let __epoch_nvtx = stark::instruments::nvtx_range_fmt(|| format!("epoch[i={index}]"));
+        #[cfg(feature = "instruments")]
+        let __epoch = stark::instruments::span("epoch");
+
         let register_init: Vec<u32> = if index == 0 {
             register::register_init_from_entry_point(elf.entry_point)
         } else {
@@ -1060,6 +1073,8 @@ pub fn prove_continuation(
         };
 
         // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("epoch_execute");
         let logs = match executor
             .resume_with_limit(epoch_size)
             .map_err(|e| Error::Execution(format!("{e}")))?
@@ -1067,6 +1082,8 @@ pub fn prove_continuation(
             Some(logs) => logs.to_vec(),
             None => break,
         };
+        #[cfg(feature = "instruments")]
+        drop(__sp);
         let is_final = executor.pc() == 0;
 
         // Invariant: a non-final epoch ran the full `epoch_size` (a power of two),
@@ -1079,6 +1096,8 @@ pub fn prove_continuation(
         }
 
         let label = local_to_global::epoch_label(index);
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("epoch_trace_build");
         let traces = Traces::from_image_and_logs(
             &elf,
             &image,
@@ -1093,12 +1112,18 @@ pub fn prove_continuation(
         )?;
         let boundary =
             local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         let start = EpochStart {
             register_init: &register_init,
             label,
         };
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("epoch_prove");
         let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
         prev_fini = Some(epoch.reg_fini.clone());
 
         // Carry the image forward: this epoch's fini is the next epoch's init.
@@ -1120,6 +1145,8 @@ pub fn prove_continuation(
     // SINGLE source of truth: the same page-base list drives the committed GLOBAL_MEMORY
     // tables and is shipped in the bundle, so the two can never diverge in set or order.
     let touched_page_bases = touched_page_bases(&all_boundaries);
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("prove_global");
     let global = prove_global(
         &all_boundaries,
         elf_bytes,
@@ -1128,6 +1155,20 @@ pub fn prove_continuation(
         num_private_input_pages,
         opts,
     )?;
+    #[cfg(feature = "instruments")]
+    {
+        drop(__sp);
+        // Same timeline output as the monolithic path (prover/src/lib.rs):
+        // print the wall-clock tree and honor LAMBDA_VM_TIMELINE_JSON. Without
+        // this, continuation runs record spans that are never drained.
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
+    }
 
     Ok(ContinuationProof {
         epochs,

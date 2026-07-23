@@ -571,6 +571,8 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("lde_tree_base[n={n} m={m} bf={blowup_factor}]"));
     let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
@@ -610,6 +612,8 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("lde_tree_ext3[n={n} m={m} bf={blowup_factor}]"));
     let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
@@ -641,6 +645,8 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("lde_tree_ext3_dev[n={n} m={m} bf={blowup_factor}]"));
     let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
         n,
@@ -709,6 +715,8 @@ pub struct GpuMerkleTree {
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("lde_base[n={} bf={blowup_factor}]", evals.len()));
     let n = evals.len();
     // Empty input must short-circuit before the power-of-two assert
     // (is_power_of_two returns false for 0).
@@ -795,6 +803,13 @@ pub fn coset_lde_batch_base(
     blowup_factor: usize,
     weights: &[u64],
 ) -> Result<Vec<Vec<u64>>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "lde_batch_base[cols={} n={} bf={blowup_factor}]",
+            columns.len(),
+            columns.first().map_or(0, |c| c.len())
+        )
+    });
     if columns.is_empty() {
         return Ok(Vec::new());
     }
@@ -950,6 +965,13 @@ pub fn coset_lde_batch_base_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "lde_batch_base_into[cols={} n={} bf={blowup_factor}]",
+            columns.len(),
+            columns.first().map_or(0, |c| c.len())
+        )
+    });
     if columns.is_empty() {
         return Ok(());
     }
@@ -1077,6 +1099,13 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     outputs: &mut [&mut [u64]],
     hashed_leaves_out: &mut [u8],
 ) -> Result<()> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "lde_batch_base_hash[cols={} n={} bf={blowup_factor}]",
+            columns.len(),
+            columns.first().map_or(0, |c| c.len())
+        )
+    });
     coset_lde_batch_base_into_with_merkle_tree_inner(
         columns,
         blowup_factor,
@@ -1291,6 +1320,12 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "poly_lde_ext3[cols={} n={n} bf={blowup_factor}]",
+            coefs.len()
+        )
+    });
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1313,6 +1348,12 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<GpuLdeExt3> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "poly_lde_ext3_keep[cols={} n={n} bf={blowup_factor}]",
+            coefs.len()
+        )
+    });
     let opt = evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1481,6 +1522,12 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<()> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "poly_lde_ext3_tree[cols={} n={n} bf={blowup_factor}]",
+            coefs.len()
+        )
+    });
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1519,6 +1566,12 @@ pub fn coset_lde_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
+    let _nvtx = crate::nvtx::Range::fmt(|| {
+        format!(
+            "lde_batch_ext3[cols={} n={n} bf={blowup_factor}]",
+            columns.len()
+        )
+    });
     if columns.is_empty() {
         return Ok(());
     }

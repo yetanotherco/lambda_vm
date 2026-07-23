@@ -51,6 +51,7 @@ fn check_inverse_fault_injection() -> Result<()> {
 /// containing the inverses. Used by the parity-test suite; production
 /// callers should prefer `batch_inverse_ext3_dev` to avoid the D2H.
 pub fn batch_inverse_ext3(a: &[u64]) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("batch_inverse[n={}]", a.len() / 3));
     assert!(a.len().is_multiple_of(3));
     let n = a.len() / 3;
     if n == 0 {
@@ -83,6 +84,7 @@ pub fn batch_inverse_ext3_dev(
     n: usize,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("batch_inverse_dev[n={n}]"));
     assert!(n >= 1, "batch_inverse_ext3_dev requires n >= 1");
     // Runtime guard (not debug_assert): a u32 grid_dim is truncated past
     // u32::MAX / BLOCK_SIZE, which would silently launch too few blocks
@@ -173,6 +175,7 @@ pub fn compute_and_invert_denoms_ext3_dev(
     sign: DenomSign,
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("denoms_invert[n={n} k={k_scalars}]"));
     #[cfg(feature = "test-faults")]
     check_inverse_fault_injection()?;
     assert_eq!(z_scalars_host.len(), k_scalars * 3);

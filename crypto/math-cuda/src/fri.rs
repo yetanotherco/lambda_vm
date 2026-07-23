@@ -64,6 +64,7 @@ impl FriCommitState {
     /// initial inv_twiddles (base field, n0/2 u64). `n0` must be a power of
     /// two and >= 2.
     pub fn new(evals_host: &[u64], inv_tw_host: &[u64], n0: usize) -> Result<Self> {
+        let _nvtx = crate::nvtx::Range::fmt(|| format!("fri_init[n0={n0}]"));
         assert!(n0 >= 2 && n0.is_power_of_two());
         assert_eq!(evals_host.len(), 3 * n0);
         assert_eq!(inv_tw_host.len(), n0 / 2);
@@ -99,6 +100,7 @@ impl FriCommitState {
         &mut self,
         zeta_raw: [u64; 3],
     ) -> Result<(Vec<u64>, crate::lde::GpuMerkleTree)> {
+        let _nvtx = crate::nvtx::Range::fmt(|| format!("fri_fold[n={}]", self.current_n));
         #[cfg(feature = "test-faults")]
         check_fault_injection()?;
         let be = backend()?;

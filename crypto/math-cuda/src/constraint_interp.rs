@@ -53,6 +53,8 @@ pub fn eval_constraints_on_device(
     next_step: usize,
     num_rows: usize,
 ) -> Result<Vec<u64>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("constraint_eval[rows={num_rows} nodes={num_nodes}]"));
     let num_roots = roots.len();
     if num_rows == 0 || num_roots == 0 || num_nodes == 0 {
         return Ok(vec![0u64; num_roots * num_rows * 3]);
@@ -169,6 +171,8 @@ pub fn eval_composition_on_device(
     num_rows: usize,
     accum: &CompositionAccum,
 ) -> Result<Vec<u64>> {
+    let _nvtx =
+        crate::nvtx::Range::fmt(|| format!("constraint_comp[rows={num_rows} nodes={num_nodes}]"));
     let num_roots = roots.len();
     if num_rows == 0 {
         return Ok(Vec::new());

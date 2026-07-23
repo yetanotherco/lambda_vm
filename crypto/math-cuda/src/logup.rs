@@ -121,6 +121,7 @@ pub fn logup_fingerprints_dev(
     z: [u64; 3],
     stream: &Arc<CudaStream>,
 ) -> Result<CudaSlice<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("logup_fingerprints[rows={num_rows}]"));
     let main_dev = stream.clone_htod(main_cols)?;
     let out = fingerprints_into_dev(&main_dev, num_rows, d, alpha_powers, z, stream)?;
     stream.synchronize()?;
@@ -137,6 +138,7 @@ pub fn logup_term_columns(
     alpha_powers: &[u64],
     z: [u64; 3],
 ) -> Result<Vec<u64>> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("logup_terms[rows={num_rows}]"));
     let be = backend()?;
     let stream = be.next_stream();
     let timing = std::env::var_os("LAMBDA_VM_LOGUP_TIMING").is_some();
@@ -301,6 +303,7 @@ pub fn logup_aux_resident(
     inv_n: [u64; 3],
     stream: &Arc<CudaStream>,
 ) -> Result<ResidentAux> {
+    let _nvtx = crate::nvtx::Range::fmt(|| format!("logup_aux[rows={num_rows}]"));
     assert!(num_rows >= 1, "logup_aux_resident requires num_rows >= 1");
     let be = backend()?;
     // Per-phase timing (env LAMBDA_VM_LOGUP_TIMING): sync between phases so wall
