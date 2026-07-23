@@ -1,7 +1,11 @@
 //! KECCAK_RND: Round chip for Keccak-f[1600] permutation.
 //!
-//! One row per round (24 rows per keccak call). All bitwise operations are
-//! delegated to BITWISE lookup tables (BYTE_ALU, HWSL, ARE_BYTES).
+//! One row per round (24 rows per keccak call). Bitwise XOR/AND are delegated
+//! to BITWISE lookup tables (BYTE_ALU, ARE_BYTES); the halfword shifts (θ
+//! rotate-by-1 and ρ) are enforced directly by μ-gated linear identities over
+//! the committed shift cells instead of HWSL lookups (see
+//! `KeccakRndConstraints`). ARE_BYTES range checks on the shift outputs and the
+//! IS_BIT constraint on the θ carry are load-bearing for the identities.
 //!
 //! ## Column layout (1,480 columns)
 //!
@@ -429,12 +433,17 @@ pub fn generate_keccak_rnd_trace(
 }
 
 // =========================================================================
-// Bus interactions (1,371 total)
+// Bus interactions (1,031 total)
 // =========================================================================
+//
+// The θ/ρ halfword shifts no longer emit HWSL lookups (120 sends/row removed):
+// they are enforced by the inline μ-gated linear identities in
+// `KeccakRndConstraints`. The matching HWSL multiplicities are likewise dropped
+// on the BITWISE side (`collect_bitwise_from_keccak`).
 
 #[allow(clippy::needless_range_loop)]
 pub fn bus_interactions() -> Vec<BusInteraction> {
-    let mut interactions = Vec::with_capacity(1371);
+    let mut interactions = Vec::with_capacity(1031);
 
     // --- IO group (3) ---
 
@@ -587,48 +596,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Theta: HWSL for rotated C (20) ---
-    // HWSL(C[x] halfword[hw], 1) → (Cxz_left, Cxz_right)
-    // Cxz_right is a single carry bit zero-extended to a halfword (spec d75944ee).
-    for x in 0..5 {
-        for hw in 0..4 {
-            interactions.push(BusInteraction::sender(
-                BusId::Hwsl,
-                Multiplicity::Column(cols::MU),
-                vec![
-                    // Input halfword: Cxz[x][3][hw*2] + 256 * Cxz[x][3][hw*2+1]
-                    BusValue::linear(vec![
-                        LinearTerm::Column {
-                            coefficient: 1,
-                            column: cols::cxz(x, 3, hw * 2),
-                        },
-                        LinearTerm::Column {
-                            coefficient: 256,
-                            column: cols::cxz(x, 3, hw * 2 + 1),
-                        },
-                    ]),
-                    // Shift amount = 1
-                    BusValue::constant(1),
-                    // Output: shifted
-                    BusValue::linear(vec![
-                        LinearTerm::Column {
-                            coefficient: 1,
-                            column: cols::cxz_left(x, hw * 2),
-                        },
-                        LinearTerm::Column {
-                            coefficient: 256,
-                            column: cols::cxz_left(x, hw * 2 + 1),
-                        },
-                    ]),
-                    // Output: carry (single bit cast to Half — high byte = 0).
-                    BusValue::Packed {
-                        start_column: cols::cxz_right_bit(x, hw),
-                        packing: Packing::Direct,
-                    },
-                ],
-            ));
-        }
-    }
+    // --- Theta: rotate-C-by-1 shift is enforced by an inline μ-gated linear
+    //     identity (see `KeccakRndConstraints`), not an HWSL lookup. ---
 
     // --- Theta: ARE_BYTES range checks on Cxz_left (20 pairs) ---
     // Spec emits 40 `IS_BYTE<Cxz_left[x][z]>` templates; we merge adjacent
@@ -717,53 +686,8 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         }
     }
 
-    // --- Rho: HWSL (100) ---
-    // HWSL(theta[x][y] halfword[hw], rnc[x][y]) → (rot_left, rot_right)
-    // rnc is inlined as a constant: KECCAK_RHO[x][y] % 16.
-    for x in 0..5 {
-        for y in 0..5 {
-            let rnc_val = (KECCAK_RHO[x][y] % 16) as u64;
-            for hw in 0..4 {
-                interactions.push(BusInteraction::sender(
-                    BusId::Hwsl,
-                    Multiplicity::Column(cols::MU),
-                    vec![
-                        BusValue::linear(vec![
-                            LinearTerm::Column {
-                                coefficient: 1,
-                                column: cols::theta(x, y, hw * 2),
-                            },
-                            LinearTerm::Column {
-                                coefficient: 256,
-                                column: cols::theta(x, y, hw * 2 + 1),
-                            },
-                        ]),
-                        BusValue::constant(rnc_val),
-                        BusValue::linear(vec![
-                            LinearTerm::Column {
-                                coefficient: 1,
-                                column: cols::rot_left(x, y, hw * 2),
-                            },
-                            LinearTerm::Column {
-                                coefficient: 256,
-                                column: cols::rot_left(x, y, hw * 2 + 1),
-                            },
-                        ]),
-                        BusValue::linear(vec![
-                            LinearTerm::Column {
-                                coefficient: 1,
-                                column: cols::rot_right(x, y, hw * 2),
-                            },
-                            LinearTerm::Column {
-                                coefficient: 256,
-                                column: cols::rot_right(x, y, hw * 2 + 1),
-                            },
-                        ]),
-                    ],
-                ));
-            }
-        }
-    }
+    // --- Rho: the per-lane shift is enforced by inline μ-gated linear
+    //     identities (see `KeccakRndConstraints`), not HWSL lookups. ---
 
     // --- Rho: ARE_BYTES range checks on rot_left + rot_right (200 pairs) ---
     // Spec emits 400 IS_BYTE templates (200 per side); we merge each
@@ -900,25 +824,97 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 // Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// The KECCAK round table's 20 transition constraints as a single
-/// [`ConstraintSet`]: for `x ∈ 0..5`, `hw ∈ 0..4` (idx `x·4 + hw`), the μ-gated
-/// `IS_BIT` on `Cxz_right[x][hw]` — `μ · Cxz_right·(1 − Cxz_right)`.
+/// The 16-bit value `main[lo_col] + 256·main[hi_col]` (byte pair → halfword).
+#[inline]
+fn halfword<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+    b: &B,
+    lo_col: usize,
+    hi_col: usize,
+) -> B::Expr {
+    b.main(0, lo_col) + b.main(0, hi_col) * b.const_base(256)
+}
+
+/// The KECCAK round table's 140 transition constraints as a single
+/// [`ConstraintSet`]:
+///
+/// * **20 IS_BIT** on the θ carry bits: for `x ∈ 0..5`, `hw ∈ 0..4`, the μ-gated
+///   `μ · Cxz_right·(1 − Cxz_right)` (degree 3). Load-bearing: it pins the θ
+///   carry to a single bit so the θ shift identity below is unique.
+/// * **20 θ shift identities** (rnc = 1): for `x ∈ 0..5`, `hw ∈ 0..4`,
+///   `μ · (in·2 − right·2¹⁶ − left)` where `in` is the `Cxz[x][3]` halfword,
+///   `left` the `Cxz_left` byte pair and `right` the single `Cxz_right` carry
+///   bit (degree 2).
+/// * **100 ρ shift identities**: for `x,y ∈ 0..5`, `hw ∈ 0..4` with
+///   `rnc = KECCAK_RHO[x][y] % 16`, `μ · (in·2^rnc − right·2¹⁶ − left)` where
+///   `in` is the `theta[x][y]` halfword, `left`/`right` the `rot_left`/
+///   `rot_right` byte pairs (degree 2; the general form covers rnc = 0, which
+///   pins right = 0, left = in).
+///
+/// These identities replace the former θ/ρ HWSL bus lookups. Uniqueness of the
+/// (left, right) decomposition rests on the ARE_BYTES range checks bounding both
+/// halves to `[0, 2¹⁶)` and on `2¹⁶` being invertible mod the Goldilocks prime
+/// (z3-verified equivalent to the HWSL contract).
 pub struct KeccakRndConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for KeccakRndConstraints {
-    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3.
+    // The IS_BIT constraints are gated by μ (cond·x·(1−x)), so degree 3; the
+    // shift identities are μ × linear, degree 2.
     fn max_degree(&self) -> usize {
         3
     }
 
+    #[allow(clippy::needless_range_loop)]
     fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
         use crate::constraints::templates::emit_is_bit;
 
+        let two_16 = 1u64 << 16;
         let mut idx = 0;
+
+        // (1) IS_BIT on the θ carry bits (Cxz_right).
         for x in 0..5 {
             for hw in 0..4 {
                 emit_is_bit(b, idx, cols::cxz_right_bit(x, hw), Some(cols::MU));
                 idx += 1;
+            }
+        }
+
+        // (2) θ rotate-C-by-1 shift identity (rnc = 1):
+        //     μ · (in·2 − right·2¹⁶ − left) = 0.
+        for x in 0..5 {
+            for hw in 0..4 {
+                let inp = halfword(b, cols::cxz(x, 3, hw * 2), cols::cxz(x, 3, hw * 2 + 1));
+                let left = halfword(b, cols::cxz_left(x, hw * 2), cols::cxz_left(x, hw * 2 + 1));
+                let right = b.main(0, cols::cxz_right_bit(x, hw));
+                let identity = inp * b.const_base(2) - right * b.const_base(two_16) - left;
+                let mu = b.main(0, cols::MU);
+                b.emit_base(idx, mu * identity);
+                idx += 1;
+            }
+        }
+
+        // (3) ρ shift identity (rnc = KECCAK_RHO[x][y] % 16):
+        //     μ · (in·2^rnc − right·2¹⁶ − left) = 0.
+        for x in 0..5 {
+            for y in 0..5 {
+                let rnc = KECCAK_RHO[x][y] % 16;
+                let pow = 1u64 << rnc;
+                for hw in 0..4 {
+                    let inp = halfword(b, cols::theta(x, y, hw * 2), cols::theta(x, y, hw * 2 + 1));
+                    let left = halfword(
+                        b,
+                        cols::rot_left(x, y, hw * 2),
+                        cols::rot_left(x, y, hw * 2 + 1),
+                    );
+                    let right = halfword(
+                        b,
+                        cols::rot_right(x, y, hw * 2),
+                        cols::rot_right(x, y, hw * 2 + 1),
+                    );
+                    let identity = inp * b.const_base(pow) - right * b.const_base(two_16) - left;
+                    let mu = b.main(0, cols::MU);
+                    b.emit_base(idx, mu * identity);
+                    idx += 1;
+                }
             }
         }
     }
