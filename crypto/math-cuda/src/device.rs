@@ -205,6 +205,7 @@ pub struct Backend {
 
     // keccak.cubin
     pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
+    pub keccak256_leaves_base_row_major_row_pair_range: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
     pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
@@ -427,6 +428,8 @@ impl Backend {
             matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
             keccak256_leaves_base_row_major_row_pair: keccak
                 .load_function("keccak256_leaves_base_row_major_row_pair")?,
+            keccak256_leaves_base_row_major_row_pair_range: keccak
+                .load_function("keccak256_leaves_base_row_major_row_pair_range")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
             keccak256_leaves_base_row_pair_batched: keccak
                 .load_function("keccak256_leaves_base_row_pair_batched")?,

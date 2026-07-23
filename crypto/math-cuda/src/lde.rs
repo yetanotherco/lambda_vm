@@ -328,6 +328,46 @@ fn launch_keccak_base_row_major_row_pair(
     Ok(())
 }
 
+/// Column-range variant of [`launch_keccak_base_row_major_row_pair`]: leaves
+/// hash only columns `[col_start, col_end)` of each bit-reversed row pair
+/// (`m` stays the full row stride). Matches the CPU
+/// `commit_rows_bit_reversed_subset`.
+#[allow(clippy::too_many_arguments)]
+fn launch_keccak_base_row_major_row_pair_range(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    col_start: u64,
+    col_end: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
+) -> Result<()> {
+    debug_assert!(
+        num_rows >= 2,
+        "row-major row-pair keccak requires num_rows >= 2"
+    );
+    debug_assert!(
+        col_start < col_end && col_end <= m,
+        "column range in bounds"
+    );
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_major_row_pair_range)
+            .arg(buf)
+            .arg(&m)
+            .arg(&col_start)
+            .arg(&col_end)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
 /// Transpose row-major `lde_size × cols` → column-major with stride `lde_size`,
 /// returning the new device buffer. Used to convert the row-major LDE output to
 /// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
@@ -369,6 +409,87 @@ fn launch_row_to_col_major(
 enum InnerInput<'a> {
     Host(&'a [u64]),
     Dev(&'a CudaSlice<u64>),
+}
+
+/// The expansion stage shared by the row-major commit pipelines: upload (or
+/// D2D-copy) the row-major trace into a zero-padded `lde_size × total_cols`
+/// buffer, optionally snapshot the trace-domain input column-major (for the
+/// LogUp fingerprint kernel), then iNTT → coset weights → forward NTT in
+/// place. Returns the row-major LDE buffer and the optional snapshot.
+#[allow(clippy::too_many_arguments)]
+fn expand_row_major_on_stream(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    input: InnerInput,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_trace_col_major: bool,
+) -> Result<(CudaSlice<u64>, Option<CudaSlice<u64>>)> {
+    let lde_size = n * blowup_factor;
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = total_cols as u64;
+
+    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
+    // carry data, the remainder are already zero (zero-padding for LDE). Host
+    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
+    {
+        match input {
+            InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+            InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+        }
+    }
+
+    // Snapshot the trace-domain input (column-major) before the iNTT overwrites
+    // it in place. The LogUp aux fingerprint kernel reads the main trace in
+    // place from this buffer, so R1 aux build skips the ~3 GB main re-upload.
+    // Transpose is a plain row->col transpose on the first n rows (not yet
+    // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
+    let trace_col_major = if retain_trace_col_major {
+        Some(launch_row_to_col_major(
+            stream, be, &buf, n, total_cols, n as u64,
+        )?)
+    } else {
+        None
+    };
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    // iNTT: bit-reverse rows → per-level DIT.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        cols_u64,
+    )?;
+
+    // Coset weights: one weight per row, broadcast across all columns.
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
+
+    // Forward NTT at lde_size.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        cols_u64,
+    )?;
+
+    Ok((buf, trace_col_major))
 }
 
 /// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
@@ -419,68 +540,22 @@ fn coset_lde_row_major_inner(
     // is always even.
     let num_leaves = lde_size / 2;
     let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
-    let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
-    let n_u64 = n as u64;
     let lde_u64 = lde_size as u64;
     let cols_u64 = total_cols as u64;
 
     let be = backend()?;
     let stream = be.next_stream();
 
-    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
-    // carry data, the remainder are already zero (zero-padding for LDE). Host
-    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
-    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
-    {
-        match input {
-            InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
-            InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
-        }
-    }
-
-    // Snapshot the trace-domain input (column-major) before the iNTT overwrites
-    // it in place. The LogUp aux fingerprint kernel reads the main trace in
-    // place from this buffer, so R1 aux build skips the ~3 GB main re-upload.
-    // Transpose is a plain row->col transpose on the first n rows (not yet
-    // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
-    let trace_col_major = if retain_trace_col_major {
-        Some(launch_row_to_col_major(
-            &stream, be, &buf, n, total_cols, n as u64,
-        )?)
-    } else {
-        None
-    };
-
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    // iNTT: bit-reverse rows → per-level DIT.
-    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
-    run_row_major_ntt_body(
-        stream.as_ref(),
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
         be,
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        cols_u64,
-    )?;
-
-    // Coset weights: one weight per row, broadcast across all columns.
-    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
-
-    // Forward NTT at lde_size.
-    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
-    run_row_major_ntt_body(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        cols_u64,
+        input,
+        n,
+        total_cols,
+        blowup_factor,
+        weights,
+        retain_trace_col_major,
     )?;
 
     // Keccak + Merkle on-device. Each row-pair leaf reads two bit-reversed rows
@@ -594,6 +669,118 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         trace_rows: n,
     };
     Ok((handle, lde_out))
+}
+
+/// Row-major LDE + TWO subset Merkle trees for preprocessed tables: the
+/// precomputed columns `[0, split_col)` and the multiplicity columns
+/// `[split_col, m)` commit to separate trees over the same row-major LDE,
+/// mirroring the CPU `commit_rows_bit_reversed_subset` pair.
+///
+/// Both trees' complete node buffers are downloaded to host
+/// (`(2*num_leaves - 1) * 32` bytes each, inner nodes first, root at offset 0,
+/// leaves at the tail — the exact `MerkleTree::from_precomputed_nodes`
+/// layout), because preprocessed-table openings walk host trees. The
+/// precomputed tree is only built when `build_precomputed` is true (the
+/// caller skips it on a process-cache hit).
+///
+/// Returns `(precomputed_nodes, mult_nodes, handle, row_major_lde)`. The
+/// handle carries the column-major LDE + trace snapshot for downstream GPU
+/// rounds but NO device tree (`tree: None`) — openings for preprocessed
+/// tables never gather from device.
+#[allow(clippy::type_complexity)]
+pub fn coset_lde_row_major_split_trees(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    split_col: usize,
+    build_precomputed: bool,
+) -> Result<(Option<Vec<u8>>, Vec<u8>, GpuLdeBase, Vec<u64>)> {
+    assert!(split_col > 0 && split_col < m, "split inside the row");
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, "coset_lde_row_major_split lde_size");
+    let num_leaves = lde_size / 2;
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
+    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(num_leaves);
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = m as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    let (buf, trace_col_major) = expand_row_major_on_stream(
+        &stream,
+        be,
+        InnerInput::Host(row_major),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        true,
+    )?;
+
+    // One subset tree per column range, built sequentially on the stream.
+    let build_subset_tree = |col_start: u64, col_end: u64| -> Result<Vec<u8>> {
+        let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+        {
+            let mut leaves_view =
+                nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+            launch_keccak_base_row_major_row_pair_range(
+                stream.as_ref(),
+                be,
+                &buf,
+                cols_u64,
+                col_start,
+                col_end,
+                lde_u64,
+                log_lde,
+                &mut leaves_view,
+            )?;
+        }
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+        let mut nodes_host = vec![0u8; nodes_bytes];
+        {
+            stream.memcpy_dtoh(&nodes_dev, &mut nodes_host)?;
+        }
+        Ok(nodes_host)
+    };
+
+    let precomputed_nodes = if build_precomputed {
+        Some(build_subset_tree(0, split_col as u64)?)
+    } else {
+        None
+    };
+    let mult_nodes = build_subset_tree(split_col as u64, cols_u64)?;
+
+    // D2H the row-major LDE (preprocessed tables always keep the host copy —
+    // they are excluded from the device-only gate).
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, be.pinned_staging(), &be.ctx, &buf, lde_size * m)?;
+
+    // Column-major handle for downstream GPU rounds (DEEP, barycentric,
+    // constraint composition).
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, m, lde_u64)?;
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+
+    let lde_out = {
+        let mut out = vec![0u64; lde_size * m];
+        lde_pending.wait_into_u64(&mut out)?;
+        out
+    };
+
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size,
+        tree: None,
+        ready: Some(Arc::new(ready)),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((precomputed_nodes, mult_nodes, handle, lde_out))
 }
 
 /// Row-major ext3 LDE + Keccak + Merkle, all on-device.

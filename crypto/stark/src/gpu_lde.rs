@@ -647,6 +647,110 @@ where
     Some((tree, handle, lde_out))
 }
 
+/// Convert a GPU-built full node buffer (`(2*leaves - 1) * 32` bytes, inner
+/// nodes first, root at offset 0, leaves at the tail) into a host
+/// [`MerkleTree`], the exact layout `from_precomputed_nodes` expects.
+fn tree_from_node_bytes<B>(nodes: Vec<u8>) -> Option<MerkleTree<B>>
+where
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    debug_assert_eq!(nodes.len() % 32, 0);
+    let nodes: Vec<[u8; 32]> = nodes
+        .chunks_exact(32)
+        .map(|c| {
+            let mut n = [0u8; 32];
+            n.copy_from_slice(c);
+            n
+        })
+        .collect();
+    MerkleTree::<B>::from_precomputed_nodes(nodes)
+}
+
+/// Preprocessed-table variant of [`try_expand_leaf_and_tree_row_major_keep`]:
+/// one row-major GPU LDE of ALL columns plus TWO subset Merkle trees — the
+/// precomputed columns `[0, split_col)` and the multiplicity columns
+/// `[split_col, m)` — matching the CPU `commit_rows_bit_reversed_subset`
+/// pair bit for bit. Trees come back as full HOST trees (openings for
+/// preprocessed tables walk host trees); the handle keeps the column-major
+/// LDE + trace snapshot device-resident for the downstream GPU rounds, with
+/// no device tree.
+///
+/// `build_precomputed=false` skips the precomputed tree (process-cache hit);
+/// the first element is then `None`.
+#[allow(clippy::type_complexity)]
+pub(crate) fn try_expand_split_trees_row_major_keep<F, E, B>(
+    row_major: &[FieldElement<E>],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[FieldElement<F>],
+    split_col: usize,
+    build_precomputed: bool,
+) -> Option<(
+    Option<MerkleTree<B>>,
+    MerkleTree<B>,
+    math_cuda::lde::GpuLdeBase,
+    Vec<FieldElement<E>>,
+)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+    B: IsMerkleTreeBackend<Node = [u8; 32]>,
+{
+    let lde_size = n.saturating_mul(blowup_factor);
+    if lde_size < gpu_lde_threshold() {
+        return None;
+    }
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if row_major.len() != n * m || m == 0 || n == 0 {
+        return None;
+    }
+    if split_col == 0 || split_col >= m {
+        return None;
+    }
+
+    let raw: &[u64] = unsafe { from_raw_parts(row_major.as_ptr() as *const u64, n * m) };
+    let weights_u64 = unsafe { weights_to_u64::<F>(weights) };
+
+    GPU_LDE_CALLS.fetch_add(m as u64, Ordering::Relaxed);
+    GPU_LEAF_HASH_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
+    GPU_MERKLE_TREE_CALLS.fetch_add(1 + build_precomputed as u64, Ordering::Relaxed);
+
+    let (pre_nodes, mult_nodes, handle, lde_u64) = math_cuda::lde::coset_lde_row_major_split_trees(
+        raw,
+        n,
+        m,
+        blowup_factor,
+        &weights_u64,
+        split_col,
+        build_precomputed,
+    )
+    .ok()?;
+
+    let pre_tree = match pre_nodes {
+        Some(nodes) => Some(tree_from_node_bytes::<B>(nodes)?),
+        None => None,
+    };
+    let mult_tree = tree_from_node_bytes::<B>(mult_nodes)?;
+
+    // Transmute Vec<u64> → Vec<FieldElement<E>> (zero-copy, E == GoldilocksField).
+    let lde_out: Vec<FieldElement<E>> = unsafe {
+        let mut v = std::mem::ManuallyDrop::new(lde_u64);
+        Vec::from_raw_parts(
+            v.as_mut_ptr() as *mut FieldElement<E>,
+            v.len(),
+            v.capacity(),
+        )
+    };
+
+    Some((pre_tree, mult_tree, handle, lde_out))
+}
+
 /// Row-major ext3 GPU path: single H2D → row-major NTT (m*3 base-field cols) →
 /// row-major Keccak → Merkle → single D2H → transpose to GpuLdeExt3 handle.
 /// Same optimization as the base-field path: no extract_columns, no CPU transpose.
@@ -2000,4 +2104,87 @@ where
         })
         .collect();
     Some(decommits)
+}
+
+/// GPU↔CPU parity for the preprocessed split-tree commit path. Requires the
+/// `cuda` feature and a visible GPU (skipped otherwise via the dispatch gate
+/// returning `None` — asserted here, so a silent skip fails the test).
+#[cfg(all(test, feature = "cuda"))]
+mod split_tree_tests {
+    use super::*;
+    use crate::config::BatchedMerkleTreeBackend;
+    use crate::prover::{IsStarkProver, Prover};
+    use math::field::extensions_goldilocks::Degree3GoldilocksExtensionField as Ext3;
+
+    type F = GoldilocksField;
+    type Fp = FieldElement<F>;
+    type TestProver = Prover<F, Ext3, ()>;
+
+    struct SplitMix64(u64);
+    impl SplitMix64 {
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Both subset trees (roots, nodes via openings) must equal the CPU
+    /// `commit_rows_bit_reversed_subset` built over the same row-major LDE.
+    /// The LDE itself is parity-pinned by the existing full-row fused tests,
+    /// so the CPU reference consumes the GPU's returned LDE directly — this
+    /// isolates the tree layout/hashing under test.
+    #[test]
+    fn split_trees_match_cpu_subset_commits() {
+        // Above the dispatch threshold (2^19 LDE) so the GPU path must engage.
+        let n: usize = 1 << 18;
+        let blowup: usize = 2;
+        let m: usize = 5;
+        let split: usize = 2;
+
+        let mut rng = SplitMix64(0x5EED_C0DE_5EED_C0DE);
+        let data: Vec<Fp> = (0..n * m).map(|_| Fp::from(rng.next_u64())).collect();
+        let weights: Vec<Fp> = (0..n).map(|_| Fp::from(rng.next_u64())).collect();
+
+        let (pre_tree, mult_tree, handle, lde) =
+            try_expand_split_trees_row_major_keep::<F, F, BatchedMerkleTreeBackend<F>>(
+                &data, n, m, blowup, &weights, split, true,
+            )
+            .expect("GPU split path must engage above the threshold");
+        let pre_tree = pre_tree.expect("precomputed tree was requested");
+
+        let (cpu_pre, cpu_pre_root) =
+            TestProver::commit_rows_bit_reversed_subset(&lde, m, 0, split)
+                .expect("CPU subset commit (precomputed)");
+        let (cpu_mult, cpu_mult_root) =
+            TestProver::commit_rows_bit_reversed_subset(&lde, m, split, m)
+                .expect("CPU subset commit (multiplicities)");
+
+        assert_eq!(pre_tree.root, cpu_pre_root, "precomputed root");
+        assert_eq!(mult_tree.root, cpu_mult_root, "multiplicity root");
+
+        // Openings must be byte-identical at scattered positions (pins the
+        // full node buffers, not just the roots).
+        let num_leaves = n * blowup / 2;
+        for pos in [0usize, 1, 511, 12_345, num_leaves - 1] {
+            assert_eq!(
+                pre_tree.get_proof_by_pos(pos).unwrap().merkle_path,
+                cpu_pre.get_proof_by_pos(pos).unwrap().merkle_path,
+                "precomputed path at {pos}"
+            );
+            assert_eq!(
+                mult_tree.get_proof_by_pos(pos).unwrap().merkle_path,
+                cpu_mult.get_proof_by_pos(pos).unwrap().merkle_path,
+                "multiplicity path at {pos}"
+            );
+        }
+
+        // The handle must carry the column-major LDE for downstream rounds:
+        // spot-check a few cells against the row-major host LDE.
+        assert_eq!(handle.m, m);
+        assert_eq!(handle.lde_size, n * blowup);
+        assert!(handle.tree.is_none(), "no device tree on the split path");
+    }
 }

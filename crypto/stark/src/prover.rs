@@ -936,6 +936,86 @@ pub trait IsStarkProver<
             }
         }
 
+        // Fused GPU split path for preprocessed tables (cuda only): one
+        // row-major LDE of ALL columns plus two subset Merkle trees
+        // (precomputed / multiplicity) built on device — leaves and levels are
+        // bit-identical to `commit_rows_bit_reversed_subset`, and the trees
+        // come back as full host trees so the preprocessed opening path and
+        // the process-wide precomputed-tree cache work unchanged. The handle
+        // keeps the LDE device-resident for the downstream GPU rounds.
+        #[cfg(feature = "cuda")]
+        if let Some((expected_precomputed_root, num_precomputed)) = precomputed {
+            let (trace_slice, num_cols) = trace.main_data_row_major();
+            let n = if num_cols > 0 {
+                trace_slice.len() / num_cols
+            } else {
+                0
+            };
+            #[cfg(feature = "disk-spill")]
+            let cache_ok = storage_mode != StorageMode::Disk;
+            #[cfg(not(feature = "disk-spill"))]
+            let cache_ok = true;
+            let cached_pre = cache_ok
+                .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                .flatten();
+            #[cfg(feature = "instruments")]
+            let t_sub = Instant::now();
+            if let Some((pre_tree, mult_tree, handle, main_data)) =
+                crate::gpu_lde::try_expand_split_trees_row_major_keep::<
+                    Field,
+                    Field,
+                    BatchedMerkleTreeBackend<Field>,
+                >(
+                    trace_slice,
+                    n,
+                    num_cols,
+                    domain.blowup_factor,
+                    &twiddles.coset_weights,
+                    num_precomputed,
+                    cached_pre.is_none(),
+                )
+            {
+                #[cfg(feature = "instruments")]
+                crate::instruments::accum_r1_main(t_sub.elapsed(), std::time::Duration::ZERO);
+                let precomputed_tree = match cached_pre {
+                    // Cache key == the root a rebuild would be verified
+                    // against, so a hit needs no re-check.
+                    Some(tree) => tree,
+                    None => {
+                        #[allow(unused_mut)]
+                        let mut tree = pre_tree.expect("precomputed tree requested on cache miss");
+                        if tree.root != expected_precomputed_root {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
+                        let tree = Arc::new(tree);
+                        if cache_ok {
+                            precomputed_tree_cache_put::<Field>(
+                                expected_precomputed_root,
+                                Arc::clone(&tree),
+                            );
+                        }
+                        tree
+                    }
+                };
+                #[allow(unused_mut)]
+                let mut mult_tree = mult_tree;
+                #[cfg(feature = "disk-spill")]
+                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
+                let mult_root = mult_tree.root;
+                let commit = TableCommit::preprocessed(
+                    mult_tree,
+                    mult_root,
+                    precomputed_tree,
+                    expected_precomputed_root,
+                    num_precomputed,
+                );
+                return Ok((commit, (main_data, num_cols), Some(handle)));
+            }
+            // GPU split path declined (size threshold / tower) → CPU path below.
+        }
+
         // CPU path: the trace `Table` is already row-major, so copy it directly
         // (one memcpy — no transpose) and expand in place with the cache-blocked
         // batched two-half FFT. Row-major end-to-end: no LDE-size transpose,
