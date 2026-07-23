@@ -24,6 +24,31 @@ const BLOCK_DIM: u32 = 256;
 /// remaining rows. 65536 mirrors OpenVM's quotient `TASK_SIZE`.
 const MAX_THREADS: u32 = 1 << 16;
 
+/// Grid the composition kernel launches for `num_rows` (same clamp as the launch
+/// in [`eval_composition_on_device`]): `ceil(num_rows / BLOCK_DIM)` capped at
+/// `MAX_THREADS / BLOCK_DIM`.
+fn composition_grid(num_rows: usize) -> u32 {
+    let max_grid = MAX_THREADS / BLOCK_DIM;
+    (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid)
+}
+
+/// Device bytes of the per-thread value scratch that [`eval_composition_on_device`]
+/// allocates (`num_nodes × num_threads × 3` u64, i.e. one ext3 slot per node per
+/// thread). Exposed so the host VRAM-admission estimate uses the exact kernel
+/// constants (`BLOCK_DIM`, `MAX_THREADS`) instead of duplicating them. This buffer
+/// is a Round-2 composition transient and does not exist during R1 main commit.
+/// Saturating throughout so an implausible program can never wrap the estimate.
+pub fn composition_scratch_bytes(num_nodes: usize, num_rows: usize) -> u64 {
+    if num_nodes == 0 || num_rows == 0 {
+        return 0;
+    }
+    let num_threads = (composition_grid(num_rows) as u64).saturating_mul(BLOCK_DIM as u64);
+    (num_nodes as u64)
+        .saturating_mul(num_threads)
+        .saturating_mul(3)
+        .saturating_mul(8)
+}
+
 /// Evaluate every constraint of a lowered program over the device-resident LDE.
 ///
 /// Returns the per-constraint eval matrix as raw ext3 limbs, constraint-major:
@@ -74,8 +99,7 @@ pub fn eval_constraints_on_device(
     let d_offset = stream.clone_htod(table_offset)?;
 
     // Fixed thread count, grid-stride over rows.
-    let max_grid = MAX_THREADS / BLOCK_DIM;
-    let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
+    let grid = composition_grid(num_rows);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
     // Per-thread value scratch ([num_nodes * num_threads] ext3) and output.
@@ -220,8 +244,7 @@ pub fn eval_composition_on_device(
         stream.memcpy_htod(*slice, &mut dst)?;
     }
 
-    let max_grid = MAX_THREADS / BLOCK_DIM;
-    let grid = (num_rows as u32).div_ceil(BLOCK_DIM).clamp(1, max_grid);
+    let grid = composition_grid(num_rows);
     let num_threads = (grid as usize) * (BLOCK_DIM as usize);
 
     let mut d_values = stream.alloc_zeros::<u64>(num_nodes * num_threads * 3)?;

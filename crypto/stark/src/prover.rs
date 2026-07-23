@@ -460,20 +460,34 @@ pub fn table_parallelism() -> usize {
 }
 
 /// Heuristic peak device bytes for one table: co-resident LDE columns plus the
-/// resident Merkle trees, with a scratch factor for NTT and leaf transients. A
-/// deliberate over estimate for a safety ceiling, not a precise allocator. Pass
-/// aux_cols == 0 when the aux LDE is not yet resident (R1 main commit).
-fn estimate_table_vram_bytes(main_cols: usize, aux_cols: usize, lde_size: usize) -> u64 {
+/// resident Merkle trees, with a scratch factor for NTT and leaf transients, plus
+/// `comp_scratch_bytes` for the Round-2 composition interpreter's per-thread value
+/// scratch. A deliberate over estimate for a safety ceiling, not a precise
+/// allocator. Pass `aux_cols == 0` when the aux LDE is not yet resident and
+/// `comp_scratch_bytes == 0` when the composition scratch is not live (R1 main
+/// commit); pass the real scratch (via
+/// [`math_cuda::constraint_interp::composition_scratch_bytes`]) for the R1-aux /
+/// rounds-2-4 peak, where it can reach ~1 GB per table and would otherwise be
+/// invisible to chunk admission.
+fn estimate_table_vram_bytes(
+    main_cols: usize,
+    aux_cols: usize,
+    lde_size: usize,
+    comp_scratch_bytes: u64,
+) -> u64 {
     const BYTES_PER_BASE: u64 = 8;
     const EXT3_BYTES: u64 = 24;
     const SCRATCH_FACTOR: u64 = 2;
     const RESIDENT_TREE_BYTES_PER_LDE: u64 = 256;
     let lde = lde_size as u64;
-    let per_row = (main_cols as u64).saturating_mul(BYTES_PER_BASE)
-        + (aux_cols as u64).saturating_mul(EXT3_BYTES);
+    let per_row = (main_cols as u64)
+        .saturating_mul(BYTES_PER_BASE)
+        .saturating_add((aux_cols as u64).saturating_mul(EXT3_BYTES));
     let lde_term = lde.saturating_mul(per_row).saturating_mul(SCRATCH_FACTOR);
     let tree_term = lde.saturating_mul(RESIDENT_TREE_BYTES_PER_LDE);
-    lde_term.saturating_add(tree_term)
+    lde_term
+        .saturating_add(tree_term)
+        .saturating_add(comp_scratch_bytes)
 }
 
 /// Plan contiguous table chunks for parallel proving. A chunk grows until it
@@ -504,6 +518,59 @@ fn plan_table_chunks(estimates: &[u64], k: usize, budget: u64) -> Vec<(usize, us
         start = end;
     }
     chunks
+}
+
+#[cfg(test)]
+mod vram_admission_tests {
+    use super::{estimate_table_vram_bytes, plan_table_chunks};
+
+    #[test]
+    fn estimate_saturates_and_adds_scratch() {
+        let lde = 1 << 20;
+        let no_scratch = estimate_table_vram_bytes(8, 4, lde, 0);
+        let with_scratch = estimate_table_vram_bytes(8, 4, lde, 1_000_000_000);
+        assert_eq!(
+            with_scratch,
+            no_scratch + 1_000_000_000,
+            "composition scratch adds to the estimate"
+        );
+        // Absurd inputs cannot wrap the estimate.
+        assert_eq!(
+            estimate_table_vram_bytes(usize::MAX, usize::MAX, usize::MAX, u64::MAX),
+            u64::MAX
+        );
+    }
+
+    #[test]
+    fn composition_scratch_forces_more_chunks() {
+        // Tables that co-reside 2-per-chunk on their LDE + trees alone must be
+        // separated once the ~1 GB composition interpreter scratch is admitted.
+        let lde = 1 << 20;
+        let no_scratch = estimate_table_vram_bytes(8, 4, lde, 0);
+        // Scratch just larger than one table's non-scratch footprint, so a table
+        // with scratch exceeds a budget sized to pack two without it.
+        let big_scratch = no_scratch + 1;
+        let with_scratch = estimate_table_vram_bytes(8, 4, lde, big_scratch);
+        let budget = 2 * no_scratch; // fits exactly two scratch-free tables
+
+        let n = 4;
+        let est_no: Vec<u64> = vec![no_scratch; n];
+        let est_big: Vec<u64> = vec![with_scratch; n];
+        let chunks_no = plan_table_chunks(&est_no, n, budget);
+        let chunks_big = plan_table_chunks(&est_big, n, budget);
+
+        assert_eq!(
+            chunks_no,
+            vec![(0, 2), (2, 4)],
+            "2 tables per chunk without scratch"
+        );
+        assert_eq!(
+            chunks_big,
+            vec![(0, 1), (1, 2), (2, 3), (3, 4)],
+            "each table runs solo once scratch is admitted"
+        );
+        assert!(chunks_big.len() > chunks_no.len());
+    }
 }
 
 /// A container for the results of the second round of the STARK Prove protocol.
@@ -2776,7 +2843,9 @@ pub trait IsStarkProver<
                 .map(|(idx, (_, trace, _))| {
                     let lde_size =
                         domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
-                    estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size)
+                    // R1 main commit: the composition interpreter scratch does
+                    // not exist yet, so it is 0 here.
+                    estimate_table_vram_bytes(trace.num_main_columns, 0, lde_size, 0)
                 })
                 .collect();
             plan_table_chunks(&estimates, k, vram_budget)
@@ -3024,13 +3093,27 @@ pub trait IsStarkProver<
             let estimates: Vec<u64> = air_trace_pairs
                 .iter()
                 .enumerate()
-                .map(|(idx, (_, trace, _))| {
+                .map(|(idx, (air, trace, _))| {
                     let lde_size =
                         domains[idx].interpolation_domain_size * domains[idx].blowup_factor;
+                    // R1-aux / rounds-2-4 peak: the composition interpreter's
+                    // per-thread value scratch is live and can reach ~1 GB per
+                    // table, so admit it into the chunk estimate.
+                    #[cfg(feature = "cuda")]
+                    let comp_scratch = math_cuda::constraint_interp::composition_scratch_bytes(
+                        air.constraint_program().nodes.len(),
+                        lde_size,
+                    );
+                    #[cfg(not(feature = "cuda"))]
+                    let comp_scratch = {
+                        let _ = air;
+                        0u64
+                    };
                     estimate_table_vram_bytes(
                         trace.num_main_columns,
                         trace.num_aux_columns,
                         lde_size,
+                        comp_scratch,
                     )
                 })
                 .collect();
