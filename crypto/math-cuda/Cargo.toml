@@ -6,12 +6,15 @@ edition = "2024"
 license.workspace = true
 
 [dependencies]
+# Pin the CUDA API to 13.0 rather than auto-detecting the (13.1) toolkit: a box whose
+# driver is 13.0 lacks the 13.1-only `cuDevSmResourceSplit` symbol cudarc would otherwise
+# require, panicking at init. 13.0 bindings work on any driver >= 13.0. (Was
+# `cuda-version-from-build-system` + `fallback-latest`.)
 cudarc = { version = "0.19", default-features = false, features = [
     "driver",
     "nvrtc",
     "std",
-    "cuda-version-from-build-system",
-    "fallback-latest",
+    "cuda-13000",
     "dynamic-loading",
 ] }
 math = { path = "../math" }

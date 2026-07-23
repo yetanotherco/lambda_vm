@@ -1,0 +1,61 @@
+Reading private input file...
+=== TRACE BUILD: real op counts (pre-padding) ===
+  cpu                           4036972
+  cpu32                            3938
+  memw                            16214
+  memw_aligned                   905917
+  memw_register                 9339359
+  load                           492350
+  store                          425132
+  lt (post-fanout)              1369302
+  shift                          557683
+  mul                            330701
+  dvrm                                4
+  branch                         257535
+  eq                             107065
+  bytewise                       467791
+  bitwise (post-fanout)        85850944
+  commit                            161
+  keccak                            135
+  ecsm                               20
+  ec_scalar                         640
+  ecdas                            7677
+
+Elements: 407520652
+Aux elements (EF-cols): 134748214
+=== TIMELINE (wall-clock) ===
+execute                                      65.094ms  100.0%
+trace_build                                    2.420s 3718.2%
+  p0_decode                                  29.497ms   45.3%
+  p1_cpu_ops                                 77.999ms  119.8%
+  p2a_collect_cpu                           499.746ms  767.7%
+  p2b_collect_all                           416.621ms  640.0%
+  p3to5_build_traces                           1.001s 1537.8%
+    p4_bitwise_collect                      489.829ms  752.5%
+    p5_generate_tables                      455.310ms  699.5%
+fill:gen_ecdas                               15.185ms   23.3%
+fill:gen_cpus                               454.986ms  699.0%
+fill:gen_memw_registers                     135.405ms  208.0%
+fill:gen_memws                                3.010ms    4.6%
+fill:gen_lts                                140.408ms  215.7%
+fill:gen_decode                              72.447ms  111.3%
+fill:gen_branches                            24.260ms   37.3%
+fill:gen_bitwise                            265.566ms  408.0%
+fill:gen_ec_scalar                           64.667µs    0.1%
+fill:gen_ecsm                                58.792µs    0.1%
+fill:gen_cpu32s                             468.958µs    0.7%
+fill:gen_stores                              30.937ms   47.5%
+fill:gen_muls                                43.018ms   66.1%
+fill:gen_bytewises                           59.036ms   90.7%
+fill:gen_memw_aligneds                       55.169ms   84.8%
+fill:gen_loads                               41.903ms   64.4%
+fill:gen_shifts                              73.372ms  112.7%
+  fill:gen_dvrms                            171.709µs    0.3%
+  fill:gen_pages                            380.129ms  584.0%
+fill:gen_keccak                             314.209µs    0.5%
+fill:gen_keccak_rnd                          21.317ms   32.7%
+fill:gen_keccak_rc                            1.416µs    0.0%
+fill:gen_eqs                                  1.761ms    2.7%
+fill:gen_halt                               792.000ns    0.0%
+fill:gen_register                             3.208µs    0.0%
+fill:gen_commit                               9.000µs    0.0%

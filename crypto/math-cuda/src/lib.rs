@@ -6,6 +6,7 @@
 //! pipelines or used by the parity test suite.
 
 pub mod barycentric;
+pub mod bitwise_hist;
 pub mod constraint_interp;
 pub mod deep;
 pub mod device;
@@ -16,6 +17,8 @@ pub mod logup;
 pub mod merkle;
 pub mod ntt;
 pub mod trace_cpu;
+pub mod trace_ops;
+pub mod trace_walk;
 
 // Re-exported for downstream crates so they can refer to CUDA primitive
 // types without depending on cudarc directly.

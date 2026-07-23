@@ -569,6 +569,20 @@ impl BitwiseHistogram {
         }
     }
 
+    /// Add a raw counter array with the identical `[NUM_ROWS * NUM_LOOKUP_TYPES]`
+    /// layout (e.g. a device-computed histogram) into this one. Same commutative
+    /// monoid as [`merge`](Self::merge); the caller guarantees the layout matches.
+    pub(crate) fn add_raw_counts(&mut self, counts: &[u64]) {
+        assert_eq!(
+            counts.len(),
+            self.counters.len(),
+            "raw counts must match the histogram layout"
+        );
+        for (a, b) in self.counters.iter_mut().zip(counts.iter()) {
+            *a += *b;
+        }
+    }
+
     /// Write the accumulated multiplicities into the BITWISE trace's MU columns.
     ///
     /// OVERWRITES each nonzero cell with its count (it does not add to what is

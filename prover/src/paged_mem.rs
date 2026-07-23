@@ -96,6 +96,16 @@ impl<T: Copy> PagedMem<T> {
         page.occupied[off / WORD_BITS] |= 1u64 << (off % WORD_BITS);
     }
 
+    /// Dense value slice for the page based at `base` (length `DEFAULT_PAGE_SIZE`), or
+    /// `None` if that page was never touched. Offsets never `set` read back as `fill`.
+    /// Lets a per-page consumer index by offset with no hashing (vs a sparse map).
+    pub fn page_data(&self, base: u64) -> Option<&[T]> {
+        match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
+            Ok(i) => Some(&self.pages[i].1.data),
+            Err(_) => None,
+        }
+    }
+
     /// Base addresses of the pages that hold at least one `set` cell, ascending.
     /// (For a `DEFAULT_PAGE_SIZE`-aligned page, this equals `page_base_for_address`
     /// of every cell in it, so it replaces `cells.keys().map(page_base)`.)

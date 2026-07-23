@@ -844,3 +844,132 @@ fn fill_memw_register_on(
     }
     Ok(buf)
 }
+
+// -----------------------------------------------------------------------------
+// MEMW_R device walk + fill (no host walk, no old_* upload).
+//
+// The register memory-model walk runs on device (`trace_walk::walk_core`), and its
+// resident `(old_value, old_ts)` feed the MEMW_R fill on the same stream — the
+// recovered predecessors never touch the host. Input is the FULL register-access
+// stream (every access advances the per-address timeline, so timestamp-only writes
+// such as the implicit PC bump must be present); `row_index[i] < 0` marks an access
+// that advances the timeline but emits no MEMW_R row (skipped by the fill kernel).
+// `reg_addr` is both the walk bucket key and the fill's address column (register
+// word address `< nbins`). See `reports/tracegen/GPU-WALK-PLAN.md`.
+// -----------------------------------------------------------------------------
+
+/// Device-resident register walk **and** MEMW_R fill. Recovers each access's
+/// `(old_value, old_ts)` on device then fills the 10 MEMW_R columns row-major,
+/// returning the residency-ready `[row*NCOLS+col]` buffer. `init_value[b]` seeds
+/// bucket `b` at timestamp `init_ts` (the continuation register state).
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_and_fill_memw_register(
+    reg_addr: &[u32],
+    ts: &[u64],
+    value: &[u64],
+    is_read: &[u8],
+    row_index: &[i64],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let buf = walk_and_fill_memw_register_on(
+        &stream, reg_addr, ts, value, is_read, row_index, init_value, init_ts, nbins, num_rows,
+    )?;
+    stream.synchronize()?;
+    Ok(buf)
+}
+
+/// Host-returning wrapper over [`gpu_walk_and_fill_memw_register`] for byte-parity
+/// tests against the CPU walk + fill.
+#[allow(clippy::too_many_arguments)]
+pub fn gpu_walk_and_fill_memw_register_host(
+    reg_addr: &[u32],
+    ts: &[u64],
+    value: &[u64],
+    is_read: &[u8],
+    row_index: &[i64],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<Vec<u64>> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let buf = walk_and_fill_memw_register_on(
+        &stream, reg_addr, ts, value, is_read, row_index, init_value, init_ts, nbins, num_rows,
+    )?;
+    let host = stream.clone_dtoh(&buf)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_and_fill_memw_register_on(
+    stream: &std::sync::Arc<cudarc::driver::CudaStream>,
+    reg_addr: &[u32],
+    ts: &[u64],
+    value: &[u64],
+    is_read: &[u8],
+    row_index: &[i64],
+    init_value: &[u64],
+    init_ts: u64,
+    nbins: u32,
+    num_rows: usize,
+) -> Result<CudaSlice<u64>> {
+    let n = reg_addr.len();
+    debug_assert_eq!(ts.len(), n);
+    debug_assert_eq!(value.len(), n);
+    debug_assert_eq!(is_read.len(), n);
+    debug_assert_eq!(row_index.len(), n);
+    debug_assert_eq!(init_value.len(), nbins as usize);
+    let be = backend()?;
+    let mut buf = stream.alloc_zeros::<u64>(num_rows * MEMW_REGISTER_NCOLS)?;
+    if n == 0 {
+        return Ok(buf);
+    }
+
+    // Upload the access SoA once; `reg_addr` doubles as the walk bucket key and the
+    // fill address column, and `ts`/`value` are shared by walk and fill.
+    let keys_d = stream.clone_htod(reg_addr)?;
+    let ts_d = stream.clone_htod(ts)?;
+    let value_d = stream.clone_htod(value)?;
+    let init_value_d = stream.clone_htod(init_value)?;
+
+    // Device walk → resident (old_value, old_ts), consumed in place by the fill.
+    let (old_value_d, old_ts_d) = crate::trace_walk::walk_core(
+        be,
+        stream,
+        &keys_d,
+        &ts_d,
+        &value_d,
+        &init_value_d,
+        init_ts,
+        n,
+        nbins,
+    )?;
+
+    let is_read_d = stream.clone_htod(is_read)?;
+    let row_index_d = stream.clone_htod(row_index)?;
+    let n_u64 = n as u64;
+    let ncols_u32 = MEMW_REGISTER_NCOLS as u32;
+    unsafe {
+        stream
+            .launch_builder(&be.memw_register_fill)
+            .arg(&n_u64)
+            .arg(&keys_d)
+            .arg(&ts_d)
+            .arg(&value_d)
+            .arg(&is_read_d)
+            .arg(&row_index_d)
+            .arg(&old_value_d)
+            .arg(&old_ts_d)
+            .arg(&ncols_u32)
+            .arg(&mut buf)
+            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    }
+    Ok(buf)
+}

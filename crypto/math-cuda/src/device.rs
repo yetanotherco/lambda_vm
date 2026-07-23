@@ -99,6 +99,9 @@ const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
 const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
 const LOGUP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/logup.ptx"));
 const TRACE_CPU_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_cpu.ptx"));
+const TRACE_WALK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_walk.ptx"));
+const BITWISE_HIST_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/bitwise_hist.ptx"));
+const TRACE_OPS_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/trace_ops.ptx"));
 const CONSTRAINT_INTERP_PTX: &str =
     include_str!(concat!(env!("OUT_DIR"), "/constraint_interp.ptx"));
 
@@ -206,6 +209,27 @@ pub struct Backend {
     pub cpu32_fill: CudaFunction,
     pub memw_fill: CudaFunction,
     pub memw_register_fill: CudaFunction,
+
+    // trace_walk.ptx (on-GPU register memory-model walk)
+    pub walk_seg_hist: CudaFunction,
+    pub walk_seg_offsets: CudaFunction,
+    pub walk_seg_scatter: CudaFunction,
+    pub walk_link: CudaFunction,
+    // trace_walk.ptx (route + compact for the device MEMW_R build)
+    pub memw_route_flags: CudaFunction,
+    pub scan_reduce: CudaFunction,
+    pub scan_spine: CudaFunction,
+    pub scan_write_excl: CudaFunction,
+    pub memw_rowindex_from_excl: CudaFunction,
+    pub memw_rowindex_localize: CudaFunction,
+    pub memw_is_half_hist: CudaFunction,
+    pub memw_fb_gather: CudaFunction,
+    // bitwise_hist.ptx (on-GPU BITWISE multiplicity histogram)
+    pub bitwise_hist_cpu_ops: CudaFunction,
+    pub bitwise_hist_memw_reg: CudaFunction,
+    pub bitwise_hist_reduce: CudaFunction,
+    // trace_ops.ptx (device CpuOperation builder — Phase 0)
+    pub build_cpu_ops: CudaFunction,
     // constraint_interp.ptx
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
@@ -314,6 +338,9 @@ impl Backend {
         let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
         let logup = ctx.load_module(Ptx::from_src(LOGUP_PTX))?;
         let trace_cpu = ctx.load_module(Ptx::from_src(TRACE_CPU_PTX))?;
+        let trace_walk = ctx.load_module(Ptx::from_src(TRACE_WALK_PTX))?;
+        let bitwise_hist = ctx.load_module(Ptx::from_src(BITWISE_HIST_PTX))?;
+        let trace_ops = ctx.load_module(Ptx::from_src(TRACE_OPS_PTX))?;
         let constraint_interp = ctx.load_module(Ptx::from_src(CONSTRAINT_INTERP_PTX))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
@@ -416,6 +443,22 @@ impl Backend {
             cpu32_fill: trace_cpu.load_function("cpu32_fill")?,
             memw_fill: trace_cpu.load_function("memw_fill")?,
             memw_register_fill: trace_cpu.load_function("memw_register_fill")?,
+            walk_seg_hist: trace_walk.load_function("walk_seg_hist")?,
+            walk_seg_offsets: trace_walk.load_function("walk_seg_offsets")?,
+            walk_seg_scatter: trace_walk.load_function("walk_seg_scatter")?,
+            walk_link: trace_walk.load_function("walk_link")?,
+            memw_route_flags: trace_walk.load_function("memw_route_flags")?,
+            scan_reduce: trace_walk.load_function("scan_reduce")?,
+            scan_spine: trace_walk.load_function("scan_spine")?,
+            scan_write_excl: trace_walk.load_function("scan_write_excl")?,
+            memw_rowindex_from_excl: trace_walk.load_function("memw_rowindex_from_excl")?,
+            memw_rowindex_localize: trace_walk.load_function("memw_rowindex_localize")?,
+            memw_is_half_hist: trace_walk.load_function("memw_is_half_hist")?,
+            memw_fb_gather: trace_walk.load_function("memw_fb_gather")?,
+            bitwise_hist_cpu_ops: bitwise_hist.load_function("bitwise_hist_cpu_ops")?,
+            bitwise_hist_memw_reg: bitwise_hist.load_function("bitwise_hist_memw_reg")?,
+            bitwise_hist_reduce: bitwise_hist.load_function("bitwise_hist_reduce")?,
+            build_cpu_ops: trace_ops.load_function("build_cpu_ops")?,
             constraint_interp_kernel: constraint_interp
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp

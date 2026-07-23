@@ -1,0 +1,73 @@
+Reading ELF file...
+Reading private input file...
+Generating proof (blowup=2, queries=219)...
+=== TRACE BUILD: real op counts (pre-padding) ===
+  cpu                           1792841
+  cpu32                            3078
+  memw                            11170
+  memw_aligned                   482594
+  memw_register                 3884623
+  load                           266826
+  store                          223754
+  lt (post-fanout)               708337
+  shift                          209256
+  mul                             72986
+  dvrm                                4
+  branch                         160837
+  eq                              73008
+  bytewise                       197181
+  bitwise (post-fanout)        39991182
+  commit                            161
+  keccak                            109
+  ecsm                                4
+  ec_scalar                         128
+  ecdas                            1520
+
+
+=== PROVER TIMING ===
+  Phase                                    Wall      %
+  ──────────────────────────────────────────────────────────
+  Execute                                 0.06s    0.4%
+  Trace build                             1.45s   10.3%
+  AIR construction                        0.61s    4.4%
+  Pre-pass (domains/twiddles)             0.04s    0.3%
+  Round 1                                 5.23s   37.3%
+    Main trace commits                    2.29s          16.3%
+      Main LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)    3.86s          27.5%
+      Main commit (Merkle, CPU only)      3.35s          23.9%
+    Aux trace build (parallel)            1.01s           7.2%
+    Aux trace commit                      1.93s          13.8%
+      Aux LDE (fused GPU: LDE+Keccak+Merkle / CPU: LDE only)    3.86s          27.5%
+      Aux commit (Merkle, CPU only)       2.37s          16.9%
+  Rounds 2–4                              6.60s   47.1%
+      MEMW_R x4            4.2M           5.42s          38.7%
+      CPU x4               1.8M           4.01s          28.6%
+      LT                   1.0M           1.32s           9.4%
+      BITWISE              1.0M           0.80s           5.7%
+      MEMW_A               524K           0.78s           5.6%
+      SHIFT                262K           0.75s           5.4%
+      DECODE               1.0M           0.73s           5.2%
+      LOAD                 524K           0.71s           5.1%
+      PAGE:0x80000         262K           0.32s           2.3%
+      PAGE:0xfffffffffffc0000   262K      0.31s           2.2%
+      PAGE:0x4c0000        262K           0.31s           2.2%
+      PAGE:0x240000        262K           0.29s           2.1%
+      PAGE:0x40000         262K           0.28s           2.0%
+      (29 others)                         5.06s          36.0%
+      ── sub-operation totals (all tables) ──
+      R2  evaluate                        4.39s          31.3%
+      R3  OOD evaluation                  4.30s          30.6%
+      R4  fri::commit_phase               3.65s          26.0%
+      R4  deep_composition_poly_evals     2.53s          18.0%
+      R2  decompose_and_extend_d2         2.32s          16.6%
+      R2  commit_bit_reversed (comp-poly)    2.27s          16.2%
+      R4  queries & openings              1.36s           9.7%
+      R4  interpolate+evaluate_fft        0.18s           1.3%
+
+  Total FFT                              10.23s   72.9%
+  Total Merkle                           11.65s   83.0%
+  ──────────────────────────────────────────────────────────
+  TOTAL                                  14.03s
+
+Writing proof...
+Proof written to "/tmp/ethrex_simple_tx.proof"

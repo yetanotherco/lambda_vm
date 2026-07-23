@@ -47,6 +47,8 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(all(test, feature = "cuda"))]
+pub mod gpu_cpu_ops_parity;
+#[cfg(all(test, feature = "cuda"))]
 pub mod gpu_fill_tests;
 #[cfg(test)]
 pub mod keccak_rnd_tests;
@@ -66,6 +68,8 @@ pub mod memw_register_tests;
 pub mod memw_tests;
 #[cfg(test)]
 pub mod mul_tests;
+#[cfg(test)]
+pub mod page_dense_parity;
 #[cfg(test)]
 pub mod page_tests;
 #[cfg(test)]
@@ -88,3 +92,9 @@ pub mod templates_tests;
 pub mod trace_builder_tests;
 #[cfg(test)]
 pub mod trace_test_helpers;
+#[cfg(test)]
+pub mod walk_cost_bench;
+#[cfg(test)]
+pub mod walk_decomp_tests;
+#[cfg(all(test, feature = "cuda"))]
+pub mod walk_route_tests;

@@ -1,0 +1,47 @@
+=== TIMELINE (wall-clock) ===
+prove_total                                   14.031s  100.0%
+  execute                                    57.541ms    0.4%
+  trace_build                                  1.448s   10.3%
+    p0_decode                                30.751ms    0.2%
+    p1_cpu_ops                               36.229ms    0.3%
+    p2a_collect_cpu                         189.361ms    1.3%
+    p2b_collect_all                         232.826ms    1.7%
+    p3to5_build_traces                      810.064ms    5.8%
+      p4_bitwise_collect                    382.721ms    2.7%
+      p5_generate_tables                    399.871ms    2.8%
+fill:gen_cpus                                65.404ms    0.5%
+fill:gen_lts                                 88.288ms    0.6%
+fill:gen_ecdas                                4.620ms    0.0%
+fill:gen_memw_registers                      45.537ms    0.3%
+fill:gen_memws                                5.164ms    0.0%
+fill:gen_decode                              28.010ms    0.2%
+fill:gen_branches                            12.991ms    0.1%
+fill:gen_bitwise                            141.408ms    1.0%
+fill:gen_muls                                11.037ms    0.1%
+fill:gen_memw_aligneds                       47.627ms    0.3%
+fill:gen_loads                               33.007ms    0.2%
+fill:gen_ec_scalar                          182.333µs    0.0%
+fill:gen_ecsm                                78.042µs    0.0%
+fill:gen_cpu32s                             371.625µs    0.0%
+fill:gen_shifts                              31.434ms    0.2%
+fill:gen_stores                              15.757ms    0.1%
+fill:gen_dvrms                               35.375µs    0.0%
+fill:gen_pages                              387.855ms    2.8%
+fill:gen_keccak                             126.584µs    0.0%
+fill:gen_keccak_rnd                          21.509ms    0.2%
+fill:gen_bytewises                           11.674ms    0.1%
+fill:gen_keccak_rc                            1.041µs    0.0%
+fill:gen_eqs                                  1.534ms    0.0%
+fill:gen_commit                             742.708µs    0.0%
+fill:gen_halt                               792.000ns    0.0%
+fill:gen_register                             2.750µs    0.0%
+  air_construction                          612.681ms    4.4%
+  proving                                     11.907s   84.9%
+    r1_prepass                               37.843ms    0.3%
+    r1_main_commit                             2.286s   16.3%
+    r1_aux_build                               1.006s    7.2%
+    r1_aux_commit                              1.935s   13.8%
+    rounds_2to4                                6.601s   47.0%
+[timeline] wrote reports/tracegen/timeline_run1.json
+Cycles: 1792841
+Proving time: 14.088s
