@@ -200,7 +200,6 @@ multiplicity = "μ"
 
 [[constraint_groups]]
 name = "range"
-prefix = "R"
 
 [[constraints.range]]
 kind = "template"
@@ -287,7 +286,6 @@ iter = ["i", 0, 3]
 
 [[constraint_groups]]
 name = "alu"
-prefix = "A"
 
 [[constraints.alu]]
 kind = "template"
@@ -312,7 +310,6 @@ multiplicity = "ALU"
 
 [[constraint_groups]]
 name = "mem"
-prefix = "M"
 
 
 [[constraints.mem]]

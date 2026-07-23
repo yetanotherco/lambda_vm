@@ -115,6 +115,129 @@
   }
 }
 
+/// Fowler-Noll-Vo (FNV) 32-bit hash function, the alternative algorithm
+/// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html
+/// 
+/// Note: this is a non-cryptographic hash function; it is optimized
+/// for speed at the expense of unpredictability.
+#let FNV32-1a(bytes) = {
+  let PRIME = 0x01000193
+
+  let hash = 0x811C9DC5
+  for b in bytes {
+    hash = (hash.bit-xor(b) * PRIME).bit-and(0xFFFFFFFF)
+  }
+
+  hash.to-bytes().slice(0, 4)
+}
+
+/// FNV24-1a, derived from FNV32-1a through XOR-folding.
+/// src: http://www.isthe.com/chongo/tech/comp/fnv/index.html#xor-fold
+#let FNV24-1a(inp) = {
+  let a64 = array(FNV32-1a(inp))
+  return bytes((a64.at(0).bit-xor(a64.at(3)), a64.at(1), a64.at(2)))
+}
+
+// Recursively map nested object to bytes
+#let _SEP = bytes(",")
+#let to-bytes(leaf-transform, val) = {
+  let recurse = to-bytes.with(leaf-transform)
+  let t = type(val)
+  let (tag, val) = if t == bytes {
+    ("b", val)
+  } else if t == str {
+    ("s", leaf-transform(val))
+  } else if t == dictionary {
+    ("d", val.pairs().sorted().map(recurse).sum(default: _SEP))
+  } else if t == array {
+    ("a", val.map(recurse).join(_SEP, default: _SEP))
+  } else if t == int {
+    ("i", val.to-bytes())
+  } else {
+    assert(false, message: "to-bytes: unsupported object type: " + str(type(val)))
+  }
+  bytes("(") + bytes(tag) + val + bytes(")")
+}
+
+/// Tag constraints with an identifier
+#let _add_constraint_ids(chip) = {
+
+  /// A 24-bit NON-CRYPTOGRAPHIC hash function.
+  let nchf(bytes) = FNV24-1a(bytes)
+
+  /// Digests an object
+  let digest(obj, leaf-transform: bytes) = nchf(to-bytes(leaf-transform, obj))
+  
+  // ID settings
+  let ID_CHAR_LEN = 4;
+  let ID_CHAR_SET = "123456789ABDEFGHJKLMNPQRSTUVWXYZ".codepoints()
+
+  // Constants
+  let DIGEST_BITSIZE = 24;
+  let LOG_ID_RADIX = 5
+  let RADIX = calc.pow(2, LOG_ID_RADIX)
+  assert(ID_CHAR_SET.len() == RADIX, message: "ID_CHAR_SET <> RADIX mismatch")
+  assert(ID_CHAR_LEN * LOG_ID_RADIX <= DIGEST_BITSIZE, message: "digest size too small for configured ID entropy")
+  
+  // Map hash digest to ID
+  let digest_to_id(digest) = {
+    assert(8 * digest.len() == DIGEST_BITSIZE)
+    let int = int.from-bytes(digest)
+    for _ in range(ID_CHAR_LEN) {
+      let idx = int.bit-and(RADIX - 1)
+      int = int.bit-rshift(LOG_ID_RADIX)
+      (ID_CHAR_SET.at(idx), )
+    }.sum()
+  }
+
+  // Digest variables
+  let variable_digests = chip
+    .variables
+    .pairs()
+    .map(((group, variables)) => variables
+      .map(var => (var.name: digest((chip.name, group, var.name, var.type))))
+      .sum(default: (:))
+    ).sum(default: (:))
+
+  // Replace variable names with their ID
+  let _EXCLUDED_LABELS = ("desc", "ref", "constraint")
+  let digest_constraint(c) = {
+    // filter out excluded fields
+    let filtered = c
+      .keys()
+      .sorted()
+      .filter(k => k not in _EXCLUDED_LABELS)
+      .map(k => c.at(k))
+
+    // replace iter variables with stub
+    let iters = if "iters" in c {c.iters} else if "iter" in c {(c.iter,)} else {()}
+    let iter_map = iters
+      .enumerate()
+      .map(((idx, iter)) => ((iter.at(0)): "iter" + str(idx)))
+      .sum(default: (:))
+
+    let leaf-transform(x) = bytes((iter_map + variable_digests).at(x, default: x))
+
+    digest(filtered, leaf-transform: leaf-transform)
+  }
+
+  // Add an ID to each constraint
+  chip.constraints = chip.at("constraints", default: (:))
+    .pairs()
+    .map(((group, constraints)) => {
+      (
+        (group):
+        constraints
+          .map(c => {
+            c.id = digest_to_id(digest_constraint(c))
+            c
+          })
+      )
+    }).sum(default: (:))
+
+  chip
+}
+
 /// Load a chip object from file
 ///
 /// - path(str): path to file containing chip data
@@ -122,5 +245,5 @@
 #let load_chip(path, config) = {
   let chip = toml(path)
   _check_chip(chip, config)
-  return chip
+  return _add_constraint_ids(chip)
 }

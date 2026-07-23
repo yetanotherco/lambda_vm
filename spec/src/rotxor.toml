@@ -1,4 +1,5 @@
 name = "ROTXOR"
+code = "RTXR"
 
 [[variables.input]]
 name = "a"

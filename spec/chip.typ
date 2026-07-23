@@ -24,7 +24,7 @@
     
     config.variables.types.filter(type => type.label == var_type).first().subtypes.len() * factor
   })
-  .sum()
+  .sum(default: 0)
 }
 
 // Given a constraint, compute the number of interactions it induces
@@ -256,7 +256,7 @@
 
 // Render the iterators of `obj`.
 #let iters(obj) = {
-  iters_of(obj).map(iter => [#raw(iter.at(0)) #sym.in `[`#expr_to_code(iter.at(1)), #expr_to_code(iter.at(2))`]`]).join("\n")
+  iters_of(obj).map(iter => [#raw(iter.at(0))#sym.in`[`#expr_to_code(iter.at(1)),#expr_to_code(iter.at(2))`]`]).join("\n")
 }
 
 #let args_interaction_like(input, output) = {
@@ -269,10 +269,12 @@
 
 #let render_chip_assumptions(chip, config) = {
   let tag(assumption) = {
-    let with_index(x) = ((x,) + iters_of(assumption).map(it => it.at(0))).join(".")
-    let lbl = [#chip.name\-A]
-    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
-    cref(assumption)[#figure(kind: chip.name + "assumption", numbering: (i) => [#lbl#i], supplement: [], [])]
+    let code = chip.at("code", default: chip.name)
+    let index = (("",) + iters_of(assumption).map(it => it.at(0))).join(`.`)
+    let lbl(idx) = raw(code + "-A" + str(idx))
+
+    show figure: (it) => align(left, block[#context lbl(it.counter.get().at(0))#index])
+    cref(assumption)[#figure(kind: code + "assumption", numbering: (i) => lbl(i), supplement: [], [])]
   }
 
   show figure: set block(breakable: true)
@@ -301,16 +303,24 @@
   assert(groups.all(group => group in all_groups), message: "unknown group: " + repr(groups))
   let selected_constraints = groups.map(g => ((g): chip.constraints.at(g))).join()
 
-  // Find the group definition in the constraint_groups
-  let lookup_group(name) = chip.constraint_groups.filter((g) => g.name == name).at(0, default: (name: name))
-
   /// Render the contraint's tag.
-  let tag(constraint, group) = {
-    let with_index(x) = ((x,) + iters_of(constraint).map(it => it.at(0))).join(".")
-    let prefix = if "prefix" in group { group.prefix }
-    let lbl = [#chip.name\-C#prefix]
-    show figure: (it) => align(left, block[#lbl#context with_index(it.counter.display())])
-    cref(constraint)[#figure(kind: chip.name + "constraint", numbering: (i) => [#lbl#i], supplement: [], [])]
+  let tag(constraint) = {
+    let code = chip.at("code", default: chip.name)
+    let counter-kind = code + "constraint"
+    let tag = code + "-" + constraint.id
+    
+    let indices = (("",) + iters_of(constraint).map(it => it.at(0))).join(".")
+
+    let pad-width() = calc.max(calc.ceil(calc.log(counter(figure.where(kind: counter-kind)).final().at(0) + 1)), 2)
+    let z-pad(s) = context "0" * calc.max(pad-width() - s.len(), 0) + s
+    let ref-tag(i) = raw(tag) + sub("/" + z-pad(str(i)))
+    return (
+      context super[#emph(z-pad(str(counter(figure.where(kind: counter-kind)).get().at(0) + 1)))],
+      [
+        #show figure: (it) => align(left, raw(tag + indices))
+        #cref(constraint)[#figure(kind: counter-kind, numbering: (i) => ref-tag(i), supplement: [], [])]
+      ],
+    )
   }
 
   /// Generates a representation of `constraint`
@@ -351,13 +361,23 @@
     }
 
     (..for poly in polys {
-      (table.cell(align: right, colspan: 2, [_polynomial constraint_]), $#expr_to_math(poly) = 0$, [])
+      (
+        [], 
+        table.cell(align: right, colspan: 2, [_polynomial_]), 
+        table.cell(align: left, colspan: 1, $#expr_to_math(poly) = 0$), 
+        []
+      )
     },)
   }
 
   // Rendering the additional "desc" field for arith constraints
   let render_extra_description(constraint) = {
-    (table.cell(align: right, colspan: 2, [_description_]), eval(constraint.desc, mode: "markup"), [])
+    (
+      [],
+      table.cell(align: right, colspan: 2, [_description_]), 
+      table.cell(align: left, colspan: 1, eval(constraint.desc, mode: "markup")), 
+      []
+    )
   }
 
   // Whether there is at least one constraint with a range
@@ -370,21 +390,27 @@
 
   show figure: set block(breakable: true)
   figure(table(
-    columns: (auto, auto, 1fr, auto),
-    inset: 6pt,
-    align: (top + left, top + left, top + left, top + center),
+    columns: (auto, auto, if do_display_range {auto} else {0pt}, 1fr, if do_display_multiplicity {auto} else {0pt}),
+    inset: (x,_) => (
+      left: if x == 0 or x == 1 {0pt} else {6pt}, 
+      right: if x == 4 {0pt} else {6pt}, 
+      top: 6pt, 
+      bottom: 6pt
+    ),
+    align: (top + left, top + left, top + left, top + left, top + center),
     stroke: none,
     table.header(
+      [],
       [*Tag*], 
       if do_display_range {[*Range*]} else {[]}, 
       [*Description*], 
-      if do_display_multiplicity {[*Multiplicity*]} else {[]},
+      if do_display_multiplicity {[*Multip.*]} else {[]},
     ),
     table.hline(stroke: stroke(thickness: 2pt)),
     ..for (group, group_constraints) in selected_constraints.pairs() {
       for constraint in group_constraints {
         (
-          [#tag(constraint, lookup_group(group))],
+          ..tag(constraint),
           [#iters(constraint)],
           [#repr_constraint(constraint)],
           [#expr_to_math(constraint.at("multiplicity", default: ""))],
@@ -395,6 +421,7 @@
         if has_polynomial_constraints(constraint) {
           render_polynomial_constraints(constraint)
         }
+        (table.hline(stroke: stroke(thickness: .25pt)),)
       }
     }
   ))

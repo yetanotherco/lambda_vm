@@ -1,4 +1,5 @@
 name = "SHA256MSGSCHED"
+code = "SHM"
 
 [[variables.input]]
 name = "timestamp"
