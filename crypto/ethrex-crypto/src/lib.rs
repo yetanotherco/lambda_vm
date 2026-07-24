@@ -19,8 +19,11 @@
 use ethrex_crypto::keccak::keccak_hash;
 use ethrex_crypto::{Crypto, CryptoError};
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
-use k256::elliptic_curve::ops::{Invert, LinearCombination, Reduce};
-use k256::elliptic_curve::point::DecompressPoint;
+use k256::elliptic_curve::ops::{LinearCombination, Reduce};
+// `Invert` (software `x.invert()`) is only used by the host fallback; on the
+// riscv64 guest all inversions go through the `hint` ecall.
+#[cfg(not(target_arch = "riscv64"))]
+use k256::elliptic_curve::ops::Invert;
 use k256::elliptic_curve::sec1::ToEncodedPoint;
 use k256::elliptic_curve::PrimeField;
 use k256::{AffinePoint, FieldBytes, ProjectivePoint, Scalar, U256};
@@ -77,6 +80,94 @@ impl Crypto for LambdaVmEcsmCrypto {
 /// We compute the recovery directly rather than calling k256's
 /// `recover_from_prehash`, which internally runs a *second* lincomb to
 /// re-verify the key — doubling the ECSM ecalls for no gain here.
+/// Obtain a 32-byte little-endian hint for `x_le` via the executor `hint` ecall
+/// (the host computes the modular inverse / sqrt; the value is provable via the
+/// prover's HINT table). The result is UNVERIFIED — every caller MUST check it
+/// in-guest (`x·inv == 1`, `y² == x³+7`), since the ecall adds no correctness
+/// constraint. BENCH scaffolding.
+#[cfg(target_arch = "riscv64")]
+fn get_hint(hint_id: usize, x_le: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    lambda_vm_syscalls::syscalls::hint(hint_id, &mut out, x_le);
+    out
+}
+
+/// Scalar-field inverse `x⁻¹ mod n`. On riscv64 (guest) the inverse comes from the
+/// `hint` ecall and we verify `x·inv == 1`; off-target (host tests) it computes the
+/// inverse in software. BENCH scaffolding.
+fn scalar_inv(x: &Scalar) -> Option<Scalar> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        use k256::elliptic_curve::subtle::ConstantTimeEq;
+        let x_be = x.to_bytes();
+        let mut x_le = [0u8; 32];
+        for i in 0..32 {
+            x_le[i] = x_be[31 - i];
+        }
+        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_SCALAR_INV, &x_le);
+        let mut inv_be = k256::FieldBytes::default();
+        for i in 0..32 {
+            inv_be[i] = inv_le[31 - i];
+        }
+        let inv: Scalar = Option::from(Scalar::from_repr(inv_be))?;
+        // Verify the untrusted hint: x·inv must equal 1 (mod n).
+        if bool::from((*x * inv).ct_eq(&Scalar::ONE)) {
+            Some(inv)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        x.invert_vartime().into()
+    }
+}
+
+/// Decompress R from its x-coordinate + parity. On riscv64 the `y = sqrt(x³+7)`
+/// is an `hint`-ecall value verified in-guest (`y² == x³+7`), with parity
+/// selection; off-target it uses k256's software `decompress`. BENCH scaffolding.
+fn decompress_r(r_bytes: &FieldBytes, y_is_odd: bool) -> Option<AffinePoint> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let x: FieldElement = Option::from(FieldElement::from_bytes(r_bytes))?;
+        // secp256k1: y² = x³ + 7.
+        let mut seven_bytes = [0u8; 32];
+        seven_bytes[31] = 7;
+        let seven: FieldElement = Option::from(FieldElement::from_bytes(&seven_bytes.into()))?;
+        let x3: FieldElement = x.square() * x;
+        let rhs: FieldElement = x3 + seven;
+        // Hinted sqrt (LE in/out), then verify y² == rhs canonically.
+        let rhs_be = rhs.to_bytes();
+        let mut rhs_le = [0u8; 32];
+        for i in 0..32 {
+            rhs_le[i] = rhs_be[31 - i];
+        }
+        let y_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_SQRT, &rhs_le);
+        let mut y_be = [0u8; 32];
+        for i in 0..32 {
+            y_be[i] = y_le[31 - i];
+        }
+        let mut y: FieldElement = Option::from(FieldElement::from_bytes(&y_be.into()))?;
+        let y2: FieldElement = y.square();
+        if y2.to_bytes() != rhs.to_bytes() {
+            return None;
+        }
+        // Select the root whose canonical LSB matches the requested parity.
+        let y_odd = (y.to_bytes()[31] & 1) == 1;
+        if y_odd != y_is_odd {
+            y = -y;
+        }
+        // Build the affine point; `from_encoded_point` re-checks it's on-curve.
+        let ep = EncodedPoint::from_affine_coordinates(&x.to_bytes(), &y.to_bytes(), false);
+        Option::from(AffinePoint::from_encoded_point(&ep))
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        use k256::elliptic_curve::point::DecompressPoint;
+        AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into()
+    }
+}
+
 fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64], CryptoError> {
     let r_bytes = <&FieldBytes>::from(&sig[..32]);
     let s_bytes = <&FieldBytes>::from(&sig[32..]);
@@ -96,15 +187,14 @@ fn ecsm_ecrecover(sig: &[u8; 64], recid: u8, msg: &[u8; 32]) -> Result<[u8; 64],
     // precompile; we don't handle it (decompression simply fails), matching the
     // trait default.
     let y_is_odd = (recid & 1) != 0;
-    let r_point: Option<AffinePoint> =
-        AffinePoint::decompress(r_bytes, u8::from(y_is_odd).into()).into();
+    let r_point: Option<AffinePoint> = decompress_r(r_bytes, y_is_odd);
     let Some(r_point) = r_point else {
         return Err(CryptoError::RecoveryFailed);
     };
     let r_proj = ProjectivePoint::from(r_point);
 
     let z = <Scalar as Reduce<U256>>::reduce_bytes(&FieldBytes::from(*msg));
-    let r_inv: Option<Scalar> = r.invert_vartime().into();
+    let r_inv: Option<Scalar> = scalar_inv(&r);
     let Some(r_inv) = r_inv else {
         return Err(CryptoError::RecoveryFailed);
     };
@@ -194,6 +284,36 @@ fn ecsm_oracle(x: &FieldElement, k: &Scalar) -> Option<FieldElement> {
 /// then `Q = A + B` is one affine addition. All three inversions are batched.
 ///
 /// Generic over the oracle so unit tests can substitute a software stand-in.
+/// Base-field inverse `x⁻¹ mod p`. On riscv64 the host supplies it via the
+/// `hint` ecall and we verify `x·inv == 1` (canonical byte compare to sidestep
+/// k256's lazy-normalized magnitudes); off-target it inverts in software.
+#[cfg(any(target_arch = "riscv64", test))]
+fn field_inv(x: &FieldElement) -> Option<FieldElement> {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let x_be = x.to_bytes();
+        let mut x_le = [0u8; 32];
+        for i in 0..32 {
+            x_le[i] = x_be[31 - i];
+        }
+        let inv_le = get_hint(lambda_vm_syscalls::syscalls::HINT_FIELD_INV, &x_le);
+        let mut inv_be = [0u8; 32];
+        for i in 0..32 {
+            inv_be[i] = inv_le[31 - i];
+        }
+        let inv: FieldElement = Option::from(FieldElement::from_bytes(&inv_be.into()))?;
+        if (*x * inv).to_bytes() == FieldElement::ONE.to_bytes() {
+            Some(inv)
+        } else {
+            None
+        }
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    {
+        Option::from(x.invert())
+    }
+}
+
 #[cfg(any(target_arch = "riscv64", test))]
 fn lincomb2_with_oracle<O>(
     a1: &AffinePoint,
@@ -232,7 +352,7 @@ where
     // One shared inversion for the two λ denominators and the final chord.
     let den1 = y1.double() * dx1;
     let den2 = y2.double() * dx2;
-    let inv = Option::<FieldElement>::from((den1 * den2 * dxq).invert())?;
+    let inv = field_inv(&(den1 * den2 * dxq))?;
     let inv_den1 = inv * den2 * dxq;
     let inv_den2 = inv * den1 * dxq;
     let inv_dxq = inv * den1 * den2;
