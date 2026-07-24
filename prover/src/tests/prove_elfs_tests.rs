@@ -1210,6 +1210,115 @@ fn test_prove_ecsm_rust_guest() {
     );
 }
 
+/// P0 for the non-constraining `Hint` ecall (BENCH ONLY): the minimal Rust guest
+/// does one `hint` call (secp256k1 base-field inverse of 3) and commits the result.
+/// This exercises exactly the HINT table's bus surface (Ecall receive + the four
+/// 8-byte output MEMW writes) end-to-end through prove→verify, de-risking the bus
+/// balance before scaling to real consumers. The committed output must equal the
+/// value the executor's `compute_hint` produced (= 3^{-1} mod p).
+#[test]
+fn test_prove_hint_min_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_min rust guest should verify"
+    );
+
+    // Committed output must equal the hinted value (field inverse of 3, 32-byte LE).
+    let mut input = [0u8; 32];
+    input[0] = 3;
+    let expected =
+        executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Multi-hint P0/P2 (BENCH ONLY): three `hint` ecalls, each result read back with
+/// ordinary `LOAD`s. Complements `test_prove_hint_min_rust_guest` by proving the
+/// paths the ethrex consumer relies on that a single-call guest doesn't: **multiple
+/// real HINT rows** (padded) and **read-back via normal LOAD** (MEMW reads chaining
+/// to the HINT writes). Committed output = XOR of the three field inverses.
+#[test]
+fn test_prove_hint_multi_rust_guest() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_multi.elf"))
+            .expect("hint_multi.elf not found — run `make compile-programs-rust`");
+
+    let proof = prove_vm_minimal(&elf_bytes, &[], &Default::default());
+    assert!(
+        verify_vm_minimal(&proof, &elf_bytes),
+        "hint_multi rust guest should verify"
+    );
+
+    // Expected = XOR of field-inverses of 3, 5, 7 (32-byte LE), matching the guest.
+    let mut expected = [0u8; 32];
+    for seed in [3u8, 5u8, 7u8] {
+        let mut input = [0u8; 32];
+        input[0] = seed;
+        let inv =
+            executor::vm::instruction::execution::compute_hint(0 /* HINT_FIELD_INV */, &input);
+        for i in 0..32 {
+            expected[i] ^= inv[i];
+        }
+    }
+    assert_eq!(proof.public_output, expected.to_vec());
+}
+
+/// Soundness (BENCH ONLY): the verifier REJECTS a forged hint output.
+///
+/// The HINT table's `out_bytes` are unconstrained *by the table* — the point of a
+/// non-constraining hint. They are pinned instead by the memory argument: the HINT
+/// table *sends* the output as MEMW writes, and the MEMW table *receives* the honest
+/// values `collect_hint_ops` derived (recomputed from the input, written into
+/// `memory_state`). Forge one output byte on the (single) real HINT row and the MEMW
+/// write it sends no longer matches the received write → the Memw LogUp bus unbalances
+/// → the proof must fail to verify. This is what makes the hint value load-bearing
+/// even though the guest here does no in-circuit verify. Mirrors the ECSM analog.
+#[test]
+fn test_prove_hint_min_forged_result_rejected() {
+    use crate::tables::hint::cols as hint_cols;
+
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/hint_min.elf"))
+            .expect("hint_min.elf not found — run `make compile-programs-rust`");
+    let elf = Elf::load(&elf_bytes).expect("Failed to load ELF");
+    let executor = Executor::new(&elf, vec![]).expect("Failed to create executor");
+    let result = executor.run().expect("Failed to run program");
+    let mut traces =
+        Traces::from_elf_and_logs_minimal(&elf, &result.logs, &Default::default(), &[]).unwrap();
+
+    // Forge the low byte of the output on the (single) real HINT row.
+    let orig = *traces.hint.main_table.get(0, hint_cols::out(0));
+    let forged = orig + FieldElement::<GoldilocksField>::one();
+    traces.hint.main_table.set(0, hint_cols::out(0), forged);
+
+    assert!(
+        !prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Verifier must reject a forged hint output byte"
+    );
+}
+
 /// Soundness: the verifier REJECTS a forged ECSM result.
 ///
 /// A malicious prover must not be able to claim a wrong `k·G`. We tamper the result
