@@ -181,6 +181,7 @@ fn test_commit_phase_early_termination_roundtrip() {
         initial_len,
         blowup_log,
         final_poly_log_degree,
+        false,
     );
 
     assert_eq!(

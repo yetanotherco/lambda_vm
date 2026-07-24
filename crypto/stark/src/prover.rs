@@ -1703,7 +1703,7 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
-        let direct_fri = if direct_requested {
+        let (fri_final_poly_coeffs, fri_layers) = if direct_requested {
             let deep = deep_device.expect("direct DEEP->FRI requested without a device handle");
             let transcript_before = transcript.clone();
             let result = crate::gpu_lde::try_fri_commit_gpu::<Field, FieldExtension, _>(
@@ -1715,53 +1715,77 @@ pub trait IsStarkProver<
                 domain.blowup_factor.trailing_zeros(),
                 air.options().fri_final_poly_log_degree as u32,
             );
-            Some((transcript_before, result))
-        } else {
-            None
-        };
-
-        #[cfg(feature = "cuda")]
-        let direct_fri = direct_fri.and_then(|(transcript_before, result)| {
-            result.map(|direct| (transcript_before, direct))
-        });
-
-        #[cfg(feature = "cuda")]
-        let (fri_final_poly_coeffs, fri_layers) = if let Some((transcript_before, direct)) =
-            direct_fri
-        {
-            if crosscheck_direct {
-                let mut reference_transcript = transcript_before;
-                let reference = fri::commit_phase_from_evaluations(
-                    lde_evals.clone(),
-                    &mut reference_transcript,
-                    &coset_offset,
-                    domain_size,
-                    domain.blowup_factor.trailing_zeros(),
-                    air.options().fri_final_poly_log_degree as u32,
-                );
-                let direct_roots: Vec<_> = direct.1.iter().map(|l| l.merkle_tree.root).collect();
-                let reference_roots: Vec<_> =
-                    reference.1.iter().map(|l| l.merkle_tree.root).collect();
-                assert_eq!(
-                    direct.0, reference.0,
-                    "DEEP->FRI terminal coefficients mismatch"
-                );
-                assert_eq!(
-                    direct_roots, reference_roots,
-                    "DEEP->FRI layer roots mismatch"
-                );
-                assert_eq!(
-                    transcript.state(),
-                    reference_transcript.state(),
-                    "DEEP->FRI transcript state mismatch"
-                );
+            match result {
+                Some(direct) => {
+                    if crosscheck_direct {
+                        let mut reference_transcript = transcript_before;
+                        let reference = fri::commit_phase_from_evaluations(
+                            lde_evals.clone(),
+                            &mut reference_transcript,
+                            &coset_offset,
+                            domain_size,
+                            domain.blowup_factor.trailing_zeros(),
+                            air.options().fri_final_poly_log_degree as u32,
+                            false,
+                        );
+                        let direct_roots: Vec<_> =
+                            direct.1.iter().map(|l| l.merkle_tree.root).collect();
+                        let reference_roots: Vec<_> =
+                            reference.1.iter().map(|l| l.merkle_tree.root).collect();
+                        assert_eq!(
+                            direct.0, reference.0,
+                            "DEEP->FRI terminal coefficients mismatch"
+                        );
+                        assert_eq!(
+                            direct_roots, reference_roots,
+                            "DEEP->FRI layer roots mismatch"
+                        );
+                        assert_eq!(
+                            transcript.state(),
+                            reference_transcript.state(),
+                            "DEEP->FRI transcript state mismatch"
+                        );
+                    }
+                    direct
+                }
+                // Device-only GPU FRI failed (e.g. a GPU fault mid-fold). The host
+                // codeword was dropped for residency, so recover it instead of
+                // aborting: restore the transcript to before the failed attempt,
+                // recompute the DEEP codeword on host, and run the CPU FRI. The
+                // recompute only happens on this rare failure path, so the happy
+                // path keeps the residency win (no host D2H).
+                None => {
+                    *transcript = transcript_before;
+                    let mut recovered = Self::compute_deep_composition_poly_evaluations(
+                        &round_1_result.lde_trace,
+                        round_2_result,
+                        round_3_result,
+                        z,
+                        domain,
+                        &domain.trace_primitive_root,
+                        &gammas,
+                        &trace_term_coeffs,
+                        true,
+                    )
+                    .host;
+                    assert_eq!(
+                        recovered.len(),
+                        domain_size,
+                        "recovered DEEP codeword size mismatch on GPU-FRI fallback"
+                    );
+                    in_place_bit_reverse_permute(&mut recovered);
+                    fri::commit_phase_from_evaluations(
+                        recovered,
+                        transcript,
+                        &coset_offset,
+                        domain_size,
+                        domain.blowup_factor.trailing_zeros(),
+                        air.options().fri_final_poly_log_degree as u32,
+                        true, // force CPU: the GPU FRI already failed for this table
+                    )
+                }
             }
-            direct
         } else {
-            assert!(
-                !direct_requested || crosscheck_direct,
-                "device-only DEEP->FRI handoff failed; refusing a host fallback without a host codeword"
-            );
             fri::commit_phase_from_evaluations(
                 lde_evals,
                 transcript,
@@ -1769,6 +1793,7 @@ pub trait IsStarkProver<
                 domain_size,
                 domain.blowup_factor.trailing_zeros(),
                 air.options().fri_final_poly_log_degree as u32,
+                false,
             )
         };
 
@@ -1780,6 +1805,7 @@ pub trait IsStarkProver<
             domain_size,
             domain.blowup_factor.trailing_zeros(),
             air.options().fri_final_poly_log_degree as u32,
+            false,
         );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
