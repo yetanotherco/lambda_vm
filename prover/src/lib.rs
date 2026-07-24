@@ -19,6 +19,7 @@ mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
 mod paged_mem;
+mod preprocessed_cache;
 pub use stark::profile_markers;
 pub mod recursion;
 mod statement;
@@ -40,7 +41,7 @@ use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
+use crate::statement::{StatementKind, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -1069,6 +1070,7 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
     let executor = Executor::new(&program, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
     let result = executor
@@ -1122,16 +1124,18 @@ pub fn prove_with_options_and_inputs(
     let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
+    let preprocessed =
+        preprocessed_cache::get(&program, elf_digest, proof_options, &traces.page_configs);
     let airs = VmAirs::new(
         &program,
         proof_options,
         false,
         &traces.page_configs,
         &table_counts,
-        None,
+        Some(preprocessed.decode),
         true,
         None,
-        None,
+        Some(&preprocessed.pages),
         None,
     );
 
@@ -1153,10 +1157,10 @@ pub fn prove_with_options_and_inputs(
     // Bind the full statement (program, public output, table layout) into the
     // Fiat-Shamir transcript so every challenge depends on it.
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
         StatementKind::Monolithic,
-        elf_bytes,
+        &elf_digest,
         &traces.public_output_bytes,
         &table_counts,
         num_private_input_pages,
