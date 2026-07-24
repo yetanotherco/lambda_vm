@@ -400,6 +400,21 @@ struct PreparedEpoch {
     is_final: bool,
 }
 
+/// A collected-but-not-yet-built epoch, handed from the producer to the trace
+/// builder pool. Everything sequential (execution, op collection over the
+/// advancing memory image, boundary + register-fini derivation) already
+/// happened on the producer; a builder turns `collected` into full trace
+/// tables ([`Traces::build_from_collected`]) — pure epoch-local work — and
+/// forwards the resulting [`PreparedEpoch`] to the epoch provers.
+struct BuildJob {
+    index: u64,
+    register_init: Vec<u32>,
+    label: u64,
+    collected: crate::tables::trace_builder::CollectedEpoch,
+    boundary: Arc<Vec<CellBoundary>>,
+    is_final: bool,
+}
+
 /// One epoch's proof plus everything a standalone verifier needs to re-check it
 /// using ONLY the bundle (never the prover's in-memory traces). Each field is a
 /// public value the verifier re-binds: a wrong value either makes the proof's
@@ -1065,17 +1080,21 @@ pub fn prove_continuation(
     // of serializing after them. Proof bytes are unchanged — only the schedule.
     let (boundary_tx, boundary_rx) = std::sync::mpsc::channel::<Arc<Vec<CellBoundary>>>();
 
-    // Two-stage epoch pipeline: a producer thread prepares epoch i+1 (execute +
-    // trace build + boundary — all pure execution artifacts) while this thread
-    // proves epoch i. Everything the next epoch's preparation needs is derived
-    // from execution, not from proofs: `register_init` comes from the previous
-    // epoch's REGISTER trace (`fini_from_trace`, the same value `prove_epoch`
-    // binds), and the memory image update comes from the boundary. Proof bytes
-    // are unchanged — only the schedule is.
+    // Three-stage epoch pipeline: a producer thread runs the
+    // sequential-critical work (execute + op collection over the advancing
+    // memory image + boundary/fini derivation), a small pool of trace builders
+    // turns collected epochs into trace tables, and `workers` provers prove
+    // them. Everything the next epoch's preparation needs is derived from
+    // execution, not from proofs or traces: `register_init` comes from the
+    // collected register end state (`register_fini`, the same value the
+    // generated REGISTER trace binds) and the memory image update comes from
+    // the boundary — so the producer chains epochs without waiting for any
+    // table to be built. Proof bytes are unchanged — only the schedule is.
     //
-    // The bounded channel caps peak memory: at most `workers` epochs proving,
-    // one queued, one being built.
+    // The bounded channels cap peak memory: at most one collected epoch
+    // queued, `builders` building, one built epoch queued, `workers` proving.
     let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PreparedEpoch, Error>>(1);
+    let (build_tx, build_rx) = std::sync::mpsc::sync_channel::<Result<BuildJob, Error>>(1);
     // Shared prover-pool state; declared outside the scope so scoped threads
     // can borrow it.
     //
@@ -1090,10 +1109,21 @@ pub fn prove_continuation(
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&k| k >= 1)
         .unwrap_or(3);
+    // Trace builders: each turns one collected epoch into full trace tables
+    // (the bulk of the old per-epoch producer latency). 2 is enough to keep
+    // the prove pipeline fed on the measured workloads; builds compete with
+    // proves for CPU, so more builders mostly reshuffle the same cores.
+    let builders = std::env::var("LAMBDA_VM_TRACE_BUILDERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&b| b >= 1)
+        .unwrap_or(2);
     let rx = std::sync::Mutex::new(rx);
+    let build_rx = std::sync::Mutex::new(build_rx);
     type EpochResult = (u64, EpochProof);
     let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let decode_artifacts_ref = &decode_artifacts;
     let prove_worker = |worker: usize| {
         loop {
             // Take the next prepared epoch (lock released before proving).
@@ -1131,6 +1161,62 @@ pub fn prove_continuation(
             }
         }
     };
+    // Trace-builder worker: drain collected epochs, build their trace tables
+    // (pure epoch-local work) and forward the prepared epoch to the provers.
+    // Errors propagate through the prove channel, exactly like producer errors.
+    let build_worker =
+        |lane: usize, tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
+            loop {
+                let msg = { build_rx.lock().unwrap().recv() };
+                let job = match msg {
+                    Ok(Ok(j)) => j,
+                    Ok(Err(e)) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                    Err(_) => return, // channel closed: no more epochs
+                };
+                if first_err.lock().unwrap().is_some() {
+                    return; // a prover failed; stop building
+                }
+                let traces = Traces::build_from_collected(
+                    decode_artifacts_ref,
+                    job.collected,
+                    // Continuation epochs use the L2G bookend: PAGE tables (the
+                    // only image consumers in the build) are skipped.
+                    None::<&std::collections::HashMap<u64, u8>>,
+                    &job.register_init,
+                    &MaxRowsConfig::default(),
+                    private_inputs,
+                    job.is_final,
+                    true,
+                    #[cfg(feature = "disk-spill")]
+                    stark::storage_mode::StorageMode::Ram,
+                );
+                match traces {
+                    Ok(traces) => {
+                        let prepared = PreparedEpoch {
+                            index: job.index,
+                            register_init: job.register_init,
+                            label: job.label,
+                            traces,
+                            boundary: job.boundary,
+                            is_final: job.is_final,
+                        };
+                        // A send error means the prover side hung up (its error is
+                        // already propagating) — stop quietly.
+                        if tx.send(Ok(prepared)).is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            }
+        };
+
     // The global prove's result, produced by its own scoped thread. `None` only
     // if that thread never ran to completion (a panic — surfaced by the scope).
     type GlobalResult = (MultiProof<F, E, ()>, Vec<u64>, usize);
@@ -1193,30 +1279,29 @@ pub fn prove_continuation(
                     }
 
                     let label = local_to_global::epoch_label(index);
-                    let traces = Traces::from_image_and_logs_with_decode(
-                        &decode_artifacts,
+                    // Sequential-critical half only (Phases 1-2): op collection
+                    // over the pre-epoch image. The table build (Phases 3-5)
+                    // happens on the builder pool — nothing below needs it.
+                    let collected = Traces::collect_epoch(
+                        decode_artifacts_ref,
                         &image,
                         &register_init,
                         &logs,
-                        &MaxRowsConfig::default(),
-                        private_inputs,
                         is_final,
-                        true,
-                        #[cfg(feature = "disk-spill")]
-                        stark::storage_mode::StorageMode::Ram,
                     )?;
                     let boundary = Arc::new(local_to_global::epoch_boundary(
                         &mut provenance,
                         label,
-                        &traces.touched_memory_cells,
+                        &collected.touched_memory_cells(),
                     ));
                     // Publish this epoch's boundary for the global prove (in
                     // epoch order; the channel closes when the producer ends).
                     let _ = boundary_tx.send(Arc::clone(&boundary));
 
-                    // R_{i+1} from the committed REGISTER trace — the exact value
-                    // `prove_epoch` reads (`fini_from_trace`) and binds.
-                    prev_fini = Some(register::fini_from_trace(&traces.register));
+                    // R_{i+1} from the collected register end state — the exact
+                    // value the generated REGISTER trace binds (`fini_from_trace`
+                    // equivalence pinned by `fini_from_final_state_matches_trace`).
+                    prev_fini = Some(collected.register_fini(&register_init));
 
                     // Carry the image forward: this epoch's fini is the next
                     // epoch's init.
@@ -1224,28 +1309,39 @@ pub fn prove_continuation(
                         image.set(cell.address, (cell.fini.value & 0xFF) as u8);
                     }
 
-                    let prepared = PreparedEpoch {
+                    let job = BuildJob {
                         index,
                         register_init,
                         label,
-                        traces,
+                        collected,
                         boundary,
                         is_final,
                     };
-                    // A send error means the prover side hung up (its error is
+                    // A send error means the builder side hung up (its error is
                     // already propagating) — stop preparing quietly.
-                    if tx.send(Ok(prepared)).is_err() || is_final {
+                    if build_tx.send(Ok(job)).is_err() || is_final {
                         return Ok(());
                     }
                     index += 1;
                 }
             };
             if let Err(e) = prepare_all() {
-                // Surface preparation errors through the channel; if the prover
-                // side is already gone the error there wins.
-                let _ = tx.send(Err(e));
+                // Surface preparation errors through the builder channel (a
+                // builder forwards them to the provers); if the downstream side
+                // is already gone the error there wins.
+                let _ = build_tx.send(Err(e));
             }
         });
+
+        // Trace-builder pool: collected epochs → trace tables → prove channel.
+        // Each builder owns a clone of the prove sender; the original is
+        // dropped below so the provers' channel closes once the producer and
+        // every builder are done.
+        for lane in 0..builders {
+            let tx = tx.clone();
+            scope.spawn(move || build_worker(lane, tx));
+        }
+        drop(tx);
 
         // Global prove, overlapped: drain the boundary channel until the
         // producer hangs up (last epoch prepared), then prove the cross-epoch
