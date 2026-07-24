@@ -38,6 +38,13 @@ serde-wasm-bindgen = { version = "0.5", optional = true }
 web-sys = { version = "0.3.64", features = ['console'], optional = true }
 serde_cbor = { version = "0.11.1" }
 
+# Guest-only: the DEEP reduced-opening measurement stubs (sim-ro-ecalls /
+# sim-ro-query) call ecall wrappers from the syscalls crate. Only referenced by
+# riscv64-cfg'd + feature-gated code, so host builds never see it (mirrors
+# crypto/crypto's platform_keccak wiring).
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
+
 [dev-dependencies]
 math = { path = "../math", features = ["test-utils"] }
 criterion = { version = "0.4", default-features = false }
@@ -58,6 +65,40 @@ cuda = ["dep:math-cuda"]
 test-cuda-faults = ["cuda", "math-cuda/test-faults"]
 wasm = ["dep:wasm-bindgen", "dep:serde-wasm-bindgen", "dep:web-sys"]
 disk-spill = ["dep:memmap2", "dep:tempfile", "dep:libc", "crypto/disk-spill"]
+
+# MEASUREMENT-ONLY (never prove a build with these on). Swap the DEEP
+# reduced-opening hot loop for a trusted 1-cycle ecall to measure its cycle
+# ceiling. `sim-ro-ecalls` = Level A (per-(query×row) column loop);
+# `sim-ro-query` additionally fuses to Level B (whole per-query pair). Only
+# effective on the riscv64 recursion guest; a no-op on host builds.
+sim-ro-ecalls = []
+sim-ro-query = ["sim-ro-ecalls"]
+# ROUND-2 increment C: the in-place reduced-opening ABI. A variant of Level A
+# (`sim-ro-ecalls`) that registers the proof-constant layout ONCE via
+# REGISTER_RO_LAYOUT, then per-row passes only {row_idx, eval-slice ptrs} to
+# REDUCED_OPENING_ROW_INPLACE — killing the per-query struct fill + col-ptr
+# gather. Use INSTEAD OF sim-ro-ecalls (mutually exclusive row-loop swap).
+# EXECUTE-ONLY: never prove.
+sim-ro-inplace = []
+# MID-LEVEL accelerator measurement stubs (sim/27). MEASUREMENT-ONLY, never
+# prove. `sim-poly-eval` swaps the FRI terminal-codeword FFT for the SIM_POLY_EVAL
+# host ecall (Horner at only the queried positions); `sim-fold-chain` swaps the
+# per-query FRI fold butterfly chain for SIM_FOLD_CHAIN (the guest keeps the
+# per-layer Merkle checks and the terminal compare). Each forwards to its syscalls
+# wrapper on riscv64; a no-op on host builds.
+sim-poly-eval = ["lambda-vm-syscalls/sim-poly-eval"]
+sim-fold-chain = ["lambda-vm-syscalls/sim-fold-chain"]
+# sim/34: verify every committed FRI layer's Merkle opening for one query in one
+# SIM_VERIFY_PATH_BATCH ecall (subsumes the per-layer HASH_FELTS + VERIFY_PATH).
+# Requires `sim-fold-chain` (it consumes the folded layer values). EXECUTE-ONLY.
+sim-verify-path-batch = ["lambda-vm-syscalls/sim-verify-path-batch", "sim-fold-chain"]
+# sim/31: swap the per-query FRI evaluation-point `pow` for one batched
+# SIM_DOMAIN_POINTS host ecall. Forwards to the syscalls wrapper on riscv64.
+sim-domain-points = ["lambda-vm-syscalls/sim-domain-points"]
+# Stub 4 op-count PROXY (not an offload): tally per-table constraint counts at
+# the `compute_transition` site. The guest still runs the real evaluation — the
+# constraint-eval ceiling is not offloadable in the executor-host model.
+sim-constraint-eval = ["lambda-vm-syscalls/sim-constraint-eval"]
 
 
 [package.metadata.wasm-pack.profile.dev]

@@ -167,6 +167,7 @@ const CONTINUATION_GLOBAL_TAG: &[u8] = b"LAMBDAVM_CONTINUATION_GLOBAL_V2";
 /// shape, exactly as the monolithic and epoch statements bind it), and the touched
 /// page-base set (which GLOBAL_MEMORY tables exist).
 /// Prove and verify must call this with identical arguments.
+#[cfg(test)]
 pub(crate) fn absorb_continuation_global_statement(
     t: &mut impl IsTranscript<E>,
     elf_bytes: &[u8],
@@ -175,8 +176,30 @@ pub(crate) fn absorb_continuation_global_statement(
     fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) {
+    absorb_continuation_global_statement_with_digest(
+        t,
+        &elf_digest(elf_bytes),
+        num_epochs,
+        num_private_input_pages,
+        fri_final_poly_log_degree,
+        touched_page_bases,
+    );
+}
+
+/// [`absorb_continuation_global_statement`] with the ELF digest precomputed —
+/// the continuation verifier hashes the ELF (or, on the `attest-commitment-id`
+/// path, receives the digest) once and reuses it across every epoch and the
+/// global statement rather than re-hashing per absorb.
+pub(crate) fn absorb_continuation_global_statement_with_digest(
+    t: &mut impl IsTranscript<E>,
+    elf_digest: &[u8; 32],
+    num_epochs: usize,
+    num_private_input_pages: usize,
+    fri_final_poly_log_degree: u8,
+    touched_page_bases: &[u64],
+) {
     t.append_bytes(CONTINUATION_GLOBAL_TAG);
-    t.append_bytes(&elf_digest(elf_bytes));
+    t.append_bytes(elf_digest);
     t.append_bytes(&(num_epochs as u64).to_le_bytes());
     t.append_bytes(&(num_private_input_pages as u64).to_le_bytes());
 

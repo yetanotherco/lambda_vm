@@ -18,7 +18,6 @@ use stark::lookup::{
 };
 use stark::proof::options::ProofOptions;
 use stark::proof::stark::MultiProof;
-use stark::proof::view::MultiProofView;
 use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
@@ -540,7 +539,7 @@ fn test_l2g_binding_holds() {
 
     assert!(crate::verify_l2g_commitment_binding_view(
         &roots,
-        MultiProofView::Owned(&final_proof)
+        stark::proof::view::MultiProofView::Owned(&final_proof)
     ));
 }
 
@@ -566,7 +565,7 @@ fn test_l2g_binding_rejects_mismatch() {
 
     assert!(!crate::verify_l2g_commitment_binding_view(
         &roots,
-        MultiProofView::Owned(&final_proof)
+        stark::proof::view::MultiProofView::Owned(&final_proof)
     ));
 }
 

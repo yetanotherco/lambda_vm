@@ -10,9 +10,12 @@
 use crate::config::Commitment;
 use crate::frame::Frame;
 use crate::fri::fri_decommit::{ArchivedFriDecommitment, FriDecommitment};
+use crate::fri::mmcs::{ArchivedMixedOpening, MixedOpening};
 use crate::proof::stark::{
+    ArchivedBatchedMultiProof, ArchivedBatchedQueryOpening, ArchivedBatchedTableData,
     ArchivedDeepPolynomialOpening, ArchivedMultiProof, ArchivedPolynomialOpenings,
-    ArchivedStarkProof, DeepPolynomialOpening, MultiProof, PolynomialOpenings, StarkProof,
+    ArchivedStarkProof, BatchedMultiProof, BatchedQueryOpening, BatchedTableData,
+    DeepPolynomialOpening, MultiProof, PolynomialOpenings, StarkProof,
 };
 use crate::table::{ArchivedTable, Table, TableView};
 use math::field::element::{ArchivedFieldElement, FieldElement};
@@ -251,6 +254,14 @@ where
             Self::Owned(t) => t.row_major_data(),
             Self::Archived(t) => t.row_major_data(),
         }
+    }
+
+    /// Materialize an owned [`Table`] from this view (a bounded copy of the
+    /// backing row-major data). Used only for the small per-table OOD blocks the
+    /// batched verifier turns into a synthetic `StarkProof`; never called on
+    /// per-query openings.
+    pub fn to_owned_table(&self) -> Table<F> {
+        Table::new(self.row_major_data().to_vec(), self.width())
     }
 
     /// `true` iff `width * height` matches the backing data length — the
@@ -629,6 +640,373 @@ where
     }
 }
 
+/// Borrowed view over a [`MixedOpening`] (the shared per-phase opening of every
+/// table at one FRI query). Owned or archived-in-place: `per_matrix` entries and
+/// the shared authentication path stay borrowed either way, so the batched
+/// verifier authenticates and reconstructs straight out of the archive with no
+/// per-query copy — the zero-copy analogue of [`PolynomialOpeningsView`].
+pub enum MixedOpeningView<'a, E: IsField>
+where
+    E::BaseType: math::field::element::NativeArchived,
+{
+    Owned(&'a MixedOpening<E>),
+    Archived(&'a ArchivedMixedOpening<E>),
+}
+
+impl<'a, E: IsField> Clone for MixedOpeningView<'a, E>
+where
+    E::BaseType: math::field::element::NativeArchived,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, E: IsField> Copy for MixedOpeningView<'a, E> where
+    E::BaseType: math::field::element::NativeArchived
+{
+}
+
+impl<'a, E: IsField> MixedOpeningView<'a, E>
+where
+    E::BaseType: math::field::element::NativeArchived,
+{
+    /// The one authentication path covering every matrix's row at the query.
+    pub fn merkle_path(&self) -> &'a [Commitment] {
+        match self {
+            Self::Owned(o) => &o.proof.merkle_path,
+            Self::Archived(o) => o.proof.merkle_path.as_slice(),
+        }
+    }
+
+    pub fn per_matrix_len(&self) -> usize {
+        match self {
+            Self::Owned(o) => o.per_matrix.len(),
+            Self::Archived(o) => o.per_matrix.len(),
+        }
+    }
+
+    /// The opening of matrix `i` (row pair), as a borrowed
+    /// [`PolynomialOpeningsView`]. Each per-matrix entry's own `proof` is empty —
+    /// the shared [`Self::merkle_path`] is the authenticator.
+    pub fn per_matrix(&self, i: usize) -> PolynomialOpeningsView<'a, E> {
+        match self {
+            Self::Owned(o) => PolynomialOpeningsView::Owned(&o.per_matrix[i]),
+            Self::Archived(o) => PolynomialOpeningsView::Archived(&o.per_matrix.as_slice()[i]),
+        }
+    }
+}
+
+/// Borrowed view over a [`BatchedQueryOpening`]: the shared per-phase MMCS
+/// openings (`main`/`aux`/`composition`) plus the per-table precomputed openings
+/// at ONE FRI query. Serves each nested opening as a borrowed view, so no
+/// per-query evaluation vector is ever copied off the archive.
+pub enum BatchedQueryOpeningView<'a, F: IsSubFieldOf<E>, E: IsField>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+{
+    Owned(&'a BatchedQueryOpening<F, E>),
+    Archived(&'a ArchivedBatchedQueryOpening<F, E>),
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField> Clone for BatchedQueryOpeningView<'a, F, E>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, F: IsSubFieldOf<E>, E: IsField> Copy for BatchedQueryOpeningView<'a, F, E>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+{
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField> BatchedQueryOpeningView<'a, F, E>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+{
+    pub fn main(&self) -> MixedOpeningView<'a, F> {
+        match self {
+            Self::Owned(o) => MixedOpeningView::Owned(&o.main),
+            Self::Archived(o) => MixedOpeningView::Archived(&o.main),
+        }
+    }
+
+    pub fn aux(&self) -> Option<MixedOpeningView<'a, E>> {
+        match self {
+            Self::Owned(o) => o.aux.as_ref().map(MixedOpeningView::Owned),
+            Self::Archived(o) => o.aux.as_ref().map(MixedOpeningView::Archived),
+        }
+    }
+
+    pub fn composition(&self) -> MixedOpeningView<'a, E> {
+        match self {
+            Self::Owned(o) => MixedOpeningView::Owned(&o.composition),
+            Self::Archived(o) => MixedOpeningView::Archived(&o.composition),
+        }
+    }
+
+    pub fn precomputed_len(&self) -> usize {
+        match self {
+            Self::Owned(o) => o.precomputed.len(),
+            Self::Archived(o) => o.precomputed.len(),
+        }
+    }
+
+    pub fn precomputed(&self, i: usize) -> PolynomialOpeningsView<'a, F> {
+        match self {
+            Self::Owned(o) => PolynomialOpeningsView::Owned(&o.precomputed[i]),
+            Self::Archived(o) => PolynomialOpeningsView::Archived(&o.precomputed.as_slice()[i]),
+        }
+    }
+}
+
+/// Borrowed view over a [`BatchedTableData`] (one table's per-epoch metadata:
+/// OOD evaluations, composition OOD, precomputed root, bus/public inputs). The
+/// small OOD tables stay borrowed; only the tiny `PI` and the single bus
+/// `table_contribution` are copied out, exactly like [`StarkProofView`].
+pub enum BatchedTableDataView<'a, E: IsField, PI>
+where
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    Owned(&'a BatchedTableData<E, PI>),
+    Archived(&'a ArchivedBatchedTableData<E, PI>),
+}
+
+impl<'a, E: IsField, PI> Clone for BatchedTableDataView<'a, E, PI>
+where
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, E: IsField, PI> Copy for BatchedTableDataView<'a, E, PI>
+where
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+}
+
+impl<'a, E: IsField, PI> BatchedTableDataView<'a, E, PI>
+where
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    pub fn trace_length(&self) -> usize {
+        match self {
+            Self::Owned(t) => t.trace_length,
+            Self::Archived(t) => t.trace_length.to_native() as usize,
+        }
+    }
+
+    pub fn trace_ood_evaluations(&self) -> StarkTableView<'a, E> {
+        match self {
+            Self::Owned(t) => StarkTableView::Owned(&t.trace_ood_evaluations),
+            Self::Archived(t) => StarkTableView::Archived(&t.trace_ood_evaluations),
+        }
+    }
+
+    pub fn trace_ood_next_evaluations(&self) -> StarkTableView<'a, E> {
+        match self {
+            Self::Owned(t) => StarkTableView::Owned(&t.trace_ood_next_evaluations),
+            Self::Archived(t) => StarkTableView::Archived(&t.trace_ood_next_evaluations),
+        }
+    }
+
+    pub fn composition_poly_parts_ood_evaluation(&self) -> &'a [FieldElement<E>] {
+        match self {
+            Self::Owned(t) => &t.composition_poly_parts_ood_evaluation,
+            Self::Archived(t) => evals(&t.composition_poly_parts_ood_evaluation),
+        }
+    }
+
+    pub fn precomputed_root(&self) -> Option<&'a Commitment> {
+        match self {
+            Self::Owned(t) => t.precomputed_root.as_ref(),
+            Self::Archived(t) => t.precomputed_root.as_ref(),
+        }
+    }
+
+    /// The bus interaction's table contribution (L), if present — the only bus
+    /// field the verifier reads (mirrors [`StarkProofView::bus_table_contribution`]).
+    pub fn bus_table_contribution(&self) -> Option<FieldElement<E>> {
+        match self {
+            Self::Owned(t) => t
+                .bus_public_inputs
+                .as_ref()
+                .map(|b| b.table_contribution.clone()),
+            Self::Archived(t) => t
+                .bus_public_inputs
+                .as_ref()
+                .map(|b| b.table_contribution.as_native().clone()),
+        }
+    }
+
+    pub fn has_bus_public_inputs(&self) -> bool {
+        match self {
+            Self::Owned(t) => t.bus_public_inputs.is_some(),
+            Self::Archived(t) => t.bus_public_inputs.is_some(),
+        }
+    }
+
+    /// Materializes the (tiny) `PI` public inputs: a clone on the owned side, an
+    /// rkyv deserialize on the archived side.
+    pub fn public_inputs(&self) -> Option<PI>
+    where
+        PI: Clone,
+    {
+        match self {
+            Self::Owned(t) => Some(t.public_inputs.clone()),
+            Self::Archived(t) => {
+                rkyv::deserialize::<PI, rkyv::rancor::Error>(&t.public_inputs).ok()
+            }
+        }
+    }
+}
+
+/// Borrowed view over a [`BatchedMultiProof`] (owned or archived-in-place). Every
+/// bulk field — the per-query [`BatchedQueryOpeningView`]s and FRI
+/// [`FriDecommitmentView`]s — is served straight off the archive, so the batched
+/// (unified-shard) verifier runs with no proof deserialization and no per-query
+/// evaluation copy. The zero-copy counterpart of [`MultiProofView`] for the
+/// batched proof format.
+pub enum BatchedMultiProofView<'a, F: IsSubFieldOf<E>, E: IsField, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    Owned(&'a BatchedMultiProof<F, E, PI>),
+    Archived(&'a ArchivedBatchedMultiProof<F, E, PI>),
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Clone for BatchedMultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> Copy for BatchedMultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+}
+
+impl<'a, F: IsSubFieldOf<E>, E: IsField, PI> BatchedMultiProofView<'a, F, E, PI>
+where
+    F::BaseType: math::field::element::NativeArchived,
+    E::BaseType: math::field::element::NativeArchived,
+    PI: rkyv::Archive,
+    <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
+{
+    pub fn main_root(&self) -> &'a Commitment {
+        match self {
+            Self::Owned(p) => &p.main_root,
+            Self::Archived(p) => &p.main_root,
+        }
+    }
+
+    pub fn aux_root(&self) -> Option<&'a Commitment> {
+        match self {
+            Self::Owned(p) => p.aux_root.as_ref(),
+            Self::Archived(p) => p.aux_root.as_ref(),
+        }
+    }
+
+    pub fn composition_root(&self) -> &'a Commitment {
+        match self {
+            Self::Owned(p) => &p.composition_root,
+            Self::Archived(p) => &p.composition_root,
+        }
+    }
+
+    pub fn fri_layers_merkle_roots(&self) -> &'a [Commitment] {
+        match self {
+            Self::Owned(p) => &p.fri_layers_merkle_roots,
+            Self::Archived(p) => p.fri_layers_merkle_roots.as_slice(),
+        }
+    }
+
+    pub fn fri_last_value(&self) -> FieldElement<E> {
+        match self {
+            Self::Owned(p) => p.fri_last_value.clone(),
+            Self::Archived(p) => p.fri_last_value.as_native().clone(),
+        }
+    }
+
+    pub fn nonce(&self) -> Option<u64> {
+        match self {
+            Self::Owned(p) => p.nonce,
+            Self::Archived(p) => p.nonce.as_ref().map(|n| n.to_native()),
+        }
+    }
+
+    pub fn query_list_len(&self) -> usize {
+        match self {
+            Self::Owned(p) => p.query_list.len(),
+            Self::Archived(p) => p.query_list.len(),
+        }
+    }
+
+    pub fn query(&self, q: usize) -> FriDecommitmentView<'a, E> {
+        match self {
+            Self::Owned(p) => FriDecommitmentView::Owned(&p.query_list[q]),
+            Self::Archived(p) => FriDecommitmentView::Archived(&p.query_list.as_slice()[q]),
+        }
+    }
+
+    pub fn deep_poly_openings_len(&self) -> usize {
+        match self {
+            Self::Owned(p) => p.deep_poly_openings.len(),
+            Self::Archived(p) => p.deep_poly_openings.len(),
+        }
+    }
+
+    pub fn deep_poly_opening(&self, q: usize) -> BatchedQueryOpeningView<'a, F, E> {
+        match self {
+            Self::Owned(p) => BatchedQueryOpeningView::Owned(&p.deep_poly_openings[q]),
+            Self::Archived(p) => {
+                BatchedQueryOpeningView::Archived(&p.deep_poly_openings.as_slice()[q])
+            }
+        }
+    }
+
+    pub fn per_table_len(&self) -> usize {
+        match self {
+            Self::Owned(p) => p.per_table.len(),
+            Self::Archived(p) => p.per_table.len(),
+        }
+    }
+
+    pub fn per_table(&self, i: usize) -> BatchedTableDataView<'a, E, PI> {
+        match self {
+            Self::Owned(p) => BatchedTableDataView::Owned(&p.per_table[i]),
+            Self::Archived(p) => BatchedTableDataView::Archived(&p.per_table.as_slice()[i]),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Field-coverage guards.
 //
@@ -696,5 +1074,55 @@ fn assert_fri_decommitment_view_is_exhaustive<F: IsField>(p: &FriDecommitment<F>
     let FriDecommitment {
         layers_auth_paths: _,
         layers_evaluations_sym: _,
+    } = p;
+}
+
+#[allow(dead_code)]
+fn assert_mixed_opening_view_is_exhaustive<E: IsField>(o: &MixedOpening<E>) {
+    let MixedOpening {
+        proof: _,
+        per_matrix: _,
+    } = o;
+}
+
+#[allow(dead_code)]
+fn assert_batched_query_opening_view_is_exhaustive<F: IsSubFieldOf<E>, E: IsField>(
+    o: &BatchedQueryOpening<F, E>,
+) {
+    let BatchedQueryOpening {
+        main: _,
+        aux: _,
+        composition: _,
+        precomputed: _,
+    } = o;
+}
+
+#[allow(dead_code)]
+fn assert_batched_table_data_view_is_exhaustive<E: IsField, PI>(t: &BatchedTableData<E, PI>) {
+    let BatchedTableData {
+        trace_length: _,
+        trace_ood_evaluations: _,
+        trace_ood_next_evaluations: _,
+        composition_poly_parts_ood_evaluation: _,
+        precomputed_root: _,
+        bus_public_inputs: _,
+        public_inputs: _,
+    } = t;
+}
+
+#[allow(dead_code)]
+fn assert_batched_multi_proof_view_is_exhaustive<F: IsSubFieldOf<E>, E: IsField, PI>(
+    p: &BatchedMultiProof<F, E, PI>,
+) {
+    let BatchedMultiProof {
+        main_root: _,
+        aux_root: _,
+        composition_root: _,
+        fri_layers_merkle_roots: _,
+        fri_last_value: _,
+        query_list: _,
+        nonce: _,
+        deep_poly_openings: _,
+        per_table: _,
     } = p;
 }

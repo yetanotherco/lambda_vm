@@ -33,6 +33,119 @@ const KECCAK_SYSCALL_NUMBER: usize = usize::MAX - 1;
 #[cfg(target_arch = "riscv64")]
 const ECSM_SYSCALL_NUMBER: usize = usize::MAX - 10;
 
+// Field-native hash/transcript measurement ecalls (EXPERIMENT 1). These are
+// TRUSTED, execute-only stubs: the executor computes the correct value host-side
+// and returns it in one cycle. They drive no chip, so a program that emits them
+// must never be proven (the same unbalanced-Ecall-bus caveat as `Print`); they
+// exist only to measure the optimistic cycle ceiling of a field-native
+// hash/transcript accelerator. Guarded by the `sim-hash-ecalls` cfg so a normal
+// guest build is byte-identical (the wrappers below are simply not compiled).
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_ABSORB_FELTS_SYSCALL_NUMBER: usize = usize::MAX - 2;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_ABSORB_BYTES_SYSCALL_NUMBER: usize = usize::MAX - 3;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER: usize = usize::MAX - 4;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_HASH_PAIR_SYSCALL_NUMBER: usize = usize::MAX - 5;
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+const SIM_HASH_FELTS_SYSCALL_NUMBER: usize = usize::MAX - 6;
+
+/// Syscall number for the Goldilocks inverse HINT (u64::MAX - 7). EXPERIMENT 5.
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+const INV_GOLDILOCKS_HINT_SYSCALL_NUMBER: usize = usize::MAX - 7;
+
+/// Syscall number for the Fp3 inverse HINT (u64::MAX - 40). EXPERIMENT 5. Placed
+/// in the MAX-40s band to steer clear of the other experiments' numbers.
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+const INV_FP3_HINT_SYSCALL_NUMBER: usize = usize::MAX - 40;
+
+/// Syscall number for the Merkle path-verify measurement stub (u64::MAX - 50).
+/// ROUND-2 increment A. MEASUREMENT-ONLY: no chip table, so NEVER prove a build
+/// that emits it (the unmatched Ecall unbalances the LogUp bus, like `Print`).
+/// Only reached behind the crypto crate's `sim-path-ecall` feature.
+#[cfg(target_arch = "riscv64")]
+const VERIFY_PATH_SYSCALL_NUMBER: usize = usize::MAX - 50;
+
+/// Syscall numbers for the transcript challenge-sampling stubs (u64::MAX - 51 /
+/// -52). ROUND-2 increment B. MEASUREMENT-ONLY: never prove a build that emits
+/// them. Reached behind the crypto crate's `sim-sample-ecall` feature.
+#[cfg(target_arch = "riscv64")]
+const SAMPLE_FELT_SYSCALL_NUMBER: usize = usize::MAX - 51;
+#[cfg(target_arch = "riscv64")]
+const SAMPLE_U64_SYSCALL_NUMBER: usize = usize::MAX - 52;
+
+/// Syscall numbers for the in-place reduced-opening ABI (u64::MAX - 53 / -54).
+/// ROUND-2 increment C. MEASUREMENT-ONLY: never prove a build that emits them.
+/// Reached behind the stark crate's `sim-ro-inplace` feature.
+#[cfg(target_arch = "riscv64")]
+const REGISTER_RO_LAYOUT_SYSCALL_NUMBER: usize = usize::MAX - 53;
+#[cfg(target_arch = "riscv64")]
+const REDUCED_OPENING_ROW_INPLACE_SYSCALL_NUMBER: usize = usize::MAX - 54;
+
+/// Syscall numbers for the MID-LEVEL accelerator measurement stubs (sim/27,
+/// u64::MAX - 60..-62). MEASUREMENT-ONLY: no chip table, so NEVER prove a build
+/// that emits them. Reached behind the math/stark `sim-poly-eval` / `sim-pow` /
+/// `sim-fold-chain` features.
+#[cfg(all(target_arch = "riscv64", feature = "sim-poly-eval"))]
+const SIM_POLY_EVAL_SYSCALL_NUMBER: usize = usize::MAX - 60;
+#[cfg(all(target_arch = "riscv64", feature = "sim-pow"))]
+const SIM_POW_SYSCALL_NUMBER: usize = usize::MAX - 61;
+#[cfg(all(target_arch = "riscv64", feature = "sim-fold-chain"))]
+const SIM_FOLD_CHAIN_SYSCALL_NUMBER: usize = usize::MAX - 62;
+#[cfg(all(target_arch = "riscv64", feature = "sim-constraint-eval"))]
+const SIM_CONSTRAINT_EVAL_SYSCALL_NUMBER: usize = usize::MAX - 63;
+#[cfg(all(target_arch = "riscv64", feature = "sim-domain-points"))]
+const SIM_DOMAIN_POINTS_SYSCALL_NUMBER: usize = usize::MAX - 64;
+#[cfg(all(target_arch = "riscv64", feature = "sim-register-commit"))]
+const SIM_REGISTER_COMMIT_SYSCALL_NUMBER: usize = usize::MAX - 65;
+#[cfg(all(target_arch = "riscv64", feature = "sim-verify-path-batch"))]
+const SIM_VERIFY_PATH_BATCH_SYSCALL_NUMBER: usize = usize::MAX - 66;
+
+// Real FEXT (Fp3) accelerator ecalls (PR #818/#831). Unlike the sim stubs
+// above, these drive real prover chips (FMA/LOAD/STORE tables) and ARE proven.
+// Numbers `usize::MAX - {19,20,21}` are reserved by those chips' Ecall-bus
+// ranges — the reduced-opening measurement stubs were renumbered off them
+// (they used to sit at MAX-20/MAX-21; now MAX-30/-31 on the sim/16 lineage).
+/// Syscall number for the FEXT_LOAD accelerator (-20 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_LOAD_SYSCALL_NUMBER: usize = usize::MAX - 19;
+
+/// Syscall number for the FEXT_FMA accelerator (-21 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_FMA_SYSCALL_NUMBER: usize = usize::MAX - 20;
+
+/// Syscall number for the FEXT_STORE accelerator (-22 as usize).
+#[cfg(target_arch = "riscv64")]
+const FEXT_STORE_SYSCALL_NUMBER: usize = usize::MAX - 21;
+
+/// Syscall number for the FEXT_BASE_MUL accelerator (-23 as usize): the
+/// Goldilocks×Fp3 asymmetric product completing the FEXT chip API.
+#[cfg(target_arch = "riscv64")]
+const FEXT_BASE_MUL_SYSCALL_NUMBER: usize = usize::MAX - 22;
+
+/// Syscall number for the FEXT_INV accelerator (-24 as usize): the witnessed Fp3
+/// inverse (chip constrains `x·inv == 1`).
+#[cfg(target_arch = "riscv64")]
+const FEXT_INV_SYSCALL_NUMBER: usize = usize::MAX - 23;
+
+/// Syscall number for the `REDUCED_OPENING_ROW` measurement stub (Level A).
+///
+/// MEASUREMENT-ONLY: has no chip table, so NEVER prove a build that emits it —
+/// the unmatched Ecall on the LogUp bus would fail verification (same caveat as
+/// `Print`). Only used behind the `sim-ro-ecalls` feature of the recursion
+/// verifier guest. Renumbered from MAX-20 to MAX-30 to clear the reserved FEXT
+/// accelerator range (MAX-19..MAX-21, LOAD/FMA/STORE) with a buffer after
+/// merging PR #818/#831.
+#[cfg(target_arch = "riscv64")]
+const REDUCED_OPENING_ROW_SYSCALL_NUMBER: usize = usize::MAX - 30;
+
+/// Syscall number for the `REDUCED_OPENING_QUERY` measurement stub (Level B).
+/// Same MEASUREMENT-ONLY caveat as [`REDUCED_OPENING_ROW_SYSCALL_NUMBER`].
+/// Renumbered from MAX-21 to MAX-31 to clear the FEXT accelerator range.
+#[cfg(target_arch = "riscv64")]
+const REDUCED_OPENING_QUERY_SYSCALL_NUMBER: usize = usize::MAX - 31;
+
 /// No-op. The `Print` ecall (a7=1) has no receiver on the Ecall bus, so emitting
 /// it makes the LogUp bus unbalance and the proof fail to verify. Printing isn't
 /// needed in provable programs, so `print_string` does nothing on every target.
@@ -185,6 +298,552 @@ pub fn ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32]) {
 /// Compute `xR = (k·G)_x` on secp256k1 via the ECSM accelerator (32-byte little-endian values).
 pub fn ecsm_mul(_xr: &mut [u8; 32], _xg: &[u8; 32], _k: &[u8; 32]) {
     unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Goldilocks inverse HINT (EXPERIMENT 5). Asks the executor for `x^-1`: it
+/// overwrites `x` in place with the inverse and returns it. The returned value
+/// is UNTRUSTED — the caller MUST verify `x * result == 1` (one field multiply)
+/// and reject on mismatch. Because only the true inverse passes that check,
+/// hinting is SOUND: a wrong hint can only make an honest proof reject, never
+/// make a false one accept. `x` must be a nonzero canonical Goldilocks element.
+///
+/// The ecall drives no chip on this branch (the value is checked in-circuit), so
+/// a build that emits it is execute-only — never prove it (the Ecall-bus caveat
+/// shared with `Print`).
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+pub fn inv_goldilocks_hint(x: u64) -> u64 {
+    let mut slot = x;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") &mut slot as *mut u64,
+            in("a7") INV_GOLDILOCKS_HINT_SYSCALL_NUMBER,
+        )
+    }
+    slot
+}
+
+/// Fp3 (Degree3GoldilocksExtensionField) inverse HINT (EXPERIMENT 5). Asks the
+/// executor for `x^-1`: it overwrites the three raw limbs of `x` in place with
+/// the limbs of the inverse and returns them. The returned value is UNTRUSTED —
+/// the caller MUST verify `ext_mul(x, result) == 1` (one Fp3 multiply) and reject
+/// on mismatch. Because only the true inverse passes that check, hinting is SOUND:
+/// a wrong hint can only make an honest proof reject, never make a false one
+/// accept. `x` must be a nonzero Fp3 element (three raw Goldilocks limbs).
+///
+/// The ecall drives no chip on this branch (the value is checked in-circuit), so
+/// a build that emits it is execute-only — never prove it (the Ecall-bus caveat
+/// shared with `Print`).
+#[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+pub fn inv_fp3_hint(x: [u64; 3]) -> [u64; 3] {
+    let mut slot = x;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") slot.as_mut_ptr(),
+            in("a7") INV_FP3_HINT_SYSCALL_NUMBER,
+        )
+    }
+    slot
+}
+
+// =============================================================================
+// Field-native hash/transcript measurement ecalls (EXPERIMENT 1)
+//
+// Raw ecall wrappers for the five trusted stubs. The host reproduces the exact
+// byte semantics of the corresponding guest software path (see the executor's
+// `sim_hash` module) and returns in one cycle. 4-argument calls pass the fourth
+// operand in a3 (x13); the executor reads a0/a1/a2/a3 accordingly. All pointers
+// are into guest memory. Only compiled under the `sim-hash-ecalls` feature (the
+// `crypto` swap sites forward it), so a normal build never references them.
+// =============================================================================
+
+/// `ABSORB_FELTS(state_ptr, elems_ptr, count, kind)`: absorb `count` field
+/// elements (each `kind` Goldilocks limbs, read as raw doublewords) into the
+/// sponge at `state_ptr`, using the canonical `stream_bytes` serialization.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_absorb_felts(state_ptr: *mut u8, elems_ptr: *const u8, count: usize, kind: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") elems_ptr,
+            in("a2") count,
+            in("a3") kind,
+            in("a7") SIM_ABSORB_FELTS_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `ABSORB_BYTES(state_ptr, bytes_ptr, len)`: absorb `len` raw bytes into the
+/// sponge at `state_ptr`.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_absorb_bytes(state_ptr: *mut u8, bytes_ptr: *const u8, len: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") bytes_ptr,
+            in("a2") len,
+            in("a7") SIM_ABSORB_BYTES_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `TRANSCRIPT_SAMPLE(state_ptr, out32_ptr)`: run the whole transcript
+/// `sample()` on the sponge at `state_ptr` and write the 32-byte result to
+/// `out32_ptr` (finalize-reset + reverse + re-absorb, in one call).
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_transcript_sample(state_ptr: *mut u8, out32_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") out32_ptr,
+            in("a7") SIM_TRANSCRIPT_SAMPLE_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `HASH_PAIR(l_ptr, r_ptr, out_ptr)`: Keccak-256 of the two concatenated
+/// 32-byte nodes (the fixed Merkle-parent shape); writes 32 bytes to `out_ptr`.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_hash_pair(l_ptr: *const u8, r_ptr: *const u8, out_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") l_ptr,
+            in("a1") r_ptr,
+            in("a2") out_ptr,
+            in("a7") SIM_HASH_PAIR_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `HASH_FELTS(a_ptr, a_count, b_ptr, b_count, kind, out_ptr)`: one-shot leaf
+/// hash of the concatenation `a ‖ b` of two field-element slices (each `kind`
+/// limbs); writes the 32-byte digest to `out_ptr`. A single-slice leaf passes
+/// `b_count = 0`. The two-slice form matches the verifier's `evaluations ‖
+/// evaluations_sym` leaf shape. Uses a0..a5.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+#[allow(clippy::too_many_arguments)]
+pub fn sim_hash_felts(
+    a_ptr: *const u8,
+    a_count: usize,
+    b_ptr: *const u8,
+    b_count: usize,
+    kind: usize,
+    out_ptr: *mut u8,
+) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") a_ptr,
+            in("a1") a_count,
+            in("a2") b_ptr,
+            in("a3") b_count,
+            in("a4") kind,
+            in("a5") out_ptr,
+            in("a7") SIM_HASH_FELTS_SYSCALL_NUMBER,
+        )
+    }
+}
+
+// =============================================================================
+// DEEP reduced-opening measurement stubs (Level A / Level B).
+//
+// MEASUREMENT-ONLY. Each computes the CORRECT reduced-opening value host-side
+// in one VM cycle (trusted passthrough) so the guest still accepts the proof,
+// letting us measure the cycle ceiling of a fused reduced-opening chip. They
+// have NO chip table — NEVER prove a build that emits them (LogUp bus would
+// unbalance, like `Print`). See `math::sim_ro` for the input struct layouts and
+// `others/accelerator_noop_sim_spec.md` (Experiment 2).
+// =============================================================================
+
+/// Level A — `REDUCED_OPENING_ROW`. `input_ptr` points to a
+/// `math::sim_ro::ReducedOpeningRowInput`; the host writes
+/// `(base_row_sum, base_row_sum_sym)` (2 extension elements = 6 u64) at
+/// `out_ptr` for the given `row_idx`.
+#[cfg(target_arch = "riscv64")]
+pub fn reduced_opening_row(input_ptr: usize, row_idx: usize, out_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a1") row_idx,
+            in("a2") out_ptr,
+            in("a7") REDUCED_OPENING_ROW_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Store a degree-3 Goldilocks extension element into field-storage at `addr`
+/// via the FEXT_LOAD accelerator. `coeffs` are the three coefficients in native
+/// form; each must be a canonical field element (`< p`). `addr` is a handle into
+/// the accelerator's separate field-storage address space (not RAM).
+pub fn fext_load(addr: u64, coeffs: &[u64; 3]) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") addr,       // x10 = field-storage destination address
+            in("a1") coeffs[0],  // x11 = coefficient 0
+            in("a2") coeffs[1],  // x12 = coefficient 1
+            in("a3") coeffs[2],  // x13 = coefficient 2
+            in("a7") FEXT_LOAD_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Level A reduced-opening measurement stub (riscv64 guest only).
+pub fn reduced_opening_row(_input_ptr: usize, _row_idx: usize, _out_ptr: usize) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Level B — `REDUCED_OPENING_QUERY`. `input_ptr` points to a
+/// `math::sim_ro::ReducedOpeningQueryInput`; the host writes
+/// `(deep_eval, deep_eval_sym)` (2 extension elements = 6 u64) at `out_ptr`.
+#[cfg(target_arch = "riscv64")]
+pub fn reduced_opening_query(input_ptr: usize, out_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a1") out_ptr,
+            in("a7") REDUCED_OPENING_QUERY_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Store a degree-3 Goldilocks extension element into field-storage at `addr`.
+pub fn fext_load(_addr: u64, _coeffs: &[u64; 3]) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `out = a*b + c` over the native degree-3 Goldilocks extension via the
+/// FEXT_FMA accelerator. All arguments are field-storage handles (not RAM
+/// addresses); the result is written to `out_addr`. Argument-to-register mapping
+/// follows the spec: a/b/c in A0/A1/A2, output in A3.
+pub fn fext_fma(a_addr: u64, b_addr: u64, c_addr: u64, out_addr: u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") a_addr,   // x10 = address of a
+            in("a1") b_addr,   // x11 = address of b
+            in("a2") c_addr,   // x12 = address of c
+            in("a3") out_addr, // x13 = output field-storage address
+            in("a7") FEXT_FMA_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Level B reduced-opening measurement stub (riscv64 guest only).
+pub fn reduced_opening_query(_input_ptr: usize, _out_ptr: usize) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `out = base · ext` over the native degree-3 Goldilocks extension via
+/// the FEXT_BASE_MUL accelerator (the Goldilocks×Fp3 asymmetric product, 3 base
+/// mults). `base` is a canonical Goldilocks element passed by value; `ext_addr`
+/// and `out_addr` are field-storage handles (not RAM); they must be distinct.
+pub fn fext_base_mul(base: u64, ext_addr: u64, out_addr: u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") base,     // x10 = base Goldilocks element (by value)
+            in("a1") ext_addr, // x11 = address of the Fp3 ext operand
+            in("a2") out_addr, // x12 = output field-storage address
+            in("a7") FEXT_BASE_MUL_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Goldilocks×Fp3 asymmetric product accelerator (riscv64 guest only).
+pub fn fext_base_mul(_base: u64, _ext_addr: u64, _out_addr: u64) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Compute `out = x^-1` over the native degree-3 Goldilocks extension via the
+/// FEXT_INV accelerator. `x_addr` and `out_addr` are field-storage handles (not
+/// RAM); they must be distinct. The chip constrains `x · out == 1`, so an
+/// accepted `out` is exactly the inverse; the caller must reject zero itself
+/// (a legitimate call never inverts a zero element).
+pub fn fext_inv(x_addr: u64, out_addr: u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") x_addr,   // x10 = address of the Fp3 input
+            in("a1") out_addr, // x11 = output field-storage address
+            in("a7") FEXT_INV_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Witnessed Fp3 inverse accelerator (riscv64 guest only).
+pub fn fext_inv(_x_addr: u64, _out_addr: u64) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// `VERIFY_PATH(leaf_hash_ptr, root_ptr, index, path_ptr, path_len, out_ptr)`:
+/// verify one Merkle inclusion path host-side (ROUND-2 increment A). `leaf_hash`
+/// and `root` are 32-byte nodes; `path` is `path_len` contiguous 32-byte sibling
+/// nodes. The host recomputes the root (keccak256_pair fold with the same
+/// index-bit child ordering as `verify_merkle_path_from_leaf_hash`) and writes
+/// the REAL accept byte (1/0) at `out_ptr`; this wrapper returns that flag. A
+/// single trusted ecall replaces the whole in-guest fold, subsuming the per-node
+/// HASH_PAIR ecalls. MEASUREMENT-ONLY: never prove a build that emits it.
+#[cfg(target_arch = "riscv64")]
+pub fn sim_verify_path(
+    leaf_hash_ptr: *const u8,
+    root_ptr: *const u8,
+    index: usize,
+    path_ptr: *const u8,
+    path_len: usize,
+) -> bool {
+    let mut accept: u8 = 0;
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") leaf_hash_ptr,
+            in("a1") root_ptr,
+            in("a2") index,
+            in("a3") path_ptr,
+            in("a4") path_len,
+            in("a5") core::ptr::from_mut(&mut accept),
+            in("a7") VERIFY_PATH_SYSCALL_NUMBER,
+        )
+    }
+    accept != 0
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Merkle path-verify measurement stub (riscv64 guest only).
+pub fn sim_verify_path(
+    _leaf_hash_ptr: *const u8,
+    _root_ptr: *const u8,
+    _index: usize,
+    _path_ptr: *const u8,
+    _path_len: usize,
+) -> bool {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// `SAMPLE_FELT(state_ptr, out_ptr)`: run the whole Fp3 `sample_field_element` on
+/// the sponge at `state_ptr` host-side (ROUND-2 increment B) and write the three
+/// raw Fp3 limbs (24 bytes) at `out_ptr`. Mutates the sponge in place (one
+/// `sample()` step). MEASUREMENT-ONLY.
+#[cfg(target_arch = "riscv64")]
+pub fn sim_sample_felt(state_ptr: *mut u8, out_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") out_ptr,
+            in("a7") SAMPLE_FELT_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SAMPLE_U64(state_ptr, upper_bound, out_ptr)`: run the whole `sample_u64`
+/// rejection loop on the sponge at `state_ptr` host-side (ROUND-2 increment B)
+/// and write the resulting `u64` at `out_ptr`. Mutates the sponge in place (one
+/// `sample()` step per loop iteration). MEASUREMENT-ONLY.
+#[cfg(target_arch = "riscv64")]
+pub fn sim_sample_u64(state_ptr: *mut u8, upper_bound: usize, out_ptr: *mut u8) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") state_ptr,
+            in("a1") upper_bound,
+            in("a2") out_ptr,
+            in("a7") SAMPLE_U64_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `REGISTER_RO_LAYOUT(layout_ptr)`: cache the proof-constant reduced-opening
+/// layout (ROUND-2 increment C) for the subsequent in-place row ecalls.
+/// `layout_ptr` points at a `math::sim_ro::ReducedOpeningLayout`. Call once per
+/// proof. MEASUREMENT-ONLY.
+#[cfg(target_arch = "riscv64")]
+pub fn register_ro_layout(layout_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") layout_ptr,
+            in("a7") REGISTER_RO_LAYOUT_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `REDUCED_OPENING_ROW_INPLACE(row_idx, evals_ptr, out_ptr)` (increment C):
+/// one OOD row's `(base_row_sum, base_row_sum_sym)` from the registered layout +
+/// the six per-query eval-slice base pointers at `evals_ptr`. `out_ptr` is a
+/// `[FieldElement<ext>; 2]` (6 u64) scratch. MEASUREMENT-ONLY.
+#[cfg(target_arch = "riscv64")]
+pub fn reduced_opening_row_inplace(row_idx: usize, evals_ptr: usize, out_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") row_idx,
+            in("a1") evals_ptr,
+            in("a2") out_ptr,
+            in("a7") REDUCED_OPENING_ROW_INPLACE_SYSCALL_NUMBER,
+        )
+    }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Compute `out = a*b + c` over the native degree-3 Goldilocks extension.
+pub fn fext_fma(_a_addr: u64, _b_addr: u64, _c_addr: u64, _out_addr: u64) {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+#[cfg(target_arch = "riscv64")]
+/// Read the degree-3 extension element at field-storage address `src_addr` and
+/// return its three coefficients (native u64 form) in registers a1/a2/a3. The
+/// read-back companion to [`fext_load`] (which reads coeffs from a1/a2/a3).
+pub fn fext_store(src_addr: u64) -> [u64; 3] {
+    let (c0, c1, c2): (u64, u64, u64);
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") src_addr,   // x10 = field-storage source address
+            out("a1") c0,        // x11 = coefficient 0 (output)
+            out("a2") c1,        // x12 = coefficient 1 (output)
+            out("a3") c2,        // x13 = coefficient 2 (output)
+            in("a7") FEXT_STORE_SYSCALL_NUMBER,
+        )
+    }
+    [c0, c1, c2]
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+/// Read a degree-3 extension element from field-storage into registers.
+pub fn fext_store(_src_addr: u64) -> [u64; 3] {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+// =============================================================================
+// MID-LEVEL accelerator measurement stubs (sim/27). MEASUREMENT-ONLY: the host
+// computes the correct value from the guest's inputs in one VM cycle, so the
+// guest still accepts. Each has NO chip table — NEVER prove a build that emits
+// them. See `math::sim_midlevel` for the pointer-passed input struct layouts.
+// =============================================================================
+
+/// `SIM_POLY_EVAL(&PolyEvalInput)`: evaluate the FRI terminal polynomial at the
+/// queried codeword positions (see [`math::sim_midlevel::PolyEvalInput`]); the
+/// host fills the queried slots of the output codeword buffer.
+#[cfg(all(target_arch = "riscv64", feature = "sim-poly-eval"))]
+pub fn sim_poly_eval(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_POLY_EVAL_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_DOMAIN_POINTS(&DomainPointsInput)`: the batched primary FRI query
+/// evaluation points (see [`math::sim_midlevel::DomainPointsInput`]); the host
+/// writes `iotas_len` base-field points to the output buffer.
+#[cfg(all(target_arch = "riscv64", feature = "sim-domain-points"))]
+pub fn sim_domain_points(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_DOMAIN_POINTS_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_REGISTER_COMMIT(&RegisterCommitInput)`: offload the REGISTER
+/// preprocessed FFT+LDE+Merkle commitment (see
+/// [`math::sim_midlevel::RegisterCommitInput`]); the host writes the 32-byte
+/// commitment to the output buffer.
+#[cfg(all(target_arch = "riscv64", feature = "sim-register-commit"))]
+pub fn sim_register_commit(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_REGISTER_COMMIT_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_POW(base_ptr, num_limbs, exponent, out_ptr)`: `base^exponent` over
+/// Goldilocks (`num_limbs = 1`) or Fp3 (`num_limbs = 3`). `base_ptr`/`out_ptr`
+/// point at `num_limbs` little-endian limbs.
+#[cfg(all(target_arch = "riscv64", feature = "sim-pow"))]
+pub fn sim_pow(base_ptr: *const u64, num_limbs: usize, exponent: u64, out_ptr: *mut u64) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") base_ptr,
+            in("a1") num_limbs,
+            in("a2") exponent,
+            in("a3") out_ptr,
+            in("a7") SIM_POW_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_FOLD_CHAIN(&FoldChainInput)`: the whole per-query FRI fold butterfly
+/// chain (see [`math::sim_midlevel::FoldChainInput`]); the host writes every
+/// layer value plus the terminal value to the output buffer.
+#[cfg(all(target_arch = "riscv64", feature = "sim-fold-chain"))]
+pub fn sim_fold_chain(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_FOLD_CHAIN_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_VERIFY_PATH_BATCH(&VerifyPathBatchInput)`: verify every committed FRI
+/// layer's Merkle opening for one query in a single ecall (see
+/// [`math::sim_midlevel::VerifyPathBatchInput`]); the host hashes each layer's
+/// ordered leaf pair and folds its auth path to the committed root, writing one
+/// accept byte.
+#[cfg(all(target_arch = "riscv64", feature = "sim-verify-path-batch"))]
+pub fn sim_verify_path_batch(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_VERIFY_PATH_BATCH_SYSCALL_NUMBER,
+        )
+    }
+}
+
+/// `SIM_CONSTRAINT_EVAL(&ConstraintEvalInput)`: stub 4 v2 host offload of one
+/// table's OOD constraint evaluation (see
+/// [`math::sim_midlevel::ConstraintEvalInput`]). The host reconstructs the frame
+/// and runs the recursion verifier's constraint IR interpreter against the
+/// CLI-preloaded program, writing the per-constraint evaluations to the output
+/// buffer.
+#[cfg(all(target_arch = "riscv64", feature = "sim-constraint-eval"))]
+pub fn sim_constraint_eval(input_ptr: usize) {
+    unsafe {
+        asm!(
+            "ecall",
+            in("a0") input_ptr,
+            in("a7") SIM_CONSTRAINT_EVAL_SYSCALL_NUMBER,
+        )
+    }
 }
 
 // =============================================================================

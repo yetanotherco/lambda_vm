@@ -8,7 +8,7 @@ use crate::{
     },
     proof::options::ProofOptions,
     prover::{IsStarkProver, LdeTwiddles, Prover, evaluate_polynomial_on_lde_domain},
-    test_utils::multi_prove_ram,
+    test_utils::{multi_prove_batched_ram, multi_prove_ram},
     tests::domain_cache_stats,
     tests::trace_test_helpers::get_trace_evaluations,
     trace::{LDETraceTable, get_trace_evaluations_from_lde},
@@ -335,7 +335,7 @@ fn test_multi_prove_mixed_coset_offsets() {
         (&air_2, &mut trace_2, &pub_inputs),
     ];
 
-    let multi_proof = multi_prove_ram(
+    let multi_proof = multi_prove_batched_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
@@ -350,13 +350,58 @@ fn test_multi_prove_mixed_coset_offsets() {
     > = vec![&air_1, &air_2];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),
             &FieldElement::zero(),
         ),
         "verification should succeed when AIRs share (trace_length, blowup) but differ in coset_offset"
+    );
+}
+
+/// Scope B Task 2 smoke test: a >=2-table `multi_prove` must still run to
+/// completion and hand back a `MultiProof` (one `StarkProof` per table)
+/// without panicking, now that Round 1 Phase A absorbs a single batched
+/// `MixedMmcs` root instead of N per-table main roots. Verification is
+/// deliberately NOT asserted here — the per-table verifier doesn't understand
+/// the batched root yet (Scope B Task 7); this test only proves the batched
+/// commit wiring executes end-to-end.
+#[test_log::test]
+fn test_multi_prove_batched_main_mmcs_smoke() {
+    let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
+    let mut trace_2 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 16);
+
+    let pub_inputs = FibonacciPublicInputs {
+        a0: Felt::one(),
+        a1: Felt::one(),
+    };
+
+    let proof_options = ProofOptions::default_test_options();
+    let air_1 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+    let air_2 = FibonacciAIR::<GoldilocksField>::new(&proof_options);
+
+    let air_trace_pairs: Vec<(
+        &dyn AIR<
+            Field = GoldilocksField,
+            FieldExtension = GoldilocksField,
+            PublicInputs = FibonacciPublicInputs<GoldilocksField>,
+        >,
+        &mut _,
+        &_,
+    )> = vec![
+        (&air_1, &mut trace_1, &pub_inputs),
+        (&air_2, &mut trace_2, &pub_inputs),
+    ];
+
+    let mut transcript = DefaultTranscript::<GoldilocksField>::new(&[]);
+    let prove_result = multi_prove_ram(air_trace_pairs, &mut transcript);
+    let multi_proof = prove_result.expect("proving should succeed");
+
+    assert_eq!(
+        multi_proof.proofs.len(),
+        2,
+        "multi_prove should return one StarkProof per table"
     );
 }
 
@@ -402,7 +447,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         (&air_3, &mut trace_3, &pub_inputs),
     ];
 
-    let multi_proof = multi_prove_ram(
+    let multi_proof = multi_prove_batched_ram(
         air_trace_pairs,
         &mut DefaultTranscript::<GoldilocksField>::new(&[]),
     )
@@ -427,7 +472,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
     > = vec![&air_1, &air_2, &air_3];
 
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<GoldilocksField>::new(&[]),

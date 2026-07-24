@@ -1,6 +1,7 @@
 use super::{
     config::BatchedMerkleTreeBackend,
     domain::VerifierDomain,
+    fri::{batched::derive_batched_fri_challenges, mmcs::MixedMmcs},
     grinding,
     proof::stark::StarkProof,
     traits::{AIR, TransitionEvaluationContext},
@@ -10,15 +11,17 @@ use crate::{
     config::Commitment,
     domain::new_verifier_domain,
     lookup::{BusPublicInputs, LOGUP_CHALLENGE_ALPHA, LOGUP_NUM_CHALLENGES, compute_alpha_powers},
-    proof::stark::{ArchivedMultiProof, MultiProof},
+    proof::stark::{ArchivedMultiProof, BatchedMultiProof, MultiProof},
     proof::view::{
-        DeepPolynomialOpeningView, FriDecommitmentView, MultiProofView, PolynomialOpeningsView,
-        ProofViewSource, StarkProofView, StarkTableView,
+        BatchedMultiProofView, BatchedTableDataView, DeepPolynomialOpeningView,
+        FriDecommitmentView, MultiProofView, PolynomialOpeningsView, ProofViewSource,
+        StarkProofView, StarkTableView,
     },
     table::Table,
 };
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
-use crypto::merkle_tree::proof::{verify_merkle_path, verify_merkle_path_from_leaf_hash};
+use crypto::field_ext::Fp3Fma;
+use crypto::merkle_tree::proof::verify_merkle_path_from_leaf_hash;
 #[cfg(not(feature = "test_fiat_shamir"))]
 use log::error;
 #[cfg(feature = "debug-checks")]
@@ -33,13 +36,23 @@ use math::{
 };
 use std::collections::HashMap;
 use std::marker::PhantomData;
+
+/// sim/27 SIM_CONSTRAINT_EVAL v2 (guest, MEASUREMENT-ONLY): the global
+/// compute_transition sequence number, incremented once per per-(air, proof)
+/// evaluation. It keys the CLI-preloaded constraint program — the CLI's host
+/// capture visits the identical (epoch, air_refs) sequence, so index N here is
+/// the same table as program N there. Reset is unnecessary: one guest run does a
+/// single monotonic pass.
+#[cfg(all(target_arch = "riscv64", feature = "sim-constraint-eval"))]
+static SIM_CONSTRAINT_SEQ: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
 #[cfg(feature = "instruments")]
 use std::time::Instant;
 
 /// A default STARK verifier implementing `IsStarkVerifier`.
 pub struct Verifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > {
     phantom: PhantomData<(Field, FieldExtension, PI)>,
@@ -47,7 +60,7 @@ pub struct Verifier<
 
 impl<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: IsField + Send + Sync,
+    FieldExtension: IsField + Send + Sync + Fp3Fma,
     PI,
 > IsStarkVerifier<Field, FieldExtension, PI> for Verifier<Field, FieldExtension, PI>
 where
@@ -84,6 +97,24 @@ where
     pub grinding_seed: [u8; 32],
 }
 
+/// Verifier state carried across the batched (unified-shard) round-4 seam:
+/// everything `batched_verify_round_4` needs that rounds 1-3 derived from the
+/// transcript (per-table domains/heights, the shared OOD point `z`, the round-2
+/// constraint coefficients, and the shared LogUp challenges). Produced by
+/// `batched_verify_rounds_1_to_3`; lets the continuation epoch verifier weave the
+/// separate L2G lane in at the seam.
+pub struct VmMidState<Field: IsFFTField, FieldExtension: IsField + Send + Sync> {
+    pub(crate) domains: Vec<VerifierDomain<Field>>,
+    pub(crate) heights: Vec<usize>,
+    pub(crate) h_max: usize,
+    pub(crate) tallest: usize,
+    pub(crate) needs_lookup_challenges: bool,
+    pub(crate) lookup_challenges: Vec<FieldElement<FieldExtension>>,
+    pub(crate) boundary_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) transition_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>>,
+    pub(crate) z: FieldElement<FieldExtension>,
+}
+
 pub type DeepPolynomialEvaluations<F> = (Vec<FieldElement<F>>, Vec<FieldElement<F>>);
 
 /// Deep-composition sums that are identical across all FRI queries of a
@@ -95,6 +126,14 @@ where
     /// `ood_row_sum[row] = sum_col trace_term_coeffs[col][row] * ood(row, col)`,
     /// over the reconstructed full OOD grid (g·z-pruned positions are zero).
     ood_row_sum: Vec<FieldElement<FieldExtension>>,
+    /// The DEEP denominator base points `g^k·z` for `k in 0..ood_height`
+    /// (`gz_powers[0] = z`, `gz_powers[k] = primitive_root^k · z`). These are
+    /// query-invariant — the walk depends only on `z`, the domain generator, and
+    /// the OOD height — so it is computed once per table here instead of being
+    /// re-walked (via base×ext products / FEXT_BASE_MUL on the guest) inside every
+    /// query's `reconstruct_deep_composition_poly_evaluation_pair`. Each query then
+    /// forms its per-point denominators as `evaluation_point − gz_powers[k]`.
+    gz_powers: Vec<FieldElement<FieldExtension>>,
     /// Width of the reconstructed full OOD grid (= full trace width).
     ood_width: usize,
     /// Derived from `proof.composition_poly_parts_ood_evaluation().len()`.
@@ -122,7 +161,7 @@ compile_error!("the zero-copy STARK verifier requires a little-endian target");
 /// downstream check — no serialization, no duplicated logic.
 pub trait IsStarkVerifier<
     Field: IsSubFieldOf<FieldExtension> + IsFFTField + Send + Sync,
-    FieldExtension: Send + Sync + IsField,
+    FieldExtension: Send + Sync + IsField + Fp3Fma,
     PI,
 > where
     Field::BaseType: math::field::element::NativeArchived,
@@ -273,13 +312,19 @@ pub trait IsStarkVerifier<
             return false;
         }
 
-        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> =
-            boundary_c_i_evaluations_num
+        // Once-per-proof OOD boundary fold `acc += num*den*beta`: the 3-operand
+        // resident accumulate routes the two ext muls per term through the chip.
+        let boundary_quotient_ood_evaluation: FieldElement<FieldExtension> = {
+            let mut acc = FieldExtension::prod_acc_new();
+            for ((num, den), beta) in boundary_c_i_evaluations_num
                 .iter()
                 .zip(&boundary_c_i_evaluations_den)
                 .zip(&challenges.boundary_coeffs)
-                .map(|((num, den), beta)| num * den * beta)
-                .fold(FieldElement::<FieldExtension>::zero(), |acc, x| acc + x);
+            {
+                FieldExtension::prod_acc_add(&mut acc, num, den, beta);
+            }
+            FieldExtension::prod_acc_finish(acc)
+        };
 
         // A malformed archive can advertise fewer OOD columns than the AIR's
         // aux count; reject instead of underflowing. The current-row block keeps
@@ -295,7 +340,10 @@ pub trait IsStarkVerifier<
 
         let logup_alpha_powers: Vec<FieldElement<FieldExtension>> =
             if challenges.rap_challenges.len() > LOGUP_CHALLENGE_ALPHA {
-                compute_alpha_powers(
+                // Resident-handle power sequence: keeps α loaded in the FEXT chip
+                // across the whole [1, α, α², …] walk instead of the `*` operator
+                // reloading it per element. Byte-identical to `compute_alpha_powers`.
+                FieldExtension::geometric_powers(
                     &challenges.rap_challenges[LOGUP_CHALLENGE_ALPHA],
                     air.max_bus_elements(),
                 )
@@ -317,46 +365,100 @@ pub trait IsStarkVerifier<
         // Frame from the reconstructed full grid: the next-row step reads only
         // its transition-window columns; the zero-filled remainder is never read.
         // `into_frame` lives on the borrowed table view, so wrap the owned grid.
+        // Under `sim-constraint-eval` the host rebuilds the frame + context from
+        // the raw grid, so the guest skips this materialization entirely (its cost
+        // would otherwise mask the offload).
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-constraint-eval")))]
         let ood_frame =
             StarkTableView::Owned(ood_full).into_frame(num_main_trace_columns, step_size);
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-constraint-eval")))]
         let transition_evaluation_context = TransitionEvaluationContext::new_verifier(
             &ood_frame,
             &challenges.rap_challenges,
             &logup_alpha_powers,
             &logup_table_offset,
         );
+        // sim/27 SIM_CONSTRAINT_EVAL v2: offload this table's OOD constraint
+        // evaluation to the host, which reconstructs the frame and runs the
+        // verifier's constraint IR interpreter against the CLI-preloaded program
+        // for this table (keyed by the global sequence number). The guest passes
+        // ONLY the (untrusted) OOD frame + LogUp challenges, so a tampered blob
+        // gives a wrong frame whose constraint values miss the composition check
+        // and the proof rejects. MEASUREMENT-ONLY — never prove this build.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-constraint-eval"))]
+        let transition_ood_frame_evaluations = {
+            let num_constraints = air.num_transition_constraints();
+            let mut evals = vec![FieldElement::<FieldExtension>::zero(); num_constraints];
+            let seq = SIM_CONSTRAINT_SEQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let input = math::sim_midlevel::ConstraintEvalInput {
+                seq_index: seq as u64,
+                frame_ptr: ood_full.row_major_data().as_ptr() as u64,
+                width: ood_full.width as u64,
+                height: ood_full.height as u64,
+                num_main: num_main_trace_columns as u64,
+                step_size: step_size as u64,
+                rap_challenges_ptr: challenges.rap_challenges.as_ptr() as u64,
+                rap_challenges_len: challenges.rap_challenges.len() as u64,
+                alpha_powers_ptr: logup_alpha_powers.as_ptr() as u64,
+                alpha_powers_len: logup_alpha_powers.len() as u64,
+                table_offset_ptr: &logup_table_offset as *const _ as u64,
+                num_constraints: num_constraints as u64,
+                out_ptr: evals.as_mut_ptr() as u64,
+            };
+            lambda_vm_syscalls::syscalls::sim_constraint_eval(&input as *const _ as usize);
+            evals
+        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-constraint-eval")))]
         let transition_ood_frame_evaluations =
             air.compute_transition(&transition_evaluation_context);
 
+        // The zerofier denominator `1/(zᴺ − 1)` and the end-exemption decrement
+        // `g^(N−1)` are identical for every transition constraint of this table
+        // (only `z` and `trace_length` feed them, both fixed here), yet the
+        // per-constraint `evaluate_zerofier` recomputes that field power +
+        // inverse on every call. Hoist them out of the loop and evaluate only
+        // each constraint's end-exemptions product inside.
+        let z_pow_n = challenges.z.pow(trace_length);
+        let zerofier_denominator_inv = match (-FieldElement::<Field>::one() + z_pow_n).inv() {
+            Ok(inv) => inv,
+            // zᴺ == 1 ⇒ z lies on the trace domain (malformed proof/challenge).
+            Err(_) => return false,
+        };
+        let end_exemption_decrement = domain.trace_primitive_root.pow(trace_length - 1);
         let mut denominators =
             vec![FieldElement::<FieldExtension>::zero(); air.num_transition_constraints()];
         air.constraints_meta().iter().for_each(|m| {
-            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier(
+            denominators[m.constraint_idx] = crate::constraints::zerofier::evaluate_zerofier_with(
                 m,
                 &challenges.z,
-                &domain.trace_primitive_root,
-                trace_length,
+                &end_exemption_decrement,
+                &zerofier_denominator_inv,
             );
         });
 
-        let transition_c_i_evaluations_sum = itertools::izip!(
-            transition_ood_frame_evaluations,
-            &challenges.transition_coeffs,
-            denominators
-        )
-        .fold(FieldElement::zero(), |acc, (eval, beta, denominator)| {
-            acc + beta * eval * &denominator
-        });
+        // Once-per-proof OOD transition fold `acc += beta*eval*denominator`.
+        let transition_c_i_evaluations_sum = {
+            let mut acc = FieldExtension::prod_acc_new();
+            for (eval, beta, denominator) in itertools::izip!(
+                transition_ood_frame_evaluations,
+                &challenges.transition_coeffs,
+                denominators
+            ) {
+                FieldExtension::prod_acc_add(&mut acc, beta, &eval, &denominator);
+            }
+            FieldExtension::prod_acc_finish(acc)
+        };
 
         let composition_poly_ood_evaluation =
             &boundary_quotient_ood_evaluation + transition_c_i_evaluations_sum;
 
+        // Once-per-proof Horner `acc = acc*z + coeff`: one chip FMA per part.
         let composition_poly_claimed_ood_evaluation = proof
             .composition_poly_parts_ood_evaluation()
             .iter()
             .rev()
             .fold(FieldElement::zero(), |acc, coeff| {
-                acc * &challenges.z + coeff
+                FieldExtension::fma(&acc, &challenges.z, coeff)
             });
 
         composition_poly_claimed_ood_evaluation == composition_poly_ood_evaluation
@@ -401,6 +503,38 @@ pub trait IsStarkVerifier<
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
         crate::profile_markers::step_marker::<{ crate::profile_markers::STEP_VERIFY_FRI }>();
+        // The primary FRI query points 𝜐ᵢ are needed twice — as the DEEP
+        // denominator arguments (reconstruct, below) and, inverted, as the fold
+        // start points (`evaluation_point_inverse`, further down). Compute the
+        // `pow`-derived points ONCE here, lend them to the reconstruction, then
+        // move the same Vec into the batch inverse — no second per-query `pow`.
+        // sim/31 SIM_DOMAIN_POINTS: batch all `iotas_len` primary FRI evaluation
+        // points 𝜐ᵢ = coset_offset · lde_primitive_root^{reverse_index(2·iota,
+        // lde_length)} into ONE host call, instead of one `pow` per query (a
+        // SIM_POW ecall each when `sim-pow` is on) plus the per-query
+        // reverse_index / coset multiply / collect. The verifier still inverts
+        // them below and still folds/compares against the committed roots, so a
+        // wrong point rejects. MEASUREMENT-ONLY — never prove this build.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-domain-points"))]
+        let evaluation_points: Vec<FieldElement<Field>> = {
+            let mut points = vec![FieldElement::<Field>::zero(); challenges.iotas.len()];
+            let input = math::sim_midlevel::DomainPointsInput {
+                iotas_ptr: challenges.iotas.as_ptr() as u64,
+                iotas_len: challenges.iotas.len() as u64,
+                lde_length: domain.lde_length as u64,
+                lde_primitive_root_ptr: &domain.lde_primitive_root as *const _ as u64,
+                coset_offset_ptr: &domain.coset_offset as *const _ as u64,
+                out_ptr: points.as_mut_ptr() as u64,
+            };
+            lambda_vm_syscalls::syscalls::sim_domain_points(&input as *const _ as usize);
+            points
+        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-domain-points")))]
+        let evaluation_points: Vec<FieldElement<Field>> = challenges
+            .iotas
+            .iter()
+            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
+            .collect();
         let (deep_poly_evaluations, deep_poly_evaluations_sym) =
             match Self::reconstruct_deep_composition_poly_evaluations_for_all_queries(
                 challenges,
@@ -409,6 +543,7 @@ pub trait IsStarkVerifier<
                 ood_full,
                 next_row_cols,
                 step_size,
+                &evaluation_points,
             ) {
                 Some(pair) => pair,
                 None => return false,
@@ -448,6 +583,51 @@ pub trait IsStarkVerifier<
         }
 
         let terminal_offset = domain.coset_offset.pow(1u64 << layout.total_folds);
+        // sim/27 SIM_POLY_EVAL: evaluate the terminal polynomial at ONLY the
+        // positions the queries actually hit, host-side, instead of the O(n log n)
+        // coset FFT over the whole codeword. The verify loop below still reads
+        // `terminal_codeword.get(index)` at those exact positions; un-queried
+        // slots stay zero and are never read, so the accept/reject cascade is
+        // unchanged (a tampered final-poly gives wrong values at those points and
+        // the terminal check fails). MEASUREMENT-ONLY — never prove this build.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-poly-eval"))]
+        let terminal_codeword = {
+            // The FRI-order terminal position a query lands on: `iota >>
+            // num_committed` after the fold (non-empty zetas), or its two paired
+            // positions `iota*2`/`iota*2+1` in the no-fold clamp case (empty
+            // zetas) — exactly the indices `verify_query_and_sym_openings` reads.
+            let mut positions: Vec<u64> = if challenges.zetas.is_empty() {
+                challenges
+                    .iotas
+                    .iter()
+                    .flat_map(|&iota| [iota as u64 * 2, iota as u64 * 2 + 1])
+                    .collect()
+            } else {
+                challenges
+                    .iotas
+                    .iter()
+                    .map(|&iota| (iota >> num_committed) as u64)
+                    .collect()
+            };
+            // The chip evaluates each DISTINCT point once.
+            positions.sort_unstable();
+            positions.dedup();
+
+            let mut codeword = vec![FieldElement::<FieldExtension>::zero(); layout.terminal_len];
+            let coeffs = proof.fri_final_poly_coeffs();
+            let input = math::sim_midlevel::PolyEvalInput {
+                coeffs_ptr: coeffs.as_ptr() as u64,
+                coeffs_len: coeffs.len() as u64,
+                terminal_offset_ptr: &terminal_offset as *const _ as u64,
+                codeword_len: layout.terminal_len as u64,
+                positions_ptr: positions.as_ptr() as u64,
+                positions_len: positions.len() as u64,
+                out_ptr: codeword.as_mut_ptr() as u64,
+            };
+            lambda_vm_syscalls::syscalls::sim_poly_eval(&input as *const _ as usize);
+            codeword
+        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-poly-eval")))]
         let terminal_codeword =
             crate::fri::terminal::terminal_codeword_from_coeffs::<Field, FieldExtension>(
                 proof.fri_final_poly_coeffs(),
@@ -455,12 +635,9 @@ pub trait IsStarkVerifier<
                 layout.terminal_len,
             );
 
-        // verify FRI
-        let mut evaluation_point_inverse = challenges
-            .iotas
-            .iter()
-            .map(|iota| Self::query_challenge_to_evaluation_point(*iota, false, domain))
-            .collect::<Vec<FieldElement<Field>>>();
+        // verify FRI. Reuse the primary points computed above (reconstruct only
+        // borrowed them) and invert them in place for the fold start points.
+        let mut evaluation_point_inverse = evaluation_points;
         // Any zero evaluation point means a malformed query index, reject.
         if FieldElement::inplace_batch_inverse(&mut evaluation_point_inverse).is_err() {
             return false;
@@ -634,17 +811,28 @@ pub trait IsStarkVerifier<
         FieldElement<Field>: AsBytes + Sync + Send,
         FieldElement<FieldExtension>: AsBytes + Sync + Send,
     {
-        let evaluations = if iota % 2 == 1 {
-            vec![evaluation_sym.clone(), evaluation.clone()]
+        // The committed leaf is the ordered pair (evaluation, evaluation_sym) for
+        // an even index, (evaluation_sym, evaluation) for an odd one. Hash it
+        // straight from the two borrowed elements as single-element slices: the
+        // two-slice leaf hash streams `first ‖ second` byte-identically to
+        // `hash_data(&vec![first, second])`, but without the per-layer heap Vec
+        // and the two element clones that form required (a hot per-query×layer
+        // allocation in the FRI fold).
+        let (first, second) = if iota % 2 == 1 {
+            (evaluation_sym, evaluation)
         } else {
-            vec![evaluation.clone(), evaluation_sym.clone()]
+            (evaluation, evaluation_sym)
         };
+        let leaf_hash = BatchedMerkleTreeBackend::<FieldExtension>::hash_data_from_slices(
+            core::slice::from_ref(first),
+            core::slice::from_ref(second),
+        );
 
-        verify_merkle_path::<BatchedMerkleTreeBackend<FieldExtension>>(
+        verify_merkle_path_from_leaf_hash::<BatchedMerkleTreeBackend<FieldExtension>>(
             auth_path_sym,
             merkle_root,
             iota >> 1,
-            &evaluations,
+            leaf_hash,
         )
     }
 
@@ -689,54 +877,145 @@ pub trait IsStarkVerifier<
                     .is_some_and(|t| p0_eval_sym == t);
         }
 
-        let evaluation_point_vec: Vec<FieldElement<Field>> =
-            core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
-                Some(evaluation_point.square())
-            })
-            .take(fri_layers_merkle_roots.len())
-            .collect();
+        // sim/27 SIM_FOLD_CHAIN: offload the WHOLE per-query FRI fold butterfly
+        // chain to the host, which returns every layer value. The guest still
+        // does the per-layer Merkle path verification (VERIFY_PATH's job) using
+        // those values and still compares the terminal value against the terminal
+        // codeword below — so a tampered `evaluation_sym` breaks both the Merkle
+        // leaf (path rejects) and the folded `v` (terminal check rejects).
+        // MEASUREMENT-ONLY — never prove this build.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-fold-chain"))]
+        let (v, index, openings_ok) = {
+            let num_layers = fri_layers_merkle_roots.len();
+            let layers_sym = fri_decommitment.layers_evaluations_sym();
+            // Host writes `num_layers + 1` values: the per-layer values used for
+            // the Merkle checks, then the terminal value.
+            let mut vals = vec![FieldElement::<FieldExtension>::zero(); num_layers + 1];
+            let input = math::sim_midlevel::FoldChainInput {
+                p0_ptr: p0_eval as *const _ as u64,
+                p0_sym_ptr: p0_eval_sym as *const _ as u64,
+                eval_point_inv_ptr: &evaluation_point_inv as *const _ as u64,
+                zetas_ptr: zetas.as_ptr() as u64,
+                layers_sym_ptr: layers_sym.as_ptr() as u64,
+                num_layers: num_layers as u64,
+                out_ptr: vals.as_mut_ptr() as u64,
+            };
+            lambda_vm_syscalls::syscalls::sim_fold_chain(&input as *const _ as usize);
 
-        // Reconstruct p₁(𝜐²)
-        let mut v =
-            (p0_eval + p0_eval_sym) + evaluation_point_inv * &zetas[0] * (p0_eval - p0_eval_sym);
-        let mut index = iota;
-
-        // Fold through every committed layer: use the proof to verify the openings
-        // of pᵢ(−𝜐^(2ⁱ)) (given by the prover) and pᵢ(𝜐^(2ⁱ)) (computed on the
-        // previous iteration), then obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)). When there are no
-        // committed layers (`total_folds == 1`, a single final fold) this fold is
-        // empty and `v`/`index` already hold the terminal-layer value/position.
-        let openings_ok = fri_layers_merkle_roots
-            .iter()
-            .zip(fri_decommitment.layers_evaluations_sym())
-            .zip(evaluation_point_vec)
-            .enumerate()
-            .fold(
-                true,
-                |result, (i, ((merkle_root, evaluation_sym), evaluation_point_inv))| {
-                    // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
-                    // `v` is pᵢ(𝜐^(2ⁱ)).
-                    // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
-                    let openings_ok = Self::verify_fri_layer_openings(
-                        merkle_root,
+            // sim/34 SIM_VERIFY_PATH_BATCH: verify EVERY committed layer's leaf
+            // hash + Merkle path for this query in ONE ecall, replacing the
+            // per-layer HASH_FELTS + VERIFY_PATH pair. The host reproduces the same
+            // ordered-leaf hash and index-bit path fold `verify_fri_layer_openings`
+            // ran, ANDing the per-layer accepts. Building the per-layer path
+            // descriptors touches the same archived auth paths the loop did.
+            // MEASUREMENT-ONLY — never prove this build.
+            #[cfg(feature = "sim-verify-path-batch")]
+            let openings_ok = {
+                let mut path_descs: Vec<u64> = Vec::with_capacity(num_layers * 2);
+                for i in 0..num_layers {
+                    let p = fri_decommitment.layer_auth_path(i);
+                    path_descs.push(p.as_ptr() as u64);
+                    path_descs.push(p.len() as u64);
+                }
+                let mut accept: u8 = 0;
+                let vpb = math::sim_midlevel::VerifyPathBatchInput {
+                    num_layers: num_layers as u64,
+                    start_index: iota as u64,
+                    roots_ptr: fri_layers_merkle_roots.as_ptr() as u64,
+                    evals_ptr: vals.as_ptr() as u64,
+                    evals_sym_ptr: layers_sym.as_ptr() as u64,
+                    path_descs_ptr: path_descs.as_ptr() as u64,
+                    out_ptr: core::ptr::from_mut(&mut accept) as u64,
+                };
+                lambda_vm_syscalls::syscalls::sim_verify_path_batch(&vpb as *const _ as usize);
+                accept != 0
+            };
+            #[cfg(not(feature = "sim-verify-path-batch"))]
+            let openings_ok = {
+                let mut openings_ok = true;
+                let mut index = iota;
+                for i in 0..num_layers {
+                    openings_ok &= Self::verify_fri_layer_openings(
+                        &fri_layers_merkle_roots[i],
                         fri_decommitment.layer_auth_path(i),
-                        &v,
-                        evaluation_sym,
+                        &vals[i],
+                        &layers_sym[i],
                         index,
                     );
-
-                    // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
-                    v = (&v + evaluation_sym)
-                        + evaluation_point_inv * &zetas[i + 1] * (&v - evaluation_sym);
-
-                    // Update index for next iteration. The index of the squares in the next layer
-                    // is obtained by halving the current index. This is due to the bit-reverse
-                    // ordering of the elements in the Merkle tree.
                     index >>= 1;
+                }
+                openings_ok
+            };
+            // Terminal FRI-order position after `num_layers` halvings of `iota`
+            // (`checked_shr` saturates to 0 past the word width, matching the
+            // per-layer `index >>= 1` loop).
+            let index = iota.checked_shr(num_layers as u32).unwrap_or(0);
+            (vals[num_layers].clone(), index, openings_ok)
+        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-fold-chain")))]
+        let (v, index, openings_ok) = {
+            // The per-layer squared evaluation points 𝜐^(-2ⁱ) are consumed exactly
+            // once by the fold below, so keep them as a lazy iterator instead of
+            // collecting into a Vec — the squares are computed on demand during the
+            // fold, saving a per-(query×table) heap allocation, N stores/loads, and
+            // the drop. The yielded owned values and their order are identical to
+            // the collected Vec, so this is byte-identical (implementation-only).
+            let evaluation_point_iter =
+                core::iter::successors(Some(evaluation_point_inv.square()), |evaluation_point| {
+                    Some(evaluation_point.square())
+                })
+                .take(fri_layers_merkle_roots.len());
 
-                    result & openings_ok
-                },
-            );
+            // Reconstruct p₁(𝜐²). FRI commit-phase butterfly:
+            // v = (p₀+p₀_sym) + 𝜐⁻¹·ζ·(p₀−p₀_sym). `c0 = 𝜐⁻¹·ζ` is a base×ext
+            // product (FEXT_BASE_MUL on the guest, software elsewhere); the ext×ext
+            // product + add is one chip FMA. CAVEAT: this site is eliminated if
+            // fold-by-4 lands.
+            let c0 = FieldExtension::base_mul(&evaluation_point_inv, &zetas[0]);
+            let mut v =
+                FieldExtension::fma(&c0, &(p0_eval - p0_eval_sym), &(p0_eval + p0_eval_sym));
+            let mut index = iota;
+
+            // Fold through every committed layer: use the proof to verify the
+            // openings of pᵢ(−𝜐^(2ⁱ)) (given by the prover) and pᵢ(𝜐^(2ⁱ))
+            // (computed on the previous iteration), then obtain pᵢ₊₁(𝜐^(2ⁱ⁺¹)).
+            // When there are no committed layers (`total_folds == 1`, a single
+            // final fold) this fold is empty and `v`/`index` already hold the
+            // terminal-layer value/position.
+            let openings_ok = fri_layers_merkle_roots
+                .iter()
+                .zip(fri_decommitment.layers_evaluations_sym())
+                .zip(evaluation_point_iter)
+                .enumerate()
+                .fold(
+                    true,
+                    |result, (i, ((merkle_root, evaluation_sym), evaluation_point_inv))| {
+                        // Verify opening Open(pᵢ(Dₖ), −𝜐^(2ⁱ)) and Open(pᵢ(Dₖ), 𝜐^(2ⁱ)).
+                        // `v` is pᵢ(𝜐^(2ⁱ)).
+                        // `evaluation_sym` is pᵢ(−𝜐^(2ⁱ)).
+                        let openings_ok = Self::verify_fri_layer_openings(
+                            merkle_root,
+                            fri_decommitment.layer_auth_path(i),
+                            &v,
+                            evaluation_sym,
+                            index,
+                        );
+
+                        // Update `v` with next value pᵢ₊₁(𝜐^(2ⁱ⁺¹)). Same butterfly,
+                        // one chip FMA (c = 𝜐^(-2ⁱ)·ζ is base×ext -> FEXT_BASE_MUL).
+                        let c = FieldExtension::base_mul(&evaluation_point_inv, &zetas[i + 1]);
+                        v = FieldExtension::fma(&c, &(&v - evaluation_sym), &(&v + evaluation_sym));
+
+                        // Update index for next iteration. The index of the squares in the next layer
+                        // is obtained by halving the current index. This is due to the bit-reverse
+                        // ordering of the elements in the Merkle tree.
+                        index >>= 1;
+
+                        result & openings_ok
+                    },
+                );
+            (v, index, openings_ok)
+        };
 
         // After folding through all committed layers, `v` is the query's value at
         // the terminal layer and `index` its FRI-order position there. Check it
@@ -762,6 +1041,7 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
+        primitive_root: &FieldElement<Field>,
     ) -> Option<QueryInvariantDeepTerms<FieldExtension>> {
         let ood_evaluations_table_height = ood_full.height;
         let ood_evaluations_table_width = ood_full.width;
@@ -809,8 +1089,19 @@ pub trait IsStarkVerifier<
             h_sum_zpow += h_i_zpower * gamma;
         }
 
+        // The query-invariant DEEP denominator base points g^k·z (walked once here
+        // instead of once per query). `gz_powers[0] = z`, and each step multiplies
+        // by the domain generator (base×ext -> FEXT_BASE_MUL on the guest).
+        let mut gz_powers = Vec::with_capacity(ood_evaluations_table_height);
+        let mut current_z = challenges.z.clone();
+        for _ in 0..ood_evaluations_table_height {
+            gz_powers.push(current_z.clone());
+            current_z = FieldExtension::base_mul(primitive_root, &current_z);
+        }
+
         Some(QueryInvariantDeepTerms {
             ood_row_sum,
+            gz_powers,
             ood_width: ood_evaluations_table_width,
             number_of_parts,
             z_pow,
@@ -825,6 +1116,10 @@ pub trait IsStarkVerifier<
         ood_full: &Table<FieldExtension>,
         next_row_cols: &[usize],
         step_size: usize,
+        // The primary FRI query points 𝜐ᵢ, computed once by the caller (which also
+        // batch-inverts them for the fold), so they are not re-derived (a full
+        // `pow` each) here. `evaluation_points.len() == challenges.iotas.len()`.
+        evaluation_points: &[FieldElement<Field>],
     ) -> Option<DeepPolynomialEvaluations<FieldExtension>> {
         let num_queries = challenges.iotas.len();
 
@@ -854,9 +1149,41 @@ pub trait IsStarkVerifier<
             ood_full,
             next_row_cols,
             step_size,
+            primitive_root,
         )?;
 
-        for (i, iota) in challenges.iotas.iter().enumerate() {
+        // ROUND-2 increment C (MEASUREMENT-ONLY, never proven): the in-place
+        // reduced-opening ABI. `trace_term_coeffs` is proof-constant, so build its
+        // per-column pointer table ONCE here (not once per query as Level A does)
+        // and register it — plus the transition window / OOD dims / constant
+        // column counts — with the executor. Each per-row ecall below then passes
+        // only the six per-query eval-slice base pointers. `sim_col_ptrs` must
+        // outlive the whole query loop (the executor reads through its addresses).
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-inplace"))]
+        let sim_col_ptrs: Vec<u64> = challenges
+            .trace_term_coeffs
+            .iter()
+            .map(|c| c.as_ptr() as u64)
+            .collect();
+
+        // `sim-ro-query` (Level B) equivalent: gather the same proof-constant
+        // per-column pointer table ONCE for the whole query loop, then lend its
+        // address to each per-query ecall. The ecall reads through these
+        // addresses, so this Vec must outlive the loop. Previously the ecall
+        // wrapper rebuilt this identical gather on every query — a ~2.9M-cycle
+        // loop-invariant redundancy.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+        let sim_query_col_ptrs: Vec<u64> = challenges
+            .trace_term_coeffs
+            .iter()
+            .map(|c| c.as_ptr() as u64)
+            .collect();
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+        let coeff_col_ptrs_ptr = sim_query_col_ptrs.as_ptr() as u64;
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-query")))]
+        let coeff_col_ptrs_ptr = 0u64;
+
+        for (i, evaluation_point) in evaluation_points.iter().enumerate() {
             let opening = proof.deep_poly_opening(i);
 
             // Base-field portion as two borrowed slices in commit order —
@@ -885,12 +1212,39 @@ pub trait IsStarkVerifier<
                 .map(|a| a.evaluations_sym())
                 .unwrap_or(&[]);
 
-            let evaluation_point = Self::query_challenge_to_evaluation_point(*iota, false, domain);
-            let evaluation_point_sym =
-                Self::query_challenge_to_evaluation_point(*iota, true, domain);
+            // ROUND-2 increment C: register the proof-constant reduced-opening
+            // layout once (on the first query — the column counts are identical
+            // for every query). Thereafter the per-row ecalls read it from the
+            // executor's cache.
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-inplace"))]
+            if i == 0 {
+                let layout = math::sim_ro::ReducedOpeningLayout {
+                    coeff_col_ptrs_ptr: sim_col_ptrs.as_ptr() as u64,
+                    next_row_cols_ptr: next_row_cols.as_ptr() as u64,
+                    next_row_cols_len: next_row_cols.len() as u64,
+                    ood_width: query_invariant_terms.ood_width as u64,
+                    step_size: step_size as u64,
+                    precomputed_len: lde_precomputed.len() as u64,
+                    main_len: lde_main.len() as u64,
+                    aux_len: lde_aux.len() as u64,
+                    precomputed_sym_len: lde_precomputed_sym.len() as u64,
+                    main_sym_len: lde_main_sym.len() as u64,
+                    aux_sym_len: lde_aux_sym.len() as u64,
+                };
+                lambda_vm_syscalls::syscalls::register_ro_layout(&layout as *const _ as usize);
+            }
+
+            // The symmetric FRI query point is exactly -𝜐. The pair sits at
+            // FRI-order positions 2·iota and 2·iota+1, whose bit-reversed LDE
+            // indices differ by exactly lde_length/2 (`reverse_index(2i+1) =
+            // reverse_index(2i) + N/2`), and `lde_primitive_root^(N/2) = -1`, so
+            // `lde_coset_element(rev(2i+1)) = -lde_coset_element(rev(2i))`. Negate
+            // the primary point (supplied by the caller) instead of a second full
+            // `pow` (the same 𝜐 / -𝜐 pairing the FRI butterfly below relies on).
+            let evaluation_point_sym = -evaluation_point;
             let (evaluation, evaluation_sym) =
                 Self::reconstruct_deep_composition_poly_evaluation_pair(
-                    &evaluation_point,
+                    evaluation_point,
                     &evaluation_point_sym,
                     primitive_root,
                     challenges,
@@ -905,6 +1259,7 @@ pub trait IsStarkVerifier<
                     lde_main_sym,
                     lde_aux_sym,
                     opening.composition_poly().evaluations_sym(),
+                    coeff_col_ptrs_ptr,
                 )?;
             deep_poly_evaluations.push(evaluation);
             deep_poly_evaluations_sym.push(evaluation_sym);
@@ -925,6 +1280,13 @@ pub trait IsStarkVerifier<
     fn reconstruct_deep_composition_poly_evaluation_pair<'b>(
         evaluation_point: &FieldElement<Field>,
         evaluation_point_sym: &FieldElement<Field>,
+        // The g^k·z base points are now hoisted into `query_invariant_terms`, so
+        // this is consumed only by the Level-B `sim-ro-query` measurement ecall
+        // below; elsewhere (host, guest without that feature) it is unused.
+        #[cfg_attr(
+            not(all(target_arch = "riscv64", feature = "sim-ro-query")),
+            allow(unused_variables)
+        )]
         primitive_root: &FieldElement<Field>,
         challenges: &Challenges<FieldExtension>,
         query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
@@ -938,132 +1300,432 @@ pub trait IsStarkVerifier<
         lde_trace_main_evaluations_sym: &'b [FieldElement<Field>],
         lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
         lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
+        // Address of the caller's proof-constant per-column pointer table (built
+        // once for the whole query loop). Consumed only by the `sim-ro-query`
+        // ecall below; unused on host / other feature combinations.
+        #[cfg_attr(
+            not(all(target_arch = "riscv64", feature = "sim-ro-query")),
+            allow(unused_variables)
+        )]
+        coeff_col_ptrs_ptr: u64,
     ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
-        let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
-        let ood_evaluations_table_width = query_invariant_terms.ood_width;
-        let trace_term_coeffs = &challenges.trace_term_coeffs;
+        // MEASUREMENT-ONLY stubs (never prove a build with these features on).
+        // Level B (`sim-ro-query`) hands the whole function to one trusted
+        // ecall; Level A (`sim-ro-ecalls`) replaces only the per-row column
+        // loop below. Both are no-ops on host / with the features off, leaving
+        // the original path byte-identical.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+        return Self::sim_reduced_opening_query_ecall(
+            evaluation_point,
+            evaluation_point_sym,
+            primitive_root,
+            challenges,
+            query_invariant_terms,
+            next_row_cols,
+            step_size,
+            lde_trace_precomputed_evaluations,
+            lde_trace_main_evaluations,
+            lde_trace_aux_evaluations,
+            lde_composition_poly_parts_evaluation,
+            lde_trace_precomputed_evaluations_sym,
+            lde_trace_main_evaluations_sym,
+            lde_trace_aux_evaluations_sym,
+            lde_composition_poly_parts_evaluation_sym,
+            coeff_col_ptrs_ptr,
+        );
 
-        // Base columns are supplied as two slices (precomputed ‖ main) that the
-        // prover concatenated in this order; `num_base`/`base_at` index into
-        // them as if concatenated, without allocating.
-        let num_precomputed = lde_trace_precomputed_evaluations.len();
-        let num_base = num_precomputed + lde_trace_main_evaluations.len();
-        let base_at = move |col: usize| -> &'b FieldElement<Field> {
-            if col < num_precomputed {
-                &lde_trace_precomputed_evaluations[col]
-            } else {
-                &lde_trace_main_evaluations[col - num_precomputed]
-            }
-        };
-        let num_precomputed_sym = lde_trace_precomputed_evaluations_sym.len();
-        let num_base_sym = num_precomputed_sym + lde_trace_main_evaluations_sym.len();
-        let base_at_sym = move |col: usize| -> &'b FieldElement<Field> {
-            if col < num_precomputed_sym {
-                &lde_trace_precomputed_evaluations_sym[col]
-            } else {
-                &lde_trace_main_evaluations_sym[col - num_precomputed_sym]
-            }
-        };
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-query")))]
+        return {
+            let ood_evaluations_table_height = query_invariant_terms.ood_row_sum.len();
+            let ood_evaluations_table_width = query_invariant_terms.ood_width;
+            let trace_term_coeffs = &challenges.trace_term_coeffs;
 
-        // Runtime guards: a malformed proof may supply opening evaluations
-        // whose column count does not match the OOD table width, or whose
-        // regular/symmetric base-column split disagree. Without these checks
-        // the indexing below would panic in release builds.
-        if num_base != num_base_sym {
-            return None;
-        }
-        if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
-            || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
-        {
-            return None;
-        }
-
-        // Build both denominator sets (regular, then symmetric) and invert
-        // them together in a single batch.
-        let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms.push(evaluation_point - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        let mut current_z = challenges.z.clone();
-        for _ in 0..ood_evaluations_table_height {
-            denoms.push(evaluation_point_sym - &current_z);
-            current_z = primitive_root * &current_z;
-        }
-        // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
-        FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
-        let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
-
-        let mut trace_term = FieldElement::<FieldExtension>::zero();
-        let mut trace_term_sym = FieldElement::<FieldExtension>::zero();
-        for row_idx in 0..ood_evaluations_table_height {
-            let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
-            let mut base_row_sum = FieldElement::<FieldExtension>::zero();
-            let mut base_row_sum_sym = FieldElement::<FieldExtension>::zero();
-            if row_idx < step_size {
-                for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
-                    let coeff = &coeff_col[row_idx];
-                    if col_idx < num_base {
-                        // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
-                        base_row_sum += base_at(col_idx) * coeff;
-                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
-                    } else {
-                        let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
-                    }
+            // Base columns are supplied as two slices (precomputed ‖ main) that the
+            // prover concatenated in this order; `num_base`/`base_at` index into
+            // them as if concatenated, without allocating. (`base_at`/`base_at_sym`
+            // feed only the software column loop, so they are compiled out when
+            // the Level A ecall replaces it.)
+            let num_precomputed = lde_trace_precomputed_evaluations.len();
+            let num_base = num_precomputed + lde_trace_main_evaluations.len();
+            #[cfg(not(all(
+                target_arch = "riscv64",
+                any(feature = "sim-ro-ecalls", feature = "sim-ro-inplace")
+            )))]
+            let base_at = move |col: usize| -> &'b FieldElement<Field> {
+                if col < num_precomputed {
+                    &lde_trace_precomputed_evaluations[col]
+                } else {
+                    &lde_trace_main_evaluations[col - num_precomputed]
                 }
-            } else {
-                // g·z pruning: the next-row block opens only transition-window
-                // columns; every other column's coefficient is zero
-                // (`build_pruned_trace_term_coeffs`), so summing the window
-                // alone is exact — and skipping the rest is where the
-                // verifier/recursion cycle saving lands.
-                for &col_idx in next_row_cols {
-                    let coeff = &trace_term_coeffs[col_idx][row_idx];
-                    if col_idx < num_base {
-                        base_row_sum += base_at(col_idx) * coeff;
-                        base_row_sum_sym += base_at_sym(col_idx) * coeff;
-                    } else {
-                        let aux_idx = col_idx - num_base;
-                        base_row_sum += coeff * &lde_trace_aux_evaluations[aux_idx];
-                        base_row_sum_sym += coeff * &lde_trace_aux_evaluations_sym[aux_idx];
-                    }
+            };
+            let num_precomputed_sym = lde_trace_precomputed_evaluations_sym.len();
+            let num_base_sym = num_precomputed_sym + lde_trace_main_evaluations_sym.len();
+            #[cfg(not(all(
+                target_arch = "riscv64",
+                any(feature = "sim-ro-ecalls", feature = "sim-ro-inplace")
+            )))]
+            let base_at_sym = move |col: usize| -> &'b FieldElement<Field> {
+                if col < num_precomputed_sym {
+                    &lde_trace_precomputed_evaluations_sym[col]
+                } else {
+                    &lde_trace_main_evaluations_sym[col - num_precomputed_sym]
                 }
+            };
+
+            // Runtime guards: a malformed proof may supply opening evaluations
+            // whose column count does not match the OOD table width, or whose
+            // regular/symmetric base-column split disagree. Without these checks
+            // the indexing below would panic in release builds.
+            if num_base != num_base_sym {
+                return None;
             }
-            trace_term += &denoms_trace[row_idx] * &(&base_row_sum - ood_row_sum);
-            trace_term_sym += &denoms_trace_sym[row_idx] * &(&base_row_sum_sym - ood_row_sum);
-        }
+            if num_base + lde_trace_aux_evaluations.len() != ood_evaluations_table_width
+                || num_base + lde_trace_aux_evaluations_sym.len() != ood_evaluations_table_width
+            {
+                return None;
+            }
 
-        let number_of_parts = query_invariant_terms.number_of_parts;
-        // Also rejects a per-query opening length that disagrees with the
-        // proof-level `number_of_parts`, not just a regular/symmetric mismatch.
-        if lde_composition_poly_parts_evaluation.len() != number_of_parts
-            || lde_composition_poly_parts_evaluation_sym.len() != number_of_parts
-        {
-            return None;
-        }
-        let z_pow = &query_invariant_terms.z_pow;
+            // Build both denominator sets (regular, then symmetric) from the
+            // query-invariant g^k·z base points (walked ONCE per table in
+            // `compute_query_invariant_deep_terms`, not re-walked here per query),
+            // and invert them together in a single batch. Only the per-query
+            // subtraction against `evaluation_point[_sym]` remains in this loop.
+            let gz_powers = &query_invariant_terms.gz_powers;
+            let mut denoms = Vec::with_capacity(2 * ood_evaluations_table_height);
+            for gz in gz_powers.iter() {
+                denoms.push(evaluation_point - gz);
+            }
+            for gz in gz_powers.iter() {
+                denoms.push(evaluation_point_sym - gz);
+            }
+            // A malformed proof can land an OOD evaluation point on the LDE coset, reject.
+            FieldElement::inplace_batch_inverse(&mut denoms).ok()?;
+            let (denoms_trace, denoms_trace_sym) = denoms.split_at(ood_evaluations_table_height);
 
-        // A malformed proof can make evaluation_point == z_pow, reject.
-        let mut denom_composition_pair = [evaluation_point - z_pow, evaluation_point_sym - z_pow];
-        FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
-        let [denom_composition, denom_composition_sym] = denom_composition_pair;
+            // Level A (`sim-ro-ecalls`): build the per-query reduced-opening
+            // ecall input once (constant across the row loop). `sim_col_ptrs`
+            // is a per-column pointer table into the [col][row] coeff grid; it
+            // must outlive the loop (the ecall reads through its addresses).
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            {
+                debug_assert_eq!(core::mem::size_of::<FieldElement<Field>>(), 8);
+                debug_assert_eq!(core::mem::size_of::<FieldElement<FieldExtension>>(), 24);
+            }
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            let sim_col_ptrs: Vec<u64> = trace_term_coeffs
+                .iter()
+                .map(|c| c.as_ptr() as u64)
+                .collect();
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+            let sim_row_input = math::sim_ro::ReducedOpeningRowInput {
+                precomputed_ptr: lde_trace_precomputed_evaluations.as_ptr() as u64,
+                precomputed_len: lde_trace_precomputed_evaluations.len() as u64,
+                main_ptr: lde_trace_main_evaluations.as_ptr() as u64,
+                main_len: lde_trace_main_evaluations.len() as u64,
+                aux_ptr: lde_trace_aux_evaluations.as_ptr() as u64,
+                aux_len: lde_trace_aux_evaluations.len() as u64,
+                precomputed_sym_ptr: lde_trace_precomputed_evaluations_sym.as_ptr() as u64,
+                precomputed_sym_len: lde_trace_precomputed_evaluations_sym.len() as u64,
+                main_sym_ptr: lde_trace_main_evaluations_sym.as_ptr() as u64,
+                main_sym_len: lde_trace_main_evaluations_sym.len() as u64,
+                aux_sym_ptr: lde_trace_aux_evaluations_sym.as_ptr() as u64,
+                aux_sym_len: lde_trace_aux_evaluations_sym.len() as u64,
+                coeff_col_ptrs_ptr: sim_col_ptrs.as_ptr() as u64,
+                next_row_cols_ptr: next_row_cols.as_ptr() as u64,
+                next_row_cols_len: next_row_cols.len() as u64,
+                ood_width: ood_evaluations_table_width as u64,
+                step_size: step_size as u64,
+            };
 
-        let mut h_sum = FieldElement::<FieldExtension>::zero();
-        let mut h_sum_sym = FieldElement::<FieldExtension>::zero();
-        for j in 0..number_of_parts {
-            let h_i_upsilon = &lde_composition_poly_parts_evaluation[j];
-            let h_i_upsilon_sym = &lde_composition_poly_parts_evaluation_sym[j];
-            let gamma = &challenges.gammas[j];
-            h_sum += h_i_upsilon * gamma;
-            h_sum_sym += h_i_upsilon_sym * gamma;
-        }
-        let h_terms = (&h_sum - &query_invariant_terms.h_sum_zpow) * denom_composition;
-        let h_terms_sym = (&h_sum_sym - &query_invariant_terms.h_sum_zpow) * denom_composition_sym;
+            // Increment C: the only per-query marshaling is the six eval-slice
+            // base pointers (the slices live where the verifier already holds
+            // them). The coeff grid / dims / column counts were registered once
+            // per proof via REGISTER_RO_LAYOUT, so the per-query struct fill +
+            // col-ptr gather that Level A repeats for every query are gone. When
+            // sim-ro-inplace is on it supplies base_row_sum per row; the outer
+            // trace-term accumulation below still runs in-guest (and routes
+            // through the FEXT accelerator), so the two levers compose.
+            #[cfg(all(target_arch = "riscv64", feature = "sim-ro-inplace"))]
+            let sim_evals: [u64; math::sim_ro::REDUCED_OPENING_INPLACE_EVALS] = [
+                lde_trace_precomputed_evaluations.as_ptr() as u64,
+                lde_trace_main_evaluations.as_ptr() as u64,
+                lde_trace_aux_evaluations.as_ptr() as u64,
+                lde_trace_precomputed_evaluations_sym.as_ptr() as u64,
+                lde_trace_main_evaluations_sym.as_ptr() as u64,
+                lde_trace_aux_evaluations_sym.as_ptr() as u64,
+            ];
 
-        Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
+            // Resident trace-term accumulators: on the guest they live in FEXT
+            // field-storage across the whole row loop, so each row is a single
+            // LOAD/LOAD/FMA (3 ecalls) instead of the stateless `fma`'s
+            // LOAD×3/FMA/STORE (5). Created regular-then-sym; finished sym-first
+            // to keep the backend's accumulator stack LIFO.
+            let mut trace_acc = FieldExtension::prod_acc_new();
+            let mut trace_acc_sym = FieldExtension::prod_acc_new();
+            for row_idx in 0..ood_evaluations_table_height {
+                let ood_row_sum = &query_invariant_terms.ood_row_sum[row_idx];
+
+                #[cfg(all(target_arch = "riscv64", feature = "sim-ro-ecalls"))]
+                let (base_row_sum, base_row_sum_sym) = {
+                    // Two-element literal (not `[x; 2]`): the generic
+                    // `FieldExtension` isn't `Copy`. The ecall (asm memory
+                    // clobber) writes both elements; move them out afterward.
+                    let mut out = [
+                        FieldElement::<FieldExtension>::zero(),
+                        FieldElement::<FieldExtension>::zero(),
+                    ];
+                    lambda_vm_syscalls::syscalls::reduced_opening_row(
+                        &sim_row_input as *const _ as usize,
+                        row_idx,
+                        out.as_mut_ptr() as usize,
+                    );
+                    let [base_row_sum, base_row_sum_sym] = out;
+                    (base_row_sum, base_row_sum_sym)
+                };
+
+                // Increment C: the in-place row ecall. Passes only row_idx + the
+                // per-query eval-slice base pointers + the out scratch; the
+                // executor reads the coeff grid / dims from the registered layout.
+                #[cfg(all(target_arch = "riscv64", feature = "sim-ro-inplace"))]
+                let (base_row_sum, base_row_sum_sym) = {
+                    let mut out = [
+                        FieldElement::<FieldExtension>::zero(),
+                        FieldElement::<FieldExtension>::zero(),
+                    ];
+                    lambda_vm_syscalls::syscalls::reduced_opening_row_inplace(
+                        row_idx,
+                        sim_evals.as_ptr() as usize,
+                        out.as_mut_ptr() as usize,
+                    );
+                    let [base_row_sum, base_row_sum_sym] = out;
+                    (base_row_sum, base_row_sum_sym)
+                };
+
+                #[cfg(not(all(
+                    target_arch = "riscv64",
+                    any(feature = "sim-ro-ecalls", feature = "sim-ro-inplace")
+                )))]
+                let (base_row_sum, base_row_sum_sym) = {
+                    // Base×ext products keep the cheap asymmetric software path;
+                    // the ext×ext aux products accumulate into a resident FEXT
+                    // accumulator (regular + sym) and are folded into the base
+                    // partial at the end. Addition is commutative, so splitting
+                    // base from aux is exact. Accumulators are created
+                    // regular-then-sym, finished sym-first (backend stack LIFO).
+                    let mut base_soft = FieldElement::<FieldExtension>::zero();
+                    let mut base_soft_sym = FieldElement::<FieldExtension>::zero();
+                    let mut aux_acc = FieldExtension::prod_acc_new();
+                    let mut aux_acc_sym = FieldExtension::prod_acc_new();
+                    if row_idx < step_size {
+                        for (col_idx, coeff_col) in trace_term_coeffs.iter().enumerate() {
+                            let coeff = &coeff_col[row_idx];
+                            if col_idx < num_base {
+                                // F: IsSubFieldOf<E> gives the cheap asymmetric F * E -> E product.
+                                base_soft += base_at(col_idx) * coeff;
+                                base_soft_sym += base_at_sym(col_idx) * coeff;
+                            } else {
+                                let aux_idx = col_idx - num_base;
+                                // Ext × ext products route through the FEXT accelerator
+                                // on the guest (resident `acc += aux * coeff`; plain
+                                // software off the guest / for non-Fp3 fields).
+                                FieldExtension::prod_acc_add2(
+                                    &mut aux_acc,
+                                    &lde_trace_aux_evaluations[aux_idx],
+                                    coeff,
+                                );
+                                FieldExtension::prod_acc_add2(
+                                    &mut aux_acc_sym,
+                                    &lde_trace_aux_evaluations_sym[aux_idx],
+                                    coeff,
+                                );
+                            }
+                        }
+                    } else {
+                        // g·z pruning: the next-row block opens only transition-window
+                        // columns; every other column's coefficient is zero
+                        // (`build_pruned_trace_term_coeffs`), so summing the window
+                        // alone is exact — and skipping the rest is where the
+                        // verifier/recursion cycle saving lands.
+                        for &col_idx in next_row_cols {
+                            let coeff = &trace_term_coeffs[col_idx][row_idx];
+                            if col_idx < num_base {
+                                base_soft += base_at(col_idx) * coeff;
+                                base_soft_sym += base_at_sym(col_idx) * coeff;
+                            } else {
+                                let aux_idx = col_idx - num_base;
+                                // Ext × ext products route through the FEXT accelerator
+                                // on the guest (resident `acc += aux * coeff`; plain
+                                // software off the guest / for non-Fp3 fields).
+                                FieldExtension::prod_acc_add2(
+                                    &mut aux_acc,
+                                    &lde_trace_aux_evaluations[aux_idx],
+                                    coeff,
+                                );
+                                FieldExtension::prod_acc_add2(
+                                    &mut aux_acc_sym,
+                                    &lde_trace_aux_evaluations_sym[aux_idx],
+                                    coeff,
+                                );
+                            }
+                        }
+                    }
+                    // Finish sym-first (LIFO), then fold in the base partials.
+                    let aux_sym = FieldExtension::prod_acc_finish(aux_acc_sym);
+                    let aux = FieldExtension::prod_acc_finish(aux_acc);
+                    (&base_soft + &aux, &base_soft_sym + &aux_sym)
+                };
+
+                // Trace-term accumulation routes through the FEXT accelerator on
+                // the guest as a resident accumulate
+                // `trace_acc += denom * (base_row_sum - ood_row_sum)`.
+                FieldExtension::prod_acc_add2(
+                    &mut trace_acc,
+                    &denoms_trace[row_idx],
+                    &(&base_row_sum - ood_row_sum),
+                );
+                FieldExtension::prod_acc_add2(
+                    &mut trace_acc_sym,
+                    &denoms_trace_sym[row_idx],
+                    &(&base_row_sum_sym - ood_row_sum),
+                );
+            }
+            // Finish sym-first (LIFO: it was created after the regular chain).
+            let trace_term_sym = FieldExtension::prod_acc_finish(trace_acc_sym);
+            let trace_term = FieldExtension::prod_acc_finish(trace_acc);
+
+            let number_of_parts = query_invariant_terms.number_of_parts;
+            // Also rejects a per-query opening length that disagrees with the
+            // proof-level `number_of_parts`, not just a regular/symmetric mismatch.
+            if lde_composition_poly_parts_evaluation.len() != number_of_parts
+                || lde_composition_poly_parts_evaluation_sym.len() != number_of_parts
+            {
+                return None;
+            }
+            let z_pow = &query_invariant_terms.z_pow;
+
+            // A malformed proof can make evaluation_point == z_pow, reject.
+            let mut denom_composition_pair =
+                [evaluation_point - z_pow, evaluation_point_sym - z_pow];
+            FieldElement::inplace_batch_inverse(&mut denom_composition_pair).ok()?;
+            let [denom_composition, denom_composition_sym] = denom_composition_pair;
+
+            // Composition-part combination `h_sum += h_i * gamma`: an ext×ext
+            // accumulate, resident on the FEXT accelerator (previously plain
+            // software `*`, untouched by #831). Created regular-then-sym after
+            // the trace-term chain freed its stack regions; finished sym-first.
+            let mut h_acc = FieldExtension::prod_acc_new();
+            let mut h_acc_sym = FieldExtension::prod_acc_new();
+            for j in 0..number_of_parts {
+                let gamma = &challenges.gammas[j];
+                FieldExtension::prod_acc_add2(
+                    &mut h_acc,
+                    &lde_composition_poly_parts_evaluation[j],
+                    gamma,
+                );
+                FieldExtension::prod_acc_add2(
+                    &mut h_acc_sym,
+                    &lde_composition_poly_parts_evaluation_sym[j],
+                    gamma,
+                );
+            }
+            let h_sum_sym = FieldExtension::prod_acc_finish(h_acc_sym);
+            let h_sum = FieldExtension::prod_acc_finish(h_acc);
+            // `(h_sum - h_sum_zpow) * denom_composition`: ext×ext product routed
+            // through the accelerator.
+            let h_terms = FieldExtension::ext_mul(
+                &(&h_sum - &query_invariant_terms.h_sum_zpow),
+                &denom_composition,
+            );
+            let h_terms_sym = FieldExtension::ext_mul(
+                &(&h_sum_sym - &query_invariant_terms.h_sum_zpow),
+                &denom_composition_sym,
+            );
+
+            Some((trace_term + h_terms, trace_term_sym + h_terms_sym))
+        };
+    }
+
+    /// MEASUREMENT-ONLY (Level B, `sim-ro-query`). Marshals every input of
+    /// [`Self::reconstruct_deep_composition_poly_evaluation_pair`] into the
+    /// [`math::sim_ro::ReducedOpeningQueryInput`] ABI and delegates the whole
+    /// `(deep_eval, deep_eval_sym)` reconstruction to the trusted
+    /// `REDUCED_OPENING_QUERY` ecall (see `others/accelerator_noop_sim_spec.md`,
+    /// Experiment 2, fusion upper bound). NEVER prove a build with this on — the
+    /// unmatched ecall unbalances the LogUp bus.
+    ///
+    /// Field-element scalars are passed by pointer (this generic method cannot
+    /// assume `Field::BaseType == u64`); `sim_col_ptrs` (the per-column pointer
+    /// table into the coeff grid) must outlive the ecall.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+    #[allow(clippy::too_many_arguments)]
+    fn sim_reduced_opening_query_ecall<'b>(
+        evaluation_point: &FieldElement<Field>,
+        evaluation_point_sym: &FieldElement<Field>,
+        primitive_root: &FieldElement<Field>,
+        challenges: &Challenges<FieldExtension>,
+        query_invariant_terms: &QueryInvariantDeepTerms<FieldExtension>,
+        next_row_cols: &[usize],
+        step_size: usize,
+        lde_trace_precomputed_evaluations: &'b [FieldElement<Field>],
+        lde_trace_main_evaluations: &'b [FieldElement<Field>],
+        lde_trace_aux_evaluations: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation: &[FieldElement<FieldExtension>],
+        lde_trace_precomputed_evaluations_sym: &'b [FieldElement<Field>],
+        lde_trace_main_evaluations_sym: &'b [FieldElement<Field>],
+        lde_trace_aux_evaluations_sym: &[FieldElement<FieldExtension>],
+        lde_composition_poly_parts_evaluation_sym: &[FieldElement<FieldExtension>],
+        // Pointer to the per-column table into `challenges.trace_term_coeffs`.
+        // `trace_term_coeffs` is proof-constant, so the caller gathers this table
+        // ONCE before the query loop and lends its address here (the backing Vec
+        // must outlive the loop — the ecall reads through these addresses).
+        // Rebuilding it inside this per-query wrapper was a ~2.9M-cycle
+        // loop-invariant redundancy (the sibling `sim-ro-inplace` path already
+        // hoists the identical gather).
+        coeff_col_ptrs_ptr: u64,
+    ) -> Option<(FieldElement<FieldExtension>, FieldElement<FieldExtension>)> {
+        debug_assert_eq!(core::mem::size_of::<FieldElement<Field>>(), 8);
+        debug_assert_eq!(core::mem::size_of::<FieldElement<FieldExtension>>(), 24);
+        let input = math::sim_ro::ReducedOpeningQueryInput {
+            evaluation_point_ptr: evaluation_point as *const _ as u64,
+            evaluation_point_sym_ptr: evaluation_point_sym as *const _ as u64,
+            primitive_root_ptr: primitive_root as *const _ as u64,
+            z_ptr: &challenges.z as *const _ as u64,
+            z_pow_ptr: &query_invariant_terms.z_pow as *const _ as u64,
+            h_sum_zpow_ptr: &query_invariant_terms.h_sum_zpow as *const _ as u64,
+            ood_height: query_invariant_terms.ood_row_sum.len() as u64,
+            ood_width: query_invariant_terms.ood_width as u64,
+            number_of_parts: query_invariant_terms.number_of_parts as u64,
+            step_size: step_size as u64,
+            precomputed_ptr: lde_trace_precomputed_evaluations.as_ptr() as u64,
+            precomputed_len: lde_trace_precomputed_evaluations.len() as u64,
+            main_ptr: lde_trace_main_evaluations.as_ptr() as u64,
+            main_len: lde_trace_main_evaluations.len() as u64,
+            aux_ptr: lde_trace_aux_evaluations.as_ptr() as u64,
+            aux_len: lde_trace_aux_evaluations.len() as u64,
+            precomputed_sym_ptr: lde_trace_precomputed_evaluations_sym.as_ptr() as u64,
+            precomputed_sym_len: lde_trace_precomputed_evaluations_sym.len() as u64,
+            main_sym_ptr: lde_trace_main_evaluations_sym.as_ptr() as u64,
+            main_sym_len: lde_trace_main_evaluations_sym.len() as u64,
+            aux_sym_ptr: lde_trace_aux_evaluations_sym.as_ptr() as u64,
+            aux_sym_len: lde_trace_aux_evaluations_sym.len() as u64,
+            composition_ptr: lde_composition_poly_parts_evaluation.as_ptr() as u64,
+            composition_sym_ptr: lde_composition_poly_parts_evaluation_sym.as_ptr() as u64,
+            coeff_col_ptrs_ptr,
+            gammas_ptr: challenges.gammas.as_ptr() as u64,
+            ood_row_sum_ptr: query_invariant_terms.ood_row_sum.as_ptr() as u64,
+            next_row_cols_ptr: next_row_cols.as_ptr() as u64,
+            next_row_cols_len: next_row_cols.len() as u64,
+        };
+        let mut out = [
+            FieldElement::<FieldExtension>::zero(),
+            FieldElement::<FieldExtension>::zero(),
+        ];
+        lambda_vm_syscalls::syscalls::reduced_opening_query(
+            &input as *const _ as usize,
+            out.as_mut_ptr() as usize,
+        );
+        let [deep_eval, deep_eval_sym] = out;
+        Some((deep_eval, deep_eval_sym))
     }
 
     /// Verifies one or more STARK proofs with their corresponding AIRs.
@@ -1394,8 +2056,13 @@ pub trait IsStarkVerifier<
 
         let num_transition_constraints = air.context().num_transition_constraints;
 
-        let mut coefficients =
-            compute_alpha_powers(&beta, num_boundary_constraints + num_transition_constraints);
+        // Resident-handle power sequence (see `geometric_powers`): β stays loaded
+        // in the FEXT chip across [1, β, β², …]. Byte-identical to the running
+        // product `compute_alpha_powers` computed here before.
+        let mut coefficients = FieldExtension::geometric_powers(
+            &beta,
+            num_boundary_constraints + num_transition_constraints,
+        );
 
         let transition_coeffs: Vec<_> = coefficients.drain(..num_transition_constraints).collect();
         let boundary_coeffs = coefficients;
@@ -1445,10 +2112,17 @@ pub trait IsStarkVerifier<
         let gamma = transcript.sample_field_element();
 
         // <<<< Receive challenges: 𝛾, 𝛾'
-        let mut deep_composition_coefficients: Vec<_> =
+        // `Take<Successors>` reports a lower size-hint bound of 0, so a plain
+        // `.collect()` starts from an empty Vec and reallocates through the whole
+        // doubling schedule. The final length is known exactly here, so reserve it
+        // once and extend — identical values, no realloc/copy churn.
+        let num_deep_coeffs = num_terms_composition_poly + num_terms_trace;
+        let mut deep_composition_coefficients: Vec<FieldElement<FieldExtension>> =
+            Vec::with_capacity(num_deep_coeffs);
+        deep_composition_coefficients.extend(
             core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
-                .take(num_terms_composition_poly + num_terms_trace)
-                .collect();
+                .take(num_deep_coeffs),
+        );
 
         let trace_term_powers: Vec<_> = deep_composition_coefficients
             .drain(..num_terms_trace)
@@ -1675,5 +2349,812 @@ pub trait IsStarkVerifier<
         }
 
         true
+    }
+
+    /// Build a lightweight per-table `StarkProof` carrying only the fields
+    /// `step_2_verify_claimed_composition_polynomial` and
+    /// `reconstruct_deep_composition_poly_evaluation_pair` actually read
+    /// (trace_length, OOD evaluations, precomputed root, bus/public inputs). All
+    /// commitment/opening/FRI fields are placeholders those two helpers never
+    /// inspect — this lets the batched verifier reuse them unchanged.
+    fn batched_synthetic_table_proof(
+        table: BatchedTableDataView<'_, FieldExtension, PI>,
+    ) -> Option<StarkProof<Field, FieldExtension, PI>>
+    where
+        PI: Clone,
+    {
+        // Only the small per-table OOD blocks + tiny scalars are materialized here
+        // (never a per-query opening): the two OOD tables are `step_size × width`,
+        // so the synthetic proof stays a bounded, per-table copy. `bus_public_inputs`
+        // is rebuilt from just the `table_contribution` the verifier reads (the
+        // debug-only per-bus aggregation is not part of the archived proof).
+        Some(StarkProof {
+            trace_length: table.trace_length(),
+            lde_trace_main_merkle_root: [0u8; 32],
+            lde_trace_aux_merkle_root: None,
+            lde_trace_precomputed_merkle_root: table.precomputed_root().copied(),
+            // Split OOD (g·z pruning): current-row block + pruned next-row block,
+            // the same shape the non-batched `StarkProof` carries. The batched
+            // verifier reconstructs the full grid from these two exactly as
+            // `verify_rounds_2_to_4` does.
+            trace_ood_evaluations: table.trace_ood_evaluations().to_owned_table(),
+            trace_ood_next_evaluations: table.trace_ood_next_evaluations().to_owned_table(),
+            composition_poly_root: [0u8; 32],
+            composition_poly_parts_ood_evaluation: table
+                .composition_poly_parts_ood_evaluation()
+                .to_vec(),
+            fri_layers_merkle_roots: Vec::new(),
+            fri_final_poly_coeffs: Vec::new(),
+            query_list: Vec::new(),
+            deep_poly_openings: Vec::new(),
+            nonce: None,
+            bus_public_inputs: table
+                .bus_table_contribution()
+                .map(BusPublicInputs::from_contribution),
+            public_inputs: table.public_inputs()?,
+        })
+    }
+
+    /// Verify a `BatchedMultiProof` (unified-shard): ONE linear transcript, ONE
+    /// shared OOD point z, and ONE FRI over the height-combined per-table DEEP
+    /// codewords, with all tables opened from three shared mixed-height MMCS
+    /// trees per query. Mirrors `Prover::multi_prove_batched`.
+    #[allow(clippy::too_many_lines)]
+    fn batched_multi_verify(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: &BatchedMultiProof<Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let view = BatchedMultiProofView::Owned(proof);
+        let mid = match Self::batched_verify_rounds_1_to_3(airs, view, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+        Self::batched_verify_round_4(mid, airs, view, transcript, expected_bus_balance)
+    }
+
+    /// Rounds 1-3 of the batched (unified-shard) verifier: replays the Fiat-Shamir
+    /// transcript from Phase A (preprocessed roots + the single main MMCS root)
+    /// through the OOD absorption, returning the derived `VmMidState` that round 4
+    /// consumes. Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can weave the separate L2G lane in at the seam.
+    /// Returns `None` on any structural rejection.
+    fn batched_verify_rounds_1_to_3(
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: BatchedMultiProofView<'_, Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+    ) -> Option<VmMidState<Field, FieldExtension>>
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let num_tables = airs.len();
+        if num_tables == 0 || num_tables != proof.per_table_len() {
+            return None;
+        }
+
+        // Per-table lightweight domains + FRI heights (= lde_log_height).
+        let domains: Vec<VerifierDomain<Field>> = airs
+            .iter()
+            .enumerate()
+            .map(|(i, air)| new_verifier_domain(*air, proof.per_table(i).trace_length()))
+            .collect();
+        let heights: Vec<usize> = domains
+            .iter()
+            .map(|d| d.lde_length.trailing_zeros() as usize)
+            .collect();
+        let h_max = *heights.iter().max().expect("num_tables > 0");
+        // Any tallest table works: all tables at h_max share identical domain
+        // params (global blowup + coset_offset), so z, the FRI point and the
+        // query domain are the same whichever we pick. Mirrors the prover's
+        // `max_by_key` choice (which value it lands on is immaterial here).
+        let tallest = heights
+            .iter()
+            .position(|h| *h == h_max)
+            .expect("h_max is present");
+
+        let needs_lookup_challenges = airs.iter().any(|air| air.has_aux_trace());
+
+        // ===== Round 1 replay =====
+        // Phase A: per preprocessed table, append its hardcoded precomputed root
+        // (checked against the AIR), then the SINGLE batched main-trace MMCS root.
+        for (i, air) in airs.iter().enumerate() {
+            let t = proof.per_table(i);
+            let trace_length = t.trace_length();
+            // Soundness: composition part count is fixed by the AIR degree bound,
+            // not chosen by the prover.
+            if trace_length == 0
+                || t.composition_poly_parts_ood_evaluation().len()
+                    != air.composition_poly_degree_bound(trace_length) / trace_length
+            {
+                return None;
+            }
+            // Both OOD blocks' shapes are a public function of the AIR (invariant
+            // I3), never the prover's. Reject any table whose current/next-row
+            // block disagrees BEFORE Round 3 absorbs them and before the round-4
+            // frame/DEEP reconstruction indexes into them. Mirrors the non-batched
+            // `ood_blocks_well_formed`, but the current-row width is checked against
+            // `context().trace_columns` (the physical OOD width = main + aux, the
+            // same figure `OodLayout.num_total_cols` and the DEEP trace-term grid
+            // use) rather than `trace_layout().0 + num_aux`: the batched lane
+            // includes step-packed AIRs (e.g. BitFlags) whose `trace_layout().0` is
+            // a logical, not physical, column count. The width check is load-bearing
+            // (a wrong width desyncs the frame/grid reconstruction and would make
+            // `compute_query_invariant_deep_terms` reject a valid proof, or let a
+            // too-narrow row index out of bounds). All owned tables here, but
+            // `dimensions_consistent` still rejects a mis-deserialized one.
+            let layout = Self::ood_layout(*air);
+            let ood_current = t.trace_ood_evaluations();
+            let ood_next = t.trace_ood_next_evaluations();
+            if !ood_current.dimensions_consistent()
+                || ood_current.width() != air.context().trace_columns
+                || ood_current.height() != layout.step_size()
+                || !ood_next.dimensions_consistent()
+                || ood_next.width() != layout.expected_next_width()
+                || ood_next.height() != layout.expected_next_height()
+            {
+                return None;
+            }
+            if air.is_preprocessed() {
+                let expected = air.precomputed_commitment();
+                match t.precomputed_root().copied() {
+                    Some(actual) if actual == expected => {}
+                    _ => return None,
+                }
+                transcript.append_bytes(&expected);
+            } else if t.precomputed_root().is_some() {
+                return None;
+            }
+        }
+        transcript.append_bytes(proof.main_root());
+
+        // Bus-input presence must match the AIR layout (a dishonest prover could
+        // omit bus_public_inputs to bypass the balance check).
+        for (i, air) in airs.iter().enumerate() {
+            if air.has_trace_interaction() != proof.per_table(i).has_bus_public_inputs() {
+                return None;
+            }
+        }
+
+        // Phase B: shared LogUp challenges.
+        let lookup_challenges: Vec<FieldElement<FieldExtension>> = if needs_lookup_challenges {
+            (0..LOGUP_NUM_CHALLENGES)
+                .map(|_| transcript.sample_field_element())
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Phase C: single batched aux MMCS root (present iff any table has aux).
+        if needs_lookup_challenges != proof.aux_root().is_some() {
+            return None;
+        }
+        if let Some(root) = proof.aux_root() {
+            transcript.append_bytes(root);
+        }
+
+        // Bus contributions bind before the round-2 challenges.
+        for i in 0..num_tables {
+            if let Some(contribution) = proof.per_table(i).bus_table_contribution() {
+                transcript.append_field_element(&contribution);
+            }
+        }
+
+        // ===== Round 2: per-table beta -> boundary/transition coeffs, then the
+        // single batched composition MMCS root. =====
+        let mut boundary_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(num_tables);
+        let mut transition_coeffs_all: Vec<Vec<FieldElement<FieldExtension>>> =
+            Vec::with_capacity(num_tables);
+        for (i, air) in airs.iter().enumerate() {
+            let t = proof.per_table(i);
+            // Rebuild the tiny PI + bus contribution the boundary builder reads
+            // (a per-table copy of one `PI` and one field element — no bulk data).
+            let public_inputs = t.public_inputs()?;
+            let bus_public_inputs = t
+                .bus_table_contribution()
+                .map(BusPublicInputs::from_contribution);
+            let beta = transcript.sample_field_element();
+            let num_boundary = air
+                .boundary_constraints(
+                    &public_inputs,
+                    &lookup_challenges,
+                    bus_public_inputs.as_ref(),
+                    t.trace_length(),
+                )
+                .constraints
+                .len();
+            let num_transition = air.context().num_transition_constraints;
+            let mut coeffs = compute_alpha_powers(&beta, num_boundary + num_transition);
+            let transition_coeffs: Vec<_> = coeffs.drain(..num_transition).collect();
+            transition_coeffs_all.push(transition_coeffs);
+            boundary_coeffs_all.push(coeffs);
+        }
+        transcript.append_bytes(proof.composition_root());
+
+        // ===== Round 3: shared z (tallest domain), per-table OOD absorbed. =====
+        let z = transcript.sample_z_ood_with_domain_params(
+            domains[tallest].trace_length,
+            domains[tallest].lde_length,
+            &domains[tallest].coset_offset,
+        );
+        for i in 0..num_tables {
+            let t = proof.per_table(i);
+            // g·z pruning: absorb the current-row block then the pruned next-row
+            // block, each column-major, in the exact order the prover sent them.
+            // Index `row_major_data` column-major directly (byte-identical to
+            // `Table::columns()`) so the archived OOD block is read in place.
+            for block in [t.trace_ood_evaluations(), t.trace_ood_next_evaluations()] {
+                let width = block.width();
+                let height = block.height();
+                let data = block.row_major_data();
+                for col in 0..width {
+                    for row in 0..height {
+                        transcript.append_field_element(&data[row * width + col]);
+                    }
+                }
+            }
+            for elem in t.composition_poly_parts_ood_evaluation().iter() {
+                transcript.append_field_element(elem);
+            }
+        }
+
+        Some(VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        })
+    }
+
+    /// Round 4 of the batched (unified-shard) verifier: the FRI + query phase over
+    /// the height-combined per-table DEEP codewords, plus the bus-balance check.
+    /// Split out of `batched_multi_verify` (behavior-preserving) so the
+    /// continuation epoch verifier can run it AFTER the L2G lane at the seam.
+    fn batched_verify_round_4(
+        mid: VmMidState<Field, FieldExtension>,
+        airs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        proof: BatchedMultiProofView<'_, Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        let VmMidState {
+            domains,
+            heights,
+            h_max,
+            tallest,
+            needs_lookup_challenges,
+            lookup_challenges,
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            z,
+        } = mid;
+        let num_tables = airs.len();
+
+        // Per-table pruned-OOD layout (AIR-derived, never proof-derived — I3),
+        // built once and shared by the round-4 challenge replay, the full-grid
+        // reconstruction, step 2, the query-invariant hoist, and the per-query
+        // DEEP reconstruction. Mirrors the single `layout` the non-batched
+        // `verify_rounds_2_to_4` threads through those sites.
+        let layouts: Vec<crate::ood::OodLayout> =
+            airs.iter().map(|air| Self::ood_layout(*air)).collect();
+
+        // ===== Round 4: shared gamma, per-table DEEP coeffs, batched FRI challenges. =====
+        let gamma = transcript.sample_field_element();
+        let mut trace_term_coeffs_all: Vec<Vec<Vec<FieldElement<FieldExtension>>>> =
+            Vec::with_capacity(num_tables);
+        let mut gammas_all: Vec<Vec<FieldElement<FieldExtension>>> = Vec::with_capacity(num_tables);
+        for (i, layout) in layouts.iter().enumerate() {
+            let num_terms_comp = proof
+                .per_table(i)
+                .composition_poly_parts_ood_evaluation()
+                .len();
+            // g·z pruning: draw only the surviving trace-term powers (current-row
+            // block all columns + next-row block masked columns) and scatter them
+            // into the rectangular W×num_eval_points grid with zeros at pruned
+            // positions — identical to the prover's `build_trace_term_coeffs` and
+            // the non-batched round-4 replay.
+            let num_terms_trace = layout.num_surviving();
+            let mut coeffs: Vec<_> =
+                core::iter::successors(Some(FieldElement::one()), |x| Some(x * &gamma))
+                    .take(num_terms_comp + num_terms_trace)
+                    .collect();
+            let trace_term_powers: Vec<_> = coeffs.drain(..num_terms_trace).collect();
+            let trace_term_coeffs = layout.build_trace_term_coeffs(&trace_term_powers);
+            trace_term_coeffs_all.push(trace_term_coeffs);
+            gammas_all.push(coeffs);
+        }
+
+        let grinding_factor = airs[0].context().proof_options.grinding_factor;
+        let num_queries = airs[0].options().fri_number_of_queries;
+        let fri_domain_size = 1usize << h_max;
+        let fri_last_value = proof.fri_last_value();
+        let nonce = proof.nonce();
+        let fri_challenges = derive_batched_fri_challenges(
+            transcript,
+            &heights,
+            proof.fri_layers_merkle_roots(),
+            &fri_last_value,
+            grinding_factor,
+            nonce,
+            num_queries,
+            fri_domain_size,
+        );
+        let alpha = fri_challenges.alpha;
+        let betas_fri = fri_challenges.betas;
+        let iotas = fri_challenges.iotas;
+
+        // Grinding.
+        if grinding_factor > 0 {
+            let ok = nonce.is_some_and(|n| {
+                grinding::is_valid_nonce(&fri_challenges.grinding_seed, n, grinding_factor)
+            });
+            if !ok {
+                return false;
+            }
+        }
+
+        if proof.query_list_len() < num_queries || proof.deep_poly_openings_len() < num_queries {
+            return false;
+        }
+
+        // Per-table synthetic proofs + Challenges (reused by step 2 and the query
+        // loop). Built from borrowed per-table views: only the small OOD blocks are
+        // materialized (never a per-query opening). A failed PI deserialize rejects.
+        let synth_proofs: Vec<StarkProof<Field, FieldExtension, PI>> = match (0..num_tables)
+            .map(|i| Self::batched_synthetic_table_proof(proof.per_table(i)))
+            .collect::<Option<Vec<_>>>()
+        {
+            Some(v) => v,
+            None => return false,
+        };
+        // Move (not clone) each table's per-table coefficient vectors into its
+        // `Challenges`; they are never read again after this. Only `z` (one field
+        // element) and the shared `rap_challenges` are cloned per table.
+        let table_challenges: Vec<Challenges<FieldExtension>> = itertools::izip!(
+            boundary_coeffs_all,
+            transition_coeffs_all,
+            trace_term_coeffs_all,
+            gammas_all,
+        )
+        .map(
+            |(boundary_coeffs, transition_coeffs, trace_term_coeffs, gammas)| Challenges {
+                z: z.clone(),
+                boundary_coeffs,
+                transition_coeffs,
+                trace_term_coeffs,
+                gammas,
+                zetas: Vec::new(),
+                iotas: Vec::new(),
+                rap_challenges: lookup_challenges.clone(),
+                grinding_seed: [0u8; 32],
+            },
+        )
+        .collect();
+
+        // The full current+next-row OOD grid, reconstructed once per table from
+        // the two pruned proof blocks and shared by step 2, the query-invariant
+        // hoist, and the per-query DEEP reconstruction — exactly as
+        // `verify_rounds_2_to_4` reconstructs it once and threads it through.
+        // Pruned next-row entries are zero: no constraint reads them and DEEP
+        // skips them.
+        let ood_fulls: Vec<Table<FieldExtension>> = (0..num_tables)
+            .map(|i| {
+                let current = &synth_proofs[i].trace_ood_evaluations;
+                let next = &synth_proofs[i].trace_ood_next_evaluations;
+                layouts[i].reconstruct_full(
+                    current.row_major_data(),
+                    current.width,
+                    next.row_major_data(),
+                )
+            })
+            .collect();
+
+        // ===== Step 2 (claimed composition polynomial) per table. =====
+        for i in 0..num_tables {
+            if !Self::step_2_verify_claimed_composition_polynomial(
+                airs[i],
+                StarkProofView::Owned(&synth_proofs[i]),
+                &synth_proofs[i].public_inputs,
+                &domains[i],
+                &table_challenges[i],
+                &ood_fulls[i],
+                layouts[i].step_size(),
+            ) {
+                return false;
+            }
+        }
+
+        // MMCS binding data (all public / from the AIRs).
+        // Committed main-split width per table = full main columns minus the
+        // precomputed prefix. `context().trace_columns` counts every committed
+        // trace column (main + aux), so subtracting the aux and precomputed
+        // counts yields the main-split width. All three are AIR-intrinsic (not
+        // proof-supplied), so this binds the MMCS leaf boundaries independently
+        // of the prover. NB: `trace_layout().0` is NOT usable here — for
+        // step-packed AIRs (e.g. BitFlags) it is a logical layout figure, not
+        // the physical column count.
+        let main_widths: Vec<usize> = airs
+            .iter()
+            .map(|a| {
+                a.context().trace_columns
+                    - a.num_auxiliary_rap_columns()
+                    - a.num_precomputed_columns()
+            })
+            .collect();
+        let comp_widths: Vec<usize> = (0..num_tables)
+            .map(|i| {
+                proof
+                    .per_table(i)
+                    .composition_poly_parts_ood_evaluation()
+                    .len()
+            })
+            .collect();
+        let aux_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].has_aux_trace())
+            .collect();
+        let aux_heights: Vec<usize> = aux_indices.iter().map(|&i| heights[i]).collect();
+        let aux_widths: Vec<usize> = aux_indices
+            .iter()
+            .map(|&i| airs[i].num_auxiliary_rap_columns())
+            .collect();
+        let precomputed_indices: Vec<usize> = (0..num_tables)
+            .filter(|&i| airs[i].is_preprocessed())
+            .collect();
+
+        // alpha^i powers for the cross-table combination.
+        let mut alpha_pows: Vec<FieldElement<FieldExtension>> = Vec::with_capacity(num_tables);
+        {
+            let mut cur = FieldElement::<FieldExtension>::one();
+            for _ in 0..num_tables {
+                alpha_pows.push(cur.clone());
+                cur = &cur * &alpha;
+            }
+        }
+        let num_layers = proof.fri_layers_merkle_roots().len();
+
+        // Per-table DEEP query-invariant terms, hoisted out of the query loop
+        // (#826): the OOD/gamma sums depend only on each table's challenges and
+        // reconstructed OOD grid, not on the query point. g·z pruning: the
+        // transition-window columns (`layouts[i].next_row_cols()`) are the only
+        // next-row openings that survive, derived from the AIR (never the proof),
+        // and the pruned-away next-row terms are skipped — the same reconstruction
+        // the non-batched path performs and the batched prover's DEEP codeword
+        // committed.
+        let mut query_invariant_terms_all = Vec::with_capacity(num_tables);
+        for i in 0..num_tables {
+            let terms = match Self::compute_query_invariant_deep_terms(
+                &table_challenges[i],
+                StarkProofView::Owned(&synth_proofs[i]),
+                &ood_fulls[i],
+                layouts[i].next_row_cols(),
+                layouts[i].step_size(),
+                // Per-table trace generator `g` for the hoisted g^k·z DEEP
+                // denominator walk (sim/22 change #2). Same value the query loop
+                // hands `reconstruct_deep_composition_poly_evaluation_pair` below
+                // as `prim_root`; `trace_primitive_root == get_primitive_root_of_unity(root_order)`.
+                &domains[i].trace_primitive_root,
+            ) {
+                Some(t) => t,
+                None => return false,
+            };
+            query_invariant_terms_all.push(terms);
+        }
+
+        // sim-ro-query (Level B, MEASUREMENT-ONLY): gather each table's proof-
+        // constant per-column pointer table ONCE for the whole query loop — the
+        // same hoist the sound path applies in
+        // `reconstruct_deep_composition_poly_evaluations_for_all_queries`. The
+        // per-query DEEP ecall reads through these addresses, so the tables must
+        // outlive the loop; `coeff_col_ptrs_all[i]` lends its address per table.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+        let coeff_col_ptrs_all: Vec<Vec<u64>> = (0..num_tables)
+            .map(|i| {
+                table_challenges[i]
+                    .trace_term_coeffs
+                    .iter()
+                    .map(|c| c.as_ptr() as u64)
+                    .collect()
+            })
+            .collect();
+
+        // ===== Per query: MMCS openings, DEEP reconstruction, fold-and-inject FRI. =====
+        for (q, &iota) in iotas.iter().enumerate() {
+            let qo = proof.deep_poly_opening(q);
+
+            // 1) Authenticate the shared per-phase openings.
+            if !MixedMmcs::<Field>::verify_batch_view(
+                proof.main_root(),
+                iota,
+                qo.main(),
+                &heights,
+                &main_widths,
+            ) {
+                return false;
+            }
+            match (proof.aux_root(), qo.aux()) {
+                (Some(root), Some(aux_op)) => {
+                    if !MixedMmcs::<FieldExtension>::verify_batch_view(
+                        root,
+                        iota,
+                        aux_op,
+                        &aux_heights,
+                        &aux_widths,
+                    ) {
+                        return false;
+                    }
+                }
+                (None, None) => {}
+                _ => return false,
+            }
+            if !MixedMmcs::<FieldExtension>::verify_batch_view(
+                proof.composition_root(),
+                iota,
+                qo.composition(),
+                &heights,
+                &comp_widths,
+            ) {
+                return false;
+            }
+
+            // Precomputed openings (one per preprocessed table, in that order).
+            if qo.precomputed_len() != precomputed_indices.len() {
+                return false;
+            }
+            for (pc, &ti) in precomputed_indices.iter().enumerate() {
+                let root = match proof.per_table(ti).precomputed_root().copied() {
+                    Some(r) => r,
+                    None => return false,
+                };
+                let local = iota >> (h_max - heights[ti]);
+                if !Self::verify_opening_pair::<Field>(qo.precomputed(pc), &root, local) {
+                    return false;
+                }
+            }
+
+            // 2) Reconstruct each table's DEEP value at its opened row pair.
+            let mut deep_primary = vec![FieldElement::<FieldExtension>::zero(); num_tables];
+            let mut deep_sym = vec![FieldElement::<FieldExtension>::zero(); num_tables];
+            for i in 0..num_tables {
+                let leaf = iota >> (h_max - heights[i]);
+                // Per-matrix openings as borrowed views (owned or archived-in-place):
+                // their evaluation slices are read straight off the proof buffer.
+                let main_op = qo.main().per_matrix(i);
+                let comp_op = qo.composition().per_matrix(i);
+                let precomp_op = precomputed_indices
+                    .iter()
+                    .position(|&x| x == i)
+                    .map(|pc| qo.precomputed(pc));
+                let aux_op = aux_indices
+                    .iter()
+                    .position(|&x| x == i)
+                    .and_then(|ai| qo.aux().map(|a| a.per_matrix(ai)));
+
+                // Base columns as two borrowed slices in commit order
+                // (precomputed FIRST, then main) — the pair reconstruction
+                // resolves a base column via its own `base_at`, so there is no
+                // per-query concat allocation.
+                let precomp_p: &[FieldElement<Field>] =
+                    precomp_op.map(|p| p.evaluations()).unwrap_or(&[]);
+                let precomp_s: &[FieldElement<Field>] =
+                    precomp_op.map(|p| p.evaluations_sym()).unwrap_or(&[]);
+                let aux_p: &[FieldElement<FieldExtension>] =
+                    aux_op.map(|a| a.evaluations()).unwrap_or(&[]);
+                let aux_s: &[FieldElement<FieldExtension>] =
+                    aux_op.map(|a| a.evaluations_sym()).unwrap_or(&[]);
+
+                let prim_root = &domains[i].trace_primitive_root;
+                let ep_p = domains[i]
+                    .lde_coset_element(reverse_index(leaf * 2, domains[i].lde_length as u64));
+                let ep_s = domains[i]
+                    .lde_coset_element(reverse_index(leaf * 2 + 1, domains[i].lde_length as u64));
+
+                // Reconstruct the DEEP value at the query's row pair (regular +
+                // symmetric) together, sharing the hoisted OOD/gamma sums (#826).
+                #[cfg(all(target_arch = "riscv64", feature = "sim-ro-query"))]
+                let coeff_col_ptrs_ptr = coeff_col_ptrs_all[i].as_ptr() as u64;
+                #[cfg(not(all(target_arch = "riscv64", feature = "sim-ro-query")))]
+                let coeff_col_ptrs_ptr = 0u64;
+                let (dp, ds) = match Self::reconstruct_deep_composition_poly_evaluation_pair(
+                    &ep_p,
+                    &ep_s,
+                    prim_root,
+                    &table_challenges[i],
+                    &query_invariant_terms_all[i],
+                    layouts[i].next_row_cols(),
+                    layouts[i].step_size(),
+                    precomp_p,
+                    main_op.evaluations(),
+                    aux_p,
+                    comp_op.evaluations(),
+                    precomp_s,
+                    main_op.evaluations_sym(),
+                    aux_s,
+                    comp_op.evaluations_sym(),
+                    coeff_col_ptrs_ptr,
+                ) {
+                    Some(v) => v,
+                    None => return false,
+                };
+                deep_primary[i] = dp;
+                deep_sym[i] = ds;
+            }
+
+            // combined[h] at a codeword position selected by `bit` (0 -> primary
+            // row, 1 -> symmetric row): Sum over tables at height h of alpha^i * deep_i.
+            let combined_at = |h: usize, bit: usize| -> FieldElement<FieldExtension> {
+                let mut acc = FieldElement::<FieldExtension>::zero();
+                for i in 0..num_tables {
+                    if heights[i] == h {
+                        let d = if bit == 0 {
+                            &deep_primary[i]
+                        } else {
+                            &deep_sym[i]
+                        };
+                        acc += &alpha_pows[i] * d;
+                    }
+                }
+                acc
+            };
+
+            // 3) Fold-and-inject FRI (inverse of `batched_commit_phase`).
+            let c_hmax = combined_at(h_max, 0);
+            let c_hmax_sym = combined_at(h_max, 1);
+
+            let ep0 = domains[tallest]
+                .lde_coset_element(reverse_index(iota * 2, domains[tallest].lde_length as u64));
+            let ep0_inv = match ep0.inv() {
+                Ok(v) => v,
+                Err(_) => return false,
+            };
+
+            // Initial fold of the (uncommitted) tallest layer with betas_fri[0].
+            let mut v =
+                (&c_hmax + &c_hmax_sym) + ep0_inv.clone() * &betas_fri[0] * (&c_hmax - &c_hmax_sym);
+            let mut index = iota;
+            let mut point_inv = ep0_inv.square();
+
+            let fri_deco = proof.query(q);
+            let layers_evaluations_sym = fri_deco.layers_evaluations_sym();
+            if fri_deco.layers_auth_paths_len() != num_layers
+                || layers_evaluations_sym.len() != num_layers
+            {
+                return false;
+            }
+            let fri_roots = proof.fri_layers_merkle_roots();
+
+            let mut fold_ok = true;
+            for iter in 0..num_layers {
+                let h = h_max - 1 - iter;
+                // Inject the tables entering at this height (adds zero if none).
+                let inj = combined_at(h, index & 1);
+                v += betas_fri[iter].square() * inj;
+
+                let eval_sym = &layers_evaluations_sym[iter];
+                fold_ok &= Self::verify_fri_layer_openings(
+                    &fri_roots[iter],
+                    fri_deco.layer_auth_path(iter),
+                    &v,
+                    eval_sym,
+                    index,
+                );
+
+                v = (&v + eval_sym) + point_inv.clone() * &betas_fri[iter + 1] * (&v - eval_sym);
+                index >>= 1;
+                point_inv = point_inv.square();
+            }
+            if !fold_ok || v != fri_last_value {
+                return false;
+            }
+        }
+
+        // ===== Bus balance. =====
+        if needs_lookup_challenges {
+            let mut total = FieldElement::<FieldExtension>::zero();
+            for (i, air) in airs.iter().enumerate() {
+                if air.has_trace_interaction()
+                    && let Some(contribution) = proof.per_table(i).bus_table_contribution()
+                {
+                    total = total + &contribution;
+                }
+            }
+            if total != *expected_bus_balance {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    /// Continuation epoch verifier: verify the epoch's VM tables with the batched
+    /// (unified-shard) FRI while verifying the single L2G sub-table as a SEPARATE
+    /// commitment lane. Mirrors `IsStarkProver::multi_prove_batched_epoch`'s
+    /// transcript order exactly:
+    ///
+    /// 1. Absorb the L2G main root FIRST.
+    /// 2. `batched_verify_rounds_1_to_3` over the VM tables (to the round-4 seam).
+    /// 3. At the seam, FORK the transcript (single lane -> no idx bytes; then absorb
+    ///    the L2G aux root, then the L2G bus `table_contribution`) and verify the
+    ///    L2G lane via `verify_rounds_2_to_4` with the shared LogUp challenges.
+    /// 4. `batched_verify_round_4` for the VM tables on the main transcript.
+    fn batched_verify_epoch(
+        vm_refs: &[&dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>],
+        l2g_ref: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        vm_proof: BatchedMultiProofView<'_, Field, FieldExtension, PI>,
+        l2g_proof: StarkProofView<'_, Field, FieldExtension, PI>,
+        transcript: &mut (impl IsStarkTranscript<FieldExtension, Field> + Clone),
+        expected_bus_balance: &FieldElement<FieldExtension>,
+    ) -> bool
+    where
+        FieldElement<Field>: AsBytes + Sync + Send,
+        FieldElement<FieldExtension>: AsBytes + Sync + Send,
+        PI: Clone,
+    {
+        // (1) Mirror the prover: absorb the L2G main root FIRST (canonical order).
+        transcript.append_bytes(l2g_proof.lde_trace_main_merkle_root());
+
+        // (2) VM rounds 1-3 to the round-4 seam.
+        let mid = match Self::batched_verify_rounds_1_to_3(vm_refs, vm_proof, transcript) {
+            Some(m) => m,
+            None => return false,
+        };
+
+        // (3) L2G lane on a fork of the post-seam transcript. Single lane -> no idx
+        // bytes; absorb the aux root then the bus table_contribution (matches the
+        // prover's fork in `multi_prove_batched_epoch`).
+        let l2g_public_inputs = match l2g_proof.public_inputs() {
+            Some(pi) => pi,
+            None => return false,
+        };
+        let mut l2g_fork = transcript.clone();
+        if let Some(aux_root) = l2g_proof.lde_trace_aux_merkle_root() {
+            l2g_fork.append_bytes(aux_root);
+        }
+        if let Some(contribution) = l2g_proof.bus_table_contribution() {
+            l2g_fork.append_field_element(&contribution);
+        }
+        let l2g_ok = Self::verify_rounds_2_to_4(
+            l2g_ref,
+            l2g_proof,
+            &l2g_public_inputs,
+            &mut l2g_fork,
+            mid.lookup_challenges.clone(),
+        );
+
+        // (4) VM batched Round 4 continues on the main (un-cloned) transcript.
+        //
+        // Bus balance: L2G shares the in-trace Memory / range-check buses with the
+        // VM tables. The monolithic check summed table_contribution over VM + L2G
+        // against the COMMIT offset; batched_verify_round_4 sums only the VM lane,
+        // so fold L2G's contribution into the target:
+        //   Sum_VM table_contribution == expected - L2G_contribution
+        // i.e. Sum_VM + L2G == expected. L2G's table_contribution is bound to its
+        // committed trace by the L2G proof verified above, so this stays sound.
+        let mut vm_expected = expected_bus_balance.clone();
+        if l2g_ref.has_trace_interaction()
+            && let Some(contribution) = l2g_proof.bus_table_contribution()
+        {
+            vm_expected = &vm_expected - &contribution;
+        }
+        let vm_ok = Self::batched_verify_round_4(mid, vm_refs, vm_proof, transcript, &vm_expected);
+
+        l2g_ok && vm_ok
     }
 }

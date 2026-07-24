@@ -62,31 +62,60 @@ impl<F: IsField> FieldElement<F> {
     /// The parallel path enforces this with a zero pre-scan; the sequential
     /// path checks before any mutation.
     pub fn inplace_batch_inverse(numbers: &mut [Self]) -> Result<(), FieldError> {
-        #[cfg(feature = "parallel")]
+        // EXPERIMENT 5: with a per-element inverse HINT (1 ecall + 1 in-circuit
+        // mul check per element), a DIRECT inversion beats the Montgomery batch
+        // loop, which trades one inversion for 3(N-1) multiplications plus a
+        // prefix-product `Vec`. The batching only ever existed because software
+        // inversion (a ~72-mul addition chain, or the Fp3 norm reduction) was far
+        // costlier than a multiply; with hints that inequality flips, so the whole
+        // batch machinery is pure overhead here. Pre-scan for zeros first so the
+        // mutation stays all-or-nothing, matching the batch contract below.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
         {
-            // Montgomery batch inverse has a serial prefix-product dependency, but
-            // chunks are independent — each chunk inverts its own elements without
-            // needing values from other chunks. Trade K-1 extra field inversions
-            // (negligible vs ~2N mults per chunk) for K-way parallelism.
-            const PARALLEL_BATCH_INV_THRESHOLD: usize = 1 << 16;
-            if numbers.len() >= PARALLEL_BATCH_INV_THRESHOLD {
-                use rayon::prelude::*;
-                // Pre-scan for zeros so the mutation step is all-or-nothing.
-                // Without this, a chunk containing zero would return Err while
-                // sibling chunks may have already overwritten their elements.
-                let zero = Self::zero();
-                if numbers.par_iter().any(|x| x == &zero) {
-                    return Err(FieldError::InvZeroError);
-                }
-                let chunk_size = numbers.len().div_ceil(rayon::current_num_threads().max(1));
-                return numbers
-                    .par_chunks_mut(chunk_size)
-                    .try_for_each(Self::inplace_batch_inverse_sequential);
+            let zero = Self::zero();
+            if numbers.iter().any(|x| x == &zero) {
+                return Err(FieldError::InvZeroError);
             }
+            for x in numbers.iter_mut() {
+                *x = x.inv()?;
+            }
+            Ok(())
         }
-        Self::inplace_batch_inverse_sequential(numbers)
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-inv-hint")))]
+        {
+            #[cfg(feature = "parallel")]
+            {
+                // Montgomery batch inverse has a serial prefix-product dependency,
+                // but chunks are independent — each chunk inverts its own elements
+                // without needing values from other chunks. Trade K-1 extra field
+                // inversions (negligible vs ~2N mults per chunk) for K-way
+                // parallelism.
+                const PARALLEL_BATCH_INV_THRESHOLD: usize = 1 << 16;
+                if numbers.len() >= PARALLEL_BATCH_INV_THRESHOLD {
+                    use rayon::prelude::*;
+                    // Pre-scan for zeros so the mutation step is all-or-nothing.
+                    // Without this, a chunk containing zero would return Err while
+                    // sibling chunks may have already overwritten their elements.
+                    let zero = Self::zero();
+                    if numbers.par_iter().any(|x| x == &zero) {
+                        return Err(FieldError::InvZeroError);
+                    }
+                    let chunk_size = numbers.len().div_ceil(rayon::current_num_threads().max(1));
+                    return numbers
+                        .par_chunks_mut(chunk_size)
+                        .try_for_each(Self::inplace_batch_inverse_sequential);
+                }
+            }
+            Self::inplace_batch_inverse_sequential(numbers)
+        }
     }
 
+    // Unused on the riscv64 `sim-inv-hint` guest build, where the direct
+    // per-element hint path above replaces the Montgomery batch loop entirely.
+    #[cfg_attr(
+        all(target_arch = "riscv64", feature = "sim-inv-hint"),
+        allow(dead_code)
+    )]
     fn inplace_batch_inverse_sequential(numbers: &mut [Self]) -> Result<(), FieldError> {
         if numbers.is_empty() {
             return Ok(());

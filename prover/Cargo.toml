@@ -13,6 +13,57 @@ debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Forwards to
+# `crypto`; only affects the riscv64 guest verifier. EXECUTE-ONLY (never prove).
+sim-hash-ecalls = ["crypto/sim-hash-ecalls"]
+# Merkle path-verify measurement stub (ROUND-2 increment A). Forwards to
+# `crypto`; only affects the riscv64 guest verifier. EXECUTE-ONLY (never prove).
+sim-path-ecall = ["crypto/sim-path-ecall"]
+# Transcript challenge-sampling measurement stubs (ROUND-2 increment B). Forwards
+# to `crypto`; only affects the riscv64 guest verifier. EXECUTE-ONLY (never prove).
+sim-sample-ecall = ["crypto/sim-sample-ecall"]
+# Route the recursion verifier's Fp3 mul-add through the real FEXT accelerator on
+# the riscv64 guest (PR #818/#831). Forwards to `crypto`. Measurement toggle.
+fext-accel = ["crypto/fext-accel"]
+# Route the verifier's base×ext products through the FEXT_BASE_MUL chip. Forwards
+# to `crypto`; measurement sub-toggle isolating FEXT_BASE_MUL's delta on top of
+# fext-accel.
+fext-base-mul = ["crypto/fext-base-mul"]
+# Fp3 inverse via the FEXT_INV accelerator (completes the FEXT chip API).
+# Forwards to `math`; only affects the riscv64 guest verifier's field inversion,
+# where the guest's software check-multiply moves into the chip. Measurement
+# toggle; takes priority over `sim-inv-hint`.
+fext-inv = ["math/fext-inv"]
+# Route Fp3×Fp3 multiplication through the FEXT chip (the constraint-eval / LogUp
+# / zerofier ext×ext sites). Forwards to the math chain. riscv64-only effect.
+fext-ext-mul = ["math/fext-ext-mul"]
+# MEASUREMENT-ONLY reduced-opening stub features (EXPERIMENT 2), forwarded to the
+# verifier. Never prove a build with these on. See crypto/stark features.
+sim-ro-ecalls = ["stark/sim-ro-ecalls"]
+sim-ro-query = ["stark/sim-ro-query"]
+# ROUND-2 increment C: in-place reduced-opening ABI. Forwarded to the verifier.
+# Use instead of sim-ro-ecalls. EXECUTE-ONLY (never prove).
+sim-ro-inplace = ["stark/sim-ro-inplace"]
+# Goldilocks inverse HINT (EXPERIMENT 5). Forwards to `math`; only affects the
+# riscv64 guest verifier's field inversion. EXECUTE-ONLY (never prove).
+sim-inv-hint = ["math/sim-inv-hint"]
+# MID-LEVEL accelerator measurement stubs (sim/27). `sim-pow` forwards to `math`
+# (the pow overrides); `sim-poly-eval` / `sim-fold-chain` forward to the verifier
+# (`stark`). EXECUTE-ONLY: never prove a build with any of these on.
+sim-pow = ["math/sim-pow"]
+sim-poly-eval = ["stark/sim-poly-eval"]
+sim-fold-chain = ["stark/sim-fold-chain"]
+sim-verify-path-batch = ["stark/sim-verify-path-batch"]
+sim-constraint-eval = ["stark/sim-constraint-eval"]
+sim-domain-points = ["stark/sim-domain-points"]
+# sim/31: offload the REGISTER preprocessed commitment. The guest override lives
+# in `tables::register` (this crate), so the feature forwards straight to the
+# syscalls wrapper rather than through `stark`.
+sim-register-commit = ["lambda-vm-syscalls/sim-register-commit"]
+# R9 SIM_FIELD_PAGES: skip the rkyv bytecheck pass on the continuation-v2 blob
+# (guest-side omission in recursion.rs — models commitment-checked typed input).
+# EXECUTE-ONLY: never prove.
+sim-field-pages = []
 
 [dependencies]
 stark = { path = "../crypto/stark" }
@@ -20,6 +71,9 @@ crypto = { path = "../crypto/crypto" }
 math = { path = "../crypto/math" }
 executor = { path = "../executor" }
 ecsm = { path = "../crypto/ecsm" }
+# Only used by the guest `sim-register-commit` override (riscv64) to reach the
+# ecall wrapper; a no-op on host builds.
+lambda-vm-syscalls = { path = "../syscalls" }
 rayon = { version = "1.8.0", optional = true }
 sysinfo = { version = "0.31", default-features = false, features = ["system"] }
 log = "0.4"

@@ -53,8 +53,9 @@ use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
     create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
-    create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
-    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_ecsm_air, create_eq_air, create_fext_fma_air, create_fext_load_air,
+    create_fext_page_air, create_fext_store_air, create_halt_air, create_keccak_air,
+    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
     create_register_air, create_shift_air, create_store_air,
 };
@@ -65,8 +66,13 @@ use crate::test_utils::{
 // fixed at guest build time (`recursion::Preset`).
 pub use stark::config::Commitment;
 pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+use stark::proof::stark::BatchedMultiProof;
+// `MultiProof` now appears only in the `#[cfg(test)]` monolithic-replay helpers
+// (the production continuation path binds the global proof through a
+// `MultiProofView`); gate the import so the non-test lib build stays warning-clean.
+#[cfg(test)]
 use stark::proof::stark::MultiProof;
-use stark::proof::view::{MultiProofView, ProofViewSource};
+use stark::proof::view::{MultiProofView, StarkProofView};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
@@ -82,8 +88,8 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ecdas.
-pub const FIXED_TABLE_COUNT: usize = 10;
+/// keccak_rc, register, ecsm, ecdas, fext_load, fext_fma, fext_store, fext_page.
+pub const FIXED_TABLE_COUNT: usize = 14;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
@@ -161,8 +167,8 @@ impl TableCounts {
 /// needed by the verifier to reconstruct the AIR configuration.
 #[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VmProof {
-    /// The multi-table STARK proof.
-    pub proof: MultiProof<F, E, ()>,
+    /// The multi-table STARK proof (unified-shard / batched MMCS).
+    pub proof: BatchedMultiProof<F, E, ()>,
     /// Run-length encoded runtime page ranges.
     /// These are zero-initialized pages accessed during execution but not
     /// covered by ELF segments (stack, heap, etc.).
@@ -194,6 +200,33 @@ pub struct GuestInput {
     pub page_commitments: Vec<(u64, Commitment)>,
 }
 
+/// The v2 (`attest-commitment-id`) private-input bundle: like [`GuestInput`] but
+/// the guest never parses or hashes the inner ELF. Instead it receives the two
+/// derived values verification needs directly — the entry point (for the
+/// REGISTER preprocessed commitment) and the full-ELF digest (for the statement
+/// transcript absorb) — and reconstructs the PAGE layout from the supplied
+/// commitments (see [`verify_recursion_blob_v2`]). `program_id_v2` folds only
+/// the entry point + roots, not the digest, so identity is bound by what the
+/// proof enforces (see `recursion::program_id_v2`).
+///
+/// `inner_elf` is retained but MAY be empty: it is never consumed on this path
+/// (kept only so a measurement blob can carry the ELF bytes to isolate the
+/// cycle saving from the blob-size saving, and for forward compatibility).
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GuestInputV2 {
+    pub vm_proof: VmProof,
+    /// Unused on the v2 path; may be empty. See the struct docs.
+    pub inner_elf: Vec<u8>,
+    /// Full-ELF Keccak digest — supplied for the statement absorb only (NOT
+    /// folded into the identity).
+    pub elf_digest: [u8; 32],
+    /// Program entry point — feeds the REGISTER preprocessed commitment and the
+    /// attested identity.
+    pub entry_point: u64,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
 // ============================================================================
 // Recursion-input wire format: aligning magic prefix + rkyv archive
 // ============================================================================
@@ -211,6 +244,12 @@ pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
 
 /// Wire-format version of the recursion input blob.
 pub const RECURSION_INPUT_VERSION: u32 = 1;
+
+/// Wire-format version of the v2 (`attest-commitment-id`) recursion input blob
+/// ([`GuestInputV2`] / continuation `ContinuationGuestInputV2`). A guest built
+/// for one scheme rejects the other's blobs on this version tag before the
+/// unsafe access.
+pub const RECURSION_INPUT_VERSION_V2: u32 = 2;
 
 /// Required alignment (bytes) of the archive's first byte in guest memory.
 pub const RECURSION_INPUT_ALIGN: usize = 16;
@@ -239,11 +278,32 @@ const _: () = {
 /// both aligns the archive in guest memory (so in-place reads don't trap) and
 /// tags the format/version so the guest can validate before the unsafe access.
 pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
+    encode_recursion_archive(input, RECURSION_INPUT_VERSION)
+}
+
+/// Encode a [`GuestInputV2`] on the v2 wire (version [`RECURSION_INPUT_VERSION_V2`]).
+pub fn encode_recursion_input_v2(input: &GuestInputV2) -> Result<Vec<u8>, Error> {
+    encode_recursion_archive(input, RECURSION_INPUT_VERSION_V2)
+}
+
+/// Shared blob encoder: aligning `magic + version + reserved` prefix followed by
+/// the rkyv archive of `input`. The prefix both aligns the archive in guest
+/// memory (so in-place reads don't trap) and tags the format/version.
+pub(crate) fn encode_recursion_archive<T>(input: &T, version: u32) -> Result<Vec<u8>, Error>
+where
+    T: for<'a> rkyv::Serialize<
+            rkyv::api::high::HighSerializer<
+                rkyv::util::AlignedVec,
+                rkyv::ser::allocator::ArenaHandle<'a>,
+                rkyv::rancor::Error,
+            >,
+        >,
+{
     let archive = rkyv::to_bytes::<rkyv::rancor::Error>(input)
         .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
     let mut blob = Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
     blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
-    blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&version.to_le_bytes());
     blob.extend_from_slice(&[0u8; 4]); // reserved
     debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
     blob.extend_from_slice(&archive);
@@ -254,6 +314,12 @@ pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
 /// Returns `None` if the magic or version doesn't match — the caller should
 /// halt cleanly rather than proceed into an `access_unchecked`.
 pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
+    recursion_archive_bytes_for_version(blob, RECURSION_INPUT_VERSION)
+}
+
+/// [`recursion_archive_bytes`] for an explicit expected wire version — a guest
+/// built for one scheme (v1 vs v2) accepts only its own version tag.
+pub fn recursion_archive_bytes_for_version(blob: &[u8], expected_version: u32) -> Option<&[u8]> {
     if blob.len() < RECURSION_INPUT_PREFIX_LEN {
         return None;
     }
@@ -261,28 +327,30 @@ pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
         return None;
     }
     let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
-    if version != RECURSION_INPUT_VERSION {
+    if version != expected_version {
         return None;
     }
     Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
 }
 
 /// Validate a recursion-input blob's wire prefix and bytecheck-validate its
-/// archive, in place. Shared by [`verify_recursion_blob`] and
-/// [`crate::recursion::verify_continuation_and_attest`].
+/// archive, in place. Used by [`verify_recursion_blob_v2`] and
+/// [`crate::recursion::verify_continuation_and_attest_v2`] (the v2 paths); the v1
+/// [`verify_recursion_blob`] keeps its own inline access (sim/18 zero-copy).
 ///
 /// Returns the archived value, the original (possibly-unaligned) archive
 /// bytes, and the base pointer `archived` reads from — callers rebasing
 /// zero-copy subslices back onto `blob` need that base.
 pub(crate) fn access_recursion_archive<'s, 'a: 's, T>(
     blob: &'a [u8],
+    expected_version: u32,
     aligned_fallback: &'s mut rkyv::util::AlignedVec<RECURSION_INPUT_ALIGN>,
 ) -> Result<(&'s T, &'a [u8], *const u8), Error>
 where
     T: rkyv::Portable
         + for<'b> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'b, rkyv::rancor::Error>>,
 {
-    let archive_bytes: &'a [u8] = recursion_archive_bytes(blob)
+    let archive_bytes: &'a [u8] = recursion_archive_bytes_for_version(blob, expected_version)
         .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
 
     let archive: &'s [u8] =
@@ -343,15 +411,31 @@ pub fn verify_recursion_blob<'a>(
 ) -> Result<RecursionVerification<'a>, Error> {
     use rkyv::rancor::Error as RkyvError;
 
-    // In the guest the blob's archive starts at the 16-aligned archive base
-    // (the wire prefix exists precisely so the archive lands aligned at
+    // Validate + strip the aligning magic/version prefix. In the guest the
+    // returned slice starts at the 16-aligned archive base (the prefix exists
+    // precisely so the archive lands aligned at
     // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
-    // loads do not trap. A host caller's buffer carries no such guarantee
-    // (`Vec<u8>` is align-1), so `access_recursion_archive` falls back to one
-    // aligned copy in `aligned_fallback` when the base is misaligned.
-    let mut aligned_fallback = rkyv::util::AlignedVec::<RECURSION_INPUT_ALIGN>::new();
-    let (archived, archive_bytes, archive_base): (&ArchivedGuestInput, &[u8], *const u8) =
-        access_recursion_archive(blob, &mut aligned_fallback)?;
+    // loads do not trap.
+    let archive_bytes = recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+
+    // A host caller's buffer carries no alignment guarantee (`Vec<u8>` is
+    // align-1) — in-place access there would be UB. Fall back to one aligned
+    // copy when the base is misaligned; the guest path is aligned by
+    // construction and stays zero-copy.
+    let mut aligned_fallback = rkyv::util::AlignedVec::<{ RECURSION_INPUT_ALIGN }>::new();
+    let archive: &[u8] = if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN)
+    {
+        archive_bytes
+    } else {
+        aligned_fallback.extend_from_slice(archive_bytes);
+        &aligned_fallback
+    };
+
+    // `blob` is untrusted; validate before the zero-copy access.
+    let archived = rkyv::access::<ArchivedGuestInput, RkyvError>(archive).map_err(|e| {
+        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
+    })?;
 
     // Materialize only the small metadata; the proof stays in the buffer.
     let table_counts: TableCounts =
@@ -373,11 +457,11 @@ pub fn verify_recursion_blob<'a>(
     let public_output: &[u8] = archived.vm_proof.public_output.as_slice();
     let decode_commitment: Commitment = archived.decode_commitment;
 
-    // Rebase the returned slices onto the caller's buffer: `archived` may
-    // point into the aligned fallback copy, whose lifetime ends with this
-    // call. Same bytes at the same offsets in both buffers.
+    // Rebase the returned slices onto the caller's buffer: `archive` may be
+    // the aligned fallback copy, whose lifetime ends with this call. Same
+    // bytes at the same offsets in both buffers.
     let rebase = |s: &[u8]| -> &'a [u8] {
-        let offset = s.as_ptr() as usize - archive_base as usize;
+        let offset = s.as_ptr() as usize - archive.as_ptr() as usize;
         &archive_bytes[offset..offset + s.len()]
     };
     let inner_elf_rebased = rebase(inner_elf);
@@ -389,13 +473,25 @@ pub fn verify_recursion_blob<'a>(
     let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let elf_digest = statement::elf_digest(inner_elf);
 
-    let ok = verify_proof_parts(
-        MultiProofView::Archived(&archived.vm_proof.proof),
-        &table_counts,
-        &runtime_page_ranges,
+    // The batched (unified-shard) proof has no zero-copy view machinery yet —
+    // `StarkProofView` and `verify_proof_parts` target the per-table
+    // `MultiProof` format — so materialize the proof and verify through the
+    // batched verifier. TODO(batched-fri): port the view machinery to
+    // `BatchedMultiProof` to restore fully in-place verification.
+    let proof: BatchedMultiProof<F, E, ()> =
+        rkyv::deserialize::<BatchedMultiProof<F, E, ()>, RkyvError>(&archived.vm_proof.proof)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize proof failed: {e}")))?;
+    let vm_proof = VmProof {
+        proof,
+        runtime_page_ranges: runtime_page_ranges.clone(),
+        table_counts: table_counts.clone(),
+        public_output: public_output.to_vec(),
         num_private_input_pages,
-        public_output,
+    };
+    let ok = verify_prepared(
+        &vm_proof,
         &program,
+        None,
         &elf_digest,
         proof_options,
         Some(decode_commitment),
@@ -410,6 +506,120 @@ pub fn verify_recursion_blob<'a>(
         page_commitments,
         elf_digest,
         entry_point: program.entry_point,
+    })
+}
+
+/// Result of a v2 (`attest-commitment-id`) recursion-blob verification. Unlike
+/// [`RecursionVerification`] there is no `elf_digest`/`inner_elf` to return for a
+/// `program_id` fold — the v2 identity ([`recursion::program_id_v2`]) uses only
+/// the entry point and the supplied roots.
+pub struct RecursionVerificationV2<'a> {
+    /// Whether the inner proof verified.
+    pub ok: bool,
+    /// The inner proof's committed public output (zero-copy from the blob).
+    pub public_output: &'a [u8],
+    /// The supplied DECODE commitment (zero-copy from the blob).
+    pub decode_commitment: Commitment,
+    /// The supplied page-genesis commitments (materialized — small).
+    pub page_commitments: Vec<(u64, Commitment)>,
+    /// The supplied entry point — folded into the v2 identity.
+    pub entry_point: u64,
+}
+
+/// Verify a v2 recursion-input blob ([`encode_recursion_input_v2`]) in place.
+///
+/// The v2 (`attest-commitment-id`) path never parses or hashes the inner ELF:
+/// the entry point and the full-ELF digest are supplied (the latter only for the
+/// statement absorb, not the identity), and the PAGE layout is reconstructed from
+/// the supplied commitments via
+/// [`Traces::page_configs_from_commitments_and_runtime`]. VmAirs is built from a
+/// minimal `Elf` carrying only the supplied entry point (the DECODE and PAGE
+/// preprocessed roots are supplied, so no ELF segments are needed). Everything
+/// else — statement absorb, transcript, bus balance, `multi_verify` — is the
+/// identical `verify_proof_parts` path as v1.
+pub fn verify_recursion_blob_v2<'a>(
+    blob: &'a [u8],
+    proof_options: &ProofOptions,
+) -> Result<RecursionVerificationV2<'a>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    let mut aligned_fallback = rkyv::util::AlignedVec::<RECURSION_INPUT_ALIGN>::new();
+    let (archived, archive_bytes, archive_base): (&ArchivedGuestInputV2, &[u8], *const u8) =
+        access_recursion_archive(blob, RECURSION_INPUT_VERSION_V2, &mut aligned_fallback)?;
+
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.vm_proof.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: Vec<RuntimePageRange> = rkyv::deserialize::<
+        Vec<RuntimePageRange>,
+        RkyvError,
+    >(&archived.vm_proof.runtime_page_ranges)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let num_private_input_pages = archived.vm_proof.num_private_input_pages.to_native() as usize;
+    let public_output: &[u8] = archived.vm_proof.public_output.as_slice();
+    let decode_commitment: Commitment = archived.decode_commitment;
+    let elf_digest: [u8; 32] = archived.elf_digest;
+    let entry_point: u64 = archived.entry_point.to_native();
+
+    // Rebase the zero-copy public output onto the caller's buffer (same as v1).
+    let rebase = |s: &[u8]| -> &'a [u8] {
+        let offset = s.as_ptr() as usize - archive_base as usize;
+        &archive_bytes[offset..offset + s.len()]
+    };
+    let public_output_rebased = rebase(public_output);
+
+    // Reconstruct the PAGE layout from the supplied commitments — no ELF parse.
+    let page_configs = Traces::page_configs_from_commitments_and_runtime(
+        &page_commitments,
+        &runtime_page_ranges,
+        num_private_input_pages,
+    );
+
+    // Minimal ELF: only the supplied entry point is consumed (for the REGISTER
+    // preprocessed commitment); DECODE/PAGE roots are supplied, so no segments.
+    let program = Elf {
+        entry_point,
+        data: Vec::new(),
+    };
+
+    // The batched (unified-shard) proof has no zero-copy view machinery yet, so
+    // materialize it and verify through the batched verifier — exactly like v1's
+    // `verify_recursion_blob`. The v2 difference is purely the supplied,
+    // commitment-derived PAGE layout (`Some(&page_configs)`), so `verify_prepared`
+    // skips the ELF-based `page_configs_from_elf_and_runtime` (the minimal
+    // `program` has no segments). TODO(batched-fri): port the view machinery to
+    // restore fully in-place verification here too.
+    let proof: BatchedMultiProof<F, E, ()> =
+        rkyv::deserialize::<BatchedMultiProof<F, E, ()>, RkyvError>(&archived.vm_proof.proof)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize proof failed: {e}")))?;
+    let vm_proof = VmProof {
+        proof,
+        runtime_page_ranges: runtime_page_ranges.clone(),
+        table_counts: table_counts.clone(),
+        public_output: public_output.to_vec(),
+        num_private_input_pages,
+    };
+    let ok = verify_prepared(
+        &vm_proof,
+        &program,
+        Some(&page_configs),
+        &elf_digest,
+        proof_options,
+        Some(decode_commitment),
+        Some(&page_commitments),
+    )?;
+
+    Ok(RecursionVerificationV2 {
+        ok,
+        public_output: public_output_rebased,
+        decode_commitment,
+        page_commitments,
+        entry_point,
     })
 }
 
@@ -438,6 +648,12 @@ pub enum Error {
     /// A non-final continuation epoch contains the program-terminating
     /// instruction. The terminating instruction must be in the final epoch.
     HaltInNonFinalEpoch,
+    /// A FEXT (field-extension) accelerator ecall was used under continuation.
+    /// Field-storage is not carried across epochs yet (only RAM and registers
+    /// are), so a value written in one epoch would read back as zero in the
+    /// next — an unsound reset. Rejected until L2G field-storage carry lands;
+    /// prove monolithically in the meantime.
+    FextInContinuation,
     /// Recursion host-side helper failed (guest-input encoding or
     /// commitment recompute — see the `recursion` module).
     Recursion(String),
@@ -467,6 +683,13 @@ impl fmt::Display for Error {
                 write!(
                     f,
                     "the program-terminating instruction must be in the final epoch"
+                )
+            }
+            Error::FextInContinuation => {
+                write!(
+                    f,
+                    "FEXT accelerator ecalls are not supported under continuation \
+                     (field-storage is not carried across epochs); prove monolithically"
                 )
             }
             Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
@@ -503,6 +726,10 @@ pub(crate) struct VmAirs {
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
     pub ecdas: VmAir,
+    pub fext_load: VmAir,
+    pub fext_fma: VmAir,
+    pub fext_store: VmAir,
+    pub fext_page: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
@@ -528,6 +755,10 @@ impl VmAirs {
             (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
             (self.ecsm.as_ref(), &mut traces.ecsm, &()),
             (self.ecdas.as_ref(), &mut traces.ecdas, &()),
+            (self.fext_load.as_ref(), &mut traces.fext_load, &()),
+            (self.fext_fma.as_ref(), &mut traces.fext_fma, &()),
+            (self.fext_store.as_ref(), &mut traces.fext_store, &()),
+            (self.fext_page.as_ref(), &mut traces.fext_page, &()),
             (self.register.as_ref(), &mut traces.register, &()),
         ];
         if self.include_halt {
@@ -602,6 +833,10 @@ impl VmAirs {
             self.keccak_rc.as_ref(),
             self.ecsm.as_ref(),
             self.ecdas.as_ref(),
+            self.fext_load.as_ref(),
+            self.fext_fma.as_ref(),
+            self.fext_store.as_ref(),
+            self.fext_page.as_ref(),
             self.register.as_ref(),
         ];
         if self.include_halt {
@@ -759,6 +994,10 @@ impl VmAirs {
         ));
         let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
         let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
+        let fext_load: VmAir = Box::new(create_fext_load_air(proof_options));
+        let fext_fma: VmAir = Box::new(create_fext_fma_air(proof_options));
+        let fext_store: VmAir = Box::new(create_fext_store_air(proof_options));
+        let fext_page: VmAir = Box::new(create_fext_page_air(proof_options));
         let register: VmAir =
             if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
                 Box::new(
@@ -865,6 +1104,10 @@ impl VmAirs {
             keccak_rc,
             ecsm,
             ecdas,
+            fext_load,
+            fext_fma,
+            fext_store,
+            fext_page,
             register,
             pages,
             memw_registers,
@@ -880,6 +1123,30 @@ impl VmAirs {
 // =============================================================================
 // Bus Balance Target: Verifier-Computed COMMIT Output Bus
 // =============================================================================
+
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
+/// trace commitments in the same order as the prover, then samples two
+/// challenge elements.
+///
+/// Only the batched analogue is used in the production path now; this
+/// non-batched replay is retained for the monolithic-style test helpers.
+#[cfg(test)]
+pub(crate) fn replay_transcript_phase_a(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    multi_proof: &MultiProof<F, E, ()>,
+    transcript: &mut DefaultTranscript<E>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
 
 /// Compute the bus balance offset for the COMMIT[index, value] bus.
 ///
@@ -930,15 +1197,68 @@ pub(crate) fn compute_commit_bus_offset(
     )
 }
 
-/// Replay the prover's Phase A (main trace commitments) to recover the shared
-/// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
-/// — no `MultiProof` deserialization required either way.
-pub(crate) fn replay_transcript_phase_a_view<'p>(
+/// Compute the expected COMMIT bus balance for a `MultiProof`.
+///
+/// Replays Phase A of the transcript to recover (z, alpha), then computes
+/// the offset from the given public output bytes. Call this after `multi_prove`
+/// and before `multi_verify`.
+///
+/// Superseded by [`compute_expected_commit_bus_balance_batched`] in the
+/// production path; retained for the monolithic-style test helpers.
+#[cfg(test)]
+pub(crate) fn compute_expected_commit_bus_balance(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: impl ProofViewSource<'p, F, E, ()>,
+    proof: &MultiProof<F, E, ()>,
+    public_output_bytes: &[u8],
+    start_index: u64,
+    transcript: &mut DefaultTranscript<E>,
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
+/// Batched (unified-shard) analogue of [`replay_transcript_phase_a`]: appends
+/// each preprocessed table's hardcoded precomputed root and the SINGLE batched
+/// main MMCS root (Phase A of the linear transcript), then samples the shared
+/// LogUp `(z, alpha)`. Mirrors `Prover::prove_rounds_1_to_3` Phase A + B.
+pub(crate) fn replay_transcript_phase_a_batched(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    main_root: &Commitment,
+    l2g_main_root: Option<&Commitment>,
     transcript: &mut DefaultTranscript<E>,
 ) -> (FieldElement<E>, FieldElement<E>) {
-    for (air, proof) in airs.iter().zip(proofs.view_iter()) {
+    // Continuation epochs absorb the standalone L2G main root FIRST (mirrors
+    // `Prover::multi_prove_batched_epoch`, which appends it before the VM roots);
+    // monolithic proofs have no separate L2G lane and pass `None`. Takes the
+    // shared batched main-MMCS root by reference (the only proof field Phase A
+    // reads), so the archived continuation path passes `view.main_root()` — no
+    // `BatchedMultiProof` deserialization.
+    if let Some(root) = l2g_main_root {
+        transcript.append_bytes(root);
+    }
+    for air in airs.iter() {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+    }
+    transcript.append_bytes(main_root);
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// View counterpart of [`replay_transcript_phase_a`]: replays Phase A over a
+/// proof view (owned or archived-in-place), with no `MultiProof`
+/// deserialization required either way.
+// Unused while the monolithic + recursion-blob paths verify the batched
+// (unified-shard) proof format; kept for the TODO(batched-fri) view port.
+#[allow(dead_code)]
+pub(crate) fn replay_transcript_phase_a_view(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: &[StarkProofView<F, E, ()>],
+    transcript: &mut DefaultTranscript<E>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    for (air, proof) in airs.iter().zip(proofs) {
         if air.is_preprocessed() {
             transcript.append_bytes(&air.precomputed_commitment());
         }
@@ -949,11 +1269,28 @@ pub(crate) fn replay_transcript_phase_a_view<'p>(
     (z, alpha)
 }
 
-/// Computes the expected COMMIT bus balance for a proof view slice (owned or
-/// archived-in-place).
-pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
+/// Batched analogue of [`compute_expected_commit_bus_balance`] for a
+/// [`BatchedMultiProof`].
+pub(crate) fn compute_expected_commit_bus_balance_batched(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proofs: impl ProofViewSource<'p, F, E, ()>,
+    main_root: &Commitment,
+    public_output_bytes: &[u8],
+    start_index: u64,
+    l2g_main_root: Option<&Commitment>,
+    transcript: &mut DefaultTranscript<E>,
+) -> Option<FieldElement<E>> {
+    let (z, alpha) = replay_transcript_phase_a_batched(airs, main_root, l2g_main_root, transcript);
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
+/// View counterpart of [`compute_expected_commit_bus_balance`]: operates on a
+/// proof view slice (owned or archived-in-place).
+// Unused while the monolithic + recursion-blob paths verify the batched
+// (unified-shard) proof format; kept for the TODO(batched-fri) view port.
+#[allow(dead_code)]
+pub(crate) fn compute_expected_commit_bus_balance_view(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: &[StarkProofView<F, E, ()>],
     public_output_bytes: &[u8],
     start_index: u64,
     transcript: &mut DefaultTranscript<E>,
@@ -962,18 +1299,17 @@ pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
     compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
 }
 
-/// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
+/// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs, reading
+/// the global proof through a [`MultiProofView`] (owned or archived-in-place) so
+/// the continuation guest binds without deserializing it.
 ///
 /// The final proof commits one local-to-global sub-table per epoch as its first
-/// `N` tables, so `final_proof.get(i).lde_trace_main_merkle_root()` is epoch
+/// `N` tables, so `final_proof.proofs[i].lde_trace_main_merkle_root` is epoch
 /// `i`'s L2G commitment. `epoch_l2g_roots[i]` is the same root as committed in
 /// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
 /// the very same L2G tables the epochs committed (shared commitments).
 ///
-/// `final_proof` is a [`MultiProofView`] (owned or archived-in-place), so this
-/// reads straight off either representation with no `MultiProof` deserialization.
-///
-/// Called by `continuation::verify_continuation_view`; also exercised by the
+/// Called by `continuation::verify_continuation`; also exercised by the
 /// local-to-global bus tests.
 pub(crate) fn verify_l2g_commitment_binding_view(
     epoch_l2g_roots: &[Commitment],
@@ -983,7 +1319,7 @@ pub(crate) fn verify_l2g_commitment_binding_view(
         && epoch_l2g_roots
             .iter()
             .enumerate()
-            .all(|(i, root)| *final_proof.get(i).lde_trace_main_merkle_root() == *root)
+            .all(|(i, root)| final_proof.get(i).lde_trace_main_merkle_root() == root)
 }
 
 // =============================================================================
@@ -1162,10 +1498,10 @@ pub fn prove_with_options_and_inputs(
         proof_options.fri_final_poly_log_degree,
     );
 
-    // Phase 4: Prove (multi_prove)
+    // Phase 4: Prove (unified-shard batched MMCS + single FRI)
     #[cfg(feature = "instruments")]
     let __sp = stark::instruments::span("proving");
-    let proof = Prover::multi_prove(
+    let proof = Prover::multi_prove_batched(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
@@ -1256,6 +1592,7 @@ pub fn verify_with_options(
     verify_prepared(
         vm_proof,
         &program,
+        None,
         &elf_digest,
         proof_options,
         decode_commitment,
@@ -1271,39 +1608,140 @@ pub fn verify_with_options(
 pub(crate) fn verify_prepared(
     vm_proof: &VmProof,
     program: &Elf,
+    page_configs_override: Option<&[crate::tables::page::PageConfig]>,
     elf_digest: &[u8; 32],
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
-    verify_proof_parts(
-        MultiProofView::Owned(&vm_proof.proof),
-        &vm_proof.table_counts,
-        &vm_proof.runtime_page_ranges,
-        vm_proof.num_private_input_pages,
-        &vm_proof.public_output,
+    // Validate table_counts before constructing AIRs.
+    // A malicious prover could set counts to 0, removing entire constraint sets.
+    vm_proof.table_counts.validate()?;
+
+    // Bound num_private_input_pages before allocating PageConfigs — the tight honest
+    // max, shared with the continuation verifier (see `page::max_private_input_pages`).
+    {
+        let max_pages = crate::tables::page::max_private_input_pages();
+        if vm_proof.num_private_input_pages > max_pages {
+            return Err(Error::InvalidTableCounts(format!(
+                "num_private_input_pages ({}) exceeds max ({max_pages})",
+                vm_proof.num_private_input_pages,
+            )));
+        }
+    }
+
+    // v1 derives the PAGE layout from the parsed ELF; the v2 (`attest-commitment-id`)
+    // guest has no ELF, so it supplies a layout reconstructed from the commitments
+    // (`page_configs_from_commitments_and_runtime`) and passes a minimal `program`
+    // (entry point only — used solely for the REGISTER commitment, since the DECODE
+    // and PAGE roots are supplied).
+    let computed_configs;
+    let page_configs: &[crate::tables::page::PageConfig] = match page_configs_override {
+        Some(pc) => pc,
+        None => {
+            computed_configs = Traces::page_configs_from_elf_and_runtime(
+                program,
+                &vm_proof.runtime_page_ranges,
+                vm_proof.num_private_input_pages,
+            );
+            &computed_configs
+        }
+    };
+
+    // Cross-check: table_counts must match the number of sub-proofs.
+    // FIXED_TABLE_COUNT always-present tables, plus page tables.
+    let expected_proof_count =
+        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    if expected_proof_count != vm_proof.proof.per_table.len() {
+        return Err(Error::InvalidTableCounts(format!(
+            "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
+            vm_proof.table_counts.total(),
+            page_configs.len(),
+            expected_proof_count,
+            vm_proof.proof.per_table.len(),
+        )));
+    }
+
+    let airs = VmAirs::new(
         program,
-        elf_digest,
         proof_options,
+        false,
+        page_configs,
+        &vm_proof.table_counts,
         decode_commitment,
+        true,
+        None,
         page_commitments,
-    )
+        None,
+    );
+
+    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // If public_output was tampered, the recomputed offset won't match the
+    // actual bus total in the proof, and multi_verify will reject.
+    let air_refs = airs.air_refs();
+
+    // Bind the statement into the verifier's transcript. A tampered statement
+    // field makes this diverge from the prover's transcript state, so every
+    // derived challenge differs and verification rejects.
+    let mut transcript = DefaultTranscript::<E>::new(&[]);
+    absorb_statement_with_digest(
+        &mut transcript,
+        StatementKind::Monolithic,
+        elf_digest,
+        &vm_proof.public_output,
+        &vm_proof.table_counts,
+        vm_proof.num_private_input_pages,
+        &vm_proof.runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
+    );
+
+    // Fork the post-absorb state: the replay helper advances through Phase A
+    // independently of the multi_verify transcript, but both must start from
+    // the same statement-bound state.
+    let mut transcript_for_replay = transcript.clone();
+    let expected_bus_balance = match compute_expected_commit_bus_balance_batched(
+        &air_refs,
+        &vm_proof.proof.main_root,
+        &vm_proof.public_output,
+        // Monolithic proof: commits are indexed from 0.
+        0,
+        // No standalone L2G lane in a monolithic proof.
+        None,
+        &mut transcript_for_replay,
+    ) {
+        Some(balance) => balance,
+        None => return Ok(false),
+    };
+
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
+
+    Ok(Verifier::batched_multi_verify(
+        &air_refs,
+        &vm_proof.proof,
+        &mut transcript,
+        &expected_bus_balance,
+    ))
 }
 
 /// The single VM-proof verification implementation, given the proof's
 /// metadata fields plus an already-parsed ELF and its digest. Both
 /// [`verify_prepared`] (owned proof) and [`verify_recursion_blob`] (guest
-/// blob, zero-copy) funnel here, passing a [`MultiProofView`] over their
-/// respective (owned or archived) proof data — no serialization, no
+/// blob, zero-copy) funnel here, passing a [`StarkProofView`] slice over
+/// their respective (owned or archived) proof data — no serialization, no
 /// duplicated verification logic, and no repeated `Elf::load`/digest.
+// Unused while the monolithic + recursion-blob paths verify the batched
+// (unified-shard) proof format; kept for the TODO(batched-fri) view port.
+#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 fn verify_proof_parts(
-    proofs: MultiProofView<'_, F, E, ()>,
+    proofs: &[StarkProofView<F, E, ()>],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
     num_private_input_pages: usize,
     public_output: &[u8],
     program: &Elf,
+    page_configs_override: Option<&[crate::tables::page::PageConfig]>,
     elf_digest: &[u8; 32],
     proof_options: &ProofOptions,
     decode_commitment: Option<Commitment>,
@@ -1324,11 +1762,23 @@ fn verify_proof_parts(
         }
     }
 
-    let page_configs = Traces::page_configs_from_elf_and_runtime(
-        program,
-        runtime_page_ranges,
-        num_private_input_pages,
-    );
+    // v1 derives the PAGE layout from the parsed ELF; the v2 (`attest-commitment-id`)
+    // guest has no ELF, so it supplies a layout reconstructed from the commitments
+    // (`page_configs_from_commitments_and_runtime`) and passes a minimal `program`
+    // (entry point only — used solely for the REGISTER commitment, since the DECODE
+    // and PAGE roots are supplied).
+    let computed_configs;
+    let page_configs: &[crate::tables::page::PageConfig] = match page_configs_override {
+        Some(pc) => pc,
+        None => {
+            computed_configs = Traces::page_configs_from_elf_and_runtime(
+                program,
+                runtime_page_ranges,
+                num_private_input_pages,
+            );
+            &computed_configs
+        }
+    };
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
@@ -1347,7 +1797,7 @@ fn verify_proof_parts(
         program,
         proof_options,
         false,
-        &page_configs,
+        page_configs,
         table_counts,
         decode_commitment,
         true,

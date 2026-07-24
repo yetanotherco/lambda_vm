@@ -115,6 +115,51 @@ pub fn zerofier_evaluations_on_extended_domain<F: IsFFTField>(
         .collect()
 }
 
+/// Per-constraint zerofier denominator, with the table-invariant pieces hoisted
+/// out by the caller.
+///
+/// For a whole table the challenge `z` and `trace_length` are fixed, so
+/// `1/(zᴺ − 1)` (`denominator_inv`) and the first end-exemption root
+/// `g^(N−1)` (`decrement`) are identical for every transition constraint — a
+/// full field exponentiation + inverse that [`evaluate_zerofier`] otherwise
+/// recomputes on every call. Passing them in leaves only the constraint-specific
+/// end-exemptions product `∏(z − rᵢ)`. Byte-identical to [`evaluate_zerofier`]:
+/// same root sequence (`g^(N−1), g^(2(N−1)), …`), same sign and fold order, same
+/// final `denominator_inv · correction`.
+pub fn evaluate_zerofier_with<F, E>(
+    meta: &ConstraintMeta,
+    z: &FieldElement<E>,
+    decrement: &FieldElement<F>,
+    denominator_inv: &FieldElement<E>,
+) -> FieldElement<E>
+where
+    F: IsSubFieldOf<E>,
+    E: IsField,
+{
+    // No end-exemption factors: the exemptions product is one, so the zerofier is
+    // exactly `denominator_inv`. Return it directly instead of `denominator_inv *
+    // one` — that leading multiply by one is a wasted ext-mul on the accelerated
+    // guest, and `denominator_inv` is already reduced (it comes from a field
+    // inverse), so the value is unchanged.
+    if meta.end_exemptions == 0 {
+        return denominator_inv.clone();
+    }
+
+    // Factor `z - rᵢ` written as `-(rᵢ - z)`: `rᵢ ∈ F`, `z ∈ E`, so the field ops
+    // only go subfield − superfield (matches `evaluate_zerofier`). Seed the
+    // running product with the first factor rather than `one * factor`, dropping
+    // the leading multiply by one; the closing `denominator_inv · …` reduces the
+    // product regardless, so the result is byte-identical.
+    let mut current = decrement.clone();
+    let mut end_exemptions_eval = -(current.clone() - z.clone());
+    current = &current * decrement;
+    for _ in 1..meta.end_exemptions {
+        end_exemptions_eval = &end_exemptions_eval * &(-(current.clone() - z.clone()));
+        current = &current * decrement;
+    }
+    denominator_inv * &end_exemptions_eval
+}
+
 /// Evaluation of the constraint's zerofier at some point `z`, which may be in
 /// a field extension.
 pub fn evaluate_zerofier<F, E>(

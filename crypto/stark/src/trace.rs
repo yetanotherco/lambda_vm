@@ -606,6 +606,22 @@ where
         &self.aux_data[row * self.num_aux_cols + col]
     }
 
+    /// Borrow the whole row-major main-trace buffer (`num_rows * num_main_cols`).
+    /// Row `r`'s column `c` is at `main_data()[r * num_main_cols + c]`. Used by the
+    /// batched prover to serve main openings straight from the retained LDE
+    /// instead of a duplicated MMCS copy.
+    #[inline]
+    pub fn main_data(&self) -> &[FieldElement<F>] {
+        &self.main_data
+    }
+
+    /// Borrow the whole row-major aux-trace buffer (`num_rows * num_aux_cols`).
+    /// Empty when there are no aux columns.
+    #[inline]
+    pub fn aux_data(&self) -> &[FieldElement<E>] {
+        &self.aux_data
+    }
+
     /// Borrow a full main-trace row as a contiguous slice (row-major buffer).
     #[inline]
     pub fn main_row(&self, row: usize) -> &[FieldElement<F>] {

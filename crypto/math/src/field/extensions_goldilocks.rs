@@ -303,21 +303,59 @@ impl IsField for Degree3GoldilocksExtensionField {
     /// add/sub). The reduction savings outweigh the extra multiplications.
     #[inline(always)]
     fn mul(a: &Self::BaseType, b: &Self::BaseType) -> Self::BaseType {
-        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
-        let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
+        // FEXT ext×ext product on the guest: `fma(a, b, 0) = a·b`, mirroring
+        // `crypto::field_ext::ext_mul` but reachable from `math` so the `*`
+        // operator itself offloads — this covers the ext×ext sites the explicit
+        // accelerator callsites do not (constraint evaluation, LogUp fingerprint,
+        // zerofier). Field-storage handles are in the reserved 0x…0002_xxxx range,
+        // disjoint from the FEXT_INV pair (…0002_0000/1) and the Fp3Fma
+        // accelerator (…0000_xxxx); `MUL_ZERO` is never written, so the chip reads
+        // it as zero (the same convention `field_ext::ext_mul`'s `H_ZERO` uses),
+        // and the four handles are pairwise-distinct (the chip forbids aliasing).
+        #[cfg(all(target_arch = "riscv64", feature = "fext-ext-mul"))]
+        {
+            const MUL_A: u64 = 0xFFFF_0000_0002_0002;
+            const MUL_B: u64 = 0xFFFF_0000_0002_0003;
+            const MUL_ZERO: u64 = 0xFFFF_0000_0002_0004;
+            const MUL_OUT: u64 = 0xFFFF_0000_0002_0005;
+            let a_limbs = [
+                a[0].canonical_u64(),
+                a[1].canonical_u64(),
+                a[2].canonical_u64(),
+            ];
+            let b_limbs = [
+                b[0].canonical_u64(),
+                b[1].canonical_u64(),
+                b[2].canonical_u64(),
+            ];
+            lambda_vm_syscalls::syscalls::fext_load(MUL_A, &a_limbs);
+            lambda_vm_syscalls::syscalls::fext_load(MUL_B, &b_limbs);
+            lambda_vm_syscalls::syscalls::fext_fma(MUL_A, MUL_B, MUL_ZERO, MUL_OUT);
+            let out = lambda_vm_syscalls::syscalls::fext_store(MUL_OUT);
+            return [
+                FpE::from_raw(out[0]),
+                FpE::from_raw(out[1]),
+                FpE::from_raw(out[2]),
+            ];
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "fext-ext-mul")))]
+        {
+            let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
+            let (b0, b1, b2) = (*b[0].value(), *b[1].value(), *b[2].value());
 
-        // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
-        let b1_2 = GoldilocksField::double(&b1);
-        let b2_2 = GoldilocksField::double(&b2);
+            // Precompute 2*b1 and 2*b2 for the w^3 = 2 reduction
+            let b1_2 = GoldilocksField::double(&b1);
+            let b2_2 = GoldilocksField::double(&b2);
 
-        // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
-        let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
-        // c1 = a0*b1 + a1*b0 + a2*(2*b2)
-        let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
-        // c2 = a0*b2 + a1*b1 + a2*b0
-        let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
+            // c0 = a0*b0 + a1*(2*b2) + a2*(2*b1)
+            let c0 = dot_product_3(a0, b0, a1, b2_2, a2, b1_2);
+            // c1 = a0*b1 + a1*b0 + a2*(2*b2)
+            let c1 = dot_product_3(a0, b1, a1, b0, a2, b2_2);
+            // c2 = a0*b2 + a1*b1 + a2*b0
+            let c2 = dot_product_3(a0, b2, a1, b1, a2, b0);
 
-        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+            [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+        }
     }
 
     /// Squaring using fused dot products.
@@ -327,20 +365,51 @@ impl IsField for Degree3GoldilocksExtensionField {
     ///   c2 = 2*a0*a2 + a1^2
     #[inline(always)]
     fn square(a: &Self::BaseType) -> Self::BaseType {
-        let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
+        // FEXT ext×ext square on the guest: `fma(a, a, 0) = a·a`, routing the `*`
+        // operator's repeated-squaring sites (Fp3 `pow`, the zerofier walk) through
+        // the same FEXT chip `mul` already uses. The chip forbids operand aliasing,
+        // so `a` is loaded into two distinct scratch handles (same value); the pair
+        // reuses `mul`'s reserved field-storage handles (…0002_0002/3), `MUL_ZERO`
+        // is never written so the chip reads it as zero, and the four handles are
+        // pairwise-distinct.
+        #[cfg(all(target_arch = "riscv64", feature = "fext-ext-mul"))]
+        {
+            const MUL_A: u64 = 0xFFFF_0000_0002_0002;
+            const MUL_B: u64 = 0xFFFF_0000_0002_0003;
+            const MUL_ZERO: u64 = 0xFFFF_0000_0002_0004;
+            const MUL_OUT: u64 = 0xFFFF_0000_0002_0005;
+            let a_limbs = [
+                a[0].canonical_u64(),
+                a[1].canonical_u64(),
+                a[2].canonical_u64(),
+            ];
+            lambda_vm_syscalls::syscalls::fext_load(MUL_A, &a_limbs);
+            lambda_vm_syscalls::syscalls::fext_load(MUL_B, &a_limbs);
+            lambda_vm_syscalls::syscalls::fext_fma(MUL_A, MUL_B, MUL_ZERO, MUL_OUT);
+            let out = lambda_vm_syscalls::syscalls::fext_store(MUL_OUT);
+            return [
+                FpE::from_raw(out[0]),
+                FpE::from_raw(out[1]),
+                FpE::from_raw(out[2]),
+            ];
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "fext-ext-mul")))]
+        {
+            let (a0, a1, a2) = (*a[0].value(), *a[1].value(), *a[2].value());
 
-        let a0_2 = GoldilocksField::double(&a0);
-        let a2_4 = GoldilocksField::double(&GoldilocksField::double(&a2));
+            let a0_2 = GoldilocksField::double(&a0);
+            let a2_4 = GoldilocksField::double(&GoldilocksField::double(&a2));
 
-        // c0 = a0*a0 + a1*(4*a2) — using dot_product_2
-        let c0 = dot_product_2(a0, a0, a1, a2_4);
-        // c1 = (2*a0)*a1 + (2*a2)*a2 — using dot_product_2
-        let a2_2 = GoldilocksField::double(&a2);
-        let c1 = dot_product_2(a0_2, a1, a2_2, a2);
-        // c2 = a1*a1 + (2*a0)*a2 — using dot_product_2
-        let c2 = dot_product_2(a1, a1, a0_2, a2);
+            // c0 = a0*a0 + a1*(4*a2) — using dot_product_2
+            let c0 = dot_product_2(a0, a0, a1, a2_4);
+            // c1 = (2*a0)*a1 + (2*a2)*a2 — using dot_product_2
+            let a2_2 = GoldilocksField::double(&a2);
+            let c1 = dot_product_2(a0_2, a1, a2_2, a2);
+            // c2 = a1*a1 + (2*a0)*a2 — using dot_product_2
+            let c2 = dot_product_2(a1, a1, a0_2, a2);
 
-        [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+            [FpE::from_raw(c0), FpE::from_raw(c1), FpE::from_raw(c2)]
+        }
     }
 
     /// Returns the component-wise subtraction of `a` and `b`
@@ -357,39 +426,132 @@ impl IsField for Degree3GoldilocksExtensionField {
 
     /// Returns the multiplicative inverse of `a`
     fn inv(a: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
-        let a0_sq = a[0].square();
-        let a1_sq = a[1].square();
-        let a2_sq = a[2].square();
+        // FEXT_INV (completing the FEXT chip API): the executor supplies the
+        // inverse and the CHIP constrains `x·inv == 1` in-circuit, so the guest
+        // drops the software check-multiply the INV_FP3_HINT path ran below. The
+        // up-front zero rejection stays here (a legitimate call never inverts
+        // zero; the chip's zero flag covers soundness at x = 0). Takes priority
+        // over `sim-inv-hint` when both features are on.
+        #[cfg(all(target_arch = "riscv64", feature = "fext-inv"))]
+        {
+            if Self::eq(a, &Self::zero()) {
+                return Err(FieldError::InvZeroError);
+            }
+            // Field-storage handles in a reserved high range disjoint from the
+            // Fp3Fma accelerator's (`crypto::field_ext`, based at
+            // 0xFFFF_0000_0000_0000). `x != out`, as the chip requires.
+            const H_X: u64 = 0xFFFF_0000_0002_0000;
+            const H_INV: u64 = 0xFFFF_0000_0002_0001;
+            let x = [
+                a[0].canonical_u64(),
+                a[1].canonical_u64(),
+                a[2].canonical_u64(),
+            ];
+            lambda_vm_syscalls::syscalls::fext_load(H_X, &x);
+            lambda_vm_syscalls::syscalls::fext_inv(H_X, H_INV);
+            let inv = lambda_vm_syscalls::syscalls::fext_store(H_INV);
+            return Ok([
+                FpE::from_raw(inv[0]),
+                FpE::from_raw(inv[1]),
+                FpE::from_raw(inv[2]),
+            ]);
+        }
+        // EXPERIMENT 5: on the guest, ask the executor for the Fp3 inverse and
+        // VERIFY it (`ext_mul(a, hint) == 1`, one Fp3 multiply) instead of
+        // running the norm-reduction (a base inversion plus ~14 base muls). Sound
+        // by construction — only the true inverse passes the check, so a wrong
+        // hint makes the guest reject, never accept. The zero element (no
+        // inverse) is rejected up front, matching the norm path's Err below.
+        // Superseded by FEXT_INV above when `fext-inv` is on (the check-multiply
+        // moves into the chip); kept as the fallback behind its own feature.
+        #[cfg(all(
+            target_arch = "riscv64",
+            feature = "sim-inv-hint",
+            not(feature = "fext-inv")
+        ))]
+        {
+            if Self::eq(a, &Self::zero()) {
+                return Err(FieldError::InvZeroError);
+            }
+            let x = [*a[0].value(), *a[1].value(), *a[2].value()];
+            let h = lambda_vm_syscalls::syscalls::inv_fp3_hint(x);
+            let hint = [
+                FpE::from_raw(h[0]),
+                FpE::from_raw(h[1]),
+                FpE::from_raw(h[2]),
+            ];
+            assert!(
+                Self::eq(&<Self as IsField>::mul(a, &hint), &Self::one()),
+                "fp3 inverse hint failed in-circuit verification"
+            );
+            return Ok(hint);
+        }
+        // Software fallback: `a^-1 = adjugate(a) / N(a)` via the field norm.
+        // Reproduced host-side by the executor's `fp3_inv_hint`, so the hint the
+        // guest verifies above is exactly this value.
+        #[cfg(not(all(
+            target_arch = "riscv64",
+            any(feature = "sim-inv-hint", feature = "fext-inv")
+        )))]
+        {
+            let a0_sq = a[0].square();
+            let a1_sq = a[1].square();
+            let a2_sq = a[2].square();
 
-        // Compute the norm: N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let a0_cubed = a0_sq * a[0];
-        let a1_cubed = a1_sq * a[1];
-        let a2_cubed = a2_sq * a[2];
-        let a0a1a2 = a[0] * a[1] * a[2];
+            // Compute the norm: N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
+            let a0_cubed = a0_sq * a[0];
+            let a1_cubed = a1_sq * a[1];
+            let a2_cubed = a2_sq * a[2];
+            let a0a1a2 = a[0] * a[1] * a[2];
 
-        // N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
-        let norm = a0_cubed + a1_cubed.double() + a2_cubed.double().double()
-            - (a0a1a2.double() + a0a1a2).double();
+            // N = a0^3 + 2*a1^3 + 4*a2^3 - 6*a0*a1*a2
+            let norm = a0_cubed + a1_cubed.double() + a2_cubed.double().double()
+                - (a0a1a2.double() + a0a1a2).double();
 
-        let norm_inv = norm.inv()?;
+            let norm_inv = norm.inv()?;
 
-        // inv[0] = (a0^2 - 2*a1*a2) / N
-        // inv[1] = (2*a2^2 - a0*a1) / N
-        // inv[2] = (a1^2 - a0*a2) / N
-        let a1a2 = a[1] * a[2];
-        let a0a1 = a[0] * a[1];
-        let a0a2 = a[0] * a[2];
+            // inv[0] = (a0^2 - 2*a1*a2) / N
+            // inv[1] = (2*a2^2 - a0*a1) / N
+            // inv[2] = (a1^2 - a0*a2) / N
+            let a1a2 = a[1] * a[2];
+            let a0a1 = a[0] * a[1];
+            let a0a2 = a[0] * a[2];
 
-        Ok([
-            (a0_sq - a1a2.double()) * norm_inv,
-            (a2_sq.double() - a0a1) * norm_inv,
-            (a1_sq - a0a2) * norm_inv,
-        ])
+            Ok([
+                (a0_sq - a1a2.double()) * norm_inv,
+                (a2_sq.double() - a0a1) * norm_inv,
+                (a1_sq - a0a2) * norm_inv,
+            ])
+        }
     }
 
     fn div(a: &Self::BaseType, b: &Self::BaseType) -> Result<Self::BaseType, FieldError> {
         let b_inv = Self::inv(b)?;
         Ok(<Self as IsField>::mul(a, &b_inv))
+    }
+
+    // sim/27 SIM_POW override: route Fp3 `base^exp` (the OOD zerofier's `z^N`)
+    // through the host ecall, which returns the power in one VM cycle.
+    // MEASUREMENT-ONLY — the ecall drives no chip, so a build with `sim-pow` on
+    // must never be proven. When the feature/arch cfg is off this method is
+    // absent and the `IsField::pow` square-and-multiply default runs (over the
+    // `mul`/`square` above), so a normal build is byte-identical. Raw limbs are
+    // marshaled both ways (the executor applies the same field ops), so the
+    // returned value matches the software path bit-for-bit.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-pow"))]
+    fn pow<T>(a: &Self::BaseType, exponent: T) -> Self::BaseType
+    where
+        T: crate::unsigned_integer::traits::IsUnsignedInteger,
+    {
+        let exp = crate::unsigned_integer::traits::exp_to_u64(exponent);
+        let base = [*a[0].value(), *a[1].value(), *a[2].value()];
+        let mut out = [0u64; 3];
+        lambda_vm_syscalls::syscalls::sim_pow(base.as_ptr(), 3, exp, out.as_mut_ptr());
+        [
+            FpE::from_raw(out[0]),
+            FpE::from_raw(out[1]),
+            FpE::from_raw(out[2]),
+        ]
     }
 
     fn eq(a: &Self::BaseType, b: &Self::BaseType) -> bool {
@@ -428,10 +590,39 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
     ) -> <Degree3GoldilocksExtensionField as IsField>::BaseType {
-        let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
-        let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
-        let c2 = FpE::from_raw(<Self as IsField>::mul(a, b[2].value()));
-        [c0, c1, c2]
+        // FEXT base×ext product `base·ext` on the guest via the FEXT_BASE_MUL
+        // chip (the base rides a register, so only `ext` is LOADed:
+        // LOAD/BASE_MUL/STORE). Mirrors `field_ext::base_mul` but reachable from
+        // `math` so the `*` operator offloads — this covers the base×ext sites the
+        // accelerator's explicit `base_mul` callsites miss, chiefly the FFT
+        // twiddle products. Handles in the reserved 0x…0002_xxxx range, disjoint
+        // from FEXT_INV, the ext-mul handles above, and the Fp3Fma accelerator.
+        #[cfg(all(target_arch = "riscv64", feature = "fext-ext-mul"))]
+        {
+            const BM_EXT: u64 = 0xFFFF_0000_0002_0006;
+            const BM_OUT: u64 = 0xFFFF_0000_0002_0007;
+            let base_u64 = FpE::from_raw(*a).canonical_u64();
+            let ext_limbs = [
+                b[0].canonical_u64(),
+                b[1].canonical_u64(),
+                b[2].canonical_u64(),
+            ];
+            lambda_vm_syscalls::syscalls::fext_load(BM_EXT, &ext_limbs);
+            lambda_vm_syscalls::syscalls::fext_base_mul(base_u64, BM_EXT, BM_OUT);
+            let out = lambda_vm_syscalls::syscalls::fext_store(BM_OUT);
+            return [
+                FpE::from_raw(out[0]),
+                FpE::from_raw(out[1]),
+                FpE::from_raw(out[2]),
+            ];
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "fext-ext-mul")))]
+        {
+            let c0 = FpE::from_raw(<Self as IsField>::mul(a, b[0].value()));
+            let c1 = FpE::from_raw(<Self as IsField>::mul(a, b[1].value()));
+            let c2 = FpE::from_raw(<Self as IsField>::mul(a, b[2].value()));
+            [c0, c1, c2]
+        }
     }
 
     #[inline(always)]
@@ -572,16 +763,14 @@ impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
 }
 
 impl HasDefaultTranscript for Degree3GoldilocksExtensionField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         let mut coeffs = [FpE::zero(), FpE::zero(), FpE::zero()];
 
         for coeff in &mut coeffs {
             loop {
-                rng.fill(&mut sample);
-                let int_sample = u64::from_be_bytes(sample);
-                if int_sample < GOLDILOCKS_PRIME {
-                    *coeff = FpE::from(int_sample);
+                let candidate = next_u64();
+                if candidate < GOLDILOCKS_PRIME {
+                    *coeff = FpE::from(candidate);
                     break;
                 }
             }
