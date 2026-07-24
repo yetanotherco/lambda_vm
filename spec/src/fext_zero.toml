@@ -23,11 +23,11 @@ pad = 0
 name = "all"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "addr", 0], ["idx", "addr", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "addr", 0], ["idx", "addr", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [10, "addr", "timestamp"]
+output = "addr"
+cond = "μ"
 
 [[constraints.all]]
 kind = "interaction"
@@ -41,4 +41,5 @@ iter = ["d", 0, 2]
 kind = "interaction"
 tag = "ECALL"
 input = ["timestamp", ["arr", ["-", ["^", 2, 32], 22], ["-", ["^", 2, 32], 1]]]
+multiplicity = "μ"
 

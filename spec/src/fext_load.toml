@@ -29,18 +29,18 @@ pad = 0
 name = "all"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", "addr", 0], ["idx", "addr", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", "addr", 0], ["idx", "addr", 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [10, "addr", "timestamp"]
+output = "addr"
+cond = "μ"
 
 [[constraints.all]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, ["+", 11, "i"]], "DWordWL"], ["arr", ["idx", ["idx", "coeffs", "i"], 0], ["idx", ["idx", "coeffs", "i"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["idx", "coeffs", "i"], 0], ["idx", ["idx", "coeffs", "i"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [["+", 11, "i"], ["idx", "coeffs", "i"], "timestamp"]
+output = ["idx", "coeffs", "i"]
+cond = "μ"
 iter = ["i", 0, 2]
 
 [[constraints.all]]
