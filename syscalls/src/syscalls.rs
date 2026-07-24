@@ -78,22 +78,27 @@ pub fn commit(slice: &[u8]) {
 /// `PRIVATE_INPUT_START = 0xFF000000`.
 ///
 /// The host pre-loads the input before execution; this function reads the
-/// 4-byte LE length prefix and then copies the data bytes into a new `Vec`.
+/// 4-byte LE length prefix and returns a zero-copy slice over the data bytes.
 /// No ecall is performed — it's a plain memory read (ZisK-style).
+///
+/// The returned slice borrows from the fixed private-input mapping: the host
+/// writes it before execution starts and never mutates it afterward, so the
+/// borrow is valid for the whole run.
 #[cfg(target_arch = "riscv64")]
-pub fn get_private_input() -> Vec<u8> {
+pub fn get_private_input() -> &'static [u8] {
     // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
     // execution. The 4-byte LE length prefix is always valid (written by the
-    // executor). The data pointer and length are within the memory-mapped region.
+    // executor). The data pointer and length are within the memory-mapped region,
+    // which lives for the entire program execution and is never mutated after
+    // loading, so the 'static borrow is sound.
     let len_ptr = PRIVATE_INPUT_START as *const u32;
     let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
     let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
-    let slice = unsafe { core::slice::from_raw_parts(data_ptr, len) };
-    slice.to_vec()
+    unsafe { core::slice::from_raw_parts(data_ptr, len) }
 }
 
 #[cfg(not(target_arch = "riscv64"))]
-pub fn get_private_input() -> Vec<u8> {
+pub fn get_private_input() -> &'static [u8] {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

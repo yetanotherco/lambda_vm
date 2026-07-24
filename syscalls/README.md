@@ -9,7 +9,7 @@ Published as `lambda-vm-syscalls`. Intended to be used from RISC-V (RV64IM) gues
 | Function | Purpose |
 |---|---|
 | `commit(bytes: &[u8])` | Append bytes to the **public output** that the verifier checks. |
-| `get_private_input() -> Vec<u8>` | Read the host-supplied private input bytes (memory-mapped at `0xFF000000`). |
+| `get_private_input() -> &'static [u8]` | Read the host-supplied private input bytes zero-copy (memory-mapped at `0xFF000000`). |
 | `sys_halt() -> !` | Terminate execution cleanly. Called automatically after `main` by the default entry point. |
 | `keccak_permute(state: &mut [u64; 25])` | Keccak-f[1600] permutation precompile. |
 | `ecsm_mul(xr: &mut [u8; 32], xg: &[u8; 32], k: &[u8; 32])` | secp256k1 scalar multiplication: writes `xR = (k·G)_x` (32-byte little-endian; `0 < k < N`). |
