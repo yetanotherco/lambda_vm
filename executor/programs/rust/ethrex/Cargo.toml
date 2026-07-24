@@ -28,3 +28,10 @@ rkyv = { version = "=0.8.16", features = ["std", "unaligned"] }
 # current syscalls (keccak_permute + the Print-ecall no-op fix).
 [patch."https://github.com/yetanotherco/lambda_vm.git"]
 lambda-vm-syscalls = { path = "../../../../syscalls" }
+
+# BENCH: route every Keccak permutation (Ethereum trie/RLP hashing via ethrex-crypto's
+# `keccak_hash` + `ethbloom`) through the `keccak_permute` accelerator syscall by
+# swapping in our vendored tiny-keccak fork (only `keccakf` changes; host builds
+# fall back to the software permutation).
+[patch.crates-io]
+tiny-keccak = { path = "../../../../crypto/tiny-keccak" }

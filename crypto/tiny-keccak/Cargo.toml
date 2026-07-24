@@ -1,0 +1,38 @@
+# Vendored fork of tiny-keccak 2.0.2 (CC0-1.0), used ONLY as a `[patch.crates-io]`
+# override in the ethrex guest so every Keccak permutation (Ethereum trie/RLP hashing
+# via ethrex-crypto's `keccak_hash` + `ethbloom`) routes through the lambda_vm
+# `keccak_permute` accelerator syscall instead of the software ARX permutation.
+#
+# The ONLY change vs upstream 2.0.2 is `src/keccakf.rs`: on riscv64 the `keccakf`
+# permutation calls `lambda_vm_syscalls::syscalls::keccak_permute`; on every other
+# target it runs the original software permutation (so host builds/tests are unchanged).
+# Keep name/version = tiny-keccak/2.0.2 so the crates.io patch resolves.
+[package]
+name = "tiny-keccak"
+version = "2.0.2"
+authors = ["debris <marek.kotewicz@gmail.com>"]
+description = "An implementation of Keccak derived functions (lambda_vm keccak-syscall fork)."
+edition = "2018"
+license = "CC0-1.0"
+homepage = "https://github.com/debris/tiny-keccak"
+
+[dependencies]
+crunchy = "0.2.2"
+
+# The keccak-permute accelerator syscall only exists on the riscv64 guest; on host
+# the software permutation is used, so this dependency is guest-only.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
+
+[features]
+cshake = []
+default = []
+fips202 = ["keccak", "shake", "sha3"]
+k12 = []
+keccak = []
+kmac = ["cshake"]
+parallel_hash = ["cshake"]
+sha3 = []
+shake = []
+sp800 = ["cshake", "kmac", "tuple_hash"]
+tuple_hash = ["cshake"]
