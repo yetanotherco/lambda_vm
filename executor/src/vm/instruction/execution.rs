@@ -16,6 +16,9 @@ pub enum SyscallNumbers {
     Halt = 93,
     // Placeholder discriminant. The actual syscall value is ECSM_SYSCALL_NUMBER.
     Ecsm = 94,
+    // Placeholder discriminant. The actual syscall value is HINT_SYSCALL_NUMBER.
+    // BENCH ONLY: non-constraining hint (host computes modular inverse/sqrt, guest verifies).
+    Hint = 95,
 }
 
 /// Syscall number for KeccakPermute (u64::MAX - 1 = 0xFFFF_FFFF_FFFF_FFFE).
@@ -31,6 +34,19 @@ const KECCAK_STATE_BYTES: u64 = 25 * 8;
 /// bus as `[lo32, hi32] = [2^32 - 11, 2^32 - 1]`.
 pub const ECSM_SYSCALL_NUMBER: u64 = u64::MAX - 10;
 
+/// Syscall number for the non-constraining `Hint` ecall (BENCH ONLY).
+///
+/// The host computes a modular inverse or square root and writes it back to the
+/// guest, which must verify it (e.g. `x·inv == 1`). This adds no in-circuit
+/// correctness constraint of its own — it exists to measure the cost of the
+/// hint-then-verify pattern versus computing the operation in the guest.
+pub const HINT_SYSCALL_NUMBER: u64 = u64::MAX - 20;
+
+/// Hint operation selector passed in `a0`.
+pub const HINT_FIELD_INV: u64 = 0; // secp256k1 base-field inverse (mod p)
+pub const HINT_SCALAR_INV: u64 = 1; // secp256k1 scalar-field inverse (mod n)
+pub const HINT_FIELD_SQRT: u64 = 2; // secp256k1 base-field square root
+
 /// `2^32`. ECSM memory operands must not overflow their lower 32-bit address limb when the
 /// largest per-access offset is added: the 32-byte operands reach offset +31 (last byte).
 const LOW_LIMB: u64 = 1 << 32;
@@ -45,6 +61,7 @@ impl TryFrom<u64> for SyscallNumbers {
             93 => Ok(SyscallNumbers::Halt),
             v if v == KECCAK_SYSCALL_NUMBER => Ok(SyscallNumbers::KeccakPermute),
             v if v == ECSM_SYSCALL_NUMBER => Ok(SyscallNumbers::Ecsm),
+            v if v == HINT_SYSCALL_NUMBER => Ok(SyscallNumbers::Hint),
             _ => Err(()),
         }
     }
@@ -68,7 +85,8 @@ impl SyscallNumbers {
             SyscallNumbers::Print
             | SyscallNumbers::Panic
             | SyscallNumbers::Commit
-            | SyscallNumbers::Halt => None,
+            | SyscallNumbers::Halt
+            | SyscallNumbers::Hint => None,
         }
     }
 }
@@ -91,6 +109,55 @@ fn store_u256_le(memory: &mut Memory, addr: u64, bytes: &[u8; 32]) -> Result<(),
         memory.store_doubleword(addr + (i as u64) * 8, u64::from_le_bytes(dw))?;
     }
     Ok(())
+}
+
+/// BENCH ONLY. Compute a non-constraining hint (modular inverse / sqrt) with the
+/// same k256 arithmetic the guest verifies against. Input/output are 32-byte
+/// little-endian (matching the ECSM ABI). On any failure (non-canonical input,
+/// no inverse/sqrt) returns zeros; the guest's verify then fails loudly.
+///
+/// `pub` so the prover's `collect_hint_ops` can reproduce the exact output value
+/// the executor wrote to guest memory (the value is not carried in the CPU log).
+pub fn compute_hint(hint_id: u64, in_le: &[u8; 32]) -> [u8; 32] {
+    use k256::elliptic_curve::PrimeField;
+    // k256 serialization is big-endian; the ABI is little-endian.
+    let mut be = [0u8; 32];
+    for i in 0..32 {
+        be[i] = in_le[31 - i];
+    }
+    let mut fb = k256::FieldBytes::default();
+    fb.copy_from_slice(&be);
+
+    let out_be: [u8; 32] = match hint_id {
+        HINT_FIELD_INV => {
+            let x: Option<k256::FieldElement> = Option::from(k256::FieldElement::from_bytes(&fb));
+            match x.and_then(|x| Option::<k256::FieldElement>::from(x.invert())) {
+                Some(inv) => inv.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        HINT_SCALAR_INV => {
+            let x: Option<k256::Scalar> = Option::from(k256::Scalar::from_repr(fb));
+            match x.and_then(|x| Option::<k256::Scalar>::from(x.invert())) {
+                Some(inv) => inv.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        HINT_FIELD_SQRT => {
+            let x: Option<k256::FieldElement> = Option::from(k256::FieldElement::from_bytes(&fb));
+            match x.and_then(|x| Option::<k256::FieldElement>::from(x.sqrt())) {
+                Some(r) => r.to_bytes().into(),
+                None => [0u8; 32],
+            }
+        }
+        _ => [0u8; 32],
+    };
+
+    let mut out_le = [0u8; 32];
+    for i in 0..32 {
+        out_le[i] = out_be[31 - i];
+    }
+    out_le
 }
 
 /// Checks the ECSM address-alignment assumption: `(addr mod 2^32) + max_offset < 2^32`.
@@ -453,6 +520,19 @@ impl Instruction {
                         // by the ECSM register-read path in the trace builder.
                         src2_val = addr_xg;
                         dst_val = addr_k;
+                    }
+                    SyscallNumbers::Hint => {
+                        // BENCH ONLY. Non-constraining hint: host computes a modular
+                        // inverse/sqrt and writes it to the guest, which verifies it.
+                        // a0 = hint_id, a1 = input addr (32-byte LE), a2 = output addr.
+                        let hint_id = registers.read(10)?;
+                        let in_addr = registers.read(11)?;
+                        let out_addr = registers.read(12)?;
+                        let input = load_u256_le(memory, in_addr)?;
+                        let output = compute_hint(hint_id, &input);
+                        store_u256_le(memory, out_addr, &output)?;
+                        src2_val = in_addr;
+                        dst_val = out_addr;
                     }
                     SyscallNumbers::Halt => {
                         // halt

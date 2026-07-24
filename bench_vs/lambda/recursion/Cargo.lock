@@ -233,6 +233,7 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "k256",
  "rustc-demangle",
  "thiserror",
 ]
