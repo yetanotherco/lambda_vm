@@ -2749,6 +2749,46 @@ fn test_prove_commit_sum() {
 
 #[test]
 #[ignore = "takes too long"]
+fn test_prove_ethrex_5_transfers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_5_transfers.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex 5-transfer block should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
+fn test_prove_ethrex_20_transfers() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let elf_bytes =
+        std::fs::read(workspace_root.join("executor/program_artifacts/rust/ethrex.elf"))
+            .expect("need ethrex.elf");
+    let input =
+        std::fs::read(workspace_root.join("executor/tests/ethrex_20_transfers.bin")).unwrap();
+    let proof = crate::prove_with_inputs(&elf_bytes, &input).expect("prove");
+    assert!(
+        crate::verify(&proof, &elf_bytes).expect("verify"),
+        "ethrex 20-transfer block should verify"
+    );
+}
+
+#[test]
+#[ignore = "takes too long"]
 fn test_prove_ethrex_empty_block() {
     let _ = env_logger::builder().is_test(true).try_init();
     let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))

@@ -97,6 +97,16 @@ fn constraint_set_count() {
     assert_eq!(EcsmConstraints.meta().len(), 413);
 }
 
+/// Pins the bus-interaction counts after the paired-ARE_BYTES rewrite
+/// (ECSM 579 → 515: 129 single-byte sends → 64 pairs + lone q1[32];
+/// ECDAS 388 → 290: 196 single-byte sends → 98 pairs). A drift here means the
+/// send layout changed — `collect_bitwise_from_*` must be updated in lockstep.
+#[test]
+fn bus_interaction_counts() {
+    assert_eq!(crate::tables::ecsm::bus_interactions().len(), 515);
+    assert_eq!(crate::tables::ecdas::bus_interactions().len(), 290);
+}
+
 /// The yG carry recurrence closes on all-zero padding because both the `µ·p²` offset and the
 /// curve constant `µ·b` are multiplied by `µ`, so they vanish when `µ = 0`. This checks the
 /// closing argument (Yg limb-0 ConvCarry = constraint `IDX_YG_CONV0`) and its two ingredients.

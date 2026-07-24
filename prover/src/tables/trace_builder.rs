@@ -2273,6 +2273,12 @@ fn is_byte_op(b: u8) -> BitwiseOperation {
     BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, b, 0)
 }
 
+/// Paired ARE_BYTES lookup: one send range-checks BOTH bytes (the BITWISE table
+/// enumerates every `(x, y)` byte pair). Tuple order must match the sender's.
+fn are_bytes_op(x: u8, y: u8) -> BitwiseOperation {
+    BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, x, y)
+}
+
 /// BITWISE lookups sent by the ECSM core table (range checks + the `k != 0` ZERO check),
 /// so the BITWISE receiver multiplicities account for them.
 #[allow(clippy::needless_range_loop)]
@@ -2280,17 +2286,16 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..=32).
-        // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
-        // while the others are 32. Do NOT merge into a single loop — extending the
-        // loop bound would push q1[32] twice and break AreBytes bus balance.
-        for i in 0..32 {
-            out.push(is_byte_op(w.x2[i]));
-            out.push(is_byte_op(w.q0[i]));
-            out.push(is_byte_op(w.y_g[i]));
-            out.push(is_byte_op(w.q1[i]));
+        // Paired ARE_BYTES on x2, q0, yG and q1's 32-byte prefix: (2i, 2i+1),
+        // mirroring `ecsm::bus_interactions()` exactly (sends and multiplicities
+        // must move together). q1[32] (the odd 33rd byte) rides alone as [b, 0].
+        for i in 0..16 {
+            out.push(are_bytes_op(w.x2[2 * i], w.x2[2 * i + 1]));
+            out.push(are_bytes_op(w.q0[2 * i], w.q0[2 * i + 1]));
+            out.push(are_bytes_op(w.y_g[2 * i], w.y_g[2 * i + 1]));
+            out.push(are_bytes_op(w.q1[2 * i], w.q1[2 * i + 1]));
         }
-        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, not covered by the loop above
+        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, unpaired
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
@@ -2321,17 +2326,19 @@ pub(crate) fn collect_bitwise_from_ecdas(ops: &[ecdas::EcdasOperation]) -> Vec<B
     let mut out = Vec::new();
     for op in ops {
         let s = &op.step;
-        out.push(is_byte_op(s.round));
-        for i in 0..32 {
-            out.push(is_byte_op(s.lambda[i]));
-            out.push(is_byte_op(s.x_r[i]));
-            out.push(is_byte_op(s.y_r[i]));
+        // Paired ARE_BYTES mirroring `ecdas::bus_interactions()` exactly: the
+        // 32-byte prefixes of lambda, x_r, y_r, q0, q1, q2 pair as (2i, 2i+1);
+        // the four odd bytes pair as (round, q0[32]) and (q1[32], q2[32]).
+        for i in 0..16 {
+            out.push(are_bytes_op(s.lambda[2 * i], s.lambda[2 * i + 1]));
+            out.push(are_bytes_op(s.x_r[2 * i], s.x_r[2 * i + 1]));
+            out.push(are_bytes_op(s.y_r[2 * i], s.y_r[2 * i + 1]));
+            out.push(are_bytes_op(s.q0[2 * i], s.q0[2 * i + 1]));
+            out.push(are_bytes_op(s.q1[2 * i], s.q1[2 * i + 1]));
+            out.push(are_bytes_op(s.q2[2 * i], s.q2[2 * i + 1]));
         }
-        for i in 0..33 {
-            out.push(is_byte_op(s.q0[i]));
-            out.push(is_byte_op(s.q1[i]));
-            out.push(is_byte_op(s.q2[i]));
-        }
+        out.push(are_bytes_op(s.round, s.q0[32]));
+        out.push(are_bytes_op(s.q1[32], s.q2[32]));
         for i in 0..63 {
             out.push(is_half_op((s.c0[i] + ecdas::CARRY_OFFSET_LAMBDA) as u16));
             out.push(is_half_op((s.c1[i] + ecdas::CARRY_OFFSET_XR) as u16));

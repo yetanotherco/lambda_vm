@@ -443,20 +443,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ));
     }
 
-    // IS_BYTE range checks (single byte → AreBytes[x, 0]).
-    let is_byte = |col: usize, len: usize, out: &mut Vec<BusInteraction>| {
-        for i in 0..len {
-            out.push(BusInteraction::sender(
-                BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
-                vec![packed(col + i), BusValue::constant(0)],
-            ));
-        }
+    // ARE_BYTES range checks, paired: `ARE_BYTES[X, Y]` checks BOTH elements
+    // (bitwise.rs `generate_bitwise_row` enumerates every (x, y) byte pair), so
+    // adjacent bytes share one send — 129 single-byte `[b, 0]` sends become 65.
+    // Layout: X2, Q0, YG and Q1's 32-byte prefix pair internally as (2i, 2i+1);
+    // the odd 33rd byte q1[32] rides alone as `[q1[32], 0]`.
+    // `collect_bitwise_from_ecsm` mirrors this layout exactly (sends and
+    // BITWISE multiplicities must move together).
+    let pair = |col_x: usize, col_y: usize, out: &mut Vec<BusInteraction>| {
+        out.push(BusInteraction::sender(
+            BusId::AreBytes,
+            Multiplicity::Column(cols::MU),
+            vec![packed(col_x), packed(col_y)],
+        ));
     };
-    is_byte(cols::X2, 32, &mut out);
-    is_byte(cols::Q0, 32, &mut out);
-    is_byte(cols::YG, 32, &mut out);
-    is_byte(cols::Q1, 33, &mut out); // q1[0..=32] (all 33 bytes)
+    for base in [cols::X2, cols::Q0, cols::YG, cols::Q1] {
+        for i in 0..16 {
+            pair(base + 2 * i, base + 2 * i + 1, &mut out);
+        }
+    }
+    out.push(BusInteraction::sender(
+        BusId::AreBytes,
+        Multiplicity::Column(cols::MU),
+        vec![packed(cols::q1(32)), BusValue::constant(0)],
+    ));
     // xG and k are byte-checked at memory write time (store.rs AreBytes), not re-checked here.
 
     // IS_HALF range checks on shifted carries, then k_sub_N / xR_sub_p.

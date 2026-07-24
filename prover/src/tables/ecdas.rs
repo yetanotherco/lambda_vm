@@ -171,23 +171,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ),
     ));
 
-    // IS_BYTE range checks (single byte → AreBytes[x, 0]).
-    let is_byte = |col: usize, len: usize, out: &mut Vec<BusInteraction>| {
-        for i in 0..len {
-            out.push(BusInteraction::sender(
-                BusId::AreBytes,
-                Multiplicity::Column(cols::MU),
-                vec![packed(col + i), BusValue::constant(0)],
-            ));
-        }
+    // ARE_BYTES range checks, paired: `ARE_BYTES[X, Y]` checks BOTH elements
+    // (bitwise.rs `generate_bitwise_row` enumerates every (x, y) byte pair), so
+    // adjacent bytes share one send — 196 single-byte `[b, 0]` sends become 98.
+    // Layout: the 32-byte prefixes of LAMBDA, XR, YR, Q0, Q1, Q2 pair internally
+    // as (2i, 2i+1); the four odd bytes pair as (ROUND, Q0[32]) and
+    // (Q1[32], Q2[32]). `collect_bitwise_from_ecdas` mirrors this layout exactly
+    // (sends and BITWISE multiplicities must move together).
+    let pair = |col_x: usize, col_y: usize, out: &mut Vec<BusInteraction>| {
+        out.push(BusInteraction::sender(
+            BusId::AreBytes,
+            Multiplicity::Column(cols::MU),
+            vec![packed(col_x), packed(col_y)],
+        ));
     };
-    is_byte(cols::ROUND, 1, &mut out);
-    is_byte(cols::LAMBDA, 32, &mut out);
-    is_byte(cols::Q0, 33, &mut out);
-    is_byte(cols::XR, 32, &mut out);
-    is_byte(cols::Q1, 33, &mut out);
-    is_byte(cols::YR, 32, &mut out);
-    is_byte(cols::Q2, 33, &mut out);
+    for base in [
+        cols::LAMBDA,
+        cols::XR,
+        cols::YR,
+        cols::Q0,
+        cols::Q1,
+        cols::Q2,
+    ] {
+        for i in 0..16 {
+            pair(base + 2 * i, base + 2 * i + 1, &mut out);
+        }
+    }
+    pair(cols::ROUND, cols::Q0 + 32, &mut out);
+    pair(cols::Q1 + 32, cols::Q2 + 32, &mut out);
 
     // IS_HALF range checks on the carries (offsets keep them in [0, 2^16)).
     let half = |col: usize, off: i64| {
