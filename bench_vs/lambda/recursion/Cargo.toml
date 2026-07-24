@@ -9,25 +9,251 @@ edition = "2024"
 # Exactly one selects the fixed ProofOptions (see main.rs) — hardcoded, not
 # private input, so a malicious input can't downgrade the security level.
 # Cargo features are additive by design, so the compile_error! mutual-exclusion
-# guard in main.rs is the loud failure that stops a mislabeled artifact if both
+# guard in main.rs is the loud failure that stops a mislabeled artifact if two
 # ever get enabled at once (e.g. under `--all-features`). The crate must stay a
 # standalone `[workspace]` (not a root-workspace member) so root-level feature
-# unification can never turn both on.
+# unification can never turn two on.
 min = []
+blowup2 = []
+blowup4 = []
 blowup8 = []
+# Orthogonal to the presets: verify a ContinuationProof bundle (multi-epoch,
+# memory-bounded inner prove) instead of a monolithic VmProof. Selects the
+# `recursion-cont-<preset>-bench` bins below.
+continuation = []
+# Orthogonal to the presets: swap the guest hash/transcript software paths for
+# trusted host ecalls (EXPERIMENT 1) via the prover -> crypto feature chain.
+# Selects the `-simhash` bins below. EXECUTE-ONLY: measure with `cli execute`
+# (`--cycles`), NEVER prove (the ecalls drive no chip).
+sim-hash-ecalls = ["lambda-vm-prover/sim-hash-ecalls"]
+# Merkle path-verify measurement stub (ROUND-2 increment A) via the prover ->
+# crypto feature chain. Swaps the guest's 32-byte keccak Merkle path fold for a
+# single trusted VERIFY_PATH host ecall. EXECUTE-ONLY: measure with `cli execute`
+# (`--cycles`), NEVER prove (the ecall drives no chip).
+sim-path-ecall = ["lambda-vm-prover/sim-path-ecall"]
+# Transcript challenge-sampling measurement stubs (ROUND-2 increment B) via the
+# prover -> crypto feature chain. Swaps DefaultTranscript's Fp3
+# sample_field_element / sample_u64 for trusted SAMPLE_FELT / SAMPLE_U64 host
+# ecalls. EXECUTE-ONLY: measure with `cli execute` (`--cycles`), NEVER prove.
+sim-sample-ecall = ["lambda-vm-prover/sim-sample-ecall"]
+# MEASUREMENT-ONLY (never prove these). Replace the DEEP reduced-opening hot
+# loop with a trusted 1-cycle ecall to measure its cycle ceiling (EXPERIMENT 2).
+# sim-ro-ecalls = Level A (per-row column loop); sim-ro-query = Level B (whole
+# per-query pair, implies Level A). See crypto/stark + others/accelerator_noop_sim_spec.md.
+sim-ro-ecalls = ["lambda-vm-prover/sim-ro-ecalls"]
+sim-ro-query = ["lambda-vm-prover/sim-ro-query", "sim-ro-ecalls"]
+# ROUND-2 increment C: in-place reduced-opening ABI (REGISTER_RO_LAYOUT once per
+# proof + per-row REDUCED_OPENING_ROW_INPLACE). Use INSTEAD OF sim-ro-ecalls.
+# EXECUTE-ONLY: never prove.
+sim-ro-inplace = ["lambda-vm-prover/sim-ro-inplace"]
+# EXPERIMENT 5 (software-path optimizations): real, sound guest-side wins layered
+# on the sim-ecall base. `bump-alloc` swaps the TLSF global allocator for a bump
+# allocator (no-op free) — sound here because the verifier's TOTAL allocation
+# (~49 MiB) fits the ~3 GiB heap.
+bump-alloc = ["lambda-vm-syscalls/bump-alloc"]
+# `inv-hint` swaps the guest's Goldilocks field inversion for an executor HINT
+# verified in-circuit (`x * hint == 1`) — sound, and it collapses the ~72-mul
+# addition chain (base inv, Fp3 norm, batch inverse all bottom out there).
+inv-hint = ["lambda-vm-prover/sim-inv-hint"]
+# Route the recursion verifier's Fp3 mul-add through the real FEXT accelerator
+# (PR #818/#831). Forwards to the prover -> crypto feature chain. Unlike the
+# sim-* stubs this drives real proven chips; used here as a measurement toggle so
+# a guest with the accelerator can be measured against a byte-identical fext-off
+# build. The FEXT chip's own tables are always present in the prover regardless.
+fext-accel = ["lambda-vm-prover/fext-accel"]
+# Orthogonal to the presets: the v2 commitment-derived attestation. The guest
+# NEVER parses or hashes the inner ELF — the entry point + digest are supplied
+# and the PAGE layout is reconstructed from the supplied commitments — and the
+# committed `program_id` folds only the entry point + roots, not the ELF digest.
+# A REAL, SOUND change (unlike the sim-* stub features): safe to prove. Selects
+# the `-attestid` bins and consumes the v2 blob format (`GuestInputV2` /
+# `ContinuationGuestInputV2`, wire version 2). Composes with the grand stack: the
+# `-grand-v2` bin layers it on the full sim/software feature set.
+attest-commitment-id = []
+# Route the verifier's base×ext products (FRI butterfly, OOD `g·z`) through the
+# FEXT_BASE_MUL chip. Forwards to the prover -> crypto chain; measurement
+# sub-toggle isolating FEXT_BASE_MUL's delta on top of fext-accel.
+fext-base-mul = ["lambda-vm-prover/fext-base-mul"]
+# Fp3 inverse via the FEXT_INV accelerator (completes the FEXT chip API). The
+# executor supplies `x^-1` and the chip constrains `x·inv == 1`, so the guest's
+# software check-multiply (the `inv-hint` path) moves into the chip. Forwards to
+# the prover -> math chain; takes priority over `inv-hint` where both are on.
+fext-inv = ["lambda-vm-prover/fext-inv"]
+# Route Fp3×Fp3 multiplication through the FEXT chip. Offloads the ext×ext `*`
+# sites the explicit accelerator callsites miss — constraint evaluation, LogUp
+# fingerprint, zerofier. Forwards to the prover -> math chain. riscv64-only.
+fext-ext-mul = ["lambda-vm-prover/fext-ext-mul"]
+# MID-LEVEL accelerator measurement stubs (sim/27). Each swaps a recursion-verifier
+# hot bucket for a host ecall that computes it in one cycle, to measure the
+# optimistic guest-cycle ceiling of a future in-circuit chip. Forwards to the
+# prover feature chain. MEASUREMENT-ONLY — the ecalls drive no chip, so a build
+# with any of these on is EXECUTE-ONLY (measure with `cli execute --cycles`,
+# NEVER prove). sim-poly-eval = FRI terminal evaluation; sim-pow = Fp3/Goldilocks
+# exponentiation; sim-fold-chain = the per-query FRI fold butterfly chain.
+sim-poly-eval = ["lambda-vm-prover/sim-poly-eval"]
+sim-pow = ["lambda-vm-prover/sim-pow"]
+sim-fold-chain = ["lambda-vm-prover/sim-fold-chain"]
+# sim/34: verify every committed FRI layer's Merkle opening for one query in one
+# SIM_VERIFY_PATH_BATCH ecall (subsumes the per-layer HASH_FELTS + VERIFY_PATH).
+# EXECUTE-ONLY: never prove.
+sim-verify-path-batch = ["lambda-vm-prover/sim-verify-path-batch"]
+# Stub 4: op-count PROXY only (per-table constraint tally); the guest still runs
+# the real constraint evaluation. Not a cycle-offload — see the executor
+# `sim_midlevel` module note on why the constraint-eval ceiling is not
+# offloadable in the executor-host model.
+sim-constraint-eval = ["lambda-vm-prover/sim-constraint-eval"]
+# sim/31: batch the per-query FRI evaluation-point `pow` into one
+# SIM_DOMAIN_POINTS host ecall. EXECUTE-ONLY: never prove.
+sim-domain-points = ["lambda-vm-prover/sim-domain-points"]
+# sim/31: offload the REGISTER preprocessed commitment to the host (served by a
+# CLI-registered evaluator). EXECUTE-ONLY: never prove.
+sim-register-commit = ["lambda-vm-prover/sim-register-commit"]
+# R9 SIM_FIELD_PAGES: skip the rkyv bytecheck on the blob (guest-side omission —
+# models commitment-checked typed input). EXECUTE-ONLY: never prove.
+sim-field-pages = ["lambda-vm-prover/sim-field-pages"]
 
 # One distinctly named binary per preset (selected by its feature) so a parallel
 # `make -j` builds them to different filenames — structurally race-free, no cp
-# clobbering. Both use src/main.rs; required-features gates each to its preset.
+# clobbering. All use src/main.rs; required-features gates each to its preset.
 [[bin]]
 name = "recursion-min-bench"
 path = "src/main.rs"
 required-features = ["min"]
 
 [[bin]]
+name = "recursion-blowup2-bench"
+path = "src/main.rs"
+required-features = ["blowup2"]
+
+[[bin]]
+name = "recursion-blowup4-bench"
+path = "src/main.rs"
+required-features = ["blowup4"]
+
+[[bin]]
 name = "recursion-blowup8-bench"
 path = "src/main.rs"
 required-features = ["blowup8"]
+
+[[bin]]
+name = "recursion-cont-min-bench"
+path = "src/main.rs"
+required-features = ["continuation", "min"]
+
+[[bin]]
+name = "recursion-cont-blowup2-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2"]
+
+[[bin]]
+name = "recursion-cont-blowup4-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4"]
+
+# EXPERIMENT 1 measurement bins: the blowup2 preset with the field-native
+# hash/transcript ecalls swapped in. Measured (execute-only) against the matching
+# non-simhash baseline ELF built from the same preset.
+[[bin]]
+name = "recursion-blowup2-simhash-bench"
+path = "src/main.rs"
+required-features = ["blowup2", "sim-hash-ecalls"]
+
+[[bin]]
+name = "recursion-cont-blowup2-simhash-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-hash-ecalls"]
+
+# MEASUREMENT-ONLY reduced-opening stub variants of the cont/blowup2 guest.
+# Level A (simroA): per-row column-loop ecall. Level B (simroB): whole per-query
+# pair ecall. NEVER prove these builds.
+[[bin]]
+name = "recursion-cont-blowup2-simroA-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-ro-ecalls"]
+
+[[bin]]
+name = "recursion-cont-blowup2-simroB-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-ro-query"]
+
+# EXPERIMENT 3 (combined) measurement bins: EXPERIMENT 1 hash/transcript ecalls
+# AND EXPERIMENT 2 reduced-opening ecalls in one guest. simboth = Level A RO;
+# simbothB = Level B RO (whole per-query pair). EXECUTE-ONLY, never prove.
+[[bin]]
+name = "recursion-cont-blowup2-simboth-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-hash-ecalls", "sim-ro-ecalls"]
+
+[[bin]]
+name = "recursion-cont-blowup2-simbothB-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-hash-ecalls", "sim-ro-query"]
+
+# ROUND-2 increment C: hash ecalls + the in-place reduced-opening ABI (sim-ro-
+# inplace INSTEAD of sim-ro-ecalls). EXECUTE-ONLY, never prove.
+[[bin]]
+name = "recursion-cont-blowup2-simboth-inplace-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "sim-hash-ecalls", "sim-ro-inplace"]
+
+# The blowup4 counterpart of simboth: EXPERIMENT 1 hash/transcript ecalls AND
+# EXPERIMENT 2 Level-A reduced-opening ecalls in the cont/blowup4 guest. This is
+# the bin the composed measurement build reuses — the `recursion-cont-blowup4-
+# simboth-sw.elf` Makefile target adds `bump-alloc inv-hint` on top of these
+# required-features (same relationship blowup2's simboth-sw has to its bin).
+# EXECUTE-ONLY, never prove.
+[[bin]]
+name = "recursion-cont-blowup4-simboth-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4", "sim-hash-ecalls", "sim-ro-ecalls"]
+
+# THE GRAND COMPOSITE bin: the cont/blowup4 guest with the in-place reduced-
+# opening ABI (sim-ro-inplace, INSTEAD of Level-A sim-ro-ecalls). The Makefile
+# `recursion-cont-blowup4-grand.elf` target adds sim-path-ecall + bump-alloc +
+# inv-hint + fext-accel on top of these required-features (sim-sample-ecall is
+# omitted: #841's duplex sampling supersedes it — see default_transcript.rs).
+# EXECUTE-ONLY, never prove.
+[[bin]]
+name = "recursion-cont-blowup4-grand-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4", "sim-hash-ecalls", "sim-ro-inplace"]
+
+# THE GRAND COMPOSITE + v2 commitment-derived attestation bin. Same feature stack
+# as `-grand-bench` plus `attest-commitment-id`, so the guest additionally drops
+# the in-VM ELF parse + full-ELF keccak (entry point + digest are supplied, PAGE
+# layout reconstructed from the supplied commitments). The Makefile
+# `recursion-cont-blowup4-grand-v2.elf` target adds sim-path-ecall + bump-alloc +
+# inv-hint + fext-accel on top of these required-features, matching `-grand`.
+# Unlike the sim-* stubs `attest-commitment-id` is REAL/SOUND, but this composed
+# guest still carries the stub ecalls, so it stays EXECUTE-ONLY (never prove).
+[[bin]]
+name = "recursion-cont-blowup4-grand-v2-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4", "sim-hash-ecalls", "sim-ro-inplace", "attest-commitment-id"]
+
+# sim/27 R9 SIM_DEEP_RECON variant: same guest, but the reduced-opening loop uses
+# the Level-B whole-per-query DEEP ecall (sim-ro-query) INSTEAD OF Level-A
+# (sim-ro-inplace) — the two are mutually exclusive, so this bin requires
+# sim-ro-query in place of sim-ro-inplace. MEASUREMENT-ONLY.
+[[bin]]
+name = "recursion-cont-blowup4-grand-v2-deeprecon-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup4", "sim-hash-ecalls", "sim-ro-query", "attest-commitment-id"]
+
+# v2 commitment-derived attestation (`attest-commitment-id`) measurement bins.
+# Built on a REAL (no sim-* stub) blowup2 base so the ELF parse+hash saving is
+# measured against real software keccak/parse, not stubbed-cheap ecalls. The
+# `-attestid` guest consumes the v2 blob format. Measured (execute-only) against
+# the matching non-attestid baseline ELF.
+[[bin]]
+name = "recursion-blowup2-attestid-bench"
+path = "src/main.rs"
+required-features = ["blowup2", "attest-commitment-id"]
+
+[[bin]]
+name = "recursion-cont-blowup2-attestid-bench"
+path = "src/main.rs"
+required-features = ["continuation", "blowup2", "attest-commitment-id"]
 
 [dependencies]
 lambda-vm-prover = { path = "../../../prover", default-features = false, features = [
@@ -38,3 +264,4 @@ rkyv = { version = "0.8.10", default-features = false, features = ["alloc", "byt
 
 [profile.release]
 debug = 2
+lto = "thin"

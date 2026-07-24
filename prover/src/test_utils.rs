@@ -19,7 +19,7 @@ use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
 use math::field::element::FieldElement;
-use stark::constraints::builder::{ConstraintSet, EmptyConstraints};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet, EmptyConstraints};
 use stark::debug::validate_trace;
 use stark::domain::Domain;
 use stark::lookup::{
@@ -64,6 +64,18 @@ use crate::tables::ecsm::{
     EcsmConstraints, bus_interactions as ecsm_bus_interactions, cols as ecsm_cols,
 };
 use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
+use crate::tables::fext_fma::{
+    FextFmaConstraints, bus_interactions as fext_fma_bus_interactions, cols as fext_fma_cols,
+};
+use crate::tables::fext_load::{
+    FextLoadConstraints, bus_interactions as fext_load_bus_interactions, cols as fext_load_cols,
+};
+use crate::tables::fext_page::{
+    FextPageConstraints, bus_interactions as fext_page_bus_interactions, cols as fext_page_cols,
+};
+use crate::tables::fext_store::{
+    FextStoreConstraints, bus_interactions as fext_store_bus_interactions, cols as fext_store_cols,
+};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
@@ -945,5 +957,140 @@ pub fn create_ecdas_air(proof_options: &ProofOptions) -> ConcreteVmAir<EcdasCons
         1,
         EcdasConstraints,
         "ECDAS",
+    )
+}
+
+/// Create FEXT_LOAD AIR.
+pub fn create_fext_load_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextLoadConstraints> {
+    build_air(
+        fext_load_cols::NUM_COLUMNS,
+        fext_load_bus_interactions(),
+        proof_options,
+        1,
+        FextLoadConstraints,
+        "FEXT_LOAD",
+    )
+}
+
+/// Create FEXT_FMA AIR.
+pub fn create_fext_fma_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextFmaConstraints> {
+    build_air(
+        fext_fma_cols::NUM_COLUMNS,
+        fext_fma_bus_interactions(),
+        proof_options,
+        1,
+        FextFmaConstraints,
+        "FEXT_FMA",
+    )
+}
+
+/// Create FEXT_STORE AIR.
+pub fn create_fext_store_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextStoreConstraints> {
+    build_air(
+        fext_store_cols::NUM_COLUMNS,
+        fext_store_bus_interactions(),
+        proof_options,
+        1,
+        FextStoreConstraints,
+        "FEXT_STORE",
+    )
+}
+
+/// Create FEXT_PAGE AIR (field-storage init/finalization bookend).
+pub fn create_fext_page_air(proof_options: &ProofOptions) -> ConcreteVmAir<FextPageConstraints> {
+    build_air(
+        fext_page_cols::NUM_COLUMNS,
+        fext_page_bus_interactions(),
+        proof_options,
+        1,
+        FextPageConstraints,
+        "FEXT_PAGE",
+    )
+}
+
+/// Wraps a table's constraint set with an extra `μ = 0` constraint, forcing the
+/// table to be empty. Used to build the FEXT accelerator AIRs under continuation,
+/// where field-storage is not carried across epochs and the accelerator must be
+/// unused. This binds the *verifier*: a prover-side guard alone does not stop a
+/// malicious prover from submitting a continuation proof with FEXT rows.
+pub struct ForbidEmpty<C> {
+    pub base: C,
+    pub mu_col: usize,
+}
+
+impl<C: ConstraintSet<F, E>> ConstraintSet<F, E> for ForbidEmpty<C> {
+    fn eval<B: ConstraintBuilder<F, E>>(&self, b: &mut B) {
+        self.base.eval(b);
+        let mu0_idx = self.base.meta().len();
+        let mu = b.main(0, self.mu_col);
+        b.emit_base(mu0_idx, mu);
+    }
+
+    fn max_degree(&self) -> usize {
+        self.base.max_degree()
+    }
+}
+
+pub fn create_fext_load_air_forbidden(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<ForbidEmpty<FextLoadConstraints>> {
+    build_air(
+        fext_load_cols::NUM_COLUMNS,
+        fext_load_bus_interactions(),
+        proof_options,
+        1,
+        ForbidEmpty {
+            base: FextLoadConstraints,
+            mu_col: fext_load_cols::MU,
+        },
+        "FEXT_LOAD",
+    )
+}
+
+pub fn create_fext_fma_air_forbidden(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<ForbidEmpty<FextFmaConstraints>> {
+    build_air(
+        fext_fma_cols::NUM_COLUMNS,
+        fext_fma_bus_interactions(),
+        proof_options,
+        1,
+        ForbidEmpty {
+            base: FextFmaConstraints,
+            mu_col: fext_fma_cols::MU,
+        },
+        "FEXT_FMA",
+    )
+}
+
+pub fn create_fext_store_air_forbidden(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<ForbidEmpty<FextStoreConstraints>> {
+    build_air(
+        fext_store_cols::NUM_COLUMNS,
+        fext_store_bus_interactions(),
+        proof_options,
+        1,
+        ForbidEmpty {
+            base: FextStoreConstraints,
+            mu_col: fext_store_cols::MU,
+        },
+        "FEXT_STORE",
+    )
+}
+
+pub fn create_fext_page_air_forbidden(
+    proof_options: &ProofOptions,
+) -> ConcreteVmAir<ForbidEmpty<FextPageConstraints>> {
+    build_air(
+        fext_page_cols::NUM_COLUMNS,
+        fext_page_bus_interactions(),
+        proof_options,
+        1,
+        ForbidEmpty {
+            base: FextPageConstraints,
+            mu_col: fext_page_cols::MU,
+        },
+        "FEXT_PAGE",
     )
 }

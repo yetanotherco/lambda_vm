@@ -8,8 +8,28 @@ license.workspace = true
 thiserror = "1.0.68"
 rustc-demangle = "0.1"
 ecsm = { path = "../crypto/ecsm" }
+# Host-side Goldilocks + degree-3 extension arithmetic for the reduced-opening
+# measurement ecalls (sim-ro-ecalls / sim-ro-query) and the FEXT accelerator
+# handler. Acyclic: math does not depend on executor. `std` pulls in `alloc`
+# (needed for batch inverse).
+math = { path = "../crypto/math", default-features = false, features = ["std"] }
+# ROUND-2 increment B: the SAMPLE_FELT ecall reproduces the guest transcript's
+# ChaCha20 challenge expansion host-side, byte-identically. It MUST match the
+# guest's `rand_chacha` (0.3.1, pulled by crypto) — a different major version
+# draws a different stream — so pin it here (renamed to coexist with the 0.9
+# `rand_chacha` used only by this crate's tests). Feeds `math`'s
+# `get_random_field_element_from_rng` (rand 0.8.5 / rand_core 0.6), which
+# ChaCha20Rng satisfies.
+rand_chacha_compat = { package = "rand_chacha", version = "0.3.1" }
 
 [dev-dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny-keccak = { version = "2.0", features = ["keccak"] }
+# Byte-identity references for the sim-hash ecall handlers (`vm::instruction::sim_hash`
+# tests): `sha3` is the keccak reference the crypto sponge is itself tested against,
+# `math` supplies `AsBytes::stream_bytes` (the field-element serialization oracle).
+sha3 = "0.10"
+math = { path = "../crypto/math", default-features = false, features = ["alloc"] }
+rand = "0.9"
+rand_chacha = "0.9"

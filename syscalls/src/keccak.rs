@@ -50,12 +50,100 @@ const DELIMITER: u8 = 0x01;
 const FINAL_PAD_LANE_BIT: u64 = (0x80u64) << 56;
 
 /// Incremental Keccak-256 hasher; the state doubles as the absorption buffer.
+///
+/// `#[repr(C)]` pins the field order (`state` at byte 0, `offset` at byte 200)
+/// so the field-native measurement ecalls (EXPERIMENT 1) can load and store this
+/// struct from guest memory at a known layout. This is a layout-only guarantee:
+/// no hashed byte or digest changes, so it is behavior-neutral for every build.
 #[derive(Clone)]
+#[repr(C)]
 pub struct Keccak256 {
     state: [u64; 25],
     /// Byte offset into the rate region where the next input byte XORs in.
     /// Invariant between calls: `offset < RATE_BYTES`.
     offset: usize,
+}
+
+// Sponge-pointer helpers for the field-native measurement ecalls (EXPERIMENT 1).
+// Each passes a raw pointer to `self` (the `#[repr(C)]` sponge) to the executor,
+// which reproduces the same update/finalize semantics host-side and writes the
+// struct back. Only compiled under `sim-hash-ecalls`; a normal build is
+// unchanged. See `crate::syscalls` for the raw ecall wrappers.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+impl Keccak256 {
+    /// Absorb raw bytes via the `ABSORB_BYTES` ecall (in-place on this sponge).
+    pub fn sim_absorb_bytes(&mut self, bytes: &[u8]) {
+        crate::syscalls::sim_absorb_bytes(
+            (self as *mut Self).cast::<u8>(),
+            bytes.as_ptr(),
+            bytes.len(),
+        );
+    }
+
+    /// Absorb `count` field elements of `kind` limbs each (raw limbs at
+    /// `elems_ptr`) via the `ABSORB_FELTS` ecall, using the canonical
+    /// `stream_bytes` serialization host-side.
+    pub fn sim_absorb_felts(&mut self, elems_ptr: *const u8, count: usize, kind: usize) {
+        crate::syscalls::sim_absorb_felts((self as *mut Self).cast::<u8>(), elems_ptr, count, kind);
+    }
+
+    /// Run the whole transcript `sample()` on this sponge via the
+    /// `TRANSCRIPT_SAMPLE` ecall and return the 32-byte result.
+    pub fn sim_transcript_sample(&mut self) -> [u8; 32] {
+        let mut out = [0u8; 32];
+        crate::syscalls::sim_transcript_sample((self as *mut Self).cast::<u8>(), out.as_mut_ptr());
+        out
+    }
+}
+
+// Transcript challenge-sampling ecalls (ROUND-2 increment B): thin pass-throughs
+// that hand the executor a raw pointer to this `#[repr(C)]` sponge (mutated in
+// place) plus an output pointer. Reached only behind the crypto crate's
+// `sim-sample-ecall` feature; compiled on every riscv64 guest (unused otherwise).
+#[cfg(target_arch = "riscv64")]
+impl Keccak256 {
+    /// `SAMPLE_FELT` ecall: sample one Fp3 field element from this sponge and
+    /// write its three raw limbs (24 bytes) at `out_ptr`. Mutates the sponge.
+    pub fn sim_sample_felt(&mut self, out_ptr: *mut u8) {
+        crate::syscalls::sim_sample_felt((self as *mut Self).cast::<u8>(), out_ptr);
+    }
+
+    /// `SAMPLE_U64` ecall: sample a `u64` in `[0, upper_bound)` from this sponge
+    /// (the whole rejection loop) and return it. Mutates the sponge.
+    pub fn sim_sample_u64(&mut self, upper_bound: u64) -> u64 {
+        let mut out: u64 = 0;
+        crate::syscalls::sim_sample_u64(
+            (self as *mut Self).cast::<u8>(),
+            upper_bound as usize,
+            core::ptr::from_mut(&mut out).cast::<u8>(),
+        );
+        out
+    }
+}
+
+/// `HASH_PAIR` ecall: Keccak-256 of two concatenated 32-byte nodes (the fixed
+/// Merkle-parent shape), computed host-side. Drop-in for [`keccak256_pair`].
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_hash_pair(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    crate::syscalls::sim_hash_pair(left.as_ptr(), right.as_ptr(), out.as_mut_ptr());
+    out
+}
+
+/// `HASH_FELTS` ecall: one-shot leaf hash of the concatenation `a ‖ b` of two
+/// field-element slices (each `kind` limbs, raw limbs at `a_ptr`/`b_ptr`),
+/// computed host-side. A single-slice leaf passes `b_count = 0`.
+#[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+pub fn sim_hash_felts(
+    a_ptr: *const u8,
+    a_count: usize,
+    b_ptr: *const u8,
+    b_count: usize,
+    kind: usize,
+) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    crate::syscalls::sim_hash_felts(a_ptr, a_count, b_ptr, b_count, kind, out.as_mut_ptr());
+    out
 }
 
 impl Default for Keccak256 {

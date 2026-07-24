@@ -385,6 +385,21 @@ fn test_prove_elfs_arith_8() {
     );
 }
 
+/// End-to-end FEXT accelerator test: FEXT_LOAD a/b/c into field-storage, then
+/// FEXT_FMA out = a*b + c over the native degree-3 Goldilocks extension. Proves
+/// and verifies the full VM (exercises the FEXT_LOAD/FEXT_FMA/FEXT_STORE chips +
+/// FEXT_PAGE bookend + their Memory/Alu/Ecall/Memw bus interactions balancing).
+#[test]
+fn test_prove_elfs_fext() {
+    let (elf, logs, instructions) = run_asm_elf("test_fext");
+    let mut traces =
+        Traces::from_logs_minimal(&logs, instructions.clone(), &Default::default()).unwrap();
+    assert!(
+        prove_and_verify_vm_minimal(&elf, &mut traces),
+        "Proof verification failed for test_fext program"
+    );
+}
+
 /// Basic arithmetic test with 32 instructions covering:
 /// - 64-bit ADD with positive, negative, and edge cases
 /// - 64-bit SUB with underflow, negative results
@@ -3407,6 +3422,36 @@ fn test_continuation_pipeline_end_to_end() {
         ),
         "final proof must be bound to the real per-epoch L2G roots"
     );
+}
+
+/// FEXT accelerator ecalls under continuation (`l2g_memory_bookend = true`) are
+/// rejected: field-storage is not carried across epochs, so a written value would
+/// read back as zero in the next epoch. The guard must fire before any trace is built.
+#[test]
+fn fext_rejected_under_continuation() {
+    use crate::tables::register;
+    use crate::tables::trace_builder::build_initial_image;
+
+    let (elf, logs, _instructions) = run_asm_elf("test_fext");
+    let image = build_initial_image(&elf, &[]);
+    let register_init = register::register_init_from_entry_point(elf.entry_point);
+    let result = Traces::from_image_and_logs(
+        &elf,
+        &image,
+        &register_init,
+        &logs,
+        &MaxRowsConfig::default(),
+        &[],
+        true,
+        true,
+        #[cfg(feature = "disk-spill")]
+        stark::storage_mode::StorageMode::Ram,
+    );
+    match result {
+        Err(crate::Error::FextInContinuation) => {}
+        Err(e) => panic!("expected FextInContinuation, got a different error: {e}"),
+        Ok(_) => panic!("expected FextInContinuation, but trace building succeeded"),
+    }
 }
 
 /// A continuation epoch built with `l2g_memory_bookend = true` proves and verifies:

@@ -60,6 +60,7 @@ impl<'a, F: IsField> PolynomialOpeningsView<'a, F>
 where
     F::BaseType: math::field::element::NativeArchived,
 {
+    #[inline]
     pub fn merkle_path(&self) -> &'a [Commitment] {
         match self {
             Self::Owned(p) => &p.proof.merkle_path,
@@ -67,6 +68,7 @@ where
         }
     }
 
+    #[inline]
     pub fn evaluations(&self) -> &'a [FieldElement<F>] {
         match self {
             Self::Owned(p) => &p.evaluations,
@@ -74,6 +76,7 @@ where
         }
     }
 
+    #[inline]
     pub fn evaluations_sym(&self) -> &'a [FieldElement<F>] {
         match self {
             Self::Owned(p) => &p.evaluations_sym,
@@ -112,6 +115,7 @@ where
     F::BaseType: math::field::element::NativeArchived,
     E::BaseType: math::field::element::NativeArchived,
 {
+    #[inline]
     pub fn composition_poly(&self) -> PolynomialOpeningsView<'a, E> {
         match self {
             Self::Owned(p) => PolynomialOpeningsView::Owned(&p.composition_poly),
@@ -119,6 +123,7 @@ where
         }
     }
 
+    #[inline]
     pub fn main_trace_polys(&self) -> PolynomialOpeningsView<'a, F> {
         match self {
             Self::Owned(p) => PolynomialOpeningsView::Owned(&p.main_trace_polys),
@@ -126,6 +131,7 @@ where
         }
     }
 
+    #[inline]
     pub fn precomputed_trace_polys(&self) -> Option<PolynomialOpeningsView<'a, F>> {
         match self {
             Self::Owned(p) => p
@@ -139,6 +145,7 @@ where
         }
     }
 
+    #[inline]
     pub fn aux_trace_polys(&self) -> Option<PolynomialOpeningsView<'a, E>> {
         match self {
             Self::Owned(p) => p
@@ -178,6 +185,7 @@ impl<'a, E: IsField> FriDecommitmentView<'a, E>
 where
     E::BaseType: math::field::element::NativeArchived,
 {
+    #[inline]
     pub fn layers_auth_paths_len(&self) -> usize {
         match self {
             Self::Owned(p) => p.layers_auth_paths.len(),
@@ -185,6 +193,7 @@ where
         }
     }
 
+    #[inline]
     pub fn layer_auth_path(&self, i: usize) -> &'a [Commitment] {
         match self {
             Self::Owned(p) => &p.layers_auth_paths[i].merkle_path,
@@ -192,6 +201,7 @@ where
         }
     }
 
+    #[inline]
     pub fn layers_evaluations_sym(&self) -> &'a [FieldElement<E>] {
         match self {
             Self::Owned(p) => &p.layers_evaluations_sym,
@@ -225,6 +235,7 @@ impl<'a, F: IsField> StarkTableView<'a, F>
 where
     F::BaseType: math::field::element::NativeArchived,
 {
+    #[inline]
     pub fn width(&self) -> usize {
         match self {
             Self::Owned(t) => t.width,
@@ -232,6 +243,7 @@ where
         }
     }
 
+    #[inline]
     pub fn height(&self) -> usize {
         match self {
             Self::Owned(t) => t.height,
@@ -239,6 +251,7 @@ where
         }
     }
 
+    #[inline]
     pub fn get_row(&self, row_idx: usize) -> &'a [FieldElement<F>] {
         match self {
             Self::Owned(t) => t.get_row(row_idx),
@@ -246,6 +259,7 @@ where
         }
     }
 
+    #[inline]
     pub fn row_major_data(&self) -> &'a [FieldElement<F>] {
         match self {
             Self::Owned(t) => t.row_major_data(),
@@ -255,6 +269,7 @@ where
 
     /// `true` iff `width * height` matches the backing data length — the
     /// invariant `get_row` indexing relies on.
+    #[inline]
     pub fn dimensions_consistent(&self) -> bool {
         match self {
             Self::Owned(t) => t.dimensions_consistent(),
@@ -332,6 +347,7 @@ where
     PI: rkyv::Archive,
     <PI as rkyv::Archive>::Archived: rkyv::Deserialize<PI, PiDeserializer>,
 {
+    #[inline]
     pub fn trace_length(&self) -> usize {
         match self {
             Self::Owned(p) => p.trace_length,
@@ -339,6 +355,7 @@ where
         }
     }
 
+    #[inline]
     pub fn lde_trace_main_merkle_root(&self) -> &'a Commitment {
         match self {
             Self::Owned(p) => &p.lde_trace_main_merkle_root,
@@ -346,6 +363,7 @@ where
         }
     }
 
+    #[inline]
     pub fn lde_trace_aux_merkle_root(&self) -> Option<&'a Commitment> {
         match self {
             Self::Owned(p) => p.lde_trace_aux_merkle_root.as_ref(),
@@ -353,6 +371,7 @@ where
         }
     }
 
+    #[inline]
     pub fn lde_trace_precomputed_merkle_root(&self) -> Option<&'a Commitment> {
         match self {
             Self::Owned(p) => p.lde_trace_precomputed_merkle_root.as_ref(),
@@ -360,6 +379,7 @@ where
         }
     }
 
+    #[inline]
     pub fn trace_ood_evaluations(&self) -> StarkTableView<'a, E> {
         match self {
             Self::Owned(p) => StarkTableView::Owned(&p.trace_ood_evaluations),
@@ -371,6 +391,7 @@ where
     /// the AIR reads at the next row (empty when it reads none). Parallels
     /// [`Self::trace_ood_evaluations`]; the verifier scatters these back into the
     /// full grid via [`crate::ood::reconstruct_ood_full`].
+    #[inline]
     pub fn trace_ood_next_evaluations(&self) -> StarkTableView<'a, E> {
         match self {
             Self::Owned(p) => StarkTableView::Owned(&p.trace_ood_next_evaluations),
@@ -378,6 +399,7 @@ where
         }
     }
 
+    #[inline]
     pub fn composition_poly_root(&self) -> &'a Commitment {
         match self {
             Self::Owned(p) => &p.composition_poly_root,
@@ -385,6 +407,7 @@ where
         }
     }
 
+    #[inline]
     pub fn composition_poly_parts_ood_evaluation(&self) -> &'a [FieldElement<E>] {
         match self {
             Self::Owned(p) => &p.composition_poly_parts_ood_evaluation,
@@ -392,6 +415,7 @@ where
         }
     }
 
+    #[inline]
     pub fn fri_layers_merkle_roots(&self) -> &'a [Commitment] {
         match self {
             Self::Owned(p) => &p.fri_layers_merkle_roots,
@@ -399,6 +423,7 @@ where
         }
     }
 
+    #[inline]
     pub fn fri_final_poly_coeffs(&self) -> &'a [FieldElement<E>] {
         match self {
             Self::Owned(p) => &p.fri_final_poly_coeffs,
@@ -406,6 +431,7 @@ where
         }
     }
 
+    #[inline]
     pub fn query_list_len(&self) -> usize {
         match self {
             Self::Owned(p) => p.query_list.len(),
@@ -413,6 +439,7 @@ where
         }
     }
 
+    #[inline]
     pub fn query(&self, i: usize) -> FriDecommitmentView<'a, E> {
         match self {
             Self::Owned(p) => FriDecommitmentView::Owned(&p.query_list[i]),
@@ -420,6 +447,7 @@ where
         }
     }
 
+    #[inline]
     pub fn deep_poly_openings_len(&self) -> usize {
         match self {
             Self::Owned(p) => p.deep_poly_openings.len(),
@@ -427,6 +455,7 @@ where
         }
     }
 
+    #[inline]
     pub fn deep_poly_opening(&self, i: usize) -> DeepPolynomialOpeningView<'a, F, E> {
         match self {
             Self::Owned(p) => DeepPolynomialOpeningView::Owned(&p.deep_poly_openings[i]),
@@ -436,6 +465,7 @@ where
         }
     }
 
+    #[inline]
     pub fn nonce(&self) -> Option<u64> {
         match self {
             Self::Owned(p) => p.nonce,
@@ -446,6 +476,7 @@ where
     /// The bus interaction's table contribution (L), if present. This is the
     /// only field of `BusPublicInputs` the verifier reads; both sides copy it
     /// out (it's a single field element, not worth a dedicated view type).
+    #[inline]
     pub fn bus_table_contribution(&self) -> Option<FieldElement<E>> {
         match self {
             Self::Owned(p) => p
@@ -459,6 +490,7 @@ where
         }
     }
 
+    #[inline]
     pub fn has_bus_public_inputs(&self) -> bool {
         match self {
             Self::Owned(p) => p.bus_public_inputs.is_some(),

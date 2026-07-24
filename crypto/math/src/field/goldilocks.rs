@@ -145,6 +145,22 @@ impl IsField for GoldilocksField {
         if canonical == 0 {
             return Err(FieldError::InvZeroError);
         }
+        // EXPERIMENT 5: on the guest, ask the executor for `canonical^-1` and
+        // VERIFY it (`canonical * hint == 1`) instead of running the ~72-mul
+        // addition chain. Sound by construction — only the true inverse passes
+        // the check, so a wrong hint makes the guest reject, never accept. The
+        // check is a single Goldilocks multiply. All other inversion paths
+        // (Fp3 norm, batch inverse) bottom out here, so they inherit the hint.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+        {
+            let hint = lambda_vm_syscalls::syscalls::inv_goldilocks_hint(canonical);
+            assert!(
+                Self::canonical(&Self::mul(&canonical, &hint)) == 1,
+                "goldilocks inverse hint failed in-circuit verification"
+            );
+            return Ok(hint);
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-inv-hint")))]
         Ok(exp_p_minus_2(canonical))
     }
 
@@ -153,9 +169,37 @@ impl IsField for GoldilocksField {
         Ok(Self::mul(a, &b_inv))
     }
 
+    // sim/27 SIM_POW override: route Goldilocks `base^exp` (the end-exemption
+    // roots' `g^(N-1)` and friends) through the host ecall, which returns the
+    // power in one VM cycle. MEASUREMENT-ONLY — the ecall drives no chip, so a
+    // build with `sim-pow` on must never be proven. When the feature/arch cfg is
+    // off this method is absent and the `IsField::pow` square-and-multiply
+    // default runs, so a normal build is byte-identical. The result is written
+    // raw (the executor applies the same field ops), so callers see the exact
+    // value the software path would have produced.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-pow"))]
+    fn pow<T>(a: &u64, exponent: T) -> u64
+    where
+        T: crate::unsigned_integer::traits::IsUnsignedInteger,
+    {
+        let exp = crate::unsigned_integer::traits::exp_to_u64(exponent);
+        let base = *a;
+        let mut out: u64 = 0;
+        lambda_vm_syscalls::syscalls::sim_pow(&base as *const u64, 1, exp, &mut out as *mut u64);
+        out
+    }
+
     #[inline(always)]
     fn eq(a: &u64, b: &u64) -> bool {
-        Self::canonical(a) == Self::canonical(b)
+        // Equal raw representations are always equal field elements, so short-
+        // circuit on the raw compare before canonicalizing. In the verifier's hot
+        // equality checks (per-query terminal-codeword comparisons) the values are
+        // freshly reduced and equal on the accept path, so the raw compare hits
+        // and both `canonical` reductions are skipped. Falls through to the
+        // canonical compare only when the raw words differ (unequal elements, or
+        // the same element in the two lazy `x` / `x+p` representations), keeping
+        // the result identical to `canonical(a) == canonical(b)`.
+        *a == *b || Self::canonical(a) == Self::canonical(b)
     }
 
     #[inline(always)]
@@ -545,13 +589,11 @@ impl IsFFTField for GoldilocksField {
 }
 
 impl HasDefaultTranscript for GoldilocksField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         loop {
-            rng.fill(&mut sample);
-            let int_sample = u64::from_be_bytes(sample);
-            if int_sample < GOLDILOCKS_PRIME {
-                return FieldElement::from(int_sample);
+            let candidate = next_u64();
+            if candidate < GOLDILOCKS_PRIME {
+                return FieldElement::from(candidate);
             }
         }
     }

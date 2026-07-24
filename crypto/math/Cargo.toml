@@ -31,6 +31,13 @@ rkyv = { version = "0.8.10", default-features = false, features = [
     "aligned",
 ], optional = true }
 
+# Guest-only: the Goldilocks inverse HINT (sim-inv-hint) calls an ecall wrapper
+# from the syscalls crate. Target-gated to riscv64, so on the host this dep is
+# absent and the `sim-inv-hint` feature is inert (math stays host-buildable and
+# does not depend on syscalls off-target). No cycle: syscalls has no math dep.
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+lambda-vm-syscalls = { path = "../../syscalls" }
+
 [dev-dependencies]
 rand_chacha = "0.3.1"
 criterion = "0.5.1"
@@ -48,6 +55,31 @@ proptest = ["dep:proptest"]
 instruments = []
 test-utils = []
 rkyv = ["dep:rkyv"]
+# Goldilocks inverse HINT (EXPERIMENT 5). On riscv64 swaps `GoldilocksField::inv`
+# to ask the executor for `x^-1` and verify it in-circuit (`x * hint == 1`)
+# instead of running the ~72-mul addition chain. riscv64-only effect; inert on
+# the host (the syscalls dep is target-gated out). EXECUTE-ONLY: the ecall drives
+# no chip, so a build with this on must never be proven. Off by default.
+sim-inv-hint = ["lambda-vm-syscalls/sim-inv-hint"]
+# Fp3 inverse via the FEXT_INV accelerator (completes the FEXT chip API). On
+# riscv64 swaps `Degree3GoldilocksExtensionField::inv` to the FEXT_INV ecall: the
+# executor supplies `x^-1` and the CHIP constrains `x·inv == 1`, so the guest
+# drops the software check-multiply the `sim-inv-hint` path ran. Takes priority
+# over `sim-inv-hint`. riscv64-only effect; inert on the host. Off by default.
+fext-inv = []
+# Route Fp3×Fp3 multiplication through the FEXT chip (fma(a,b,0)=a·b). On riscv64
+# swaps `Degree3GoldilocksExtensionField::mul` to the FEXT ecall path, offloading
+# the ext×ext products the accelerator's explicit `ext_mul`/`fma` callsites do NOT
+# cover — the verifier's constraint evaluation, LogUp fingerprint, and zerofier
+# `*` sites. riscv64-only effect; inert on the host. Off by default.
+fext-ext-mul = []
+# MID-LEVEL accelerator measurement stub (sim/27): route the hot `pow` calls (Fp3
+# `z^N` in the OOD zerofier, Goldilocks `g^(N-1)` in the end-exemption roots,
+# plus the smaller powers) through the SIM_POW host ecall, which returns
+# `base^exp` in one cycle. On riscv64 swaps `GoldilocksField::pow` /
+# `Degree3GoldilocksExtensionField::pow` to call it. MEASUREMENT-ONLY: no chip,
+# so never prove a build with this on. riscv64-only effect; inert on the host.
+sim-pow = ["lambda-vm-syscalls/sim-pow"]
 
 [target.wasm32-unknown-unknown.dependencies]
 getrandom = { version = "0.2.15", features = ["js"] }

@@ -305,20 +305,46 @@ pub fn compute_precomputed_commitment_with_fini(
     fini: &[u32],
 ) -> Commitment {
     debug_assert_eq!(fini.len(), NUM_REGISTER_ADDRESSES);
-    let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
-    let addr_list = register_word_address_list();
 
-    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
-    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
-    let mut fini_col = crate::tables::types::zeroed_fe_vec(num_rows);
-
-    for i in 0..NUM_REGISTER_ADDRESSES {
-        offset_col[i] = FE::from(addr_list[i]);
-        init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
-        fini_col[i] = FE::from(fini[i] as u64);
+    // sim/31 SIM_REGISTER_COMMIT: offload the FFT+LDE+Merkle preprocessed
+    // commitment to the host, which recomputes it from (init, fini) with this
+    // SAME prover code (bit-identical bytes). MEASUREMENT-ONLY — never prove.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-register-commit"))]
+    {
+        let _ = options;
+        // 8-aligned output so the host can store the 4 commitment limbs into it.
+        let mut out = [0u64; 4];
+        let input = math::sim_midlevel::RegisterCommitInput {
+            init_ptr: init.as_ptr() as u64,
+            init_len: init.len() as u64,
+            fini_ptr: fini.as_ptr() as u64,
+            fini_len: fini.len() as u64,
+            out_ptr: out.as_mut_ptr() as u64,
+        };
+        lambda_vm_syscalls::syscalls::sim_register_commit(&input as *const _ as usize);
+        let mut commitment: Commitment = [0u8; 32];
+        for (i, limb) in out.iter().enumerate() {
+            commitment[i * 8..i * 8 + 8].copy_from_slice(&limb.to_le_bytes());
+        }
+        commitment
     }
+    #[cfg(not(all(target_arch = "riscv64", feature = "sim-register-commit")))]
+    {
+        let num_rows = NUM_REGISTER_ADDRESSES.next_power_of_two();
+        let addr_list = register_word_address_list();
 
-    commit_register_columns(options, vec![offset_col, init_col, fini_col])
+        let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+        let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
+        let mut fini_col = crate::tables::types::zeroed_fe_vec(num_rows);
+
+        for i in 0..NUM_REGISTER_ADDRESSES {
+            offset_col[i] = FE::from(addr_list[i]);
+            init_col[i] = FE::from(init.get(i).copied().unwrap_or(0) as u64);
+            fini_col[i] = FE::from(fini[i] as u64);
+        }
+
+        commit_register_columns(options, vec![offset_col, init_col, fini_col])
+    }
 }
 
 /// LDE + bit-reverse + Merkle-commit the given preprocessed columns (in column
