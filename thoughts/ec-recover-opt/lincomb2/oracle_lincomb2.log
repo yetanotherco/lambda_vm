@@ -1,0 +1,23 @@
+lincomb2 oracle validation (independent Python reference, lincomb2_ref.py)
+==========================================================================
+Re-run: from thoughts/ec-recover-opt/oracle/,
+  <scratchpad>/ec-oracle/venv/bin/python  (has the `ecdsa` lib, independent lineage)
+
+T0 (NUMS blinding point) — SHA-256 try-and-increment of "lambdavm/ecsm/lincomb2/T0/v1":
+  counter = 1  (counter 0 rejected)
+  T0.x = 0xaf319aa90f91a86b297de85edb330a665efba79aa98893db1b49070cb1ae7864
+  T0.y = 0x1481a038143c0732071db0bcf3b05b8ca2e624fa217d82193f3c254a606277a0
+  on-curve: yes   y even: yes
+
+lincomb2(u1,P1,u2,P2) vs the `ecdsa` PyPI library (independent lineage):
+  600/600 PASS  (0 infinity/degenerate skipped)
+
+NUMS-blinded joint Shamir/Straus trace (mirror of the Rust witness algorithm):
+  self-consistency: blinded accumulator == Q + 2^len*T0, correction lands on Q,
+  over 600 random (u1,u2,P1,P2) + 80-case quick set + edges — all PASS.
+  edges: (1,1)(1,2)(3,5)(2^255, 2^255-1)(N-1, N-1)(N-1, 1) — all consistent.
+
+ROW COUNT PER ECRECOVER (one joint chain; today's scheme uses four chains):
+  doubles mean 255.7   adds mean 192.0   + P12-precompute 1 + correction 1
+  total rows: mean 449.7   max 468
+  (DESIGN.md estimated 448 — confirmed, ±5% collapsed to +0.4%/+4.5% worst.)

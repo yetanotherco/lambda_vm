@@ -12,3 +12,8 @@ num-traits = "0.2.19"
 # constraint system). Used for executor scalar multiplication and for the projective
 # double-and-add replay + batch inversion that builds ECDAS step witnesses efficiently.
 k256 = { version = "0.13", default-features = false, features = ["arithmetic", "expose-field"] }
+
+[dev-dependencies]
+# Test-only: re-derives the NUMS blinding point T₀ (SHA-256 try-and-increment)
+# to prove the pinned constant in `witness.rs` is reproducible from its tag.
+sha2 = { version = "0.10", default-features = false }

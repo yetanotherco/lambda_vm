@@ -503,6 +503,7 @@ dependencies = [
  "k256",
  "num-bigint",
  "num-traits",
+ "sha2",
 ]
 
 [[package]]
