@@ -5,7 +5,10 @@ L1 (z3, per relation): carry recurrence over ℤ + c_63 = 0  ⇒  Σ 256^i·S_i 
 
 L2a (exact interval arithmetic): for every ConvCarry constraint, the integer value
     of the constraint LHS under the range CONTRACTS (bytes: AreBytes sends
-    ecsm.rs:446-459 / ecdas.rs:174-190 + MEMW-write byte authority for xG,k;
+    ecsm.rs:446-470 / ecdas.rs:174-194 (paired ARE_BYTES sends — the contract
+    checks BOTH tuple elements, so the per-column byte hypothesis is identical
+    to the pre-pairing [b, 0] form; see pairing-equivalence.md) + MEMW-write
+    byte authority for xG,k;
     carries: IsHalfword sends ecsm.rs:462-506 / ecdas.rs:192-214 with the exact
     offsets; bits: IS_BIT constraints) is bounded ≪ p_g, so "≡ 0 mod p_g" ⇒ "= 0
     over ℤ". Bounds are EXACT: every S_i is multilinear-plus-signed-squares in

@@ -1,5 +1,11 @@
 # ECSM/ECDAS z3 gate — lemma board & soundness theorem
 
+> **Post-gate rewrite (feat/ec-arebytes-pairing):** the single-byte AreBytes
+> sends were paired ([b,0]×2 → [b_even,b_odd]; ECDAS 388→290, ECSM 579→515
+> interactions/row). The theorem below is unaffected — every lemma consumes the
+> byte contract per COLUMN, not per send, and contract C1 checks both tuple
+> elements. Argument + layout: `pairing-equivalence.md`.
+
 Reverse-order verification of the EXISTING chips (keccak_rnd playbook), 2026-07-24.
 Model transcribed from `prover/src/tables/ecsm.rs` / `ecdas.rs` (citations inline in
 the scripts); independent reference = `../oracle/ec_ref.py` (3-lineage-anchored).

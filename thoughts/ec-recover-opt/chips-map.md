@@ -1,5 +1,11 @@
 # ECSM / ECDAS chip map — z3 gate input + cost census
 
+> **UPDATE (feat/ec-arebytes-pairing):** candidate A1/A2 below LANDED — the
+> single-byte AreBytes sends are now paired (ECDAS 388→290, ECSM 579→515
+> interactions/row, ≈ −13.3% ECDAS committed cells). The census tables below
+> describe the PRE-pairing layout the gate verified; see
+> `gate/pairing-equivalence.md` for the rewrite argument and new counts.
+
 Working doc for the EC RECOVER optimization campaign (keccak-hwsl-inline playbook:
 oracle → verify existing → gate-proved rewrite → bench). Status: mapping done
 2026-07-24; oracle agent running; z3 gate not started.
