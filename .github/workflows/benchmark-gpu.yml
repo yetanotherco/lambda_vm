@@ -1,0 +1,490 @@
+name: Benchmark GPU (PR)
+
+# Rent an RTX 5090 on Vast.ai (hourly) and run the drift-free A/B/B/A (ABBA) paired
+# prover benchmark — the same method as the CPU `/bench-abba` (scripts/bench_abba.sh) —
+# but with the CUDA prover path enabled (BENCH_FEATURES=jemalloc-stats,prover/cuda).
+# It builds the cli at the PR head and at main, runs N interleaved pairs on the GPU,
+# posts the paired-t + Wilcoxon verdict back to the PR, then ALWAYS destroys the box.
+#
+# Triggered by a "/bench-gpu [N]" comment on a PR (N = pair count, default 14) or via
+# workflow_dispatch. Orchestration runs on a GitHub-hosted runner; all GPU work happens
+# on the rented Vast box (provisioned by the template onstart).
+#
+# Requires repo secrets:
+#   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
+#   VAST_TEMPLATE_HASH  — hash of the "NVIDIA CUDA Lambda VM 64GB" template
+
+on:
+  workflow_dispatch:
+    inputs:
+      pairs:
+        description: "Number of A/B/B/A pairs"
+        default: "14"
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: benchmark-gpu-${{ github.event.issue.number || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  # Vast offer search: RTX 5090, >=16 cores, >=48GB RAM, >=64GB disk, verified +
+  # rentable, Blackwell-capable driver, <= cap. gpu_frac=1 (whole-machine, dedicated
+  # host) — see the query step for why.
+  GPU_NAME: RTX_5090
+  PRICE_CAP: "1"
+  VAST_IMAGE_DISK: "64"
+  # cli features for the ABBA build — the GPU (cuda) prover path plus jemalloc heap stats.
+  BENCH_FEATURES: "jemalloc-stats,prover/cuda"
+  # Unique per-run label set on the instance, for easy identification in the Vast console.
+  RUN_LABEL: "gpu-bench-${{ github.run_id }}-${{ github.run_attempt }}"
+  # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
+  # hash can't) — avoids pulling untrusted code at run time.
+  VAST_CLI_COMMIT: "28494d92c6c03d887f8375085243c22eb68c5874"
+
+jobs:
+  benchmark-gpu:
+    runs-on: ubuntu-latest
+    # Skip unless: workflow_dispatch, or a "/bench-gpu" comment from a privileged author.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'issue_comment' &&
+       github.event.issue.pull_request &&
+       startsWith(github.event.comment.body, '/bench-gpu') &&
+       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association))
+    # ABBA on the GPU: provisioning + dual cuda build (~30 min) + 2*pairs proves
+    # (~95s each). At the max 32 pairs (64 proves) a slow-provision box runs ~3 hr,
+    # so allow headroom over that; teardown still always destroys the box.
+    timeout-minutes: 210
+    steps:
+      - name: Resolve PR ref + pair count
+        id: config
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          PR_NUM: ${{ github.event.issue.number }}
+          DISPATCH_PAIRS: ${{ github.event.inputs.pairs }}
+          DISPATCH_REF: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT_NAME" = "issue_comment" ]; then
+            # Pin the head SHA (works for fork PRs; avoids a force-push race mid-run).
+            HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
+            OUT_PR_NUM="$PR_NUM"; OUT_HEAD_SHA="$HEAD_SHA"; OUT_BRANCH=""
+            # "/bench-gpu 20" -> 20 pairs; otherwise default.
+            N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-gpu[[:space:]]*\([0-9]\+\).*|\1|p')
+            PAIRS=${N:-14}
+          else
+            # workflow_dispatch: compare this branch vs main.
+            OUT_PR_NUM=""; OUT_HEAD_SHA=""; OUT_BRANCH="$DISPATCH_REF"
+            PAIRS=${DISPATCH_PAIRS:-14}
+          fi
+          # Clamp to [2,32]; out-of-range -> default. 14 ~ resolves a 2% delta. The ceiling
+          # keeps the worst-case run (64 proves + provisioning + dual build) under the job
+          # timeout above.
+          if [ "$PAIRS" -lt 2 ] 2>/dev/null || [ "$PAIRS" -gt 32 ] 2>/dev/null; then
+            echo "::warning::pair count out of range [2,32], defaulting to 14"
+            PAIRS=14
+          fi
+          # Even is ideal so the AB/BA orders balance; round an odd request up by one.
+          if [ "$((PAIRS % 2))" -ne 0 ]; then
+            PAIRS=$((PAIRS + 1))
+            echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
+          fi
+          {
+            echo "pr_num=$OUT_PR_NUM"
+            echo "head_sha=$OUT_HEAD_SHA"
+            echo "branch=$OUT_BRANCH"
+            echo "pairs=$PAIRS"
+          } >> "$GITHUB_OUTPUT"
+          echo "Using $PAIRS A/B/B/A pairs"
+
+      - name: Acknowledge (react + occupancy notice)
+        if: github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          PAIRS: ${{ steps.config.outputs.pairs }}
+        with:
+          script: |
+            await github.rest.reactions.createForIssueComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              comment_id: context.payload.comment.id, content: 'eyes'
+            });
+            // Post the "started" notice under the SAME marker the result step uses, so the
+            // result updates this comment in place (and re-runs reuse it rather than stacking).
+            const marker = 'GPU Benchmark (ABBA)';
+            const body = `## GPU Benchmark (ABBA) — running…\n\n⏳ Renting an RTX 5090 on Vast.ai and running ${process.env.PAIRS} interleaved pairs (PR vs main) on the CUDA prover path. This takes ~1 hr; the result will replace this comment.`;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      - name: Install Vast CLI
+        # No secrets in this step's env: install-time code can't read the API key during pip
+        # install. Pinned to an immutable commit (see VAST_CLI_COMMIT) for the same reason.
+        # --break-system-packages: the ephemeral runner's Python may be PEP-668 "externally
+        # managed"; safe to override on a disposable runner.
+        run: pip install --quiet --break-system-packages "git+https://github.com/vast-ai/vast-cli.git@${VAST_CLI_COMMIT}"
+
+      - name: Authenticate Vast CLI
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+        run: vastai set api-key "$VAST_API_KEY"
+
+      - name: Generate ephemeral SSH key
+        id: sshkey
+        run: |
+          mkdir -p "$HOME/.ssh"
+          KEY="$HOME/.ssh/vast_bench"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "gh-actions-bench-${GITHUB_RUN_ID}" >/dev/null
+          echo "key_path=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Pick a Vast offer
+        id: offer
+        env:
+          # Retry the same query to ride out transient scarcity. Requiring gpu_frac=1
+          # (dedicated host) shrinks the rentable pool (~7 vs ~28 fractional), so give it
+          # more attempts to find a free whole-machine box. Total wait ~= ATTEMPTS * INTERVAL.
+          OFFER_ATTEMPTS: "20"
+          OFFER_INTERVAL: "30"
+          # Require driver >= this major so cudarc (default cuda-version-from-build-system)
+          # matches the runtime driver. Older drivers (e.g. 575) lack newer symbols like
+          # cuCtxGetDevice_v2 and the GPU path falls back to CPU. Filtered client-side in jq
+          # because vast can't numerically compare the driver_version string server-side.
+          MIN_DRIVER: "580"
+        run: |
+          # cpu_ram filter is in GB. Floor 48 GB: the bench workload moved to the
+          # 5-transfer ethrex fixture (executor/tests/ethrex_5_transfers.bin), far smaller
+          # than the old 20-transfer prove (~78 GB heap) that set the previous 96 GB floor.
+          # 48 GB widens the dedicated pool (~15 vs ~11 offers).
+          # gpu_frac=1 requires a WHOLE-MACHINE offer (you rent every GPU on the host), so
+          # Vast places no other tenant on the box: CPU cores, RAM/memory bandwidth, PCIe,
+          # and NVMe are fully dedicated. Without it the "most expensive" sort below lands on
+          # 1-of-8 slices (gpu_frac=0.125) on big multi-GPU servers — the GPU die is still
+          # whole, but up to 7 noisy neighbors share the host CPU/PCIe and add per-pair
+          # variance that ABBA pairing can't cancel (it's not static drift). Dedicated boxes
+          # exist in the same pool, just priced lower per slot.
+          QUERY="gpu_name=${GPU_NAME} num_gpus=1 gpu_frac=1 cpu_cores_effective>=16 cpu_cores_effective<=32 cpu_ram>=48 disk_space>=64 verified=true rentable=true cuda_max_good>=12.8 dph_total<=${PRICE_CAP}"
+          echo "Query: $QUERY (+ client-side driver_version major >= $MIN_DRIVER)"
+          # Keep only offers whose driver major >= MIN_DRIVER, then most expensive first
+          # (within the price cap). Within the now whole-machine pool, price just tracks
+          # core/RAM size; the priciest box gives the most headroom. The cheapest boxes were
+          # flaky (slow image pulls, OOM), so bias high.
+          # `try ... catch 0` so a malformed/null driver_version on one offer is treated as 0
+          # (filtered out) rather than erroring the whole jq and wasting the attempt.
+          SELECT="map(select((try (.driver_version|split(\".\")[0]|tonumber) catch 0) >= ${MIN_DRIVER})) | sort_by(.dph_total) | reverse"
+          OFFER_ID=""
+          for attempt in $(seq 1 "$OFFER_ATTEMPTS"); do
+            vastai search offers "$QUERY" --raw -o dph_total > offers.json || true
+            OFFER_ID=$(jq -r "$SELECT | .[0].id // empty" offers.json)
+            OFFER_PRICE=$(jq -r "$SELECT | .[0].dph_total // empty" offers.json)
+            if [ -n "$OFFER_ID" ]; then
+              echo "Selected offer $OFFER_ID at \$${OFFER_PRICE}/hr (attempt $attempt)"
+              break
+            fi
+            echo "No matching offer (attempt $attempt/$OFFER_ATTEMPTS); retrying in ${OFFER_INTERVAL}s..."
+            sleep "$OFFER_INTERVAL"
+          done
+          if [ -z "$OFFER_ID" ]; then
+            echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS attempts (>=16 cores, >=96GB RAM, >=64GB disk, driver>=${MIN_DRIVER}, <= \$${PRICE_CAP}/hr)"
+            exit 1
+          fi
+          echo "id=$OFFER_ID" >> "$GITHUB_OUTPUT"
+          echo "price=$OFFER_PRICE" >> "$GITHUB_OUTPUT"
+
+      - name: Create instance
+        id: instance
+        env:
+          VAST_TEMPLATE_HASH: ${{ secrets.VAST_TEMPLATE_HASH }}
+          OFFER_ID: ${{ steps.offer.outputs.id }}
+        run: |
+          vastai create instance "$OFFER_ID" \
+            --template_hash "$VAST_TEMPLATE_HASH" \
+            --disk "$VAST_IMAGE_DISK" \
+            --label "$RUN_LABEL" \
+            --ssh --direct --raw > create.json
+          # Log only the fields we need rather than the full --raw response, which could carry
+          # an unexpected sensitive field into the (collaborator-/world-readable) run log.
+          jq '{success, new_contract: (.new_contract // .instances.new_contract)}' create.json
+          IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json)
+          if [ -z "$IID" ]; then
+            echo "::error::Failed to create Vast instance"
+            exit 1
+          fi
+          # Persist immediately so teardown runs even if later steps fail.
+          echo "$IID" > "$RUNNER_TEMP/vast_instance_id"
+          echo "id=$IID" >> "$GITHUB_OUTPUT"
+          echo "Created instance $IID (label $RUN_LABEL)"
+
+      - name: Attach SSH key to instance
+        env:
+          IID: ${{ steps.instance.outputs.id }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          # Attach the ephemeral pubkey to THIS instance only (added to its authorized_keys).
+          # It's removed when the instance is destroyed, so no account-level key to clean up.
+          # Retry: the instance may not accept the attach immediately after create.
+          PUB="$(cat "$KEY.pub")"
+          for attempt in $(seq 1 12); do
+            if vastai attach ssh "$IID" "$PUB"; then
+              echo "Attached ssh key (attempt $attempt)"; exit 0
+            fi
+            echo "attach failed (attempt $attempt/12); retrying in 10s..."
+            sleep 10
+          done
+          echo "::error::Failed to attach ssh key to instance $IID"
+          exit 1
+
+      - name: Wait for SSH
+        id: ssh
+        env:
+          IID: ${{ steps.instance.outputs.id }}
+        run: |
+          echo "Waiting for instance $IID to reach 'running' with SSH endpoint..."
+          HOST=""; PORT=""
+          # The base CUDA image is large; some hosts sit in 'loading' (image pull) a while.
+          for _ in $(seq 1 180); do   # ~30 min
+            vastai show instance "$IID" --raw > inst.json || true
+            STATUS=$(jq -r '.actual_status // empty' inst.json)
+            # We create with --direct, so SSH straight to the public IP + the host port
+            # mapped to container port 22. The .ssh_host/.ssh_port proxy fields are
+            # unreliable (observed off-by-one vs the real proxy port), so use the direct
+            # mapping — same endpoint `vastai ssh-url` reports.
+            HOST=$(jq -r '.public_ipaddr // empty' inst.json)
+            PORT=$(jq -r '.ports["22/tcp"][0].HostPort // empty' inst.json)
+            echo "  status=$STATUS ssh=$HOST:$PORT"
+            if [ "$STATUS" = "running" ] && [ -n "$HOST" ] && [ -n "$PORT" ]; then
+              break
+            fi
+            sleep 10
+          done
+          if [ "$STATUS" != "running" ] || [ -z "$HOST" ] || [ -z "$PORT" ]; then
+            echo "::error::Instance never became reachable (status=$STATUS host=$HOST port=$PORT)"
+            exit 1
+          fi
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+
+          # Wait for sshd to accept our key.
+          for _ in $(seq 1 30); do
+            if ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes \
+                 -i "${{ steps.sshkey.outputs.key_path }}" -p "$PORT" "root@$HOST" true 2>/dev/null; then
+              echo "sshd reachable"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::sshd did not accept connections in time"
+          exit 1
+
+      - name: Wait for onstart provisioning
+        env:
+          HOST: ${{ steps.ssh.outputs.host }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          echo "Waiting for the template onstart script to finish (Rust + LLVM + sysroot + clone)..."
+          # The bootstrap's final stdout line is "=== done ===". Vast captures onstart
+          # output to /var/log/onstart.log; fall back to checking the artifacts it leaves.
+          for _ in $(seq 1 120); do   # ~20 min
+            if $SSH 'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null'; then
+              echo "onstart reported done"; exit 0
+            fi
+            # Fallback if the log marker isn't found: the late-stage artifacts (cargo + the
+            # sysroot + the cloned repo) imply the earlier Rust/LLVM/toolchain install finished.
+            # Deliberately no toolchain-date check — it would go stale when the repo bumps nightly.
+            # shellcheck disable=SC2016  # $HOME must expand on the remote box, not the runner
+            if $SSH 'test -x "$HOME/.cargo/bin/cargo" \
+                  && test -f /opt/lambda-vm-sysroot/include/stdlib.h \
+                  && test -d /workspace/lambda_vm/.git'; then
+              echo "provisioning artifacts present"; exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::onstart provisioning did not complete in time"
+          exit 1
+
+      - name: Run GPU ABBA benchmark
+        id: bench
+        env:
+          HOST: ${{ steps.ssh.outputs.host }}
+          PORT: ${{ steps.ssh.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          PR_NUM: ${{ steps.config.outputs.pr_num }}
+          HEAD_SHA: ${{ steps.config.outputs.head_sha }}
+          BRANCH: ${{ steps.config.outputs.branch }}
+          PAIRS: ${{ steps.config.outputs.pairs }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+
+          # Resolve the PR side (REF_A) and the fetch needed to make it resolvable on the box.
+          if [ -n "$PR_NUM" ]; then
+            FETCH="git fetch --force origin refs/pull/$PR_NUM/head"
+            REF_A="$HEAD_SHA"
+          else
+            # Reject anything outside the git-ref-safe charset before it reaches the remote
+            # `bash -lc` (defense-in-depth; workflow_dispatch is write-access only, but never
+            # interpolate an unvalidated ref into a remote shell command).
+            case "$BRANCH" in
+              ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid branch name: '$BRANCH'"; exit 1 ;;
+            esac
+            FETCH="git fetch --force origin $BRANCH"
+            REF_A="origin/$BRANCH"
+          fi
+
+          # Run main's bench_abba.sh — the harness is the pinned measurement methodology, so a
+          # PR can't alter how its own benchmark is computed. (The template clones the default
+          # branch, so checking out origin/main is also what's already there; this makes it
+          # explicit and robust to the template default changing.) The harness still builds the
+          # cli at REF_A (the PR) and origin/main in isolated worktrees, runs PAIRS interleaved
+          # A/B/B/A proves, and prints the paired-t CI + Wilcoxon verdict. BENCH_FEATURES routes
+          # the build through the CUDA prover path. NOTE: requires this PR's bench_abba.sh change
+          # (the BENCH_FEATURES env) to be on main — i.e. it only takes effect after merge.
+          # REBUILD=1: each Vast box is fresh, GPU-specific hardware — always rebuild both
+          # binaries (cubin is compiled for the detected arch); never trust a cached binary.
+          # CUDARC_PIN: compat shim for pre-pin baseline shas. cudarc's CUDA version is now pinned
+          # permanently in crypto/math-cuda/Cargo.toml (cuda-12080), so this no-ops on shas that
+          # carry the pin and only rewrites older baselines (where fallback-latest could request a
+          # symbol the box's driver doesn't export, e.g. cuDevSmResourceSplit -> runtime panic).
+          # MIN_DRIVER>=580 still guards the too-old end (older drivers lack cuCtxGetDevice_v2 and
+          # the GPU path falls back to CPU). nvidia-smi is logged for diagnosing driver issues.
+          REMOTE="set -e; cd /workspace/lambda_vm; \
+            command -v python3 >/dev/null || { apt-get update -qq && apt-get install -y -qq python3; }; \
+            nvidia-smi || true; \
+            git fetch --force origin main; $FETCH; \
+            git checkout -f origin/main; \
+            REBUILD=1 CUDARC_PIN=cuda-12080 SYSROOT_DIR=/opt/lambda-vm-sysroot BENCH_FEATURES='$BENCH_FEATURES' \
+            scripts/bench_abba.sh $REF_A origin/main $PAIRS"
+
+          # pipefail so a failed remote bench (e.g. a prove that dies) propagates through the
+          # tee pipe and fails this step, instead of being masked by tee's exit 0.
+          set -o pipefail
+          $SSH "bash -lc \"$REMOTE\"" | tee "$RUNNER_TEMP/abba_out.txt"
+          # Extract the result section for the PR comment (same marker bench-abba.yml uses).
+          sed -n '/=== ABBA paired result/,$p' "$RUNNER_TEMP/abba_out.txt" > "$RUNNER_TEMP/abba_result.txt"
+
+      - name: Write run summary
+        # Always run so a failure (incl. workflow_dispatch, which has no PR comment step) is
+        # visible in the Actions run summary instead of only the raw step log.
+        if: always() && (steps.bench.outcome == 'success' || steps.bench.outcome == 'failure')
+        env:
+          OUTCOME: ${{ steps.bench.outcome }}
+        run: |
+          {
+            echo "## GPU ABBA — ethrex 20 transfers (vs main)"
+            if [ "$OUTCOME" = "success" ] && [ -s "$RUNNER_TEMP/abba_result.txt" ]; then
+              echo '```'
+              cat "$RUNNER_TEMP/abba_result.txt"
+              echo '```'
+            else
+              echo "❌ Run outcome: ${OUTCOME:-unknown}. Last log lines:"
+              echo '```'
+              tail -n 30 "$RUNNER_TEMP/abba_out.txt" 2>/dev/null || echo "(no output captured)"
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment ABBA result on PR
+        if: always() && github.event_name == 'issue_comment'
+        uses: actions/github-script@v7
+        env:
+          HEAD_SHA: ${{ steps.config.outputs.head_sha }}
+          PAIRS: ${{ steps.config.outputs.pairs }}
+          OUTCOME: ${{ steps.bench.outcome }}
+          GPU_NAME: ${{ env.GPU_NAME }}
+          OFFER_PRICE: ${{ steps.offer.outputs.price }}
+        with:
+          script: |
+            const fs = require('fs');
+            const tmp = process.env.RUNNER_TEMP;
+            const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
+            const head = (process.env.HEAD_SHA || '').slice(0, 10);
+            const pairs = process.env.PAIRS;
+            const gpu = (process.env.GPU_NAME || '').replace('_', ' ');
+            const price = process.env.OFFER_PRICE;
+
+            let body = `## GPU Benchmark (ABBA) — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            body += `<sub>${gpu} · Vast.ai datacenter${price ? ` @ \$${price}/hr` : ''} · \`prover/cuda\` · drift-free A/B/B/A</sub>\n\n`;
+            if (process.env.OUTCOME === 'success') {
+              const res = read(`${tmp}/abba_result.txt`) || read(`${tmp}/abba_out.txt`);
+              body += '```\n' + res + '\n```\n';
+              body += '\n<sub>- = PR faster. Trust the verdict when paired-t and Wilcoxon agree.</sub>\n';
+            } else {
+              const tail = read(`${tmp}/abba_out.txt`).split('\n').slice(-30).join('\n');
+              body += `❌ Run failed. Last log lines:\n\n` + '```\n' + tail + '\n```\n';
+            }
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, per_page: 100,
+            });
+            const marker = 'GPU Benchmark (ABBA)';
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # --- Teardown: ALWAYS destroy the instance (cost guardrail) ---
+      - name: Destroy instance
+        if: always()
+        run: |
+          # Retry transient failures (network/auth) so a paid box isn't stranded.
+          # --yes: skip the interactive [y/N] confirm (CI has no tty).
+          destroy() {
+            iid="$1"; destroyed=""
+            for attempt in 1 2 3; do
+              if vastai destroy instance "$iid" --yes; then destroyed=1; break; fi
+              echo "destroy attempt $attempt failed; retrying in 10s..."
+              sleep 10
+            done
+            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $iid after 3 attempts — check the Vast console (label $RUN_LABEL)"
+          }
+          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
+            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
+            echo "Destroying instance $IID"
+            destroy "$IID"
+          else
+            # The id file is written only AFTER create succeeds AND its JSON parses, so a box can
+            # exist unrecorded if the run was cancelled in that window (concurrency cancel) or the
+            # parse failed. Fall back to destroying by our unique RUN_LABEL so the box can't leak
+            # (bill indefinitely). RUN_LABEL is unique per run, so this never touches another run's box.
+            echo "No instance id recorded; searching Vast for any box labelled $RUN_LABEL..."
+            vastai show instances --raw > all_inst.json 2>/dev/null || echo '[]' > all_inst.json
+            # Tolerate either a bare array or {instances:[...]}; match our exact label.
+            LEAKED=$(jq -r --arg L "$RUN_LABEL" \
+              '(if type=="array" then . else (.instances // []) end) | .[] | select(.label == $L) | .id' \
+              all_inst.json 2>/dev/null || true)
+            if [ -z "$LEAKED" ]; then
+              echo "No instance labelled $RUN_LABEL found; nothing to destroy."
+            else
+              for IID in $LEAKED; do
+                echo "Destroying leaked instance $IID (label $RUN_LABEL)"
+                destroy "$IID"
+              done
+            fi
+          fi

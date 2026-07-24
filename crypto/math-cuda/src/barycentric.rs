@@ -337,3 +337,81 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     stream.synchronize()?;
     Ok(out)
 }
+
+/// Gather full rows from a device-resident base-field LDE handle. `rows` are LDE
+/// row indices; returns their column values row-major (`rows.len() * main.m`
+/// u64, `out[q*num_cols + col]`) — i.e. the concatenation of
+/// `gather_main_row(rows[q])` for each `q`. Runs on the caller's stream.
+pub fn gather_rows_base_on_device(
+    main: &GpuLdeBase,
+    rows: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u64>> {
+    let num_cols = main.m;
+    if num_cols == 0 || rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let be = backend()?;
+    let rows_dev = stream.clone_htod(rows)?;
+    let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols)?;
+    let col_stride = main.lde_size as u64;
+    let num_cols_u64 = num_cols as u64;
+    let num_rows_u64 = rows.len() as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (rows.len() as u32, 1, 1),
+        block_dim: (BLOCK_DIM.min(num_cols as u32).max(1), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.gather_rows_base)
+            .arg(main.buf.as_ref())
+            .arg(&col_stride)
+            .arg(&num_cols_u64)
+            .arg(&rows_dev)
+            .arg(&num_rows_u64)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}
+
+/// Ext3 sibling of [`gather_rows_base_on_device`]: returns `rows.len() * aux.m *
+/// 3` u64, interleaved ext3 (`out[(q*num_cols + col)*3 + k]`).
+pub fn gather_rows_ext3_on_device(
+    aux: &GpuLdeExt3,
+    rows: &[u32],
+    stream: &Arc<CudaStream>,
+) -> Result<Vec<u64>> {
+    let num_cols = aux.m;
+    if num_cols == 0 || rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    let be = backend()?;
+    let rows_dev = stream.clone_htod(rows)?;
+    let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols * 3)?;
+    let col_stride = aux.lde_size as u64;
+    let num_cols_u64 = num_cols as u64;
+    let num_rows_u64 = rows.len() as u64;
+    let cfg = LaunchConfig {
+        grid_dim: (rows.len() as u32, 1, 1),
+        block_dim: (BLOCK_DIM.min(num_cols as u32).max(1), 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.gather_rows_ext3)
+            .arg(aux.buf.as_ref())
+            .arg(&col_stride)
+            .arg(&num_cols_u64)
+            .arg(&rows_dev)
+            .arg(&num_rows_u64)
+            .arg(&mut out)
+            .launch(cfg)?;
+    }
+    let host = stream.clone_dtoh(&out)?;
+    stream.synchronize()?;
+    Ok(host)
+}

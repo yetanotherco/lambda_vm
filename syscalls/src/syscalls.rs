@@ -8,6 +8,15 @@ use core::arch::asm;
 #[cfg(target_arch = "riscv64")]
 pub const PRIVATE_INPUT_START: usize = 0xFF000000;
 
+/// Maximum private-input length the guest will read, in bytes (512 MiB).
+/// The host caps stored input at this size in `Memory::store_private_inputs`,
+/// so an honest length prefix is always `<=` this bound; a larger value can only
+/// come from a malformed or forged prefix. The reader clamps to this cap so a
+/// bogus length can never make the guest fabricate an arbitrarily long slice.
+/// Must match `executor::vm::memory::MAX_PRIVATE_INPUT_SIZE`.
+#[cfg(target_arch = "riscv64")]
+const MAX_PRIVATE_INPUT_SIZE: usize = 512 * 1024 * 1024;
+
 #[cfg(target_arch = "riscv64")]
 pub enum SyscallNumbers {
     Print = 1,
@@ -82,18 +91,40 @@ pub fn commit(slice: &[u8]) {
 /// No ecall is performed — it's a plain memory read (ZisK-style).
 #[cfg(target_arch = "riscv64")]
 pub fn get_private_input() -> Vec<u8> {
-    // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
-    // execution. The 4-byte LE length prefix is always valid (written by the
-    // executor). The data pointer and length are within the memory-mapped region.
-    let len_ptr = PRIVATE_INPUT_START as *const u32;
-    let len = unsafe { core::ptr::read_volatile(len_ptr) } as usize;
-    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
-    let slice = unsafe { core::slice::from_raw_parts(data_ptr, len) };
-    slice.to_vec()
+    // Copy the borrowed private-input bytes into an owned `Vec`. The raw-pointer
+    // read (length prefix + data slice) and its single `unsafe` block live in
+    // `get_private_input_slice`, so the memory layout is defined in one place.
+    get_private_input_slice().to_vec()
 }
 
 #[cfg(not(target_arch = "riscv64"))]
 pub fn get_private_input() -> Vec<u8> {
+    unimplemented!("syscalls are only implemented for riscv64 targets");
+}
+
+/// Borrow the private input bytes in place from the memory-mapped region —
+/// no copy, no allocation. Same layout as [`get_private_input`]; the returned
+/// slice starts at `PRIVATE_INPUT_START + 4` (a 4-aligned address) and lives
+/// for the whole execution (the host never remaps the region).
+#[cfg(target_arch = "riscv64")]
+pub fn get_private_input_slice() -> &'static [u8] {
+    // SAFETY: The host pre-loads private input at PRIVATE_INPUT_START before
+    // execution and never remaps it afterward, so the returned slice is valid
+    // for the `'static` lifetime of the guest's single-threaded execution
+    // region, which stays mapped and unmodified for the whole execution.
+    let len_ptr = PRIVATE_INPUT_START as *const u32;
+    // Clamp the prover-written length prefix to `MAX_PRIVATE_INPUT_SIZE`. An
+    // honest prefix (written by the host, which caps stored input at this size)
+    // is always within bound, so clamping never changes behavior for real
+    // inputs — it only bounds the slice length when a malformed or forged prefix
+    // claims more, keeping the read deterministic.
+    let len = (unsafe { core::ptr::read_volatile(len_ptr) } as usize).min(MAX_PRIVATE_INPUT_SIZE);
+    let data_ptr = (PRIVATE_INPUT_START + 4) as *const u8;
+    unsafe { core::slice::from_raw_parts(data_ptr, len) }
+}
+
+#[cfg(not(target_arch = "riscv64"))]
+pub fn get_private_input_slice() -> &'static [u8] {
     unimplemented!("syscalls are only implemented for riscv64 targets");
 }
 

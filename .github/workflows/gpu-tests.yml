@@ -1,0 +1,396 @@
+name: GPU Tests (merge queue)
+
+# Run the GPU test suite (which CPU CI can't, since GitHub runners have no GPU) on a rented
+# Vast.ai RTX 5090 when a PR is in the merge queue, and block the merge if it fails.
+# Groups (see scripts/gpu_test.sh): math-cuda kernel parity, cuda_path_integration (GPU proof
+# verifies), cuda_fallback (CPU fallback verifies), the prover/stark/crypto/ecsm suite on the
+# GPU path, and the comprehensive all-instructions prove. Orchestration runs on a GitHub-hosted
+# runner; all GPU work happens on the rented box (provisioned by the template onstart). The box
+# is ALWAYS destroyed at the end.
+#
+# The GPU suite runs on `merge_group` (one rental per merge, not per push) + `workflow_dispatch`
+# for manual runs. The `pull_request` trigger exists ONLY so the job reports on PRs: it is
+# skipped there (no rental, no cost), and GitHub counts a skipped job as satisfying a required
+# status check. Without it, `gpu-tests` never reports on the PR head and the PR is stuck at
+# "Expected — Waiting for status to be reported", unable to enter the merge queue. To gate
+# merges, add the job name `gpu-tests` to the branch-protection required status checks for
+# `main` (GitHub UI).
+#
+# Requires repo secrets:
+#   VAST_API_KEY        — https://cloud.vast.ai/manage-keys/
+#   VAST_TEMPLATE_HASH  — hash of the "NVIDIA CUDA Lambda VM 64GB" template
+
+on:
+  merge_group:
+  # Reports the check as Skipped on PRs (see the job-level `if`) so the required check is
+  # satisfied and the PR can enter the merge queue.
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Vast offer search: RTX 5090, >=16 cores, >=48GB RAM, >=64GB disk, verified + rentable,
+  # Blackwell-capable driver.
+  GPU_NAME: RTX_5090
+  # Escalating price bands ($/hr, ascending). We prefer the cheapest band with capacity and
+  # only climb to a pricier one when a lower band is empty or its boxes fail to provision.
+  # The last value is the hard cap. (Idea borrowed from IDP's create-vast-server.yml.)
+  PRICE_THRESHOLDS: "0.6 0.8 1.0"
+  VAST_IMAGE_DISK: "64"
+  # Unique per-run label set on the instance, for identification + leak-proof teardown.
+  RUN_LABEL: "gpu-tests-${{ github.run_id }}-${{ github.run_attempt }}"
+  # Pin the Vast CLI to an immutable commit (a PyPI version can be re-published; a commit
+  # hash can't) — avoids pulling untrusted code at run time.
+  VAST_CLI_COMMIT: "28494d92c6c03d887f8375085243c22eb68c5874"
+
+jobs:
+  gpu-tests:
+    runs-on: ubuntu-latest
+    # Skip on PRs (reports as Skipped = required check satisfied, no GPU rental); run for
+    # real on merge_group and manual dispatch.
+    if: github.event_name != 'pull_request'
+    # Provisioning + cuda builds + 5 test groups; the prover suite (single-threaded, real
+    # ELF proves) dominates. Generous ceiling; teardown still always destroys the box.
+    timeout-minutes: 240
+    steps:
+      - name: Install Vast CLI
+        # No secrets in this step's env: install-time code can't read the API key during pip
+        # install. Pinned to an immutable commit (see VAST_CLI_COMMIT) for the same reason.
+        # --break-system-packages: the ephemeral runner's Python may be PEP-668 "externally
+        # managed"; safe to override on a disposable runner.
+        run: pip install --quiet --break-system-packages "git+https://github.com/vast-ai/vast-cli.git@${VAST_CLI_COMMIT}"
+
+      - name: Authenticate Vast CLI
+        env:
+          VAST_API_KEY: ${{ secrets.VAST_API_KEY }}
+        run: vastai set api-key "$VAST_API_KEY"
+
+      - name: Generate ephemeral SSH key
+        id: sshkey
+        run: |
+          mkdir -p "$HOME/.ssh"
+          KEY="$HOME/.ssh/vast_gpu_tests"
+          ssh-keygen -t ed25519 -N "" -f "$KEY" -C "gh-actions-gpu-tests-${GITHUB_RUN_ID}" >/dev/null
+          echo "key_path=$KEY" >> "$GITHUB_OUTPUT"
+
+      # Rent → provision → wait-for-ready, retrying across DIFFERENT offers. A box that never
+      # becomes ready within PROVISION_TIMEOUT (slow image pull, dead sshd, stuck onstart) is
+      # destroyed and a different host is tried — up to MAX_TRIES. We prefer the cheapest price
+      # band with capacity and only climb when a band is empty. Ideas from IDP's
+      # create-vast-server.yml (price bands + per-box readiness budget + tried-host exclusion).
+      - name: Provision instance (retry across offers)
+        id: provision
+        env:
+          VAST_TEMPLATE_HASH: ${{ secrets.VAST_TEMPLATE_HASH }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          # Distinct offers to try before giving up (each is a different physical host).
+          MAX_TRIES: "5"
+          # Per-box readiness budget (seconds): running + sshd + onstart done, else swap hosts.
+          PROVISION_TIMEOUT: "600"
+          # How many times to re-scan all bands for an offer before failing (transient scarcity).
+          OFFER_ATTEMPTS: "10"
+          OFFER_INTERVAL: "30"
+          # Require driver major >= this so cudarc matches the runtime driver (older drivers lack
+          # newer symbols and the GPU path falls back to CPU). Filtered client-side in jq because
+          # vast can't numerically compare the driver_version string server-side.
+          MIN_DRIVER: "580"
+        run: |
+          # We handle failures explicitly (retry/destroy), so don't let -e abort the step.
+          set +e
+          SSH_OPTS="-o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes"
+          PUB="$(cat "$KEY.pub")"
+          read -r -a THRESHOLDS <<< "$PRICE_THRESHOLDS"
+          # cpu_ram filter is in GB (the returned .cpu_ram field is in MB).
+          BASE="gpu_name=${GPU_NAME} num_gpus=1 cpu_cores_effective>=16 cpu_ram>=48 disk_space>=${VAST_IMAGE_DISK} verified=true rentable=true cuda_max_good>=13.1"
+          TRIED=""   # space-separated machine_ids already attempted (never re-pick a flaky host)
+
+          destroy() {  # $1 = instance id; retry transient destroy failures so no box is stranded
+            for _ in 1 2 3; do
+              vastai destroy instance "$1" --yes && return 0
+              sleep 10
+            done
+            echo "::warning::failed to destroy instance $1 after 3 tries (label $RUN_LABEL)"
+          }
+
+          # Pick the priciest offer in the cheapest non-empty band, excluding tried hosts.
+          # Premium hosts within a band tend to have faster disks/network + better reliability.
+          # Sets OFFER_ID / MACHINE_ID / OFFER_PRICE / SPECS. Returns 1 if no band has capacity.
+          pick_offer() {
+            OFFER_ID=""; MACHINE_ID=""; OFFER_PRICE=""; SPECS=""
+            local excl sel
+            excl="[$(echo "$TRIED" | tr -s ' ' ',' | sed 's/^,//; s/,$//')]"
+            for band in "${THRESHOLDS[@]}"; do
+              vastai search offers "$BASE dph_total<=$band" --raw -o dph_total > offers.json 2>/dev/null || true
+              sel=$(jq -c --argjson excl "$excl" '
+                map(select((try (.driver_version|split(".")[0]|tonumber) catch 0) >= '"$MIN_DRIVER"'))
+                | map(select(([.machine_id] | inside($excl)) | not))
+                | sort_by(.dph_total) | reverse | .[0] // empty' offers.json)
+              if [ -n "$sel" ]; then
+                OFFER_ID=$(echo "$sel" | jq -r '.id')
+                MACHINE_ID=$(echo "$sel" | jq -r '.machine_id')
+                OFFER_PRICE=$(echo "$sel" | jq -r '.dph_total')
+                SPECS=$(echo "$sel" | jq -r '"cores=\(.cpu_cores_effective) ram=\(.cpu_ram)MB disk=\(.disk_space)GB driver=\(.driver_version) cuda_max_good=\(.cuda_max_good) geo=\(.geolocation)"')
+                echo "  band<=\$$band -> offer $OFFER_ID (machine $MACHINE_ID) at \$$OFFER_PRICE/hr | $SPECS"
+                return 0
+              fi
+              echo "  band<=\$$band -> no capacity"
+            done
+            return 1
+          }
+
+          # Wait until the box is running + sshd accepts our key + onstart bootstrap finished.
+          # Sets HOST/PORT. Returns 0 ready, 1 timeout, 2 unrecoverable image/scheduling failure.
+          wait_ready() {  # $1 = instance id
+            local iid="$1" waited=0 status host port msg
+            HOST=""; PORT=""
+            while [ "$waited" -lt "$PROVISION_TIMEOUT" ]; do
+              vastai show instance "$iid" --raw > inst.json 2>/dev/null || true
+              status=$(jq -r '.actual_status // empty' inst.json)
+              msg=$(jq -r '.status_msg // empty' inst.json)
+              # Fail fast on an image that can't be pulled / a host that can't meet the ask —
+              # waiting the full budget won't help (borrowed from IDP wait_ready).
+              case "$msg" in
+                *"not started loading"*|*"cannot be met"*|*"Error response from daemon"*)
+                  echo "  unrecoverable: $msg"; return 2 ;;
+              esac
+              # --direct: SSH straight to the public IP + the host port mapped to container 22
+              # (the .ssh_host/.ssh_port proxy fields are unreliable).
+              host=$(jq -r '.public_ipaddr // empty' inst.json)
+              port=$(jq -r '.ports["22/tcp"][0].HostPort // empty' inst.json)
+              if [ "$status" = "running" ] && [ -n "$host" ] && [ -n "$port" ]; then
+                HOST="$host"; PORT="$port"
+                # shellcheck disable=SC2086  # $SSH_OPTS is intentionally word-split into flags
+                if ssh $SSH_OPTS -i "$KEY" -p "$PORT" "root@$HOST" true 2>/dev/null; then
+                  # onstart's final stdout line is "=== done ==="; fall back to its artifacts.
+                  # shellcheck disable=SC2016,SC2086  # $HOME expands remotely; $SSH_OPTS word-splits
+                  if ssh $SSH_OPTS -i "$KEY" -p "$PORT" "root@$HOST" \
+                       'grep -q "=== done ===" /var/log/onstart.log 2>/dev/null || { test -x "$HOME/.cargo/bin/cargo" && test -f /opt/lambda-vm-sysroot/include/stdlib.h && test -d /workspace/lambda_vm/.git; }' 2>/dev/null; then
+                    echo "  ready at $HOST:$PORT (onstart done, ${waited}s)"; return 0
+                  fi
+                  echo "  status=$status ssh ok, onstart still running (${waited}s)"
+                else
+                  echo "  status=$status ssh=$HOST:$PORT sshd not accepting yet (${waited}s)"
+                fi
+              else
+                echo "  status=$status host=$host port=$port (${waited}s)"
+              fi
+              sleep 15; waited=$((waited + 15))
+            done
+            echo "  not ready within ${PROVISION_TIMEOUT}s"; return 1
+          }
+
+          for try in $(seq 1 "$MAX_TRIES"); do
+            echo "=== provisioning attempt $try/$MAX_TRIES (bands: $PRICE_THRESHOLDS, driver>=$MIN_DRIVER) ==="
+
+            # Scan bands for an offer, re-scanning to ride out transient RTX 5090 scarcity.
+            got=""
+            for scan in $(seq 1 "$OFFER_ATTEMPTS"); do
+              if pick_offer; then got=1; break; fi
+              echo "  no capacity in any band (scan $scan/$OFFER_ATTEMPTS); retry in ${OFFER_INTERVAL}s"
+              sleep "$OFFER_INTERVAL"
+            done
+            if [ -z "$got" ]; then
+              echo "::error::No RTX 5090 offer matched after $OFFER_ATTEMPTS scans (bands: $PRICE_THRESHOLDS, >=16 cores, >=48GB RAM, >=${VAST_IMAGE_DISK}GB disk, driver>=${MIN_DRIVER})"
+              exit 1
+            fi
+            TRIED="$TRIED $MACHINE_ID"
+
+            vastai create instance "$OFFER_ID" \
+              --template_hash "$VAST_TEMPLATE_HASH" \
+              --disk "$VAST_IMAGE_DISK" \
+              --label "$RUN_LABEL" \
+              --ssh --direct --raw > create.json 2>/dev/null
+            # Log only the fields we need (the full --raw response could carry a sensitive field).
+            jq '{success, new_contract: (.new_contract // .instances.new_contract)}' create.json 2>/dev/null || true
+            IID=$(jq -r '.new_contract // .instances.new_contract // empty' create.json 2>/dev/null)
+            if [ -z "$IID" ]; then
+              echo "::warning::create failed for offer $OFFER_ID; trying another host"
+              continue
+            fi
+            # Persist immediately so the always() teardown destroys this box even if we're
+            # cancelled mid-wait. Cleared below if we destroy it ourselves and move on.
+            echo "$IID" > "$RUNNER_TEMP/vast_instance_id"
+            echo "created instance $IID (offer $OFFER_ID, machine $MACHINE_ID, label $RUN_LABEL)"
+
+            # Attach the ephemeral pubkey to THIS instance only (its authorized_keys); it goes
+            # away when the box is destroyed, so there's no account-level key to clean up.
+            attached=""
+            for _ in $(seq 1 12); do
+              vastai attach ssh "$IID" "$PUB" && { attached=1; break; }
+              sleep 10
+            done
+            if [ -z "$attached" ]; then
+              echo "::warning::could not attach ssh key to $IID; destroying and trying another host"
+              destroy "$IID"; rm -f "$RUNNER_TEMP/vast_instance_id"; continue
+            fi
+
+            if wait_ready "$IID"; then
+              {
+                echo "host=$HOST"; echo "port=$PORT"; echo "id=$IID"
+                echo "price=$OFFER_PRICE"; echo "specs=$SPECS"
+              } >> "$GITHUB_OUTPUT"
+              {
+                echo "### GPU box"
+                echo "- offer \`$OFFER_ID\` (machine \`$MACHINE_ID\`) at \$$OFFER_PRICE/hr"
+                echo "- $SPECS"
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "instance $IID ready — proceeding to tests"
+              exit 0
+            else
+              rc=$?
+            fi
+            echo "::warning::instance $IID not ready (rc=$rc: 1=timeout, 2=image/scheduling failure); destroying and trying another host"
+            destroy "$IID"; rm -f "$RUNNER_TEMP/vast_instance_id"
+          done
+
+          echo "::error::Could not provision a ready GPU box after $MAX_TRIES distinct offers"
+          exit 1
+
+      # Print the box's hardware in its own step: the "Run GPU tests" log is huge and gets
+      # truncated/rotated in the UI, so nvidia-smi printed inside gpu_test.sh can be hard to
+      # recover. Its own short-lived step keeps the GPU/driver/CPU/RAM info easy to find.
+      - name: Print machine info
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+        run: |
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # shellcheck disable=SC2016  # $(nproc) etc. must expand on the remote box, not here
+          $SSH 'nvidia-smi; echo; nvcc --version | tail -n2; echo; \
+                echo "CPU: $(nproc) cores"; \
+                grep -m1 "model name" /proc/cpuinfo; \
+                free -h'
+
+      - name: Run GPU tests
+        id: tests
+        env:
+          HOST: ${{ steps.provision.outputs.host }}
+          PORT: ${{ steps.provision.outputs.port }}
+          KEY: ${{ steps.sshkey.outputs.key_path }}
+          # merge_group: refs/heads/gh-readonly-queue/main/pr-… (the merge commit = PR + main),
+          # so we test exactly what will land. workflow_dispatch: the chosen branch ref.
+          REF: ${{ github.ref }}
+        run: |
+          # ServerAlive*: ConnectTimeout only covers connection setup; without keepalives a box
+          # that wedges or drops off the network mid-suite would hang this step silently until
+          # the 240-minute job timeout. 60s x 10 fails the run ~10 minutes after the box goes dark.
+          SSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -o ServerAliveInterval=60 -o ServerAliveCountMax=10 -o BatchMode=yes -i $KEY -p $PORT root@$HOST"
+          # Defense-in-depth: never interpolate an unvalidated ref into the remote `bash -lc`.
+          case "$REF" in
+            ''|*[!A-Za-z0-9._/-]*) echo "::error::invalid ref: '$REF'"; exit 1 ;;
+          esac
+          # Check out the ref under test on the box, then run the CUDA test groups.
+          # gpu_test.sh owns the SYSROOT_DIR default — don't duplicate it here. (cudarc's CUDA
+          # version is pinned in crypto/math-cuda/Cargo.toml, so no CUDARC_PIN is needed.)
+          REMOTE="set -e; cd /workspace/lambda_vm; \
+            git fetch --force origin '$REF'; \
+            git checkout -f FETCH_HEAD; \
+            bash scripts/gpu_test.sh"
+
+          # pipefail so a test failure on the box propagates through the tee pipe and FAILS this
+          # step (which fails the job and blocks the merge), instead of being masked by tee.
+          # 2>&1 so remote stderr (build errors, panics) is captured too — both into the live
+          # step log and the file the run-summary step tails.
+          set -o pipefail
+          $SSH "bash -lc \"$REMOTE\"" 2>&1 | tee "$RUNNER_TEMP/gpu_test_out.txt"
+
+      - name: Write run summary
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        env:
+          OUTCOME: ${{ steps.tests.outcome }}
+        run: |
+          OUT="$RUNNER_TEMP/gpu_test_out.txt"
+          {
+            echo "## GPU tests (CUDA suite) — ${OUTCOME}"
+            if [ "$OUTCOME" = "success" ]; then
+              echo "All GPU test groups passed."
+            else
+              # Group the failed tests under the make target that ran them: gpu_test.sh prints
+              # "=== make <target> ===" before each group, and cargo prints "test <name> ... FAILED".
+              report=$(awk '
+                /^=== make / { grp=$3; next }
+                / \.\.\. FAILED/ { fails[grp]=fails[grp] "\n    - " $2; n[grp]++ }
+                END { for (g in fails) printf "- **%s** (%d failed):%s\n", g, n[g], fails[g] }
+              ' "$OUT" 2>/dev/null || true)
+              # Per-test panic/assertion messages: each "thread '…' panicked at …:" block plus
+              # its following message lines (assertion, left/right), capped per block.
+              details=$(awk '
+                /^thread .* panicked at / { cap=1; lines=0; buf=$0; next }
+                cap {
+                  if ($0 ~ /^note: run with/ || $0 ~ /^----/ || $0 ~ /^test / || $0 ~ /^=== / || $0 ~ /^[[:space:]]*$/) { printf "%s\n\n", buf; cap=0; next }
+                  if (lines < 14) { buf=buf "\n" $0; lines++ } else if (lines==14) { buf=buf "\n    ...(truncated)"; lines++ }
+                }
+                END { if (cap) printf "%s\n", buf }
+              ' "$OUT" 2>/dev/null || true)
+              if [ -n "$report" ]; then
+                echo; echo "### Failed tests by group"; echo "$report"
+                if [ -n "$details" ]; then
+                  echo; echo "### Failure details"; echo '```'; echo "$details"; echo '```'
+                fi
+              else
+                # No per-test failures parsed (likely a build/infra error) — fall back to the
+                # failed-group markers plus a short log tail.
+                grps=$(grep -F '::error::GPU test group failed:' "$OUT" 2>/dev/null | sed 's/.*failed: /- /' | sort -u || true)
+                [ -n "$grps" ] && { echo; echo "### Failed groups"; echo "$grps"; }
+                echo; echo "No individual test failures parsed (build/infra error?). Last lines:"
+                echo '```'; tail -n 40 "$OUT" 2>/dev/null || echo "(no output captured)"; echo '```'
+              fi
+              echo; echo "<sub>Full output: \"Run GPU tests\" step log, or the \`gpu-test-log\` artifact (survives UI log truncation).</sub>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The step log gets truncated/rotated in the UI for multi-hour runs (see the machine-info
+      # comment above); the artifact keeps the complete output retrievable.
+      - name: Upload full test log
+        if: always() && (steps.tests.outcome == 'success' || steps.tests.outcome == 'failure')
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-log
+          path: ${{ runner.temp }}/gpu_test_out.txt
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # --- Teardown: ALWAYS destroy the instance (cost guardrail) ---
+      - name: Destroy instance
+        if: always()
+        run: |
+          # Retry transient failures (network/auth) so a paid box isn't stranded.
+          # --yes: skip the interactive [y/N] confirm (CI has no tty).
+          destroy() {
+            iid="$1"; destroyed=""
+            for attempt in 1 2 3; do
+              if vastai destroy instance "$iid" --yes; then destroyed=1; break; fi
+              echo "destroy attempt $attempt failed; retrying in 10s..."
+              sleep 10
+            done
+            [ -n "$destroyed" ] || echo "::warning::Failed to destroy instance $iid after 3 attempts — check the Vast console (label $RUN_LABEL)"
+          }
+          if [ -f "$RUNNER_TEMP/vast_instance_id" ]; then
+            IID=$(cat "$RUNNER_TEMP/vast_instance_id")
+            echo "Destroying instance $IID"
+            destroy "$IID"
+          else
+            # The id file is written only AFTER create succeeds AND its JSON parses, so a box can
+            # exist unrecorded if the run was cancelled in that window or the parse failed. Fall
+            # back to destroying by our unique RUN_LABEL so the box can't leak (bill indefinitely).
+            echo "No instance id recorded; searching Vast for any box labelled $RUN_LABEL..."
+            vastai show instances --raw > all_inst.json 2>/dev/null || echo '[]' > all_inst.json
+            LEAKED=$(jq -r --arg L "$RUN_LABEL" \
+              '(if type=="array" then . else (.instances // []) end) | .[] | select(.label == $L) | .id' \
+              all_inst.json 2>/dev/null || true)
+            if [ -z "$LEAKED" ]; then
+              echo "No instance labelled $RUN_LABEL found; nothing to destroy."
+            else
+              for IID in $LEAKED; do
+                echo "Destroying leaked instance $IID (label $RUN_LABEL)"
+                destroy "$IID"
+              done
+            fi
+          fi

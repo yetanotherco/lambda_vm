@@ -38,7 +38,7 @@ fn keccak_leaves_base_matches_cpu() {
                     flat[c * n + r] = *e.value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n, 1).unwrap();
             assert_eq!(gpu.len(), n * 32);
             for i in 0..n {
                 assert_eq!(
@@ -84,13 +84,94 @@ fn keccak_leaves_ext3_matches_cpu() {
                     flat[(c * 3 + 2) * n + r] = *e.value()[2].value();
                 }
             }
-            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n).unwrap();
+            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n, 1).unwrap();
             assert_eq!(gpu.len(), n * 32);
             for i in 0..n {
                 assert_eq!(
                     &gpu[i * 32..(i + 1) * 32],
                     &cpu[i][..],
                     "ext3 leaf mismatch at row {i} (log_n={log_n}, cols={num_cols})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn keccak_leaves_base_row_pair_matches_cpu() {
+    // Row-pair (trace) commit: leaf `i` hashes bit-reversed rows `2i`, `2i+1`.
+    // GPU `keccak_leaves_base(.., rows_per_leaf=2)` must match the CPU prover
+    // helper `keccak_leaves_row_pair_bit_reversed` over base columns.
+    for log_n in [4u32, 6, 8, 10, 12] {
+        for num_cols in [1usize, 5, 17, 41] {
+            let n = 1 << log_n;
+            let mut rng = ChaCha8Rng::seed_from_u64(500 + log_n as u64 + num_cols as u64);
+            let columns: Vec<Vec<Fp>> = (0..num_cols)
+                .map(|_| (0..n).map(|_| Fp::from_raw(rng.r#gen::<u64>())).collect())
+                .collect();
+
+            let cpu = keccak_leaves_row_pair_bit_reversed(&columns);
+            assert_eq!(cpu.len(), n / 2);
+
+            let mut flat = vec![0u64; num_cols * n];
+            for (c, col) in columns.iter().enumerate() {
+                for (r, e) in col.iter().enumerate() {
+                    flat[c * n + r] = *e.value();
+                }
+            }
+            let gpu = math_cuda::merkle::keccak_leaves_base(&flat, n, num_cols, n, 2).unwrap();
+            assert_eq!(gpu.len(), (n / 2) * 32);
+            for i in 0..n / 2 {
+                assert_eq!(
+                    &gpu[i * 32..(i + 1) * 32],
+                    &cpu[i][..],
+                    "base row-pair leaf mismatch at i={i} (log_n={log_n}, cols={num_cols})"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn keccak_leaves_ext3_row_pair_matches_cpu() {
+    for log_n in [4u32, 6, 8, 10] {
+        for num_cols in [1usize, 3, 11, 20] {
+            let n = 1 << log_n;
+            let mut rng = ChaCha8Rng::seed_from_u64(600 + log_n as u64 + num_cols as u64);
+            let columns: Vec<Vec<Fp3>> = (0..num_cols)
+                .map(|_| {
+                    (0..n)
+                        .map(|_| {
+                            Fp3::new([
+                                Fp::from_raw(rng.r#gen::<u64>()),
+                                Fp::from_raw(rng.r#gen::<u64>()),
+                                Fp::from_raw(rng.r#gen::<u64>()),
+                            ])
+                        })
+                        .collect()
+                })
+                .collect();
+
+            let cpu = keccak_leaves_row_pair_bit_reversed(&columns);
+            assert_eq!(cpu.len(), n / 2);
+
+            // De-interleaved 3-slab layout per ext3 column (same as the 1-row
+            // ext3 leaf path): [col*3+k] each a contiguous slab of n u64s.
+            let mut flat = vec![0u64; num_cols * 3 * n];
+            for (c, col) in columns.iter().enumerate() {
+                for (r, e) in col.iter().enumerate() {
+                    flat[(c * 3) * n + r] = *e.value()[0].value();
+                    flat[(c * 3 + 1) * n + r] = *e.value()[1].value();
+                    flat[(c * 3 + 2) * n + r] = *e.value()[2].value();
+                }
+            }
+            let gpu = math_cuda::merkle::keccak_leaves_ext3(&flat, n, num_cols, n, 2).unwrap();
+            assert_eq!(gpu.len(), (n / 2) * 32);
+            for i in 0..n / 2 {
+                assert_eq!(
+                    &gpu[i * 32..(i + 1) * 32],
+                    &cpu[i][..],
+                    "ext3 row-pair leaf mismatch at i={i} (log_n={log_n}, cols={num_cols})"
                 );
             }
         }
@@ -136,8 +217,13 @@ fn keccak_comp_poly_leaves_matches_cpu() {
             let parts_slices: Vec<&[u64]> =
                 parts_interleaved.iter().map(|v| v.as_slice()).collect();
 
-            let nodes =
-                math_cuda::merkle::build_comp_poly_tree_from_evals_ext3(&parts_slices).unwrap();
+            // Exercise the production keep path, then read the resident nodes
+            // back to host to check the leaf bytes.
+            let tree = math_cuda::merkle::build_comp_poly_tree_from_evals_ext3_keep(&parts_slices)
+                .unwrap();
+            let be = math_cuda::device::backend().unwrap();
+            let stream = be.next_stream();
+            let nodes: Vec<u8> = stream.clone_dtoh(&*tree.nodes).unwrap();
             let num_leaves = lde_size / 2;
             let leaves_offset = (num_leaves - 1) * 32;
             for i in 0..num_leaves {

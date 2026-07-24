@@ -90,13 +90,21 @@ impl Drop for PinnedStaging {
     }
 }
 
-const ARITH_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/arith.ptx"));
-const NTT_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/ntt.ptx"));
-const KECCAK_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/keccak.ptx"));
-const BARY_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/barycentric.ptx"));
-const DEEP_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/deep.ptx"));
-const FRI_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/fri.ptx"));
-const INVERSE_PTX: &str = include_str!(concat!(env!("OUT_DIR"), "/inverse.ptx"));
+// Kernels are AOT-compiled to native cubin (SASS) by build.rs, embedded here,
+// and loaded via `Ptx::from_binary` (cubin bytes -> cuModuleLoadData). This
+// avoids the PTX-ISA/driver-version JIT check — see build.rs `compile_kernel`.
+// An empty slice (nvcc-less stub build) fails to load at runtime and the caller
+// falls back to CPU.
+const ARITH_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/arith.cubin"));
+const NTT_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ntt.cubin"));
+const KECCAK_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/keccak.cubin"));
+const BARY_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/barycentric.cubin"));
+const DEEP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/deep.cubin"));
+const FRI_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/fri.cubin"));
+const INVERSE_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/inverse.cubin"));
+const LOGUP_CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/logup.cubin"));
+const CONSTRAINT_INTERP_CUBIN: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/constraint_interp.cubin"));
 
 /// Number of CUDA streams in the pool. Larger pools let many rayon-parallel
 /// callers overlap on the GPU without serializing on stream ownership. The
@@ -118,8 +126,11 @@ pub struct Backend {
     pinned_hashes: Vec<Mutex<PinnedStaging>>,
     util_stream: Arc<CudaStream>,
     next: AtomicUsize,
+    /// VRAM budget (bytes) for table-session admission control. See
+    /// [`detect_vram_budget_bytes`].
+    vram_budget_bytes: u64,
 
-    // arith.ptx
+    // arith.cubin
     pub vector_add_u64: CudaFunction,
     pub gl_add: CudaFunction,
     pub gl_sub: CudaFunction,
@@ -129,7 +140,7 @@ pub struct Backend {
     pub ext3_add: CudaFunction,
     pub ext3_sub: CudaFunction,
 
-    // ntt.ptx
+    // ntt.cubin
     pub bit_reverse_permute: CudaFunction,
     pub ntt_dit_level: CudaFunction,
     pub ntt_dit_8_levels: CudaFunction,
@@ -140,56 +151,161 @@ pub struct Backend {
     pub ntt_dit_8_levels_batched: CudaFunction,
     pub pointwise_mul_batched: CudaFunction,
     pub scalar_mul_batched: CudaFunction,
+    // row-major NTT kernels
+    pub bit_reverse_row_major: CudaFunction,
+    pub ntt_dit_level_row_major: CudaFunction,
+    pub pointwise_mul_row_major: CudaFunction,
+    pub matrix_transpose_strided: CudaFunction,
 
-    // keccak.ptx
+    // keccak.cubin
+    pub keccak256_leaves_base_row_major_row_pair: CudaFunction,
     pub keccak256_leaves_base_batched: CudaFunction,
+    pub keccak256_leaves_base_row_pair_batched: CudaFunction,
     pub keccak256_leaves_ext3_batched: CudaFunction,
     pub keccak_comp_poly_leaves_ext3: CudaFunction,
     pub keccak_fri_leaves_ext3: CudaFunction,
     pub keccak_merkle_level: CudaFunction,
+    pub merkle_gather_paths: CudaFunction,
 
-    // barycentric.ptx
+    // barycentric.cubin
     pub barycentric_base_batched: CudaFunction,
     pub barycentric_ext3_batched: CudaFunction,
     pub barycentric_base_batched_strided: CudaFunction,
     pub barycentric_ext3_batched_strided: CudaFunction,
+    pub gather_rows_base: CudaFunction,
+    pub gather_rows_ext3: CudaFunction,
 
-    // deep.ptx
+    // deep.cubin
     pub deep_composition_ext3_row: CudaFunction,
 
-    // fri.ptx
+    // fri.cubin
     pub fri_fold_ext3: CudaFunction,
     pub fri_update_twiddles: CudaFunction,
 
-    // inverse.ptx
+    // inverse.cubin
     pub compute_denoms_ext3: CudaFunction,
     pub block_inclusive_scan_fwd_ext3: CudaFunction,
     pub apply_block_offsets_fwd_ext3: CudaFunction,
     pub block_inclusive_scan_rev_ext3: CudaFunction,
     pub apply_block_offsets_rev_ext3: CudaFunction,
     pub batch_inverse_combine_ext3: CudaFunction,
+    pub logup_fingerprint_ext3: CudaFunction,
+    pub logup_term_ext3: CudaFunction,
+    pub logup_row_sum_ext3: CudaFunction,
+    pub logup_scan_block_add_ext3: CudaFunction,
+    pub logup_apply_offsets_add_ext3: CudaFunction,
+    pub logup_finalize_accum_ext3: CudaFunction,
+    pub logup_assemble_aux_ext3: CudaFunction,
+
+    // constraint_interp.cubin
+    pub constraint_interp_kernel: CudaFunction,
+    pub constraint_composition_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
     inv_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
 }
 
+/// Raise the device default memory pool's release threshold so freed
+/// stream-ordered allocations are kept for reuse instead of returned to the OS
+/// at each sync. Best-effort: any failure (e.g. a device/driver without
+/// stream-ordered allocator support) leaves the default behaviour untouched.
+fn retain_default_mempool(ctx: &CudaContext) {
+    use cudarc::driver::sys;
+    // SAFETY: raw CUDA driver calls. `ctx.cu_device()` is a valid device for
+    // the just-created context; the out-pointers are valid stack slots; the
+    // threshold is read as a u64 by the driver. Errors are swallowed.
+    unsafe {
+        let dev = ctx.cu_device();
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool as *mut _, dev)
+            .result()
+            .is_err()
+        {
+            return;
+        }
+        // Default: retain freed stream-ordered blocks indefinitely (u64::MAX)
+        // for reuse. `LAMBDA_VM_MEMPOOL_RELEASE_MB` overrides the cap (bytes the
+        // pool keeps before returning memory to the OS) when retained-pool
+        // growth needs bounding.
+        let threshold: u64 = std::env::var("LAMBDA_VM_MEMPOOL_RELEASE_MB")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|mb| mb.saturating_mul(1024 * 1024))
+            .unwrap_or(u64::MAX);
+        let _ = sys::cuMemPoolSetAttribute(
+            pool,
+            sys::CUmemPool_attribute_enum::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD,
+            &threshold as *const u64 as *mut core::ffi::c_void,
+        )
+        .result();
+    }
+}
+
+/// Device VRAM budget in bytes for table session admission control.
+///
+/// LAMBDA_VM_VRAM_BUDGET_MB overrides it (used to force the throttle in tests).
+/// Otherwise it is 80% of total device memory, leaving headroom for the
+/// context, module code, and retained pool blocks. Returns u64::MAX on any
+/// query failure, which disables budgeting (chunks fall back to the core bound
+/// size alone).
+fn detect_vram_budget_bytes(ctx: &CudaContext) -> u64 {
+    if let Ok(mb) = std::env::var("LAMBDA_VM_VRAM_BUDGET_MB")
+        && let Ok(mb) = mb.parse::<u64>()
+    {
+        return mb.saturating_mul(1024 * 1024);
+    }
+    use cudarc::driver::sys;
+    // SAFETY: raw driver query writing into two stack slots. The caller's
+    // context is already current (it was just created in `init`). Any error
+    // falls through to the budgeting-disabled sentinel.
+    unsafe {
+        let _ = ctx;
+        let mut free: usize = 0;
+        let mut total: usize = 0;
+        if sys::cuMemGetInfo_v2(&mut free as *mut usize, &mut total as *mut usize)
+            .result()
+            .is_err()
+        {
+            return u64::MAX;
+        }
+        // 80% of total, computed to avoid intermediate overflow.
+        (total as u64) / 5 * 4
+    }
+}
+
 impl Backend {
     fn init() -> Result<Self> {
         let ctx = CudaContext::new(0)?;
         // cudarc's default per-slice CudaEvent tracking adds two driver calls
-        // per alloc and serialises under the context lock. We never share
-        // slices across streams (every call scopes its own buffers and syncs
-        // before returning), so the tracking is pure overhead. Disable it.
+        // per alloc and serialises under the context lock. Slices are only
+        // shared across streams after the producing stream has been host-
+        // synchronised (e.g. the retained trace snapshot and the resident
+        // LogUp aux buffer; every producer syncs before its handle escapes),
+        // so the tracking is pure overhead. Disable it.
         unsafe { ctx.disable_event_tracking() };
 
-        let arith = ctx.load_module(Ptx::from_src(ARITH_PTX))?;
-        let ntt = ctx.load_module(Ptx::from_src(NTT_PTX))?;
-        let keccak = ctx.load_module(Ptx::from_src(KECCAK_PTX))?;
-        let bary = ctx.load_module(Ptx::from_src(BARY_PTX))?;
-        let deep = ctx.load_module(Ptx::from_src(DEEP_PTX))?;
-        let fri = ctx.load_module(Ptx::from_src(FRI_PTX))?;
-        let inverse = ctx.load_module(Ptx::from_src(INVERSE_PTX))?;
+        // Retain freed device memory in the stream ordered pool for reuse.
+        //
+        // cudarc routes CudaStream::alloc* through cuMemAllocAsync, drawing from
+        // the device default memory pool. Its release threshold defaults to 0,
+        // so every freed buffer goes back to the OS at the next sync and the
+        // prover's large LDE/FRI buffers are rebuilt from scratch each op.
+        // Raising the threshold keeps freed blocks in the pool so a same size
+        // allocation skips a real driver allocation. Best effort: on any error
+        // we keep the current behaviour.
+        retain_default_mempool(&ctx);
+
+        let arith = ctx.load_module(Ptx::from_binary(ARITH_CUBIN.to_vec()))?;
+        let ntt = ctx.load_module(Ptx::from_binary(NTT_CUBIN.to_vec()))?;
+        let keccak = ctx.load_module(Ptx::from_binary(KECCAK_CUBIN.to_vec()))?;
+        let bary = ctx.load_module(Ptx::from_binary(BARY_CUBIN.to_vec()))?;
+        let deep = ctx.load_module(Ptx::from_binary(DEEP_CUBIN.to_vec()))?;
+        let fri = ctx.load_module(Ptx::from_binary(FRI_CUBIN.to_vec()))?;
+        let inverse = ctx.load_module(Ptx::from_binary(INVERSE_CUBIN.to_vec()))?;
+        let logup = ctx.load_module(Ptx::from_binary(LOGUP_CUBIN.to_vec()))?;
+        let constraint_interp =
+            ctx.load_module(Ptx::from_binary(CONSTRAINT_INTERP_CUBIN.to_vec()))?;
 
         let mut streams = Vec::with_capacity(STREAM_POOL_SIZE);
         for _ in 0..STREAM_POOL_SIZE {
@@ -218,6 +334,8 @@ impl Backend {
         // Length = TWO_ADICITY + 1 to allow indexing at log_n = TWO_ADICITY.
         let max_log = GoldilocksField::TWO_ADICITY as usize + 1;
 
+        let vram_budget_bytes = detect_vram_budget_bytes(&ctx);
+
         Ok(Self {
             vector_add_u64: arith.load_function("vector_add_u64")?,
             gl_add: arith.load_function("gl_add_kernel")?,
@@ -237,17 +355,28 @@ impl Backend {
             ntt_dit_8_levels_batched: ntt.load_function("ntt_dit_8_levels_batched")?,
             pointwise_mul_batched: ntt.load_function("pointwise_mul_batched")?,
             scalar_mul_batched: ntt.load_function("scalar_mul_batched")?,
+            bit_reverse_row_major: ntt.load_function("bit_reverse_row_major")?,
+            ntt_dit_level_row_major: ntt.load_function("ntt_dit_level_row_major")?,
+            pointwise_mul_row_major: ntt.load_function("pointwise_mul_row_major")?,
+            matrix_transpose_strided: ntt.load_function("matrix_transpose_strided")?,
+            keccak256_leaves_base_row_major_row_pair: keccak
+                .load_function("keccak256_leaves_base_row_major_row_pair")?,
             keccak256_leaves_base_batched: keccak.load_function("keccak256_leaves_base_batched")?,
+            keccak256_leaves_base_row_pair_batched: keccak
+                .load_function("keccak256_leaves_base_row_pair_batched")?,
             keccak256_leaves_ext3_batched: keccak.load_function("keccak256_leaves_ext3_batched")?,
             keccak_comp_poly_leaves_ext3: keccak.load_function("keccak_comp_poly_leaves_ext3")?,
             keccak_fri_leaves_ext3: keccak.load_function("keccak_fri_leaves_ext3")?,
             keccak_merkle_level: keccak.load_function("keccak_merkle_level")?,
+            merkle_gather_paths: keccak.load_function("merkle_gather_paths")?,
             barycentric_base_batched: bary.load_function("barycentric_base_batched")?,
             barycentric_ext3_batched: bary.load_function("barycentric_ext3_batched")?,
             barycentric_base_batched_strided: bary
                 .load_function("barycentric_base_batched_strided")?,
             barycentric_ext3_batched_strided: bary
                 .load_function("barycentric_ext3_batched_strided")?,
+            gather_rows_base: bary.load_function("gather_rows_base")?,
+            gather_rows_ext3: bary.load_function("gather_rows_ext3")?,
             deep_composition_ext3_row: deep.load_function("deep_composition_ext3_row")?,
             fri_fold_ext3: fri.load_function("fri_fold_ext3")?,
             fri_update_twiddles: fri.load_function("fri_update_twiddles")?,
@@ -259,6 +388,17 @@ impl Backend {
                 .load_function("block_inclusive_scan_rev_ext3")?,
             apply_block_offsets_rev_ext3: inverse.load_function("apply_block_offsets_rev_ext3")?,
             batch_inverse_combine_ext3: inverse.load_function("batch_inverse_combine_ext3")?,
+            logup_fingerprint_ext3: logup.load_function("logup_fingerprint_ext3")?,
+            logup_term_ext3: logup.load_function("logup_term_ext3")?,
+            logup_row_sum_ext3: logup.load_function("logup_row_sum_ext3")?,
+            logup_scan_block_add_ext3: logup.load_function("logup_scan_block_add_ext3")?,
+            logup_apply_offsets_add_ext3: logup.load_function("logup_apply_offsets_add_ext3")?,
+            logup_finalize_accum_ext3: logup.load_function("logup_finalize_accum_ext3")?,
+            logup_assemble_aux_ext3: logup.load_function("logup_assemble_aux_ext3")?,
+            constraint_interp_kernel: constraint_interp
+                .load_function("constraint_interp_kernel")?,
+            constraint_composition_kernel: constraint_interp
+                .load_function("constraint_composition_kernel")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,
@@ -267,7 +407,14 @@ impl Backend {
             pinned_hashes,
             util_stream,
             next: AtomicUsize::new(0),
+            vram_budget_bytes,
         })
+    }
+
+    /// VRAM budget in bytes for table-session admission control. `u64::MAX`
+    /// when budgeting is disabled (query failed). See the field docs.
+    pub fn vram_budget_bytes(&self) -> u64 {
+        self.vram_budget_bytes
     }
 
     /// Round-robin over the stream pool. Concurrent callers get different
@@ -363,7 +510,26 @@ pub fn backend() -> Result<&'static Backend> {
     if let Some(b) = BACKEND.get() {
         return Ok(b);
     }
-    let b = Backend::init()?;
+    let b = match Backend::init() {
+        Ok(b) => b,
+        Err(e) => {
+            // Backend init failing means every GPU entry point silently falls
+            // back to CPU. That is expected on a GPU-less host, but it also
+            // fires when the AOT cubins won't load — most often a build-host vs
+            // run-host GPU-arch mismatch (cubins are compiled for the detected
+            // `sm_XX`) or an empty nvcc-less stub. Warn once so the fallback is
+            // never silent: rebuild on the run host, or set `CUDARC_NVCC_ARCH`.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                eprintln!(
+                    "math-cuda: GPU backend unavailable ({e}) — running on CPU. \
+                     If a GPU is present this is likely a kernel-cubin arch mismatch; \
+                     rebuild on the run host or set CUDARC_NVCC_ARCH to its sm_XX."
+                );
+            });
+            return Err(e);
+        }
+    };
     let _ = BACKEND.set(b);
     Ok(BACKEND.get().expect("backend just initialised"))
 }

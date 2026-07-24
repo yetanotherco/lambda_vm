@@ -16,7 +16,7 @@ use cudarc::driver::{CudaSlice, CudaStream, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::{Backend, backend};
-use crate::merkle::{keccak_launch_cfg, launch_keccak_base, launch_keccak_ext3};
+use crate::merkle::{keccak_launch_cfg, launch_keccak_base, launch_keccak_base_row_pair};
 use crate::ntt::run_ntt_body;
 
 /// Goldilocks `TWO_ADICITY = 32` puts the theoretical domain ceiling at
@@ -34,26 +34,26 @@ fn assert_u32_domain(n: usize, what: &str) {
 /// Output shape requested from the fused LDE + Keccak entry points.
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum KeccakCommit {
-    /// Only the `lde_size` keccak-256 leaves; no inner-tree build. Caller
-    /// receives `lde_size * 32` bytes.
+    /// Only the keccak-256 leaves; no inner-tree build. Caller receives
+    /// `num_leaves * 32` bytes.
     LeavesOnly,
     /// Full Merkle tree: leaves at the tail + inner nodes built on-device.
-    /// Caller receives `(2*lde_size - 1) * 32` bytes.
+    /// Caller receives `(2*num_leaves - 1) * 32` bytes.
     FullTree,
 }
 
 impl KeccakCommit {
-    fn total_nodes_bytes(self, lde_size: usize) -> usize {
+    fn total_nodes_bytes(self, num_leaves: usize) -> usize {
         match self {
-            KeccakCommit::LeavesOnly => lde_size * 32,
-            KeccakCommit::FullTree => (2 * lde_size - 1) * 32,
+            KeccakCommit::LeavesOnly => num_leaves * 32,
+            KeccakCommit::FullTree => (2 * num_leaves - 1) * 32,
         }
     }
 
-    fn leaves_offset_bytes(self, lde_size: usize) -> usize {
+    fn leaves_offset_bytes(self, num_leaves: usize) -> usize {
         match self {
             KeccakCommit::LeavesOnly => 0,
-            KeccakCommit::FullTree => (lde_size - 1) * 32,
+            KeccakCommit::FullTree => (num_leaves - 1) * 32,
         }
     }
 }
@@ -216,14 +216,469 @@ fn launch_pointwise_mul_batched(
     Ok(())
 }
 
+// ── Row-major NTT helpers ────────────────────────────────────────────────────
+
+fn launch_bit_reverse_row_major(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    m: u64,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.bit_reverse_row_major)
+            .arg(buf)
+            .arg(&n)
+            .arg(&log_n)
+            .arg(&m)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+fn launch_pointwise_mul_row_major(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    weights: &CudaSlice<u64>,
+    n: u64,
+    m: u64,
+) -> Result<()> {
+    let cfg = LaunchConfig {
+        grid_dim: ((m as u32).div_ceil(256), (n as u32).min(65535), 1),
+        block_dim: (256, 1, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.pointwise_mul_row_major)
+            .arg(buf)
+            .arg(weights)
+            .arg(&n)
+            .arg(&m)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+fn run_row_major_ntt_body(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &mut CudaSlice<u64>,
+    tw: &CudaSlice<u64>,
+    n: u64,
+    log_n: u64,
+    m: u64,
+) -> Result<()> {
+    let col_tile: u32 = 32.min(m as u32);
+    let row_tile: u32 = (256 / col_tile).max(1);
+    for level in 0..log_n {
+        let cfg = LaunchConfig {
+            grid_dim: (
+                (m as u32).div_ceil(col_tile),
+                ((n >> 1) as u32).div_ceil(row_tile).min(65535),
+                1,
+            ),
+            block_dim: (col_tile, row_tile, 1),
+            shared_mem_bytes: 0,
+        };
+        unsafe {
+            stream
+                .launch_builder(&be.ntt_dit_level_row_major)
+                .arg(&mut *buf)
+                .arg(tw)
+                .arg(&n)
+                .arg(&log_n)
+                .arg(&level)
+                .arg(&m)
+                .launch(cfg)?;
+        }
+    }
+    Ok(())
+}
+
+/// Row-major ROW-PAIR leaf hashing: leaf `i` hashes the two consecutive
+/// bit-reversed rows `reverse_index(2i)`, `reverse_index(2i+1)` (each `m` lanes,
+/// read contiguously from the row-major `buf`), producing `num_rows / 2` leaves.
+/// Row-major analog of [`launch_keccak_base_row_pair`]; matches the CPU
+/// `commit_bit_reversed(.., 2)` and the verifier's `verify_opening_pair`.
+fn launch_keccak_base_row_major_row_pair(
+    stream: &CudaStream,
+    be: &Backend,
+    buf: &CudaSlice<u64>,
+    m: u64,
+    num_rows: u64,
+    log_num_rows: u64,
+    leaves_out: &mut cudarc::driver::CudaViewMut<'_, u8>,
+) -> Result<()> {
+    // Register-heavy Keccak kernel: launch with the keccak-tuned block dim (128,
+    // via `keccak_launch_cfg`); a larger block exceeds the per-block register
+    // budget and fails the launch (CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES). The kernel
+    // derives rows as `__brevll(2*tid + k) >> (64 - log_num_rows)`; a 64-bit shift
+    // is UB at `log_num_rows == 0`, so require `num_rows >= 2` (also the minimum
+    // for a single row pair).
+    debug_assert!(
+        num_rows >= 2,
+        "row-major row-pair keccak requires num_rows >= 2"
+    );
+    // One thread per leaf (= one bit-reversed row pair).
+    let cfg = keccak_launch_cfg(num_rows >> 1);
+    unsafe {
+        stream
+            .launch_builder(&be.keccak256_leaves_base_row_major_row_pair)
+            .arg(buf)
+            .arg(&m)
+            .arg(&num_rows)
+            .arg(&log_num_rows)
+            .arg(leaves_out)
+            .launch(cfg)?;
+    }
+    Ok(())
+}
+
+/// Transpose row-major `lde_size × cols` → column-major with stride `lde_size`,
+/// returning the new device buffer. Used to convert the row-major LDE output to
+/// the column-major layout expected by downstream GPU kernels (DEEP, barycentric).
+/// No synchronize — callers on the same stream are ordered; other streams must
+/// synchronize themselves.
+fn launch_row_to_col_major(
+    stream: &Arc<CudaStream>,
+    be: &Backend,
+    src: &CudaSlice<u64>,
+    lde_size: usize,
+    cols: usize,
+    lde_u64: u64,
+) -> Result<CudaSlice<u64>> {
+    let mut dst = stream.alloc_zeros::<u64>(lde_size * cols)?;
+    let cfg = LaunchConfig {
+        grid_dim: (
+            (cols as u32).div_ceil(32),
+            (lde_size as u32).div_ceil(32).min(65535),
+            1,
+        ),
+        block_dim: (32, 32, 1),
+        shared_mem_bytes: 0,
+    };
+    unsafe {
+        stream
+            .launch_builder(&be.matrix_transpose_strided)
+            .arg(src)
+            .arg(&mut dst)
+            .arg(&(lde_size as u32))
+            .arg(&(cols as u32))
+            .arg(&lde_u64)
+            .launch(cfg)?;
+    }
+    Ok(dst)
+}
+
+/// Row-major LDE input: either a host slice (uploaded) or an already-resident
+/// device buffer (copied device-to-device, no PCIe upload).
+enum InnerInput<'a> {
+    Host(&'a [u64]),
+    Dev(&'a CudaSlice<u64>),
+}
+
+/// Shared row-major LDE + Keccak + Merkle pipeline for the base and ext3 paths.
+///
+/// `total_cols` is the number of base-field columns in the row-major layout:
+/// `m` for base, `m * 3` for ext3. Because `Fp3 = [u64; 3]`, the three ext3
+/// components are just three adjacent base-field columns, so the same row-major
+/// NTT and Keccak kernels process all of them simultaneously — no de-interleave.
+///
+/// Single H2D (or D2D), row-major NTT, single D2H — no CPU-side extract or
+/// transpose. Returns (merkle_nodes, column-major device buffer, row-major LDE
+/// Vec, optional trace-domain column-major snapshot — `Some` iff
+/// `retain_trace_col_major`). The buffer is transposed to column-major (as
+/// required by the downstream GPU kernels DEEP/barycentric); callers wrap it in
+/// the appropriate LDE handle.
+#[allow(clippy::type_complexity)]
+#[allow(clippy::too_many_arguments)]
+fn coset_lde_row_major_inner(
+    input: InnerInput,
+    n: usize,
+    total_cols: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    what: &str,
+    retain_trace_col_major: bool,
+    retain_host_lde: bool,
+) -> Result<(
+    GpuMerkleTree,
+    CudaSlice<u64>,
+    Vec<u64>,
+    Option<CudaSlice<u64>>,
+)> {
+    let input_len = match &input {
+        InnerInput::Host(h) => h.len(),
+        InnerInput::Dev(d) => d.len(),
+    };
+    assert_eq!(input_len, n * total_cols);
+    assert!(n.is_power_of_two());
+    assert_eq!(weights.len(), n);
+    assert!(blowup_factor.is_power_of_two());
+    let lde_size = n * blowup_factor;
+    assert_u32_domain(lde_size, what);
+
+    // Row-pair trace commit: one Merkle leaf per bit-reversed row pair (rows 2i,
+    // 2i+1), matching the CPU `commit_bit_reversed(.., ROWS_PER_LEAF=2)` and the
+    // verifier's `verify_opening_pair`. `lde_size` is a power of two >= 2, so it
+    // is always even.
+    let num_leaves = lde_size / 2;
+    let nodes_bytes = KeccakCommit::FullTree.total_nodes_bytes(num_leaves);
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let cols_u64 = total_cols as u64;
+
+    let be = backend()?;
+    let stream = be.next_stream();
+
+    // Fill a zeroed lde_size*total_cols buffer; only the first n*total_cols rows
+    // carry data, the remainder are already zero (zero-padding for LDE). Host
+    // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
+    let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
+    match input {
+        InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+    }
+
+    // Snapshot the trace-domain input (column-major) before the iNTT overwrites
+    // it in place. The LogUp aux fingerprint kernel reads the main trace in
+    // place from this buffer, so R1 aux build skips the ~3 GB main re-upload.
+    // Transpose is a plain row->col transpose on the first n rows (not yet
+    // bit-reversed): dst[col*n + row] = buf[row*total_cols + col].
+    let trace_col_major = if retain_trace_col_major {
+        Some(launch_row_to_col_major(
+            &stream, be, &buf, n, total_cols, n as u64,
+        )?)
+    } else {
+        None
+    };
+
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    // iNTT: bit-reverse rows → per-level DIT.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, n_u64, log_n, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        cols_u64,
+    )?;
+
+    // Coset weights: one weight per row, broadcast across all columns.
+    launch_pointwise_mul_row_major(stream.as_ref(), be, &mut buf, &weights_dev, n_u64, cols_u64)?;
+
+    // Forward NTT at lde_size.
+    launch_bit_reverse_row_major(stream.as_ref(), be, &mut buf, lde_u64, log_lde, cols_u64)?;
+    run_row_major_ntt_body(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        cols_u64,
+    )?;
+
+    // Keccak + Merkle on-device. Each row-pair leaf reads two bit-reversed rows
+    // of `total_cols` consecutive u64s (`lde_u64` is the bit-reverse modulus; the
+    // kernel emits `lde_size / 2` leaves).
+    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_bytes) }?;
+    let leaves_offset = KeccakCommit::FullTree.leaves_offset_bytes(num_leaves);
+    {
+        let mut leaves_view = nodes_dev.slice_mut(leaves_offset..leaves_offset + num_leaves * 32);
+        launch_keccak_base_row_major_row_pair(
+            stream.as_ref(),
+            be,
+            &buf,
+            cols_u64,
+            lde_u64,
+            log_lde,
+            &mut leaves_view,
+        )?;
+    }
+    crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
+
+    // D2H the row-major LDE first (before the handle transpose). Release the
+    // staging lock before the Merkle nodes transfer to minimise lock contention.
+    // Skipped entirely when `retain_host_lde` is false (the caller keeps the LDE
+    // device-only): this is the round-1 trace D2H the full-residency path
+    // eliminates — the big transfer/alloc win — so we return an empty host Vec.
+    let lde_out = if retain_host_lde {
+        let staging_slot = be.pinned_staging();
+        let mut staging = staging_slot.lock().unwrap();
+        staging.ensure_capacity(lde_size * total_cols, &be.ctx)?;
+        let pinned = unsafe { staging.as_mut_slice(lde_size * total_cols) };
+        stream.memcpy_dtoh(&buf, pinned)?;
+        stream.synchronize()?;
+        let out = pinned[..lde_size * total_cols].to_vec();
+        drop(staging);
+        out
+    } else {
+        Vec::new()
+    };
+
+    // Keep the Merkle tree resident on device; copy only the 32 byte root so the
+    // commitment is available without copying the whole tree. Query openings
+    // gather paths from the device tree (see merkle::gather_merkle_paths_dev).
+    let mut root = [0u8; 32];
+    stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+
+    // Transpose row-major buf into column-major for the handle. Downstream
+    // kernels (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
+    let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, total_cols, lde_u64)?;
+    // Synchronize before returning: the handle crosses stream boundaries.
+    // Downstream consumers call be.next_stream() and read handle.buf on a
+    // different stream, and the root copy above must have landed.
+    stream.synchronize()?;
+
+    let tree = GpuMerkleTree {
+        nodes: Arc::new(nodes_dev),
+        leaves_len: num_leaves,
+        root,
+    };
+    Ok((tree, col_major_dev, lde_out, trace_col_major))
+}
+
+/// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
+/// resident on device (in the handle's `tree`). The host tree is not built, so
+/// the whole tree copy to host is eliminated; query openings gather paths from
+/// the device tree.
+///
+/// Input: `row_major` is a flat `n * m` slice in row-major order. Returns the
+/// `GpuLdeBase` handle (column-major buf, plus the device tree) and the
+/// row-major LDE Vec.
+pub fn coset_lde_row_major_with_merkle_tree_keep(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeBase, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
+        InnerInput::Host(row_major),
+        n,
+        m,
+        blowup_factor,
+        weights,
+        "coset_lde_row_major lde_size",
+        true,
+        retain_host_lde,
+    )?;
+    let handle = GpuLdeBase {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+        trace_dev: trace_col_major.map(Arc::new),
+        trace_rows: n,
+    };
+    Ok((handle, lde_out))
+}
+
+/// Row-major ext3 LDE + Keccak + Merkle, all on-device.
+///
+/// `Fp3` is `[u64; 3]` in memory, so row-major ext3 with `m` ext3 columns is
+/// identical to row-major base-field with `m3 = m * 3`. The same row-major NTT
+/// and Keccak kernels handle all three components simultaneously — no extra
+/// de-interleave step.
+///
+/// Input: `row_major` is `n * m` ext3 elements as flat `n * m * 3` u64s
+/// (element [row][col] components k=0,1,2 at `row_major[(row*m + col)*3 + k]`).
+/// Returns (merkle_nodes, GpuLdeExt3 handle, row-major ext3 LDE Vec<u64>).
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
+    row_major: &[u64],
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+        InnerInput::Host(row_major),
+        n,
+        m * 3,
+        blowup_factor,
+        weights,
+        "coset_lde_ext3_row_major lde_size",
+        false,
+        retain_host_lde,
+    )?;
+    let handle = GpuLdeExt3 {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+    };
+    Ok((handle, lde_out))
+}
+
+/// Like [`coset_lde_ext3_row_major_with_merkle_tree_keep`] but the input is an
+/// already-resident device buffer (`n * m` ext3 elements, row-major, `n*m*3`
+/// u64s). No PCIe upload: the buffer is copied device-to-device into the LDE
+/// scratch. Used by the resident LogUp aux path.
+pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
+    input_dev: &CudaSlice<u64>,
+    n: usize,
+    m: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    retain_host_lde: bool,
+) -> Result<(GpuLdeExt3, Vec<u64>)> {
+    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+        InnerInput::Dev(input_dev),
+        n,
+        m * 3,
+        blowup_factor,
+        weights,
+        "coset_lde_ext3_row_major_dev lde_size",
+        false,
+        retain_host_lde,
+    )?;
+    let handle = GpuLdeExt3 {
+        buf: Arc::new(col_major_dev),
+        m,
+        lde_size: n * blowup_factor,
+        tree: Some(tree),
+    };
+    Ok((handle, lde_out))
+}
+
 /// Handle to a base-field LDE kept live on device after R1 commit.
 /// Layout: `m` columns, each `lde_size` u64s, column `c` at byte offset
 /// `c * lde_size * 8` within `buf`. Freed when `buf` Arc drops.
+///
+/// `tree` optionally carries the main trace Merkle tree kept resident on device
+/// (the keep path), so R4 query openings gather paths on device instead of
+/// copying the whole tree to host. None on the CPU path.
 #[derive(Clone)]
 pub struct GpuLdeBase {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+    pub tree: Option<GpuMerkleTree>,
+    /// Trace-domain main columns, column-major `[col*trace_rows + row]`, kept
+    /// resident from the R1 main LDE so the LogUp aux fingerprint kernel reads
+    /// them in place (no re-upload). None unless the base keep path retained it.
+    pub trace_dev: Option<Arc<CudaSlice<u64>>>,
+    /// Row count (n) of `trace_dev`; 0 when `trace_dev` is None.
+    pub trace_rows: usize,
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -234,6 +689,23 @@ pub struct GpuLdeExt3 {
     pub buf: Arc<CudaSlice<u64>>,
     pub m: usize,
     pub lde_size: usize,
+    /// Optionally the aux or composition Merkle tree kept resident on device
+    /// (the keep path), so R4 openings gather paths on device. None otherwise.
+    pub tree: Option<GpuMerkleTree>,
+}
+
+/// Merkle tree kept resident on device after a commit, so query openings gather
+/// paths on device instead of copying the whole tree to host. Node layout
+/// matches the CPU tree (`crypto/crypto/src/merkle_tree`): `nodes[0..leaves_len-1]`
+/// are inner nodes (root at 0), `nodes[leaves_len-1..]` are the leaves, each 32
+/// bytes. Freed when the `nodes` Arc drops.
+#[derive(Clone)]
+pub struct GpuMerkleTree {
+    pub nodes: Arc<CudaSlice<u8>>,
+    pub leaves_len: usize,
+    /// The Merkle root (node 0), copied to host at build time so the commitment
+    /// is available without copying the whole tree.
+    pub root: [u8; 32],
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
@@ -592,12 +1064,12 @@ pub fn coset_lde_batch_base_into(
     Ok(())
 }
 
-/// Fused LDE + Keccak-256 leaf hashing. Caller receives the `lde_size * 32`
-/// bytes of leaf hashes in `hashed_leaves_out` (one 32-byte digest per output
-/// row, in natural row order; leaves are computed reading columns at
-/// bit-reversed rows, matching `commit_columns_bit_reversed` on the CPU
-/// side). Thin wrapper over `coset_lde_batch_base_into_with_merkle_tree_inner`
-/// with `LeavesOnly` — no inner-tree build, no device handle.
+/// Fused LDE + row-pair Keccak-256 leaf hashing. Caller receives
+/// `(lde_size / 2) * 32` bytes of leaf hashes in `hashed_leaves_out` (one
+/// 32-byte digest per bit-reversed row pair, in natural leaf order, matching
+/// `commit_bit_reversed(.., 2)` on the CPU side). Thin wrapper over
+/// `coset_lde_batch_base_into_with_merkle_tree_inner` with `LeavesOnly` — no
+/// inner-tree build, no device handle.
 pub fn coset_lde_batch_base_into_with_leaf_hash(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -613,60 +1085,12 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
         hashed_leaves_out,
         KeccakCommit::LeavesOnly,
         false,
+        2,
     )
     .map(|_| ())
 }
 
-/// Like `coset_lde_batch_base_into_with_leaf_hash`, but also builds the full
-/// Merkle tree on device and returns the `2*lde_size - 1` node buffer back
-/// to the caller in `merkle_nodes_out` (byte length `(2*lde_size - 1) * 32`).
-///
-/// The leaf hashes are never exposed to the caller — they stay on device and
-/// feed straight into the pair-hash tree kernel, avoiding the
-/// pinned→pageable→pinned round-trip that the separate-step GPU tree build
-/// would pay.
-pub fn coset_lde_batch_base_into_with_merkle_tree(
-    columns: &[&[u64]],
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_base_into_with_merkle_tree_inner(
-        columns,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        false,
-    )
-    .map(|_| ())
-}
-
-/// Fused LDE + leaf-hash + Merkle tree build. If `keep_device_buf` is true,
-/// returns an `Arc<CudaSlice<u64>>` wrapping the LDE device buffer so callers
-/// (R2–R4 GPU paths) can reuse the LDE without a re-H2D.
-pub fn coset_lde_batch_base_into_with_merkle_tree_keep(
-    columns: &[&[u64]],
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<GpuLdeBase> {
-    let opt = coset_lde_batch_base_into_with_merkle_tree_inner(
-        columns,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        true,
-    )?;
-    let handle = opt.expect("keep_device_buf=true must return Some");
-    Ok(handle)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn coset_lde_batch_base_into_with_merkle_tree_inner(
     columns: &[&[u64]],
     blowup_factor: usize,
@@ -675,6 +1099,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     nodes_out: &mut [u8],
     commit: KeccakCommit,
     keep_device_buf: bool,
+    // 1 = one leaf per bit-reversed row; 2 = one leaf per row pair (2i, 2i+1),
+    // matching the CPU `commit_bit_reversed(.., 2)` used for the trace commit.
+    rows_per_leaf: usize,
 ) -> Result<Option<GpuLdeBase>> {
     if columns.is_empty() {
         assert_eq!(outputs.len(), 0);
@@ -698,7 +1125,13 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     for o in outputs.iter() {
         assert_eq!(o.len(), lde_size);
     }
-    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
+    assert!(
+        rows_per_leaf == 1 || rows_per_leaf == 2,
+        "rows_per_leaf must be 1 or 2"
+    );
+    assert_eq!(lde_size % rows_per_leaf, 0);
+    let num_leaves = lde_size / rows_per_leaf;
+    let nodes_dev_bytes = commit.total_nodes_bytes(num_leaves);
     assert_eq!(nodes_out.len(), nodes_dev_bytes);
     let log_n = n.trailing_zeros() as u64;
     let log_lde = lde_size.trailing_zeros() as u64;
@@ -781,28 +1214,39 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
     )?;
 
     // Allocate the device output buffer. In `LeavesOnly` mode this is just
-    // `lde_size * 32` bytes (the leaves themselves); in `FullTree` mode it's
-    // `(2*lde_size - 1) * 32` bytes (leaves in the tail + inner nodes filled
+    // `num_leaves * 32` bytes (the leaves themselves); in `FullTree` mode it's
+    // `(2*num_leaves - 1) * 32` bytes (leaves in the tail + inner nodes filled
     // below). `alloc` (not `alloc_zeros`) is safe because every byte is
     // written before any reader sees it: the keccak kernel fills the
     // leaves slab, the inner-tree pass (when present) fills the head.
     let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
-    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
+    let leaves_offset_bytes = commit.leaves_offset_bytes(num_leaves);
     {
         let mut leaves_view =
-            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        launch_keccak_base(
-            stream.as_ref(),
-            &buf,
-            col_stride_u64,
-            m as u64,
-            lde_u64,
-            &mut leaves_view,
-        )?;
+            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + num_leaves * 32);
+        if rows_per_leaf == 2 {
+            launch_keccak_base_row_pair(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        } else {
+            launch_keccak_base(
+                stream.as_ref(),
+                &buf,
+                col_stride_u64,
+                m as u64,
+                lde_u64,
+                &mut leaves_view,
+            )?;
+        }
     }
 
     if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
+        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
     // D2H the LDE and the tree/leaves nodes via pinned staging.
@@ -821,231 +1265,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
             buf: Arc::new(buf),
             m,
             lde_size,
-        }))
-    } else {
-        drop(buf);
-        Ok(None)
-    }
-}
-
-/// Ext3 variant of `coset_lde_batch_base_into_with_leaf_hash`: fused
-/// LDE + Keccak-256 leaf hashing over ext3 columns. Thin wrapper over
-/// `coset_lde_batch_ext3_into_with_merkle_tree_inner` with `LeavesOnly`.
-pub fn coset_lde_batch_ext3_into_with_leaf_hash(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    hashed_leaves_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        hashed_leaves_out,
-        KeccakCommit::LeavesOnly,
-        false,
-    )
-    .map(|_| ())
-}
-
-/// Ext3 variant of the fused `coset_lde_batch_base_into_with_merkle_tree`.
-/// LDE + leaf hashing + inner-tree build, all on device; D2Hs only the LDE
-/// evaluations and the full `2*lde_size - 1` node buffer.
-pub fn coset_lde_batch_ext3_into_with_merkle_tree(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<()> {
-    coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        false,
-    )
-    .map(|_| ())
-}
-
-/// Ext3 variant of [`coset_lde_batch_base_into_with_merkle_tree_keep`] —
-/// returns an `Arc<CudaSlice<u64>>` handle to the de-interleaved LDE device
-/// buffer.
-pub fn coset_lde_batch_ext3_into_with_merkle_tree_keep(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    merkle_nodes_out: &mut [u8],
-) -> Result<GpuLdeExt3> {
-    let opt = coset_lde_batch_ext3_into_with_merkle_tree_inner(
-        columns,
-        n,
-        blowup_factor,
-        weights,
-        outputs,
-        merkle_nodes_out,
-        KeccakCommit::FullTree,
-        true,
-    )?;
-    Ok(opt.expect("keep_device_buf=true must return Some"))
-}
-
-#[allow(clippy::too_many_arguments)]
-fn coset_lde_batch_ext3_into_with_merkle_tree_inner(
-    columns: &[&[u64]],
-    n: usize,
-    blowup_factor: usize,
-    weights: &[u64],
-    outputs: &mut [&mut [u64]],
-    nodes_out: &mut [u8],
-    commit: KeccakCommit,
-    keep_device_buf: bool,
-) -> Result<Option<GpuLdeExt3>> {
-    if columns.is_empty() {
-        assert_eq!(outputs.len(), 0);
-        return Ok(None);
-    }
-    // (is_power_of_two returns false for 0).
-    if n == 0 {
-        return Ok(None);
-    }
-    let m = columns.len();
-    assert_eq!(outputs.len(), m);
-    assert!(n.is_power_of_two());
-    assert_eq!(weights.len(), n);
-    assert!(blowup_factor.is_power_of_two());
-    for c in columns.iter() {
-        assert_eq!(c.len(), 3 * n);
-    }
-    let lde_size = n * blowup_factor;
-    assert_u32_domain(
-        lde_size,
-        "coset_lde_batch_ext3_into_with_merkle_tree lde_size",
-    );
-    for o in outputs.iter() {
-        assert_eq!(o.len(), 3 * lde_size);
-    }
-    let nodes_dev_bytes = commit.total_nodes_bytes(lde_size);
-    assert_eq!(nodes_out.len(), nodes_dev_bytes);
-    let log_n = n.trailing_zeros() as u64;
-    let log_lde = lde_size.trailing_zeros() as u64;
-
-    let mb = 3 * m;
-    let be = backend()?;
-    let stream = be.next_stream();
-    let staging_slot = be.pinned_staging();
-
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(mb * lde_size, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(mb * lde_size) };
-
-    pack_ext3_to_pinned_slabs(columns, pinned, n);
-
-    let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
-    }
-
-    let inv_tw = be.inv_twiddles_for(log_n)?;
-    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
-    let weights_dev = stream.clone_htod(weights)?;
-
-    let n_u64 = n as u64;
-    let lde_u64 = lde_size as u64;
-    let col_stride_u64 = lde_size as u64;
-    let mb_u32 = mb as u32;
-
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        inv_tw.as_ref(),
-        n_u64,
-        log_n,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_pointwise_mul_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        &weights_dev,
-        n_u64,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    launch_bit_reverse_batched(
-        stream.as_ref(),
-        be,
-        &mut buf,
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-    run_batched_ntt_body(
-        stream.as_ref(),
-        &mut buf,
-        fwd_tw.as_ref(),
-        lde_u64,
-        log_lde,
-        col_stride_u64,
-        mb_u32,
-    )?;
-
-    // Allocate device output buffer (LeavesOnly → lde_size*32; FullTree →
-    // (2*lde_size - 1)*32). Leaf kernel writes to the leaves slab; the
-    // inner-tree pass (when present) fills the head.
-    let mut nodes_dev = unsafe { stream.alloc::<u8>(nodes_dev_bytes) }?;
-    let leaves_offset_bytes = commit.leaves_offset_bytes(lde_size);
-    {
-        let mut leaves_view =
-            nodes_dev.slice_mut(leaves_offset_bytes..leaves_offset_bytes + lde_size * 32);
-        launch_keccak_ext3(
-            stream.as_ref(),
-            &buf,
-            col_stride_u64,
-            m as u64,
-            lde_u64,
-            &mut leaves_view,
-        )?;
-    }
-
-    if commit == KeccakCommit::FullTree {
-        crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, lde_size)?;
-    }
-
-    // D2H LDE (mb * lde_size u64) and tree/leaves nodes.
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
-
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
-
-    if keep_device_buf {
-        Ok(Some(GpuLdeExt3 {
-            buf: Arc::new(buf),
-            m,
-            lde_size,
+            tree: None,
+            trace_dev: None,
+            trace_rows: 0,
         }))
     } else {
         drop(buf);
@@ -1236,6 +1458,7 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             buf: std::sync::Arc::new(buf),
             m,
             lde_size,
+            tree: None,
         }))
     } else {
         drop(buf);

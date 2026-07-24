@@ -6,12 +6,12 @@
 //! - Padding: Auto-padding to power of 2 works correctly
 //! - Border cases: Edge values (0, MAX, signed boundaries) work
 
+use stark::constraints::builder::EmptyConstraints;
 use std::collections::HashMap;
 
 use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use math::field::element::FieldElement;
 
-use stark::constraints::transition::TransitionConstraintEvaluator;
 use stark::lookup::{
     AirWithBuses, AuxiliaryTraceBuildData, BusInteraction, BusValue, Multiplicity,
     NullBoundaryConstraintBuilder, Packing,
@@ -65,9 +65,7 @@ mod sender_cols {
 
 fn new_sender_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::sender(
             BusId::Alu,
@@ -114,15 +112,13 @@ fn new_sender_air(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 
 fn new_receiver_air(
     proof_options: &ProofOptions,
-) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, ()> {
-    let transition_constraints: Vec<Box<dyn TransitionConstraintEvaluator<F, E>>> = vec![];
-
+) -> AirWithBuses<F, E, NullBoundaryConstraintBuilder, (), EmptyConstraints> {
     // Use the same bus interaction as the LT table
     let auxiliary_trace_build_data = AuxiliaryTraceBuildData {
         interactions: vec![BusInteraction::receiver(
@@ -170,7 +166,7 @@ fn new_receiver_air(
         auxiliary_trace_build_data,
         proof_options,
         1,
-        transition_constraints,
+        EmptyConstraints,
     )
 }
 

@@ -17,18 +17,16 @@
 //!
 //! Register reads use the cast-to-`DWordWL` encoding.
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
 use super::types::{
     BusId, FE, GoldilocksExtension, GoldilocksField, SHIFT_16, VmTable, alu_op,
     packed_decode_shrunk,
 };
-use crate::constraints::templates::{AddConstraint, AddOperand, new_is_bit_constraints};
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
+use crate::constraints::templates::{AddOperand, emit_add_pair, emit_is_bit};
 
 // =========================================================================
 // Column indices for CPU32 table
@@ -199,7 +197,7 @@ pub fn generate_cpu32_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -585,147 +583,30 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// Arithmetic constraints for CPU32: the sign-extension `ext` group plus the
-/// register-zero checks. (`IS_BIT` flags and the ADD/SUB carries are produced
-/// by the template helpers in [`cpu32_constraints`].)
-pub struct Cpu32Constraint {
-    constraint_idx: usize,
-    kind: Cpu32ConstraintKind,
-}
+/// The CPU32 table's 32 transition constraints as a single [`ConstraintSet`]:
+/// - idx 0-6:   `IS_BIT` on `read_register1/2`, `write_register`, `alu`, `add`,
+///   `sub`, `μ`;
+/// - idx 7,8:   `ADD` pair `arg1 + arg2 = res` (gated on `add`);
+/// - idx 9,10:  `ADD` pair `arg2 + res = arg1` (gated on `sub`);
+/// - idx 11-16: `(1 − read)·value` for the six `rv1/rv2` limbs;
+/// - idx 17-22: sign-extension arithmetic `Arg1Lo/Hi`, `Arg2Lo/Hi`, `RvdLo/Hi`;
+/// - idx 23,24: `(1 − signed)·rv·_sign` (sign zero when unsigned);
+/// - idx 25,26: `read_register2·imm[i]` (arg2 exclusivity);
+/// - idx 27-31: `(1 − μ)·flag` for `read_register1/2`, `write_register`,
+///   `signed`, `res_sign`.
+pub struct Cpu32Constraints;
 
-#[derive(Debug, Clone, Copy)]
-pub enum Cpu32ConstraintKind {
-    /// `arg1[0] = rv1[0] + 2^16·rv1[1]` (low word of `arg1`).
-    Arg1Lo,
-    /// `arg1[1] = (2^32-1)·rv1_sign` (sign/zero extension of the high word;
-    /// `rv1_sign` already folds in `signed` via `SIGN(rv1[1], signed)`).
-    Arg1Hi,
-    /// `arg2[0] = rv2[0] + 2^16·rv2[1] + imm[0]`.
-    Arg2Lo,
-    /// `arg2[1] = (2^32-1)·rv2_sign + imm[1]` (`rv2_sign` folds in `signed`).
-    Arg2Hi,
-    /// `rvd[0] = res[0] + 2^16·res[1]`.
-    RvdLo,
-    /// `rvd[1] = (2^32-1)·res_sign` (the `*W` result is always sign-extended).
-    RvdHi,
-    /// `(1 - read_col)·value_col = 0` (an unread register half is zero).
-    RegZero { read_col: usize, value_col: usize },
-    /// `read_register2·imm[i] = 0` (decoding guarantees at most one is nonzero;
-    /// spec defense-in-depth assumption). `usize` is the `imm` limb column.
-    Arg2Exclusive { imm_col: usize },
-    /// `(1 - signed)·sign_col = 0`: the arith half of `SIGN(rv·[1], signed)` —
-    /// when the inputs are not sign-extended the sign bit must be 0 (the MSB16
-    /// lookup is gated by `signed`, so it is not pinned otherwise). `usize` is
-    /// the sign column (`RV1_SIGN`/`RV2_SIGN`).
-    SignZeroWhenUnsigned { sign_col: usize },
-    /// `(1 - μ)·flag = 0`: a flag that drives a bus interaction or a high-word
-    /// fill must be 0 on a padding row (`μ = 0`). For the register flags this
-    /// prevents a disconnected row from emitting a forged register read/write
-    /// token (no DECODE binding, no CPU32 delegation); for `signed` it closes
-    /// the soundness hole where a free `signed` on padding (the `BYTE_ALU`
-    /// extractor is gated by `μ`) leaks into the `arg1/arg2` high words; for
-    /// `res_sign` (gated by the μ-gated `MSB16`) it is the arith half of
-    /// `SIGN(res, μ)`, keeping the `rvd` high word zero on padding. Spec
-    /// `cpu32.toml` (PR #646). `usize` is the flag column.
-    FlagImpliesMu { flag_col: usize },
-}
-
-impl Cpu32Constraint {
-    pub fn new(kind: Cpu32ConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
-    }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for Cpu32Constraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // `arg·[1] = (2^32-1)·rv·_sign` is now linear (`signed` is folded into
-            // `rv·_sign`); the lo/rvd fills are linear too.
-            Cpu32ConstraintKind::Arg1Lo
-            | Cpu32ConstraintKind::Arg1Hi
-            | Cpu32ConstraintKind::Arg2Lo
-            | Cpu32ConstraintKind::Arg2Hi
-            | Cpu32ConstraintKind::RvdLo
-            | Cpu32ConstraintKind::RvdHi => 1,
-            // (1-read)·value, read2·imm, (1-μ)·flag, (1-signed)·sign — all degree 2
-            Cpu32ConstraintKind::RegZero { .. }
-            | Cpu32ConstraintKind::Arg2Exclusive { .. }
-            | Cpu32ConstraintKind::FlagImpliesMu { .. }
-            | Cpu32ConstraintKind::SignZeroWhenUnsigned { .. } => 2,
-        }
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for Cpu32Constraints {
+    fn max_degree(&self) -> usize {
+        3
     }
 
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let get = |c: usize| step.get_main_evaluation_element(0, c).clone();
-        let shift16 = FieldElement::<F>::from(SHIFT_16);
-        let hi_fill = FieldElement::<F>::from(HI_FILL);
-        let one = FieldElement::<F>::one();
-
-        match self.kind {
-            Cpu32ConstraintKind::Arg1Lo => {
-                get(cols::ARG1_0) - get(cols::RV1_0) - &shift16 * get(cols::RV1_1)
-            }
-            Cpu32ConstraintKind::Arg1Hi => get(cols::ARG1_1) - hi_fill * get(cols::RV1_SIGN),
-            Cpu32ConstraintKind::Arg2Lo => {
-                get(cols::ARG2_0)
-                    - get(cols::RV2_0)
-                    - &shift16 * get(cols::RV2_1)
-                    - get(cols::IMM_0)
-            }
-            Cpu32ConstraintKind::Arg2Hi => {
-                get(cols::ARG2_1) - hi_fill * get(cols::RV2_SIGN) - get(cols::IMM_1)
-            }
-            Cpu32ConstraintKind::RvdLo => {
-                get(cols::RVD_0) - get(cols::RES_0) - &shift16 * get(cols::RES_1)
-            }
-            Cpu32ConstraintKind::RvdHi => get(cols::RVD_1) - hi_fill * get(cols::RES_SIGN),
-            Cpu32ConstraintKind::RegZero {
-                read_col,
-                value_col,
-            } => (one - get(read_col)) * get(value_col),
-            Cpu32ConstraintKind::Arg2Exclusive { imm_col } => {
-                get(cols::READ_REGISTER2) * get(imm_col)
-            }
-            Cpu32ConstraintKind::FlagImpliesMu { flag_col } => {
-                (one - get(cols::MU)) * get(flag_col)
-            }
-            Cpu32ConstraintKind::SignZeroWhenUnsigned { sign_col } => {
-                (one - get(cols::SIGNED)) * get(sign_col)
-            }
-        }
-    }
-}
-
-/// Creates all transition constraints for the CPU32 table:
-/// `IS_BIT` on the flag columns, the `ADD`/`SUB` fast-path carries, the
-/// register-zero checks, and the sign-extension `ext` arithmetic.
-pub fn cpu32_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-
-    // IS_BIT on the flag columns and the multiplicity.
-    let (is_bit, mut idx) = new_is_bit_constraints(
-        &[
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0-6: IS_BIT on the flag columns and the multiplicity.
+        for (i, &col) in [
             cols::READ_REGISTER1,
             cols::READ_REGISTER2,
             cols::WRITE_REGISTER,
@@ -733,113 +614,110 @@ pub fn cpu32_constraints(
             cols::ADD,
             cols::SUB,
             cols::MU,
-        ],
-        constraint_idx_start,
-    );
-    for c in is_bit {
-        constraints.push(c.boxed());
-    }
+        ]
+        .iter()
+        .enumerate()
+        {
+            emit_is_bit(b, i, col, None);
+        }
 
-    // ADD fast-path: arg1 + arg2 = res (cond = ADD).
-    let (add_lo, add_hi) = AddConstraint::new_pair(
-        vec![cols::ADD],
-        AddOperand::dword(cols::ARG1_0),
-        AddOperand::dword(cols::ARG2_0),
-        AddOperand::from_dword_hl(cols::RES_0),
-        idx,
-    );
-    idx += 2;
-    constraints.push(add_lo.boxed());
-    constraints.push(add_hi.boxed());
-
-    // SUB fast-path: res = arg1 - arg2, encoded as arg2 + res = arg1 (cond = SUB).
-    let (sub_lo, sub_hi) = AddConstraint::new_pair(
-        vec![cols::SUB],
-        AddOperand::dword(cols::ARG2_0),
-        AddOperand::from_dword_hl(cols::RES_0),
-        AddOperand::dword(cols::ARG1_0),
-        idx,
-    );
-    idx += 2;
-    constraints.push(sub_lo.boxed());
-    constraints.push(sub_hi.boxed());
-
-    // Unread register limbs are zero. `rv1`/`rv2` span three limbs
-    // (low halfword, high halfword, high word), so all three must be forced to
-    // zero when the register is not read — the bus reads the full word
-    // `[lo0 + 2^16·lo1, hi]`, leaving `RV*_2` free otherwise.
-    for (read_col, value_col) in [
-        (cols::READ_REGISTER1, cols::RV1_0),
-        (cols::READ_REGISTER1, cols::RV1_1),
-        (cols::READ_REGISTER1, cols::RV1_2),
-        (cols::READ_REGISTER2, cols::RV2_0),
-        (cols::READ_REGISTER2, cols::RV2_1),
-        (cols::READ_REGISTER2, cols::RV2_2),
-    ] {
-        constraints.push(
-            Cpu32Constraint::new(
-                Cpu32ConstraintKind::RegZero {
-                    read_col,
-                    value_col,
-                },
-                idx,
-            )
-            .boxed(),
+        // idx 7,8: ADD fast-path arg1 + arg2 = res (cond = ADD).
+        emit_add_pair(
+            b,
+            7,
+            &[cols::ADD],
+            &AddOperand::dword(cols::ARG1_0),
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
         );
-        idx += 1;
-    }
 
-    // Sign-extension (`ext`) arithmetic for arg1, arg2, rvd.
-    for kind in [
-        Cpu32ConstraintKind::Arg1Lo,
-        Cpu32ConstraintKind::Arg1Hi,
-        Cpu32ConstraintKind::Arg2Lo,
-        Cpu32ConstraintKind::Arg2Hi,
-        Cpu32ConstraintKind::RvdLo,
-        Cpu32ConstraintKind::RvdHi,
-    ] {
-        constraints.push(Cpu32Constraint::new(kind, idx).boxed());
-        idx += 1;
-    }
-
-    // arith half of `SIGN(rv·[1], signed)`: when not sign-extending, the sign
-    // bit is 0 (the MSB16 is gated by `signed`, so it is not otherwise pinned).
-    for sign_col in [cols::RV1_SIGN, cols::RV2_SIGN] {
-        constraints.push(
-            Cpu32Constraint::new(Cpu32ConstraintKind::SignZeroWhenUnsigned { sign_col }, idx)
-                .boxed(),
+        // idx 9,10: SUB fast-path arg2 + res = arg1 (cond = SUB).
+        emit_add_pair(
+            b,
+            9,
+            &[cols::SUB],
+            &AddOperand::dword(cols::ARG2_0),
+            &AddOperand::from_dword_hl(cols::RES_0),
+            &AddOperand::dword(cols::ARG1_0),
         );
-        idx += 1;
-    }
 
-    // arg2 multiplex exclusivity (spec assumption): read_register2·imm[i] = 0.
-    for imm_col in [cols::IMM_0, cols::IMM_1] {
-        constraints.push(
-            Cpu32Constraint::new(Cpu32ConstraintKind::Arg2Exclusive { imm_col }, idx).boxed(),
-        );
-        idx += 1;
-    }
+        // idx 11-16: unread register limbs are zero: (1 - read)·value.
+        let mut idx = 11;
+        for (read_col, value_col) in [
+            (cols::READ_REGISTER1, cols::RV1_0),
+            (cols::READ_REGISTER1, cols::RV1_1),
+            (cols::READ_REGISTER1, cols::RV1_2),
+            (cols::READ_REGISTER2, cols::RV2_0),
+            (cols::READ_REGISTER2, cols::RV2_1),
+            (cols::READ_REGISTER2, cols::RV2_2),
+        ] {
+            let one = b.one();
+            let read = b.main(0, read_col);
+            let value = b.main(0, value_col);
+            b.emit_base(idx, (one - read) * value);
+            idx += 1;
+        }
 
-    // flag ⇒ μ: a flag must be 0 on padding rows (μ = 0). The register flags
-    // gate MEMW interactions, so a free flag would inject a forged register
-    // access; `signed` (extracted via a μ-gated BYTE_ALU) would otherwise be
-    // free on padding and leak into the `arg1/arg2` high-word fills; `res_sign`
-    // (from the μ-gated MSB16) would otherwise be free and leak into the `rvd`
-    // high word. This is the arith half of `SIGN(res, μ)`. Spec `cpu32.toml`,
-    // PR #646. ALU is not gated: with `write_register = 0` its ALU-lookup
-    // result is never written back, so it has no side effect.
-    for flag_col in [
-        cols::READ_REGISTER1,
-        cols::READ_REGISTER2,
-        cols::WRITE_REGISTER,
-        cols::SIGNED,
-        cols::RES_SIGN,
-    ] {
-        constraints.push(
-            Cpu32Constraint::new(Cpu32ConstraintKind::FlagImpliesMu { flag_col }, idx).boxed(),
-        );
-        idx += 1;
-    }
+        // idx 17-22: sign-extension (`ext`) arithmetic for arg1, arg2, rvd.
+        let shift16 = b.const_base(SHIFT_16);
+        let hi_fill = b.const_base(HI_FILL);
 
-    (constraints, idx)
+        // Arg1Lo: arg1_0 - rv1_0 - shift16·rv1_1
+        let e = b.main(0, cols::ARG1_0)
+            - b.main(0, cols::RV1_0)
+            - shift16.clone() * b.main(0, cols::RV1_1);
+        b.emit_base(17, e);
+        // Arg1Hi: arg1_1 - hi_fill·rv1_sign
+        let e = b.main(0, cols::ARG1_1) - hi_fill.clone() * b.main(0, cols::RV1_SIGN);
+        b.emit_base(18, e);
+        // Arg2Lo: arg2_0 - rv2_0 - shift16·rv2_1 - imm_0
+        let e = b.main(0, cols::ARG2_0)
+            - b.main(0, cols::RV2_0)
+            - shift16.clone() * b.main(0, cols::RV2_1)
+            - b.main(0, cols::IMM_0);
+        b.emit_base(19, e);
+        // Arg2Hi: arg2_1 - hi_fill·rv2_sign - imm_1
+        let e = b.main(0, cols::ARG2_1)
+            - hi_fill.clone() * b.main(0, cols::RV2_SIGN)
+            - b.main(0, cols::IMM_1);
+        b.emit_base(20, e);
+        // RvdLo: rvd_0 - res_0 - shift16·res_1
+        let e = b.main(0, cols::RVD_0) - b.main(0, cols::RES_0) - shift16 * b.main(0, cols::RES_1);
+        b.emit_base(21, e);
+        // RvdHi: rvd_1 - hi_fill·res_sign
+        let e = b.main(0, cols::RVD_1) - hi_fill * b.main(0, cols::RES_SIGN);
+        b.emit_base(22, e);
+
+        // idx 23,24: (1 - signed)·sign — sign bit is zero when unsigned.
+        for (i, sign_col) in [cols::RV1_SIGN, cols::RV2_SIGN].into_iter().enumerate() {
+            let one = b.one();
+            let signed = b.main(0, cols::SIGNED);
+            let sign = b.main(0, sign_col);
+            b.emit_base(23 + i, (one - signed) * sign);
+        }
+
+        // idx 25,26: read_register2·imm[i] (arg2 multiplex exclusivity).
+        for (i, imm_col) in [cols::IMM_0, cols::IMM_1].into_iter().enumerate() {
+            let rr2 = b.main(0, cols::READ_REGISTER2);
+            let imm = b.main(0, imm_col);
+            b.emit_base(25 + i, rr2 * imm);
+        }
+
+        // idx 27-31: (1 - μ)·flag — flag must be 0 on padding rows.
+        for (i, flag_col) in [
+            cols::READ_REGISTER1,
+            cols::READ_REGISTER2,
+            cols::WRITE_REGISTER,
+            cols::SIGNED,
+            cols::RES_SIGN,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let one = b.one();
+            let mu = b.main(0, cols::MU);
+            let flag = b.main(0, flag_col);
+            b.emit_base(27 + i, (one - mu) * flag);
+        }
+    }
 }

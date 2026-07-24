@@ -37,3 +37,58 @@ where
         (a(), b())
     }
 }
+
+/// Map `f(i)` over `range` and collect into a `Vec`, preserving index order.
+/// Parallel when `feature = "parallel"`, sequential otherwise. Rayon's
+/// `collect()` is index-ordered, so the result is identical either way.
+pub(crate) fn par_map_collect<R: Send>(
+    range: std::ops::Range<usize>,
+    f: impl Fn(usize) -> R + Sync + Send,
+) -> Vec<R> {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        range.into_par_iter().map(f).collect()
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        range.map(f).collect()
+    }
+}
+
+/// Run `f(&mut item)` for each element of `slice`. Parallel when
+/// `feature = "parallel"`, sequential otherwise (ordering is irrelevant).
+// Only called from the `debug-checks`-gated column-LDE reconstruct path
+// (production LDE is row-major); keep it available without warning otherwise.
+#[cfg_attr(not(feature = "debug-checks"), allow(dead_code))]
+pub(crate) fn par_for_each_mut<T: Send>(slice: &mut [T], f: impl Fn(&mut T) + Sync + Send) {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        slice.par_iter_mut().for_each(f);
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        slice.iter_mut().for_each(f);
+    }
+}
+
+/// Run `f(&mut item)` for each element of `slice`, short-circuiting on the
+/// first `Err`. Parallel when `feature = "parallel"`, sequential otherwise.
+// Only called from `disk-spill`-gated paths; keep it available without warning
+// when that feature is off.
+#[cfg_attr(not(feature = "disk-spill"), allow(dead_code))]
+pub(crate) fn par_try_for_each_mut<T: Send, E: Send>(
+    slice: &mut [T],
+    f: impl Fn(&mut T) -> Result<(), E> + Sync + Send,
+) -> Result<(), E> {
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        slice.par_iter_mut().try_for_each(f)
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        slice.iter_mut().try_for_each(f)
+    }
+}

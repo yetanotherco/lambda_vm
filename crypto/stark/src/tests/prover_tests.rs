@@ -7,7 +7,7 @@ use crate::{
         simple_fibonacci::{self, FibonacciAIR, FibonacciPublicInputs},
     },
     proof::options::ProofOptions,
-    prover::{IsStarkProver, Prover, evaluate_polynomial_on_lde_domain},
+    prover::{IsStarkProver, LdeTwiddles, Prover, evaluate_polynomial_on_lde_domain},
     test_utils::multi_prove_ram,
     tests::domain_cache_stats,
     tests::trace_test_helpers::get_trace_evaluations,
@@ -22,6 +22,42 @@ use math::{
 
 type Felt = FieldElement<GoldilocksField>;
 
+/// The fused composition half-extension (`extend_half_to_lde`) must produce exactly
+/// the same g-coset evaluations as the reference it replaces: iFFT on the g²-coset →
+/// coefficients → evaluate on the g-coset LDE. Both yield the unique degree-`<n`
+/// polynomial evaluated on the g-coset of size `2n`, so they must be byte-identical.
+#[test]
+fn composition_extend_half_fused_matches_reference() {
+    use math::fft::bowers_fft::LayerTwiddles;
+    type F = GoldilocksField;
+
+    let g = Felt::from(3); // any non-zero coset offset
+    let g2 = &g * &g;
+
+    for n in [4usize, 8, 16, 32] {
+        let half: Vec<Felt> = (0..n).map(|i| Felt::from((i as u64) * 7 + 1)).collect();
+
+        // Reference: iFFT(g²) → coeffs → evaluate on the g-coset of size 2n.
+        let poly = Polynomial::interpolate_offset_fft(&half, &g2).unwrap();
+        let reference = evaluate_polynomial_on_lde_domain(&poly, 2, n, &g).unwrap();
+
+        // Fused: coset_lde_full with weights wⱼ = g⁻ʲ / n.
+        let n_inv = Felt::from(n as u64).inv().unwrap();
+        let g_inv = g.inv().unwrap();
+        let mut weights = Vec::with_capacity(n);
+        let mut w = n_inv;
+        for _ in 0..n {
+            weights.push(w);
+            w = &w * &g_inv;
+        }
+        let inv = LayerTwiddles::<F>::new_inverse(n.trailing_zeros() as u64).unwrap();
+        let fwd = LayerTwiddles::<F>::new((2 * n).trailing_zeros() as u64).unwrap();
+        let fused = Polynomial::coset_lde_full::<F>(&half, 2, &weights, &inv, &fwd).unwrap();
+
+        assert_eq!(reference, fused, "mismatch at n={n}");
+    }
+}
+
 #[test]
 fn test_domain_constructor() {
     let trace = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -35,6 +71,7 @@ fn test_domain_constructor() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor,
+        fri_final_poly_log_degree: 7,
     };
 
     let domain = Domain::new(
@@ -43,7 +80,6 @@ fn test_domain_constructor() {
     );
     assert_eq!(domain.blowup_factor, 2);
     assert_eq!(domain.interpolation_domain_size, trace_length);
-    assert_eq!(domain.root_order, trace_length.trailing_zeros());
     assert_eq!(domain.coset_offset, FieldElement::from(coset_offset));
 
     let primitive_root = GoldilocksField::get_primitive_root_of_unity(
@@ -126,6 +162,7 @@ fn barycentric_trace_eval_matches_horner_trace_eval() {
         fri_number_of_queries: 1,
         coset_offset,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     let air = simple_fibonacci::FibonacciAIR::<GoldilocksField>::new(&proof_options);
@@ -197,6 +234,7 @@ fn test_decompose_and_extend_d2_matches_original() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     // We need an AIR with composition_poly_degree_bound = 2 * trace_length.
@@ -232,10 +270,15 @@ fn test_decompose_and_extend_d2_matches_original() {
         .collect();
 
     // --- New path: algebraic decomposition ---
+    let twiddles = LdeTwiddles::new(&domain);
+    assert!(!twiddles.has_composition_cache());
     let new_result = Prover::<GoldilocksField, GoldilocksField, ()>::decompose_and_extend_d2(
         &constraint_evaluations,
         &domain,
+        &twiddles,
     );
+    #[cfg(not(feature = "cuda"))]
+    assert!(twiddles.has_composition_cache());
 
     assert_eq!(new_result.len(), 2);
     assert_eq!(new_result[0].len(), original[0].len());
@@ -257,12 +300,14 @@ fn test_multi_prove_mixed_coset_offsets() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
     let proof_options_7 = ProofOptions {
         blowup_factor: 2,
         fri_number_of_queries: 3,
         coset_offset: 7,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
     // Both AIRs have the same trace length and blowup, but different coset offsets.
@@ -327,6 +372,7 @@ fn test_multi_prove_dedups_shared_domain_params() {
         fri_number_of_queries: 3,
         coset_offset: 3,
         grinding_factor: 1,
+        fri_final_poly_log_degree: 7,
     };
 
     let mut trace_1 = simple_fibonacci::fibonacci_trace([Felt::from(1), Felt::from(1)], 8);
@@ -417,6 +463,7 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
         fri_number_of_queries: 1,
         coset_offset: 3,
         grinding_factor: 0,
+        fri_final_poly_log_degree: 7,
     };
 
     let air = QuadraticAIR::<GoldilocksField>::new(&proof_options);
@@ -519,5 +566,47 @@ fn test_deep_poly_direct_2n_matches_interpolate_fft_extend() {
             "deep evaluation mismatch at LDE index {i}: direct-2N path diverges from \
              iFFT+FFT-extended path"
         );
+    }
+}
+
+#[test]
+fn commit_rows_bit_reversed_matches_commit_bit_reversed() {
+    type F = GoldilocksField;
+    type FE = FieldElement<F>;
+
+    for num_cols in [1usize, 3, 7] {
+        for log_rows in [4usize, 6, 8] {
+            let num_rows = 1usize << log_rows;
+
+            let columns: Vec<Vec<FE>> = (0..num_cols)
+                .map(|c| {
+                    (0..num_rows)
+                        .map(|r| FE::from((c * num_rows + r) as u64 * 6700417 + 1))
+                        .collect()
+                })
+                .collect();
+
+            // Row-major interleaving: data[row * num_cols + col] = columns[col][row].
+            let mut row_major: Vec<FE> = Vec::with_capacity(num_rows * num_cols);
+            for r in 0..num_rows {
+                for col in &columns {
+                    row_major.push(col[r]);
+                }
+            }
+
+            // Both commits are row-pair (ROWS_PER_LEAF=2): the column-major
+            // `commitment` path and the row-major prover path must produce the
+            // same Merkle root (identical leaf bytes, only the read pattern differs).
+            let (_, root_col) =
+                crate::commitment::commit_bit_reversed(&columns, crate::commitment::ROWS_PER_LEAF)
+                    .expect("column-major commit must succeed");
+            let (_, root_row) = Prover::<F, F, ()>::commit_rows_bit_reversed(&row_major, num_cols)
+                .expect("row-major commit must succeed");
+
+            assert_eq!(
+                root_col, root_row,
+                "commit root mismatch: num_cols={num_cols} log_rows={log_rows}"
+            );
+        }
     }
 }

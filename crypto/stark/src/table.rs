@@ -1,4 +1,3 @@
-use crate::frame::Frame;
 #[cfg(feature = "disk-spill")]
 use crypto::mmap_util::spill_slice_to_mmap;
 use math::field::{
@@ -44,7 +43,15 @@ impl std::fmt::Debug for TableMmapBacking {
 #[derive(Default, Debug, serde::Deserialize)]
 #[cfg_attr(
     not(feature = "disk-spill"),
-    derive(serde::Serialize, Clone, PartialEq, Eq)
+    derive(
+        Clone,
+        PartialEq,
+        Eq,
+        serde::Serialize,
+        rkyv::Archive,
+        rkyv::Serialize,
+        rkyv::Deserialize
+    )
 )]
 #[serde(bound = "")]
 pub struct Table<F: IsField> {
@@ -96,6 +103,137 @@ where
             }
         }
         seq.end()
+    }
+}
+
+// Manual rkyv impl under disk-spill: the derive can't handle `mmap_backing`,
+// and serialization must read through `row_major_data()` so a spilled table
+// archives its mmap contents (deserializing always yields an unspilled table).
+// The archived layout matches what the derive generates without disk-spill, so
+// both configurations produce byte-identical archives.
+#[cfg(feature = "disk-spill")]
+mod archived_table {
+    use super::{FieldElement, IsField, Table};
+    use math::field::element::ArchivedFieldElement;
+    use rkyv::rancor::Fallible;
+    use rkyv::ser::{Allocator, Writer};
+    use rkyv::vec::{ArchivedVec, VecResolver};
+    use rkyv::{Archive, Deserialize, Place, Portable, Serialize};
+
+    #[derive(Portable, rkyv::bytecheck::CheckBytes)]
+    #[bytecheck(crate = rkyv::bytecheck)]
+    #[repr(C)]
+    pub struct ArchivedTable<F: IsField>
+    where
+        F::BaseType: Archive,
+    {
+        pub data: ArchivedVec<ArchivedFieldElement<F>>,
+        pub width: rkyv::primitive::ArchivedUsize,
+        pub height: rkyv::primitive::ArchivedUsize,
+    }
+
+    pub struct TableResolver {
+        data: VecResolver,
+    }
+
+    impl<F: IsField> Archive for Table<F>
+    where
+        F::BaseType: Archive,
+    {
+        type Archived = ArchivedTable<F>;
+        type Resolver = TableResolver;
+
+        fn resolve(&self, resolver: Self::Resolver, out: Place<Self::Archived>) {
+            rkyv::munge::munge!(let ArchivedTable { data, width, height } = out);
+            ArchivedVec::resolve_from_len(self.width * self.height, resolver.data, data);
+            self.width.resolve((), width);
+            self.height.resolve((), height);
+        }
+    }
+
+    impl<F: IsField, S> Serialize<S> for Table<F>
+    where
+        F::BaseType: Archive,
+        FieldElement<F>: Serialize<S>,
+        S: Fallible + Allocator + Writer + ?Sized,
+    {
+        fn serialize(&self, serializer: &mut S) -> Result<Self::Resolver, S::Error> {
+            Ok(TableResolver {
+                data: ArchivedVec::serialize_from_slice(self.row_major_data(), serializer)?,
+            })
+        }
+    }
+
+    impl<F: IsField, D> Deserialize<Table<F>, D> for ArchivedTable<F>
+    where
+        F::BaseType: Archive,
+        ArchivedFieldElement<F>: Deserialize<FieldElement<F>, D>,
+        D: Fallible + ?Sized,
+    {
+        fn deserialize(&self, deserializer: &mut D) -> Result<Table<F>, D::Error> {
+            // Element-by-element rather than `self.data.deserialize(...)`:
+            // `ArchivedVec`'s blanket `Deserialize` impl needs a
+            // `DeserializeUnsized` bound this crate doesn't otherwise use,
+            // while the per-element bound below is already satisfied.
+            let data = self
+                .data
+                .iter()
+                .map(|elem| elem.deserialize(deserializer))
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Table {
+                data,
+                width: self.width.to_native() as usize,
+                height: self.height.to_native() as usize,
+                mmap_backing: None,
+            })
+        }
+    }
+}
+
+#[cfg(feature = "disk-spill")]
+pub use archived_table::ArchivedTable;
+
+/// Read API over an rkyv-archived [`Table`], used by the verifier to consume
+/// the out-of-domain evaluations straight from the proof buffer. On
+/// little-endian targets the element data is viewed in place with no copy.
+#[cfg(target_endian = "little")]
+impl<F: IsField> ArchivedTable<F>
+where
+    F::BaseType: math::field::element::NativeArchived,
+{
+    #[inline]
+    pub fn width(&self) -> usize {
+        self.width.to_native() as usize
+    }
+
+    #[inline]
+    pub fn height(&self) -> usize {
+        self.height.to_native() as usize
+    }
+
+    /// Full row-major element data, viewed in place.
+    #[inline]
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        math::field::element::ArchivedFieldElement::slice_as_native(self.data.as_slice())
+    }
+
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. A malformed archive can
+    /// advertise dimensions that disagree with the data length; callers must
+    /// reject such tables before row access.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width()
+            .checked_mul(self.height())
+            .is_some_and(|n| n == self.data.len())
+    }
+
+    /// Row `row_idx` as a native field-element slice (no copy).
+    #[inline]
+    pub fn get_row(&self, row_idx: usize) -> &[FieldElement<F>] {
+        let width = self.width();
+        let start = row_idx * width;
+        &self.row_major_data()[start..start + width]
     }
 }
 
@@ -224,6 +362,34 @@ impl<F: IsField> Table<F> {
         &self.data[row_offset..row_offset + self.width]
     }
 
+    /// Full row-major data as a contiguous slice, reading the mmap when spilled.
+    pub fn row_major_data(&self) -> &[FieldElement<F>] {
+        #[cfg(feature = "disk-spill")]
+        if let Some(ref backing) = self.mmap_backing {
+            // SAFETY: same contract as get_row — spill_to_disk writes row-major and
+            // FieldElement<F> is #[repr(transparent)] over F::BaseType: SpillSafe.
+            return unsafe {
+                std::slice::from_raw_parts(
+                    backing.mmap.as_ptr() as *const FieldElement<F>,
+                    backing.height * backing.width,
+                )
+            };
+        }
+        &self.data
+    }
+
+    /// `true` iff the backing data holds exactly `width × height` elements —
+    /// the invariant `get_row` indexing relies on. Owned counterpart to
+    /// `ArchivedTable::dimensions_consistent`, reading the length through
+    /// `row_major_data()` so a disk-spilled table (whose `data` Vec is emptied)
+    /// reports its true mmap-backed length.
+    #[inline]
+    pub fn dimensions_consistent(&self) -> bool {
+        self.width
+            .checked_mul(self.height)
+            .is_some_and(|n| n == self.row_major_data().len())
+    }
+
     /// Returns a vector of vectors of field elements representing the table
     /// columns
     pub fn columns(&self) -> Vec<Vec<FieldElement<F>>> {
@@ -341,31 +507,6 @@ impl<F: IsField> Table<F> {
 
     #[cfg(all(feature = "disk-spill", not(unix)))]
     pub fn advise_drop_cache(&self) {}
-
-    /// Given a step size, converts the given table into a `Frame`.
-    /// Clones row data into owned Vecs (only used by verifier on small OOD tables).
-    pub fn into_frame(&self, main_trace_columns: usize, step_size: usize) -> Frame<F, F> {
-        debug_assert!(self.height.is_multiple_of(step_size));
-        let steps = (0..self.height)
-            .step_by(step_size)
-            .map(|initial_row_idx| {
-                let end_row_idx = initial_row_idx + step_size;
-
-                let mut step_main_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-                let mut step_aux_data: Vec<Vec<FieldElement<F>>> = Vec::new();
-
-                (initial_row_idx..end_row_idx).for_each(|row_idx| {
-                    let row = self.get_row(row_idx);
-                    step_main_data.push(row[..main_trace_columns].to_vec());
-                    step_aux_data.push(row[main_trace_columns..].to_vec());
-                });
-
-                TableView::new(step_main_data, step_aux_data)
-            })
-            .collect();
-
-        Frame::new(steps)
-    }
 }
 
 /// A view of a contiguous subset of rows of a table.
