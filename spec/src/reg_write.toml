@@ -1,0 +1,31 @@
+name = "REGW"
+
+[[variables.condition]]
+name = "cond"
+type = "BaseField"
+desc = "the multiplicity with which to apply the interaction"
+
+[[variables.input]]
+name = "register"
+type = "Byte"
+desc = "the index of the register being addressed"
+
+[[variables.input]]
+name = "value"
+type = "DWordWL"
+desc = "the value being written to the register"
+
+[[variables.input]]
+name = "timestamp"
+type = "Word"
+desc = "the timestamp of the access"
+
+
+[[constraint_groups]]
+name = "all"
+
+[[constraints.all]]
+kind = "interaction"
+tag = "MEMW"
+input = [1, ["arr", ["*", 2, "register"], 0], ["arr", ["idx", "value", 0], ["idx", "value", 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
+multiplicity = "cond"

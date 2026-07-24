@@ -51,11 +51,11 @@ name = "mem"
 
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["cast", ["*", 2, 10], "DWordWL"], ["arr", ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 0], ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0], "timestamp", 1, 0, 0]
-output = ["arr", ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 0], ["idx", ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], 1], 0, 0, 0, 0, 0, 0]
-multiplicity = "μ"
+kind = "template"
+tag = "REG"
+input = [10, ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"], "timestamp"]
+output = ["cast", ["idx", ["idx", "state_ptr", 0], 0], "DWordWL"]
+cond = "μ"
 ref = "keccak:c:read_state_ptr"
 
 [[constraints.mem]]

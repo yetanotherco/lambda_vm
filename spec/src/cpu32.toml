@@ -312,11 +312,11 @@ name = "mem"
 
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs1"], ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 0], 1, 0, 0]
-output = ["arr", ["idx", ["cast", "rv1", "DWordWL"], 0], ["idx", "rv1", 2], 0, 0, 0, 0, 0, 0]
-multiplicity = "read_register1"
+kind = "template"
+tag = "REG"
+input = ["rs1", ["cast", "rv1", "DWordWL"], ["+", "timestamp", 0]]
+output = ["cast", "rv1", "DWordWL"]
+cond = "read_register1"
 
 [[constraints.mem]]
 kind = "arith"
@@ -325,11 +325,11 @@ poly = ["*", ["not", "read_register1"], ["idx", "rv1", "i"]]
 iter = ["i", 0, 2]
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rs2"], ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 1], 1, 0, 0]
-output = ["arr", ["idx", ["cast", "rv2", "DWordWL"], 0], ["idx", "rv2", 2], 0, 0, 0, 0, 0, 0]
-multiplicity = "read_register2"
+kind = "template"
+tag = "REG"
+input = ["rs2", ["cast", "rv2", "DWordWL"], ["+", "timestamp", 1]]
+output = ["cast", "rv2", "DWordWL"]
+cond = "read_register2"
 
 [[constraints.mem]]
 kind = "arith"
@@ -338,10 +338,10 @@ poly = ["*", ["not", "read_register2"], ["idx", "rv2", "i"]]
 iter = ["i", 0, 2]
 
 [[constraints.mem]]
-kind = "interaction"
-tag = "MEMW"
-input = [1, ["*", ["cast", 2, "DWordWL"], "rd"], ["arr", ["idx", "rvd", 0], ["idx", "rvd", 1], 0, 0, 0, 0, 0, 0], ["+", "timestamp", 2], 1, 0, 0]
-multiplicity = "write_register"
+kind = "template"
+tag = "REGW"
+input = ["rd", "rvd", ["+", "timestamp", 2]]
+cond = "write_register"
 
 [[constraint_groups]]
 name = "logup"
