@@ -249,3 +249,51 @@ fn page_commitments_empty_list_matches_none() {
         "empty page_commitments slice must behave like None — every page falls through to recompute",
     );
 }
+
+/// Differential test: the dense PAGE generator must produce a byte-identical
+/// trace to the sparse `FinalStateMap` generator it replaces, for both the
+/// monolithic (`exclude_touched = false`) and continuation-epoch
+/// (`exclude_touched = true`) cases. Locks the PR's "exact same PAGE trace"
+/// claim directly, instead of relying only on full prove+verify integration.
+///
+/// Compares `main_table` (PAGE is a main-only table): `Table<F>: PartialEq` only
+/// holds without `disk-spill`, and the whole `TraceTable` can't be compared
+/// because its `aux_table: Table<E>` param lacks `PartialEq`.
+#[cfg(not(feature = "disk-spill"))]
+#[test]
+fn generate_page_trace_dense_matches_sparse() {
+    use crate::paged_mem::PagedMem;
+
+    let page_base = 0u64;
+    let init_bytes = vec![0x01u8, 0x02, 0x03, 0x04];
+    let config = PageConfig::with_data(page_base, init_bytes.clone());
+
+    // Mirror production (`MemoryState::from_image` + replay): seed the initial
+    // image as (byte, ts=0), then apply runtime writes at ts > 0 (production
+    // uses ts = i*4 + 4, always >= 4).
+    let mut cells: PagedMem<(u8, u64)> = PagedMem::new((0, 0));
+    for (off, &b) in init_bytes.iter().enumerate() {
+        cells.set(page_base + off as u64, (b, 0)); // image seed (ts 0)
+    }
+    cells.set(page_base, (0xFF, 100)); // overwrite an init byte at runtime
+    cells.set(page_base + 10, (0x77, 48)); // write a previously-untouched cell
+
+    for exclude_touched in [false, true] {
+        // Old path: sparse FinalStateMap, filtered exactly as trace_builder did.
+        let final_state: FinalStateMap = cells
+            .iter()
+            .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
+            .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
+            .collect();
+        let sparse = generate_page_trace(&config, &final_state);
+
+        // New path: dense per-page slice.
+        let dense =
+            generate_page_trace_from_dense(&config, cells.page_data(page_base), exclude_touched);
+
+        assert_eq!(
+            sparse.main_table, dense.main_table,
+            "mismatch with exclude_touched = {exclude_touched}"
+        );
+    }
+}
