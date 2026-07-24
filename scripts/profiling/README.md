@@ -29,7 +29,8 @@ not comparable across sessions.
 
 ```bash
 # 3 instrumented runs + phase table with GPU util per phase:
-scripts/profiling/run_profile.sh executor/program_artifacts/asm/fib_iterative_372k.elf
+scripts/profiling/run_profile.sh executor/program_artifacts/rust/ethrex.elf \
+  --private-input executor/tests/ethrex_5_transfers.bin
 
 # the real workload, plus an nsys-traced run and the per-phase GPU-busy report:
 scripts/profiling/run_profile.sh --nsys \
@@ -37,9 +38,9 @@ scripts/profiling/run_profile.sh --nsys \
   --private-input executor/tests/ethrex_5_transfers.bin
 
 # big continuation run, nsys capture limited to one `proving` span (one epoch):
-LAMBDA_VM_NSYS_CAPTURE_SPAN=proving scripts/profiling/run_profile.sh --nsys --continuations \
+LAMBDA_VM_NSYS_CAPTURE_SPAN=epoch_prove scripts/profiling/run_profile.sh --nsys --continuations \
   executor/program_artifacts/rust/ethrex.elf \
-  --private-input executor/tests/ethrex_20_transfers.bin
+  --private-input executor/tests/ethrex_10_transfers.bin
 ```
 
 Each invocation produces a self-contained bundle under
@@ -124,8 +125,6 @@ ncu --set full -k 'regex:ntt_dit|keccak' --launch-skip 20 --launch-count 10 \
 
 ```bash
 # on-CPU + off-CPU SVGs for one workload, in one command:
-scripts/profiling/flamegraphs.sh executor/program_artifacts/asm/fib_iterative_372k.elf
-
 scripts/profiling/flamegraphs.sh executor/program_artifacts/rust/ethrex.elf \
   --private-input executor/tests/ethrex_5_transfers.bin
 ```

@@ -13,10 +13,10 @@
 #   --no-build        reuse ./target/release/cli as-is
 #   --continuations   prove with --continuations
 #   --skip-offcpu     only the on-CPU graph (off-CPU needs sudo + bpfcc-tools)
-#   --offcpu-secs N   sample off-CPU for a fixed N-second window instead of
-#                     the whole run (whole-run capture SIGINTs offcputime when
-#                     the prove exits; if that yields an empty graph on your
-#                     kernel, use a window)
+#   --offcpu-secs N   override the off-CPU capture window (default: the
+#                     measured on-CPU run duration + 15s, so offcputime exits
+#                     on its own and flushes — signalling it through sudo is
+#                     unreliable)
 # Env:
 #   PROFILE_FEATURES  cli features (default "nvtx,jemalloc-stats")
 #   EXTRA_PROVE_ARGS  appended to every `cli prove`
@@ -71,8 +71,10 @@ CLI="$ROOT/target/release/cli"
 
 # --- on-CPU ------------------------------------------------------------------
 echo "==> on-CPU: perf record (997 Hz, fp call graphs, all threads)"
+T0=$SECONDS
 perf record -F 997 -g -o "$OUT/perf.data" -- "$CLI" "${PROVE_ARGS[@]}" \
   > "$OUT/oncpu_run.log" 2>&1
+ONCPU_SECS=$((SECONDS - T0))
 rm -f "$OUT/proof.bin"
 perf script -i "$OUT/perf.data" | inferno-collapse-perf > "$OUT/oncpu.folded"
 inferno-flamegraph --title "on-CPU: $NAME @ $SHA" "$OUT/oncpu.folded" > "$OUT/oncpu.svg"
@@ -87,22 +89,17 @@ if [[ "$SKIP_OFFCPU" == 1 ]]; then
 elif [[ -z "$OFFCPU_BIN" ]]; then
   echo "==> off-CPU skipped: offcputime-bpfcc missing (apt install bpfcc-tools)"
 else
-  echo "==> off-CPU: second prove run under offcputime-bpfcc (needs sudo)"
+  # Fixed capture window sized from the on-CPU run: offcputime exits on its
+  # own and flushes its report. (Interrupting it through sudo is unreliable —
+  # a SIGINT-based whole-run capture hung and produced 0 bytes in practice.)
+  DUR="${OFFCPU_SECS:-$((ONCPU_SECS + 15))}"
+  echo "==> off-CPU: second prove run under offcputime-bpfcc for ${DUR}s (needs sudo)"
   "$CLI" "${PROVE_ARGS[@]}" > "$OUT/offcpu_run.log" 2>&1 &
   PID=$!
-  if [[ -n "$OFFCPU_SECS" ]]; then
-    sudo "$OFFCPU_BIN" -df -p "$PID" "$OFFCPU_SECS" > "$OUT/offcpu.folded" || true
-    wait "$PID" || true
-  else
-    # capture the whole run: huge duration, SIGINT when the prove exits
-    # (bcc tools print their report on KeyboardInterrupt; sudo relays signals)
-    sudo "$OFFCPU_BIN" -df -p "$PID" 999999 > "$OUT/offcpu.folded" &
-    OCP=$!
-    wait "$PID" || true
-    sleep 1
-    sudo kill -INT "$OCP" 2>/dev/null || true
-    wait "$OCP" 2>/dev/null || true
-  fi
+  sudo "$OFFCPU_BIN" -df -p "$PID" "$DUR" > "$OUT/offcpu.folded" &
+  OCP=$!
+  wait "$PID" || true
+  wait "$OCP" || true
   rm -f "$OUT/proof.bin"
   if [[ -s "$OUT/offcpu.folded" ]]; then
     inferno-flamegraph --colors io --countname us --title "off-CPU: $NAME @ $SHA" \

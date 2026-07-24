@@ -170,15 +170,19 @@ not change codegen, unlike `-G`(never use `-G` for perf work).
 
 ## 3. Workload matrix
 
-Fixed set, smallest-that-shows-the-behavior first:
+**Rule (team convention): profiling and benchmarks ALWAYS use ethrex — never
+fibonacci.** Fib's table mix is not representative and conclusions don't
+transfer. Fib ELFs remain only inside correctness tests that hardcode them
+(`test-cuda-integration`).
 
 | Workload | Why |
 |---|---|
-| `fib_iterative_372k.elf` | small, fast iteration; existing default in `bench_prove.sh` |
-| `fib_iterative_4M.elf` | mid-size, one big table dominates |
-| `ethrex.elf` + `ethrex_5_transfers.bin` | the real benchmark (matches `/bench-gpu` CI) |
-| `ethrex.elf` + `ethrex_20_transfers.bin` + `--continuations` | large realistic trace; where GPU residency matters; per-epoch profiling |
-| `keccak.elf`, `matrix_multiply.elf` (bench programs) | different table-shape mix |
+| `ethrex.elf` + `ethrex_5_transfers.bin` | THE workload for fast iteration (matches `/bench-gpu` CI) |
+| `ethrex.elf` + `ethrex_10_transfers.bin` | larger trace |
+| `ethrex.elf` + 10tx + `--continuations` | per-epoch profiling; where GPU residency matters |
+
+Fixtures: `tooling/ethrex-fixtures/target/release/ethrex-fixtures <N> executor/tests/ethrex_<N>_transfers.bin distinct`.
+Scaling is explored via tx count and `EPOCH_SIZE_LOG2`, not synthetic ELFs.
 
 Each measurement run = `cli prove <elf> --private-input <in> -o /tmp/p.bin --time`
 built with `--features jemalloc-stats,prover/cuda,instruments` (+ `nvtx` once it

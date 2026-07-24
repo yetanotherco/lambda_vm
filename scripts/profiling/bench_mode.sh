@@ -40,8 +40,11 @@ nvidia-smi -lmc "$(nvidia-smi --query-gpu=clocks.max.mem --format=csv,noheader,n
 
 if command -v cpupower >/dev/null; then
   cpupower frequency-set -g performance >/dev/null || true
+elif ls /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor >/dev/null 2>&1; then
+  # no cpupower (e.g. Debian without linux-cpupower): set governor via sysfs
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor >/dev/null
 else
-  echo "note: cpupower not installed; CPU governor unchanged" >&2
+  echo "note: no cpufreq control available; CPU governor unchanged" >&2
 fi
 
 echo "bench mode ON: SM clock locked to ${CLOCK} MHz (max ${MAX_SM}), persistence on, governor=performance"

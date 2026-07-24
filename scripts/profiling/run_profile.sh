@@ -103,7 +103,8 @@ if [[ "$NSYS" == 1 ]]; then
   rm -f "$OUT/proof.bin"
   nsys stats -r cuda_gpu_kern_sum,cuda_gpu_mem_time_sum,cuda_api_sum,nvtx_sum \
     "$OUT/nsys_report.nsys-rep" > "$OUT/nsys_stats.txt" 2>&1 || true
-  nsys export --type sqlite -o "$OUT/nsys_report.sqlite" "$OUT/nsys_report.nsys-rep"
+  # --force-overwrite: `nsys stats` above already materializes the sqlite
+  nsys export --type sqlite --force-overwrite true -o "$OUT/nsys_report.sqlite" "$OUT/nsys_report.nsys-rep"
   python3 "$HERE/nsys_phase_busy.py" "$OUT/nsys_report.sqlite" > "$OUT/phase_busy.md"
   echo "==> GPU phase-busy report: $OUT/phase_busy.md"
 fi
