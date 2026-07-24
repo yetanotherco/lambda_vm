@@ -69,7 +69,9 @@ use crate::statement::{StatementKind, absorb_continuation_global_statement, abso
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
-use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
+use crate::tables::trace_builder::{
+    DecodeArtifacts, Traces, build_init_page_data, build_initial_image_paged,
+};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
 use crate::{
@@ -1037,6 +1039,10 @@ pub fn prove_continuation(
     // it once here instead of once per epoch inside `build_epoch_airs`.
     let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
         .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
+    // Same for the DECODE trace artifacts (instruction map + pristine trace):
+    // a pure function of the ELF, built once and shared by every epoch's trace
+    // build instead of re-parsed/regenerated inside the serial producer chain.
+    let decode_artifacts = DecodeArtifacts::from_elf(&elf)?;
 
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
@@ -1187,8 +1193,8 @@ pub fn prove_continuation(
                     }
 
                     let label = local_to_global::epoch_label(index);
-                    let traces = Traces::from_image_and_logs(
-                        elf_ref,
+                    let traces = Traces::from_image_and_logs_with_decode(
+                        &decode_artifacts,
                         &image,
                         &register_init,
                         &logs,

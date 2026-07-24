@@ -2655,6 +2655,36 @@ fn generate_page_tables<I: ImageSource>(
 // Trace Generation
 // =============================================================================
 
+/// Per-ELF DECODE artifacts: the parsed instruction map, the pristine DECODE
+/// trace (multiplicities all zero) and its PC→row index. They are a pure
+/// function of the ELF, so continuation epochs build them once
+/// ([`DecodeArtifacts::from_elf`]) and share them across every epoch's trace
+/// build ([`Traces::from_image_and_logs_with_decode`]) instead of re-parsing
+/// the ELF and regenerating the trace per epoch.
+pub struct DecodeArtifacts {
+    instructions: U64HashMap<Instruction>,
+    decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
+    decode_pc_to_row: decode::PcToRow,
+}
+
+impl DecodeArtifacts {
+    /// Parse the ELF and generate the pristine DECODE trace.
+    ///
+    /// IMPORTANT: uses `generate_decode_trace` (same as
+    /// `compute_precomputed_commitment`) so the DECODE trace row ordering
+    /// matches the AIR's hardcoded commitment.
+    pub fn from_elf(elf: &Elf) -> Result<Self, Error> {
+        let instructions = decode::instructions_from_elf(elf)
+            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        Ok(Self {
+            instructions,
+            decode_trace,
+            decode_pc_to_row,
+        })
+    }
+}
+
 /// All generated trace tables.
 pub struct Traces {
     /// CPU execution traces (split into chunks of max_rows::CPU)
@@ -2976,7 +3006,7 @@ fn build_traces<I: ImageSource + Sync>(
     memory_state: &MemoryState,
     register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: decode::PcToRow,
+    decode_pc_to_row: &decode::PcToRow,
     mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
@@ -3330,7 +3360,7 @@ fn build_traces<I: ImageSource + Sync>(
         let mut decode = decode_trace;
         let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
         decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-        decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+        decode::update_multiplicities(&mut decode, decode_pc_to_row, &decode_lookups);
         decode
     };
     let gen_commit = || commit::generate_commit_trace(&commit_ops);
@@ -4223,6 +4253,39 @@ impl Traces {
         l2g_memory_bookend: bool,
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        let artifacts = DecodeArtifacts::from_elf(elf)?;
+        Self::from_image_and_logs_with_decode(
+            &artifacts,
+            initial_image,
+            register_init,
+            logs,
+            max_rows,
+            private_input,
+            is_final,
+            l2g_memory_bookend,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// [`Self::from_image_and_logs`] with the per-ELF DECODE artifacts supplied
+    /// by the caller. Continuation epochs of the same ELF build
+    /// [`DecodeArtifacts`] once and reuse them here, so the per-epoch producer
+    /// chain skips the ELF re-parse and the pristine DECODE trace regeneration
+    /// (Phase 0) — the trace is cloned (a memcpy) and its multiplicities are
+    /// filled per epoch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_image_and_logs_with_decode<I: ImageSource + Sync>(
+        artifacts: &DecodeArtifacts,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
         // A non-final epoch must not contain the program-terminating instruction
         // (next_pc == 0). Otherwise the CPU sends an ECALL bus token with no HALT
         // table to receive it (HALT is excluded when !is_final), producing an
@@ -4231,21 +4294,20 @@ impl Traces {
             return Err(Error::HaltInNonFinalEpoch);
         }
 
-        // Phase 0: ELF → DECODE + instructions
-        // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
-        // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        // Phase 0 (cached): per-ELF DECODE artifacts; the pristine trace is
+        // cloned so `build_traces` can fill this epoch's multiplicities.
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p0_decode");
-        let instructions = decode::instructions_from_elf(elf)
-            .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
-        let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        let instructions = &artifacts.instructions;
+        let decode_trace = artifacts.decode_trace.clone();
+        let decode_pc_to_row = &artifacts.decode_pc_to_row;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
         // Phase 1: Logs → CPU operations
         #[cfg(feature = "instruments")]
         let __sp = stark::instruments::span("p1_cpu_ops");
-        let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        let cpu_ops = collect_cpu_ops(logs, instructions)?;
         #[cfg(feature = "instruments")]
         drop(__sp);
 
@@ -4370,7 +4432,7 @@ impl Traces {
             &memory_state,
             &register_init,
             decode_trace,
-            decode_pc_to_row,
+            &decode_pc_to_row,
             register_state,
             max_rows,
             #[cfg(feature = "disk-spill")]
