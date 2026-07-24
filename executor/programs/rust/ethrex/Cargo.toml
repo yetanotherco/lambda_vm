@@ -1,5 +1,12 @@
 [workspace]
 
+# Thin LTO measurably lowers executed guest cycles (~2.3% on the committed
+# ethrex_bench fixtures) at a small ELF-size cost, which is free in this VM
+# (execution is priced per executed instruction, not by ELF size). Cargo's
+# release default is lto = false / codegen-units = 16.
+[profile.release]
+lto = "thin"
+
 [package]
 name = "ethrex"
 version = "0.1.0"
