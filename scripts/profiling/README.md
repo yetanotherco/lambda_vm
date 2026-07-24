@@ -60,6 +60,61 @@ How to read `phase_busy.md`: a phase with low busy% is host-bound — fix
 pipeline/overlap/syncs, don't touch its kernels. A phase with high busy% is
 kernel-bound — take its top kernels to Nsight Compute.
 
+## What each column means
+
+`phase_table.md` (from the instruments spans + the NVML sampler):
+
+| column | meaning |
+|---|---|
+| `median` | wall-clock of the span, median across warm runs; repeated spans (per-epoch, per-table) are **summed within a run** first (`n/run` = instances) |
+| `% of total` | share of the root span (`prove_total` / `prove_continuation_total`) |
+| `cv%` | run-to-run spread (stdev/mean) — the noise floor an optimization claim must beat |
+| `gpu% / mem%` | average `nvidia-smi` utilization **sampled at 10 Hz inside the span's wall window**. Coarse: SM-occupancy-ish, includes other phases' async kernels landing in the window |
+| `vram MiB` | max VRAM sampled inside the window |
+| instances tables | per-instance wall, `gap→next` (host time between consecutive instances), gpu% inside the span vs inside the gap |
+
+`phase_busy.md` (from the nsys sqlite export; only exists with `--nsys`):
+
+| column | meaning |
+|---|---|
+| `wall ms` | union of that phase's NVTX windows (merged if overlapping) |
+| `kernel-sum ms` | sum of kernel durations **attributed by correlation ID to launches made inside the phase** — can exceed wall when streams overlap |
+| `gpu-busy ms / busy%` | union coverage of kernel intervals clipped to the phase windows — the honest "GPU was doing *something*" number; the one to rank phases by |
+| `h2d / d2h ms/MiB` | memcpy time and volume attributed to the phase |
+
+The two GPU numbers answer different questions: `gpu%` (NVML) is a cheap
+always-on sanity signal; `busy%` (nsys) is the precise one — trust it when
+they disagree. Attribution is by *launch site*, so async kernels count toward
+the phase that enqueued them even if they execute later.
+
+## Reference: scripts and knobs
+
+| script | what it does / flags |
+|---|---|
+| `run_profile.sh [opts] <elf> [--private-input <bin>]` | the bundle. `--runs N` (default 3; run 1 kept separately as cold), `--nsys`, `--gpu-metrics` (needs the counters permission), `--continuations`, `--out DIR`, `--no-build`. Env: `PROFILE_FEATURES` (default `nvtx,jemalloc-stats`), `EXTRA_PROVE_ARGS` |
+| `flamegraphs.sh [opts] <elf> …` | on-CPU + off-CPU SVGs. `--offcpu-secs N` overrides the capture window, `--skip-offcpu`, `--no-build`, `--continuations` |
+| `bench_mode.sh on [mhz] / off` | lock/unlock SM clocks (default 90% of max), persistence, governor |
+| `capture_env.sh` | env JSON to stdout — attach to anything you measure by hand |
+| `phase_table.py [--util u.csv]… tl.json…` | aggregate timelines; `--instances LABEL` adds per-instance tables for deeper repeated spans, `--min-pct X` hides noise rows |
+| `nsys_phase_busy.py report.sqlite [--top N]` | the GPU busy report from `nsys export --type sqlite` |
+| `nvml_sampler.py -o out.csv [-i 0.1]` | standalone 10 Hz GPU util sampler (epoch-ns timestamps, aligns with span `start_ns`) |
+| `timeline_to_perfetto.py tl.json > trace.json` | span tree for ui.perfetto.dev |
+
+Environment variables the tooling understands:
+
+| var | effect |
+|---|---|
+| `LAMBDA_VM_TIMELINE_JSON=<path>` | prover writes the span timeline there (needs `instruments`) |
+| `LAMBDA_VM_NSYS_CAPTURE_SPAN=<label>` | cuProfilerStart/Stop around that span → with `run_profile.sh --nsys`, capture only that window (`epoch_prove`, `rounds_2to4`, …) |
+| `LAMBDA_VM_NVTX_LIB=<path>` | where to dlopen `libnvToolsExt.so.1` from |
+| `LAMBDA_VM_NVCC_LINEINFO=1` | build cubins with SASS→source mapping for ncu |
+
+Useful prover knobs for A/B experiments (pre-existing, see plan §11):
+`LAMBDA_VM_DISABLE_GPU_COMPOSITION`, `LAMBDA_VM_NO_GPU_LOGUP`,
+`LAMBDA_VM_DISABLE_DEVICE_ONLY`, `LAMBDA_VM_GPU_LDE_THRESHOLD`,
+`LAMBDA_VM_GPU_BARY_THRESHOLD`, `LAMBDA_VM_VRAM_BUDGET_MB`,
+`TABLE_PARALLELISM`.
+
 ## Continuations: per-epoch data for parallelization
 
 `prove_continuation` is instrumented independently of the monolithic path
@@ -136,6 +191,25 @@ futexes; invisible in the on-CPU graph). Read them against `phase_busy.md`:
 low GPU busy% + little on-CPU time in a phase = blocked time, and the off-CPU
 graph names the stack. For an interactive view, `samply record
 ./target/release/cli prove <elf> ...` opens the Firefox profiler UI.
+
+## Troubleshooting
+
+- **No NVTX ranges in the nsys report** (`nsys_phase_busy.py` warns): the
+  binary didn't find `libnvToolsExt.so.1`. Check `LAMBDA_VM_NVTX_LIB` /
+  `~/nvtx/` — a missing library no-ops silently by design.
+- **Numbers look great but the GPU path silently fell back to CPU**: every
+  dataset must be gated on `make test-cuda-integration` (it asserts every
+  `gpu_*_calls()` counter fired). A cubin/arch mismatch falls back without
+  erroring.
+- **Empty `offcpu.folded`**: rerun with `--offcpu-secs <prove seconds + 10>`;
+  the bcc tool needs `linux-headers` for the running kernel.
+- **`Proving time` jitter above ~1%**: clocks aren't locked (`bench_mode.sh
+  on`) or something else is running on the box; check
+  `nvidia-smi -q -d PERFORMANCE` for throttle reasons.
+- **Spans from concurrent threads** (e.g. the epoch-pipeline branch): the
+  tree in `phase_table.md` mis-nests spans recorded on different threads
+  (order-based reconstruction, no tid in `SpanRecord`). The per-instance
+  tables and everything nsys-side stay correct — use those.
 
 ## Not yet built (next steps on the box)
 
