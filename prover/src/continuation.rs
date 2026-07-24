@@ -1048,6 +1048,14 @@ pub fn prove_continuation(
         ))
     })?;
 
+    // Root span for the profiling toolkit (scripts/profiling): the whole
+    // continuation prove is one tree; per-stage spans below are recorded from
+    // their worker threads and told apart by label + instance order.
+    #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_continuation_total");
+
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
@@ -1125,7 +1133,7 @@ pub fn prove_continuation(
     let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
     let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
     let decode_artifacts_ref = &decode_artifacts;
-    let prove_worker = |worker: usize| {
+    let prove_worker = |_worker: usize| {
         loop {
             // Take the next prepared epoch (lock released before proving).
             let msg = { rx.lock().unwrap().recv() };
@@ -1140,6 +1148,14 @@ pub fn prove_continuation(
             if first_err.lock().unwrap().is_some() {
                 return; // another worker failed; stop consuming
             }
+            // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
+            // instruments span carries a static label and instances are told
+            // apart by order (phase_table.py reports them per instance).
+            #[cfg(feature = "nvtx")]
+            let __nvtx =
+                stark::instruments::nvtx_range_fmt(|| format!("epoch_prove[i={}]", prepared.index));
+            #[cfg(feature = "instruments")]
+            let __sp = stark::instruments::span("epoch_prove");
             let start = EpochStart {
                 register_init: &prepared.register_init,
                 label: prepared.label,
@@ -1166,7 +1182,7 @@ pub fn prove_continuation(
     // (pure epoch-local work) and forward the prepared epoch to the provers.
     // Errors propagate through the prove channel, exactly like producer errors.
     let build_worker =
-        |lane: usize, tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
+        |_lane: usize, tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
             loop {
                 let msg = { build_rx.lock().unwrap().recv() };
                 let job = match msg {
@@ -1180,6 +1196,12 @@ pub fn prove_continuation(
                 if first_err.lock().unwrap().is_some() {
                     return; // a prover failed; stop building
                 }
+                #[cfg(feature = "nvtx")]
+                let __nvtx = stark::instruments::nvtx_range_fmt(|| {
+                    format!("epoch_trace_build[i={}]", job.index)
+                });
+                #[cfg(feature = "instruments")]
+                let __sp = stark::instruments::span("epoch_trace_build");
                 let traces = Traces::build_from_collected(
                     decode_artifacts_ref,
                     job.collected,
@@ -1194,6 +1216,12 @@ pub fn prove_continuation(
                     #[cfg(feature = "disk-spill")]
                     stark::storage_mode::StorageMode::Ram,
                 );
+                // Close the build span BEFORE forwarding: the send below blocks
+                // on prove-channel backpressure, which is waiting, not building.
+                #[cfg(feature = "instruments")]
+                drop(__sp);
+                #[cfg(feature = "nvtx")]
+                drop(__nvtx);
                 match traces {
                     Ok(traces) => {
                         let prepared = PreparedEpoch {
@@ -1261,6 +1289,8 @@ pub fn prove_continuation(
 
                     // Run one epoch; `logs` is this epoch's chunk only (the executor
                     // clears it).
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_execute");
                     let logs = match executor
                         .resume_with_limit(epoch_size)
                         .map_err(|e| Error::Execution(format!("{e}")))?
@@ -1268,6 +1298,8 @@ pub fn prove_continuation(
                         Some(logs) => logs.to_vec(),
                         None => return Ok(()),
                     };
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
                     let is_final = executor.pc() == 0;
 
                     // Invariant: a non-final epoch ran the full `epoch_size` (a power
@@ -1283,6 +1315,11 @@ pub fn prove_continuation(
                     // Sequential-critical half only (Phases 1-2): op collection
                     // over the pre-epoch image. The table build (Phases 3-5)
                     // happens on the builder pool — nothing below needs it.
+                    #[cfg(feature = "nvtx")]
+                    let __nvtx =
+                        stark::instruments::nvtx_range_fmt(|| format!("epoch_collect[i={index}]"));
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_collect");
                     let collected = Traces::collect_epoch(
                         decode_artifacts_ref,
                         &image,
@@ -1310,6 +1347,12 @@ pub fn prove_continuation(
                         image.set(cell.address, (cell.fini.value & 0xFF) as u8);
                     }
 
+                    // Close the collect span BEFORE handing off: the send below
+                    // blocks on builder backpressure, which is waiting, not work.
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    #[cfg(feature = "nvtx")]
+                    drop(__nvtx);
                     let job = BuildJob {
                         index,
                         register_init,
@@ -1357,6 +1400,8 @@ pub fn prove_continuation(
                 all.push(b);
             }
             let run = || -> Result<GlobalResult, Error> {
+                #[cfg(feature = "instruments")]
+                let __sp = stark::instruments::span("prove_global");
                 let num_private_input_pages = page::private_input_page_count(private_inputs);
                 // SINGLE source of truth: the same page-base list drives the
                 // committed GLOBAL_MEMORY tables and is shipped in the bundle,
@@ -1416,18 +1461,18 @@ pub fn prove_continuation(
             Error::ContinuationInvariant("global prove thread produced no result".to_string())
         })??;
 
-    // GPU device timeline accumulated across every epoch + global prove
-    // (collected only when LAMBDA_VM_GPU_TIMELINE[_JSON] is set).
-    #[cfg(all(feature = "cuda", feature = "instruments"))]
-    if let Some(gpu_tl) = stark::gpu_lde::gpu_timeline_drain() {
-        crate::instruments::print_gpu_report(&gpu_tl);
-        if let Ok(path) = std::env::var("LAMBDA_VM_GPU_TIMELINE_JSON") {
-            let spans = stark::instruments::take_timeline();
-            let _ = std::fs::write(
-                &path,
-                crate::instruments::chrome_trace_json(&spans, &gpu_tl),
-            );
-            println!("[gpu-timeline] wrote {path}");
+    // Same timeline output as the monolithic path (prover/src/lib.rs): print
+    // the wall-clock span tree and honor LAMBDA_VM_TIMELINE_JSON. Without this,
+    // continuation runs record spans that are never drained (the profiling
+    // toolkit's phase_table.py consumes the JSON).
+    #[cfg(feature = "instruments")]
+    {
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
         }
     }
 
