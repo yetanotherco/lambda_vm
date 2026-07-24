@@ -14,6 +14,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use math_cuda::{CudaSlice, CudaStream};
 
+// External-profiler capture window (nsys -c cudaProfilerApi); re-exported so
+// the prover crate can bracket the proving section without a math-cuda dep.
+
 use crypto::fiat_shamir::is_transcript::IsStarkTranscript;
 use crypto::merkle_tree::merkle::MerkleTree;
 use crypto::merkle_tree::proof::Proof;
@@ -1287,6 +1290,14 @@ where
         &weights_u64,
         retain_host_lde,
     )
+    .inspect_err(|e| {
+        // This path has no CPU fallback (the host aux trace is empty), so the
+        // caller hard-aborts; surface the swallowed driver error (e.g. OOM).
+        eprintln!(
+            "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
+            ra.num_rows, ra.num_aux_cols, blowup_factor
+        );
+    })
     .ok()?;
 
     let lde_out: Vec<FieldElement<E>> = unsafe {
@@ -1852,7 +1863,7 @@ where
     let mut fri_layer_list: Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>> =
         Vec::with_capacity(num_committed);
 
-    for _ in 0..num_committed {
+    for _layer_idx in 0..num_committed {
         // <<<< Receive challenge zeta_k
         let zeta: FieldElement<E> = transcript.sample_field_element();
         // SAFETY: E == Ext3.

@@ -1,5 +1,5 @@
 use std::marker::PhantomData;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
 use std::time::{Duration, Instant};
 
@@ -139,18 +139,20 @@ where
         }
     }
 
-    /// Build a `TableCommit` for a preprocessed table.
+    /// Build a `TableCommit` for a preprocessed table. The precomputed tree
+    /// arrives as an `Arc` because it may be shared from the process-wide
+    /// cache (see [`precomputed_tree_cache_get`]).
     fn preprocessed(
         tree: BatchedMerkleTree<F>,
         root: Commitment,
-        precomputed_tree: BatchedMerkleTree<F>,
+        precomputed_tree: Arc<BatchedMerkleTree<F>>,
         precomputed_root: Commitment,
         num_precomputed_cols: usize,
     ) -> Self {
         Self {
             tree: Arc::new(tree),
             root,
-            precomputed_tree: Some(Arc::new(precomputed_tree)),
+            precomputed_tree: Some(precomputed_tree),
             precomputed_root: Some(precomputed_root),
             num_precomputed_cols,
         }
@@ -170,6 +172,47 @@ where
     fn is_preprocessed(&self) -> bool {
         self.precomputed_tree.is_some()
     }
+}
+
+/// Process-wide cache of precomputed-column Merkle trees, keyed by their
+/// commitment root. The root fully determines the tree (column content,
+/// domain, blowup and leaf layout all feed the hash), so a hit needs no
+/// re-verification: the lookup key IS the root a rebuild would be checked
+/// against. This is what makes continuation epochs stop re-committing the
+/// same DECODE/BITWISE/range tables once per epoch — those trees are
+/// execution-independent; only the multiplicity columns change per run.
+/// Type-erased so one static serves every field instantiation.
+fn precomputed_tree_cache()
+-> &'static Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>> {
+    static CACHE: OnceLock<
+        Mutex<std::collections::HashMap<Commitment, Arc<dyn std::any::Any + Send + Sync>>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn precomputed_tree_cache_get<F: IsField + 'static>(
+    root: &Commitment,
+) -> Option<Arc<BatchedMerkleTree<F>>>
+where
+    FieldElement<F>: AsBytes,
+{
+    let cache = precomputed_tree_cache().lock().unwrap();
+    cache
+        .get(root)
+        .cloned()
+        .and_then(|any| any.downcast::<BatchedMerkleTree<F>>().ok())
+}
+
+fn precomputed_tree_cache_put<F: IsField + 'static>(
+    root: Commitment,
+    tree: Arc<BatchedMerkleTree<F>>,
+) where
+    FieldElement<F>: AsBytes,
+{
+    precomputed_tree_cache()
+        .lock()
+        .unwrap()
+        .insert(root, tree as Arc<dyn std::any::Any + Send + Sync>);
 }
 
 /// A container for the results of the first round of the STARK Prove protocol.
@@ -936,15 +979,47 @@ pub trait IsStarkProver<
                 TableCommit::plain(tree, root)
             }
             Some((expected_precomputed_root, num_precomputed)) => {
-                #[allow(unused_mut)]
-                let (mut precomputed_tree, precomputed_root) =
-                    Self::commit_rows_bit_reversed_subset(
-                        &main_data,
-                        total_cols,
-                        0,
-                        num_precomputed,
-                    )
-                    .ok_or(ProvingError::EmptyCommitment)?;
+                // Only the multiplicity columns depend on the execution; the
+                // precomputed-columns tree is a pure function of (content,
+                // domain) already pinned by `expected_precomputed_root`, so it
+                // is reused from the process cache when this exact commitment
+                // was built before — across epochs and across proves. Bypassed
+                // in disk-spill Disk mode, where trees are spilled (mutated).
+                #[cfg(feature = "disk-spill")]
+                let cache_ok = storage_mode != StorageMode::Disk;
+                #[cfg(not(feature = "disk-spill"))]
+                let cache_ok = true;
+                let precomputed_tree = match cache_ok
+                    .then(|| precomputed_tree_cache_get::<Field>(&expected_precomputed_root))
+                    .flatten()
+                {
+                    // Cache key == the root a rebuild would be verified
+                    // against, so a hit needs no re-check.
+                    Some(tree) => tree,
+                    None => {
+                        #[allow(unused_mut)]
+                        let (mut tree, root) = Self::commit_rows_bit_reversed_subset(
+                            &main_data,
+                            total_cols,
+                            0,
+                            num_precomputed,
+                        )
+                        .ok_or(ProvingError::EmptyCommitment)?;
+                        if root != expected_precomputed_root {
+                            return Err(ProvingError::PrecomputedCommitmentMismatch);
+                        }
+                        #[cfg(feature = "disk-spill")]
+                        Self::spill_tree(&mut tree, storage_mode, "precomputed Merkle tree")?;
+                        let tree = Arc::new(tree);
+                        if cache_ok {
+                            precomputed_tree_cache_put::<Field>(
+                                expected_precomputed_root,
+                                Arc::clone(&tree),
+                            );
+                        }
+                        tree
+                    }
+                };
                 #[allow(unused_mut)]
                 let (mut mult_tree, mult_root) = Self::commit_rows_bit_reversed_subset(
                     &main_data,
@@ -953,23 +1028,13 @@ pub trait IsStarkProver<
                     total_cols,
                 )
                 .ok_or(ProvingError::EmptyCommitment)?;
-                if precomputed_root != expected_precomputed_root {
-                    return Err(ProvingError::PrecomputedCommitmentMismatch);
-                }
                 #[cfg(feature = "disk-spill")]
-                {
-                    Self::spill_tree(
-                        &mut precomputed_tree,
-                        storage_mode,
-                        "precomputed Merkle tree",
-                    )?;
-                    Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
-                }
+                Self::spill_tree(&mut mult_tree, storage_mode, "mult Merkle tree")?;
                 TableCommit::preprocessed(
                     mult_tree,
                     mult_root,
                     precomputed_tree,
-                    precomputed_root,
+                    expected_precomputed_root,
                     num_precomputed,
                 )
             }
@@ -2405,6 +2470,13 @@ pub trait IsStarkProver<
             .unwrap_or(u64::MAX);
         #[cfg(not(feature = "cuda"))]
         let vram_budget = u64::MAX;
+
+        // NOTE: an earlier revision published prove-wide pinned-staging size
+        // hints here (`set_staging_size_hints`) so slabs allocated once at
+        // final size. Measured on a 5090 it BACKFIRED: every worker slot then
+        // pays a max-size cuMemHostAlloc (~160ms avg, 7.5s total vs 4.2s of
+        // ladder churn), and those allocations convoy the driver lock. Left
+        // out until a shared-slab design bounds the number of allocations.
 
         // R1 main commit: only the main LDE and its Merkle scratch are resident,
         // so the aux columns add nothing to this phase's working set.

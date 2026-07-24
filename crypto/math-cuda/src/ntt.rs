@@ -76,23 +76,27 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
     let be = backend()?;
     let stream = be.next_stream();
 
-    let mut x_dev = stream.clone_htod(input)?;
-    let tw_dev = if forward {
-        be.fwd_twiddles_for(log_n)?
-    } else {
-        be.inv_twiddles_for(log_n)?
+    let mut x_dev = { stream.clone_htod(input)? };
+    let tw_dev = {
+        if forward {
+            be.fwd_twiddles_for(log_n)?
+        } else {
+            be.inv_twiddles_for(log_n)?
+        }
     };
 
     let n_u64 = n as u64;
 
     // 1. Bit-reverse: natural → bit-reversed.
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut x_dev)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    {
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute)
+                .arg(&mut x_dev)
+                .arg(&n_u64)
+                .arg(&log_n)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
     }
 
     // 2. DIT butterfly levels. For log_n >= 8 we fuse 8 levels per kernel via
@@ -114,8 +118,10 @@ fn ntt_inplace(input: &[u64], forward: bool) -> Result<Vec<u64>> {
         }
     }
 
-    let out = stream.clone_dtoh(&x_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&x_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 

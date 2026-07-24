@@ -145,6 +145,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
         stream.synchronize().expect("sync uploads");
 
         let main = GpuLdeBase {
+            ready: None,
             buf: Arc::new(base_dev),
             m: main_cols,
             lde_size,
@@ -153,6 +154,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
             trace_rows: 0,
         };
         let aux = GpuLdeExt3 {
+            ready: None,
             buf: Arc::new(aux_dev),
             m: aux_cols,
             lde_size,

@@ -9,10 +9,10 @@ default = ["parallel"]
 parallel = ["stark/parallel", "math/parallel", "crypto/parallel", "dep:rayon"]
 cuda = ["stark/cuda"]
 test-cuda-faults = ["cuda", "stark/test-cuda-faults"]
-# GPU profiling build: NVTX ranges on prover spans + math-cuda entry points.
-nvtx = ["cuda", "instruments", "stark/nvtx"]
 debug-checks = ["stark/debug-checks"]
 instruments = ["stark/instruments"]
+# GPU profiling build (Nsight): implies cuda — the toolkit always traces the GPU prover.
+nvtx = ["cuda", "instruments", "stark/nvtx"]
 profile-markers = ["stark/profile-markers"]
 disk-spill = ["stark/disk-spill"]
 

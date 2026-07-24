@@ -167,25 +167,10 @@ fn d2h_bytes_via_pinned_hashes(
     dev_bytes: &CudaSlice<u8>,
     dst: &mut [u8],
 ) -> Result<()> {
-    let n_bytes = dst.len();
-    let u64_len = n_bytes.div_ceil(8);
-    let staging_slot = be.pinned_hashes();
-    let mut staging = staging_slot.lock().unwrap();
-    staging.ensure_capacity(u64_len, &be.ctx)?;
-    let pinned = unsafe { staging.as_mut_slice(u64_len) };
-    // Reinterpret the u64 pinned buffer as bytes — same allocation, just
-    // typed differently. SAFETY: u64 has stricter alignment than u8 and the
-    // byte length fits in the `u64_len` capacity (rounded up to u64).
-    let pinned_bytes: &mut [u8] =
-        unsafe { std::slice::from_raw_parts_mut(pinned.as_mut_ptr() as *mut u8, n_bytes) };
-    stream.memcpy_dtoh(dev_bytes, pinned_bytes)?;
-    stream.synchronize()?;
-
-    // Runs under the pinned_hashes lock, where rayon can deadlock. See
-    // `Backend::pinned_staging`.
-    dst.copy_from_slice(pinned_bytes);
-    drop(staging);
-    Ok(())
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_hashes(), &be.ctx, dev_bytes, dst.len())?;
+    // Waits only for work queued up to the copy (event), not the whole stream.
+    pending.wait_into_bytes(dst)
 }
 
 /// Run `pointwise_mul_batched`: `buf[c*col_stride + i] *= weights[i]` for
@@ -415,6 +400,7 @@ fn coset_lde_row_major_inner(
     CudaSlice<u64>,
     Vec<u64>,
     Option<CudaSlice<u64>>,
+    Arc<crate::device::PooledEvent>,
 )> {
     let input_len = match &input {
         InnerInput::Host(h) => h.len(),
@@ -446,9 +432,11 @@ fn coset_lde_row_major_inner(
     // carry data, the remainder are already zero (zero-padding for LDE). Host
     // input uploads (H2D); device input copies in place (D2D, no PCIe upload).
     let mut buf = stream.alloc_zeros::<u64>(lde_size * total_cols)?;
-    match input {
-        InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
-        InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+    {
+        match input {
+            InnerInput::Host(h) => stream.memcpy_htod(h, &mut buf.slice_mut(0..n * total_cols))?,
+            InnerInput::Dev(d) => stream.memcpy_dtod(d, &mut buf.slice_mut(0..n * total_cols))?,
+        }
     }
 
     // Snapshot the trace-domain input (column-major) before the iNTT overwrites
@@ -514,45 +502,60 @@ fn coset_lde_row_major_inner(
     }
     crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
 
-    // D2H the row-major LDE first (before the handle transpose). Release the
-    // staging lock before the Merkle nodes transfer to minimise lock contention.
-    // Skipped entirely when `retain_host_lde` is false (the caller keeps the LDE
-    // device-only): this is the round-1 trace D2H the full-residency path
-    // eliminates — the big transfer/alloc win — so we return an empty host Vec.
-    let lde_out = if retain_host_lde {
-        let staging_slot = be.pinned_staging();
-        let mut staging = staging_slot.lock().unwrap();
-        staging.ensure_capacity(lde_size * total_cols, &be.ctx)?;
-        let pinned = unsafe { staging.as_mut_slice(lde_size * total_cols) };
-        stream.memcpy_dtoh(&buf, pinned)?;
-        stream.synchronize()?;
-        let out = pinned[..lde_size * total_cols].to_vec();
-        drop(staging);
-        out
-    } else {
-        Vec::new()
-    };
-
-    // Keep the Merkle tree resident on device; copy only the 32 byte root so the
-    // commitment is available without copying the whole tree. Query openings
-    // gather paths from the device tree (see merkle::gather_merkle_paths_dev).
+    // Copy the 32-byte root BEFORE queueing the big drain/transpose: this
+    // pageable copy host-blocks until everything queued so far lands, so
+    // keeping it early means it waits for the tree kernels only (the root is
+    // needed now regardless — Fiat-Shamir absorbs it before anything else).
+    // The Merkle tree stays resident on device; query openings gather paths
+    // from it (see merkle::gather_merkle_paths_dev).
     let mut root = [0u8; 32];
     stream.memcpy_dtoh(&nodes_dev.slice(0..32), &mut root)?;
+
+    // D2H the row-major LDE (skipped when `retain_host_lde` is false — the
+    // full-residency path keeps the LDE device-only; that skip is the big
+    // transfer/alloc win, and we return an empty host Vec).
+    let lde_pending = if retain_host_lde {
+        Some(crate::device::async_dtoh_via(
+            &stream,
+            be.pinned_staging(),
+            &be.ctx,
+            &buf,
+            lde_size * total_cols,
+        )?)
+    } else {
+        None
+    };
 
     // Transpose row-major buf into column-major for the handle. Downstream
     // kernels (DEEP, barycentric) expect buf[c * lde_size + r] (column-major).
     let col_major_dev = launch_row_to_col_major(&stream, be, &buf, lde_size, total_cols, lde_u64)?;
-    // Synchronize before returning: the handle crosses stream boundaries.
-    // Downstream consumers call be.next_stream() and read handle.buf on a
-    // different stream, and the root copy above must have landed.
-    stream.synchronize()?;
+    // No host synchronize here: the handle carries a `ready` event instead,
+    // and consumers on other streams wait on it device-side
+    // (`wait_ready_on`). On the device-only path this makes the whole
+    // commit's tail (transpose) run behind the host's next work.
+    let ready = be.take_event()?;
+    ready.event().record(&stream)?;
+    let lde_out = match lde_pending {
+        Some(p) => {
+            let mut out = vec![0u64; lde_size * total_cols];
+            p.wait_into_u64(&mut out)?;
+            out
+        }
+        None => Vec::new(),
+    };
 
     let tree = GpuMerkleTree {
         nodes: Arc::new(nodes_dev),
         leaves_len: num_leaves,
         root,
     };
-    Ok((tree, col_major_dev, lde_out, trace_col_major))
+    Ok((
+        tree,
+        col_major_dev,
+        lde_out,
+        trace_col_major,
+        Arc::new(ready),
+    ))
 }
 
 /// Row-major LDE + Keccak + Merkle, all on-device, keeping the Merkle tree
@@ -571,9 +574,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeBase, Vec<u64>)> {
-    let _nvtx =
-        crate::nvtx::Range::fmt(|| format!("lde_tree_base[n={n} m={m} bf={blowup_factor}]"));
-    let (tree, col_major_dev, lde_out, trace_col_major) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, trace_col_major, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
         m,
@@ -588,6 +589,7 @@ pub fn coset_lde_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
         trace_dev: trace_col_major.map(Arc::new),
         trace_rows: n,
     };
@@ -612,9 +614,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let _nvtx =
-        crate::nvtx::Range::fmt(|| format!("lde_tree_ext3[n={n} m={m} bf={blowup_factor}]"));
-    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Host(row_major),
         n,
         m * 3,
@@ -629,6 +629,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
     };
     Ok((handle, lde_out))
 }
@@ -645,9 +646,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
     weights: &[u64],
     retain_host_lde: bool,
 ) -> Result<(GpuLdeExt3, Vec<u64>)> {
-    let _nvtx =
-        crate::nvtx::Range::fmt(|| format!("lde_tree_ext3_dev[n={n} m={m} bf={blowup_factor}]"));
-    let (tree, col_major_dev, lde_out, _) = coset_lde_row_major_inner(
+    let (tree, col_major_dev, lde_out, _, ready) = coset_lde_row_major_inner(
         InnerInput::Dev(input_dev),
         n,
         m * 3,
@@ -662,6 +661,7 @@ pub fn coset_lde_ext3_row_major_with_merkle_tree_keep_dev(
         m,
         lde_size: n * blowup_factor,
         tree: Some(tree),
+        ready: Some(ready),
     };
     Ok((handle, lde_out))
 }
@@ -685,6 +685,20 @@ pub struct GpuLdeBase {
     pub trace_dev: Option<Arc<CudaSlice<u64>>>,
     /// Row count (n) of `trace_dev`; 0 when `trace_dev` is None.
     pub trace_rows: usize,
+    /// Fires once `buf` is fully written (recorded after the producer's last
+    /// kernel). `None` means the producer synchronized before returning.
+    /// Consumers on other streams call [`GpuLdeBase::wait_ready_on`].
+    pub ready: Option<Arc<crate::device::PooledEvent>>,
+}
+
+impl GpuLdeBase {
+    /// Make `stream` wait (device-side, no host block) until `buf` is ready.
+    pub fn wait_ready_on(&self, stream: &CudaStream) -> Result<()> {
+        match &self.ready {
+            Some(ev) => stream.wait(ev.event()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Handle to an ext3 LDE kept live on device, de-interleaved into 3 base
@@ -698,6 +712,19 @@ pub struct GpuLdeExt3 {
     /// Optionally the aux or composition Merkle tree kept resident on device
     /// (the keep path), so R4 openings gather paths on device. None otherwise.
     pub tree: Option<GpuMerkleTree>,
+    /// Fires once `buf` is fully written. `None` = producer synchronized.
+    /// Consumers on other streams call [`GpuLdeExt3::wait_ready_on`].
+    pub ready: Option<Arc<crate::device::PooledEvent>>,
+}
+
+impl GpuLdeExt3 {
+    /// Make `stream` wait (device-side, no host block) until `buf` is ready.
+    pub fn wait_ready_on(&self, stream: &CudaStream) -> Result<()> {
+        match &self.ready {
+            Some(ev) => stream.wait(ev.event()),
+            None => Ok(()),
+        }
+    }
 }
 
 /// Merkle tree kept resident on device after a commit, so query openings gather
@@ -715,8 +742,6 @@ pub struct GpuMerkleTree {
 }
 
 pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> Result<Vec<u64>> {
-    let _nvtx =
-        crate::nvtx::Range::fmt(|| format!("lde_base[n={} bf={blowup_factor}]", evals.len()));
     let n = evals.len();
     // Empty input must short-circuit before the power-of-two assert
     // (is_power_of_two returns false for 0).
@@ -752,13 +777,15 @@ pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> R
     let lde_u64 = lde_size as u64;
 
     // === 1. iNTT on first N: bit_reverse + 8-level-fused DIT body ===
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut buf)
-            .arg(&n_u64)
-            .arg(&log_n)
-            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    {
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute)
+                .arg(&mut buf)
+                .arg(&n_u64)
+                .arg(&log_n)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
     }
     // Note: `run_ntt_body` expects a standalone CudaSlice; we pass `buf` and
     // the kernel walks the first `n_u64` elements via its own indexing.
@@ -767,28 +794,34 @@ pub fn coset_lde_base(evals: &[u64], blowup_factor: usize, weights: &[u64]) -> R
     // next pointwise multiply applies both the coset shift and the 1/N factor.
 
     // === 2. Pointwise multiply first N by coset weights (includes 1/N) ===
-    unsafe {
-        stream
-            .launch_builder(&be.pointwise_mul)
-            .arg(&mut buf)
-            .arg(&weights_dev)
-            .arg(&n_u64)
-            .launch(LaunchConfig::for_num_elems(n as u32))?;
+    {
+        unsafe {
+            stream
+                .launch_builder(&be.pointwise_mul)
+                .arg(&mut buf)
+                .arg(&weights_dev)
+                .arg(&n_u64)
+                .launch(LaunchConfig::for_num_elems(n as u32))?;
+        }
     }
 
     // === 3. Forward NTT on full buffer ===
-    unsafe {
-        stream
-            .launch_builder(&be.bit_reverse_permute)
-            .arg(&mut buf)
-            .arg(&lde_u64)
-            .arg(&log_lde)
-            .launch(LaunchConfig::for_num_elems(lde_size as u32))?;
+    {
+        unsafe {
+            stream
+                .launch_builder(&be.bit_reverse_permute)
+                .arg(&mut buf)
+                .arg(&lde_u64)
+                .arg(&log_lde)
+                .launch(LaunchConfig::for_num_elems(lde_size as u32))?;
+        }
     }
     run_ntt_body(stream.as_ref(), &mut buf, fwd_tw.as_ref(), lde_u64, log_lde)?;
 
-    let out = stream.clone_dtoh(&buf)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&buf)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -803,13 +836,6 @@ pub fn coset_lde_batch_base(
     blowup_factor: usize,
     weights: &[u64],
 ) -> Result<Vec<Vec<u64>>> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "lde_batch_base[cols={} n={} bf={blowup_factor}]",
-            columns.len(),
-            columns.first().map_or(0, |c| c.len())
-        )
-    });
     if columns.is_empty() {
         return Ok(Vec::new());
     }
@@ -839,9 +865,9 @@ pub fn coset_lde_batch_base(
     let staging_slot = be.pinned_staging();
 
     // Pinned staging. Lock and grow to max(m*n for upload, m*lde_size for
-    // download). Holding the guard across the whole call serialises concurrent
-    // batched calls that happened to hash to the same stream slot, but that's
-    // exactly what we want — one stream can only do one sequence at a time.
+    // download). The guard is held from the pack until the async uploads have
+    // landed (the H2D DMA reads the slab directly); the D2H drain at the end
+    // re-acquires the slot via `async_dtoh_via`.
     let mut staging = staging_slot.lock().unwrap();
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     // SAFETY: staging is locked, the slice alias ends before we unlock.
@@ -850,8 +876,10 @@ pub fn coset_lde_batch_base(
     // Pack columns into the first m*n slots of the pinned buffer. Runs under
     // the pinned-staging lock, where rayon can deadlock. See
     // `Backend::pinned_staging`.
-    for (c, col) in columns.iter().enumerate() {
-        pinned[c * n..c * n + n].copy_from_slice(col);
+    {
+        for (c, col) in columns.iter().enumerate() {
+            pinned[c * n..c * n + n].copy_from_slice(col);
+        }
     }
 
     // Column layout: `buf[c * lde_size + r]`. Zeroed so the [n, lde_size)
@@ -859,10 +887,16 @@ pub fn coset_lde_batch_base(
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
     // One memcpy per column from the pinned buffer into the strided slots.
     // The pinned source hits PCIe line-rate.
-    for c in 0..m {
-        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+    {
+        for c in 0..m {
+            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+        }
     }
+    // The uploads above are truly asynchronous (pinned source), so the
+    // staging slot must stay locked until they land; the slot's reusable event marks that
+    // point. It is waited just before the D2H drain re-acquires the slot.
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -928,29 +962,44 @@ pub fn coset_lde_batch_base(
         m_u32,
     )?;
 
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the NTT kernels above are queued behind them, so the
+    // GPU stays busy while the host waits here).
+    staging.sync_event()?;
+    drop(staging);
+
     // Single big D2H into the reusable pinned staging buffer — pinned, one
-    // call to the driver, saturates PCIe.
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
-    stream.synchronize()?;
+    // call to the driver, saturates PCIe. Enqueued without blocking; the host
+    // blocks once, in `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
 
     // Split pinned into per-column Vec<u64>s. Runs under the pinned-staging
-    // lock, where rayon can deadlock. See `Backend::pinned_staging`.
-    let out: Vec<Vec<u64>> = (0..m)
-        .map(|c| {
-            // set_len skips the O(N) zero-init that vec![0; n] would do.
-            // copy_from_slice below writes every slot before any reader
-            // sees the Vec.
-            #[allow(clippy::uninit_vec)]
-            let mut v = {
-                let mut v = Vec::<u64>::with_capacity(lde_size);
-                unsafe { v.set_len(lde_size) };
-                v
-            };
-            v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-            v
-        })
-        .collect();
-    drop(staging);
+    // lock (held by `pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    let out: Vec<Vec<u64>> = {
+        pending.wait_and_read(|bytes| {
+            // SAFETY: the pinned slab is u64-aligned by construction and the
+            // copy deposited exactly `m * lde_size` u64s.
+            let pinned =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+            (0..m)
+                .map(|c| {
+                    // set_len skips the O(N) zero-init that vec![0; n] would
+                    // do. copy_from_slice below writes every slot before any
+                    // reader sees the Vec.
+                    #[allow(clippy::uninit_vec)]
+                    let mut v = {
+                        let mut v = Vec::<u64>::with_capacity(lde_size);
+                        unsafe { v.set_len(lde_size) };
+                        v
+                    };
+                    v.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+                    v
+                })
+                .collect()
+        })?
+    };
     Ok(out)
 }
 
@@ -965,13 +1014,6 @@ pub fn coset_lde_batch_base_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "lde_batch_base_into[cols={} n={} bf={blowup_factor}]",
-            columns.len(),
-            columns.first().map_or(0, |c| c.len())
-        )
-    });
     if columns.is_empty() {
         return Ok(());
     }
@@ -1008,15 +1050,22 @@ pub fn coset_lde_batch_base_into(
     staging.ensure_capacity(m * lde_size, &be.ctx)?;
     let pinned = unsafe { staging.as_mut_slice(m * lde_size) };
 
-    for (c, col) in columns.iter().enumerate() {
-        pinned[c * n..c * n + n].copy_from_slice(col);
+    {
+        for (c, col) in columns.iter().enumerate() {
+            pinned[c * n..c * n + n].copy_from_slice(col);
+        }
     }
 
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    for c in 0..m {
-        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+    {
+        for c in 0..m {
+            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+        }
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1074,15 +1123,30 @@ pub fn coset_lde_batch_base_into(
         m_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
-    stream.synchronize()?;
-
-    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
-    // where rayon can deadlock. See `Backend::pinned_staging`.
-    for (c, dst) in outputs.iter_mut().enumerate() {
-        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
-    }
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
     drop(staging);
+
+    // Big D2H enqueued without blocking; the host blocks once, in
+    // `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
+
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock
+    // (held by `pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    {
+        pending.wait_and_read(|bytes| {
+            // SAFETY: the pinned slab is u64-aligned by construction and the
+            // copy deposited exactly `m * lde_size` u64s.
+            let pinned =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+            for (c, dst) in outputs.iter_mut().enumerate() {
+                dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -1099,13 +1163,6 @@ pub fn coset_lde_batch_base_into_with_leaf_hash(
     outputs: &mut [&mut [u64]],
     hashed_leaves_out: &mut [u8],
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "lde_batch_base_hash[cols={} n={} bf={blowup_factor}]",
-            columns.len(),
-            columns.first().map_or(0, |c| c.len())
-        )
-    });
     coset_lde_batch_base_into_with_merkle_tree_inner(
         columns,
         blowup_factor,
@@ -1175,15 +1232,22 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
 
     // Pack columns into the pinned buffer. Runs under the pinned-staging
     // lock, where rayon can deadlock. See `Backend::pinned_staging`.
-    for (c, col) in columns.iter().enumerate() {
-        pinned[c * n..c * n + n].copy_from_slice(col);
+    {
+        for (c, col) in columns.iter().enumerate() {
+            pinned[c * n..c * n + n].copy_from_slice(col);
+        }
     }
 
     let mut buf = stream.alloc_zeros::<u64>(m * lde_size)?;
-    for c in 0..m {
-        let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
-        stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+    {
+        for c in 0..m {
+            let mut dst = buf.slice_mut(c * lde_size..c * lde_size + n);
+            stream.memcpy_htod(&pinned[c * n..c * n + n], &mut dst)?;
+        }
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1278,16 +1342,33 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
     }
 
-    // D2H the LDE and the tree/leaves nodes via pinned staging.
-    stream.memcpy_dtoh(&buf, &mut pinned[..m * lde_size])?;
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // D2H the LDE (async, via pinned staging, enqueued without blocking) and
+    // the tree/leaves nodes (via the separate pinned-hashes slot; that helper
+    // waits internally, and its event is recorded after the LDE copy, so the
+    // `wait_and_read` below is nearly instant).
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, m * lde_size)?;
     d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
 
-    // Copy pinned into caller outputs. Runs under the pinned-staging lock,
-    // where rayon can deadlock. See `Backend::pinned_staging`.
-    for (c, dst) in outputs.iter_mut().enumerate() {
-        dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+    // Copy pinned into caller outputs. Runs under the pinned-staging lock
+    // (held by `lde_pending`), where rayon can deadlock. See
+    // `Backend::pinned_staging`.
+    {
+        lde_pending.wait_and_read(|bytes| {
+            // SAFETY: the pinned slab is u64-aligned by construction and the
+            // copy deposited exactly `m * lde_size` u64s.
+            let pinned =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, m * lde_size) };
+            for (c, dst) in outputs.iter_mut().enumerate() {
+                dst.copy_from_slice(&pinned[c * lde_size..c * lde_size + lde_size]);
+            }
+        })?;
     }
-    drop(staging);
 
     if keep_device_buf {
         Ok(Some(GpuLdeBase {
@@ -1297,6 +1378,9 @@ fn coset_lde_batch_base_into_with_merkle_tree_inner(
             tree: None,
             trace_dev: None,
             trace_rows: 0,
+            // The pending wait above drained the stream past the last write
+            // to `buf`, so the handle is complete at return.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1320,12 +1404,6 @@ pub fn evaluate_poly_coset_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "poly_lde_ext3[cols={} n={n} bf={blowup_factor}]",
-            coefs.len()
-        )
-    });
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1348,12 +1426,6 @@ pub fn evaluate_poly_coset_batch_ext3_into_keep(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<GpuLdeExt3> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "poly_lde_ext3_keep[cols={} n={n} bf={blowup_factor}]",
-            coefs.len()
-        )
-    });
     let opt = evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1414,10 +1486,15 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
     pack_ext3_to_pinned_slabs(coefs, pinned, n);
 
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    {
+        for s in 0..mb {
+            let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+            stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+        }
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
     let weights_dev = stream.clone_htod(weights)?;
@@ -1458,8 +1535,9 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
         mb_u32,
     )?;
 
-    // Optional R2-style row-pair Merkle tree build on the LDE buffer.
-    if let Some(nodes_out) = merkle_nodes_out {
+    // Optional R2-style row-pair Merkle tree build on the LDE buffer, queued
+    // ahead of the drains below.
+    let nodes = if let Some(nodes_out) = merkle_nodes_out {
         let num_leaves = lde_size / 2;
         let tight_total_nodes = 2 * num_leaves - 1;
         assert_eq!(nodes_out.len(), tight_total_nodes * 32);
@@ -1484,22 +1562,44 @@ fn evaluate_poly_coset_batch_ext3_into_inner(
             }
         }
         crate::merkle::build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, num_leaves)?;
-
-        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-        d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
+        Some((nodes_dev, nodes_out))
     } else {
-        stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-        stream.synchronize()?;
+        None
+    };
+
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // LDE drain enqueued without blocking. When a tree was built, its nodes
+    // drain via the separate pinned-hashes slot; that helper waits internally,
+    // and its event is recorded after the LDE copy, so the `wait_and_read`
+    // below is nearly instant.
+    let lde_pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, mb * lde_size)?;
+    if let Some((nodes_dev, nodes_out)) = nodes {
+        d2h_bytes_via_pinned_hashes(&stream, be, &nodes_dev, nodes_out)?;
     }
 
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
+    {
+        lde_pending.wait_and_read(|bytes| {
+            // SAFETY: the pinned slab is u64-aligned by construction and the
+            // copy deposited exactly `mb * lde_size` u64s.
+            let pinned =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+            unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+        })?;
+    }
     if keep_device_buf {
         Ok(Some(GpuLdeExt3 {
             buf: std::sync::Arc::new(buf),
             m,
             lde_size,
             tree: None,
+            // The pending wait above drained the stream past the last write
+            // to `buf`, so the handle is complete at return.
+            ready: None,
         }))
     } else {
         drop(buf);
@@ -1522,12 +1622,6 @@ pub fn evaluate_poly_coset_batch_ext3_into_with_merkle_tree(
     outputs: &mut [&mut [u64]],
     merkle_nodes_out: &mut [u8],
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "poly_lde_ext3_tree[cols={} n={n} bf={blowup_factor}]",
-            coefs.len()
-        )
-    });
     evaluate_poly_coset_batch_ext3_into_inner(
         coefs,
         n,
@@ -1566,12 +1660,6 @@ pub fn coset_lde_batch_ext3_into(
     weights: &[u64],
     outputs: &mut [&mut [u64]],
 ) -> Result<()> {
-    let _nvtx = crate::nvtx::Range::fmt(|| {
-        format!(
-            "lde_batch_ext3[cols={} n={n} bf={blowup_factor}]",
-            columns.len()
-        )
-    });
     if columns.is_empty() {
         return Ok(());
     }
@@ -1615,10 +1703,15 @@ pub fn coset_lde_batch_ext3_into(
     // Allocate + zero-pad device buffer holding 3M slabs of `lde_size`.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
     // H2D: slab by slab into the first N slots of each `lde_size`-slab.
-    for s in 0..mb {
-        let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
-        stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+    {
+        for s in 0..mb {
+            let mut dst = buf.slice_mut(s * lde_size..s * lde_size + n);
+            stream.memcpy_htod(&pinned[s * n..s * n + n], &mut dst)?;
+        }
     }
+    // The uploads above are truly asynchronous (pinned source); the staging
+    // slot stays locked until this event fires (waited before the drain).
+    staging.record_event(&stream)?;
 
     let inv_tw = be.inv_twiddles_for(log_n)?;
     let fwd_tw = be.fwd_twiddles_for(log_lde)?;
@@ -1677,13 +1770,28 @@ pub fn coset_lde_batch_ext3_into(
         mb_u32,
     )?;
 
-    stream.memcpy_dtoh(&buf, &mut pinned[..mb * lde_size])?;
-    stream.synchronize()?;
+    // Release the staging slot before the drain: the uploads have landed once
+    // the slot event fires (the kernels above are queued behind them).
+    staging.sync_event()?;
+    drop(staging);
+
+    // Big D2H enqueued without blocking; the host blocks once, in
+    // `wait_and_read` below.
+    let pending =
+        crate::device::async_dtoh_via(&stream, staging_slot, &be.ctx, &buf, mb * lde_size)?;
 
     // Unpack: for each output column, re-interleave 3 slabs back into the
-    // ext3-per-element layout.
-    unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
-    drop(staging);
+    // ext3-per-element layout. Runs under the pinned-staging lock (held by
+    // `pending`), where rayon can deadlock. See `Backend::pinned_staging`.
+    {
+        pending.wait_and_read(|bytes| {
+            // SAFETY: the pinned slab is u64-aligned by construction and the
+            // copy deposited exactly `mb * lde_size` u64s.
+            let pinned =
+                unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+            unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+        })?;
+    }
     Ok(())
 }
 
