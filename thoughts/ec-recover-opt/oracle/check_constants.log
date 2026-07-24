@@ -1,0 +1,8 @@
+PASS  p formula == SEC2 hex
+PASS  N == SEC2 hex
+PASS  G on curve
+PASS  G.y even (canonical form exists)
+PASS  repo P_BYTES == p (LE)
+PASS  repo N_BYTES == N (LE)
+PASS  repo R_BYTES == 3p (LE)
+PASS  repo B == 7

@@ -1,0 +1,8 @@
+[PROVED] L5a no-2-torsion  (−7)^((p−1)/3) mod p ≠ 1: True; |E|=N odd: True
+[PROVED] L5b incomplete-addition unreachable  0s
+[PROVED] L5c x-equal ⇒ y = ±y (mod p)  + A-PRIME closes; 5s
+
+Summary:
+  PROVED   L5a no-2-torsion
+  PROVED   L5b incomplete-addition unreachable
+  PROVED   L5c x-equal ⇒ y = ±y (mod p)

@@ -1,0 +1,2 @@
+BONUS 1 (ecrecover 3-way, 40 sigs): PASS (0 failures)
+BONUS 2 (solve_y identity, 200 cases): PASS (0 failures)

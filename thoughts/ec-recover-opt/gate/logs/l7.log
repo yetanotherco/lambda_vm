@@ -1,0 +1,2 @@
+[PROVED] L7 end-to-end pinning vs oracle  3 points × 12 scalars × 2 sign classes; 990 linear UNSAT queries all unsat; both sign classes converge; drain (XR_SUB_P) unique == oracle; 3s
+queries: 990, unsat: 990

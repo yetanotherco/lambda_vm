@@ -1,0 +1,25 @@
+[UNSAT(OK)       ] N1/N3 baseline (all checks ⇒ no wrong decode)  full window set + c₆₃=0 forces V ≡ 0 mod p; 76s
+[UNSAT/REDUNDANT ] N1 drop IsHalfword(c[40])  mid carry window individually redundant given c₆₃=0 + neighbours (strong: S free); 59s
+[SAT(FORGES)     ] N3 drop ColIsZero(c[63])  top overflow unconstrained ⇒ decoded value ≢ 0 mod p; c₆₃=0 LOAD-BEARING; 49s (realizability caveat: gadget over-approx)
+[SAT(FORGES)     ] N6 drop XR_SUB_P  present⇒UNSAT (canonical forced); dropped⇒SAT (xR=v+p accepted, v<2^32+977). LOAD-BEARING
+[SAT(FORGES)     ] NSW transcription tamper (xA↔xG in yR)  tampered relation admits yR=0x10e944847da1b419c87b4edc147f2bab568e273a3adba1de07e85b07bf8fa2dd ≠ honest 0x51ed993ea0d455b75642e2098ea51448d967ae33bfbdfe40cfe97bdc47739922
+[SAT(CATCHES)    ] N-CONST wrong-prime (p→p+2)  honest witness: value≡0 under p ✓, value≢0 under p+2 ✓ ⇒ constraints bind the constant
+[UNSAT/REDUNDANT ] N4 drop OP·NEXT_OP [k=6]  Bit-balance alone blocks AA schedules; +drop balance ⇒ SAT forgery; 0s
+[UNSAT/REDUNDANT ] N4 drop OP·NEXT_OP [k=11]  Bit-balance alone blocks AA schedules; +drop balance ⇒ SAT forgery; 0s
+[UNSAT/REDUNDANT ] N5 drop IS_BIT(q1[32])  curve relation still pins yG²≡xG³+7 with q1<2^264; 0s
+[UNSAT/REDUNDANT ] N7 drop KBitsZeroOnPadding  rejection-only: padding k_bits (mult∈{0,1}) can only add unmatched Bit-receives (all padding senders µ/next_op-dead, ecsm.rs:529-540 / ecdas.rs:217-221) ⇒ imbalance; soundness-redundant, keep as completeness hygiene (argument, not search)
+
+Summary:
+  UNSAT(OK)        N1/N3 baseline (all checks ⇒ no wrong decode)
+  UNSAT/REDUNDANT  N1 drop IsHalfword(c[40])
+  SAT(FORGES)      N3 drop ColIsZero(c[63])
+  SAT(FORGES)      N6 drop XR_SUB_P
+  SAT(FORGES)      NSW transcription tamper (xA↔xG in yR)
+  SAT(CATCHES)     N-CONST wrong-prime (p→p+2)
+  UNSAT/REDUNDANT  N4 drop OP·NEXT_OP [k=6]
+  UNSAT/REDUNDANT  N4 drop OP·NEXT_OP [k=11]
+  UNSAT/REDUNDANT  N5 drop IS_BIT(q1[32])
+  UNSAT/REDUNDANT  N7 drop KBitsZeroOnPadding
+
+Genuine forgeries/catches (non-vacuity): 4 -> ['N3 drop ColIsZero(c[63])', 'N6 drop XR_SUB_P', 'NSW transcription tamper (xA↔xG in yR)', 'N-CONST wrong-prime (p→p+2)']
+Redundancy findings: 5
