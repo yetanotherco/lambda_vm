@@ -20,7 +20,7 @@ use crate::lookup::{
 use crate::proof::options::ProofOptions;
 use crate::prover::{IsStarkProver, Prover};
 use crate::table::Table;
-use crate::test_utils::multi_prove_ram;
+use crate::test_utils::{multi_prove_batched_ram, multi_prove_ram};
 use crate::trace::TraceTable;
 use crate::traits::AIR;
 use crate::verifier::{IsStarkVerifier, Verifier};
@@ -125,13 +125,13 @@ fn test_rejects_inflated_composition_part_count() {
         (&mul_air, &mut mul_trace, &()),
     ];
     let mut multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&cpu_air, &add_air, &mul_air];
 
     // The untampered proof verifies.
-    assert!(Verifier::multi_verify(
+    assert!(Verifier::batched_multi_verify(
         &airs,
         &multi_proof,
         &mut DefaultTranscript::<E>::new(&[]),
@@ -139,12 +139,12 @@ fn test_rejects_inflated_composition_part_count() {
     ));
 
     // Tamper: inflate the first table's composition-poly part count.
-    multi_proof.proofs[0]
+    multi_proof.per_table[0]
         .composition_poly_parts_ood_evaluation
         .push(FieldElement::<E>::zero());
 
     assert!(
-        !Verifier::multi_verify(
+        !Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),
@@ -2296,14 +2296,14 @@ fn test_compound_equals_primitive_expansion() {
     ];
 
     let multi_proof =
-        multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+        multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
 
     let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
         vec![&sender, &receiver];
 
     // This should PASS - compound and primitive expansion are equivalent
     assert!(
-        Verifier::multi_verify(
+        Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

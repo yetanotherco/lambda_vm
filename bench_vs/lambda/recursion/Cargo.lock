@@ -129,8 +129,6 @@ dependencies = [
  "digest",
  "lambda-vm-syscalls",
  "math",
- "rand 0.8.6",
- "rand_chacha 0.3.1",
  "rkyv",
  "serde",
  "sha3",
@@ -233,6 +231,8 @@ name = "executor"
 version = "0.1.0"
 dependencies = [
  "ecsm",
+ "math",
+ "rand_chacha 0.3.1",
  "rustc-demangle",
  "thiserror",
 ]
@@ -432,6 +432,7 @@ name = "math"
 version = "0.1.0"
 dependencies = [
  "getrandom 0.2.17",
+ "lambda-vm-syscalls",
  "num-bigint",
  "num-traits",
  "rand 0.8.6",
@@ -853,6 +854,7 @@ dependencies = [
  "crypto",
  "digest",
  "itertools",
+ "lambda-vm-syscalls",
  "log",
  "math",
  "rkyv",

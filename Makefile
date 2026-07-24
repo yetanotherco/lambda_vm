@@ -56,13 +56,18 @@ RECURSION_GUESTS := empty fibonacci
 RECURSION_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/, $(addsuffix .elf, $(RECURSION_GUESTS)))
 
 # The recursion verifier itself (bench_vs/lambda/recursion) requires picking
-# exactly one of its `min`/`blowup8` Cargo features at build time (fixes the
-# inner ProofOptions — see main.rs). Each preset builds its own distinctly
-# named [[bin]] (recursion-<preset>-bench) to its own artifact, via the
+# exactly one of its preset Cargo features at build time (fixes the inner
+# ProofOptions — see main.rs). Each preset builds its own distinctly named
+# [[bin]] (recursion-<preset>-bench) to its own artifact, via the
 # define/foreach/eval below rather than the generic %.elf pattern rule. The
-# distinct bin names also make the two `cp`s race-free under `make -j`.
-RECURSION_VERIFIER_PRESETS := min blowup8
-RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS)))
+# distinct bin names also make the per-preset `cp`s race-free under `make -j`.
+RECURSION_VERIFIER_PRESETS := min blowup2 blowup4 blowup8
+# Continuation-verifying variants (the guest's `continuation` feature): verify a
+# multi-epoch ContinuationProof bundle instead of a monolithic VmProof. Kept to
+# the presets the recursion benchmarks actually measure.
+RECURSION_CONT_PRESETS := min blowup2 blowup4
+RECURSION_VERIFIER_ARTIFACTS := $(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-, $(addsuffix .elf, $(RECURSION_VERIFIER_PRESETS))) \
+	$(addprefix $(RECURSION_ARTIFACTS_DIR)/recursion-cont-, $(addsuffix .elf, $(RECURSION_CONT_PRESETS)))
 
 # Override with: make ... SYSROOT_DIR=$HOME/.lambda-vm-sysroot
 # to install the sysroot in a user-writable location and avoid sudo.
@@ -215,7 +220,7 @@ $(BENCH_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(BENCH_ARTIFACTS_DIR)
 $(RECURSION_ARTIFACTS_DIR)/%.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
 	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/$*,$*-bench)
 
-# The recursion verifier's `min`/`blowup8` presets: same crate dir, one
+# The recursion verifier's presets (RECURSION_VERIFIER_PRESETS): same crate dir, one
 # differently named [[bin]] per preset (recursion-<preset>-bench, gated on that
 # preset's Cargo feature) -> a differently named artifact. Generated per preset
 # from RECURSION_VERIFIER_PRESETS via define/foreach/eval rather than a pattern
@@ -235,6 +240,346 @@ $(RECURSION_ARTIFACTS_DIR)/recursion-$(1).elf: FORCE | prepare-sysroot $(RECURSI
 	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-$(1)-bench,--features $(1))
 endef
 $(foreach preset,$(RECURSION_VERIFIER_PRESETS),$(eval $(call recursion_verifier_rule,$(preset))))
+
+# Continuation variants: same crate, `continuation` feature on top of the preset
+# feature -> recursion-cont-<preset>-bench -> recursion-cont-<preset>.elf.
+define recursion_cont_verifier_rule
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-$(1).elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$$(call build_guest_elf,$$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-$(1)-bench,--features "continuation $(1)")
+endef
+$(foreach preset,$(RECURSION_CONT_PRESETS),$(eval $(call recursion_cont_verifier_rule,$(preset))))
+
+# EXPERIMENT 1 (field-native hash/transcript ecalls) measurement ELFs: the
+# blowup2 preset with the `sim-hash-ecalls` feature, monolithic and continuation.
+# Deliberately NOT part of RECURSION_VERIFIER_ARTIFACTS / compile-recursion-elfs
+# — they are EXECUTE-ONLY measurement builds (never proven), built on demand via
+# `make compile-recursion-simhash-elfs` (or the individual .elf target). Each is
+# measured against the matching non-simhash baseline (recursion-cont-blowup2.elf
+# / recursion-blowup2.elf) with `cli execute --cycles`.
+.PHONY: compile-recursion-simhash-elfs
+compile-recursion-simhash-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-simhash.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simhash.elf
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-simhash.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-blowup2-simhash-bench,--features "blowup2 sim-hash-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simhash.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simhash-bench,--features "continuation blowup2 sim-hash-ecalls")
+
+# v2 commitment-derived attestation (`attest-commitment-id`) guests: REAL, SOUND
+# (not a stub) — safe to prove. Built on a plain blowup2 base (no sim-* ecalls) so
+# the ELF parse+hash cycle saving is measured against real software keccak/parse.
+# Measured (execute-only for the cycle delta) against the matching non-attestid
+# baseline (recursion-blowup2.elf / recursion-cont-blowup2.elf) on the SAME inner.
+.PHONY: compile-recursion-attestid-elfs
+compile-recursion-attestid-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-attestid.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-attestid.elf
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-blowup2-attestid.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-blowup2-attestid-bench,--features "blowup2 attest-commitment-id")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-attestid.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-attestid-bench,--features "continuation blowup2 attest-commitment-id")
+
+# MEASUREMENT-ONLY: DEEP reduced-opening stub variants of the cont/blowup2 guest
+# (Experiment 2). Level A (simroA) = per-row column-loop ecall; Level B (simroB)
+# = whole per-query pair ecall. NEVER prove these ELFs (the unmatched ecall
+# unbalances the LogUp bus) — execute-only cycle measurement. Kept OUT of
+# compile-recursion-elfs/compile-programs so they never build by accident; build
+# explicitly with `make compile-recursion-sim-ro-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroA.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simroA-bench,--features "continuation blowup2 sim-ro-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroB.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simroB-bench,--features "continuation blowup2 sim-ro-query")
+
+.PHONY: compile-recursion-sim-ro-elfs
+compile-recursion-sim-ro-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroA.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simroB.elf
+
+# EXPERIMENT 3 (combined) measurement ELFs: EXPERIMENT 1 hash/transcript ecalls
+# AND EXPERIMENT 2 reduced-opening ecalls in one cont/blowup2 guest. simboth =
+# Level A RO; simbothB = Level B RO. EXECUTE-ONLY (never prove). Kept out of the
+# default targets; build with `make compile-recursion-simboth-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simbothB.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simbothB-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-query")
+
+.PHONY: compile-recursion-simboth-elfs
+compile-recursion-simboth-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simbothB.elf
+
+# EXPERIMENT 5 (software-path optimizations): the simboth guest (both stub
+# families) plus REAL, sound guest-side software wins — a bump allocator
+# (`bump-alloc`) and an in-circuit-verified Goldilocks inverse hint (`inv-hint`).
+# Reuses the simboth bin with extra features on top. Still EXECUTE-ONLY (built on
+# the sim-ecall base, which drives no chip): measure with `cli execute --cycles`,
+# never prove. Build with `make compile-recursion-simboth-sw-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls bump-alloc inv-hint")
+
+.PHONY: compile-recursion-simboth-sw-elf
+compile-recursion-simboth-sw-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw.elf
+
+# ROUND-2 increment A: the simboth-sw floor guest plus the Merkle path-verify
+# stub (`sim-path-ecall`). One trusted VERIFY_PATH ecall per Merkle path replaces
+# the in-guest fold, subsuming the per-node HASH_PAIR ecalls on the verify paths.
+# Reuses the simboth bin with one extra feature. Still EXECUTE-ONLY (never prove).
+# Build with `make compile-recursion-simboth-sw-path-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-path.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls bump-alloc inv-hint sim-path-ecall")
+
+.PHONY: compile-recursion-simboth-sw-path-elf
+compile-recursion-simboth-sw-path-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-path.elf
+
+# ROUND-2 increment B (independent): floor guest + the transcript
+# challenge-sampling stubs (`sim-sample-ecall`). SAMPLE_FELT/SAMPLE_U64 fold the
+# guest's ChaCha20 expansion + rejection loops into one ecall each. EXECUTE-ONLY.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-sample.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls bump-alloc inv-hint sim-sample-ecall")
+
+.PHONY: compile-recursion-simboth-sw-sample-elf
+compile-recursion-simboth-sw-sample-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-sample.elf
+
+# ROUND-2 increment C (independent): floor guest but the reduced-opening row loop
+# uses the in-place ABI (`sim-ro-inplace`) INSTEAD OF Level A (`sim-ro-ecalls`):
+# REGISTER_RO_LAYOUT once per proof + per-row REDUCED_OPENING_ROW_INPLACE, killing
+# the per-query struct fill + col-ptr gather. Uses the inplace bin. EXECUTE-ONLY.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-inplace.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace bump-alloc inv-hint")
+
+.PHONY: compile-recursion-simboth-sw-inplace-elf
+compile-recursion-simboth-sw-inplace-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-inplace.elf
+
+# ROUND-2 cumulative: the floor stack with ALL THREE increments stacked — path
+# verify (A) + transcript sample (B) + in-place reduced opening (C, in place of
+# Level A). Uses the inplace bin. EXECUTE-ONLY, never prove.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-abc.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace bump-alloc inv-hint sim-path-ecall sim-sample-ecall")
+
+.PHONY: compile-recursion-simboth-sw-abc-elf
+compile-recursion-simboth-sw-abc-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-abc.elf
+
+# FEXT accelerator (PR #818/#831) measurement ELFs. Each is the fext-ON twin of
+# an otherwise identical fext-OFF guest, so `cli execute --cycles` against the
+# same blob yields the exact cycle effect of routing the recursion verifier's
+# Fp3 mul-add through the real FEXT chip. `-fext` = plain cont/blowup2 baseline
+# (full software column loop -> fext covers every ext×ext product); `-simboth-sw-fext`
+# = the best measured stack (both sim stub families + software wins) with fext on
+# (the RO stub already swallows the ext×ext products, so fext here fires only at
+# the residual trace-term site). Build: `make compile-recursion-fext-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-fext.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-bench,--features "continuation blowup2 fext-accel")
+
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-fext.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-ecalls bump-alloc inv-hint fext-accel")
+
+.PHONY: compile-recursion-fext-elfs
+compile-recursion-fext-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-fext.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-simboth-sw-fext.elf
+
+# THE COMPOSED MEASUREMENT ELF: the blowup4 counterpart of simboth-sw — full
+# accelerator stack (both stub families) plus the software wins (bump-alloc,
+# inv-hint) on the cont/blowup4 preset. Reuses the recursion-cont-blowup4-simboth
+# bin with the two software features on top, exactly as the blowup2 target above.
+# EXECUTE-ONLY (never prove). Build with
+# `make compile-recursion-simboth-sw-blowup4-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-simboth-sw.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-simboth-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-ecalls bump-alloc inv-hint")
+
+.PHONY: compile-recursion-simboth-sw-blowup4-elf
+compile-recursion-simboth-sw-blowup4-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-simboth-sw.elf
+
+# THE GRAND COMPOSITE MEASUREMENT ELF (rung-1, unbatched): every kept lever of
+# the campaign on the cont/blowup4 preset — field-native hash/transcript stubs
+# (sim-hash-ecalls), the in-place reduced-opening ABI (sim-ro-inplace), the
+# Merkle path-verify stub (sim-path-ecall), the software wins (bump-alloc,
+# inv-hint), and the real FEXT Fp3 accelerator (fext-accel). #841's ChaCha
+# removal is always-on code (not a feature); sim-sample-ecall is deliberately
+# omitted (superseded by #841 — see default_transcript.rs). Reuses the grand
+# bin. EXECUTE-ONLY (the sim-ecall base drives no chip): measure with
+# `cli execute --cycles`, NEVER prove. Build with
+# `make compile-recursion-grand-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel")
+
+.PHONY: compile-recursion-grand-elf
+compile-recursion-grand-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand.elf
+
+# RUNG-2 (batched) composed ELF: same grand stack but Level-A reduced-opening
+# (sim-ro-ecalls) INSTEAD of sim-ro-inplace. MEASURED FINDING: the in-place RO
+# ABI (increment C) is INCOMPATIBLE with batched FRI — register_ro_layout caches
+# the per-query eval-slice lengths once per proof, but batched shared-MMCS
+# openings vary them per query, so the cached lengths are wrong and the guest
+# rejects a valid batched proof. Level-A passes the lengths fresh per query and
+# composes with batching (as in the four-way). So on the batched rung the
+# composed guest uses Level-A; inplace's ~3M unbatched saving is unrealizable
+# here. Uses the simboth (Level-A) bin. EXECUTE-ONLY, never prove.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-simboth-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-ecalls sim-path-ecall bump-alloc inv-hint fext-accel")
+
+.PHONY: compile-recursion-grand-levelA-elf
+compile-recursion-grand-levelA-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA.elf
+
+# RUNG-2 (batched) GRAND-LEVEL-A + v2 commitment-derived attestation ELF: the full
+# batched grand (Level-A) feature stack plus `attest-commitment-id`, so the guest
+# also drops the in-VM ELF parse + full-ELF keccak (entry point + digest supplied,
+# PAGE layout reconstructed from the supplied commitments). Consumes the v2 blob
+# format (wire version 2) and rides sim-18's zero-copy archived-view verify path.
+# Uses the grand-levelA-v2 bin. `attest-commitment-id` is REAL/SOUND, but this
+# composed guest still carries the sim-* stub ecalls, so it stays EXECUTE-ONLY:
+# measure with `cli execute --cycles`, NEVER prove. Build with
+# `make compile-recursion-grand-levelA-v2-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-levelA-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-ecalls sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id")
+
+.PHONY: compile-recursion-grand-levelA-v2-elf
+compile-recursion-grand-levelA-v2-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2.elf
+
+# RUNG-2 (batched) FINAL COMPOSITE: the batched grand-levelA-v2 stack PLUS the two
+# completed FEXT ops from sim/20 (FEXT_BASE_MUL via fext-base-mul + FEXT_INV via
+# fext-inv). This is the last composition on the batched rung — Level-A RO (batched-
+# compatible, NOT the batched-incompatible inplace ABI), v2 commitment-derived
+# attestation, zero-copy archived views, and the full FEXT chip API. The FEXT ops
+# change NO proof format (chips are execute-only, not pipeline-registered), so this
+# reuses the v2 blob. Uses the grand-levelA-v2 bin (fext-base-mul/fext-inv layered
+# on at build time). EXECUTE-ONLY: measure with `cli execute --cycles` against the
+# v2 blob, NEVER prove. Build with
+# `make compile-recursion-grand-levelA-v2-fextapi-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2-fextapi.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-levelA-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-ecalls sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id fext-base-mul fext-inv")
+
+.PHONY: compile-recursion-grand-levelA-v2-fextapi-elf
+compile-recursion-grand-levelA-v2-fextapi-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2-fextapi.elf
+
+# BATCHED FINAL COMPOSITE + fext-ext-mul: the grand-levelA-v2-fextapi stack with
+# the riscv64-only fext-ext-mul toggle added, routing the software Fp3×Fp3 and
+# Goldilocks×Fp3 `*` sites (constraint eval, LogUp fingerprint, zerofier, FFT
+# twiddles) through the FEXT chip — the batched port of the sim/22 unbatched win.
+# EXECUTE-ONLY, never prove. Build with
+# `make compile-recursion-grand-levelA-v2-fextapi-extmul-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2-fextapi-extmul.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-levelA-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-ecalls sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id fext-base-mul fext-inv fext-ext-mul")
+
+.PHONY: compile-recursion-grand-levelA-v2-fextapi-extmul-elf
+compile-recursion-grand-levelA-v2-fextapi-extmul-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-levelA-v2-fextapi-extmul.elf
+
+# THE GRAND COMPOSITE + v2 commitment-derived attestation ELF (rung-1, unbatched):
+# the full grand feature stack plus `attest-commitment-id`, so the guest also
+# drops the in-VM ELF parse + full-ELF keccak (entry point + digest are supplied,
+# PAGE layout reconstructed from the supplied commitments). Consumes the v2 blob
+# format (wire version 2). Uses the grand-v2 bin. `attest-commitment-id` is itself
+# REAL/SOUND, but this composed guest still carries the sim-* stub ecalls, so it
+# stays EXECUTE-ONLY: measure with `cli execute --cycles`, NEVER prove. Build with
+# `make compile-recursion-grand-v2-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id")
+
+.PHONY: compile-recursion-grand-v2-elf
+compile-recursion-grand-v2-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2.elf
+
+# THE FINAL-MIX ELF (sim/22 endgame, rung-1 unbatched): grand-v2 plus the
+# completed FEXT chip API — FEXT_BASE_MUL (fext-base-mul; the FRI butterfly and
+# OOD `g·z` base×ext products) and FEXT_INV (fext-inv; the Fp3 inverse's
+# check-multiply). Every kept lever of the unbatched campaign in one guest: v2
+# commitment-derived attestation + the full sim/software stack + the real FEXT
+# accelerator + its two completing ops. Reuses the grand-v2 bin (the fext toggles
+# ride on top of its required-features and change no proof format, so the v2 blob
+# stays valid). EXECUTE-ONLY (the sim-* base drives no chip): measure with
+# `cli execute --cycles`, NEVER prove. Build with
+# `make compile-recursion-grand-v2-fextapi-elf SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2-fextapi.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id fext-base-mul fext-inv")
+
+# FINAL MIX + fext-ext-mul: additionally routes the Fp3×Fp3 `*` sites (constraint
+# eval / LogUp fingerprint / zerofier) through the FEXT chip. Same recipe + the
+# fext-ext-mul toggle. EXECUTE-ONLY, never prove.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2-fextapi-extmul.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-v2-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id fext-base-mul fext-inv fext-ext-mul")
+
+.PHONY: compile-recursion-grand-v2-fextapi-elf
+compile-recursion-grand-v2-fextapi-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2-fextapi.elf
+
+.PHONY: compile-recursion-grand-v2-fextapi-extmul-elf
+compile-recursion-grand-v2-fextapi-extmul-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-v2-fextapi-extmul.elf
+
+# GRAND + the completed FEXT chip API (sim/20): the grand composite plus the two
+# measured-missing FEXT ops — FEXT_BASE_MUL (rides fext-accel; the FRI butterfly
+# and OOD `g·z` base×ext products) and FEXT_INV (fext-inv; the Fp3 inverse's
+# check-multiply moves into the chip). Same recipe/binary as grand, +fext-inv.
+# EXECUTE-ONLY: measure with `cli execute --cycles` against the grand blob, never
+# prove. Build with `make compile-recursion-grand-fextapi-elf SYSROOT_DIR=...`.
+# base_mul-only variant (fext-base-mul, no fext-inv): isolates FEXT_BASE_MUL's
+# blowup4 delta against the grand baseline. FEXT_INV's delta = basemul - fextapi.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-basemul.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel fext-base-mul")
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-fextapi.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup4-grand-bench,--features "continuation blowup4 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel fext-base-mul fext-inv")
+
+.PHONY: compile-recursion-grand-fextapi-elf
+compile-recursion-grand-fextapi-elf: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-basemul.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup4-grand-fextapi.elf
+
+# BLOWUP2 grand + fextapi ladder for LOCAL fixed-blob measurement (the blowup4
+# grand blob needs ~116 GB to dump, so the blowup2 recipe is the local proxy;
+# deltas scale up at blowup4 — more FRI queries/layers/inversions). Same binary
+# as the blowup2 inplace composite, feature-laddered so base_mul and inv isolate:
+#   -grand          : the reference (base×ext software, inverse hint software-check)
+#   -grand-basemul  : +fext-base-mul  -> FEXT_BASE_MUL delta
+#   -grand-fextapi  : +fext-base-mul +fext-inv -> +FEXT_INV delta
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel")
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-basemul.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel fext-base-mul")
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-fextapi.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel fext-base-mul fext-inv")
+
+.PHONY: compile-recursion-grand-fextapi-b2-elfs
+compile-recursion-grand-fextapi-b2-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-basemul.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-fextapi.elf
+
+# BLOWUP2 grand-v2 final-mix pair for LOCAL fixed-blob measurement (sim/22 endgame).
+# The blowup4 grand-v2 blob needs ~114 GB to dump, so this blowup2 recipe is the
+# local proxy for the FINAL-MIX increment (fext delta on the v2 path) and the
+# Part-2 monomorphization base. Reuses the blowup2 inplace composite bin +
+# attest-commitment-id (v2) on top of the grand feature stack:
+#   -grand-v2         : the v2 reference (base×ext software, inverse hint software-check)
+#   -grand-v2-fextapi : +fext-base-mul +fext-inv -> the FEXT chip API delta on v2
+# EXECUTE-ONLY: measure with `cli execute --cycles` against the blowup2 v2 blob,
+# never prove. Build with `make compile-recursion-grand-v2-fextapi-b2-elfs SYSROOT_DIR=...`.
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-v2.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id")
+$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-v2-fextapi.elf: FORCE | prepare-sysroot $(RECURSION_ARTIFACTS_DIR)
+	$(call build_guest_elf,$(RECURSION_GUESTS_DIR)/recursion,recursion-cont-blowup2-simboth-inplace-bench,--features "continuation blowup2 sim-hash-ecalls sim-ro-inplace sim-path-ecall bump-alloc inv-hint fext-accel attest-commitment-id fext-base-mul fext-inv")
+
+.PHONY: compile-recursion-grand-v2-fextapi-b2-elfs
+compile-recursion-grand-v2-fextapi-b2-elfs: prepare-sysroot \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-v2.elf \
+	$(RECURSION_ARTIFACTS_DIR)/recursion-cont-blowup2-grand-v2-fextapi.elf
 
 clean-asm:
 	-rm -rf $(ASM_ARTIFACTS_DIR)

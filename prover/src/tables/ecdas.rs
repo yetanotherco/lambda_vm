@@ -153,7 +153,10 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
     let mu = || Multiplicity::Column(cols::MU);
     let ts_lo = || packed(cols::TIMESTAMP_0);
     let ts_hi = || packed(cols::TIMESTAMP_1);
-    let mut out = Vec::new();
+    // Exact final interaction count (all loop bounds are constant), so reserve
+    // once and skip the `Vec::new()` doubling/realloc-copy schedule.
+    const NUM_INTERACTIONS: usize = 388;
+    let mut out = Vec::with_capacity(NUM_INTERACTIONS);
 
     // Receive [id, ts, xA, yA, xG, yG, round, op].
     out.push(BusInteraction::receiver(
@@ -246,6 +249,11 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
         ),
     ));
 
+    debug_assert_eq!(
+        out.len(),
+        NUM_INTERACTIONS,
+        "ecdas bus interaction count drifted; update the with_capacity reservation"
+    );
     out
 }
 

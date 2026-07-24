@@ -5,7 +5,7 @@ use crate::tables::bitwise::{
     generate_bitwise_trace, is_preprocessed, preprocessed_commitment, row_index,
 };
 use crate::tables::types::{BusId, FE};
-use crate::test_utils::multi_prove_ram;
+use crate::test_utils::{multi_prove_batched_ram, multi_prove_ram};
 use math::field::element::FieldElement;
 use stark::constraints::builder::EmptyConstraints;
 use stark::lookup::Multiplicity;
@@ -626,12 +626,13 @@ mod soundness_tests {
         ];
 
         let multi_proof =
-            multi_prove_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[])).unwrap();
+            multi_prove_batched_ram(air_trace_pairs, &mut DefaultTranscript::<E>::new(&[]))
+                .unwrap();
 
         let airs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> =
             vec![&sender_air, &receiver_air];
 
-        let result = Verifier::multi_verify(
+        let result = Verifier::batched_multi_verify(
             &airs,
             &multi_proof,
             &mut DefaultTranscript::<E>::new(&[]),

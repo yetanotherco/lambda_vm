@@ -1,7 +1,14 @@
 [target.riscv64im-lambda-vm-elf]
+# Codegen tuning (sim/29 sweep): the VM bills EXECUTED instructions, and code
+# size is free, so push LLVM to inline/unroll far past its size-tuned defaults.
+# inline-threshold 2500 (stock 225) is the measured interior optimum — 5000
+# regresses on spill pressure; unroll-threshold 2000 stacks a smaller win. On
+# grand-all this is -318,352 cyc on top of thin-LTO (15,533,990 -> 15,215,638).
 rustflags = [
   "-C", "link-arg=-e",
   "-C", "link-arg=main",
   "--cfg", "getrandom_backend=\"custom\"",
-  "-C", "passes=lower-atomic"
+  "-C", "passes=lower-atomic",
+  "-C", "llvm-args=-inline-threshold=2500",
+  "-C", "llvm-args=-unroll-threshold=2000"
 ]

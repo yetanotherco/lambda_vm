@@ -179,13 +179,13 @@ fn custom_prove_with_statement_elf(
         opts.fri_final_poly_log_degree,
     );
 
-    let proof = Prover::multi_prove(
+    let proof = Prover::multi_prove_batched(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
         #[cfg(feature = "disk-spill")]
         stark::storage_mode::StorageMode::Ram,
     )
-    .expect("multi_prove failed");
+    .expect("multi_prove_batched failed");
 
     VmProof {
         proof,
