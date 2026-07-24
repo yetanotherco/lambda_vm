@@ -835,7 +835,6 @@ pub struct AirWithBuses<
     /// Lazily captured flat IR of every transition constraint, built once on
     /// first request (prover/GPU/tests only — the verify path never forces it).
     constraint_program: std::sync::OnceLock<crate::constraint_ir::ConstraintProgram<F, E>>,
-    auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
     preprocessed_commitment: Option<crate::config::Commitment>,
@@ -877,7 +876,11 @@ impl<
         // Base-field (table) constraints come from the constraint set; LogUp
         // (extension) constraints are appended by the framework from the layout.
         let num_interactions = auxiliary_trace_build_data.interactions.len();
-        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions.clone());
+        // Move the interaction list into the LogUp layout — it is the single
+        // retained copy (`self.logup.interactions`); every read below (aux-trace
+        // build, boundary pin, next-row detection) goes through it, so the AIR no
+        // longer keeps a second `auxiliary_trace_build_data.interactions` clone.
+        let logup = LogUpLayout::from_interactions(auxiliary_trace_build_data.interactions);
         let num_term_columns = logup.num_term_columns;
 
         // meta = constraint_set base-prefix meta + appended LogUp ext meta,
@@ -924,7 +927,6 @@ impl<
             meta,
             num_base,
             constraint_program: std::sync::OnceLock::new(),
-            auxiliary_trace_build_data,
             boundary_constraint_builder: PhantomData,
             preprocessed_commitment: None,
             num_precomputed_cols: None,
@@ -1009,7 +1011,7 @@ where
         // accumulated column there (all committed terms and absorbed operands
         // read the current row). Its full-width index is the main width plus the
         // accumulated column's aux index. No interactions => no next-row reads.
-        if self.auxiliary_trace_build_data.interactions.is_empty() {
+        if self.logup.interactions.is_empty() {
             Vec::new()
         } else {
             vec![self.trace_layout.0 + self.logup.acc_column_idx]
@@ -1017,7 +1019,7 @@ where
     }
 
     fn has_trace_interaction(&self) -> bool {
-        !self.auxiliary_trace_build_data.interactions.is_empty()
+        !self.logup.interactions.is_empty()
     }
 
     fn max_bus_elements(&self) -> usize {
@@ -1111,7 +1113,7 @@ where
             trace.allocate_aux_table(num_aux_columns);
         }
 
-        let num_interactions = self.auxiliary_trace_build_data.interactions.len();
+        let num_interactions = self.logup.interactions.len();
 
         if num_interactions == 0 {
             return None;
@@ -1140,7 +1142,7 @@ where
         // the throughput the per-pair dispatch used to provide for small-trace
         // tables with many interactions.
         // Without `parallel`: sequential over pairs, sequential over rows.
-        let interactions = &self.auxiliary_trace_build_data.interactions;
+        let interactions = &self.logup.interactions;
 
         // GPU-resident aux build (Goldilocks + ext3, not disk-spill, not
         // debug-checks): build the aux columns on device and keep them resident
@@ -1238,7 +1240,7 @@ where
         #[cfg(feature = "debug-checks")]
         let (per_bus_sums, per_bus_sender_sums, per_bus_receiver_sums) =
             compute_debug_bus_sums_batched(
-                &self.auxiliary_trace_build_data.interactions,
+                &self.logup.interactions,
                 &main_segment_cols,
                 trace_len,
                 challenges,
@@ -1285,7 +1287,7 @@ where
 
         // Pin acc[0] = 0 to remove the constant-shift degree of freedom in the
         // circular transition constraint (forward accumulation starts at 0).
-        if !self.auxiliary_trace_build_data.interactions.is_empty() {
+        if !self.logup.interactions.is_empty() {
             let acc_col_idx = self.trace_layout.1 - 1; // last aux column = accumulated
             boundary_constraints.push(BoundaryConstraint::new_aux(
                 acc_col_idx,

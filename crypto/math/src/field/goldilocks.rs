@@ -145,6 +145,22 @@ impl IsField for GoldilocksField {
         if canonical == 0 {
             return Err(FieldError::InvZeroError);
         }
+        // EXPERIMENT 5: on the guest, ask the executor for `canonical^-1` and
+        // VERIFY it (`canonical * hint == 1`) instead of running the ~72-mul
+        // addition chain. Sound by construction — only the true inverse passes
+        // the check, so a wrong hint makes the guest reject, never accept. The
+        // check is a single Goldilocks multiply. All other inversion paths
+        // (Fp3 norm, batch inverse) bottom out here, so they inherit the hint.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-inv-hint"))]
+        {
+            let hint = lambda_vm_syscalls::syscalls::inv_goldilocks_hint(canonical);
+            assert!(
+                Self::canonical(&Self::mul(&canonical, &hint)) == 1,
+                "goldilocks inverse hint failed in-circuit verification"
+            );
+            return Ok(hint);
+        }
+        #[cfg(not(all(target_arch = "riscv64", feature = "sim-inv-hint")))]
         Ok(exp_p_minus_2(canonical))
     }
 
@@ -155,7 +171,15 @@ impl IsField for GoldilocksField {
 
     #[inline(always)]
     fn eq(a: &u64, b: &u64) -> bool {
-        Self::canonical(a) == Self::canonical(b)
+        // Equal raw representations are always equal field elements, so short-
+        // circuit on the raw compare before canonicalizing. In the verifier's hot
+        // equality checks (per-query terminal-codeword comparisons) the values are
+        // freshly reduced and equal on the accept path, so the raw compare hits
+        // and both `canonical` reductions are skipped. Falls through to the
+        // canonical compare only when the raw words differ (unequal elements, or
+        // the same element in the two lazy `x` / `x+p` representations), keeping
+        // the result identical to `canonical(a) == canonical(b)`.
+        *a == *b || Self::canonical(a) == Self::canonical(b)
     }
 
     #[inline(always)]
@@ -545,13 +569,11 @@ impl IsFFTField for GoldilocksField {
 }
 
 impl HasDefaultTranscript for GoldilocksField {
-    fn get_random_field_element_from_rng(rng: &mut impl rand::Rng) -> FieldElement<Self> {
-        let mut sample = [0u8; 8];
+    fn sample_field_element_from(mut next_u64: impl FnMut() -> u64) -> FieldElement<Self> {
         loop {
-            rng.fill(&mut sample);
-            let int_sample = u64::from_be_bytes(sample);
-            if int_sample < GOLDILOCKS_PRIME {
-                return FieldElement::from(int_sample);
+            let candidate = next_u64();
+            if candidate < GOLDILOCKS_PRIME {
+                return FieldElement::from(candidate);
             }
         }
     }

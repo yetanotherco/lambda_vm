@@ -17,8 +17,6 @@ serde = { version = "1.0", default-features = false, features = [
     "alloc",
 ], optional = true }
 rayon = { version = "1.8.0", optional = true }
-rand = { version = "0.8.5", default-features = false }
-rand_chacha = { version = "0.3.1", default-features = false }
 memmap2 = { version = "0.9", optional = true }
 tempfile = { version = "3", optional = true }
 libc = { version = "0.2", optional = true }
@@ -47,3 +45,37 @@ parallel = ["dep:rayon"]
 disk-spill = ["std", "dep:memmap2", "dep:tempfile", "dep:libc"]
 alloc = []
 rkyv = ["dep:rkyv", "math/rkyv"]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Swaps the guest
+# transcript-absorb / transcript-sample / Merkle leaf+parent hash software paths
+# for trusted host ecalls. riscv64-only effect; on the host the
+# `lambda-vm-syscalls` dep is target-gated out, so this feature is inert there.
+# EXECUTE-ONLY: a build with this on must never be proven (the ecalls drive no
+# chip). Off by default -> a normal build is byte-identical.
+sim-hash-ecalls = ["lambda-vm-syscalls/sim-hash-ecalls"]
+# Merkle path-verify measurement stub (ROUND-2 increment A). Swaps the guest's
+# 32-byte keccak `verify_merkle_path_from_leaf_hash` fold for a single trusted
+# VERIFY_PATH host ecall (subsuming the per-node HASH_PAIR fold). riscv64-only
+# effect (the `lambda-vm-syscalls` wrapper is target-gated out on the host).
+# EXECUTE-ONLY: a build with this on must never be proven (the ecall drives no
+# chip). Off by default -> a normal build is byte-identical.
+sim-path-ecall = []
+# Transcript challenge-sampling measurement stubs (ROUND-2 increment B). Swaps
+# DefaultTranscript's Fp3 `sample_field_element` and `sample_u64` for trusted
+# SAMPLE_FELT / SAMPLE_U64 host ecalls (each folds the ChaCha20 expansion /
+# rejection loop into one cycle). riscv64-only effect. EXECUTE-ONLY: never prove.
+# Off by default -> a normal build is byte-identical.
+# NOTE (grand composite): superseded by #841's duplex sampling; the guest call
+# sites were dropped in the sim/15 merge, so this feature is inert on this branch.
+sim-sample-ecall = []
+# Route the recursion verifier's degree-3 extension `fma`/`ext_mul`/`prod_acc`
+# through the real FEXT accelerator on the riscv64 guest (PR #818/#831). Off ->
+# the software Fp3 arithmetic in `field_ext::imp`. Measurement toggle: lets an
+# accelerator build be compared against an otherwise byte-identical fext-off
+# guest. Unlike the sim-* stubs this drives real, proven chips, so a build with
+# it on may be proven.
+fext-accel = []
+# Route the verifier's base×ext products (FRI butterfly `𝜐⁻¹·ζ`, OOD `g·z` walk)
+# through the FEXT_BASE_MUL chip. A measurement sub-toggle on top of `fext-accel`:
+# off, base×ext stays the software subfield product (byte-identical) while
+# fma/ext_mul still ride the accelerator, isolating FEXT_BASE_MUL's cycle delta.
+fext-base-mul = []

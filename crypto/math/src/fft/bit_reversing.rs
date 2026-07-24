@@ -3,10 +3,40 @@ use rayon::prelude::*;
 
 /// In-place bit-reverse permutation algorithm. Requires input length to be a power of two.
 pub fn in_place_bit_reverse_permute<E>(input: &mut [E]) {
-    for i in 0..input.len() {
-        let bit_reversed_index = reverse_index(i, input.len() as u64);
-        if bit_reversed_index > i {
-            input.swap(i, bit_reversed_index);
+    let n = input.len();
+    if n <= 1 {
+        return;
+    }
+    if n.is_power_of_two() {
+        // Maintain `rev` = the bit-reversal of `i` and advance it with a single
+        // carry-propagating step per element (a bit-reversed binary counter),
+        // instead of recomputing a full `usize::reverse_bits()` for every index.
+        // Over the whole loop this is O(n) rather than O(n · logn) instructions,
+        // and the software `reverse_bits` on the guest is ~20 instructions/call,
+        // so the per-element save is large. Produces the identical permutation to
+        // the `reverse_index`-per-element form below (verified: `rev == 0` when
+        // `i == 0`, and the counter update yields `reverse_index(i + 1, n)`).
+        let mut rev = 0usize;
+        for i in 0..n {
+            if rev > i {
+                input.swap(i, rev);
+            }
+            let mut bit = n >> 1;
+            while rev & bit != 0 {
+                rev ^= bit;
+                bit >>= 1;
+            }
+            rev ^= bit;
+        }
+    } else {
+        // Non-power-of-two lengths keep the original per-index form so behaviour
+        // is byte-identical for every caller (the fast path relies on `n` being a
+        // power of two to run the reversed-counter update).
+        for i in 0..n {
+            let bit_reversed_index = reverse_index(i, n as u64);
+            if bit_reversed_index > i {
+                input.swap(i, bit_reversed_index);
+            }
         }
     }
 }

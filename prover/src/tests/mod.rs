@@ -47,6 +47,18 @@ pub mod ecsm_tests;
 #[cfg(test)]
 pub mod eq_tests;
 #[cfg(test)]
+pub mod fext_base_mul_tests;
+#[cfg(test)]
+pub mod fext_fma_tests;
+#[cfg(test)]
+pub mod fext_inv_tests;
+#[cfg(test)]
+pub mod fext_load_tests;
+#[cfg(test)]
+pub mod fext_page_tests;
+#[cfg(test)]
+pub mod fext_store_tests;
+#[cfg(test)]
 pub mod keccak_rnd_tests;
 #[cfg(test)]
 pub mod load_tests;
@@ -74,6 +86,8 @@ pub mod prove_elfs_tests;
 pub mod recursion_smoke_test;
 #[cfg(test)]
 pub mod recursion_soundness_gap_poc;
+#[cfg(test)]
+pub mod recursion_v2_tests;
 #[cfg(test)]
 pub mod register_tests;
 #[cfg(test)]

@@ -75,20 +75,67 @@ fn hash_new_parent_bytes<D: Digest + 'static, const NUM_BYTES: usize>(
     left: &[u8; NUM_BYTES],
     right: &[u8; NUM_BYTES],
 ) -> [u8; NUM_BYTES] {
+    let mut out = [0u8; NUM_BYTES];
+    hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, &mut out);
+    out
+}
+
+/// Like [`hash_new_parent_bytes`] but writes the parent digest straight into
+/// `out`. Folding a Merkle path can then accumulate the running hash in place
+/// (ping-ponging two buffers) instead of reassigning the by-value return each
+/// step — that per-step 32-byte copy compiled to a `memcpy` call and dominated
+/// `verify_merkle_path_from_leaf_hash`. Byte-identical to the returning form.
+#[inline]
+fn hash_new_parent_bytes_into<D: Digest + 'static, const NUM_BYTES: usize>(
+    left: &[u8; NUM_BYTES],
+    right: &[u8; NUM_BYTES],
+    out: &mut [u8; NUM_BYTES],
+) {
     #[cfg(target_arch = "riscv64")]
     if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
         let l: &[u8; 32] = left[..].try_into().unwrap();
         let r: &[u8; 32] = right[..].try_into().unwrap();
-        let hash = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
-        let mut result = [0u8; NUM_BYTES];
-        result.copy_from_slice(&hash);
-        return result;
+        let out32: &mut [u8; 32] = (&mut out[..]).try_into().unwrap();
+        // EXPERIMENT 1: HASH_PAIR ecall replaces the in-guest 64-byte
+        // compression (byte-identical). Off-feature keeps the guest sponge.
+        #[cfg(feature = "sim-hash-ecalls")]
+        lambda_vm_syscalls::syscalls::sim_hash_pair(l.as_ptr(), r.as_ptr(), out32.as_mut_ptr());
+        #[cfg(not(feature = "sim-hash-ecalls"))]
+        {
+            *out32 = lambda_vm_syscalls::keccak::keccak256_pair(l, r);
+        }
+        return;
     }
 
-    hash_streamed::<D, NUM_BYTES>(|sink| {
+    *out = hash_streamed::<D, NUM_BYTES>(|sink| {
         sink(left);
         sink(right);
-    })
+    });
+}
+
+/// Equality of two `NUM_BYTES`-byte nodes. For the 32-byte digests this compares
+/// four `u64` words (which LLVM keeps inline) instead of the generic `memcmp`
+/// call that `[u8; 32] == [u8; 32]` lowers to; that call was the root check at
+/// the end of every Merkle-path fold. Byte-array equality is unchanged: equal
+/// words iff equal bytes (same native endianness on both sides).
+#[inline]
+fn nodes_eq_bytes<const NUM_BYTES: usize>(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+    if NUM_BYTES == 32 {
+        let a: &[u8; 32] = a[..].try_into().unwrap();
+        let b: &[u8; 32] = b[..].try_into().unwrap();
+        let mut i = 0;
+        while i < 32 {
+            let aw = u64::from_ne_bytes(a[i..i + 8].try_into().unwrap());
+            let bw = u64::from_ne_bytes(b[i..i + 8].try_into().unwrap());
+            if aw != bw {
+                return false;
+            }
+            i += 8;
+        }
+        true
+    } else {
+        a == b
+    }
 }
 
 /// A backend for Merkle trees that uses fixed-size pairs of field elements.
@@ -120,6 +167,26 @@ where
     type Data = [FieldElement<F>; 2];
 
     fn hash_data(input: &[FieldElement<F>; 2]) -> [u8; NUM_BYTES] {
+        // EXPERIMENT 1: one-shot HASH_FELTS ecall over the two contiguous
+        // elements. `FieldElement<F>` is `#[repr(transparent)]` over its
+        // Goldilocks limbs, so the array pointer is the raw-limb pointer and
+        // `size_of / 8` is the per-element limb count (kind). Byte-identical to
+        // the `stream_bytes` streaming path below.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+            let kind = core::mem::size_of::<FieldElement<F>>() / 8;
+            let hash = lambda_vm_syscalls::keccak::sim_hash_felts(
+                core::ptr::from_ref(input).cast::<u8>(),
+                2,
+                core::ptr::null(),
+                0,
+                kind,
+            );
+            let mut result = [0u8; NUM_BYTES];
+            result.copy_from_slice(&hash);
+            return result;
+        }
+
         hash_streamed::<D, NUM_BYTES>(|sink| {
             input[0].stream_bytes(sink);
             input[1].stream_bytes(sink);
@@ -128,6 +195,18 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+
+    fn hash_new_parent_into(
+        left: &[u8; NUM_BYTES],
+        right: &[u8; NUM_BYTES],
+        out: &mut [u8; NUM_BYTES],
+    ) {
+        hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
+    }
+
+    fn nodes_eq(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+        nodes_eq_bytes::<NUM_BYTES>(a, b)
     }
 }
 
@@ -171,6 +250,27 @@ where
     /// `hash_data(&[a, b].concat())`: the sponge absorbs the same element bytes
     /// in the same order, just without the intermediate `Vec`.
     pub fn hash_data_from_slices(a: &[FieldElement<F>], b: &[FieldElement<F>]) -> [u8; NUM_BYTES] {
+        // EXPERIMENT 1: one-shot HASH_FELTS ecall over the two slices `a ‖ b`
+        // (the verifier's `evaluations ‖ evaluations_sym` leaf shape; the plain
+        // leaf case passes an empty `b`). Elements are contiguous
+        // `#[repr(transparent)]` limbs, so each slice's `as_ptr()` is its
+        // raw-limb pointer and `size_of / 8` is the kind. Byte-identical to the
+        // streaming path below.
+        #[cfg(all(target_arch = "riscv64", feature = "sim-hash-ecalls"))]
+        if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+            let kind = core::mem::size_of::<FieldElement<F>>() / 8;
+            let hash = lambda_vm_syscalls::keccak::sim_hash_felts(
+                a.as_ptr().cast::<u8>(),
+                a.len(),
+                b.as_ptr().cast::<u8>(),
+                b.len(),
+                kind,
+            );
+            let mut result = [0u8; NUM_BYTES];
+            result.copy_from_slice(&hash);
+            return result;
+        }
+
         hash_streamed::<D, NUM_BYTES>(|sink| {
             for element in a.iter().chain(b.iter()) {
                 element.stream_bytes(sink);
@@ -199,6 +299,49 @@ where
 
     fn hash_new_parent(left: &[u8; NUM_BYTES], right: &[u8; NUM_BYTES]) -> [u8; NUM_BYTES] {
         hash_new_parent_bytes::<D, NUM_BYTES>(left, right)
+    }
+
+    fn hash_new_parent_into(
+        left: &[u8; NUM_BYTES],
+        right: &[u8; NUM_BYTES],
+        out: &mut [u8; NUM_BYTES],
+    ) {
+        hash_new_parent_bytes_into::<D, NUM_BYTES>(left, right, out);
+    }
+
+    fn nodes_eq(a: &[u8; NUM_BYTES], b: &[u8; NUM_BYTES]) -> bool {
+        nodes_eq_bytes::<NUM_BYTES>(a, b)
+    }
+
+    /// ROUND-2 increment A: recompute the Merkle root from `leaf_hash` and the
+    /// authentication path with ONE trusted VERIFY_PATH ecall, replacing the
+    /// per-node `hash_new_parent_into` fold and its running-buffer glue. Only the
+    /// 32-byte keccak node has a byte-faithful host handler (`keccak256_pair`
+    /// fold, same index-bit ordering); any other digest/size returns `None` so
+    /// the caller runs the generic fold. Byte-identical: the returned bool
+    /// matches `nodes_eq(root, computed_root)`. MEASUREMENT-ONLY, never proven.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-path-ecall"))]
+    fn try_verify_path_ecall(
+        merkle_path: &[[u8; NUM_BYTES]],
+        root: &[u8; NUM_BYTES],
+        index: usize,
+        leaf_hash: &[u8; NUM_BYTES],
+    ) -> Option<bool> {
+        if NUM_BYTES == 32 && TypeId::of::<D>() == TypeId::of::<PlatformKeccak256>() {
+            let leaf: &[u8; 32] = leaf_hash[..].try_into().unwrap();
+            let root: &[u8; 32] = root[..].try_into().unwrap();
+            // `merkle_path` is a contiguous slice of 32-byte sibling nodes; its
+            // base pointer + element count hand the host the whole path.
+            Some(lambda_vm_syscalls::syscalls::sim_verify_path(
+                leaf.as_ptr(),
+                root.as_ptr(),
+                index,
+                merkle_path.as_ptr().cast::<u8>(),
+                merkle_path.len(),
+            ))
+        } else {
+            None
+        }
     }
 }
 

@@ -24,6 +24,8 @@ impl BenchConfig {
 /// Benchmark configurations
 const CONFIGS: &[BenchConfig] = &[
     BenchConfig::new("vm_32k", "bench_32k"), // 2^15 = 32768 rows.
+    // 4096 FEXT_FMA calls: measures the FEXT accelerator's proving cost.
+    BenchConfig::new("fext_4k", "fext_bench"),
 ];
 
 // =============================================================================

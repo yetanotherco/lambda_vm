@@ -32,22 +32,42 @@ pub fn verify_merkle_path_from_leaf_hash<B>(
     merkle_path: &[B::Node],
     root_hash: &B::Node,
     mut index: usize,
-    mut hashed_value: B::Node,
+    hashed_value: B::Node,
 ) -> bool
 where
     B: IsMerkleTreeBackend,
 {
+    // ROUND-2 increment A (MEASUREMENT-ONLY, never proven): on the riscv64 guest
+    // under `sim-path-ecall`, a 32-byte keccak backend swallows the whole fold
+    // below — per-node parent hash, running-buffer glue, and the root compare —
+    // into ONE trusted VERIFY_PATH ecall that returns the REAL accept/reject.
+    // Every other backend/target returns `None` and runs the fold unchanged.
+    #[cfg(all(target_arch = "riscv64", feature = "sim-path-ecall"))]
+    if let Some(accept) = B::try_verify_path_ecall(merkle_path, root_hash, index, &hashed_value) {
+        return accept;
+    }
+
+    // Ping-pong two buffers: each parent hash is written straight into the
+    // inactive one and then only the two `&mut` references are swapped (a pointer
+    // swap, no data move). This avoids reassigning a by-value `Node` every step —
+    // that per-step copy compiled to a 32-byte `memcpy` call and dominated the
+    // fold. `cur` always holds the running hash; `nxt` is scratch. Byte-identical
+    // to the returning form (input and output buffers are always distinct).
+    let mut cur = hashed_value;
+    let mut nxt = cur.clone();
+    let mut src = &mut cur;
+    let mut dst = &mut nxt;
     for sibling_node in merkle_path.iter() {
         if index.is_multiple_of(2) {
-            hashed_value = B::hash_new_parent(&hashed_value, sibling_node);
+            B::hash_new_parent_into(src, sibling_node, dst);
         } else {
-            hashed_value = B::hash_new_parent(sibling_node, &hashed_value);
+            B::hash_new_parent_into(sibling_node, src, dst);
         }
-
+        core::mem::swap(&mut src, &mut dst);
         index >>= 1;
     }
 
-    root_hash == &hashed_value
+    B::nodes_eq(root_hash, src)
 }
 
 /// Verifies a Merkle inclusion proof given the authentication path as a borrowed

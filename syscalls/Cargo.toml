@@ -3,6 +3,24 @@ name = "lambda-vm-syscalls"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Field-native hash/transcript measurement ecalls (EXPERIMENT 1). Compiles the
+# `sim_*` ecall wrappers + the `Keccak256` sponge-pointer helpers used by the
+# `crypto` swap sites. Off by default so a normal guest build is byte-identical;
+# `crypto`'s `sim-hash-ecalls` feature forwards to this one on riscv64.
+sim-hash-ecalls = []
+# Replace the TLSF global allocator with a bump allocator (no-op `dealloc`).
+# SOUND only for guests whose TOTAL allocated bytes over the whole run fit the
+# heap region (nothing is ever reclaimed). The recursion verifier is such a
+# guest (measured ~49 MiB total vs a ~3 GiB heap), so it opts in; other guests
+# keep TLSF. riscv64-only effect; on the host the attribute isn't applied.
+bump-alloc = []
+# Goldilocks inverse HINT ecall wrapper (EXPERIMENT 5). Compiles the
+# `inv_goldilocks_hint` guest wrapper; `math`'s `sim-inv-hint` feature forwards
+# to this one on riscv64 and swaps `GoldilocksField::inv` to call it (verifying
+# the returned hint in-circuit). Off by default so a normal build is unaffected.
+sim-inv-hint = []
+
 [dependencies]
 embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }

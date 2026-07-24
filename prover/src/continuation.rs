@@ -64,13 +64,19 @@ use stark::trace::TraceTable;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::{StatementKind, absorb_continuation_global_statement, absorb_statement};
+use crate::statement::{
+    StatementKind, absorb_continuation_global_statement_with_digest, absorb_statement_with_digest,
+};
 use crate::tables::local_to_global::{self, CellBoundary};
 use crate::tables::page::{self, PageConfig};
 use crate::tables::register;
 use crate::tables::trace_builder::{Traces, build_init_page_data, build_initial_image_paged};
 use crate::tables::types::{GoldilocksExtension, GoldilocksField};
 use crate::tables::{MaxRowsConfig, global_memory};
+use crate::test_utils::{
+    create_fext_fma_air_forbidden, create_fext_load_air_forbidden, create_fext_page_air_forbidden,
+    create_fext_store_air_forbidden,
+};
 use crate::{
     Error, FIXED_TABLE_COUNT, RuntimePageRange, TableCounts, VmAirs,
     compute_expected_commit_bus_balance_view, verify_l2g_commitment_binding_view,
@@ -85,7 +91,7 @@ type AirRef<'a> = &'a dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>;
 /// bus-balance replay all seed via this so their challenges match; the seeding
 /// pins each epoch proof to its program and position (replay protection).
 fn epoch_transcript(
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     public_output: &[u8],
     table_counts: &TableCounts,
     runtime_page_ranges: &[RuntimePageRange],
@@ -93,10 +99,10 @@ fn epoch_transcript(
     fri_final_poly_log_degree: u8,
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
         StatementKind::ContinuationEpoch { epoch_label },
-        elf_bytes,
+        elf_digest,
         public_output,
         table_counts,
         // Continuation epochs skip PAGE (the L2G bookend replaces it), so they never
@@ -111,16 +117,16 @@ fn epoch_transcript(
 /// Fresh transcript seeded with the global proof's statement (ELF + epoch count).
 /// `prove_global` and `verify_global` both seed via this so their challenges match.
 fn global_transcript(
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     num_epochs: usize,
     num_private_input_pages: usize,
     fri_final_poly_log_degree: u8,
     touched_page_bases: &[u64],
 ) -> DefaultTranscript<E> {
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_continuation_global_statement(
+    absorb_continuation_global_statement_with_digest(
         &mut transcript,
-        elf_bytes,
+        elf_digest,
         num_epochs,
         num_private_input_pages,
         fri_final_poly_log_degree,
@@ -322,6 +328,35 @@ fn global_memory_configs_classify_only(
         .collect()
 }
 
+/// [`global_memory_configs_classify_only`] without the ELF — the v2
+/// (`attest-commitment-id`) continuation path, where the verifier never parses
+/// the ELF. A touched page is ELF-data iff a genesis commitment was supplied for
+/// it: `continuation_precomputed_commitments` produces exactly one root per
+/// touched non-private data page, so the supplied key set is precisely the
+/// `elf_page_has_data`-true set. Private-input pages are identified by range;
+/// everything else is zero-init. The classification is therefore identical to
+/// `global_memory_configs_classify_only`'s over the honest ELF, so the rebuilt
+/// AIRs match the committed trace; a mismatched supplied set is caught by the
+/// GlobalMemory-bus imbalance / preprocessed-root openings.
+fn global_memory_configs_classify_from_commitments(
+    page_bases: &[u64],
+    num_private_input_pages: usize,
+    supplied: &HashMap<u64, Commitment>,
+) -> Vec<PageConfig> {
+    page_bases
+        .iter()
+        .map(|&page_base| {
+            if page::is_private_input_page(page_base, num_private_input_pages) {
+                PageConfig::with_private_input(page_base, Vec::new())
+            } else if supplied.contains_key(&page_base) {
+                PageConfig::with_data(page_base, Vec::new())
+            } else {
+                PageConfig::zero_init(page_base)
+            }
+        })
+        .collect()
+}
+
 /// Whether any ELF segment overlaps the byte range `[page_base, page_base + DEFAULT_PAGE_SIZE)`.
 /// `elf.data` is small (a handful of `PT_LOAD` segments) and sorted by `base_addr`, so this
 /// is cheap without needing a full byte-level image.
@@ -390,7 +425,7 @@ struct EpochStart<'a> {
 /// Note: continuation epochs use the L2G memory bookend, so PAGE is skipped and the
 /// per-epoch page config set is empty — the verifier builds the AIRs with no PAGE
 /// tables rather than trusting any prover-supplied page config.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 struct EpochProof {
     /// The epoch's STARK proof (its tables + the epoch-local L2G sub-table last).
     proof: MultiProof<F, E, ()>,
@@ -427,7 +462,7 @@ struct EpochProof {
 ///
 /// `verify_continuation` checks this using only the bundle and the ELF. It derives
 /// rkyv, so it round-trips exactly like a monolithic `VmProof`.
-#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct ContinuationProof {
     epochs: Vec<EpochProof>,
     global: MultiProof<F, E, ()>,
@@ -608,7 +643,7 @@ fn build_epoch_airs(
         register::compute_precomputed_commitment_with_fini(opts, register_init, reg_fini),
         register::NUM_PREPROCESSED_COLS_WITH_FINI,
     ));
-    VmAirs::new(
+    let mut airs = VmAirs::new(
         elf,
         opts,
         false,
@@ -619,7 +654,17 @@ fn build_epoch_airs(
         None,
         None,
         register_preprocessed,
-    )
+    );
+    // Continuation disallows the FEXT accelerator: field-storage is not carried
+    // across epochs, so a value written in one epoch would read back as zero in
+    // the next. Force the four FEXT tables empty (μ = 0) at the AIR level so the
+    // *verifier* rejects any continuation proof that uses them — the prover-side
+    // guard in `build_traces` does not bind a malicious prover.
+    airs.fext_load = Box::new(create_fext_load_air_forbidden(opts));
+    airs.fext_fma = Box::new(create_fext_fma_air_forbidden(opts));
+    airs.fext_store = Box::new(create_fext_store_air_forbidden(opts));
+    airs.fext_page = Box::new(create_fext_page_air_forbidden(opts));
+    airs
 }
 
 /// Prove one epoch (prove half only). Commits its local-to-global table (built from
@@ -671,9 +716,10 @@ fn prove_epoch(
     );
 
     let label = start.label;
+    let elf_digest = crate::statement::elf_digest(elf_bytes);
     let seed = || {
         epoch_transcript(
-            elf_bytes,
+            &elf_digest,
             &public_output,
             &table_counts,
             &runtime_page_ranges,
@@ -731,7 +777,7 @@ fn prove_epoch(
 #[allow(clippy::too_many_arguments)]
 fn verify_epoch(
     elf: &Elf,
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
     epoch: EpochProofView<'_>,
     register_init: &[u32],
     is_final: bool,
@@ -779,7 +825,7 @@ fn verify_epoch(
 
     let seed = || {
         epoch_transcript(
-            elf_bytes,
+            elf_digest,
             public_output,
             &table_counts,
             &runtime_page_ranges,
@@ -881,7 +927,7 @@ fn prove_global(
     Prover::multi_prove(
         pairs,
         &mut global_transcript(
-            elf_bytes,
+            &crate::statement::elf_digest(elf_bytes),
             boundaries.len(),
             num_private_input_pages,
             opts.fri_final_poly_log_degree,
@@ -899,7 +945,8 @@ fn verify_global(
     page_bases: &[u64],
     proof: MultiProofView<'_, F, E, ()>,
     elf: &Elf,
-    elf_bytes: &[u8],
+    elf_digest: &[u8; 32],
+    classify_from_commitments: bool,
     num_private_input_pages: usize,
     opts: &ProofOptions,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
@@ -909,30 +956,40 @@ fn verify_global(
     let l2g_airs: Vec<_> = (0..num_epochs)
         .map(|i| l2g_global_air(opts, local_to_global::epoch_label(i as u64)))
         .collect();
-    // Rebuild the genesis configs FROM THE ELF (no private bytes) and recompute their
-    // commitments: this is the binding for ELF/runtime pages — a prover that claimed
-    // different genesis values would commit a different root and fail to verify.
-    // Private-input pages (the first `num_private_input_pages` from
-    // PRIVATE_INPUT_START_INDEX) are built non-preprocessed, so the verifier never
-    // recomputes their genesis from the ELF; the GlobalMemory bus enforces them. A
-    // wrong `num_private_input_pages` flips a touched page's preprocessed mode, so the
-    // rebuilt AIR no longer matches the committed trace and `multi_verify` rejects.
+    // Keyed by raw page_base, same as the monolithic path's `page_commitments`
+    // lookup (`lib.rs`).
+    let supplied: HashMap<u64, Commitment> = page_genesis_commitments
+        .map(|s| s.iter().copied().collect())
+        .unwrap_or_default();
+    // Rebuild the genesis configs and recompute their commitments: this is the
+    // binding for ELF/runtime pages — a prover that claimed different genesis
+    // values would commit a different root and fail to verify. Private-input pages
+    // (the first `num_private_input_pages` from PRIVATE_INPUT_START_INDEX) are built
+    // non-preprocessed, so the verifier never recomputes their genesis; the
+    // GlobalMemory bus enforces them. A wrong `num_private_input_pages` flips a
+    // touched page's preprocessed mode, so the rebuilt AIR no longer matches the
+    // committed trace and `multi_verify` rejects.
     //
     // `page_genesis_commitments` (the recursion guest's supplied roots) skips the
     // per-data-page recompute; a supplied root shifts the genesis binding to the
     // attestation fold + consumer recompute, exactly like the monolithic guest's
     // `page_commitments`. Zero-init pages always share one commitment, computed
     // once here rather than per touched page.
-    let gm_configs = if page_genesis_commitments.is_some() {
+    //
+    // `classify_from_commitments` (the v2 `attest-commitment-id` path) has no ELF
+    // to inspect, so it classifies ELF-data pages by supplied-commitment membership
+    // — identical output to `classify_only` over the honest ELF (see that fn).
+    let gm_configs = if classify_from_commitments {
+        global_memory_configs_classify_from_commitments(
+            page_bases,
+            num_private_input_pages,
+            &supplied,
+        )
+    } else if page_genesis_commitments.is_some() {
         global_memory_configs_classify_only(page_bases, elf, num_private_input_pages)
     } else {
         global_memory_configs(page_bases, elf, num_private_input_pages)
     };
-    // Keyed by raw page_base, same as the monolithic path's `page_commitments`
-    // lookup (`lib.rs`).
-    let supplied: HashMap<u64, Commitment> = page_genesis_commitments
-        .map(|s| s.iter().copied().collect())
-        .unwrap_or_default();
     // A missing entry here would leave `global_memory_air` to recompute over the
     // classify-only (empty) `init_values`, yielding the zero-init root instead of
     // the real genesis — an honest proof would then fail `multi_verify`, but
@@ -969,7 +1026,7 @@ fn verify_global(
         &refs,
         proof,
         &mut global_transcript(
-            elf_bytes,
+            elf_digest,
             num_epochs,
             num_private_input_pages,
             opts.fri_final_poly_log_degree,
@@ -992,6 +1049,81 @@ fn verify_global(
 /// final epoch keeps its remainder and its HALT, so its padding chain is anchored as
 /// usual. A program that fits in one epoch runs as a single final (monolithic-style)
 /// epoch.
+///
+/// MEASUREMENT-ONLY (parameter sweep): build the per-table chunk caps from env so a
+/// sweep can vary chunking at runtime without a rebuild. `RECURSION_MAXROWS_ALL_LOG2=N`
+/// sets every cap to `2^N`; `RECURSION_MAXROWS_<FIELD>_LOG2=N` overrides one field
+/// (FIELD in CPU, MEMW, MEMW_A, DVRM, MUL, LT, SHIFT, LOAD, BRANCH, MEMW_R, EQ,
+/// BYTEWISE, STORE, CPU32). Unset => the production `MaxRowsConfig::default()`.
+fn max_rows_from_env() -> MaxRowsConfig {
+    let mut c = MaxRowsConfig::default();
+    let getlog2 = |k: &str| -> Option<usize> {
+        std::env::var(k)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .map(|n| 1usize << n)
+    };
+    if let Some(v) = getlog2("RECURSION_MAXROWS_ALL_LOG2") {
+        c.cpu = v;
+        c.memw = v;
+        c.memw_aligned = v;
+        c.dvrm = v;
+        c.mul = v;
+        c.lt = v;
+        c.shift = v;
+        c.load = v;
+        c.branch = v;
+        c.memw_register = v;
+        c.eq = v;
+        c.bytewise = v;
+        c.store = v;
+        c.cpu32 = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_CPU_LOG2") {
+        c.cpu = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_MEMW_LOG2") {
+        c.memw = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_MEMW_A_LOG2") {
+        c.memw_aligned = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_DVRM_LOG2") {
+        c.dvrm = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_MUL_LOG2") {
+        c.mul = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_LT_LOG2") {
+        c.lt = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_SHIFT_LOG2") {
+        c.shift = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_LOAD_LOG2") {
+        c.load = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_BRANCH_LOG2") {
+        c.branch = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_MEMW_R_LOG2") {
+        c.memw_register = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_EQ_LOG2") {
+        c.eq = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_BYTEWISE_LOG2") {
+        c.bytewise = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_STORE_LOG2") {
+        c.store = v;
+    }
+    if let Some(v) = getlog2("RECURSION_MAXROWS_CPU32_LOG2") {
+        c.cpu32 = v;
+    }
+    c
+}
+
 pub fn prove_continuation(
     elf_bytes: &[u8],
     private_inputs: &[u8],
@@ -1084,7 +1216,7 @@ pub fn prove_continuation(
             &image,
             &register_init,
             &logs,
-            &MaxRowsConfig::default(),
+            &max_rows_from_env(),
             private_inputs,
             is_final,
             true,
@@ -1182,6 +1314,7 @@ pub fn verify_continuation_with_roots(
     let result = verify_continuation_view(
         ContinuationProofView::Owned(bundle),
         elf_bytes,
+        None,
         opts,
         decode_commitment,
         page_genesis_commitments,
@@ -1207,10 +1340,36 @@ pub(crate) fn verify_continuation_archived(
     verify_continuation_view(
         ContinuationProofView::Archived(archived),
         elf_bytes,
+        None,
         opts,
         Some(decode_commitment),
         Some(page_genesis_commitments),
     )
+}
+
+/// [`verify_continuation_archived`] for the v2 (`attest-commitment-id`) guest:
+/// the entry point and full-ELF digest are supplied (no in-VM ELF parse or
+/// hash), and the touched-page classification is derived from the supplied
+/// genesis commitments. Returns the public output (the `entry_point` is already
+/// known to the caller, so it is dropped here). `Ok(None)` if the bundle did not
+/// verify.
+pub(crate) fn verify_continuation_archived_v2(
+    archived: &ArchivedContinuationProof,
+    entry_point: u64,
+    elf_digest: [u8; 32],
+    opts: &ProofOptions,
+    decode_commitment: Commitment,
+    page_genesis_commitments: &[(u64, Commitment)],
+) -> Result<Option<Vec<u8>>, Error> {
+    let result = verify_continuation_view(
+        ContinuationProofView::Archived(archived),
+        &[],
+        Some((entry_point, elf_digest)),
+        opts,
+        Some(decode_commitment),
+        Some(page_genesis_commitments),
+    )?;
+    Ok(result.map(|(public_output, _entry_point)| public_output))
 }
 
 /// Shared implementation behind [`verify_continuation_with_roots`] (owned) and
@@ -1221,6 +1380,7 @@ pub(crate) fn verify_continuation_archived(
 fn verify_continuation_view(
     bundle: ContinuationProofView<'_>,
     elf_bytes: &[u8],
+    supplied: Option<(u64, [u8; 32])>,
     opts: &ProofOptions,
     decode_commitment: Option<Commitment>,
     page_genesis_commitments: Option<&[(u64, Commitment)]>,
@@ -1238,7 +1398,26 @@ fn verify_continuation_view(
         )));
     }
 
-    let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    // v1 parses the inner ELF for the entry point + page classification and hashes
+    // it once for the statement absorbs. v2 (`attest-commitment-id`, `supplied` =
+    // Some) receives the entry point + digest directly and never touches the ELF —
+    // a minimal `Elf` carries only the entry point (used for epoch 0's REGISTER
+    // init), and pages are classified from the supplied genesis commitments.
+    let (elf, elf_digest, classify_from_commitments) = match supplied {
+        Some((entry_point, digest)) => (
+            Elf {
+                entry_point,
+                data: Vec::new(),
+            },
+            digest,
+            true,
+        ),
+        None => {
+            let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+            let digest = crate::statement::elf_digest(elf_bytes);
+            (elf, digest, false)
+        }
+    };
 
     let n = bundle.num_epochs();
     if n == 0 {
@@ -1270,7 +1449,7 @@ fn verify_continuation_view(
 
         if !verify_epoch(
             &elf,
-            elf_bytes,
+            &elf_digest,
             epoch,
             &register_init,
             is_final,
@@ -1334,7 +1513,8 @@ fn verify_continuation_view(
         &page_bases,
         global_proof,
         &elf,
-        elf_bytes,
+        &elf_digest,
+        classify_from_commitments,
         num_private_input_pages,
         opts,
         page_genesis_commitments,

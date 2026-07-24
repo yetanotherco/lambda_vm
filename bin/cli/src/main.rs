@@ -11,7 +11,7 @@ use clap::{Parser, Subcommand, ValueHint};
 #[global_allocator]
 static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 use executor::vm::instruction::decoding::Instruction;
-use executor::vm::instruction::execution::{Accelerator, SyscallNumbers};
+use executor::vm::instruction::execution::{Accelerator, SimHashEcall, SyscallNumbers};
 use executor::{elf::Elf, flamegraph::FlamegraphGenerator, vm::execution::Executor};
 use prover::VmProof;
 use stark::proof::options::GoldilocksCubicProofOptions;
@@ -147,6 +147,14 @@ enum Commands {
         /// data).
         #[arg(long)]
         cycles: bool,
+
+        /// MEASUREMENT-ONLY: write a per-PC instruction histogram (`<hexaddr>
+        /// <count>` lines) over the exact same execution. Host-side counting, so
+        /// it does not perturb the guest cycle count. Enrich each PC to
+        /// source+inline chain via `llvm-addr2line -f -i -C`. Uses the plain
+        /// streaming path (incompatible with --flamegraph).
+        #[arg(long, value_hint = ValueHint::FilePath, conflicts_with = "flamegraph")]
+        pc_histogram: Option<PathBuf>,
     },
 
     /// Generate a proof for an ELF program
@@ -243,6 +251,7 @@ fn main() -> ExitCode {
             flamegraph_checkpoint_cycles,
             cycle_budget,
             cycles,
+            pc_histogram,
         } => cmd_execute(
             elf,
             private_input,
@@ -253,6 +262,7 @@ fn main() -> ExitCode {
             },
             cycle_budget,
             cycles,
+            pc_histogram,
         ),
         Commands::Prove {
             elf,
@@ -377,12 +387,165 @@ fn accelerator_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<Ac
         .and_then(|s| s.accelerator())
 }
 
+/// Classifies one executed instruction as a field-native hash/transcript
+/// measurement ecall (EXPERIMENT 1). Same shape as [`accelerator_of`]; these
+/// stubs drive no chip, so they are counted here rather than as accelerators.
+fn sim_hash_ecall_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<SimHashEcall> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    SyscallNumbers::try_from(src1_val)
+        .ok()
+        .and_then(|s| s.sim_hash_ecall())
+}
+
+/// A DEEP reduced-opening MEASUREMENT stub ecall (Experiment 2). These are not
+/// accelerators (no chip, never proven), so they don't appear in
+/// [`accelerator_of`]; they are tallied separately so an execute-only ceiling
+/// run can report how many were swallowed alongside the (unchanged) keccak count.
+enum SimReducedOpening {
+    Row,
+    Query,
+    /// ROUND-2 increment C: per-row in-place ecall (replaces Level A `Row`).
+    RowInplace,
+    /// ROUND-2 increment C: once-per-proof layout registration.
+    RegisterLayout,
+}
+
+fn sim_reduced_opening_of(
+    instruction: Option<&Instruction>,
+    src1_val: u64,
+) -> Option<SimReducedOpening> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    match SyscallNumbers::try_from(src1_val).ok()? {
+        SyscallNumbers::ReducedOpeningRow => Some(SimReducedOpening::Row),
+        SyscallNumbers::ReducedOpeningQuery => Some(SimReducedOpening::Query),
+        SyscallNumbers::ReducedOpeningRowInplace => Some(SimReducedOpening::RowInplace),
+        SyscallNumbers::RegisterRoLayout => Some(SimReducedOpening::RegisterLayout),
+        _ => None,
+    }
+}
+
+/// Whether an executed instruction is the Goldilocks inverse HINT ecall
+/// (EXPERIMENT 5). Verified in-circuit by the guest, so it is sound (not a
+/// trusted passthrough) but still drives no chip; tallied separately.
+fn is_inv_hint(instruction: Option<&Instruction>, src1_val: u64) -> bool {
+    matches!(instruction, Some(Instruction::EcallEbreak))
+        && matches!(
+            SyscallNumbers::try_from(src1_val),
+            Ok(SyscallNumbers::InvGoldilocksHint)
+        )
+}
+
+/// Whether an executed instruction is the Fp3 inverse HINT ecall (EXPERIMENT 5).
+/// Same soundness/counting story as [`is_inv_hint`]; tallied separately so the
+/// base-field and extension-field hints can be read off independently.
+fn is_inv_fp3_hint(instruction: Option<&Instruction>, src1_val: u64) -> bool {
+    matches!(instruction, Some(Instruction::EcallEbreak))
+        && matches!(
+            SyscallNumbers::try_from(src1_val),
+            Ok(SyscallNumbers::InvFp3Hint)
+        )
+}
+
+/// Whether an executed instruction is the Merkle path-verify measurement stub
+/// (ROUND-2 increment A). Trusted-but-real (computes the actual accept/reject),
+/// drives no chip; tallied separately. Each call SUBSUMES the per-node HASH_PAIR
+/// ecalls of one verify path, so `sim_hash_pair` drops as this rises — report
+/// both so the hash-chip bill stays computable.
+fn is_verify_path(instruction: Option<&Instruction>, src1_val: u64) -> bool {
+    matches!(instruction, Some(Instruction::EcallEbreak))
+        && matches!(
+            SyscallNumbers::try_from(src1_val),
+            Ok(SyscallNumbers::VerifyPath)
+        )
+}
+
+/// The transcript challenge-sampling stub (ROUND-2 increment B) this instruction
+/// is, if any. Each folds one or more TRANSCRIPT_SAMPLE ecalls plus the ChaCha20
+/// expansion / rejection loop into a single call, so `transcript_sample` drops as
+/// these rise — report all three. Trusted-but-real; drives no chip.
+enum SimSample {
+    Felt,
+    U64,
+}
+
+fn sim_sample_of(instruction: Option<&Instruction>, src1_val: u64) -> Option<SimSample> {
+    if !matches!(instruction, Some(Instruction::EcallEbreak)) {
+        return None;
+    }
+    match SyscallNumbers::try_from(src1_val).ok()? {
+        SyscallNumbers::SampleFelt => Some(SimSample::Felt),
+        SyscallNumbers::SampleU64 => Some(SimSample::U64),
+        _ => None,
+    }
+}
+
+/// Whether an ECALL's `a7` value is one this CLI tallies (accelerator, sim-hash,
+/// or reduced-opening stub). Cheap `src1_val`-only prefilter for candidate
+/// collection; the `*_of` classifiers confirm the instruction afterward.
+fn is_counted_syscall(src1_val: u64) -> bool {
+    SyscallNumbers::try_from(src1_val)
+        .map(|s| {
+            s.accelerator().is_some()
+                || s.sim_hash_ecall().is_some()
+                || matches!(
+                    s,
+                    SyscallNumbers::ReducedOpeningRow
+                        | SyscallNumbers::ReducedOpeningQuery
+                        | SyscallNumbers::InvGoldilocksHint
+                        | SyscallNumbers::InvFp3Hint
+                        | SyscallNumbers::VerifyPath
+                        | SyscallNumbers::SampleFelt
+                        | SyscallNumbers::SampleU64
+                        | SyscallNumbers::ReducedOpeningRowInplace
+                        | SyscallNumbers::RegisterRoLayout
+                )
+        })
+        .unwrap_or(false)
+}
+
+/// Per-ecall invocation tallies printed under `--cycles`. Keccak/ECSM are real
+/// accelerator chips; the `sim_*` fields are EXPERIMENT 1 (hash/transcript) and
+/// the `reduced_opening_*` fields are EXPERIMENT 2 measurement stubs, each
+/// counted separately so the optimistic-ceiling score can be recomputed under
+/// different chip-cost assumptions.
+#[derive(Default, Clone, Copy)]
+struct EcallCounts {
+    keccak: u64,
+    ecsm: u64,
+    // Real FEXT (Fp3) accelerator chips (PR #818/#831): proven, unlike the sim
+    // stubs below.
+    fext_load: u64,
+    fext_fma: u64,
+    fext_store: u64,
+    fext_base_mul: u64,
+    fext_inv: u64,
+    sim_absorb_felts: u64,
+    sim_absorb_bytes: u64,
+    sim_transcript_sample: u64,
+    sim_hash_pair: u64,
+    sim_hash_felts: u64,
+    reduced_opening_row: u64,
+    reduced_opening_query: u64,
+    inv_goldilocks_hint: u64,
+    inv_fp3_hint: u64,
+    verify_path: u64,
+    sample_felt: u64,
+    sample_u64: u64,
+    reduced_opening_row_inplace: u64,
+    register_ro_layout: u64,
+}
+
 fn cmd_execute(
     elf_path: PathBuf,
     private_input_path: Option<PathBuf>,
     flamegraph: FlamegraphCliOptions,
     cycle_budget: Option<u64>,
     cycles: bool,
+    pc_histogram: Option<PathBuf>,
 ) -> ExitCode {
     let elf_data = match std::fs::read(&elf_path) {
         Ok(data) => data,
@@ -408,11 +571,13 @@ fn cmd_execute(
         }
     };
 
-    // Accelerator invocation counts, tallied only in the plain streaming path
-    // below (the flamegraph path drives execution inside the executor and does
-    // not expose per-log data). `None` means "not counted", so the accel lines
-    // are omitted rather than printed as misleading zeros.
-    let mut accel_counts: Option<(u64, u64)> = None;
+    // Ecall invocation counts (keccak, ecsm, the FEXT accelerator chips, the five
+    // EXPERIMENT 1 sim-hash stubs, and the two EXPERIMENT 2 reduced-opening
+    // stubs), tallied only in the plain streaming path below (the flamegraph path
+    // drives execution inside the executor and does not expose per-log data).
+    // `None` means "not counted", so the ecall lines are omitted rather than
+    // printed as misleading zeros.
+    let mut ecall_counts: Option<EcallCounts> = None;
 
     let cycle_count = if let Some(ref output_path) = flamegraph.path {
         // Shared execute+flamegraph path (executor::flamegraph) instead of
@@ -478,14 +643,20 @@ fn cmd_execute(
         };
 
         let mut cycle_count: u64 = 0;
-        let mut keccak_calls: u64 = 0;
-        let mut ecsm_calls: u64 = 0;
-        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches an
-        // accelerator syscall number. This is a cheap superset — a non-ECALL
-        // instruction can hold the same value in src1 — that `accelerator_of`
-        // confirms below, once the chunk's `&Log` borrow (tied to the executor's
-        // `&mut`) is released so the instruction cache can be read again.
-        let mut accel_candidates: Vec<(u64, u64)> = Vec::new();
+        let mut counts = EcallCounts::default();
+        // MEASUREMENT-ONLY: per-PC instruction histogram over the exact same
+        // execution (host-side; does not perturb the guest). Inlining-immune
+        // attribution: enrich each PC's inline chain via addr2line offline.
+        let mut pc_hist: Option<std::collections::HashMap<u64, u64>> = pc_histogram
+            .as_ref()
+            .map(|_| std::collections::HashMap::new());
+        // Reused per chunk: `(current_pc, a7)` for logs whose a7 matches a
+        // counted syscall number (accelerator or either experiment's sim stub).
+        // This is a cheap superset — a non-ECALL instruction can hold the same
+        // value in src1 — that the `*_of` classifiers confirm below, once the
+        // chunk's `&Log` borrow (tied to the executor's `&mut`) is released so
+        // the instruction cache can be read again.
+        let mut ecall_candidates: Vec<(u64, u64)> = Vec::new();
         loop {
             let logs = match executor.resume_budgeted(cycle_count, cycle_budget) {
                 Ok(logs) => logs,
@@ -496,22 +667,59 @@ fn cmd_execute(
             };
             let Some(logs) = logs else { break };
             cycle_count += logs.len() as u64;
+            if let Some(hist) = pc_hist.as_mut() {
+                for log in logs {
+                    *hist.entry(log.current_pc).or_insert(0) += 1;
+                }
+            }
             if cycles {
                 for log in logs {
-                    if SyscallNumbers::try_from(log.src1_val)
-                        .map(|s| s.accelerator().is_some())
-                        .unwrap_or(false)
-                    {
-                        accel_candidates.push((log.current_pc, log.src1_val));
+                    if is_counted_syscall(log.src1_val) {
+                        ecall_candidates.push((log.current_pc, log.src1_val));
                     }
                 }
             }
             // `logs` is no longer used, so the executor's `&mut` borrow is free
             // and the instruction cache can be read to confirm each candidate.
-            for (pc, a7) in accel_candidates.drain(..) {
-                match accelerator_of(executor.instructions.get(pc), a7) {
-                    Some(Accelerator::Keccak) => keccak_calls += 1,
-                    Some(Accelerator::Ecsm) => ecsm_calls += 1,
+            for (pc, a7) in ecall_candidates.drain(..) {
+                let instr = executor.instructions.get(pc);
+                match accelerator_of(instr, a7) {
+                    Some(Accelerator::Keccak) => counts.keccak += 1,
+                    Some(Accelerator::Ecsm) => counts.ecsm += 1,
+                    Some(Accelerator::FextLoad) => counts.fext_load += 1,
+                    Some(Accelerator::FextFma) => counts.fext_fma += 1,
+                    Some(Accelerator::FextStore) => counts.fext_store += 1,
+                    Some(Accelerator::FextBaseMul) => counts.fext_base_mul += 1,
+                    Some(Accelerator::FextInv) => counts.fext_inv += 1,
+                    None => {}
+                }
+                match sim_hash_ecall_of(instr, a7) {
+                    Some(SimHashEcall::AbsorbFelts) => counts.sim_absorb_felts += 1,
+                    Some(SimHashEcall::AbsorbBytes) => counts.sim_absorb_bytes += 1,
+                    Some(SimHashEcall::TranscriptSample) => counts.sim_transcript_sample += 1,
+                    Some(SimHashEcall::HashPair) => counts.sim_hash_pair += 1,
+                    Some(SimHashEcall::HashFelts) => counts.sim_hash_felts += 1,
+                    None => {}
+                }
+                match sim_reduced_opening_of(instr, a7) {
+                    Some(SimReducedOpening::Row) => counts.reduced_opening_row += 1,
+                    Some(SimReducedOpening::Query) => counts.reduced_opening_query += 1,
+                    Some(SimReducedOpening::RowInplace) => counts.reduced_opening_row_inplace += 1,
+                    Some(SimReducedOpening::RegisterLayout) => counts.register_ro_layout += 1,
+                    None => {}
+                }
+                if is_inv_hint(instr, a7) {
+                    counts.inv_goldilocks_hint += 1;
+                }
+                if is_inv_fp3_hint(instr, a7) {
+                    counts.inv_fp3_hint += 1;
+                }
+                if is_verify_path(instr, a7) {
+                    counts.verify_path += 1;
+                }
+                match sim_sample_of(instr, a7) {
+                    Some(SimSample::Felt) => counts.sample_felt += 1,
+                    Some(SimSample::U64) => counts.sample_u64 += 1,
                     None => {}
                 }
             }
@@ -525,17 +733,95 @@ fn cmd_execute(
             return ExitCode::FAILURE;
         }
 
+        if let (Some(hist), Some(path)) = (pc_hist, pc_histogram.as_ref()) {
+            let mut entries: Vec<(u64, u64)> = hist.into_iter().collect();
+            entries.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            let mut out = String::new();
+            for (pc, cnt) in entries {
+                out.push_str(&format!("0x{pc:x} {cnt}\n"));
+            }
+            if let Err(e) = std::fs::write(path, out) {
+                eprintln!("Failed to write pc-histogram: {e}");
+                return ExitCode::FAILURE;
+            }
+            eprintln!("PC histogram written to {:?}", path);
+        }
+
         if cycles {
-            accel_counts = Some((keccak_calls, ecsm_calls));
+            ecall_counts = Some(counts);
         }
         cycle_count
     };
 
     if cycles {
         println!("Cycles: {}", cycle_count);
-        if let Some((keccak_calls, ecsm_calls)) = accel_counts {
-            println!("Keccak calls: {}", keccak_calls);
-            println!("Ecsm calls: {}", ecsm_calls);
+        if let Some(c) = ecall_counts {
+            println!("Keccak calls: {}", c.keccak);
+            println!("Ecsm calls: {}", c.ecsm);
+            // FEXT accelerator chips (real, proven). Only surface a line when the
+            // build actually fired it, so ordinary runs keep their compact report.
+            if c.fext_load > 0 {
+                println!("Fext load calls: {}", c.fext_load);
+            }
+            if c.fext_fma > 0 {
+                println!("Fext fma calls: {}", c.fext_fma);
+            }
+            if c.fext_store > 0 {
+                println!("Fext store calls: {}", c.fext_store);
+            }
+            if c.fext_base_mul > 0 {
+                println!("Fext base-mul calls: {}", c.fext_base_mul);
+            }
+            if c.fext_inv > 0 {
+                println!("Fext inv calls: {}", c.fext_inv);
+            }
+            // Only surface a stub line when that build actually fired it, so
+            // ordinary runs keep their two-line accelerator report.
+            if c.sim_absorb_felts > 0 {
+                println!("Sim absorb_felts calls: {}", c.sim_absorb_felts);
+            }
+            if c.sim_absorb_bytes > 0 {
+                println!("Sim absorb_bytes calls: {}", c.sim_absorb_bytes);
+            }
+            if c.sim_transcript_sample > 0 {
+                println!("Sim transcript_sample calls: {}", c.sim_transcript_sample);
+            }
+            if c.sim_hash_pair > 0 {
+                println!("Sim hash_pair calls: {}", c.sim_hash_pair);
+            }
+            if c.sim_hash_felts > 0 {
+                println!("Sim hash_felts calls: {}", c.sim_hash_felts);
+            }
+            if c.reduced_opening_row > 0 {
+                println!("Reduced-opening row calls: {}", c.reduced_opening_row);
+            }
+            if c.reduced_opening_query > 0 {
+                println!("Reduced-opening query calls: {}", c.reduced_opening_query);
+            }
+            if c.inv_fp3_hint > 0 {
+                println!("Fp3 inverse-hint calls: {}", c.inv_fp3_hint);
+            }
+            if c.inv_goldilocks_hint > 0 {
+                println!("Inverse-hint calls: {}", c.inv_goldilocks_hint);
+            }
+            if c.verify_path > 0 {
+                println!("Verify-path calls: {}", c.verify_path);
+            }
+            if c.sample_felt > 0 {
+                println!("Sample-felt calls: {}", c.sample_felt);
+            }
+            if c.sample_u64 > 0 {
+                println!("Sample-u64 calls: {}", c.sample_u64);
+            }
+            if c.register_ro_layout > 0 {
+                println!("Register-ro-layout calls: {}", c.register_ro_layout);
+            }
+            if c.reduced_opening_row_inplace > 0 {
+                println!(
+                    "Reduced-opening row-inplace calls: {}",
+                    c.reduced_opening_row_inplace
+                );
+            }
         }
     }
 
