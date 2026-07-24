@@ -381,6 +381,18 @@ struct EpochStart<'a> {
     label: u64,
 }
 
+/// One epoch's proving inputs, fully derived from execution (register init,
+/// traces, boundary — no dependency on any previous epoch's *proof*), so the
+/// preparation of epoch i+1 can run on a producer thread while epoch i proves.
+struct PreparedEpoch {
+    index: u64,
+    register_init: Vec<u32>,
+    label: u64,
+    traces: Traces,
+    boundary: Vec<CellBoundary>,
+    is_final: bool,
+}
+
 /// One epoch's proof plus everything a standalone verifier needs to re-check it
 /// using ONLY the bundle (never the prover's in-memory traces). Each field is a
 /// public value the verifier re-binds: a wrong value either makes the proof's
@@ -635,6 +647,7 @@ fn prove_epoch(
     is_final: bool,
     boundary: &[CellBoundary],
     opts: &ProofOptions,
+    decode_commitment: Commitment,
 ) -> Result<EpochProof, Error> {
     // Count this L2G table's range-check lookups into the BITWISE table so its
     // AreBytes/IsHalfword multiplicities balance the range-check senders.
@@ -667,7 +680,10 @@ fn prove_epoch(
         start.register_init,
         &reg_fini,
         is_final,
-        None,
+        // Computed once per prove_continuation — the DECODE commitment is a
+        // function of (ELF, opts) only, identical for every epoch; passing
+        // None here would rebuild the whole DECODE trace+LDE+tree per epoch.
+        Some(decode_commitment),
     );
 
     let label = start.label;
@@ -1017,6 +1033,10 @@ pub fn prove_continuation(
     let elf = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let mut executor = Executor::new(&elf, private_inputs.to_vec())
         .map_err(|e| Error::Execution(format!("{e}")))?;
+    // The DECODE precomputed commitment depends only on (ELF, opts): compute
+    // it once here instead of once per epoch inside `build_epoch_airs`.
+    let decode_commitment = crate::tables::decode::commitment_from_elf(&elf, opts)
+        .map_err(|e| Error::Recursion(format!("DECODE commitment from ELF: {e}")))?;
 
     // The cross-epoch memory image, carried forward: epoch i+1's init is epoch i's
     // fini, updated in place with each epoch's touched-cell final values.
@@ -1031,112 +1051,235 @@ pub fn prove_continuation(
     // holds cell values (private-input bytes for private reads); only the value-free
     // page-base set is shipped (see `touched_page_bases`).
     let mut all_boundaries: Vec<Vec<CellBoundary>> = Vec::new();
-    // The previous epoch's bound final register file R_{i+1}; epoch i+1's init is
-    // derived from it (the cross-epoch register binding).
-    let mut prev_fini: Option<Vec<u32>> = None;
 
-    let mut index: u64 = 0;
-    loop {
-        if executor.pc() == 0 {
-            break;
+    // Two-stage epoch pipeline: a producer thread prepares epoch i+1 (execute +
+    // trace build + boundary — all pure execution artifacts) while this thread
+    // proves epoch i. Everything the next epoch's preparation needs is derived
+    // from execution, not from proofs: `register_init` comes from the previous
+    // epoch's REGISTER trace (`fini_from_trace`, the same value `prove_epoch`
+    // binds), and the memory image update comes from the boundary. Proof bytes
+    // are unchanged — only the schedule is.
+    //
+    // The bounded channel caps peak memory: at most `workers` epochs proving,
+    // one queued, one being built.
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Result<PreparedEpoch, Error>>(1);
+    // Shared prover-pool state; declared outside the scope so scoped threads
+    // can borrow it.
+    //
+    // Default 3: measured on ethrex-10tx / RTX 5090 32 GB (8×8 interleaved
+    // runs), 3 concurrent epoch proves beat 2 by ~4% (14.9s vs 15.5s) at
+    // ~15 GB peak VRAM. On smaller cards (< 32 GB) set
+    // LAMBDA_VM_EPOCH_CONCURRENCY=2 — each concurrent 2^20-cycle epoch prove
+    // peaks at ~9 GB and the device-only GPU paths abort hard on VRAM
+    // exhaustion rather than degrade.
+    let workers = std::env::var("LAMBDA_VM_EPOCH_CONCURRENCY")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k >= 1)
+        .unwrap_or(3);
+    let rx = std::sync::Mutex::new(rx);
+    type EpochResult = (u64, EpochProof, Vec<CellBoundary>);
+    let results: std::sync::Mutex<Vec<EpochResult>> = std::sync::Mutex::new(Vec::new());
+    let first_err: std::sync::Mutex<Option<Error>> = std::sync::Mutex::new(None);
+    let prove_worker = |_worker: usize| {
+        loop {
+            // Take the next prepared epoch (lock released before proving).
+            let msg = { rx.lock().unwrap().recv() };
+            let prepared = match msg {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) => {
+                    first_err.lock().unwrap().get_or_insert(e);
+                    return;
+                }
+                Err(_) => return, // channel closed: no more epochs
+            };
+            if first_err.lock().unwrap().is_some() {
+                return; // another worker failed; stop consuming
+            }
+            // Per-epoch identity on Nsight timelines; overlap across workers
+            // is visible there. The instruments span gives per-instance wall.
+            #[cfg(feature = "nvtx")]
+            let __epoch_nvtx =
+                stark::instruments::nvtx_range_fmt(|| format!("epoch[i={}]", prepared.index));
+            #[cfg(feature = "instruments")]
+            let __sp = stark::instruments::span("epoch_prove");
+            let start = EpochStart {
+                register_init: &prepared.register_init,
+                label: prepared.label,
+            };
+            match prove_epoch(
+                &elf,
+                elf_bytes,
+                &start,
+                prepared.traces,
+                prepared.is_final,
+                &prepared.boundary,
+                opts,
+                decode_commitment,
+            ) {
+                Ok(epoch) => {
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    results
+                        .lock()
+                        .unwrap()
+                        .push((prepared.index, epoch, prepared.boundary))
+                }
+                Err(e) => {
+                    first_err.lock().unwrap().get_or_insert(e);
+                    return;
+                }
+            }
         }
-        // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 - init_epoch`)
-        // only spans `local_to_global::MAX_EPOCHS` epochs. Beyond that the IsB20 bus
-        // cannot balance, so an honest proof is impossible — fail fast with a clear
-        // error instead of building an unprovable trace. The verifier already
-        // rejects any such proof; this is a prover-side guard for a clean message.
-        if index >= local_to_global::MAX_EPOCHS {
-            return Err(Error::InvalidContinuationEpochSize(format!(
-                "execution needs more than {} continuation epochs (the IsB20 cross-epoch \
-                 ordering range); use a larger epoch size",
-                local_to_global::MAX_EPOCHS
-            )));
+    };
+    std::thread::scope(|scope| -> Result<(), Error> {
+        let elf_ref = &elf;
+        let producer = scope.spawn(move || {
+            let mut prepare_all = || -> Result<(), Error> {
+                let mut prev_fini: Option<Vec<u32>> = None;
+                let mut index: u64 = 0;
+                loop {
+                    if executor.pc() == 0 {
+                        return Ok(());
+                    }
+                    // The cross-epoch ordering check (IsB20 on `fini_epoch - 1 -
+                    // init_epoch`) only spans `local_to_global::MAX_EPOCHS` epochs.
+                    // Beyond that the IsB20 bus cannot balance, so an honest proof
+                    // is impossible — fail fast with a clear error instead of
+                    // building an unprovable trace.
+                    if index >= local_to_global::MAX_EPOCHS {
+                        return Err(Error::InvalidContinuationEpochSize(format!(
+                            "execution needs more than {} continuation epochs (the IsB20 \
+                             cross-epoch ordering range); use a larger epoch size",
+                            local_to_global::MAX_EPOCHS
+                        )));
+                    }
+                    let register_init: Vec<u32> = match (index, prev_fini.take()) {
+                        (0, _) => register::register_init_from_entry_point(elf_ref.entry_point),
+                        // Epoch i+1's init is epoch i's bound fini, reused directly
+                        // (same `register_word_address_list` order) — the cross-epoch
+                        // register binding.
+                        (_, Some(fini)) => fini,
+                        (_, None) => {
+                            return Err(Error::ContinuationInvariant(
+                                "previous epoch final registers are missing after the first epoch"
+                                    .to_string(),
+                            ));
+                        }
+                    };
+
+                    // Run one epoch; `logs` is this epoch's chunk only (the executor
+                    // clears it).
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_execute");
+                    let logs = match executor
+                        .resume_with_limit(epoch_size)
+                        .map_err(|e| Error::Execution(format!("{e}")))?
+                    {
+                        Some(logs) => logs.to_vec(),
+                        None => return Ok(()),
+                    };
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    let is_final = executor.pc() == 0;
+
+                    // Invariant: a non-final epoch ran the full `epoch_size` (a power
+                    // of two), so its CPU table has no padding rows.
+                    if !is_final && logs.len() != epoch_size {
+                        return Err(Error::ContinuationInvariant(format!(
+                            "intermediate epoch ran {} cycles, expected {epoch_size}",
+                            logs.len()
+                        )));
+                    }
+
+                    let label = local_to_global::epoch_label(index);
+                    #[cfg(feature = "instruments")]
+                    let __sp = stark::instruments::span("epoch_trace_build");
+                    let traces = Traces::from_image_and_logs(
+                        elf_ref,
+                        &image,
+                        &register_init,
+                        &logs,
+                        &MaxRowsConfig::default(),
+                        private_inputs,
+                        is_final,
+                        true,
+                        #[cfg(feature = "disk-spill")]
+                        stark::storage_mode::StorageMode::Ram,
+                    )?;
+                    let boundary = local_to_global::epoch_boundary(
+                        &mut provenance,
+                        label,
+                        &traces.touched_memory_cells,
+                    );
+
+                    // R_{i+1} from the committed REGISTER trace — the exact value
+                    // `prove_epoch` reads (`fini_from_trace`) and binds.
+                    prev_fini = Some(register::fini_from_trace(&traces.register));
+
+                    // Carry the image forward: this epoch's fini is the next
+                    // epoch's init.
+                    for cell in &boundary {
+                        image.set(cell.address, (cell.fini.value & 0xFF) as u8);
+                    }
+
+                    #[cfg(feature = "instruments")]
+                    drop(__sp);
+                    let prepared = PreparedEpoch {
+                        index,
+                        register_init,
+                        label,
+                        traces,
+                        boundary,
+                        is_final,
+                    };
+                    // A send error means the prover side hung up (its error is
+                    // already propagating) — stop preparing quietly.
+                    if tx.send(Ok(prepared)).is_err() || is_final {
+                        return Ok(());
+                    }
+                    index += 1;
+                }
+            };
+            if let Err(e) = prepare_all() {
+                // Surface preparation errors through the channel; if the prover
+                // side is already gone the error there wins.
+                let _ = tx.send(Err(e));
+            }
+        });
+
+        // Prove epochs concurrently. Epoch proofs are mutually independent —
+        // each is seeded by its own label-domain-separated transcript
+        // (`epoch_transcript`) and nothing in an epoch's proof feeds the next
+        // one (the execution chain lives entirely in the producer above) — so
+        // `workers` provers pull prepared epochs and prove in parallel.
+        // Results are re-ordered by epoch index before the bundle is
+        // assembled, so proof bytes are identical to the sequential schedule.
+        //
+        // Sizing: each concurrent epoch prove costs its own peak VRAM/heap
+        // (~9 GB VRAM per 2^20-cycle epoch measured on ethrex), so the
+        // default is a conservative 2; tune with LAMBDA_VM_EPOCH_CONCURRENCY.
+        let prover_handles: Vec<_> = (0..workers)
+            .map(|k| scope.spawn(move || prove_worker(k)))
+            .collect();
+        for h in prover_handles {
+            h.join().map_err(|_| {
+                Error::ContinuationInvariant("epoch prover thread panicked".to_string())
+            })?;
         }
-        // Per-epoch identity on Nsight timelines (dynamic NVTX name); the
-        // instruments spans below carry static labels and are told apart by
-        // instance order (phase_table.py reports them per instance).
-        #[cfg(feature = "nvtx")]
-        let __epoch_nvtx = stark::instruments::nvtx_range_fmt(|| format!("epoch[i={index}]"));
-        #[cfg(feature = "instruments")]
-        let __epoch = stark::instruments::span("epoch");
-
-        let register_init: Vec<u32> = if index == 0 {
-            register::register_init_from_entry_point(elf.entry_point)
-        } else {
-            // Epoch i+1's init is epoch i's bound fini, reused directly (same
-            // `register_word_address_list` order) — the cross-epoch register binding.
-            prev_fini.clone().ok_or_else(|| {
-                Error::ContinuationInvariant(
-                    "previous epoch final registers are missing after the first epoch".to_string(),
-                )
-            })?
-        };
-
-        // Run one epoch; `logs` is this epoch's chunk only (the executor clears it).
-        #[cfg(feature = "instruments")]
-        let __sp = stark::instruments::span("epoch_execute");
-        let logs = match executor
-            .resume_with_limit(epoch_size)
-            .map_err(|e| Error::Execution(format!("{e}")))?
-        {
-            Some(logs) => logs.to_vec(),
-            None => break,
-        };
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-        let is_final = executor.pc() == 0;
-
-        // Invariant: a non-final epoch ran the full `epoch_size` (a power of two),
-        // so its CPU table has no padding rows.
-        if !is_final && logs.len() != epoch_size {
-            return Err(Error::ContinuationInvariant(format!(
-                "intermediate epoch ran {} cycles, expected {epoch_size}",
-                logs.len()
-            )));
-        }
-
-        let label = local_to_global::epoch_label(index);
-        #[cfg(feature = "instruments")]
-        let __sp = stark::instruments::span("epoch_trace_build");
-        let traces = Traces::from_image_and_logs(
-            &elf,
-            &image,
-            &register_init,
-            &logs,
-            &MaxRowsConfig::default(),
-            private_inputs,
-            is_final,
-            true,
-            #[cfg(feature = "disk-spill")]
-            stark::storage_mode::StorageMode::Ram,
-        )?;
-        let boundary =
-            local_to_global::epoch_boundary(&mut provenance, label, &traces.touched_memory_cells);
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-
-        let start = EpochStart {
-            register_init: &register_init,
-            label,
-        };
-        #[cfg(feature = "instruments")]
-        let __sp = stark::instruments::span("epoch_prove");
-        let epoch = prove_epoch(&elf, elf_bytes, &start, traces, is_final, &boundary, opts)?;
-        #[cfg(feature = "instruments")]
-        drop(__sp);
-        prev_fini = Some(epoch.reg_fini.clone());
-
-        // Carry the image forward: this epoch's fini is the next epoch's init.
-        for cell in &boundary {
-            image.set(cell.address, (cell.fini.value & 0xFF) as u8);
-        }
+        producer.join().map_err(|_| {
+            Error::ContinuationInvariant("epoch preparation thread panicked".to_string())
+        })?;
+        Ok(())
+    })?;
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|(index, _, _)| *index);
+    for (_, epoch, boundary) in results {
         epochs.push(epoch);
         all_boundaries.push(boundary);
-
-        if is_final {
-            break;
-        }
-        index += 1;
     }
 
     // One global LogUp over all the (kept) local-to-global tables. `all_boundaries` was

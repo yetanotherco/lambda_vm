@@ -1287,6 +1287,14 @@ where
         &weights_u64,
         retain_host_lde,
     )
+    .inspect_err(|e| {
+        // This path has no CPU fallback (the host aux trace is empty), so the
+        // caller hard-aborts; surface the swallowed driver error (e.g. OOM).
+        eprintln!(
+            "[gpu] resident aux LDE failed (rows={} cols={} blowup={}): {e:?}",
+            ra.num_rows, ra.num_aux_cols, blowup_factor
+        );
+    })
     .ok()?;
 
     let lde_out: Vec<FieldElement<E>> = unsafe {

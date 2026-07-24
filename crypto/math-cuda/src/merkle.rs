@@ -60,7 +60,7 @@ pub fn keccak_leaves_base(
     assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let cols_dev = { stream.clone_htod(&columns[..total])? };
     let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
     let launch = if rows_per_leaf == 2 {
         launch_keccak_base_row_pair
@@ -75,8 +75,10 @@ pub fn keccak_leaves_base(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -114,7 +116,7 @@ pub fn keccak_leaves_ext3(
     assert!(columns.len() >= total);
     let be = backend()?;
     let stream = be.next_stream();
-    let cols_dev = stream.clone_htod(&columns[..total])?;
+    let cols_dev = { stream.clone_htod(&columns[..total])? };
     let mut out_dev = stream.alloc_zeros::<u8>((num_rows / rows_per_leaf) * 32)?;
     let launch = if rows_per_leaf == 2 {
         launch_keccak_ext3_row_pair
@@ -129,8 +131,10 @@ pub fn keccak_leaves_ext3(
         num_rows as u64,
         &mut out_dev.as_view_mut(),
     )?;
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -320,8 +324,10 @@ pub fn build_merkle_tree_on_device(hashed_leaves: &[u8]) -> Result<Vec<u8>> {
 
     build_inner_tree_levels(stream.as_ref(), be, &mut nodes_dev, leaves_len)?;
 
-    let out = stream.clone_dtoh(&nodes_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&nodes_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -382,8 +388,16 @@ pub fn gather_merkle_paths_dev(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    // Async drain via the pinned-hashes slot (path nodes are hash output):
+    // enqueued without blocking, then the host waits only on the copy's event
+    // (which also covers the gather kernel queued before it) instead of a
+    // full stream sync.
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_hashes(), &be.ctx, &out, out.len())?;
+    let mut host = vec![0u8; out.len()];
+    {
+        pending.wait_into_bytes(&mut host)?;
+    }
     Ok(host)
 }
 
@@ -427,8 +441,10 @@ fn build_comp_poly_tree_nodes_dev(
     // below read the device `buf`, not `pinned`). Synchronize first so the
     // async H2D has consumed `pinned` before it is freed/reused.
     let mut buf = stream.alloc_zeros::<u64>(mb * lde_size)?;
-    stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
-    stream.synchronize()?;
+    {
+        stream.memcpy_htod(&pinned[..mb * lde_size], &mut buf)?;
+        stream.synchronize()?;
+    }
     drop(staging);
 
     // Leaves into tail of a tight node buffer.

@@ -46,9 +46,13 @@ pub fn barycentric_base(
     let be = backend()?;
     let stream = be.next_stream();
 
-    let cols_dev = stream.clone_htod(&columns[..num_cols * col_stride])?;
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (cols_dev, points_dev, inv_dev) = {
+        (
+            stream.clone_htod(&columns[..num_cols * col_stride])?,
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -69,8 +73,10 @@ pub fn barycentric_base(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -102,9 +108,13 @@ pub fn barycentric_ext3(
     let be = backend()?;
     let stream = be.next_stream();
 
-    let cols_dev = stream.clone_htod(&columns[..num_cols * 3 * col_stride])?;
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (cols_dev, points_dev, inv_dev) = {
+        (
+            stream.clone_htod(&columns[..num_cols * 3 * col_stride])?,
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -125,8 +135,10 @@ pub fn barycentric_ext3(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -152,9 +164,14 @@ pub fn barycentric_base_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    main_handle.wait_ready_on(&stream)?;
 
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (points_dev, inv_dev) = {
+        (
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -177,8 +194,10 @@ pub fn barycentric_base_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -201,6 +220,7 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
     n: usize,
 ) -> Result<Vec<u64>> {
     let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_base_dev2[n={n} cols={}]", main_handle.m));
+    main_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -237,8 +257,10 @@ pub fn barycentric_base_on_device_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -262,9 +284,14 @@ pub fn barycentric_ext3_on_device(
 
     let be = backend()?;
     let stream = be.next_stream();
+    aux_handle.wait_ready_on(&stream)?;
 
-    let points_dev = stream.clone_htod(coset_points)?;
-    let inv_dev = stream.clone_htod(inv_denoms_ext3)?;
+    let (points_dev, inv_dev) = {
+        (
+            stream.clone_htod(coset_points)?,
+            stream.clone_htod(inv_denoms_ext3)?,
+        )
+    };
     let mut out_dev = stream.alloc_zeros::<u64>(3 * num_cols)?;
 
     let col_stride_u64 = col_stride as u64;
@@ -287,8 +314,10 @@ pub fn barycentric_ext3_on_device(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -303,6 +332,7 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
     n: usize,
 ) -> Result<Vec<u64>> {
     let _nvtx = crate::nvtx::Range::fmt(|| format!("bary_ext3_dev2[n={n} cols={}]", aux_handle.m));
+    aux_handle.wait_ready_on(stream)?;
     assert!(coset_points_dev.len() >= n);
     let inv_end = inv_offset_u64
         .checked_add(3 * n)
@@ -339,8 +369,10 @@ pub fn barycentric_ext3_on_device_with_dev_inv_denoms(
             .arg(&mut out_dev)
             .launch(cfg)?;
     }
-    let out = stream.clone_dtoh(&out_dev)?;
-    stream.synchronize()?;
+    let out = { stream.clone_dtoh(&out_dev)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(out)
 }
 
@@ -354,12 +386,13 @@ pub fn gather_rows_base_on_device(
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
     let _nvtx = crate::nvtx::Range::fmt(|| format!("gather_rows_base[q={}]", rows.len()));
+    main.wait_ready_on(stream)?;
     let num_cols = main.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());
     }
     let be = backend()?;
-    let rows_dev = stream.clone_htod(rows)?;
+    let rows_dev = { stream.clone_htod(rows)? };
     let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols)?;
     let col_stride = main.lde_size as u64;
     let num_cols_u64 = num_cols as u64;
@@ -380,8 +413,10 @@ pub fn gather_rows_base_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    let host = { stream.clone_dtoh(&out)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(host)
 }
 
@@ -393,12 +428,13 @@ pub fn gather_rows_ext3_on_device(
     stream: &Arc<CudaStream>,
 ) -> Result<Vec<u64>> {
     let _nvtx = crate::nvtx::Range::fmt(|| format!("gather_rows_ext3[q={}]", rows.len()));
+    aux.wait_ready_on(stream)?;
     let num_cols = aux.m;
     if num_cols == 0 || rows.is_empty() {
         return Ok(Vec::new());
     }
     let be = backend()?;
-    let rows_dev = stream.clone_htod(rows)?;
+    let rows_dev = { stream.clone_htod(rows)? };
     let mut out = stream.alloc_zeros::<u64>(rows.len() * num_cols * 3)?;
     let col_stride = aux.lde_size as u64;
     let num_cols_u64 = num_cols as u64;
@@ -419,7 +455,9 @@ pub fn gather_rows_ext3_on_device(
             .arg(&mut out)
             .launch(cfg)?;
     }
-    let host = stream.clone_dtoh(&out)?;
-    stream.synchronize()?;
+    let host = { stream.clone_dtoh(&out)? };
+    {
+        stream.synchronize()?;
+    }
     Ok(host)
 }
