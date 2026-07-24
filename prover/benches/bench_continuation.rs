@@ -133,6 +133,23 @@ fn main() {
                 print!("{r}");
             }
         }
+        "verifywarm" => {
+            // Build one proof, then verify it N times in the same process. This
+            // isolates steady-state verifier costs such as program-specific
+            // preprocessed commitments from proving and one-time initialization.
+            let n_verifies: usize = args
+                .get(3)
+                .map(|s| s.parse().expect("bad verify count"))
+                .unwrap_or(3);
+            let proof = lambda_vm_prover::prove_with_inputs(&elf, &private_inputs)
+                .expect("monolithic prove failed");
+            for i in 0..n_verifies {
+                let t = Instant::now();
+                let ok = lambda_vm_prover::verify(&proof, &elf).expect("verify errored");
+                assert!(ok, "monolithic proof did NOT verify");
+                println!("verify {} ok ({:.6}s)", i + 1, t.elapsed().as_secs_f64());
+            }
+        }
         "cont" => {
             let epoch_size_log2: u32 = args
                 .get(3)
@@ -178,7 +195,9 @@ fn main() {
             }
         }
         other => {
-            eprintln!("unknown mode {other:?}; use count|footprint|main|warm|cont");
+            eprintln!(
+                "unknown mode {other:?}; use count|footprint|main|mainverify|verifywarm|warm|cont"
+            );
             std::process::exit(2);
         }
     }

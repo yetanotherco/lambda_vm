@@ -1369,16 +1369,42 @@ fn verify_proof_parts(
         )));
     }
 
+    // Native verification normally derives both program-specific roots from
+    // the ELF. Reuse the same content-addressed cache as the prover so repeated
+    // verifies do not rebuild the DECODE/PAGE FFTs and Merkle trees. Preserve
+    // the supplied-root API exactly: recursion and callers passing either root
+    // keep the existing trust/fallback semantics and never consult this cache.
+    let cached_preprocessed = if decode_commitment.is_none() && page_commitments.is_none() {
+        Some(preprocessed_cache::get(
+            program,
+            *elf_digest,
+            proof_options,
+            &page_configs,
+        ))
+    } else {
+        None
+    };
+    let effective_decode_commitment = decode_commitment.or_else(|| {
+        cached_preprocessed
+            .as_ref()
+            .map(|preprocessed| preprocessed.decode)
+    });
+    let effective_page_commitments = page_commitments.or_else(|| {
+        cached_preprocessed
+            .as_ref()
+            .map(|preprocessed| preprocessed.pages.as_slice())
+    });
+
     let airs = VmAirs::new(
         program,
         proof_options,
         false,
         &page_configs,
         table_counts,
-        decode_commitment,
+        effective_decode_commitment,
         true,
         None,
-        page_commitments,
+        effective_page_commitments,
         None,
     );
 
