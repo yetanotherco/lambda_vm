@@ -157,6 +157,7 @@ fn check_air(air: &dyn AIR<Field = Gl, FieldExtension = Ext, PublicInputs = ()>,
             m: aux_cols,
             lde_size,
             tree: None,
+            ready: None,
         };
 
         let gpu = try_eval_program_gpu(
