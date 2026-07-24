@@ -65,6 +65,7 @@ use crate::tables::ecsm::{
 };
 use crate::tables::eq::{EqConstraints, bus_interactions as eq_bus_interactions, cols as eq_cols};
 use crate::tables::halt::{bus_interactions as halt_bus_interactions, cols as halt_cols};
+use crate::tables::hint::{bus_interactions as hint_bus_interactions, cols as hint_cols};
 use crate::tables::keccak::{
     KeccakConstraints, bus_interactions as keccak_bus_interactions, cols as keccak_cols,
 };
@@ -837,6 +838,19 @@ pub fn create_halt_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConst
         1,
         EmptyConstraints,
         "HALT",
+    )
+}
+
+/// Create HINT AIR with bus interactions (no transition constraints). BENCH ONLY:
+/// a non-constraining receiver for the `hint` ecall (Ecall receive + output MEMW writes).
+pub fn create_hint_air(proof_options: &ProofOptions) -> ConcreteVmAir<EmptyConstraints> {
+    build_air(
+        hint_cols::NUM_COLUMNS,
+        hint_bus_interactions(),
+        proof_options,
+        1,
+        EmptyConstraints,
+        "HINT",
     )
 }
 
