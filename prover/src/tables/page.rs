@@ -284,6 +284,24 @@ pub fn generate_page_trace(
     trace
 }
 
+/// The final `(value, timestamp)` a PAGE offset contributes, from its init byte
+/// and the dense-store cell `(value, timestamp)`. An untouched/image offset
+/// (`timestamp == 0`, where value already equals init) or a runtime write dropped
+/// by `exclude_touched` collapses to `(init, 0)`; otherwise it keeps the written
+/// `(value, timestamp)`.
+///
+/// Single source of truth for the PAGE table's FINI/TIMESTAMP columns
+/// ([`generate_page_trace_from_dense`]) AND the ARE_BYTES bitwise multiplicities
+/// (`collect_bitwise_from_page`), so the two cannot drift and the AreBytes bus
+/// stays balanced.
+pub fn page_final(init: u8, value: u8, timestamp: u64, exclude_touched: bool) -> (u8, u64) {
+    if timestamp == 0 || (exclude_touched && timestamp > 0) {
+        (init, 0)
+    } else {
+        (value, timestamp)
+    }
+}
+
 /// Like [`generate_page_trace`] but reads each offset's final `(value, timestamp)`
 /// straight from the dense per-page memory store ([`crate::paged_mem::PagedMem::page_data`])
 /// — one indexed read per offset, no hashing. Equivalent to looking each byte up in a
@@ -330,13 +348,9 @@ pub fn generate_page_trace_from_dense(
         table.set_byte(offset, cols::INIT, init_value);
 
         let (value, timestamp) = final_page.map_or((0u8, 0u64), |p| p[offset]);
-        let (fini_value, timestamp) = if timestamp == 0 || (exclude_touched && timestamp > 0) {
-            (init_value, 0)
-        } else {
-            (value, timestamp)
-        };
+        let (fini_value, fini_ts) = page_final(init_value, value, timestamp, exclude_touched);
         table.set_byte(offset, cols::FINI, fini_value);
-        table.set_dword_wl(offset, cols::TIMESTAMP_LO, timestamp);
+        table.set_dword_wl(offset, cols::TIMESTAMP_LO, fini_ts);
     }
 
     trace
