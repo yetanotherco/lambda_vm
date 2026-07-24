@@ -848,6 +848,39 @@ pub struct AirWithBuses<
     max_bus_elements: usize,
 }
 
+/// Cloning an `AirWithBuses` copies its derived artifacts — the MetaBuilder-run
+/// constraint metadata, the LogUp layout, and (if already forced) the captured
+/// constraint IR inside the `OnceLock` — so a pre-built, pre-captured prototype
+/// clones into per-shard/per-epoch instances without re-running the constraint
+/// bodies. `B`/`PI` ride in `PhantomData` and need no bounds.
+impl<
+    F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync,
+    E: IsField + Send + Sync,
+    B: BoundaryConstraintBuilder<F, E, PI>,
+    PI,
+    CS: ConstraintSet<F, E> + Clone,
+> Clone for AirWithBuses<F, E, B, PI, CS>
+{
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.clone(),
+            step_size: self.step_size,
+            trace_layout: self.trace_layout,
+            constraint_set: self.constraint_set.clone(),
+            logup: self.logup.clone(),
+            meta: self.meta.clone(),
+            num_base: self.num_base,
+            constraint_program: self.constraint_program.clone(),
+            auxiliary_trace_build_data: self.auxiliary_trace_build_data.clone(),
+            boundary_constraint_builder: PhantomData,
+            preprocessed_commitment: self.preprocessed_commitment,
+            num_precomputed_cols: self.num_precomputed_cols,
+            name: self.name.clone(),
+            max_bus_elements: self.max_bus_elements,
+        }
+    }
+}
+
 impl<
     F: IsFFTField + IsSubFieldOf<E> + IsPrimeField + Send + Sync + 'static,
     E: IsField + Send + Sync + 'static,
@@ -1312,6 +1345,7 @@ where
 
 /// Struct representing how each lookup air should build its auxiliary trace
 /// Contains a list of all lookup interactions
+#[derive(Clone)]
 pub struct AuxiliaryTraceBuildData {
     pub interactions: Vec<BusInteraction>,
 }

@@ -250,6 +250,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 /// - idx 0,1: `ADD` pair `b + diff = a` (unconditional);
 /// - idx 2:   `IS_BIT(invert)` (unconditional);
 /// - idx 3:   `res = eq XOR invert`.
+#[derive(Clone, Copy)]
 pub struct EqConstraints;
 
 impl ConstraintSet<GoldilocksField, GoldilocksExtension> for EqConstraints {

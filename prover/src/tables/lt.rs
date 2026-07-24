@@ -356,6 +356,7 @@ use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
 /// LT table constraints as a single-source [`ConstraintSet`]. No column
 /// configuration is needed (the LT layout is fixed via `cols`).
+#[derive(Clone, Copy)]
 pub struct LtConstraints;
 
 impl LtConstraints {

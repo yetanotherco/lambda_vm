@@ -142,6 +142,7 @@ fn global_transcript(
 /// identical trace (root-bound), so it inherits it.
 /// The L2G epoch-local table's single transition constraint: `MU ∈ {0,1}`
 /// (`MU·(1−MU) = 0`) at constraint index 0.
+#[derive(Clone, Copy)]
 struct L2gMemoryConstraints;
 
 impl ConstraintSet<F, E> for L2gMemoryConstraints {
