@@ -17,7 +17,9 @@
 //! integer recurrence here; the prover converts the resulting integers to field elements.
 
 use num_bigint::{BigInt, BigUint};
+use num_integer::Integer;
 use num_traits::{Signed, Zero};
+use rayon::prelude::*;
 
 use crate::curve::{StepPts, replay_double_and_add};
 use crate::{B, EcsmError, P_BYTES, R_BYTES, n, p, prepare, to_le_32};
@@ -254,11 +256,12 @@ fn to_le_33(relation: &str, v: &BigUint) -> [u8; 33] {
 /// `r + numerator / p`, where `numerator` must be divisible by `p`. Asserts divisibility
 /// and that the result is non-negative (guaranteed by the spec quotient ranges).
 fn shifted_quotient(relation: &str, numerator: &BigInt, p_big: &BigInt, r_big: &BigInt) -> BigUint {
+    let (q, rem) = numerator.div_rem(p_big);
     assert!(
-        (numerator % p_big).is_zero(),
+        rem.is_zero(),
         "ECSM witness {relation}: numerator not divisible by p"
     );
-    let q = r_big + numerator / p_big;
+    let q = r_big + q;
     assert!(
         !q.is_negative(),
         "ECSM witness {relation}: quotient unexpectedly negative"
@@ -322,8 +325,10 @@ pub fn compute_witness(k_le: &[u8; 32], xg_le: &[u8; 32]) -> Result<EcsmWitness,
     let y_r = to_le_32(&result.y);
     let x_r_sub_p = to_le_32(&((&two_256 + &result.x) - p()));
 
+    // Steps are independent witnesses (each builds its own λ/quotient/carry data
+    // from one StepPts), so they parallelize freely.
     let steps = steps_pts
-        .iter()
+        .par_iter()
         .map(|s| build_step(s, &p_big, &r_big, &r_ext, &pp))
         .collect();
 
