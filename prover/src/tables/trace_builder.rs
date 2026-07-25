@@ -33,6 +33,8 @@ use executor::elf::Elf;
 use executor::vm::instruction::decoding::Instruction;
 use executor::vm::logs::Log;
 use executor::vm::memory::U64HashMap;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::trace::TraceTable;
@@ -45,7 +47,6 @@ use super::cpu::{self, CpuOperation};
 use super::cpu32;
 use super::decode;
 use super::dvrm::{self, DvrmOperation};
-use super::ec_scalar;
 use super::ecdas;
 use super::ecsm;
 use super::eq;
@@ -54,10 +55,11 @@ use super::keccak::{self, KeccakOperation};
 use super::keccak_rc;
 use super::keccak_rnd::{self, KeccakRoundOperation};
 use super::load::{self, LoadOperation};
+use super::local_to_global;
 use super::lt::{self, LtOperation};
 use super::memw::{self, MemwOperation};
 use super::memw_aligned;
-use super::memw_register;
+use super::memw_register::{self, RegRow};
 use super::mul::{self, MulOperation};
 use super::page::{self, FinalByteState, FinalStateMap, PageConfig};
 use super::register::{self, FinalRegisterStateMap, FinalRegisterWordState};
@@ -65,6 +67,7 @@ use super::shift::{self, ShiftOperation};
 use super::store;
 use super::types::{GoldilocksExtension, GoldilocksField};
 use crate::Error;
+use crate::paged_mem::{ImageSource, PagedMem};
 
 // =============================================================================
 // Memory and Register State Tracking
@@ -78,35 +81,30 @@ type RegisterCell = (u64, u64);
 
 /// Memory state tracker for generating MEMW/LOAD traces.
 struct MemoryState {
-    /// Map from byte address to (value, timestamp)
-    cells: HashMap<u64, MemoryCell>,
+    /// Per byte-address `(value, timestamp)`, as a dense per-page store. This is
+    /// the hot structure — `read_byte`/`write_byte` hit it on every memory access
+    /// during the replay, and it's rebuilt each epoch — so a per-page array (small
+    /// page-map lookup + dense indexing, no per-cell hashing or rehash-on-grow)
+    /// is both lighter and faster than a per-cell `HashMap`.
+    cells: PagedMem<MemoryCell>,
 }
 
 impl MemoryState {
     fn new() -> Self {
         Self {
-            cells: HashMap::new(),
+            cells: PagedMem::new((0, 0)),
         }
     }
 
-    /// Initialize memory state from ELF segments.
+    /// Initialize memory state from a pre-built initial-memory image.
     ///
-    /// Pre-populates all ELF bytes with timestamp=0 so that when MEMW first
+    /// Pre-populates all starting bytes with timestamp=0 so that when MEMW first
     /// accesses an address, it gets the correct initial value for `old_value`.
     /// This is required for the Memory bus to balance (MEMW-M1 must match PAGE-C3).
-    fn from_elf(elf: &Elf) -> Self {
-        let mut cells = HashMap::new();
-        for segment in &elf.data {
-            for (i, &word) in segment.values.iter().enumerate() {
-                let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
-                // Split 32-bit word into 4 bytes (little-endian)
-                for byte_offset in 0..4u64 {
-                    let byte_addr = word_addr.wrapping_add(byte_offset);
-                    let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                    // Initial state: value from ELF, timestamp=0
-                    cells.insert(byte_addr, (byte_value, 0));
-                }
-            }
+    fn from_image<I: ImageSource>(image: &I) -> Self {
+        let mut cells = PagedMem::new((0, 0));
+        for (addr, value) in image.image_iter() {
+            cells.set(addr, (value, 0));
         }
         Self { cells }
     }
@@ -119,39 +117,27 @@ impl MemoryState {
             "page_size must be a power of two for the bitmask to work"
         );
         let mask = !(page_size - 1);
-        let pages: HashSet<u64> = self.cells.keys().map(|&a| a & mask).collect();
+        let pages: HashSet<u64> = self.cells.iter().map(|(a, _)| a & mask).collect();
         pages.len() as u64
-    }
-
-    /// Pre-populate the private input memory region at `PRIVATE_INPUT_START_INDEX`.
-    fn add_private_input(&mut self, private_input: &[u8]) {
-        if private_input.is_empty() {
-            return;
-        }
-        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-        let start = PRIVATE_INPUT_START_INDEX;
-        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
-            self.cells.insert(start + i as u64, (b, 0));
-        }
     }
 
     /// Read a byte from memory. Returns (value, timestamp) or (0, 0) if never written.
     fn read_byte(&self, address: u64) -> MemoryCell {
-        self.cells.get(&address).copied().unwrap_or((0, 0))
+        self.cells.get(address)
     }
 
     /// Write a byte to memory with the given timestamp.
     fn write_byte(&mut self, address: u64, value: u8, timestamp: u64) {
-        self.cells.insert(address, (value, timestamp));
+        self.cells.set(address, (value, timestamp));
     }
 
     /// Read multiple bytes. Returns arrays of values and timestamps.
-    fn read_bytes(&self, base_address: u64, count: usize) -> ([u64; 8], [u64; 8]) {
-        let mut values = [0u64; 8];
+    fn read_bytes(&self, base_address: u64, count: usize) -> ([u32; 8], [u64; 8]) {
+        let mut values = [0u32; 8];
         let mut timestamps = [0u64; 8];
         for i in 0..count {
             let (val, ts) = self.read_byte(base_address.wrapping_add(i as u64));
-            values[i] = val as u64;
+            values[i] = val as u32;
             timestamps[i] = ts;
         }
         (values, timestamps)
@@ -188,6 +174,28 @@ impl RegisterState {
             index_register: (0, 1),
             // PC register (x255) starts at entry_point, timestamp 1
             pc_register: (entry_point, 1),
+        }
+    }
+
+    /// Seed register state from a register init vector (one value per row, in
+    /// `register_word_address_list` order), so the first access in a continuation
+    /// epoch reads the epoch's boundary register values as `old_value`. All initial
+    /// timestamps are 1, matching the REGISTER table's init token. Mirrors
+    /// `MemoryState::from_image`.
+    fn from_init(init: &[u32]) -> Self {
+        let word = |pos: usize| init.get(pos).copied().unwrap_or(0) as u64;
+        let mut regs = [(0u64, 1u64); 32];
+        for (reg, slot) in regs.iter_mut().enumerate() {
+            let base = reg * 2;
+            *slot = (word(base) | (word(base + 1) << 32), 1);
+        }
+        Self {
+            regs,
+            index_register: (init.get(register::X254_INDEX).copied().unwrap_or(0), 1),
+            pc_register: (
+                word(register::PC_LO_INDEX) | (word(register::PC_HI_INDEX) << 32),
+                1,
+            ),
         }
     }
 
@@ -304,8 +312,17 @@ fn cpu_op_to_bytes_and_signed(op: &CpuOperation) -> (usize, bool) {
 /// Pack a 64-bit register value into the MEMW value format.
 ///
 /// For register operations, values are packed as [lo32, hi32, 0, 0, 0, 0, 0, 0].
-fn pack_register_value(value: u64) -> [u64; 8] {
-    [value & 0xFFFF_FFFF, value >> 32, 0, 0, 0, 0, 0, 0]
+fn pack_register_value(value: u64) -> [u32; 8] {
+    [
+        (value & 0xFFFF_FFFF) as u32,
+        (value >> 32) as u32,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]
 }
 
 // =============================================================================
@@ -343,25 +360,186 @@ fn collect_cpu_ops(
 // Phase 2: CPU ops → MEMW, LOAD, LT, Bitwise
 // =============================================================================
 
+/// Destination table for a `MemwOperation`.
+///
+/// The order of the checks matters and must never change: register ops would
+/// also pass `is_aligned_op`, so MEMW_R is decided first, then MEMW_A, and the
+/// rest goes to the general MEMW table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemwRoute {
+    Register,
+    Aligned,
+    General,
+}
+
+/// The single classification used everywhere a `MemwOperation` is routed to a
+/// table — the walk's [`MemwBuckets`] and the sizing pass (`count_table_lengths`)
+/// share it, so their routing cannot drift.
+#[inline]
+fn classify_memw(op: &MemwOperation) -> MemwRoute {
+    if is_register_op(op) {
+        MemwRoute::Register
+    } else if is_aligned_op(op) {
+        MemwRoute::Aligned
+    } else {
+        MemwRoute::General
+    }
+}
+
+/// Routes each `MemwOperation` into its destination table bucket at CREATION time
+/// (register fast-path / aligned / general), so the walk fills the three buckets directly
+/// and no separate routing pass is needed downstream. Classification order is register
+/// first, then aligned (see [`classify_memw`]), and push order within each bucket is the
+/// walk's insertion order — the buckets are fully deterministic, which the per-cell
+/// multiplicity counts rely on.
+///
+/// ## Direct-to-column register fill
+///
+/// For the register fast path we do NOT materialize a `Vec<MemwOperation>`. Ops that route
+/// to MEMW_R are stored as compact [`RegRow`]s (`register_rows`) and later filled directly
+/// into the MEMW_R columns. The `aligned` / `general` buckets hold `MemwOperation`s — an op
+/// that FAILS `is_register_op` is routed there (aligned if `is_aligned_op`, else general).
+#[derive(Default)]
+struct MemwBuckets {
+    /// Compact register rows (filled directly into the MEMW_R columns).
+    register_rows: Vec<RegRow>,
+    aligned: Vec<MemwOperation>,
+    general: Vec<MemwOperation>,
+}
+
+impl MemwBuckets {
+    fn with_register_capacity(n: usize) -> Self {
+        Self {
+            register_rows: Vec::with_capacity(n),
+            aligned: Vec::new(),
+            general: Vec::new(),
+        }
+    }
+
+    #[inline]
+    fn push(&mut self, op: MemwOperation) {
+        match classify_memw(&op) {
+            MemwRoute::Register => self.register_rows.push(RegRow::from_memw(&op)),
+            MemwRoute::Aligned => self.aligned.push(op),
+            MemwRoute::General => self.general.push(op),
+        }
+    }
+    fn extend_ops(&mut self, ops: impl IntoIterator<Item = MemwOperation>) {
+        for op in ops {
+            self.push(op);
+        }
+    }
+}
+
+/// Sink for `MemwOperation`s so `collect_register_ops_from_cpu` can feed either a plain
+/// `Vec` (the `count_table_lengths` trace-sizing pass) or the classifying
+/// [`MemwBuckets`] (the walk).
+trait MemwSink {
+    fn push_op(&mut self, op: MemwOperation);
+
+    /// Fast path for a 2-word register access (M1/M3/M5 and precompile register I/O).
+    ///
+    /// The caller passes the compact, pre-decomposed fields. The sink decides routing
+    /// (via the same predicate as `is_register_op`): if the timestamp delta admits the
+    /// op into MEMW_R it fills a compact [`RegRow`] DIRECTLY — no `MemwOperation` is
+    /// built. Only on the (rare) fallback (delta out of IS_HALF range, or upper-limb
+    /// mismatch) does it build the `MemwOperation` (via [`build_reg_fallback`]) and
+    /// route it to the aligned/general bucket exactly as before.
+    ///
+    /// `reg_addr` is `2 * reg_index`; `val`/`old` are the two 32-bit halves of the new
+    /// and previous register words; `old_ts` is the (shared) old_timestamp of both words.
+    #[inline]
+    fn push_reg_access(
+        &mut self,
+        reg_addr: u64,
+        val: [u32; 2],
+        old: [u32; 2],
+        timestamp: u64,
+        old_ts: u64,
+        is_read: bool,
+    ) {
+        // Default impl (plain Vec): register accesses are still ordinary MemwOperations.
+        self.push_op(build_reg_fallback(
+            reg_addr, val, old, timestamp, old_ts, is_read,
+        ));
+    }
+}
+impl MemwSink for Vec<MemwOperation> {
+    #[inline]
+    fn push_op(&mut self, op: MemwOperation) {
+        self.push(op);
+    }
+}
+impl MemwSink for MemwBuckets {
+    #[inline]
+    fn push_op(&mut self, op: MemwOperation) {
+        self.push(op);
+    }
+
+    #[inline]
+    fn push_reg_access(
+        &mut self,
+        reg_addr: u64,
+        val: [u32; 2],
+        old: [u32; 2],
+        timestamp: u64,
+        old_ts: u64,
+        is_read: bool,
+    ) {
+        // Mirror `is_register_op` for a width-2 register access whose two words share
+        // `old_ts` (always true here by construction). If it passes, fill a RegRow
+        // directly; otherwise fall back to the general/aligned MemwOperation path.
+        if reg_ts_delta_in_range(timestamp, old_ts) {
+            self.register_rows.push(RegRow::new(
+                reg_addr, timestamp, val[0], val[1], old[0], old[1], old_ts, is_read,
+            ));
+        } else {
+            let op = build_reg_fallback(reg_addr, val, old, timestamp, old_ts, is_read);
+            debug_assert!(!is_register_op(&op), "reg fallback must not be MEMW_R");
+            self.push(op);
+        }
+    }
+}
+
+/// Materialize the aligned/general `MemwOperation` for a register access that does
+/// NOT fit the MEMW_R fast path. Register values pack as `[lo, hi, 0, …]` (see
+/// [`pack_register_value`]) and both words share `old_ts`, so this rebuilds exactly
+/// the op the fast-path callers would otherwise have routed to the buckets.
+fn build_reg_fallback(
+    reg_addr: u64,
+    val: [u32; 2],
+    old: [u32; 2],
+    timestamp: u64,
+    old_ts: u64,
+    is_read: bool,
+) -> MemwOperation {
+    let value = [val[0], val[1], 0, 0, 0, 0, 0, 0];
+    let old_value = [old[0], old[1], 0, 0, 0, 0, 0, 0];
+    let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
+    MemwOperation::new(true, reg_addr, value, timestamp, 2, is_read)
+        .with_old(old_value, old_timestamps)
+}
+
 /// Collects all derived operations from CPU operations in a single pass.
 ///
 /// This includes:
-/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7)
+/// - MEMW ops (register reads/writes M1/M3/M5, memory loads/stores M6/M7),
+///   already routed into their MEMW_R / MEMW_A / MEMW buckets (see [`MemwBuckets`])
 /// - LOAD ops (memory loads with sign/zero extension)
 /// - LT ops (from SLT/BLT instructions)
 /// - Bitwise lookups (from CPU operations)
 ///
 /// MEMW and LOAD collection requires sequential processing with state tracking.
 ///
-/// Returns: (memw_ops, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops, keccak_ops,
-/// cpu32_ops, ecsm_ops, ec_scalar_ops, ecdas_ops)
+/// Returns: (memw_buckets, load_ops, lt_ops, shift_ops, bitwise_ops, commit_ops,
+/// keccak_ops, cpu32_ops, ecsm_ops, ecdas_ops)
 #[allow(clippy::type_complexity)]
 fn collect_ops_from_cpu(
     cpu_ops: &[CpuOperation],
     memory_state: &mut MemoryState,
     register_state: &mut RegisterState,
 ) -> (
-    Vec<MemwOperation>,
+    MemwBuckets,
     Vec<LoadOperation>,
     Vec<LtOperation>,
     Vec<ShiftOperation>,
@@ -370,10 +548,9 @@ fn collect_ops_from_cpu(
     Vec<KeccakOperation>,
     Vec<cpu32::Cpu32Operation>,
     Vec<ecsm::EcsmOperation>,
-    Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
-    let mut memw_ops = Vec::with_capacity(cpu_ops.len() * 3);
+    let mut memw = MemwBuckets::with_register_capacity(cpu_ops.len() * 3);
     let mut load_ops = Vec::with_capacity(cpu_ops.len() / 8 + 1);
     let mut lt_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
     let mut shift_ops = Vec::with_capacity(cpu_ops.len() / 10 + 1);
@@ -382,9 +559,13 @@ fn collect_ops_from_cpu(
     let mut keccak_ops = Vec::new();
     let mut cpu32_ops = Vec::new();
     let mut ecsm_ops = Vec::new();
-    let mut ec_scalar_ops = Vec::new();
     let mut ecdas_ops = Vec::new();
-    let mut current_commit_index = 0u32;
+    // Seed from the carried x254 (0 for a monolithic run or the first epoch) so a
+    // continuation epoch indexes its commits globally, matching the x254 the
+    // register binding transports across epochs. Resetting to 0 here would drift
+    // from x254 and break the COMMIT chip's Memw token (see the drift assert below).
+    let start_commit_index = register_state.read_index().0;
+    let mut current_commit_index = start_commit_index;
     let mut commit_ecall_count = 0u32;
 
     for op in cpu_ops {
@@ -400,17 +581,16 @@ fn collect_ops_from_cpu(
         // Collect memory operations for Load/Store instructions
         if op.decode.fields.is_load() {
             let (memw_op, load_op, lookups) = collect_load_op_from_cpu(op, memory_state);
-            memw_ops.push(memw_op);
+            memw.push(memw_op);
             load_ops.push(load_op);
             bitwise_ops.extend(lookups);
         } else if op.decode.fields.is_store() {
             let memw_op = collect_store_op_from_cpu(op, memory_state);
-            memw_ops.push(memw_op);
+            memw.push(memw_op);
         }
 
         // Collect register operations (M1, M3, M5)
-        let reg_memw_ops = collect_register_ops_from_cpu(op, register_state);
-        memw_ops.extend(reg_memw_ops);
+        collect_register_ops_from_cpu(op, register_state, &mut memw);
 
         // Collect COMMIT ECALL memory operations (register reads/writes + byte reads)
         if op.ecall_commit {
@@ -420,7 +600,7 @@ fn collect_ops_from_cpu(
                 current_commit_index as u64,
             ));
             let reg_commit_ops = collect_commit_memw_ops(op, register_state, memory_state);
-            memw_ops.extend(reg_commit_ops);
+            memw.extend_ops(reg_commit_ops);
             let count = u32::try_from(op.commit_count).expect("commit_count exceeds u32 range");
             current_commit_index = current_commit_index
                 .checked_add(count)
@@ -456,7 +636,7 @@ fn collect_ops_from_cpu(
             // collect_keccak_memw_ops handles memory_state + register_state updates
             let keccak_memw_ops =
                 collect_keccak_memw_ops(op, &input, &output, memory_state, register_state);
-            memw_ops.extend(keccak_memw_ops);
+            memw.extend_ops(keccak_memw_ops);
             keccak_ops.push(KeccakOperation {
                 timestamp: op.timestamp,
                 state_addr,
@@ -465,13 +645,12 @@ fn collect_ops_from_cpu(
             });
         }
 
-        // Collect ECSM ecall operations (memory I/O + the three table row sets)
+        // Collect ECSM ecall operations (memory I/O + the two table row sets)
         if op.ecall_ecsm {
-            let (ecsm_memw, ecsm_op, ec_scalar_rows, ecdas_rows) =
+            let (ecsm_memw, ecsm_op, ecdas_rows) =
                 collect_ecsm_ops(op, memory_state, register_state);
-            memw_ops.extend(ecsm_memw);
+            memw.extend_ops(ecsm_memw);
             ecsm_ops.push(ecsm_op);
-            ec_scalar_ops.extend(ec_scalar_rows);
             ecdas_ops.extend(ecdas_rows);
         }
 
@@ -505,19 +684,22 @@ fn collect_ops_from_cpu(
             }
         }
 
-        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF).
+        // Collect CPU range-check bitwise lookups (ARE_BYTES + IS_HALF). Kept serial here:
+        // it's only ~110 ms (a serial `.extend` into one growing Vec), and moving it to a
+        // rayon `flat_map`-collect over 6.8 M per-op Vecs regressed p4 ~4× (alloc + merge).
         bitwise_ops.extend(op.collect_bitwise_ops());
     }
 
-    // Each ecall generates count+1 operations (count real rows + 1 end row)
+    // Each ecall generates count+1 operations (count real rows + 1 end row).
+    // Count only this epoch's rows, so subtract the carried start index.
     debug_assert_eq!(
         commit_ops.len(),
-        current_commit_index as usize + commit_ecall_count as usize,
+        (current_commit_index - start_commit_index) as usize + commit_ecall_count as usize,
         "commit_ops count should match accumulated commit index plus end rows"
     );
 
     (
-        memw_ops,
+        memw,
         load_ops,
         lt_ops,
         shift_ops,
@@ -526,7 +708,6 @@ fn collect_ops_from_cpu(
         keccak_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     )
 }
@@ -548,9 +729,9 @@ fn collect_load_op_from_cpu(
     let (_old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Extract individual bytes from loaded value
-    let mut value_bytes = [0u64; 8];
+    let mut value_bytes = [0u32; 8];
     for (j, byte) in value_bytes.iter_mut().take(byte_count).enumerate() {
-        *byte = (loaded_value >> (j * 8)) & 0xFF;
+        *byte = ((loaded_value >> (j * 8)) & 0xFF) as u32;
     }
 
     // Sign/zero extend the upper bytes
@@ -581,7 +762,7 @@ fn collect_load_op_from_cpu(
         op.timestamp,
         byte_count as u8,
         signed,
-        res_bytes,
+        res_bytes.map(u64::from),
     );
 
     // Collect MSB8 lookups for sign bit extraction
@@ -607,13 +788,15 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     let (old_values, old_timestamps) = memory_state.read_bytes(base_address, 8);
 
     // Pack ALL 8 bytes of store_value into value_bytes.
-    // Bus 14: MEMW Memory Write receiver reconstructs lo32/hi32 via linear combination
-    //   of all 8 bytes. Must match CPU M7 which sends full rv2 as [lo32, hi32].
+    // Bus 14: the MEMW Memory Write receiver reconstructs lo32/hi32 via a linear
+    //   combination of all 8 bytes, so it must match the store value the CPU sends
+    //   as [lo32, hi32] on the MEMORY bus (MEMOP) and that this STORE chip forwards
+    //   as the MEMW write (the CPU no longer emits an inline store MEMW — see below).
     // Bus 16: only positions 0..byte_count participate (controlled by w2/w4/write8
     //   multiplicities), so extra bytes don't affect memory consistency.
-    let mut value_bytes = [0u64; 8];
+    let mut value_bytes = [0u32; 8];
     for (j, byte) in value_bytes.iter_mut().enumerate() {
-        *byte = (store_value >> (j * 8)) & 0xFF;
+        *byte = ((store_value >> (j * 8)) & 0xFF) as u32;
     }
 
     // The STORE chip now owns this MEMW write (the CPU sends MEMORY instead of
@@ -635,11 +818,11 @@ fn collect_store_op_from_cpu(op: &CpuOperation, memory_state: &mut MemoryState) 
     memw_op
 }
 
-/// Collects all MEMW ops and the ECSM / EC_SCALAR / ECDAS table ops for one ECSM ecall.
+/// Collects all MEMW ops and the ECSM / ECDAS table ops for one ECSM ecall.
 ///
-/// Timestamp scheme (within the instruction's 4-wide budget): the `x11`/`x12` register reads
-/// and the `xG`/`k` memory reads happen at `T`; the `x10` register read and the EC_SCALAR
-/// byte reads at `T + 1`; the `xR` memory writes at `T + 2`. Every read advances
+/// Timestamp scheme: `x11` register read and `xG` memory reads at `T`;
+/// `x12` register read and `k` memory reads at `T + 1`; `x10` register read and
+/// `xR` memory writes at `T + 2`. Every read advances
 /// `memory_state` / `register_state` (the offline read-old + write-new model), so later
 /// accesses always observe a strictly smaller old timestamp.
 #[allow(clippy::needless_range_loop)]
@@ -650,7 +833,6 @@ fn collect_ecsm_ops(
 ) -> (
     Vec<MemwOperation>,
     ecsm::EcsmOperation,
-    Vec<ec_scalar::EcScalarOperation>,
     Vec<ecdas::EcdasOperation>,
 ) {
     let t = op.timestamp;
@@ -669,67 +851,77 @@ fn collect_ecsm_ops(
     let witness = ::ecsm::compute_witness(&k, &xg)
         .expect("ECSM witness: executor validates 0 < k < N and xG on curve");
 
-    let mut memw_ops = Vec::with_capacity(47);
+    let mut memw_ops = Vec::with_capacity(15);
 
-    // x11 -> addr_xG, x12 -> addr_k (register reads at T).
-    for reg in [11u8, 12u8] {
-        let (val, old_ts) = register_state.read(reg);
+    // x11 -> addr_xG (register read at T), x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(11);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * reg as u64, value, t, 2, true)
+            MemwOperation::new(true, 2 * 11, value, t, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(reg, val, t);
+        register_state.write(11, val, t);
     }
 
-    // xG and k: 4 doubleword reads each at T.
-    for (base, bytes) in [(addr_xg, &witness.x_g), (addr_k, &witness.k)] {
-        for i in 0..4 {
-            let addr = base.wrapping_add((8 * i) as u64);
-            let mut value = [0u64; 8];
-            let mut dword = 0u64;
-            for j in 0..8 {
-                value[j] = bytes[8 * i + j] as u64;
-                dword |= (bytes[8 * i + j] as u64) << (8 * j);
-            }
-            let (_old, old_ts) = memory_state.read_bytes(addr, 8);
-            memw_ops
-                .push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
-            memory_state.write_bytes(addr, dword, 8, t);
+    // xG: 4 doubleword reads at T.
+    for i in 0..4 {
+        let addr = addr_xg.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.x_g[8 * i + j] as u32;
+            dword |= (witness.x_g[8 * i + j] as u64) << (8 * j);
         }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops.push(MemwOperation::new(false, addr, value, t, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t);
     }
 
-    // x10 -> addr_xR (register read at T + 1).
+    // x12 -> addr_k (register read at T+1).
+    {
+        let (val, old_ts) = register_state.read(12);
+        let value = pack_register_value(val);
+        memw_ops.push(
+            MemwOperation::new(true, 2 * 12, value, t + 1, 2, true)
+                .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
+        );
+        register_state.write(12, val, t + 1);
+    }
+
+    // k: 4 doubleword reads at T+1.
+    for i in 0..4 {
+        let addr = addr_k.wrapping_add((8 * i) as u64);
+        let mut value = [0u32; 8];
+        let mut dword = 0u64;
+        for j in 0..8 {
+            value[j] = witness.k[8 * i + j] as u32;
+            dword |= (witness.k[8 * i + j] as u64) << (8 * j);
+        }
+        let (_old, old_ts) = memory_state.read_bytes(addr, 8);
+        memw_ops
+            .push(MemwOperation::new(false, addr, value, t + 1, 8, true).with_old(value, old_ts));
+        memory_state.write_bytes(addr, dword, 8, t + 1);
+    }
+
+    // x10 -> addr_xR (register read at T + 2, grouped with xR writes per spec ecsm.toml:658).
     {
         let (val, old_ts) = register_state.read(10);
         let value = pack_register_value(val);
         memw_ops.push(
-            MemwOperation::new(true, 2 * 10, value, t + 1, 2, true)
+            MemwOperation::new(true, 2 * 10, value, t + 2, 2, true)
                 .with_old(value, [old_ts, old_ts, 0, 0, 0, 0, 0, 0]),
         );
-        register_state.write(10, val, t + 1);
-    }
-
-    // EC_SCALAR byte reads of k at T + 1 (one per scalar byte).
-    for offset in 0..32u64 {
-        let addr = addr_k.wrapping_add(offset);
-        let byte = k[offset as usize];
-        let value = [byte as u64, 0, 0, 0, 0, 0, 0, 0];
-        let (_v, old_ts) = memory_state.read_byte(addr);
-        memw_ops.push(
-            MemwOperation::new(false, addr, value, t + 1, 1, true)
-                .with_old(value, [old_ts, 0, 0, 0, 0, 0, 0, 0]),
-        );
-        memory_state.write_byte(addr, byte, t + 1);
+        register_state.write(10, val, t + 2);
     }
 
     // xR writes at T + 2 (4 doublewords).
     for i in 0..4 {
         let addr = addr_xr.wrapping_add((8 * i) as u64);
-        let mut value = [0u64; 8];
+        let mut value = [0u32; 8];
         let mut dword = 0u64;
         for j in 0..8 {
-            value[j] = witness.x_r[8 * i + j] as u64;
+            value[j] = witness.x_r[8 * i + j] as u32;
             dword |= (witness.x_r[8 * i + j] as u64) << (8 * j);
         }
         let (old_vals, old_ts) = memory_state.read_bytes(addr, 8);
@@ -739,7 +931,6 @@ fn collect_ecsm_ops(
         memory_state.write_bytes(addr, dword, 8, t + 2);
     }
 
-    let ec_scalar_ops = ec_scalar::rows_for_scalar(t, addr_k, &witness.k);
     let ecdas_ops = witness
         .steps
         .iter()
@@ -754,17 +945,16 @@ fn collect_ecsm_ops(
         witness,
     };
 
-    (memw_ops, ecsm_op, ec_scalar_ops, ecdas_ops)
+    (memw_ops, ecsm_op, ecdas_ops)
 }
 
-/// Collects register read/write operations (M1, M3, M5) from CpuOperation.
-///
-/// Returns: Vec of MEMW operations for register accesses
-fn collect_register_ops_from_cpu(
+/// Collects register read/write operations (M1, M3, M5) from CpuOperation,
+/// pushing them into `memw_ops`.
+fn collect_register_ops_from_cpu<S: MemwSink>(
     op: &CpuOperation,
     register_state: &mut RegisterState,
-) -> Vec<MemwOperation> {
-    let mut memw_ops = Vec::with_capacity(4);
+    memw_ops: &mut S,
+) {
     let d = &op.decode.fields;
     // These register accesses happen for every real instruction. For non-word
     // rows the main CPU sends the MEMW lookups; for word (`*W`) rows the CPU32
@@ -782,12 +972,18 @@ fn collect_register_ops_from_cpu(
         } else {
             register_state.read(d.rs1)
         };
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp;
+        // Direct fast path: fill a RegRow when routing to MEMW_R; push_reg_access
+        // rebuilds the identical MemwOperation only on the (rare) general/aligned
+        // fallback. Reads leave the value unchanged, so old == new here.
+        memw_ops.push_reg_access(
+            reg_addr,
+            [reg_value[0], reg_value[1]],
+            [reg_value[0], reg_value[1]],
+            ts,
+            old_ts,
+            true,
+        );
         if d.rs1 == 255 {
             register_state.write_pc(op.rv1, op.timestamp);
         } else {
@@ -800,12 +996,15 @@ fn collect_register_ops_from_cpu(
         let reg_value = pack_register_value(op.rv2);
         let reg_addr = 2 * d.rs2 as u64;
         let (_old_val, old_ts) = register_state.read(d.rs2);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 1, 2, true)
-            .with_old(reg_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp + 1;
+        memw_ops.push_reg_access(
+            reg_addr,
+            [reg_value[0], reg_value[1]],
+            [reg_value[0], reg_value[1]],
+            ts,
+            old_ts,
+            true,
+        );
         register_state.write(d.rs2, op.rv2, op.timestamp + 1);
     }
 
@@ -815,20 +1014,21 @@ fn collect_register_ops_from_cpu(
         let reg_addr = 2 * d.rd as u64;
         let (old_val, old_ts) = register_state.read(d.rd);
         let old_value = pack_register_value(old_val);
-        // old_timestamps array is 8 elements but only first 2 are used for registers
-        let old_timestamps = [old_ts, old_ts, 0, 0, 0, 0, 0, 0];
-
-        let memw_op = MemwOperation::new(true, reg_addr, reg_value, op.timestamp + 2, 2, false)
-            .with_old(old_value, old_timestamps);
-        memw_ops.push(memw_op);
+        let ts = op.timestamp + 2;
+        memw_ops.push_reg_access(
+            reg_addr,
+            [reg_value[0], reg_value[1]],
+            [old_value[0], old_value[1]],
+            ts,
+            old_ts,
+            false,
+        );
         register_state.write(d.rd, op.rvd, op.timestamp + 2);
     }
 
     // PC register state update (needed for M1 reads when rs1=255, i.e. AUIPC/JAL).
     // The actual PC read/write is now inline in the CPU via memory bus interactions.
     register_state.write_pc(op.next_pc, op.timestamp + 1);
-
-    memw_ops
 }
 
 // =============================================================================
@@ -1057,11 +1257,18 @@ fn collect_commit_memw_ops(
         let new_index = old_index
             .checked_add(u32::try_from(count).expect("commit_count exceeds u32 range"))
             .expect("commit index exceeds u32 range");
-        let old_value = [old_index as u64, 0, 0, 0, 0, 0, 0, 0];
-        let new_value = [new_index as u64, 0, 0, 0, 0, 0, 0, 0];
+        let old_value = [old_index, 0, 0, 0, 0, 0, 0, 0];
+        let new_value = [new_index, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
-        let memw_op = MemwOperation::new(true, 508, new_value, ts, 1, true)
-            .with_old(old_value, old_timestamps);
+        let memw_op = MemwOperation::new(
+            true,
+            register::register_base_address(254),
+            new_value,
+            ts,
+            1,
+            true,
+        )
+        .with_old(old_value, old_timestamps);
         memw_ops.push(memw_op);
         register_state.write_index(new_index, ts);
     }
@@ -1070,7 +1277,7 @@ fn collect_commit_memw_ops(
     for i in 0..count {
         let addr = buf_addr.wrapping_add(i);
         let (byte_val, old_ts) = memory_state.read_byte(addr);
-        let value = [byte_val as u64, 0, 0, 0, 0, 0, 0, 0];
+        let value = [byte_val as u32, 0, 0, 0, 0, 0, 0, 0];
         let old_timestamps = [old_ts, 0, 0, 0, 0, 0, 0, 0];
         let memw_op =
             MemwOperation::new(false, addr, value, ts, 1, true).with_old(value, old_timestamps);
@@ -1178,10 +1385,10 @@ fn collect_keccak_memw_ops(
             .checked_add(lane_idx as u64 * 8)
             .expect("keccak state address range must be validated by the executor");
 
-        let mut old_bytes = [0u64; 8];
+        let mut old_bytes = [0u32; 8];
         let mut old_timestamps = [0u64; 8];
         for b in 0..8 {
-            old_bytes[b] = (in_lane >> (b * 8)) & 0xFF;
+            old_bytes[b] = ((in_lane >> (b * 8)) & 0xFF) as u32;
             let byte_addr = lane_addr
                 .checked_add(b as u64)
                 .expect("keccak state address range must be validated by the executor");
@@ -1189,9 +1396,9 @@ fn collect_keccak_memw_ops(
             old_timestamps[b] = old_ts;
         }
 
-        let mut value_bytes = [0u64; 8];
+        let mut value_bytes = [0u32; 8];
         for (b, byte) in value_bytes.iter_mut().enumerate() {
-            *byte = (out_lane >> (b * 8)) & 0xFF;
+            *byte = ((out_lane >> (b * 8)) & 0xFF) as u32;
         }
 
         let memw_op = MemwOperation::new(false, lane_addr, value_bytes, ts, 8, true)
@@ -1359,36 +1566,25 @@ pub(crate) fn is_register_op(op: &MemwOperation) -> bool {
     if op.old_timestamp[0] != op.old_timestamp[1] {
         return false;
     }
-    let ts = op.timestamp;
-    let old_ts = op.old_timestamp[0];
-    let ts_lo = ts & 0xFFFF_FFFF;
-    let old_ts_lo = old_ts & 0xFFFF_FFFF;
-    let ts_hi = ts >> 32;
-    let old_ts_hi = old_ts >> 32;
-    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
+    reg_ts_delta_in_range(op.timestamp, op.old_timestamp[0])
 }
 
-/// Collects IS_HALFWORD bitwise lookups for MEMW_R operations.
+/// The timestamp-delta admission test for MEMW_R (conditions 3-5 of `is_register_op`),
+/// factored out so the direct fast path (`push_reg_access`) and the `MemwOperation`
+/// classifier (`is_register_op`) share EXACTLY the same routing logic:
+/// - `ts_hi == old_ts_hi` (upper limbs match)
+/// - `ts_lo > old_ts_lo` (lower-limb ordering)
+/// - `ts_lo - old_ts_lo <= 2^16` (delta fits the IS_HALF range [1, 2^16])
 ///
-/// For each register op: checks that `timestamp[0] - old_timestamp_lo - 1` fits
-/// in a halfword (proving the timestamp delta is in range [1, 2^16]).
-fn collect_bitwise_from_memw_register(ops: &[MemwOperation]) -> Vec<BitwiseOperation> {
-    ops.iter()
-        .map(|op| {
-            let ts_lo = op.timestamp & 0xFFFF_FFFF;
-            let old_ts_lo = op.old_timestamp[0] & 0xFFFF_FFFF;
-            debug_assert!(
-                ts_lo > old_ts_lo,
-                "ts_lo must exceed old_ts_lo (enforced by is_register_op)"
-            );
-            let diff_minus_1 = (ts_lo - old_ts_lo - 1) as u16;
-            BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                (diff_minus_1 & 0xFF) as u8,
-                (diff_minus_1 >> 8) as u8,
-            )
-        })
-        .collect()
+/// The fast path only calls this for width-2 register accesses whose two words share
+/// `old_ts` by construction, so conditions 1-2 of `is_register_op` always hold there.
+#[inline]
+fn reg_ts_delta_in_range(timestamp: u64, old_ts: u64) -> bool {
+    let ts_lo = timestamp & 0xFFFF_FFFF;
+    let old_ts_lo = old_ts & 0xFFFF_FFFF;
+    let ts_hi = timestamp >> 32;
+    let old_ts_hi = old_ts >> 32;
+    ts_hi == old_ts_hi && ts_lo > old_ts_lo && (ts_lo - old_ts_lo) <= 0x10000
 }
 
 // =============================================================================
@@ -1784,34 +1980,21 @@ fn collect_bitwise_from_branch(branch_ops: &[BranchOperation]) -> Vec<BitwiseOpe
 /// Since the CPU bus interactions use Multiplicity::One for range checks,
 /// padding rows also send, so we need matching bitwise ops.
 ///
-/// Per padding row: 1 AreBytes(0,0) for RS1+RS2, 1 AreBytes(0) for RD, and
-/// 12 AreBytes(0,0) for ARG1/ARG2/RES byte pairs = 14 ops.
-fn collect_byte_check_ops_for_padding(num_padding_rows: usize) -> Vec<BitwiseOperation> {
-    if num_padding_rows == 0 {
-        return Vec::new();
-    }
-
-    let mut ops = Vec::with_capacity(num_padding_rows * 14);
-    for _ in 0..num_padding_rows {
-        // The shrunk CPU sends, per row (incl. padding where all values are 0):
-        // 3× ARE_BYTES (rs1/rs2, rd/instruction_length, alu_flags/mem_flags) and
-        // 4× IS_HALF (the four `res` halves).
-        for _ in 0..3 {
-            ops.push(BitwiseOperation::byte_op(
-                BitwiseOperationType::AreBytes,
-                0,
-                0,
-            ));
-        }
-        for _ in 0..4 {
-            ops.push(BitwiseOperation::halfword(
-                BitwiseOperationType::IsHalf,
-                0,
-                0,
-            ));
-        }
-    }
-    ops
+/// Add the BITWISE lookups every CPU padding row sends. A padding row has all
+/// values zero, so per row it sends 3× ARE_BYTES[0,0] (rs1/rs2,
+/// rd/instruction_length, alu_flags/mem_flags) and 4× IS_HALF[0] (the four `res`
+/// halves). Every padding row sends the same lookups, so their whole
+/// contribution is a per-cell count: two `bump_n`s, no per-row work.
+fn add_padding_byte_checks(hist: &mut bitwise::BitwiseHistogram, num_padding_rows: usize) {
+    let n = num_padding_rows as u64;
+    hist.bump_n(
+        BitwiseOperation::byte_op(BitwiseOperationType::AreBytes, 0, 0),
+        3 * n,
+    );
+    hist.bump_n(
+        BitwiseOperation::halfword(BitwiseOperationType::IsHalf, 0, 0),
+        4 * n,
+    );
 }
 
 /// Collects ARE_BYTES lookups from PAGE data (init and fini values).
@@ -1832,67 +2015,130 @@ fn private_input_bytes(private_input: &[u8]) -> Vec<u8> {
         .collect()
 }
 
-fn build_init_page_data(elf: &Elf, private_input: &[u8]) -> HashMap<u64, Vec<u8>> {
-    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-    let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+/// Build the initial-memory image (byte address -> value) from the ELF segments
+/// and the private-input region. Single source of "what memory starts as", read
+/// by both `MemoryState` seeding and PAGE/bitwise init.
+pub(crate) fn build_initial_image(elf: &Elf, private_input: &[u8]) -> HashMap<u64, u8> {
+    let mut image: HashMap<u64, u8> = HashMap::new();
     for segment in &elf.data {
         for (i, &word) in segment.values.iter().enumerate() {
-            let word_addr = segment.base_addr + (i as u64 * 4);
+            let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
             for byte_offset in 0..4u64 {
-                let byte_addr = word_addr + byte_offset;
+                let byte_addr = word_addr.wrapping_add(byte_offset);
                 let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
-                let page_base = page::page_base_for_address(byte_addr);
-                let offset = page::offset_in_page(byte_addr);
-                let page_data = init_page_data
-                    .entry(page_base)
-                    .or_insert_with(|| vec![0u8; page_size]);
-                page_data[offset] = byte_value;
+                image.insert(byte_addr, byte_value);
             }
         }
     }
     if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
         for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
-            let addr = PRIVATE_INPUT_START_INDEX + i as u64;
-            let page_base = page::page_base_for_address(addr);
-            let offset = page::offset_in_page(addr);
-            let page_data = init_page_data
-                .entry(page_base)
-                .or_insert_with(|| vec![0u8; page_size]);
-            page_data[offset] = b;
+            image.insert(PRIVATE_INPUT_START_INDEX + i as u64, b);
         }
+    }
+    image
+}
+
+/// Build the initial-memory image as a dense per-page store instead of a
+/// per-cell `HashMap`. Used by the streaming continuation, which carries the
+/// image across all epochs (so its size matters); the byte values are identical
+/// to [`build_initial_image`]. Unset cells read back as 0.
+pub(crate) fn build_initial_image_paged(elf: &Elf, private_input: &[u8]) -> PagedMem<u8> {
+    let mut image = PagedMem::new(0u8);
+    for segment in &elf.data {
+        for (i, &word) in segment.values.iter().enumerate() {
+            let word_addr = segment.base_addr.wrapping_add(i as u64 * 4);
+            for byte_offset in 0..4u64 {
+                let byte_addr = word_addr.wrapping_add(byte_offset);
+                let byte_value = ((word >> (byte_offset * 8)) & 0xFF) as u8;
+                image.set(byte_addr, byte_value);
+            }
+        }
+    }
+    if !private_input.is_empty() {
+        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+        for (i, &b) in private_input_bytes(private_input).iter().enumerate() {
+            image.set(PRIVATE_INPUT_START_INDEX + i as u64, b);
+        }
+    }
+    image
+}
+
+/// Test helper for computing one epoch's local-to-global touched cells without
+/// building every trace table.
+#[cfg(test)]
+pub(crate) fn epoch_touched_cells<I: ImageSource>(
+    elf: &Elf,
+    initial_image: &I,
+    register_init: &[u32],
+    logs: &[Log],
+) -> Result<Vec<(u64, u64, u64)>, Error> {
+    let instructions = decode::instructions_from_elf(elf)
+        .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
+    let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+
+    let mut memory_state = MemoryState::from_image(initial_image);
+    let mut register_state = RegisterState::from_init(register_init);
+    let _ = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+
+    Ok(touched_cells_from_memory_state(&memory_state))
+}
+
+fn touched_cells_from_memory_state(memory_state: &MemoryState) -> local_to_global::EpochTouches {
+    let mut touched: Vec<(u64, u64, u64)> = memory_state
+        .cells
+        .iter()
+        .filter(|(_, cell)| cell.1 > 0)
+        .map(|(addr, cell)| (addr, cell.0 as u64, cell.1))
+        .collect();
+    touched.sort_by_key(|&(addr, _, _)| addr);
+    touched
+}
+
+/// Bucket an initial-memory image into per-page byte arrays for PAGE init columns.
+pub(crate) fn build_init_page_data<I: ImageSource>(image: &I) -> HashMap<u64, Vec<u8>> {
+    let page_size = page::DEFAULT_PAGE_SIZE;
+    let mut init_page_data: HashMap<u64, Vec<u8>> = HashMap::new();
+    for (addr, value) in image.image_iter() {
+        let page_base = page::page_base_for_address(addr);
+        let offset = page::offset_in_page(addr);
+        let page_data = init_page_data
+            .entry(page_base)
+            .or_insert_with(|| vec![0u8; page_size]);
+        page_data[offset] = value;
     }
     init_page_data
 }
 
-fn collect_bitwise_from_page(
-    elf: &Elf,
+fn collect_bitwise_from_page<I: ImageSource>(
+    image: &I,
     memory_state: &MemoryState,
-    private_input: &[u8],
-) -> Vec<BitwiseOperation> {
+    exclude_touched: bool,
+    hist: &mut bitwise::BitwiseHistogram,
+) {
     use std::collections::BTreeSet;
 
     let page_size = page::DEFAULT_PAGE_SIZE;
-    let mut bitwise_ops = Vec::new();
 
-    let elf_page_data = build_init_page_data(elf, private_input);
+    let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
-    for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
-    }
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
-    // Build final state map from memory_state
+    // Build final state map from memory_state, matching `generate_page_tables`:
+    // when `exclude_touched`, touched cells (timestamp > 0) are dropped so PAGE
+    // emits `fini == init` for them, and the ARE_BYTES multiplicities here must
+    // agree (otherwise the AreBytes bus would not balance).
     let final_state: FinalStateMap = memory_state
         .cells
         .iter()
-        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
+        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
     // For each page and each byte, add ARE_BYTES lookups for init and fini
     for &page_base in &page_bases {
-        let init_data = elf_page_data.get(&page_base);
+        let init_data = init_page_data.get(&page_base);
 
         for offset in 0..page_size {
             let addr = page_base + offset as u64;
@@ -1904,16 +2150,16 @@ fn collect_bitwise_from_page(
             // Get fini value (from final_state or init if never accessed)
             let fini = final_state.get(&addr).map_or(init, |state| state.value);
 
-            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes
-            bitwise_ops.push(BitwiseOperation::byte_op(
+            // C1+C2: ARE_BYTES[init, fini] — batched range check for both bytes.
+            // Bumped straight into the histogram: this loop visits every byte of
+            // every touched page, and the histogram is the only consumer.
+            hist.bump(BitwiseOperation::byte_op(
                 BitwiseOperationType::AreBytes,
                 init,
                 fini,
             ));
         }
     }
-
-    bitwise_ops
 }
 
 // =============================================================================
@@ -2010,13 +2256,10 @@ fn collect_bitwise_from_commit(commit_ops: &[CommitOperation]) -> Vec<BitwiseOpe
 }
 
 // =============================================================================
-// PAGE Table Generation
+// BITWISE lookup helpers
 // =============================================================================
 
-/// Generates PAGE tables for memory initialization and finalization.
-///
-/// Derives all page bases from `memory_state.cells.keys()` — this includes
-/// IS_HALF lookup for a value `v ∈ [0, 2^16)` (split into low/high bytes).
+/// IS_HALF lookup for a value `v in [0, 2^16)` (split into low/high bytes).
 fn is_half_op(v: u16) -> BitwiseOperation {
     BitwiseOperation::halfword(
         BitwiseOperationType::IsHalf,
@@ -2037,20 +2280,27 @@ pub(crate) fn collect_bitwise_from_ecsm(ops: &[ecsm::EcsmOperation]) -> Vec<Bitw
     let mut out = Vec::new();
     for op in ops {
         let w = &op.witness;
-        // IS_BYTE on x2, q0, yG, q1[0..31].
+        // IS_BYTE on x2, q0, yG (32 bytes each) and q1 (33 bytes: 0..=32).
+        // x2/q0/y_g loop stays at 0..32; q1[32] is outside because q1 is 33 bytes
+        // while the others are 32. Do NOT merge into a single loop — extending the
+        // loop bound would push q1[32] twice and break AreBytes bus balance.
         for i in 0..32 {
             out.push(is_byte_op(w.x2[i]));
             out.push(is_byte_op(w.q0[i]));
             out.push(is_byte_op(w.y_g[i]));
             out.push(is_byte_op(w.q1[i]));
         }
+        out.push(is_byte_op(w.q1[32])); // q1[32]: 33rd byte, not covered by the loop above
         // IS_HALF on the shifted carries (i = 0..62).
         for i in 0..63 {
             out.push(is_half_op((w.c0[i] + ecsm::CARRY_OFFSET_X2) as u16));
             out.push(is_half_op((w.c1[i] + ecsm::CARRY_OFFSET_YG) as u16));
         }
-        // IS_HALF on the U256HL limbs of k_sub_N and xR_sub_p.
+        // IS_HALF on the U256HL limbs of xG_sub_p, k_sub_N and xR_sub_p.
         for i in 0..16 {
+            out.push(is_half_op(
+                w.x_g_sub_p[2 * i] as u16 + ((w.x_g_sub_p[2 * i + 1] as u16) << 8),
+            ));
             out.push(is_half_op(
                 w.k_sub_n[2 * i] as u16 + ((w.k_sub_n[2 * i + 1] as u16) << 8),
             ));
@@ -2347,49 +2597,44 @@ pub(crate) fn collect_bitwise_from_keccak(keccak_ops: &[KeccakOperation]) -> Vec
 
 /// every address accessed during execution (ELF init + runtime stores/loads).
 /// ELF pages get their init data from the binary; all others are zero-init.
-fn generate_page_tables(
-    elf: &Elf,
+fn generate_page_tables<I: ImageSource>(
+    image: &I,
     memory_state: &MemoryState,
     private_input: &[u8],
+    exclude_touched: bool,
 ) -> (
     Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     Vec<PageConfig>,
 ) {
     use std::collections::BTreeSet;
 
-    // Collect init data from ELF segments + private input region
-    let init_page_data = build_init_page_data(elf, private_input);
+    // Per-page init bytes from the initial-memory image.
+    let init_page_data = build_init_page_data(image);
 
     // Derive ALL page bases from memory_state (includes ELF + runtime pages)
-    let mut page_bases: BTreeSet<u64> = BTreeSet::new();
-    for &addr in memory_state.cells.keys() {
-        page_bases.insert(page::page_base_for_address(addr));
-    }
+    let page_bases: BTreeSet<u64> = memory_state.cells.page_bases().collect();
 
-    // Build final state map from memory_state
+    // Build final state map from memory_state. When `exclude_touched` (continuation
+    // epoch with L2G bookend), drop touched cells (timestamp > 0) so PAGE self-
+    // cancels them (init == fini, ts == 0) and the local-to-global table owns their
+    // Memory-bus init/fini instead.
     let final_state: FinalStateMap = memory_state
         .cells
         .iter()
-        .map(|(&addr, &(value, timestamp))| (addr, FinalByteState { timestamp, value }))
+        .filter(|(_, cell)| !exclude_touched || cell.1 == 0)
+        .map(|(addr, (value, timestamp))| (addr, FinalByteState { timestamp, value }))
         .collect();
 
     // Generate PAGE tables and configs
     let mut pages = Vec::new();
     let mut page_configs = Vec::new();
 
-    // Determine which page bases hold private input data.
-    let private_input_page_bases: std::collections::BTreeSet<u64> = if !private_input.is_empty() {
-        use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-        let total_bytes = 4 + private_input.len(); // length prefix + data
-        (0..total_bytes)
-            .map(|i| page::page_base_for_address(PRIVATE_INPUT_START_INDEX + i as u64))
-            .collect()
-    } else {
-        std::collections::BTreeSet::new()
-    };
+    // Determine which page bases hold private input data — count-based, via the
+    // shared helpers (single source of truth with the continuation path).
+    let num_private_input_pages = page::private_input_page_count(private_input);
 
     for &page_base in &page_bases {
-        let config = if private_input_page_bases.contains(&page_base) {
+        let config = if page::is_private_input_page(page_base, num_private_input_pages) {
             let init_data = init_page_data.get(&page_base).cloned().unwrap_or_default();
             PageConfig::with_private_input(page_base, init_data)
         } else if let Some(init_data) = init_page_data.get(&page_base) {
@@ -2475,14 +2720,19 @@ pub struct Traces {
     /// ECSM core table (one row per scalar-multiplication ecall)
     pub ecsm: TraceTable<GoldilocksField, GoldilocksExtension>,
 
-    /// EC_SCALAR table (32 rows per ecall)
-    pub ec_scalar: TraceTable<GoldilocksField, GoldilocksExtension>,
-
     /// ECDAS double/add table (variable rows per ecall)
     pub ecdas: TraceTable<GoldilocksField, GoldilocksExtension>,
 
     /// MEMW_R register-only fast-path traces (split into chunks of max_rows::MEMW_R)
     pub memw_registers: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
+    /// Local-to-global boundary table for continuation epochs. Empty unless the
+    /// continuation driver fills it with the boundary derived from
+    /// `touched_memory_cells`.
+    pub local_to_global: TraceTable<GoldilocksField, GoldilocksExtension>,
+    /// Touched cells observed while replaying this epoch's logs, each as
+    /// `(address, end_value, end_timestamp)`. Populated only for continuation
+    /// epochs that use the L2G memory bookend.
+    pub touched_memory_cells: local_to_global::EpochTouches,
     // Auxiliary ALU / memory / CPU32 dispatch chips (split into chunks of their max_rows)
     pub eqs: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
     pub bytewises: Vec<TraceTable<GoldilocksField, GoldilocksExtension>>,
@@ -2496,7 +2746,8 @@ struct CollectedOps {
     cpu_ops: Vec<CpuOperation>,
     memw_ops: Vec<MemwOperation>,
     memw_aligned_ops: Vec<MemwOperation>,
-    memw_register_ops: Vec<MemwOperation>,
+    /// Direct-fill MEMW_R rows (register fast path).
+    memw_register_rows: Vec<RegRow>,
     load_ops: Vec<LoadOperation>,
     lt_ops: Vec<LtOperation>,
     shift_ops: Vec<ShiftOperation>,
@@ -2513,17 +2764,16 @@ struct CollectedOps {
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     // EC scalar-multiplication accelerator chips.
     ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
 }
 
 /// Chunk raw ops and generate one trace table per chunk. When `storage_mode`
 /// is `Disk`, each chunk's main table is spilled to mmap before the next chunk
 /// is built so peak heap usage stays bounded.
-fn chunk_and_generate<T>(
+fn chunk_and_generate<T: Sync>(
     ops: &[T],
     max_rows: usize,
-    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension>,
+    generate: impl Fn(&[T]) -> TraceTable<GoldilocksField, GoldilocksExtension> + Send + Sync,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
 ) -> Result<Vec<TraceTable<GoldilocksField, GoldilocksExtension>>, Error> {
     let op_chunks: Vec<&[T]> = if ops.is_empty() {
@@ -2531,18 +2781,24 @@ fn chunk_and_generate<T>(
     } else {
         ops.chunks(max_rows).collect()
     };
-    let mut tables = Vec::with_capacity(op_chunks.len());
-    for chunk in op_chunks {
-        #[allow(unused_mut)]
-        let mut t = generate(chunk);
-        #[cfg(feature = "disk-spill")]
-        if storage_mode == StorageMode::Disk {
+    // Disk mode generates one chunk at a time so each spills before the next
+    // allocates, keeping trace memory bounded.
+    #[cfg(feature = "disk-spill")]
+    if storage_mode == StorageMode::Disk {
+        let mut tables = Vec::with_capacity(op_chunks.len());
+        for chunk in op_chunks {
+            let mut t = generate(chunk);
             t.main_table
                 .spill_to_disk()
                 .map_err(|e| Error::Prover(format!("disk-spill trace: {e}")))?;
+            tables.push(t);
         }
-        tables.push(t);
+        return Ok(tables);
     }
+    #[cfg(feature = "parallel")]
+    let tables = op_chunks.into_par_iter().map(generate).collect();
+    #[cfg(not(feature = "parallel"))]
+    let tables = op_chunks.into_iter().map(generate).collect();
     Ok(tables)
 }
 
@@ -2553,7 +2809,7 @@ fn chunk_and_generate<T>(
 #[allow(clippy::too_many_arguments)]
 fn collect_all_ops(
     cpu_ops: Vec<CpuOperation>,
-    mut memw_ops: Vec<MemwOperation>,
+    mut memw: MemwBuckets,
     load_ops: Vec<LoadOperation>,
     mut lt_ops: Vec<LtOperation>,
     mut shift_ops: Vec<ShiftOperation>,
@@ -2562,21 +2818,29 @@ fn collect_all_ops(
     keccak_ops: Vec<KeccakOperation>,
     cpu32_ops: Vec<cpu32::Cpu32Operation>,
     ecsm_ops: Vec<ecsm::EcsmOperation>,
-    ec_scalar_ops: Vec<ec_scalar::EcScalarOperation>,
     ecdas_ops: Vec<ecdas::EcdasOperation>,
     register_state: &mut RegisterState,
+    is_final: bool,
 ) -> CollectedOps {
     // HALT finalization: 33 register MEMW operations at timestamp u64::MAX.
     // Must come before Phase 3 (LT from MEMW) so HALT ops get timestamp checks.
-    let halt_memw_ops = collect_halt_ops(register_state);
-    memw_ops.extend(halt_memw_ops);
+    // Only the final epoch terminates; intermediate epochs keep their boundary
+    // register state (no zeroizing) so it can seed the next epoch.
+    if is_final {
+        // Route halt ops through the same classifier; they append to the end of their
+        // buckets.
+        memw.extend_ops(collect_halt_ops(register_state));
+    }
 
-    // Route MEMW_R (register fast-path) first, then MEMW_A (aligned), rest → MEMW.
-    // Order matters: register ops would also pass is_aligned_op, so check first.
-    let (memw_register_ops, memw_ops): (Vec<_>, Vec<_>) =
-        memw_ops.into_iter().partition(is_register_op);
-    let (memw_aligned_ops, memw_ops): (Vec<_>, Vec<_>) =
-        memw_ops.into_iter().partition(is_aligned_op);
+    // The walk (`collect_ops_from_cpu`) already routed every MemwOperation into its bucket at
+    // creation via `MemwBuckets`, so there is no separate routing pass here: the ops are not
+    // moved a second time. Order within each bucket is the walk's insertion order, which the
+    // multiplicity counts depend on being deterministic.
+    let MemwBuckets {
+        register_rows: memw_register_rows,
+        aligned: memw_aligned_ops,
+        general: memw_ops,
+    } = memw;
 
     // Collect BRANCH operations from CPU ops where branch_cond = true
     let branch_ops: Vec<BranchOperation> = cpu_ops
@@ -2681,7 +2945,7 @@ fn collect_all_ops(
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
-        memw_register_ops,
+        memw_register_rows,
         load_ops,
         lt_ops,
         shift_ops,
@@ -2696,37 +2960,39 @@ fn collect_all_ops(
         store_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     }
 }
 
 /// Phases 3-5: From routed ops, produce all traces and assemble `Traces`.
 ///
-/// `elf` controls PAGE table generation: `Some(elf)` generates real PAGE tables
-/// and PAGE bitwise lookups; `None` produces empty page tables.
+/// `initial_image` controls PAGE table generation: `Some(image)` generates real
+/// PAGE tables and PAGE bitwise lookups seeded from the initial-memory image;
+/// `None` produces empty page tables.
 #[allow(clippy::too_many_arguments)]
-fn build_traces(
+fn build_traces<I: ImageSource + Sync>(
     ops: CollectedOps,
-    elf: Option<&Elf>,
+    initial_image: Option<&I>,
     memory_state: &MemoryState,
-    entry_point: u64,
+    register_init: &[u32],
     decode_trace: TraceTable<GoldilocksField, GoldilocksExtension>,
-    decode_pc_to_row: HashMap<u64, usize>,
+    decode_pc_to_row: decode::PcToRow,
     mut register_state: RegisterState,
     max_rows: &super::MaxRowsConfig,
     #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     private_input: &[u8],
+    is_final: bool,
+    l2g_memory_bookend: bool,
 ) -> Result<Traces, Error> {
     let CollectedOps {
         cpu_ops,
         memw_ops,
         memw_aligned_ops,
-        memw_register_ops,
+        memw_register_rows,
         load_ops,
         mut lt_ops,
         shift_ops,
-        mut bitwise_ops,
+        bitwise_ops,
         branch_ops,
         mul_ops,
         dvrm_ops,
@@ -2737,7 +3003,6 @@ fn build_traces(
         store_ops,
         cpu32_ops,
         ecsm_ops,
-        ec_scalar_ops,
         ecdas_ops,
     } = ops;
 
@@ -2750,43 +3015,14 @@ fn build_traces(
     // =====================================================================
     // PHASE 4: All → Bitwise lookups
     // =====================================================================
-    bitwise_ops.extend(collect_bitwise_from_lt(&lt_ops));
-    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass
-    // the same chunk size used to split them into instances (see chunk_and_generate
-    // below) so the BITWISE multiplicity matches the per-instance sends.
-    bitwise_ops.extend(collect_bitwise_from_mul(&mul_ops, max_rows.mul));
-    bitwise_ops.extend(collect_bitwise_from_dvrm(&dvrm_ops, max_rows.dvrm));
-    bitwise_ops.extend(collect_bitwise_from_branch(&branch_ops));
-    bitwise_ops.extend(shift::collect_bitwise_from_shift(&shift_ops));
-    // Auxiliary chips: BYTEWISE sends 8× BYTE_ALU/op; EQ sends 4× IS_HALF + ZERO.
-    for op in &bytewise_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &eq_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    for op in &store_ops {
-        bitwise_ops.extend(op.collect_bitwise_ops());
-    }
-    bitwise_ops.extend(collect_bitwise_from_memw_aligned(&memw_aligned_ops));
-    // MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]
-    bitwise_ops.extend(collect_bitwise_from_memw_register(&memw_register_ops));
-    // PAGE tables do a batched ARE_BYTES[init, fini] lookup per row (C1+C2)
-    if let Some(elf) = elf {
-        bitwise_ops.extend(collect_bitwise_from_page(elf, memory_state, private_input));
-    }
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p4_bitwise_collect");
 
     let public_output_bytes: Vec<u8> = commit_ops
         .iter()
         .filter(|op| !op.end)
         .map(|op| op.value)
         .collect();
-    // COMMIT table sends AreBytes and IsHalfword lookups
-    bitwise_ops.extend(collect_bitwise_from_commit(&commit_ops));
-    // KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL; KECCAK core sends IS_HALF
-    bitwise_ops.extend(collect_bitwise_from_keccak(&keccak_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecsm(&ecsm_ops));
-    bitwise_ops.extend(collect_bitwise_from_ecdas(&ecdas_ops));
 
     // CPU padding rows send ARE_BYTES with all-zero values.
     // Add corresponding ops so the bitwise table multiplicities balance.
@@ -2794,207 +3030,455 @@ fn build_traces(
         .chunks(max_rows.cpu)
         .map(|chunk| chunk.len().next_power_of_two().max(4) - chunk.len())
         .sum();
-    bitwise_ops.extend(collect_byte_check_ops_for_padding(num_padding_rows));
+
+    // The per-source bitwise collectors are all pure functions of their inputs, and the
+    // BITWISE multiplicities are order-independent (they ride a permutation-invariant bus),
+    // so every source can be collected in parallel and the per-worker histograms summed in
+    // any order.
+    //
+    // MUL/DVRM dedup their per-unique bit-gated lookups PER CHIP INSTANCE, so pass the same
+    // chunk size used to split them into instances so multiplicities match the per-instance
+    // sends. MEMW_R sends IS_HALFWORD[timestamp_0 - old_timestamp_lo - 1]. PAGE does a
+    // batched ARE_BYTES[init, fini] per row (skipped in continuation epochs, which the L2G
+    // table owns). COMMIT sends AreBytes+IsHalfword; KECCAK_RND sends XOR/AND/ARE_BYTES/HWSL.
+    // We never concatenate the lookups into one giant `Vec<BitwiseOperation>` (~140 M ops /
+    // ~560 MB at 10-tx whose only consumer is the multiplicity count). Each collector bumps
+    // the `BitwiseHistogram` it is handed: the heavy sources (MEMW_R one-per-row, PAGE
+    // one-per-byte, padding) count directly with no per-source Vec at all, and the small
+    // sources fold their transient `collect_*` Vec in and drop it. The histogram is a
+    // commutative monoid, so per-worker histograms tree-reduce to multiplicities that are
+    // independent of accumulation order.
+    type Collector<'a> = Box<dyn Fn(&mut bitwise::BitwiseHistogram) + Sync + 'a>;
+    let mul_chunk = max_rows.mul;
+    let dvrm_chunk = max_rows.dvrm;
+    // Every source except the two dominant ones (the in-walk lookups and MEMW_R, which are
+    // split into row-ranges in the parallel path below) stays a single whole-source collector.
+    let mut collectors: Vec<Collector> = vec![
+        Box::new(|h| h.add_ops(&collect_bitwise_from_lt(&lt_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_mul(&mul_ops, mul_chunk))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_dvrm(&dvrm_ops, dvrm_chunk))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_branch(&branch_ops))),
+        Box::new(|h| h.add_ops(&shift::collect_bitwise_from_shift(&shift_ops))),
+        Box::new(|h| {
+            for op in &bytewise_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }),
+        Box::new(|h| {
+            for op in &eq_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }),
+        Box::new(|h| {
+            for op in &store_ops {
+                h.add_ops(&op.collect_bitwise_ops());
+            }
+        }),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_memw_aligned(&memw_aligned_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_commit(&commit_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_keccak(&keccak_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecsm(&ecsm_ops))),
+        Box::new(|h| h.add_ops(&collect_bitwise_from_ecdas(&ecdas_ops))),
+        Box::new(|h| add_padding_byte_checks(h, num_padding_rows)),
+    ];
+    if let Some(image) = initial_image
+        && !l2g_memory_bookend
+    {
+        collectors.push(Box::new(move |h| {
+            collect_bitwise_from_page(image, memory_state, l2g_memory_bookend, h)
+        }));
+    }
+
+    let mut base = bitwise::BitwiseHistogram::new();
+
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        // Cap concurrent 80 MiB histograms at `cap` to bound peak memory. The two dominant
+        // sources — the in-walk lookups and MEMW_R (each tens of millions of items) — are
+        // split into ~`cap` row-range slices so they parallelize INTERNALLY instead of each
+        // pinning one core while the rest idle. Every unit (whole collectors + the heavy
+        // slices) is round-robined into exactly `cap` buckets, one histogram each, so the
+        // split heavy work is spread across buckets rather than piled into one.
+        // add_ops/bump/merge form a commutative monoid, so any partition yields
+        // byte-identical multiplicities (same as the serial fallback below).
+        let cap = rayon::current_num_threads().clamp(1, 8);
+        let mut units: Vec<Collector> = Vec::with_capacity(collectors.len() + 2 * cap);
+        let iw_chunk = bitwise_ops.len().div_ceil(cap).max(1);
+        for slice in bitwise_ops.chunks(iw_chunk) {
+            units.push(Box::new(move |h| h.add_ops(slice)));
+        }
+        let reg_chunk = memw_register_rows.len().div_ceil(cap).max(1);
+        for slice in memw_register_rows.chunks(reg_chunk) {
+            units.push(Box::new(move |h| {
+                memw_register::collect_bitwise_from_memw_register(slice, h)
+            }));
+        }
+        units.extend(collectors);
+
+        let mut buckets: Vec<Vec<Collector>> = (0..cap).map(|_| Vec::new()).collect();
+        for (i, unit) in units.into_iter().enumerate() {
+            buckets[i % cap].push(unit);
+        }
+        if let Some(reduced) = buckets
+            .par_iter()
+            .map(|bucket| {
+                let mut h = bitwise::BitwiseHistogram::new();
+                for f in bucket {
+                    f(&mut h);
+                }
+                h
+            })
+            .reduce_with(|mut a, b| {
+                a.merge(&b);
+                a
+            })
+        {
+            base.merge(&reduced);
+        }
+    }
+    #[cfg(not(feature = "parallel"))]
+    {
+        base.add_ops(&bitwise_ops);
+        memw_register::collect_bitwise_from_memw_register(&memw_register_rows, &mut base);
+        for f in &collectors {
+            f(&mut base);
+        }
+    }
+    let bitwise_histogram = base;
+    // The in-walk lookup Vec has been counted into the histogram; free it now.
+    drop(bitwise_ops);
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     // =====================================================================
     // PHASE 5: Generate final traces (parallelized)
     // =====================================================================
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("p5_generate_tables");
 
-    // Extract halt timestamp from the last ECALL instruction
-    let halt_op = cpu_ops
-        .iter()
-        .rev()
-        .find(|op| op.decode.fields.ecall)
-        .ok_or(Error::MissingHaltEcall)?;
-    let halt_timestamp = halt_op.timestamp;
-    let halt_next_pc = halt_op.next_pc;
+    // A monolithic run or the final continuation epoch terminates on the program's
+    // halt ECALL. Intermediate continuation epochs do not halt, so fall back to the
+    // last cycle's timestamp and skip HALT-based PC finalization — the PC is carried
+    // to the next epoch via the register snapshot, and HALT is excluded from the
+    // proof (`include_halt = false`) so `halt_trace` is unused there.
+    let (halt_timestamp, halt_next_pc) = if is_final {
+        let halt_op = cpu_ops
+            .iter()
+            .rev()
+            .find(|op| op.decode.fields.ecall)
+            .ok_or(Error::MissingHaltEcall)?;
+        // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
+        // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
+        // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
+        // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
+        // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
+        // must match that last write to balance the memory argument.
+        register_state.write_pc(1, halt_op.timestamp + 4 * num_padding_rows as u64 + 1);
+        (halt_op.timestamp, halt_op.next_pc)
+    } else {
+        (cpu_ops.last().map(|op| op.timestamp).unwrap_or(0), 0)
+    };
 
-    // Finalize the PC (x255) on the REGISTER table. The CPU padding rows carry
-    // pc=1 and chain the inline-PC `memory` tokens with a +4 timestamp cadence
-    // starting from the HALT chip's emit_pc at `halt_timestamp + 1`; the last
-    // padding write therefore lands at `halt_timestamp + 4*num_padding_rows + 1`
-    // (= `halt_timestamp + 1` when there is no padding). The REGISTER final token
-    // must match that last write to balance the memory argument.
-    register_state.write_pc(1, halt_timestamp + 4 * num_padding_rows as u64 + 1);
-
-    let cpus = chunk_and_generate(
-        &cpu_ops,
-        max_rows.cpu,
-        cpu::generate_cpu_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memws = chunk_and_generate(
-        &memw_ops,
-        max_rows.memw,
-        memw::generate_memw_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memw_aligneds = chunk_and_generate(
-        &memw_aligned_ops,
-        max_rows.memw_aligned,
-        memw_aligned::generate_memw_aligned_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let memw_registers = chunk_and_generate(
-        &memw_register_ops,
-        max_rows.memw_register,
-        memw_register::generate_memw_register_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let loads = chunk_and_generate(
-        &load_ops,
-        max_rows.load,
-        load::generate_load_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let lts = chunk_and_generate(
-        &lt_ops,
-        max_rows.lt,
-        lt::generate_lt_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let shifts = chunk_and_generate(
-        &shift_ops,
-        max_rows.shift,
-        shift::generate_shift_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let muls = chunk_and_generate(
-        &mul_ops,
-        max_rows.mul,
-        mul::generate_mul_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let dvrms = chunk_and_generate(
-        &dvrm_ops,
-        max_rows.dvrm,
-        dvrm::generate_dvrm_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let branches = chunk_and_generate(
-        &branch_ops,
-        max_rows.branch,
-        branch::generate_branch_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-
-    // Auxiliary ALU / memory / CPU32 dispatch chips generated from CPU-derived ops.
-    let eqs = chunk_and_generate::<eq::EqOperation>(
-        &eq_ops,
-        max_rows.eq,
-        eq::generate_eq_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let bytewises = chunk_and_generate::<bytewise::BytewiseOperation>(
-        &bytewise_ops,
-        max_rows.bytewise,
-        bytewise::generate_bytewise_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let stores = chunk_and_generate::<store::StoreOperation>(
-        &store_ops,
-        max_rows.store,
-        store::generate_store_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-    let cpu32s = chunk_and_generate::<cpu32::Cpu32Operation>(
-        &cpu32_ops,
-        max_rows.cpu32,
-        cpu32::generate_cpu32_trace,
-        #[cfg(feature = "disk-spill")]
-        storage_mode,
-    )?;
-
-    let mut bitwise = bitwise::generate_bitwise_trace();
-    bitwise::update_multiplicities(&mut bitwise, &bitwise_ops);
-
-    // Update DECODE multiplicities
-    // Each CPU operation looks up the DECODE table once
-    // Padding rows also look up pc=1 (the CPU padding entry)
-    // When CPU is split, each chunk pads independently
-    let mut decode = decode_trace;
-    let mut decode_lookups: Vec<u64> = cpu_ops.iter().map(|op| op.decode.pc).collect();
-    decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
-    decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
-
-    // Prepare register final state before scope (needs register_state ownership)
     let register_final_state = register_state.to_final_state_map();
 
-    // Generate remaining traces in parallel (page, register, halt, commit).
-    // chunk_and_generate already handled cpu, lt, memw, load, mul, dvrm, branch above.
-    #[allow(unused_mut)]
-    let mut commit_trace = commit::generate_commit_trace(&commit_ops);
-
-    // Generate keccak traces (core table + per-round table + preprocessed RC)
-    let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
-        .iter()
-        .map(|op| KeccakRoundOperation {
-            timestamp: op.timestamp,
-            input: op.input,
-            output: op.output,
-        })
-        .collect();
-    let keccak_trace = keccak::generate_keccak_trace(&keccak_ops);
-    let keccak_rnd_trace = keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops);
-    let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
-    keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
-
-    // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
-    let ecsm_trace = ecsm::generate_ecsm_trace(&ecsm_ops);
-    let ec_scalar_trace = ec_scalar::generate_ec_scalar_trace(&ec_scalar_ops);
-    let ecdas_trace = ecdas::generate_ecdas_trace(&ecdas_ops);
-
-    #[allow(unused_mut)]
-    let (mut pages, page_configs, mut register_trace, mut halt_trace);
-    #[cfg(feature = "parallel")]
-    {
-        let ((pages_val, register_val), halt_val) = rayon::join(
-            || {
-                rayon::join(
-                    || match elf {
-                        Some(elf) => generate_page_tables(elf, memory_state, private_input),
-                        None => (Vec::new(), Vec::new()),
-                    },
-                    || register::generate_register_trace(&register_final_state, entry_point),
-                )
-            },
-            || halt::generate_halt_trace(halt_timestamp, halt_next_pc),
-        );
-        let (pages_v, page_configs_v) = pages_val;
-        pages = pages_v;
-        page_configs = page_configs_v;
-        register_trace = register_val;
-        halt_trace = halt_val;
-    }
-    #[cfg(not(feature = "parallel"))]
-    {
-        match elf {
-            Some(elf) => {
-                let (p, c) = generate_page_tables(elf, memory_state, private_input);
-                pages = p;
-                page_configs = c;
-            }
-            None => {
-                pages = Vec::new();
-                page_configs = Vec::new();
-            }
+    // Each build below reads disjoint op lists and writes its own table, so
+    // they all run in one rayon scope. Disk-spill stays sequential: its
+    // generate→spill order keeps trace memory bounded.
+    let cpu_ops_ref = &cpu_ops;
+    let gen_cpus = || {
+        chunk_and_generate(
+            cpu_ops_ref,
+            max_rows.cpu,
+            cpu::generate_cpu_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memws = || {
+        chunk_and_generate(
+            &memw_ops,
+            max_rows.memw,
+            memw::generate_memw_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memw_aligneds = || {
+        chunk_and_generate(
+            &memw_aligned_ops,
+            max_rows.memw_aligned,
+            memw_aligned::generate_memw_aligned_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_memw_registers = || {
+        // Direct-to-column fill from compact RegRows — the register fast path never
+        // materializes a `Vec<MemwOperation>`.
+        chunk_and_generate(
+            &memw_register_rows,
+            max_rows.memw_register,
+            memw_register::generate_memw_register_trace_from_rows,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_loads = || {
+        chunk_and_generate(
+            &load_ops,
+            max_rows.load,
+            load::generate_load_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_lts = || {
+        chunk_and_generate(
+            &lt_ops,
+            max_rows.lt,
+            lt::generate_lt_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_shifts = || {
+        chunk_and_generate(
+            &shift_ops,
+            max_rows.shift,
+            shift::generate_shift_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_muls = || {
+        chunk_and_generate(
+            &mul_ops,
+            max_rows.mul,
+            mul::generate_mul_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_dvrms = || {
+        chunk_and_generate(
+            &dvrm_ops,
+            max_rows.dvrm,
+            dvrm::generate_dvrm_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_branches = || {
+        chunk_and_generate(
+            &branch_ops,
+            max_rows.branch,
+            branch::generate_branch_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    // Auxiliary ALU / memory / CPU32 dispatch chips. Not yet driven by the CPU
+    // dispatch, so they are generated empty — one padded (μ=0) chunk each, which
+    // contributes nothing to any bus.
+    let gen_eqs = || {
+        chunk_and_generate::<eq::EqOperation>(
+            &eq_ops,
+            max_rows.eq,
+            eq::generate_eq_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_bytewises = || {
+        chunk_and_generate::<bytewise::BytewiseOperation>(
+            &bytewise_ops,
+            max_rows.bytewise,
+            bytewise::generate_bytewise_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_stores = || {
+        chunk_and_generate::<store::StoreOperation>(
+            &store_ops,
+            max_rows.store,
+            store::generate_store_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_cpu32s = || {
+        chunk_and_generate::<cpu32::Cpu32Operation>(
+            &cpu32_ops,
+            max_rows.cpu32,
+            cpu32::generate_cpu32_trace,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    };
+    let gen_bitwise = || {
+        let mut bitwise = bitwise::generate_bitwise_trace();
+        // Fill the MU columns (11..=20) from the accumulated histogram.
+        bitwise_histogram.fill_multiplicities(&mut bitwise);
+        bitwise
+    };
+    // Each CPU operation looks up the DECODE table once; padding rows look up
+    // pc=1 (the CPU padding entry). When CPU is split, each chunk pads
+    // independently.
+    let gen_decode = move || {
+        let mut decode = decode_trace;
+        let mut decode_lookups: Vec<u64> = cpu_ops_ref.iter().map(|op| op.decode.pc).collect();
+        decode_lookups.extend(std::iter::repeat_n(cpu::CPU_PADDING_PC, num_padding_rows));
+        decode::update_multiplicities(&mut decode, &decode_pc_to_row, &decode_lookups);
+        decode
+    };
+    let gen_commit = || commit::generate_commit_trace(&commit_ops);
+    let gen_keccak = || keccak::generate_keccak_trace(&keccak_ops);
+    let gen_keccak_rnd = || {
+        let keccak_rnd_ops: Vec<KeccakRoundOperation> = keccak_ops
+            .iter()
+            .map(|op| KeccakRoundOperation {
+                timestamp: op.timestamp,
+                input: op.input,
+                output: op.output,
+            })
+            .collect();
+        keccak_rnd::generate_keccak_rnd_trace(&keccak_rnd_ops)
+    };
+    let gen_keccak_rc = || {
+        let mut keccak_rc_trace = keccak_rc::generate_keccak_rc_trace();
+        keccak_rc::update_multiplicities(&mut keccak_rc_trace, keccak_ops.len());
+        keccak_rc_trace
+    };
+    let gen_pages = || match initial_image {
+        // Continuation epochs (l2g_memory_bookend) skip PAGE: the L2G table owns
+        // every touched cell's Memory init/fini, and every untouched PAGE row
+        // self-cancels (init==fini, ts=0), so PAGE contributes nothing here.
+        Some(image) if !l2g_memory_bookend => {
+            generate_page_tables(image, memory_state, private_input, l2g_memory_bookend)
         }
-        register_trace = register::generate_register_trace(&register_final_state, entry_point);
-        halt_trace = halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+        _ => (Vec::new(), Vec::new()),
+    };
+    let gen_register = || register::generate_register_trace(&register_final_state, register_init);
+    let gen_halt = || halt::generate_halt_trace(halt_timestamp, halt_next_pc);
+    // ECSM accelerator traces (empty/all-padding for programs that do not use ECSM).
+    let gen_ecsm = || ecsm::generate_ecsm_trace(&ecsm_ops);
+    let gen_ecdas = || ecdas::generate_ecdas_trace(&ecdas_ops);
+
+    let (mut cpus_slot, mut memws_slot, mut memw_aligneds_slot, mut memw_registers_slot) =
+        (None, None, None, None);
+    let (mut loads_slot, mut lts_slot, mut shifts_slot, mut muls_slot) = (None, None, None, None);
+    let (mut dvrms_slot, mut branches_slot, mut bitwise_slot, mut decode_slot) =
+        (None, None, None, None);
+    let (mut commit_slot, mut keccak_slot, mut keccak_rnd_slot, mut keccak_rc_slot) =
+        (None, None, None, None);
+    let (mut pages_slot, mut register_slot, mut halt_slot) = (None, None, None);
+    let (mut eqs_slot, mut bytewises_slot, mut stores_slot, mut cpu32s_slot) =
+        (None, None, None, None);
+    let (mut ecsm_slot, mut ecdas_slot) = (None, None);
+
+    #[cfg(feature = "disk-spill")]
+    let sequential = storage_mode == StorageMode::Disk || cfg!(not(feature = "parallel"));
+    #[cfg(not(feature = "disk-spill"))]
+    let sequential = cfg!(not(feature = "parallel"));
+
+    if !sequential {
+        #[cfg(feature = "parallel")]
+        rayon::scope(|s| {
+            macro_rules! spawn_into {
+                ($slot:ident, $gen:ident) => {{
+                    let slot = &mut $slot;
+                    s.spawn(move |_| *slot = Some($gen()));
+                }};
+            }
+            // Heaviest builds first so the scheduler overlaps them with the rest.
+            spawn_into!(memw_registers_slot, gen_memw_registers);
+            spawn_into!(cpus_slot, gen_cpus);
+            spawn_into!(memws_slot, gen_memws);
+            spawn_into!(lts_slot, gen_lts);
+            spawn_into!(decode_slot, gen_decode);
+            spawn_into!(branches_slot, gen_branches);
+            spawn_into!(bitwise_slot, gen_bitwise);
+            spawn_into!(muls_slot, gen_muls);
+            spawn_into!(memw_aligneds_slot, gen_memw_aligneds);
+            spawn_into!(loads_slot, gen_loads);
+            spawn_into!(shifts_slot, gen_shifts);
+            spawn_into!(dvrms_slot, gen_dvrms);
+            spawn_into!(pages_slot, gen_pages);
+            spawn_into!(keccak_slot, gen_keccak);
+            spawn_into!(keccak_rnd_slot, gen_keccak_rnd);
+            spawn_into!(keccak_rc_slot, gen_keccak_rc);
+            spawn_into!(commit_slot, gen_commit);
+            spawn_into!(register_slot, gen_register);
+            spawn_into!(halt_slot, gen_halt);
+            spawn_into!(eqs_slot, gen_eqs);
+            spawn_into!(bytewises_slot, gen_bytewises);
+            spawn_into!(stores_slot, gen_stores);
+            spawn_into!(cpu32s_slot, gen_cpu32s);
+            spawn_into!(ecsm_slot, gen_ecsm);
+            spawn_into!(ecdas_slot, gen_ecdas);
+        });
+    } else {
+        cpus_slot = Some(gen_cpus());
+        memws_slot = Some(gen_memws());
+        memw_aligneds_slot = Some(gen_memw_aligneds());
+        memw_registers_slot = Some(gen_memw_registers());
+        loads_slot = Some(gen_loads());
+        lts_slot = Some(gen_lts());
+        shifts_slot = Some(gen_shifts());
+        muls_slot = Some(gen_muls());
+        dvrms_slot = Some(gen_dvrms());
+        branches_slot = Some(gen_branches());
+        bitwise_slot = Some(gen_bitwise());
+        decode_slot = Some(gen_decode());
+        commit_slot = Some(gen_commit());
+        keccak_slot = Some(gen_keccak());
+        keccak_rnd_slot = Some(gen_keccak_rnd());
+        keccak_rc_slot = Some(gen_keccak_rc());
+        pages_slot = Some(gen_pages());
+        register_slot = Some(gen_register());
+        halt_slot = Some(gen_halt());
+        eqs_slot = Some(gen_eqs());
+        bytewises_slot = Some(gen_bytewises());
+        stores_slot = Some(gen_stores());
+        cpu32s_slot = Some(gen_cpu32s());
+        ecsm_slot = Some(gen_ecsm());
+        ecdas_slot = Some(gen_ecdas());
     }
+
+    const PHASE5_RAN: &str = "phase 5 generation ran in one of the branches above";
+    let cpus = cpus_slot.expect(PHASE5_RAN)?;
+    let memws = memws_slot.expect(PHASE5_RAN)?;
+    let memw_aligneds = memw_aligneds_slot.expect(PHASE5_RAN)?;
+    let memw_registers = memw_registers_slot.expect(PHASE5_RAN)?;
+    let loads = loads_slot.expect(PHASE5_RAN)?;
+    let lts = lts_slot.expect(PHASE5_RAN)?;
+    let shifts = shifts_slot.expect(PHASE5_RAN)?;
+    let muls = muls_slot.expect(PHASE5_RAN)?;
+    let dvrms = dvrms_slot.expect(PHASE5_RAN)?;
+    let branches = branches_slot.expect(PHASE5_RAN)?;
+    let eqs = eqs_slot.expect(PHASE5_RAN)?;
+    let bytewises = bytewises_slot.expect(PHASE5_RAN)?;
+    let stores = stores_slot.expect(PHASE5_RAN)?;
+    let cpu32s = cpu32s_slot.expect(PHASE5_RAN)?;
+    #[allow(unused_mut)]
+    let mut bitwise = bitwise_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut decode = decode_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut commit_trace = commit_slot.expect(PHASE5_RAN);
+    let keccak_trace = keccak_slot.expect(PHASE5_RAN);
+    let keccak_rnd_trace = keccak_rnd_slot.expect(PHASE5_RAN);
+    let keccak_rc_trace = keccak_rc_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let (mut pages, page_configs) = pages_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut register_trace = register_slot.expect(PHASE5_RAN);
+    #[allow(unused_mut)]
+    let mut halt_trace = halt_slot.expect(PHASE5_RAN);
+    let ecsm_trace = ecsm_slot.expect(PHASE5_RAN);
+    let ecdas_trace = ecdas_slot.expect(PHASE5_RAN);
 
     // Fixed-size and per-page tables aren't built through `chunk_and_generate`,
     // so spill them here before returning.
@@ -3027,6 +3511,18 @@ fn build_traces(
         }
     }
 
+    // Continuation callers derive the real cross-epoch boundary from this set and
+    // install its L2G trace after provenance is applied. Avoid building a
+    // throwaway genesis-only L2G trace here.
+    let touched_memory_cells = if l2g_memory_bookend {
+        touched_cells_from_memory_state(memory_state)
+    } else {
+        Vec::new()
+    };
+    let local_to_global = local_to_global::generate_local_to_global_trace(&[]);
+
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     Ok(Traces {
         cpus,
         bitwise,
@@ -3049,9 +3545,10 @@ fn build_traces(
         keccak_rnd: keccak_rnd_trace,
         keccak_rc: keccak_rc_trace,
         ecsm: ecsm_trace,
-        ec_scalar: ec_scalar_trace,
         ecdas: ecdas_trace,
         memw_registers,
+        local_to_global,
+        touched_memory_cells,
         eqs,
         bytewises,
         stores,
@@ -3115,8 +3612,7 @@ pub fn count_table_lengths(
     let decode_rows = (instructions.len() as u64 + 1).next_power_of_two().max(2);
 
     // Memory + register state for partition predicates that need timestamps.
-    let mut memory_state = MemoryState::from_elf(elf);
-    memory_state.add_private_input(private_input);
+    let mut memory_state = MemoryState::from_image(&build_initial_image(elf, private_input));
     let mut register_state = RegisterState::new(elf.entry_point);
 
     // Raw counts (pre-chunking + pre-padding).
@@ -3138,22 +3634,25 @@ pub fn count_table_lengths(
                           by_width: &mut [usize; 4],
                           aligned: &mut usize,
                           register: &mut usize| {
-        if is_register_op(op) {
-            *register += 1;
-        } else if is_aligned_op(op) {
-            *aligned += 1;
-        } else {
-            let idx = match op.width {
-                1 => 0,
-                2 => 1,
-                4 => 2,
-                8 => 3,
-                _ => return,
-            };
-            by_width[idx] += 1;
+        // Same classifier as the walk's MemwBuckets, so the sizing pass counts
+        // exactly the rows trace generation will produce.
+        match classify_memw(op) {
+            MemwRoute::Register => *register += 1,
+            MemwRoute::Aligned => *aligned += 1,
+            MemwRoute::General => {
+                let idx = match op.width {
+                    1 => 0,
+                    2 => 1,
+                    4 => 2,
+                    8 => 3,
+                    _ => return,
+                };
+                by_width[idx] += 1;
+            }
         }
     };
 
+    let mut reg_memw_scratch: Vec<MemwOperation> = Vec::with_capacity(4);
     for (i, log) in logs.iter().enumerate() {
         let timestamp = (i as u64) * 4 + 4;
         let instruction = instructions
@@ -3185,8 +3684,9 @@ pub fn count_table_lengths(
         }
 
         // Register accesses.
-        let reg_memw_ops = collect_register_ops_from_cpu(&cpu_op, &mut register_state);
-        for memw_op in &reg_memw_ops {
+        reg_memw_scratch.clear();
+        collect_register_ops_from_cpu(&cpu_op, &mut register_state, &mut reg_memw_scratch);
+        for memw_op in &reg_memw_scratch {
             partition_memw(
                 memw_op,
                 &mut memw_by_width,
@@ -3304,7 +3804,6 @@ impl Traces {
         use super::decode::NUM_PRECOMPUTED_COLS as DECODE_PRECOMPUTED;
         use super::decode::cols::NUM_COLUMNS as DECODE_COLS;
         use super::dvrm::cols::NUM_COLUMNS as DVRM_COLS;
-        use super::ec_scalar::cols::NUM_COLUMNS as EC_SCALAR_COLS;
         use super::ecdas::cols::NUM_COLUMNS as ECDAS_COLS;
         use super::ecsm::cols::NUM_COLUMNS as ECSM_COLS;
         use super::eq::cols::NUM_COLUMNS as EQ_COLS;
@@ -3346,7 +3845,6 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             memw_registers,
             eqs,
@@ -3355,6 +3853,8 @@ impl Traces {
             cpu32s,
             page_configs: _,
             public_output_bytes: _,
+            local_to_global: _,
+            touched_memory_cells: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -3412,7 +3912,6 @@ impl Traces {
             total += (t.num_rows() * CPU32_COLS) as u64;
         }
         total += (ecsm.num_rows() * ECSM_COLS) as u64;
-        total += (ec_scalar.num_rows() * EC_SCALAR_COLS) as u64;
         total += (ecdas.num_rows() * ECDAS_COLS) as u64;
         total
     }
@@ -3454,7 +3953,6 @@ impl Traces {
         let n_store = aux_cols(super::store::bus_interactions().len());
         let n_cpu32 = aux_cols(super::cpu32::bus_interactions().len());
         let n_ecsm = aux_cols(super::ecsm::bus_interactions().len());
-        let n_ec_scalar = aux_cols(super::ec_scalar::bus_interactions().len());
         let n_ecdas = aux_cols(super::ecdas::bus_interactions().len());
 
         let Traces {
@@ -3477,7 +3975,6 @@ impl Traces {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             memw_registers,
             eqs,
@@ -3486,6 +3983,8 @@ impl Traces {
             cpu32s,
             page_configs: _,
             public_output_bytes: _,
+            local_to_global: _,
+            touched_memory_cells: _,
         } = self;
 
         let mut total: u64 = 0;
@@ -3543,7 +4042,6 @@ impl Traces {
             total += (t.num_rows() * n_cpu32) as u64;
         }
         total += (ecsm.num_rows() * n_ecsm) as u64;
-        total += (ec_scalar.num_rows() * n_ec_scalar) as u64;
         total += (ecdas.num_rows() * n_ecdas) as u64;
         total
     }
@@ -3576,7 +4074,7 @@ impl Traces {
     pub fn page_configs_from_elf(elf: &Elf) -> Vec<PageConfig> {
         use std::collections::BTreeSet;
 
-        let init_page_data = build_init_page_data(elf, &[]);
+        let init_page_data = build_init_page_data(&build_initial_image(elf, &[]));
 
         let page_bases: BTreeSet<u64> = init_page_data.keys().copied().collect();
 
@@ -3616,16 +4114,12 @@ impl Traces {
         }
 
         // Add private-input pages (non-preprocessed, verifier doesn't know init values)
-        if num_private_input_pages > 0 {
-            use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
-            let first_page_base = page::page_base_for_address(PRIVATE_INPUT_START_INDEX);
-            for i in 0..num_private_input_pages {
-                configs.push(PageConfig {
-                    page_base: first_page_base + i as u64 * page_size as u64,
-                    init_values: None, // Verifier doesn't know these
-                    is_private_input: true,
-                });
-            }
+        for page_base in page::private_input_page_bases(num_private_input_pages) {
+            configs.push(PageConfig {
+                page_base,
+                init_values: None, // Verifier doesn't know these
+                is_private_input: true,
+            });
         }
 
         configs.sort_by_key(|c| c.page_base);
@@ -3689,20 +4183,77 @@ impl Traces {
         private_input: &[u8],
         #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
     ) -> Result<Self, Error> {
+        let initial_image = build_initial_image(elf, private_input);
+        let register_init = register::register_init_from_entry_point(elf.entry_point);
+        Self::from_image_and_logs(
+            elf,
+            &initial_image,
+            &register_init,
+            logs,
+            max_rows,
+            private_input,
+            true,
+            false,
+            #[cfg(feature = "disk-spill")]
+            storage_mode,
+        )
+    }
+
+    /// Build traces for one execution epoch starting from an explicit
+    /// initial-memory image (the epoch's starting memory) rather than the ELF
+    /// image. `elf` is still used for the program code (DECODE) and entry point.
+    ///
+    /// `register_init` is the epoch's starting register image (word address ->
+    /// value): the program-start image for the first epoch, or an epoch's boundary
+    /// register snapshot for later epochs. It seeds both `RegisterState` (for
+    /// first-access old values) and the REGISTER table's init column.
+    ///
+    /// `is_final` marks the last epoch: it applies HALT finalization (zeroize
+    /// registers, require the terminating ECALL). Intermediate epochs (`false`)
+    /// skip HALT and keep their boundary register/memory state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_image_and_logs<I: ImageSource + Sync>(
+        elf: &Elf,
+        initial_image: &I,
+        register_init: &[u32],
+        logs: &[Log],
+        max_rows: &super::MaxRowsConfig,
+        private_input: &[u8],
+        is_final: bool,
+        l2g_memory_bookend: bool,
+        #[cfg(feature = "disk-spill")] storage_mode: StorageMode,
+    ) -> Result<Self, Error> {
+        // A non-final epoch must not contain the program-terminating instruction
+        // (next_pc == 0). Otherwise the CPU sends an ECALL bus token with no HALT
+        // table to receive it (HALT is excluded when !is_final), producing an
+        // unverifiable proof. Fail explicitly instead.
+        if !is_final && logs.iter().any(|log| log.next_pc == 0) {
+            return Err(Error::HaltInNonFinalEpoch);
+        }
+
         // Phase 0: ELF → DECODE + instructions
         // IMPORTANT: Use generate_decode_trace (same as compute_precomputed_commitment)
         // so the DECODE trace row ordering matches the AIR's hardcoded commitment.
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p0_decode");
         let instructions = decode::instructions_from_elf(elf)
             .map_err(|e| Error::Execution(format!("Failed to parse instructions: {e}")))?;
         let (decode_trace, decode_pc_to_row) = decode::generate_decode_trace(&instructions);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 1: Logs → CPU operations
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p1_cpu_ops");
         let cpu_ops = collect_cpu_ops(logs, &instructions)?;
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phase 2: Collect + route all ops
-        let mut memory_state = MemoryState::from_elf(elf);
-        memory_state.add_private_input(private_input);
-        let mut register_state = RegisterState::new(elf.entry_point);
+        let mut memory_state = MemoryState::from_image(initial_image);
+        let mut register_state = RegisterState::from_init(register_init);
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2a_collect_cpu");
         let (
             memw_ops,
             load_ops,
@@ -3713,10 +4264,13 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p2b_collect_all");
         let ops = collect_all_ops(
             cpu_ops,
             memw_ops,
@@ -3728,17 +4282,21 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
             &mut register_state,
+            is_final,
         );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
 
         // Phases 3-5
-        build_traces(
+        #[cfg(feature = "instruments")]
+        let __sp = stark::instruments::span("p3to5_build_traces");
+        let result = build_traces(
             ops,
-            Some(elf),
+            Some(initial_image),
             &memory_state,
-            elf.entry_point,
+            register_init,
             decode_trace,
             decode_pc_to_row,
             register_state,
@@ -3746,7 +4304,12 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             storage_mode,
             private_input,
-        )
+            is_final,
+            l2g_memory_bookend,
+        );
+        #[cfg(feature = "instruments")]
+        drop(__sp);
+        result
     }
 
     /// Generates all traces from execution logs (legacy API).
@@ -3766,6 +4329,7 @@ impl Traces {
         // Phase 2: Collect + route all ops
         let mut memory_state = MemoryState::new();
         let entry_point = cpu_ops.first().map_or(0, |op| op.decode.pc);
+        let register_init = register::register_init_from_entry_point(entry_point);
         let mut register_state = RegisterState::new(entry_point);
         let (
             memw_ops,
@@ -3777,7 +4341,6 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
         ) = collect_ops_from_cpu(&cpu_ops, &mut memory_state, &mut register_state);
 
@@ -3792,9 +4355,9 @@ impl Traces {
             keccak_ops,
             cpu32_ops,
             ecsm_ops,
-            ec_scalar_ops,
             ecdas_ops,
             &mut register_state,
+            true,
         );
 
         // DECODE (from_elf_and_logs does this in Phase 0; same result either way)
@@ -3803,9 +4366,9 @@ impl Traces {
         // Phases 3-5 (elf=None → empty PAGE tables)
         build_traces(
             ops,
-            None,
+            None::<&HashMap<u64, u8>>,
             &memory_state,
-            entry_point,
+            &register_init,
             decode_trace,
             decode_pc_to_row,
             register_state,
@@ -3813,6 +4376,8 @@ impl Traces {
             #[cfg(feature = "disk-spill")]
             StorageMode::Ram,
             &[],
+            true,
+            false,
         )
     }
 }

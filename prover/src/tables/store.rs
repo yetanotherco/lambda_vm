@@ -19,15 +19,13 @@
 //! - `value`: DWordBL (8 bytes) — value to store
 //! - `μ`: multiplicity
 
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::{TransitionConstraint, TransitionConstraintEvaluator};
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
+
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
-use crate::constraints::templates::new_is_bit_constraints;
+use crate::constraints::templates::emit_is_bit;
 
 // =========================================================================
 // Column indices for STORE table
@@ -99,7 +97,7 @@ pub fn generate_store_trace(
 ) -> TraceTable<GoldilocksField, GoldilocksExtension> {
     let num_rows = operations.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -253,85 +251,34 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-source constraint set (ConstraintBuilder front-end)
 // =========================================================================
 
-/// Width-flag constraints for the STORE table.
-pub struct StoreConstraint {
-    constraint_idx: usize,
-    kind: StoreConstraintKind,
-}
+/// The STORE table's transition constraints as a single [`ConstraintSet`]:
+/// - idx 0-3: `IS_BIT` on `write2`, `write4`, `write8`, `μ` (unconditional);
+/// - idx 4:   `(Σ width)·(1 − Σ width) = 0` (width sum is a bit);
+/// - idx 5:   `(Σ width)·(1 − μ) = 0` (width ⇒ μ).
+pub struct StoreConstraints;
 
-#[derive(Debug, Clone, Copy)]
-pub enum StoreConstraintKind {
-    /// `write2 + write4 + write8 ∈ {0, 1}` (at most one width bit set).
-    WidthSumIsBit,
-    /// `(write2 + write4 + write8) ⇒ μ`, i.e. `(Σ width)·(1 − μ) = 0`.
-    WidthImpliesMu,
-}
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for StoreConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        emit_is_bit(b, 0, cols::WRITE2, None);
+        emit_is_bit(b, 1, cols::WRITE4, None);
+        emit_is_bit(b, 2, cols::WRITE8, None);
+        emit_is_bit(b, 3, cols::MU, None);
 
-impl StoreConstraint {
-    pub fn new(kind: StoreConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
+        let w2 = b.main(0, cols::WRITE2);
+        let w4 = b.main(0, cols::WRITE4);
+        let w8 = b.main(0, cols::WRITE8);
+        let sum = w2 + w4 + w8;
+
+        // width sum is bit: sum * (1 - sum)
+        let one = b.one();
+        b.emit_base(4, sum.clone() * (one - sum.clone()));
+
+        // width ⇒ μ: sum * (1 - μ)
+        let one = b.one();
+        let mu = b.main(0, cols::MU);
+        b.emit_base(5, sum * (one - mu));
     }
-}
-
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for StoreConstraint {
-    fn degree(&self) -> usize {
-        2
-    }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        let w2 = step.get_main_evaluation_element(0, cols::WRITE2).clone();
-        let w4 = step.get_main_evaluation_element(0, cols::WRITE4).clone();
-        let w8 = step.get_main_evaluation_element(0, cols::WRITE8).clone();
-        let sum = &w2 + &w4 + &w8;
-        let one = FieldElement::<F>::one();
-        match self.kind {
-            StoreConstraintKind::WidthSumIsBit => &sum * (&one - &sum),
-            StoreConstraintKind::WidthImpliesMu => {
-                let mu = step.get_main_evaluation_element(0, cols::MU).clone();
-                &sum * (&one - &mu)
-            }
-        }
-    }
-}
-
-/// Creates all transition constraints for the STORE table: `IS_BIT` on each
-/// width flag, the width-sum-is-bit constraint, and width ⇒ μ.
-pub fn store_constraints(
-    constraint_idx_start: usize,
-) -> (
-    Vec<Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>>,
-    usize,
-) {
-    let mut constraints: Vec<
-        Box<dyn TransitionConstraintEvaluator<GoldilocksField, GoldilocksExtension>>,
-    > = Vec::new();
-
-    let (is_bit, mut idx) = new_is_bit_constraints(
-        &[cols::WRITE2, cols::WRITE4, cols::WRITE8, cols::MU],
-        constraint_idx_start,
-    );
-    for c in is_bit {
-        constraints.push(c.boxed());
-    }
-
-    constraints.push(StoreConstraint::new(StoreConstraintKind::WidthSumIsBit, idx).boxed());
-    idx += 1;
-    constraints.push(StoreConstraint::new(StoreConstraintKind::WidthImpliesMu, idx).boxed());
-    idx += 1;
-
-    (constraints, idx)
 }

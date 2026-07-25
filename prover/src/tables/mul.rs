@@ -30,17 +30,13 @@
 //! - Receiver: ALU (×2 for lo and hi results — every MUL lookup, CPU
 //!   MUL/MULH dispatch and dvrm's internal `d*q` consistency)
 
-use std::collections::HashMap;
-
-use math::field::element::FieldElement;
-use math::field::traits::{IsField, IsSubFieldOf};
-use stark::constraints::transition::TransitionConstraint;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
-use stark::table::TableView;
 use stark::trace::TraceTable;
 
+use std::collections::HashMap;
+
 use super::types::{
-    BusId, FE, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
+    BusId, GoldilocksExtension, GoldilocksField, INV_2_32, INV_2_64, INV_2_96, INV_2_128,
     NEG_INV_2_16, NEG_INV_2_32, NEG_INV_2_48, NEG_INV_2_64, NEG_INV_2_80, NEG_INV_2_96,
     NEG_INV_2_112, NEG_INV_2_128, SHIFT_16, VmTable, alu_op,
 };
@@ -310,7 +306,7 @@ pub fn generate_mul_trace(
     let unique_ops: Vec<_> = op_map.into_iter().collect();
     let num_rows = unique_ops.len().next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -457,7 +453,7 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 
     // -------------------------------------------------------------------------
     // IS_B20 lookups for carry range checks (multiplicity: mu_lo + mu_hi)
-    // Carries are virtual columns computed as linear combinations:
+    // Carries are virtual (computed inline) as linear combinations:
     //   carry[0] = 2^-32 * (raw_product[0] - res[0])
     //   carry[i] = 2^-32 * (raw_product[i] + carry[i-1] - res[i])
     // where res = [lo_word0, lo_word1, hi_word0, hi_word1]
@@ -684,153 +680,100 @@ pub fn bus_interactions() -> Vec<BusInteraction> {
 }
 
 // =========================================================================
-// Constraints
+// Single-body constraint set (ConstraintSet front-end)
 // =========================================================================
+//
+// One body against the generic `ConstraintBuilder` serves the compiled prover
+// folder, the verifier folder and IR capture. Constraint indices 0..8:
+//   0: SignedIsBit(LHS_SIGNED)  1: SignedIsBit(RHS_SIGNED)
+//   2: LhsSign                  3: RhsSign
+//   4..8: RawProduct(0..4)
 
-/// MUL table constraint kinds.
-#[derive(Debug, Clone, Copy)]
-pub enum MulConstraintKind {
-    /// SIGN constraint for lhs: (1 - lhs_signed) * lhs_is_negative = 0
-    LhsSign,
-    /// SIGN constraint for rhs: (1 - rhs_signed) * rhs_is_negative = 0
-    RhsSign,
-    /// IS_BIT range check on a sign flag column: `x * (1 - x) = 0`. Required
-    /// because `lhs_signed`/`rhs_signed` are used as bus multiplicities, so an
-    /// out-of-range value (e.g. `lhs_signed = 3`) would otherwise be accepted.
-    SignedIsBit(usize),
-    /// Raw product convolution formula for index i
-    RawProduct(usize),
-}
+use stark::constraints::builder::{ConstraintBuilder, ConstraintSet};
 
-/// MUL table constraint.
-pub struct MulConstraint {
-    constraint_idx: usize,
-    kind: MulConstraintKind,
-}
+/// MUL table constraints as a single-source [`ConstraintSet`]. No column
+/// configuration is needed (the MUL layout is fixed via `cols`).
+pub struct MulConstraints;
 
-impl MulConstraint {
-    /// Create a new MUL constraint.
-    pub fn new(kind: MulConstraintKind, constraint_idx: usize) -> Self {
-        Self {
-            constraint_idx,
-            kind,
-        }
+impl MulConstraints {
+    /// `x · (1 − x)` IS_BIT check for a sign-flag column.
+    fn signed_is_bit<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
+        col: usize,
+    ) -> B::Expr {
+        let x = b.main(0, col);
+        let one = b.one();
+        x.clone() * (one - x)
     }
 
-    /// Compute the constraint value.
-    fn compute<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        match self.kind {
-            MulConstraintKind::LhsSign => {
-                // (1 - lhs_signed) * lhs_is_negative = 0
-                let lhs_signed = step
-                    .get_main_evaluation_element(0, cols::LHS_SIGNED)
-                    .clone();
-                let lhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &lhs_signed) * &lhs_is_neg
-            }
-            MulConstraintKind::RhsSign => {
-                // (1 - rhs_signed) * rhs_is_negative = 0
-                let rhs_signed = step
-                    .get_main_evaluation_element(0, cols::RHS_SIGNED)
-                    .clone();
-                let rhs_is_neg = step
-                    .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
-                    .clone();
-                let one = FieldElement::<F>::one();
-                (&one - &rhs_signed) * &rhs_is_neg
-            }
-            MulConstraintKind::SignedIsBit(col) => {
-                // x * (1 - x) = 0
-                let x = step.get_main_evaluation_element(0, col).clone();
-                let one = FieldElement::<F>::one();
-                &x * &(&one - &x)
-            }
-            MulConstraintKind::RawProduct(i) => {
-                // raw_product[i] = convolution formula
-                // This requires computing the sign-extended values and convolution
-                self.compute_raw_product_constraint(i, step)
-            }
-        }
-    }
-
-    /// Compute raw_product constraint for index i.
-    ///
-    /// raw_product[i] = Σ_k=0^1 2^(16k) × Σ_j=0^(2i+k) lhs_ext[j] × rhs_ext[2i+k-j]
-    fn compute_raw_product_constraint<F, E>(
-        &self,
+    /// `raw_product[i] − Σ_k 2^(16k)·Σ_j lhs_ext[j]·rhs_ext[idx−j]` (idx = 2i+k).
+    fn raw_product<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(
+        b: &B,
         i: usize,
-        step: &TableView<F, E>,
-    ) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        // Get lhs halfwords
-        let lhs: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::LHS_0).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_1).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_2).clone(),
-            step.get_main_evaluation_element(0, cols::LHS_3).clone(),
+    ) -> B::Expr {
+        let lhs = [
+            b.main(0, cols::LHS_0),
+            b.main(0, cols::LHS_1),
+            b.main(0, cols::LHS_2),
+            b.main(0, cols::LHS_3),
+        ];
+        let rhs = [
+            b.main(0, cols::RHS_0),
+            b.main(0, cols::RHS_1),
+            b.main(0, cols::RHS_2),
+            b.main(0, cols::RHS_3),
+        ];
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+
+        // Sign-extended values: [0..4] = halfwords, [4..8] = sign_fill * is_neg.
+        // Known redundancy: the two sign-fill products are rebuilt in each of
+        // the four raw_product constraints. Hoisting them was tried and showed
+        // no measurable speedup (ABBA), so the body keeps the declarative form.
+        let sign_fill = b.const_base(SIGN_FILL);
+        let lhs_hi = sign_fill.clone() * lhs_is_neg;
+        let rhs_hi = sign_fill * rhs_is_neg;
+        let lhs_ext: [B::Expr; 8] = [
+            lhs[0].clone(),
+            lhs[1].clone(),
+            lhs[2].clone(),
+            lhs[3].clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi.clone(),
+            lhs_hi,
+        ];
+        let rhs_ext: [B::Expr; 8] = [
+            rhs[0].clone(),
+            rhs[1].clone(),
+            rhs[2].clone(),
+            rhs[3].clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi.clone(),
+            rhs_hi,
         ];
 
-        // Get rhs halfwords
-        let rhs: [FieldElement<F>; 4] = [
-            step.get_main_evaluation_element(0, cols::RHS_0).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_1).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_2).clone(),
-            step.get_main_evaluation_element(0, cols::RHS_3).clone(),
-        ];
-
-        // Get sign bits
-        let lhs_is_neg = step
-            .get_main_evaluation_element(0, cols::LHS_IS_NEGATIVE)
-            .clone();
-        let rhs_is_neg = step
-            .get_main_evaluation_element(0, cols::RHS_IS_NEGATIVE)
-            .clone();
-
-        // Build sign-extended values
-        let sign_fill = FieldElement::<F>::from(SIGN_FILL);
-        let mut lhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-        let mut rhs_ext: [FieldElement<F>; 8] = std::array::from_fn(|_| FieldElement::zero());
-
-        lhs_ext[..4].clone_from_slice(&lhs);
-        rhs_ext[..4].clone_from_slice(&rhs);
-        for j in 4..8 {
-            lhs_ext[j] = &sign_fill * &lhs_is_neg;
-            rhs_ext[j] = &sign_fill * &rhs_is_neg;
-        }
-
-        // Compute convolution sum
-        let shift_16 = FieldElement::<F>::from(SHIFT_16);
-        let mut sum = FieldElement::<F>::zero();
-
-        for k in 0..=1u32 {
-            let idx = 2 * i + k as usize;
+        // Convolution sum.
+        let shift_16 = b.const_base(SHIFT_16);
+        let mut sum = b.zero();
+        for k in 0..=1usize {
+            let idx = 2 * i + k;
             if idx < 8 {
-                let mut inner_sum = FieldElement::<F>::zero();
+                let mut inner_sum = b.zero();
                 for j in 0..=idx {
                     if j < 8 && (idx - j) < 8 {
-                        inner_sum = &inner_sum + &(&lhs_ext[j] * &rhs_ext[idx - j]);
+                        inner_sum = inner_sum + lhs_ext[j].clone() * rhs_ext[idx - j].clone();
                     }
                 }
-                // Multiply by 2^(16*k)
                 if k == 0 {
-                    sum = &sum + &inner_sum;
+                    sum = sum + inner_sum;
                 } else {
-                    sum = &sum + &(&inner_sum * &shift_16);
+                    sum = sum + inner_sum * shift_16.clone();
                 }
             }
         }
 
-        // Constraint: raw_product[i] - sum = 0
         let raw_col = match i {
             0 => cols::RAW_PRODUCT_0,
             1 => cols::RAW_PRODUCT_1,
@@ -838,71 +781,37 @@ impl MulConstraint {
             3 => cols::RAW_PRODUCT_3,
             _ => unreachable!(),
         };
-        let raw_product = step.get_main_evaluation_element(0, raw_col).clone();
-
+        let raw_product = b.main(0, raw_col);
         raw_product - sum
     }
 }
 
-impl TransitionConstraint<GoldilocksField, GoldilocksExtension> for MulConstraint {
-    fn degree(&self) -> usize {
-        match self.kind {
-            // (1 - signed) * is_negative is degree 2
-            MulConstraintKind::LhsSign | MulConstraintKind::RhsSign => 2,
-            // x * (1 - x) is degree 2
-            MulConstraintKind::SignedIsBit(_) => 2,
-            // Raw product: lhs_ext[j] * rhs_ext[idx-j] where each may involve
-            // sign_fill * is_negative (degree 1), so product is degree 2
-            // But we're summing many degree-2 terms, still degree 2
-            MulConstraintKind::RawProduct(_) => 2,
+impl ConstraintSet<GoldilocksField, GoldilocksExtension> for MulConstraints {
+    fn eval<B: ConstraintBuilder<GoldilocksField, GoldilocksExtension>>(&self, b: &mut B) {
+        // idx 0,1: IS_BIT range checks on the sign-flag multiplicities.
+        let is_bit_lhs = Self::signed_is_bit(b, cols::LHS_SIGNED);
+        b.emit_base(0, is_bit_lhs);
+        let is_bit_rhs = Self::signed_is_bit(b, cols::RHS_SIGNED);
+        b.emit_base(1, is_bit_rhs);
+
+        // idx 2: LhsSign: (1 - lhs_signed) * lhs_is_negative
+        let lhs_signed = b.main(0, cols::LHS_SIGNED);
+        let lhs_is_neg = b.main(0, cols::LHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(2, (one - lhs_signed) * lhs_is_neg);
+
+        // idx 3: RhsSign: (1 - rhs_signed) * rhs_is_negative
+        let rhs_signed = b.main(0, cols::RHS_SIGNED);
+        let rhs_is_neg = b.main(0, cols::RHS_IS_NEGATIVE);
+        let one = b.one();
+        b.emit_base(3, (one - rhs_signed) * rhs_is_neg);
+
+        // idx 4..8: raw_product convolution for i = 0..4.
+        for i in 0..4 {
+            let root = Self::raw_product(b, i);
+            b.emit_base(4 + i, root);
         }
     }
-
-    fn constraint_idx(&self) -> usize {
-        self.constraint_idx
-    }
-
-    fn evaluate<F, E>(&self, step: &TableView<F, E>) -> FieldElement<F>
-    where
-        F: IsSubFieldOf<E>,
-        E: IsField,
-    {
-        self.compute(step)
-    }
-}
-
-/// Creates all constraints for the MUL table.
-///
-/// Returns: (constraints, next_constraint_idx)
-pub fn mul_constraints(constraint_idx_start: usize) -> (Vec<MulConstraint>, usize) {
-    let mut idx = constraint_idx_start;
-    let mut constraints = Vec::new();
-
-    // IS_BIT range checks on the sign flags (used as bus multiplicities).
-    constraints.push(MulConstraint::new(
-        MulConstraintKind::SignedIsBit(cols::LHS_SIGNED),
-        idx,
-    ));
-    idx += 1;
-    constraints.push(MulConstraint::new(
-        MulConstraintKind::SignedIsBit(cols::RHS_SIGNED),
-        idx,
-    ));
-    idx += 1;
-
-    // SIGN constraints
-    constraints.push(MulConstraint::new(MulConstraintKind::LhsSign, idx));
-    idx += 1;
-    constraints.push(MulConstraint::new(MulConstraintKind::RhsSign, idx));
-    idx += 1;
-
-    // Raw product constraints for i in 0..4
-    for i in 0..4 {
-        constraints.push(MulConstraint::new(MulConstraintKind::RawProduct(i), idx));
-        idx += 1;
-    }
-
-    (constraints, idx)
 }
 
 // =========================================================================

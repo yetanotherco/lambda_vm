@@ -1,15 +1,16 @@
 use crate::fiat_shamir::is_transcript::{IsStarkTranscript, IsTranscript};
 
+use crate::hash::platform_keccak::PlatformKeccak256 as Keccak256;
 use core::marker::PhantomData;
+use digest::Digest;
 use math::{
     field::{
         element::FieldElement,
         traits::{HasDefaultTranscript, IsField, IsSubFieldOf},
     },
-    traits::ByteConversion,
+    traits::AsBytes,
 };
 use rand_chacha::{ChaCha20Rng, rand_core::SeedableRng};
-use sha3::{Digest, Keccak256};
 
 pub struct DefaultTranscript<F: HasDefaultTranscript> {
     hasher: Keccak256,
@@ -28,7 +29,7 @@ impl<F: HasDefaultTranscript> Clone for DefaultTranscript<F> {
 impl<F> DefaultTranscript<F>
 where
     F: HasDefaultTranscript,
-    FieldElement<F>: ByteConversion,
+    FieldElement<F>: AsBytes,
 {
     pub fn new(data: &[u8]) -> Self {
         let mut res = Self {
@@ -50,7 +51,7 @@ where
 impl<F> Default for DefaultTranscript<F>
 where
     F: HasDefaultTranscript,
-    FieldElement<F>: ByteConversion,
+    FieldElement<F>: AsBytes,
 {
     fn default() -> Self {
         Self::new(&[])
@@ -60,14 +61,14 @@ where
 impl<F> IsTranscript<F> for DefaultTranscript<F>
 where
     F: HasDefaultTranscript,
-    FieldElement<F>: ByteConversion,
+    FieldElement<F>: AsBytes,
 {
     fn append_bytes(&mut self, new_bytes: &[u8]) {
         self.hasher.update(new_bytes);
     }
 
     fn append_field_element(&mut self, element: &FieldElement<F>) {
-        self.append_bytes(&element.to_bytes_be());
+        element.stream_bytes(&mut |b| self.hasher.update(b));
     }
 
     fn state(&self) -> [u8; 32] {
@@ -94,7 +95,7 @@ where
 impl<F, S> IsStarkTranscript<F, S> for DefaultTranscript<F>
 where
     F: HasDefaultTranscript,
-    FieldElement<F>: ByteConversion,
+    FieldElement<F>: AsBytes,
     S: IsField + IsSubFieldOf<F>,
 {
     // nothing to implement: sample_z_ood uses the default body

@@ -11,9 +11,46 @@
 use lambda_vm_prover::test_utils::asm_elf_bytes;
 use lambda_vm_prover::{prove, verify};
 use stark::gpu_lde::{
-    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_deep_calls,
-    gpu_fri_calls, gpu_lde_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
+    gpu_bary_calls, gpu_batch_invert_calls, gpu_comp_poly_tree_calls, gpu_composition_calls,
+    gpu_deep_calls, gpu_device_only_calls, gpu_extend_halves_calls, gpu_fri_calls, gpu_lde_calls,
+    gpu_logup_calls, gpu_opening_gather_calls, gpu_parts_lde_calls, reset_all_gpu_call_counters,
 };
+
+/// The R2 GPU composition-poly path (fused `H = z·Σβᵢ·Cᵢ + boundary`) fires and
+/// yields a verifying proof. Guards both a silent CPU fallback (counter == 0)
+/// and a bad-`H` regression (fires but the proof fails verification).
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_composition_path_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_composition_calls() > 0,
+        "GPU composition path did not fire (tables below threshold or gate fell back to CPU)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (fused composition) failed verification"
+    );
+}
+
+/// The GPU LogUp aux-build path fires and still yields a verifying proof.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_logup_aux_build_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_logup_calls() > 0,
+        "GPU LogUp aux-build path did not fire (tables below threshold or fell back)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "proof failed to verify"
+    );
+}
 
 #[test]
 #[ignore = "requires GPU; run with --ignored --nocapture"]
@@ -36,12 +73,20 @@ fn gpu_path_fires_end_to_end() {
     // path.
     assert!(gpu_bary_calls() > 0, "R3 GPU barycentric did not fire");
 
-    // R2 ext3 LDE of composition-poly parts. Only fires when an AIR's
-    // `number_of_parts > 2`. The branch and shift tables have degree-3
-    // transition constraints, so this triggers on any non-trivial prove.
-    assert!(gpu_parts_lde_calls() > 0, "R2 GPU parts LDE did not fire");
+    // R2 GPU composition-poly LDE. Fires via one of two paths depending on the
+    // AIR's `number_of_parts`: the fused two-halves quotient decomposition for
+    // the common degree-2 case (`== 2`, counted by `gpu_extend_halves_calls`),
+    // or the batched parts LDE for `> 2` (counted by `gpu_parts_lde_calls`).
+    // fib_iterative_1M only exercises the degree-2 path, so assert on either.
+    assert!(
+        gpu_extend_halves_calls() + gpu_parts_lde_calls() > 0,
+        "R2 GPU composition LDE did not fire (neither two-halves d2 nor parts>2 path)"
+    );
 
-    // R2 comp-poly Merkle tree build, paired with the parts LDE above.
+    // R2 comp-poly Merkle tree build. Dispatched unconditionally (independent of
+    // the parts-count branch above), so it fires for the common degree-2 case
+    // too; a silent CPU fallback would still verify, so this counter is what
+    // guards the GPU comp-poly-tree dispatch.
     assert!(
         gpu_comp_poly_tree_calls() > 0,
         "R2 GPU comp-poly tree did not fire"
@@ -65,4 +110,92 @@ fn gpu_path_fires_end_to_end() {
     // actually satisfies the verifier.
     let ok = verify(&proof, &elf).expect("verify");
     assert!(ok, "GPU-produced proof failed verification");
+}
+
+/// Focused validation of the GPU FRI early-termination commit: proves a large
+/// trace (which exceeds the GPU FRI threshold), confirms the GPU FRI commit
+/// path fired, and verifies the resulting proof. Independent of the per-round
+/// counter assertions in `gpu_path_fires_end_to_end` (some of which are
+/// sensitive to AIR/LDE shape and may bit-rot across LDE reworks).
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_fri_commit_produces_verifiable_proof() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_fri_calls() > 0,
+        "GPU FRI commit path did not fire on a 1M-row trace"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (early-termination FRI) failed verification"
+    );
+}
+
+/// Focused validation of the GPU row-pair trace commitment: proves a large
+/// trace with the GPU path and verifies the resulting proof. Independent of the
+/// per-round counter assertions in `gpu_path_fires_end_to_end` (the R2 parts-LDE
+/// assertion bit-rotted on main and cuts off before the verify). A wrong GPU
+/// trace-commit leaf layout (1-row vs the new row-pair) would fail verification.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_proof_verifies_row_pair_commitment() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_lde_calls() > 0,
+        "GPU LDE path did not fire (silent CPU fallback would not test the GPU commit)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (row-pair commitment) failed verification"
+    );
+}
+
+/// The full-residency Stage-2 R4 opening path fires: query row values are
+/// gathered straight off the device LDE (not the host trace) and, guarded by the
+/// in-prover cross-check against the host gather, still yield a verifying proof.
+/// Guards a silent regression where the openings quietly revert to the host
+/// path (which would still verify but drop the data-residency win). The
+/// cross-check `assert_eq!`s inside `open_deep_composition_poly` are
+/// release-active, so a divergent device gather would panic the prove here.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_opening_gather_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_opening_gather_calls() > 0,
+        "device-resident opening gather did not fire (openings fell back to the host LDE)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (device-gathered openings) failed verification"
+    );
+}
+
+/// The full-residency Stage-3 device-only path fires: at least one table keeps
+/// its round-1 LDE device-resident (the host D2H is skipped), and the proof
+/// still verifies. This exercises every `host_trace_empty` hard-abort guard on
+/// the happy path (none may fire) plus the GPU-only R2/R3/R4 paths reading the
+/// device LDE with no host trace behind them. A regression that silently
+/// reverts to the host D2H drops the counter to 0 (while the proof would still
+/// verify), and a mis-gate that forces a host fallback panics one of the guards.
+#[test]
+#[ignore = "requires GPU; run with --ignored --nocapture"]
+fn gpu_device_only_residency_fires_and_verifies() {
+    let elf = asm_elf_bytes("fib_iterative_1M");
+    reset_all_gpu_call_counters();
+    let proof = prove(&elf).expect("prove");
+    assert!(
+        gpu_device_only_calls() > 0,
+        "device-only residency path did not fire (every table kept its host trace)"
+    );
+    assert!(
+        verify(&proof, &elf).expect("verify"),
+        "GPU-produced proof (device-only residency) failed verification"
+    );
 }

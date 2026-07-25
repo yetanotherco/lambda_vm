@@ -43,6 +43,52 @@ pub fn dword_wl(x: u64) -> [FE; 2] {
     [FE::from(x & 0xFFFF_FFFF), FE::from(x >> 32)]
 }
 
+/// Allocate a zeroed `Vec<FE>` via the allocator's calloc path (demand-zeroed OS
+/// pages, touched lazily on first write) instead of the element-wise clone loop
+/// that `vec![FE::zero(); n]` runs. Trace fill is memory-bandwidth-bound, so
+/// skipping the eager zeroing sweep of the (multi-GB) trace is a real win.
+///
+/// Sound because `FE` is `#[repr(transparent)]` over its `u64` base value
+/// (Goldilocks has no Montgomery form), so `FE`'s canonical zero is the all-zero
+/// bit pattern — identical to `0u64`. The `zeroed_fe_vec_matches_fe_zero` test
+/// guards this invariant. Technique borrowed from SP1's `zeroed_f_vec`.
+#[inline]
+pub fn zeroed_fe_vec(len: usize) -> Vec<FE> {
+    const _: () = assert!(core::mem::size_of::<FE>() == core::mem::size_of::<u64>());
+    const _: () = assert!(core::mem::align_of::<FE>() == core::mem::align_of::<u64>());
+    let zeros: Vec<u64> = vec![0u64; len];
+    // Reinterpret the buffer as `Vec<FE>` via its raw parts rather than
+    // `mem::transmute::<Vec<u64>, Vec<FE>>`. `Vec`'s field layout is unspecified
+    // and may depend on its element type, so transmuting one `Vec` to another
+    // relies on that unspecified layout (the std `mem::transmute` docs call this
+    // out and recommend `from_raw_parts`). Rebuilding from `(ptr, len, cap)`
+    // reuses the same allocation and carries no `Vec`-layout assumption.
+    let mut zeros = core::mem::ManuallyDrop::new(zeros);
+    // SAFETY: `FE` is `#[repr(transparent)]` over `u64` with identical size and
+    // alignment (asserted above), and `0u64` is exactly `FE::zero()`'s bit
+    // pattern (Goldilocks has no Montgomery form), so the zeroed `u64` buffer is
+    // a valid `[FE]` of all `FE::zero()`. `len`/`capacity` are element counts and
+    // the element sizes are equal, so they carry over unchanged; the eventual
+    // dealloc uses the same `size * capacity` and alignment as the original
+    // allocation. `ManuallyDrop` stops the source `Vec` from freeing the buffer
+    // that the returned `Vec` now owns.
+    unsafe { Vec::from_raw_parts(zeros.as_mut_ptr() as *mut FE, zeros.len(), zeros.capacity()) }
+}
+
+#[cfg(test)]
+mod zeroed_fe_vec_tests {
+    use super::*;
+
+    /// Guards the `zeroed_fe_vec` invariant: a calloc'd all-zero buffer
+    /// reinterpreted as `Vec<FE>` must equal an element-wise `FE::zero()` fill.
+    #[test]
+    fn zeroed_fe_vec_matches_fe_zero() {
+        for len in [0usize, 1, 7, 64, 1024] {
+            assert_eq!(zeroed_fe_vec(len), vec![FE::zero(); len], "len={len}");
+        }
+    }
+}
+
 /// Decompose a `u64` into its four little-endian 16-bit limbs as field elements:
 /// `[x[0..16], x[16..32], x[32..48], x[48..64]]` (the `DWordHL` column encoding).
 #[inline]
@@ -297,16 +343,22 @@ pub enum BusId {
     Cpu32 = 27,
 
     // =========================================================================
-    // EC scalar multiplication accelerator (ECSM / ECDAS / EC_SCALAR)
+    // EC scalar multiplication accelerator (ECSM / ECDAS)
     // =========================================================================
     /// ECDAS self-referential double/add sequence bus:
     /// (timestamp, xA, yA, xG, yG, round, op). ECSM seeds and drains it.
     Ecdas = 28,
-    /// EC_SCALAR self-referential scalar-byte server bus: (timestamp, ptr, offset).
-    ServeK = 29,
-    /// Scalar-bit bus: EC_SCALAR sends one per set bit (timestamp, bit_index);
-    /// ECDAS receives one per add, ECSM receives the MSB.
+    /// Scalar-bit bus: ECDAS sends Bit[ts, round] per step (mult = next_op);
+    /// ECSM receives Bit[ts, i] for each of the 256 k bits (mult = k[i]),
+    /// and sends Bit[ts, idx_k] for the MSB (mult = μ).
     Bit = 30,
+
+    // =========================================================================
+    // Continuations
+    // =========================================================================
+    /// Cross-epoch memory bus: the local-to-global table's per-cell init/fini
+    /// boundary claims, matched across epochs by the final aggregation LogUp.
+    GlobalMemory = 31,
 }
 
 impl BusId {
@@ -334,8 +386,8 @@ impl BusId {
             BusId::MemoryOp => "MemoryOp",
             BusId::Cpu32 => "Cpu32",
             BusId::Ecdas => "Ecdas",
-            BusId::ServeK => "ServeK",
             BusId::Bit => "Bit",
+            BusId::GlobalMemory => "GlobalMemory",
         }
     }
 }
@@ -366,8 +418,8 @@ impl TryFrom<u64> for BusId {
             26 => Ok(BusId::MemoryOp),
             27 => Ok(BusId::Cpu32),
             28 => Ok(BusId::Ecdas),
-            29 => Ok(BusId::ServeK),
             30 => Ok(BusId::Bit),
+            31 => Ok(BusId::GlobalMemory),
             other => Err(other),
         }
     }

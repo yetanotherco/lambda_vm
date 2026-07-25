@@ -199,6 +199,11 @@ impl IsField for Degree2GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
+    // The base×ext ops run in the constraint-eval hot loop from downstream
+    // crates; these impls are concrete (non-generic), so without the
+    // attribute they compile as cross-crate calls under the default
+    // no-LTO release profile — unlike the #[inline(always)] IsField ops.
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -208,6 +213,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -224,6 +230,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree2GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree2GoldilocksExtensionField as IsField>::BaseType,
@@ -233,6 +240,7 @@ impl IsSubFieldOf<Degree2GoldilocksExtensionField> for GoldilocksField {
         [c0, c1]
     }
 
+    #[inline(always)]
     fn embed(a: Self::BaseType) -> <Degree2GoldilocksExtensionField as IsField>::BaseType {
         [FpE::from_raw(a), FpE::zero()]
     }
@@ -410,6 +418,12 @@ impl IsField for Degree3GoldilocksExtensionField {
 }
 
 impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
+    // The base×ext ops run in the constraint-eval hot loop from downstream
+    // crates (the evaluator's eval·β fold and every LogUp fingerprint term);
+    // these impls are concrete (non-generic), so without the attribute they
+    // compile as cross-crate calls under the default no-LTO release profile —
+    // unlike the #[inline(always)] IsField ops.
+    #[inline(always)]
     fn mul(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -420,6 +434,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    #[inline(always)]
     fn add(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -436,6 +451,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         Ok(<Self as IsSubFieldOf<Degree3GoldilocksExtensionField>>::mul(a, &b_inv))
     }
 
+    #[inline(always)]
     fn sub(
         a: &Self::BaseType,
         b: &<Degree3GoldilocksExtensionField as IsField>::BaseType,
@@ -446,6 +462,7 @@ impl IsSubFieldOf<Degree3GoldilocksExtensionField> for GoldilocksField {
         [c0, c1, c2]
     }
 
+    #[inline(always)]
     fn embed(a: Self::BaseType) -> <Degree3GoldilocksExtensionField as IsField>::BaseType {
         [FpE::from_raw(a), FpE::zero(), FpE::zero()]
     }
@@ -536,6 +553,21 @@ impl ByteConversion for FieldElement<Degree3GoldilocksExtensionField> {
 impl AsBytes for FieldElement<Degree3GoldilocksExtensionField> {
     fn as_bytes(&self) -> alloc::vec::Vec<u8> {
         self.to_bytes_be()
+    }
+
+    // Same 24 bytes as `as_bytes`, staged in a stack buffer so the guest skips
+    // the per-element `Vec`; `#[inline(always)]` is what lets the `dyn` sink
+    // devirtualize at the call site. Emitting them in one call rather than one
+    // per limb keeps it to a single `Digest::update`.
+    //
+    // The layout is load-bearing beyond this crate: `math-cuda`'s
+    // `keccak_leaves_ext3` kernel reads components in order 0,1,2 to match
+    // `write_bytes_be`, and CPU/GPU leaf parity depends on the two agreeing.
+    #[inline(always)]
+    fn stream_bytes(&self, sink: &mut dyn FnMut(&[u8])) {
+        let mut buf = [0u8; 24];
+        ByteConversion::write_bytes_be(self, &mut buf);
+        sink(&buf);
     }
 }
 

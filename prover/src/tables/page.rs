@@ -32,13 +32,13 @@
 
 use std::collections::HashMap;
 
-use math::fft::bit_reversing::in_place_bit_reverse_permute;
 use math::polynomial::Polynomial;
-use stark::config::{BatchedMerkleTree, Commitment};
+use stark::commitment::{ROWS_PER_LEAF, commit_bit_reversed};
+use stark::config::Commitment;
 use stark::lookup::{BusInteraction, BusValue, LinearTerm, Multiplicity, Packing};
 use stark::proof::options::ProofOptions;
 use stark::prover::evaluate_polynomial_on_lde_domain;
-use stark::trace::{TraceTable, columns2rows};
+use stark::trace::TraceTable;
 
 use super::types::{BusId, FE, GoldilocksExtension, GoldilocksField, VmTable};
 
@@ -138,7 +138,13 @@ impl PageConfig {
     }
 
     /// Create a page with initial values from private input data.
-    /// These pages are NOT preprocessed — the verifier never sees the init values.
+    ///
+    /// These pages are built NON-preprocessed, so INIT is a committed main-trace column
+    /// enforced by the GlobalMemory bus rather than recomputed from the ELF. Privacy comes
+    /// from that (the raw input is neither bundled nor recomputed by the verifier), NOT from
+    /// this constructor: the verifier rebuilds the config from the ELF alone and never consults
+    /// the `data` argument for a private page (it passes an empty vec). Not a ZK/hiding claim —
+    /// the committed column is still opened at STARK query positions.
     pub fn with_private_input(page_base: u64, data: Vec<u8>) -> Self {
         assert!(data.len() <= DEFAULT_PAGE_SIZE, "Data exceeds page size");
         Self {
@@ -147,6 +153,71 @@ impl PageConfig {
             is_private_input: true,
         }
     }
+}
+
+// =========================================================================
+// Private-input page math (shared by the monolithic and continuation paths)
+// =========================================================================
+
+/// Number of pages the private input occupies, starting at
+/// `PRIVATE_INPUT_START_INDEX`. The wire format is the 4-byte length prefix plus
+/// the data ([`Memory::store_private_inputs`]), and `PRIVATE_INPUT_START_INDEX` is
+/// page-aligned, so the span is `ceil((prefix + len) / page_size)` consecutive
+/// pages (0 when there is no input).
+///
+/// SINGLE source of truth: the monolithic trace builder, the continuation prover,
+/// and both verifiers' classification all derive from this count — a divergence
+/// would make one path build a private page preprocessed (ELF-recomputed) while
+/// the other commits it, which is a soundness bug, so do not reimplement it.
+///
+/// [`Memory::store_private_inputs`]: executor::vm::memory::Memory::store_private_inputs
+pub(crate) fn private_input_page_count(private_inputs: &[u8]) -> usize {
+    use executor::vm::memory::PRIVATE_INPUT_LENGTH_PREFIX_BYTES;
+    if private_inputs.is_empty() {
+        return 0;
+    }
+    (PRIVATE_INPUT_LENGTH_PREFIX_BYTES + private_inputs.len()).div_ceil(DEFAULT_PAGE_SIZE)
+}
+
+/// Whether `page_base` is one of the first `num_private_input_pages` pages starting
+/// at `PRIVATE_INPUT_START_INDEX` — the page-aligned span private input actually
+/// occupies (see [`private_input_page_count`]). Classifying by the count (not the
+/// raw `[START, START+MAX_PRIVATE_INPUT_SIZE)` byte range) keeps prover and
+/// verifier in lockstep regardless of whether the region end is page-aligned.
+///
+/// NOTE: a page classified private is built non-preprocessed, so its genesis is NOT
+/// recomputed from the ELF. This is safe because the private-input area is reserved
+/// and the reservation is enforced: `Elf::load` rejects any loadable segment
+/// reaching at/above `PRIVATE_INPUT_START_INDEX`
+/// (`ElfError::SegmentInPrivateInputRegion`) — covering every page this function
+/// can classify private — so no ELF-declared data can live there and have its
+/// genesis go unbound.
+pub(crate) fn is_private_input_page(page_base: u64, num_private_input_pages: usize) -> bool {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    let page_size = DEFAULT_PAGE_SIZE as u64;
+    let end = PRIVATE_INPUT_START_INDEX + num_private_input_pages as u64 * page_size;
+    (PRIVATE_INPUT_START_INDEX..end).contains(&page_base)
+}
+
+/// The page bases of the first `num_private_input_pages` private-input pages, in
+/// ascending order — the enumeration counterpart of [`is_private_input_page`]
+/// (`is_private_input_page(b, n)` holds exactly for the aligned bases this yields).
+pub(crate) fn private_input_page_bases(
+    num_private_input_pages: usize,
+) -> impl Iterator<Item = u64> {
+    use executor::vm::memory::PRIVATE_INPUT_START_INDEX;
+    let page_size = DEFAULT_PAGE_SIZE as u64;
+    (0..num_private_input_pages as u64).map(move |i| PRIVATE_INPUT_START_INDEX + i * page_size)
+}
+
+/// Upper bound on `num_private_input_pages` any honest proof can claim: the span of
+/// a MAX-size input including its length prefix — no slack (an honest max-size
+/// input occupies exactly this many pages). Both the monolithic and continuation
+/// verifiers bound the deserialized, untrusted count with this before sizing AIRs.
+pub(crate) fn max_private_input_pages() -> usize {
+    use executor::vm::memory::{MAX_PRIVATE_INPUT_SIZE, PRIVATE_INPUT_LENGTH_PREFIX_BYTES};
+    (MAX_PRIVATE_INPUT_SIZE as usize + PRIVATE_INPUT_LENGTH_PREFIX_BYTES)
+        .div_ceil(DEFAULT_PAGE_SIZE)
 }
 
 // =========================================================================
@@ -178,7 +249,7 @@ pub fn generate_page_trace(
 
     let num_rows = page_size; // One row per byte in the page
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );
@@ -250,19 +321,19 @@ pub fn generate_page_trace(
 pub(crate) fn static_zero_page_commitment(blowup_factor: u8) -> Option<Commitment> {
     match blowup_factor {
         2 => Some([
-            0xf9, 0x80, 0x0e, 0x45, 0x72, 0x5a, 0x8e, 0x8e, 0x5e, 0xd7, 0x5b, 0x60, 0xce, 0xd0,
-            0x8e, 0xa3, 0x27, 0x3b, 0x8a, 0xb5, 0x98, 0xc0, 0xe3, 0x16, 0xf6, 0x86, 0x75, 0x39,
-            0x4c, 0xe5, 0x88, 0x5e,
+            0x7d, 0x74, 0x85, 0xf0, 0x2b, 0x74, 0xe0, 0x3f, 0x14, 0x99, 0xb3, 0xa0, 0x5f, 0x1d,
+            0x6e, 0xf2, 0x21, 0xff, 0xaf, 0x24, 0x7e, 0x30, 0xb0, 0xda, 0x48, 0x79, 0xe1, 0x43,
+            0xee, 0xea, 0x6a, 0x0f,
         ]),
         4 => Some([
-            0x0f, 0xb5, 0x0c, 0xa8, 0x3b, 0x69, 0x4f, 0x91, 0x60, 0xbf, 0x0d, 0x0d, 0xd3, 0x33,
-            0x25, 0x38, 0x11, 0xbb, 0xf8, 0xfd, 0x54, 0xbd, 0x06, 0x7d, 0xd1, 0xeb, 0xa3, 0x58,
-            0xe8, 0x37, 0x45, 0x56,
+            0x5c, 0xcc, 0x5b, 0xb1, 0xe8, 0x11, 0x91, 0x81, 0xbd, 0xdd, 0x39, 0x40, 0x77, 0x87,
+            0xdc, 0x98, 0x06, 0x06, 0x8c, 0x63, 0xcd, 0xfd, 0xf1, 0xda, 0x4a, 0x55, 0x31, 0x4d,
+            0x6a, 0x16, 0x18, 0xd0,
         ]),
         8 => Some([
-            0x4a, 0xfb, 0xc9, 0x6d, 0x46, 0x29, 0xa3, 0xc2, 0x36, 0x14, 0xd8, 0x24, 0x3e, 0xef,
-            0x97, 0x3f, 0xe1, 0xda, 0x2b, 0xf7, 0x87, 0xb6, 0x54, 0xe1, 0xc6, 0x46, 0xc0, 0x85,
-            0x96, 0x7f, 0x7f, 0x48,
+            0xf0, 0xc0, 0x69, 0xed, 0xf8, 0x59, 0xd6, 0x56, 0x15, 0x3c, 0x2f, 0x93, 0x65, 0xd6,
+            0xe9, 0xe9, 0x8e, 0xd1, 0x83, 0x94, 0xf9, 0x75, 0x59, 0xd1, 0xec, 0x16, 0xe1, 0x37,
+            0xd5, 0x32, 0xd6, 0xd9,
         ]),
         _ => None,
     }
@@ -290,8 +361,8 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
     //   bytes loaded from the binary. Either way the column is fully determined
     //   before execution, so the verifier can check it against a preprocessed
     //   commitment instead of including it in the main trace.
-    let mut offset_col = vec![FE::zero(); num_rows];
-    let mut init_col = vec![FE::zero(); num_rows];
+    let mut offset_col = crate::tables::types::zeroed_fe_vec(num_rows);
+    let mut init_col = crate::tables::types::zeroed_fe_vec(num_rows);
 
     for i in 0..page_size {
         offset_col[i] = FE::from(i as u64);
@@ -315,7 +386,7 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
 
     let blowup_factor = options.blowup_factor as usize;
     let coset_offset = FE::from(options.coset_offset);
-    let mut lde_columns: Vec<Vec<FE>> = polys
+    let lde_columns: Vec<Vec<FE>> = polys
         .iter()
         .map(|poly| {
             evaluate_polynomial_on_lde_domain(poly, blowup_factor, num_rows, &coset_offset)
@@ -323,14 +394,9 @@ pub fn compute_precomputed_commitment(config: &PageConfig, options: &ProofOption
         })
         .collect();
 
-    for col in lde_columns.iter_mut() {
-        in_place_bit_reverse_permute(col);
-    }
-
-    let lde_rows = columns2rows(lde_columns);
-    let tree = BatchedMerkleTree::<GoldilocksField>::build(&lde_rows)
+    let (_, root) = commit_bit_reversed(&lde_columns, ROWS_PER_LEAF)
         .expect("Failed to build Merkle tree for page LDE");
-    tree.root
+    root
 }
 
 /// Returns the zero-init PAGE preprocessed commitment.

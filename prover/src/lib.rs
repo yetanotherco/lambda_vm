@@ -13,10 +13,14 @@
 #[cfg(feature = "disk-spill")]
 pub mod auto_storage;
 pub mod constraints;
+pub mod continuation;
 #[cfg(feature = "debug-checks")]
 mod debug_report;
 #[cfg(feature = "instruments")]
 pub mod instruments;
+mod paged_mem;
+pub use stark::profile_markers;
+pub mod recursion;
 mod statement;
 pub mod tables;
 pub mod test_utils;
@@ -30,14 +34,13 @@ use crypto::fiat_shamir::is_transcript::IsTranscript;
 use executor::elf::Elf;
 use executor::vm::execution::Executor;
 use math::field::element::FieldElement;
-use stark::config::Commitment;
 use stark::prover::{IsStarkProver, Prover};
 #[cfg(feature = "disk-spill")]
 use stark::storage_mode::StorageMode;
 use stark::traits::AIR;
 use stark::verifier::{IsStarkVerifier, Verifier};
 
-use crate::statement::absorb_statement;
+use crate::statement::{StatementKind, absorb_statement, absorb_statement_with_digest};
 pub use crate::tables::MaxRowsConfig;
 use crate::tables::bitwise;
 use crate::tables::decode;
@@ -49,21 +52,27 @@ use crate::tables::trace_builder::count_table_lengths;
 use crate::tables::types::BusId;
 use crate::test_utils::{
     E, F, VmAir, create_bitwise_air, create_branch_air, create_bytewise_air, create_commit_air,
-    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ec_scalar_air,
-    create_ecdas_air, create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air,
-    create_keccak_rc_air, create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
+    create_cpu_air, create_cpu32_air, create_decode_air, create_dvrm_air, create_ecdas_air,
+    create_ecsm_air, create_eq_air, create_halt_air, create_keccak_air, create_keccak_rc_air,
+    create_keccak_rnd_air, create_load_air, create_lt_air, create_memw_air,
     create_memw_aligned_air, create_memw_register_air, create_mul_air, create_page_air,
     create_register_air, create_shift_air, create_store_air,
 };
 
-use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
+// Re-exported for downstream hosts and verifier guests (e.g. the in-VM
+// recursion guest): `Commitment` is carried in the guest's private input
+// (see `GuestInput`); the proof-options types name the parameters
+// fixed at guest build time (`recursion::Preset`).
+pub use stark::config::Commitment;
+pub use stark::proof::options::{GoldilocksCubicProofOptions, ProofOptions};
 use stark::proof::stark::MultiProof;
+use stark::proof::view::{MultiProofView, ProofViewSource};
 
 /// A run-length encoded range of contiguous zero-initialized 4KB pages.
 ///
 /// Represents `count` contiguous pages starting at `base`, used for
 /// runtime-allocated memory (stack, heap) not covered by ELF segments.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct RuntimePageRange {
     /// Base address of the first page (4KB-aligned).
     pub base: u64,
@@ -73,12 +82,12 @@ pub struct RuntimePageRange {
 
 /// Number of tables that always contribute exactly one sub-proof, regardless
 /// of `TableCounts`: bitwise, decode, halt, commit, keccak, keccak_rnd,
-/// keccak_rc, register, ecsm, ec_scalar, ecdas.
-pub const FIXED_TABLE_COUNT: usize = 11;
+/// keccak_rc, register, ecsm, ecdas.
+pub const FIXED_TABLE_COUNT: usize = 10;
 
 /// Number of chunks for each split table.
 /// The verifier needs this to reconstruct matching AIRs.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct TableCounts {
     pub cpu: usize,
     pub lt: usize,
@@ -150,7 +159,7 @@ impl TableCounts {
 
 /// A complete VM proof bundle containing the STARK proof and metadata
 /// needed by the verifier to reconstruct the AIR configuration.
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct VmProof {
     /// The multi-table STARK proof.
     pub proof: MultiProof<F, E, ()>,
@@ -169,6 +178,241 @@ pub struct VmProof {
     pub num_private_input_pages: usize,
 }
 
+/// The private-input bundle the recursion verifier guest consumes: an inner
+/// proof plus the DECODE/ELF-data-page commitments supplied instead of
+/// recomputed in-VM (see `bench_vs/lambda/recursion`), and the inner ELF bytes
+/// needed to reconstruct the AIRs and (via `statement::program_id_from_elf`)
+/// bind the supplied roots to a program identity.
+///
+/// Archived as one rkyv blob so the guest reads every field straight from the
+/// input buffer with no deserialization pass.
+#[derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct GuestInput {
+    pub vm_proof: VmProof,
+    pub inner_elf: Vec<u8>,
+    pub decode_commitment: Commitment,
+    pub page_commitments: Vec<(u64, Commitment)>,
+}
+
+// ============================================================================
+// Recursion-input wire format: aligning magic prefix + rkyv archive
+// ============================================================================
+//
+// The guest reads the archive in place with naturally-aligned loads (archived
+// field elements are 8-aligned; we require 16 for headroom), and the executor
+// traps unaligned doubleword loads. The executor maps the private input as
+// `[u32 len][payload...]` with the payload at `PRIVATE_INPUT_START + 4`, which
+// is only 4-aligned. A fixed prefix pads the payload so the archive that
+// follows lands 16-aligned, and doubles as a magic + version tag the guest
+// validates before the unsafe access.
+
+/// 4-byte magic identifying a lambda-vm recursion input blob ("LVMR").
+pub const RECURSION_INPUT_MAGIC: [u8; 4] = *b"LVMR";
+
+/// Wire-format version of the recursion input blob.
+pub const RECURSION_INPUT_VERSION: u32 = 1;
+
+/// Required alignment (bytes) of the archive's first byte in guest memory.
+pub const RECURSION_INPUT_ALIGN: usize = 16;
+
+/// Aligning prefix length: `magic(4) + version(4) + reserved(4) = 12` bytes,
+/// chosen so the archive starts 16-aligned given the executor's
+/// `PRIVATE_INPUT_START + 4` payload base. Asserted below.
+pub const RECURSION_INPUT_PREFIX_LEN: usize = 12;
+
+const _: () = {
+    let payload_base = (executor::vm::memory::PRIVATE_INPUT_START_INDEX as usize) + 4;
+    let pad =
+        (RECURSION_INPUT_ALIGN - (payload_base % RECURSION_INPUT_ALIGN)) % RECURSION_INPUT_ALIGN;
+    assert!(
+        RECURSION_INPUT_PREFIX_LEN == pad,
+        "prefix length must align the archive to RECURSION_INPUT_ALIGN given the private-input payload base",
+    );
+    assert!(
+        (payload_base + RECURSION_INPUT_PREFIX_LEN).is_multiple_of(RECURSION_INPUT_ALIGN),
+        "archive must start at a RECURSION_INPUT_ALIGN-aligned guest address",
+    );
+};
+
+/// Encode a [`GuestInput`] into the on-wire blob: a 12-byte
+/// `magic + version + reserved` prefix followed by the rkyv archive. The prefix
+/// both aligns the archive in guest memory (so in-place reads don't trap) and
+/// tags the format/version so the guest can validate before the unsafe access.
+pub fn encode_recursion_input(input: &GuestInput) -> Result<Vec<u8>, Error> {
+    let archive = rkyv::to_bytes::<rkyv::rancor::Error>(input)
+        .map_err(|e| Error::Execution(format!("rkyv encode failed: {e}")))?;
+    let mut blob = Vec::with_capacity(RECURSION_INPUT_PREFIX_LEN + archive.len());
+    blob.extend_from_slice(&RECURSION_INPUT_MAGIC);
+    blob.extend_from_slice(&RECURSION_INPUT_VERSION.to_le_bytes());
+    blob.extend_from_slice(&[0u8; 4]); // reserved
+    debug_assert_eq!(blob.len(), RECURSION_INPUT_PREFIX_LEN);
+    blob.extend_from_slice(&archive);
+    Ok(blob)
+}
+
+/// Validate the wire prefix and return the archive bytes (zero-copy slice).
+/// Returns `None` if the magic or version doesn't match — the caller should
+/// halt cleanly rather than proceed into an `access_unchecked`.
+pub fn recursion_archive_bytes(blob: &[u8]) -> Option<&[u8]> {
+    if blob.len() < RECURSION_INPUT_PREFIX_LEN {
+        return None;
+    }
+    if blob[0..4] != RECURSION_INPUT_MAGIC {
+        return None;
+    }
+    let version = u32::from_le_bytes([blob[4], blob[5], blob[6], blob[7]]);
+    if version != RECURSION_INPUT_VERSION {
+        return None;
+    }
+    Some(&blob[RECURSION_INPUT_PREFIX_LEN..])
+}
+
+/// Validate a recursion-input blob's wire prefix and bytecheck-validate its
+/// archive, in place. Shared by [`verify_recursion_blob`] and
+/// [`crate::recursion::verify_continuation_and_attest`].
+///
+/// Returns the archived value, the original (possibly-unaligned) archive
+/// bytes, and the base pointer `archived` reads from — callers rebasing
+/// zero-copy subslices back onto `blob` need that base.
+pub(crate) fn access_recursion_archive<'s, 'a: 's, T>(
+    blob: &'a [u8],
+    aligned_fallback: &'s mut rkyv::util::AlignedVec<RECURSION_INPUT_ALIGN>,
+) -> Result<(&'s T, &'a [u8], *const u8), Error>
+where
+    T: rkyv::Portable
+        + for<'b> rkyv::bytecheck::CheckBytes<rkyv::api::high::HighValidator<'b, rkyv::rancor::Error>>,
+{
+    let archive_bytes: &'a [u8] = recursion_archive_bytes(blob)
+        .ok_or_else(|| Error::Execution(String::from("recursion blob: bad magic or version")))?;
+
+    let archive: &'s [u8] =
+        if (archive_bytes.as_ptr() as usize).is_multiple_of(RECURSION_INPUT_ALIGN) {
+            archive_bytes
+        } else {
+            aligned_fallback.extend_from_slice(archive_bytes);
+            aligned_fallback
+        };
+    let archive_base = archive.as_ptr();
+
+    let archived: &'s T = rkyv::access::<T, rkyv::rancor::Error>(archive).map_err(|e| {
+        Error::Execution(format!("recursion blob: bytecheck validation failed: {e}"))
+    })?;
+    Ok((archived, archive_bytes, archive_base))
+}
+
+/// Result of a recursion-blob verification: the verdict plus the inner
+/// proof's committed public output (zero-copy from the blob), which the
+/// recursion guest folds into `program_id(...) ‖ public_output`.
+pub struct RecursionVerification<'a> {
+    /// Whether the inner proof verified.
+    pub ok: bool,
+    /// The inner proof's committed public output (zero-copy from the blob).
+    pub public_output: &'a [u8],
+    /// The inner ELF bytes (zero-copy from the blob).
+    pub inner_elf: &'a [u8],
+    /// The DECODE commitment supplied for the inner proof (zero-copy from the blob).
+    pub decode_commitment: Commitment,
+    /// The ELF-data-page commitments supplied for the inner proof (materialized —
+    /// small, bounded by the ELF's data-page count).
+    pub page_commitments: Vec<(u64, Commitment)>,
+    /// Full-ELF Keccak digest of `inner_elf`, computed once here — callers
+    /// folding a `program_id` (e.g. `recursion::verify_and_attest_blob`) reuse
+    /// it instead of re-hashing the whole ELF.
+    pub elf_digest: [u8; 32],
+    /// `inner_elf`'s entry point, from the same [`Elf::load`] used to verify —
+    /// callers folding a `program_id` reuse it instead of re-parsing the ELF.
+    pub entry_point: u64,
+}
+
+/// Verify a recursion-input blob produced by [`encode_recursion_input`].
+///
+/// `proof_options` is caller-supplied (never taken from the blob — an attacker
+/// could otherwise pick trivially weak options and have the guest accept as if
+/// a real proof had been checked; see `bench_vs/lambda/recursion`).
+///
+/// The archive is read **in place**: the STARK proof is verified straight from
+/// the blob with no deserialization and no per-field allocation. Only tiny
+/// metadata (table counts, page ranges, page commitments) is materialized.
+///
+/// `blob` is untrusted (prover-supplied) input, so the archive is
+/// bytecheck-validated (`rkyv::access`) before the zero-copy access — measured
+/// at ~0.26% of total guest cycles, cheap enough to not be worth skipping.
+pub fn verify_recursion_blob<'a>(
+    blob: &'a [u8],
+    proof_options: &ProofOptions,
+) -> Result<RecursionVerification<'a>, Error> {
+    use rkyv::rancor::Error as RkyvError;
+
+    // In the guest the blob's archive starts at the 16-aligned archive base
+    // (the wire prefix exists precisely so the archive lands aligned at
+    // `PRIVATE_INPUT_START + 4 + PREFIX_LEN`), so the in-place doubleword
+    // loads do not trap. A host caller's buffer carries no such guarantee
+    // (`Vec<u8>` is align-1), so `access_recursion_archive` falls back to one
+    // aligned copy in `aligned_fallback` when the base is misaligned.
+    let mut aligned_fallback = rkyv::util::AlignedVec::<RECURSION_INPUT_ALIGN>::new();
+    let (archived, archive_bytes, archive_base): (&ArchivedGuestInput, &[u8], *const u8) =
+        access_recursion_archive(blob, &mut aligned_fallback)?;
+
+    // Materialize only the small metadata; the proof stays in the buffer.
+    let table_counts: TableCounts =
+        rkyv::deserialize::<TableCounts, RkyvError>(&archived.vm_proof.table_counts)
+            .map_err(|e| Error::Execution(format!("rkyv deserialize table_counts failed: {e}")))?;
+    let runtime_page_ranges: Vec<RuntimePageRange> = rkyv::deserialize::<
+        Vec<RuntimePageRange>,
+        RkyvError,
+    >(&archived.vm_proof.runtime_page_ranges)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page ranges failed: {e}")))?;
+    let page_commitments: Vec<(u64, Commitment)> = rkyv::deserialize::<
+        Vec<(u64, Commitment)>,
+        RkyvError,
+    >(&archived.page_commitments)
+    .map_err(|e| Error::Execution(format!("rkyv deserialize page commitments failed: {e}")))?;
+    let num_private_input_pages = archived.vm_proof.num_private_input_pages.to_native() as usize;
+    // Bytes read straight from the archived buffer (zero-copy).
+    let inner_elf: &[u8] = archived.inner_elf.as_slice();
+    let public_output: &[u8] = archived.vm_proof.public_output.as_slice();
+    let decode_commitment: Commitment = archived.decode_commitment;
+
+    // Rebase the returned slices onto the caller's buffer: `archived` may
+    // point into the aligned fallback copy, whose lifetime ends with this
+    // call. Same bytes at the same offsets in both buffers.
+    let rebase = |s: &[u8]| -> &'a [u8] {
+        let offset = s.as_ptr() as usize - archive_base as usize;
+        &archive_bytes[offset..offset + s.len()]
+    };
+    let inner_elf_rebased = rebase(inner_elf);
+    let public_output_rebased = rebase(public_output);
+
+    // Single `Elf::load` and single full-ELF Keccak, shared between the
+    // statement absorb below and any `program_id` fold the caller does
+    // (`recursion::verify_and_attest_blob`) — see `RecursionVerification`.
+    let program = Elf::load(inner_elf).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(inner_elf);
+
+    let ok = verify_proof_parts(
+        MultiProofView::Archived(&archived.vm_proof.proof),
+        &table_counts,
+        &runtime_page_ranges,
+        num_private_input_pages,
+        public_output,
+        &program,
+        &elf_digest,
+        proof_options,
+        Some(decode_commitment),
+        Some(&page_commitments),
+    )?;
+
+    Ok(RecursionVerification {
+        ok,
+        public_output: public_output_rebased,
+        inner_elf: inner_elf_rebased,
+        decode_commitment,
+        page_commitments,
+        elf_digest,
+        entry_point: program.entry_point,
+    })
+}
+
 /// Error type for the prover crate.
 #[derive(Debug)]
 pub enum Error {
@@ -184,6 +428,19 @@ pub enum Error {
     Prover(String),
     /// Proof contains invalid table_counts (e.g. zero for a required table)
     InvalidTableCounts(String),
+    /// Continuation epoch size exponent is invalid.
+    InvalidContinuationEpochSize(String),
+    /// Continuation proof construction hit an internal invariant failure.
+    ContinuationInvariant(String),
+    /// Continuation bundle is structurally malformed (fails validation before
+    /// any proof is checked).
+    MalformedContinuationBundle(String),
+    /// A non-final continuation epoch contains the program-terminating
+    /// instruction. The terminating instruction must be in the final epoch.
+    HaltInNonFinalEpoch,
+    /// Recursion host-side helper failed (guest-input encoding or
+    /// commitment recompute — see the `recursion` module).
+    Recursion(String),
 }
 
 impl fmt::Display for Error {
@@ -197,6 +454,22 @@ impl fmt::Display for Error {
             Error::Execution(msg) => write!(f, "execution error: {msg}"),
             Error::Prover(msg) => write!(f, "proving error: {msg}"),
             Error::InvalidTableCounts(msg) => write!(f, "invalid table_counts: {msg}"),
+            Error::InvalidContinuationEpochSize(msg) => {
+                write!(f, "invalid continuation epoch size: {msg}")
+            }
+            Error::ContinuationInvariant(msg) => {
+                write!(f, "continuation invariant failed: {msg}")
+            }
+            Error::MalformedContinuationBundle(msg) => {
+                write!(f, "malformed continuation bundle: {msg}")
+            }
+            Error::HaltInNonFinalEpoch => {
+                write!(
+                    f,
+                    "the program-terminating instruction must be in the final epoch"
+                )
+            }
+            Error::Recursion(msg) => write!(f, "recursion helper error: {msg}"),
         }
     }
 }
@@ -229,11 +502,13 @@ pub(crate) struct VmAirs {
     pub keccak_rnd: VmAir,
     pub keccak_rc: VmAir,
     pub ecsm: VmAir,
-    pub ec_scalar: VmAir,
     pub ecdas: VmAir,
     pub register: VmAir,
     pub pages: Vec<VmAir>,
     pub memw_registers: Vec<VmAir>,
+    /// Whether the HALT table participates in this proof. False for intermediate
+    /// continuation epochs, which do not terminate the program.
+    pub include_halt: bool,
     // Auxiliary ALU / memory / CPU32 dispatch chips
     pub eqs: Vec<VmAir>,
     pub bytewises: Vec<VmAir>,
@@ -245,71 +520,72 @@ impl VmAirs {
     /// Build `(air, trace, public_inputs)` triples for [`Prover::multi_prove`].
     pub fn air_trace_pairs<'a>(&'a self, traces: &'a mut Traces) -> Vec<AirTracePair<'a>> {
         let mut pairs: Vec<AirTracePair<'a>> = vec![
-            (&self.bitwise, &mut traces.bitwise, &()),
-            (&self.decode, &mut traces.decode, &()),
-            (&self.halt, &mut traces.halt, &()),
-            (&self.commit, &mut traces.commit, &()),
-            (&self.keccak, &mut traces.keccak, &()),
-            (&self.keccak_rnd, &mut traces.keccak_rnd, &()),
-            (&self.keccak_rc, &mut traces.keccak_rc, &()),
-            (&self.ecsm, &mut traces.ecsm, &()),
-            (&self.ec_scalar, &mut traces.ec_scalar, &()),
-            (&self.ecdas, &mut traces.ecdas, &()),
-            (&self.register, &mut traces.register, &()),
+            (self.bitwise.as_ref(), &mut traces.bitwise, &()),
+            (self.decode.as_ref(), &mut traces.decode, &()),
+            (self.commit.as_ref(), &mut traces.commit, &()),
+            (self.keccak.as_ref(), &mut traces.keccak, &()),
+            (self.keccak_rnd.as_ref(), &mut traces.keccak_rnd, &()),
+            (self.keccak_rc.as_ref(), &mut traces.keccak_rc, &()),
+            (self.ecsm.as_ref(), &mut traces.ecsm, &()),
+            (self.ecdas.as_ref(), &mut traces.ecdas, &()),
+            (self.register.as_ref(), &mut traces.register, &()),
         ];
+        if self.include_halt {
+            pairs.push((self.halt.as_ref(), &mut traces.halt, &()));
+        }
 
         for (air, trace) in self.cpus.iter().zip(traces.cpus.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.lts.iter().zip(traces.lts.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.shifts.iter().zip(traces.shifts.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.memws.iter().zip(traces.memws.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self
             .memw_aligneds
             .iter()
             .zip(traces.memw_aligneds.iter_mut())
         {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.loads.iter().zip(traces.loads.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.muls.iter().zip(traces.muls.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.dvrms.iter().zip(traces.dvrms.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.branches.iter().zip(traces.branches.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.pages.iter().zip(traces.pages.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self
             .memw_registers
             .iter()
             .zip(traces.memw_registers.iter_mut())
         {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.eqs.iter().zip(traces.eqs.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.bytewises.iter().zip(traces.bytewises.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.stores.iter().zip(traces.stores.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
         for (air, trace) in self.cpu32s.iter().zip(traces.cpu32s.iter_mut()) {
-            pairs.push((air, trace, &()));
+            pairs.push((air.as_ref(), trace, &()));
         }
 
         pairs
@@ -318,98 +594,84 @@ impl VmAirs {
     /// Collect AIR references for [`Verifier::multi_verify`].
     pub fn air_refs(&self) -> Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> {
         let mut refs: Vec<&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>> = vec![
-            &self.bitwise,
-            &self.decode,
-            &self.halt,
-            &self.commit,
-            &self.keccak,
-            &self.keccak_rnd,
-            &self.keccak_rc,
-            &self.ecsm,
-            &self.ec_scalar,
-            &self.ecdas,
-            &self.register,
+            self.bitwise.as_ref(),
+            self.decode.as_ref(),
+            self.commit.as_ref(),
+            self.keccak.as_ref(),
+            self.keccak_rnd.as_ref(),
+            self.keccak_rc.as_ref(),
+            self.ecsm.as_ref(),
+            self.ecdas.as_ref(),
+            self.register.as_ref(),
         ];
+        if self.include_halt {
+            refs.push(self.halt.as_ref());
+        }
 
         for air in &self.cpus {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.lts {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.shifts {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memws {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memw_aligneds {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.loads {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.muls {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.dvrms {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.branches {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.pages {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.memw_registers {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.eqs {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.bytewises {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.stores {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
         for air in &self.cpu32s {
-            refs.push(air);
+            refs.push(air.as_ref());
         }
 
         refs
     }
 
-    /// Create all VM AIR instances. `minimal_bitwise` controls whether the full
-    /// 2^20 bitwise preprocessed table is included (false = full, true = minimal).
-    /// DECODE is always preprocessed.
+    /// Create all VM AIR instances. `minimal_bitwise` picks the minimal vs full
+    /// 2^20 bitwise preprocessed table. DECODE is always preprocessed.
+    /// `page_configs`/`table_counts` give the PAGE bases and split-table chunk
+    /// counts.
     ///
-    /// `page_configs` provides the page base addresses for creating PAGE AIRs.
-    /// `table_counts` specifies how many chunks for each split table.
+    /// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+    /// (skipping the FFT + Merkle build) for the DECODE root and any matching
+    /// ELF-data page (keyed by `page_base`); `None` or unmatched pages recompute
+    /// from the ELF. Zero-init pages always use the shared compile-time constant.
     ///
-    /// `decode_commitment` is an optional precomputed DECODE preprocessed
-    /// commitment. When `Some`, the supplied value is used directly and the
-    /// FFT + Merkle build is skipped — useful for callers who have already
-    /// computed the commitment offline and embedded it as a compile-time
-    /// constant (e.g. the recursion guest, where the in-VM recompute is too
-    /// expensive). When `None`, the commitment is computed from the ELF.
-    ///
-    /// `page_commitments` is an optional list of precomputed ELF-data-page
-    /// preprocessed commitments, keyed by `page_base`. For each ELF data page
-    /// the verifier constructs, if a matching `(page_base, commitment)` pair
-    /// is supplied, it is used directly and that page's FFT + Merkle build is
-    /// skipped. Pages not in the list — including all zero-init pages and
-    /// pages without a match — take the normal compute path (zero-init pages
-    /// hit a compile-time constant via
-    /// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-    /// from the ELF). When `None`, every ELF data page recomputes from
-    /// scratch.
-    ///
-    /// The trust anchor for both `decode_commitment` and `page_commitments`
-    /// is the caller's compiled binary — never accept prover-supplied bytes
-    /// here. A wrong value is rejected, never silently accepted: it either
-    /// mismatches the prover's committed precomputed root (an explicit
-    /// verifier check) or yields diverging Fiat-Shamir challenges.
+    /// Supplied roots are used verbatim and NOT checked against `elf`. A wrong
+    /// caller-constant root is rejected (mismatches the proof root or diverges
+    /// Fiat-Shamir); a consistent prover-supplied mismatch is NOT — such
+    /// callers must bind identity externally (see `recursion::check_attestation`).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         elf: &Elf,
         proof_options: &ProofOptions,
@@ -417,64 +679,101 @@ impl VmAirs {
         page_configs: &[crate::tables::page::PageConfig],
         table_counts: &TableCounts,
         decode_commitment: Option<Commitment>,
+        include_halt: bool,
+        register_init: Option<&[u32]>,
         page_commitments: Option<&[(u64, Commitment)]>,
+        register_preprocessed: Option<(Commitment, usize)>,
     ) -> Self {
         let cpus: Vec<_> = (0..table_counts.cpu)
-            .map(|i| create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i)))
+            .map(|i| {
+                Box::new(create_cpu_air(proof_options).with_name(&format!("CPU[{}]", i))) as VmAir
+            })
             .collect();
-        let bitwise = if minimal_bitwise {
-            create_bitwise_air(proof_options)
+        let bitwise: VmAir = if minimal_bitwise {
+            Box::new(create_bitwise_air(proof_options))
         } else {
-            create_bitwise_air(proof_options).with_preprocessed(
+            Box::new(create_bitwise_air(proof_options).with_preprocessed(
                 bitwise::preprocessed_commitment(proof_options),
                 bitwise::NUM_PRECOMPUTED_COLS,
-            )
+            ))
         };
         let lts: Vec<_> = (0..table_counts.lt)
-            .map(|i| create_lt_air(proof_options).with_name(&format!("LT[{}]", i)))
+            .map(|i| {
+                Box::new(create_lt_air(proof_options).with_name(&format!("LT[{}]", i))) as VmAir
+            })
             .collect();
         let shifts: Vec<_> = (0..table_counts.shift)
-            .map(|i| create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+            .map(|i| {
+                Box::new(create_shift_air(proof_options).with_name(&format!("SHIFT[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let memws: Vec<_> = (0..table_counts.memw)
-            .map(|i| create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i)))
+            .map(|i| {
+                Box::new(create_memw_air(proof_options).with_name(&format!("MEMW[{}]", i))) as VmAir
+            })
             .collect();
         let memw_aligneds: Vec<_> = (0..table_counts.memw_aligned)
-            .map(|i| create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)))
+            .map(|i| {
+                Box::new(
+                    create_memw_aligned_air(proof_options).with_name(&format!("MEMW_A[{}]", i)),
+                ) as VmAir
+            })
             .collect();
         let loads: Vec<_> = (0..table_counts.load)
-            .map(|i| create_load_air(proof_options).with_name(&format!("LOAD[{}]", i)))
+            .map(|i| {
+                Box::new(create_load_air(proof_options).with_name(&format!("LOAD[{}]", i))) as VmAir
+            })
             .collect();
         let decode_root = decode_commitment.unwrap_or_else(|| {
             decode::commitment_from_elf(elf, proof_options)
                 .expect("Failed to compute decode commitment")
         });
-        let decode = create_decode_air(proof_options)
-            .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS);
+        let decode: VmAir = Box::new(
+            create_decode_air(proof_options)
+                .with_preprocessed(decode_root, decode::NUM_PRECOMPUTED_COLS),
+        );
         let muls: Vec<_> = (0..table_counts.mul)
-            .map(|i| create_mul_air(proof_options).with_name(&format!("MUL[{}]", i)))
+            .map(|i| {
+                Box::new(create_mul_air(proof_options).with_name(&format!("MUL[{}]", i))) as VmAir
+            })
             .collect();
         let dvrms: Vec<_> = (0..table_counts.dvrm)
-            .map(|i| create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i)))
+            .map(|i| {
+                Box::new(create_dvrm_air(proof_options).with_name(&format!("DVRM[{}]", i))) as VmAir
+            })
             .collect();
         let branches: Vec<_> = (0..table_counts.branch)
-            .map(|i| create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+            .map(|i| {
+                Box::new(create_branch_air(proof_options).with_name(&format!("BRANCH[{}]", i)))
+                    as VmAir
+            })
             .collect();
-        let halt = create_halt_air(proof_options);
-        let commit = create_commit_air(proof_options);
-        let keccak = create_keccak_air(proof_options);
-        let keccak_rnd = create_keccak_rnd_air(proof_options);
-        let keccak_rc = create_keccak_rc_air(proof_options).with_preprocessed(
+        let halt: VmAir = Box::new(create_halt_air(proof_options));
+        let commit: VmAir = Box::new(create_commit_air(proof_options));
+        let keccak: VmAir = Box::new(create_keccak_air(proof_options));
+        let keccak_rnd: VmAir = Box::new(create_keccak_rnd_air(proof_options));
+        let keccak_rc: VmAir = Box::new(create_keccak_rc_air(proof_options).with_preprocessed(
             tables::keccak_rc::preprocessed_commitment(proof_options),
             tables::keccak_rc::NUM_PRECOMPUTED_COLS,
-        );
-        let ecsm = create_ecsm_air(proof_options);
-        let ec_scalar = create_ec_scalar_air(proof_options);
-        let ecdas = create_ecdas_air(proof_options);
-        let register = create_register_air(proof_options).with_preprocessed(
-            register::preprocessed_commitment(proof_options, elf.entry_point),
-            register::NUM_PREPROCESSED_COLS,
-        );
+        ));
+        let ecsm: VmAir = Box::new(create_ecsm_air(proof_options));
+        let ecdas: VmAir = Box::new(create_ecdas_air(proof_options));
+        let register: VmAir =
+            if let Some((commitment, num_preprocessed_cols)) = register_preprocessed {
+                Box::new(
+                    create_register_air(proof_options)
+                        .with_preprocessed(commitment, num_preprocessed_cols),
+                )
+            } else {
+                let register_init = register_init
+                    .map(<[u32]>::to_vec)
+                    .unwrap_or_else(|| register::register_init_from_entry_point(elf.entry_point));
+                Box::new(create_register_air(proof_options).with_preprocessed(
+                    register::preprocessed_commitment(proof_options, &register_init),
+                    register::NUM_PREPROCESSED_COLS,
+                ))
+            };
         // Every zero-init page shares one preprocessed commitment: OFFSET is
         // page-relative and INIT is all-zero, so it depends only on
         // (blowup, coset) — all fixed here. Compute it once (static const
@@ -483,18 +782,20 @@ impl VmAirs {
         // initialized), so this commitment is always used.
         let zero_init_commitment = page::zero_init_preprocessed_commitment(proof_options);
 
-        let pages: Vec<_> = page_configs
+        let pages: Vec<VmAir> = page_configs
             .iter()
-            .map(|config| {
+            .map(|config| -> VmAir {
                 let air = create_page_air(proof_options, config.page_base);
                 if config.is_private_input {
                     // Private-input pages: all columns are main trace (not preprocessed).
                     // The verifier doesn't see the init values; correctness is enforced
                     // by the memory bus constraints.
-                    air
+                    Box::new(air)
                 } else if config.init_values.is_none() {
                     // Zero-init pages: the shared commitment computed once above.
-                    air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS)
+                    Box::new(
+                        air.with_preprocessed(zero_init_commitment, page::NUM_PREPROCESSED_COLS),
+                    )
                 } else {
                     // ELF data pages: INIT is program-specific, so the commitment is
                     // per-page. Prefer a caller-supplied `(page_base, commitment)`
@@ -507,24 +808,39 @@ impl VmAirs {
                         .unwrap_or_else(|| {
                             page::compute_precomputed_commitment(config, proof_options)
                         });
-                    air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS)
+                    Box::new(air.with_preprocessed(commitment, page::NUM_PREPROCESSED_COLS))
                 }
             })
             .collect();
         let memw_registers: Vec<_> = (0..table_counts.memw_register)
-            .map(|i| create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)))
+            .map(|i| {
+                Box::new(
+                    create_memw_register_air(proof_options).with_name(&format!("MEMW_R[{}]", i)),
+                ) as VmAir
+            })
             .collect();
         let eqs: Vec<_> = (0..table_counts.eq)
-            .map(|i| create_eq_air(proof_options).with_name(&format!("EQ[{}]", i)))
+            .map(|i| {
+                Box::new(create_eq_air(proof_options).with_name(&format!("EQ[{}]", i))) as VmAir
+            })
             .collect();
         let bytewises: Vec<_> = (0..table_counts.bytewise)
-            .map(|i| create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+            .map(|i| {
+                Box::new(create_bytewise_air(proof_options).with_name(&format!("BYTEWISE[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let stores: Vec<_> = (0..table_counts.store)
-            .map(|i| create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+            .map(|i| {
+                Box::new(create_store_air(proof_options).with_name(&format!("STORE[{}]", i)))
+                    as VmAir
+            })
             .collect();
         let cpu32s: Vec<_> = (0..table_counts.cpu32)
-            .map(|i| create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+            .map(|i| {
+                Box::new(create_cpu32_air(proof_options).with_name(&format!("CPU32[{}]", i)))
+                    as VmAir
+            })
             .collect();
 
         #[cfg(feature = "debug-checks")]
@@ -548,11 +864,11 @@ impl VmAirs {
             keccak_rnd,
             keccak_rc,
             ecsm,
-            ec_scalar,
             ecdas,
             register,
             pages,
             memw_registers,
+            include_halt,
             eqs,
             bytewises,
             stores,
@@ -564,26 +880,6 @@ impl VmAirs {
 // =============================================================================
 // Bus Balance Target: Verifier-Computed COMMIT Output Bus
 // =============================================================================
-
-/// Replay the prover's Phase A (main trace commitments) to recover the shared
-/// LogUp challenges (z, alpha). Creates a fresh transcript, appends all main
-/// trace commitments in the same order as the prover, then samples two
-/// challenge elements.
-pub(crate) fn replay_transcript_phase_a(
-    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    multi_proof: &MultiProof<F, E, ()>,
-    transcript: &mut DefaultTranscript<E>,
-) -> (FieldElement<E>, FieldElement<E>) {
-    for (air, proof) in airs.iter().zip(&multi_proof.proofs) {
-        if air.is_preprocessed() {
-            transcript.append_bytes(&air.precomputed_commitment());
-        }
-        transcript.append_bytes(&proof.lde_trace_main_merkle_root);
-    }
-    let z: FieldElement<E> = transcript.sample_field_element();
-    let alpha: FieldElement<E> = transcript.sample_field_element();
-    (z, alpha)
-}
 
 /// Compute the bus balance offset for the COMMIT[index, value] bus.
 ///
@@ -597,6 +893,7 @@ pub(crate) fn replay_transcript_phase_a(
 /// which the caller should treat as verification failure.
 pub(crate) fn compute_commit_bus_offset(
     public_output: &[u8],
+    start_index: u64,
     z: &FieldElement<E>,
     alpha: &FieldElement<E>,
 ) -> Option<FieldElement<E>> {
@@ -607,13 +904,16 @@ pub(crate) fn compute_commit_bus_offset(
     let bus_id = FieldElement::<E>::from(BusId::Commit as u64);
     let alpha_sq = alpha * alpha;
 
-    // fingerprint_i = z - (BusId::Commit + i·α + value_i·α²)
+    // fingerprint_i = z - (BusId::Commit + (start_index + i)·α + value_i·α²).
+    // `start_index` is the carried x254: 0 for a monolithic proof or the first
+    // epoch, nonzero for a continuation epoch whose commits continue a prior one.
     let mut fingerprints: Vec<FieldElement<E>> = public_output
         .iter()
         .enumerate()
         .map(|(i, &value)| {
+            let global_index = start_index + i as u64;
             let linear_combination = bus_id
-                + (FieldElement::<E>::from(i as u64) * alpha)
+                + (FieldElement::<E>::from(global_index) * alpha)
                 + (FieldElement::<E>::from(value as u64) * alpha_sq);
             z - linear_combination
         })
@@ -630,19 +930,60 @@ pub(crate) fn compute_commit_bus_offset(
     )
 }
 
-/// Compute the expected COMMIT bus balance for a `MultiProof`.
-///
-/// Replays Phase A of the transcript to recover (z, alpha), then computes
-/// the offset from the given public output bytes. Call this after `multi_prove`
-/// and before `multi_verify`.
-pub(crate) fn compute_expected_commit_bus_balance(
+/// Replay the prover's Phase A (main trace commitments) to recover the shared
+/// LogUp challenges (z, alpha), over a proof view (owned or archived-in-place)
+/// — no `MultiProof` deserialization required either way.
+pub(crate) fn replay_transcript_phase_a_view<'p>(
     airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
-    proof: &MultiProof<F, E, ()>,
+    proofs: impl ProofViewSource<'p, F, E, ()>,
+    transcript: &mut DefaultTranscript<E>,
+) -> (FieldElement<E>, FieldElement<E>) {
+    for (air, proof) in airs.iter().zip(proofs.view_iter()) {
+        if air.is_preprocessed() {
+            transcript.append_bytes(&air.precomputed_commitment());
+        }
+        transcript.append_bytes(proof.lde_trace_main_merkle_root());
+    }
+    let z: FieldElement<E> = transcript.sample_field_element();
+    let alpha: FieldElement<E> = transcript.sample_field_element();
+    (z, alpha)
+}
+
+/// Computes the expected COMMIT bus balance for a proof view slice (owned or
+/// archived-in-place).
+pub(crate) fn compute_expected_commit_bus_balance_view<'p>(
+    airs: &[&dyn AIR<Field = F, FieldExtension = E, PublicInputs = ()>],
+    proofs: impl ProofViewSource<'p, F, E, ()>,
     public_output_bytes: &[u8],
+    start_index: u64,
     transcript: &mut DefaultTranscript<E>,
 ) -> Option<FieldElement<E>> {
-    let (z, alpha) = replay_transcript_phase_a(airs, proof, transcript);
-    compute_commit_bus_offset(public_output_bytes, &z, &alpha)
+    let (z, alpha) = replay_transcript_phase_a_view(airs, proofs, transcript);
+    compute_commit_bus_offset(public_output_bytes, start_index, &z, &alpha)
+}
+
+/// Bind the final cross-epoch GlobalMemory proof to the per-epoch proofs.
+///
+/// The final proof commits one local-to-global sub-table per epoch as its first
+/// `N` tables, so `final_proof.get(i).lde_trace_main_merkle_root()` is epoch
+/// `i`'s L2G commitment. `epoch_l2g_roots[i]` is the same root as committed in
+/// epoch `i`'s own proof. Equal roots prove the cross-epoch matching ran over
+/// the very same L2G tables the epochs committed (shared commitments).
+///
+/// `final_proof` is a [`MultiProofView`] (owned or archived-in-place), so this
+/// reads straight off either representation with no `MultiProof` deserialization.
+///
+/// Called by `continuation::verify_continuation_view`; also exercised by the
+/// local-to-global bus tests.
+pub(crate) fn verify_l2g_commitment_binding_view(
+    epoch_l2g_roots: &[Commitment],
+    final_proof: MultiProofView<'_, F, E, ()>,
+) -> bool {
+    final_proof.len() >= epoch_l2g_roots.len()
+        && epoch_l2g_roots
+            .iter()
+            .enumerate()
+            .all(|(i, root)| *final_proof.get(i).lde_trace_main_merkle_root() == *root)
 }
 
 // =============================================================================
@@ -713,11 +1054,17 @@ pub fn prove_with_options_and_inputs(
     #[cfg(feature = "instruments")]
     let total_start = std::time::Instant::now();
     #[cfg(feature = "instruments")]
+    stark::instruments::reset_timeline();
+    #[cfg(feature = "instruments")]
+    let __root = stark::instruments::span("prove_total");
+    #[cfg(feature = "instruments")]
     let heap_before = stark::instruments::heap_bytes();
 
     // Phase 1: Execute (ELF load + run)
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("execute");
 
     let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let executor = Executor::new(&program, private_inputs.to_vec())
@@ -727,6 +1074,8 @@ pub fn prove_with_options_and_inputs(
         .map_err(|e| Error::Execution(format!("{e}")))?;
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let execute_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_execute = stark::instruments::heap_bytes();
@@ -734,6 +1083,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 2: Trace build
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("trace_build");
 
     #[cfg(feature = "disk-spill")]
     let storage_mode = {
@@ -756,6 +1107,8 @@ pub fn prove_with_options_and_inputs(
     drop(result);
 
     #[cfg(feature = "instruments")]
+    drop(__sp);
+    #[cfg(feature = "instruments")]
     let trace_build_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
     let heap_after_trace = stark::instruments::heap_bytes();
@@ -763,6 +1116,8 @@ pub fn prove_with_options_and_inputs(
     // Phase 3: AIR construction
     #[cfg(feature = "instruments")]
     let phase_start = std::time::Instant::now();
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("air_construction");
 
     let table_counts = traces.table_counts();
     let airs = VmAirs::new(
@@ -772,9 +1127,14 @@ pub fn prove_with_options_and_inputs(
         &traces.page_configs,
         &table_counts,
         None,
+        true,
+        None,
+        None,
         None,
     );
 
+    #[cfg(feature = "instruments")]
+    drop(__sp);
     #[cfg(feature = "instruments")]
     let air_elapsed = phase_start.elapsed();
     #[cfg(feature = "instruments")]
@@ -793,14 +1153,18 @@ pub fn prove_with_options_and_inputs(
     let mut transcript = DefaultTranscript::<E>::new(&[]);
     absorb_statement(
         &mut transcript,
+        StatementKind::Monolithic,
         elf_bytes,
         &traces.public_output_bytes,
         &table_counts,
         num_private_input_pages,
         &runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
     );
 
     // Phase 4: Prove (multi_prove)
+    #[cfg(feature = "instruments")]
+    let __sp = stark::instruments::span("proving");
     let proof = Prover::multi_prove(
         airs.air_trace_pairs(&mut traces),
         &mut transcript,
@@ -808,6 +1172,8 @@ pub fn prove_with_options_and_inputs(
         storage_mode,
     )
     .map_err(|e| Error::Prover(format!("{e:?}")))?;
+    #[cfg(feature = "instruments")]
+    drop(__sp);
 
     #[cfg(feature = "instruments")]
     {
@@ -823,6 +1189,14 @@ pub fn prove_with_options_and_inputs(
                 after_air: heap_after_air,
             },
         );
+        // Accurate wall-clock span tree (the trustworthy per-step breakdown).
+        drop(__root);
+        let spans = stark::instruments::take_timeline();
+        print!("{}", stark::instruments::format_timeline(&spans));
+        if let Ok(path) = std::env::var("LAMBDA_VM_TIMELINE_JSON") {
+            let _ = std::fs::write(&path, stark::instruments::timeline_json(&spans));
+            println!("[timeline] wrote {path}");
+        }
     }
 
     Ok(VmProof {
@@ -855,28 +1229,21 @@ pub fn verify(vm_proof: &VmProof, elf_bytes: &[u8]) -> Result<bool, Error> {
 /// ignoring the options embedded in the proof bundle. This prevents a
 /// malicious prover from weakening the security level.
 ///
-/// `decode_commitment` is an optional precomputed DECODE preprocessed
-/// commitment. When `Some`, the supplied value is used directly and the
-/// in-verifier FFT + Merkle build for the DECODE preprocessed columns is
-/// skipped — useful for callers (e.g. the recursion guest) that embed the
-/// commitment as a compile-time constant to avoid the in-VM recompute
-/// cost. When `None`, the verifier computes the commitment from the ELF.
+/// `decode_commitment`/`page_commitments`, when `Some`, are used directly
+/// (skipping the in-verifier FFT + Merkle build) for the DECODE root and any
+/// ELF-data page matching by `page_base`; `None` or unmatched pages recompute
+/// from the ELF, and zero-init pages always use the shared compile-time
+/// constant. Callers (e.g. the recursion guest) supply these to avoid the
+/// in-VM recompute cost.
 ///
-/// `page_commitments` is an optional list of precomputed ELF-data-page
-/// preprocessed commitments, keyed by `page_base`. For each ELF data page
-/// the verifier constructs, if a matching `(page_base, commitment)` pair is
-/// supplied, the FFT + Merkle build for that page is skipped. Pages without
-/// a match — including all zero-init pages — take the normal compute path
-/// (zero-init pages hit a compile-time constant via
-/// `page::zero_init_preprocessed_commitment`; ELF data pages recompute
-/// from the ELF). When `None`, every ELF data page recomputes from scratch.
-///
-/// Trust model: both `decode_commitment` and `page_commitments`, when
-/// supplied, must come from the caller's compiled binary (e.g. a
-/// `const [u8; 32]` and a `const [(u64, [u8; 32])]`), never from prover-
-/// supplied bytes. A wrong value is rejected, never silently accepted: it
-/// either mismatches the prover's committed precomputed root (an explicit
-/// verifier check) or yields diverging Fiat-Shamir challenges.
+/// Trust model: a supplied root is used verbatim — this function does NOT
+/// check it against `elf_bytes`. If it is a caller constant (from the compiled
+/// binary), a wrong value is rejected (it mismatches the proof's precomputed
+/// root or diverges Fiat-Shamir). If it is prover-supplied (e.g. the recursion
+/// guest's private input), a consistent mismatched root is NOT rejected here;
+/// the caller must bind identity externally (the recursion pipeline commits
+/// `recursion::program_id` and the consumer checks it via
+/// `recursion::check_attestation`).
 pub fn verify_with_options(
     vm_proof: &VmProof,
     elf_bytes: &[u8],
@@ -884,56 +1251,112 @@ pub fn verify_with_options(
     decode_commitment: Option<Commitment>,
     page_commitments: Option<&[(u64, Commitment)]>,
 ) -> Result<bool, Error> {
+    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
+    let elf_digest = statement::elf_digest(elf_bytes);
+    verify_prepared(
+        vm_proof,
+        &program,
+        &elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
+/// [`verify_with_options`] with the ELF already parsed and digested. Callers
+/// that need the parsed ELF or the digest for other purposes reuse them — the
+/// recursion attestation (`recursion::verify_and_attest_blob`) shares one
+/// `Elf::load` and one full-ELF Keccak between verification and the
+/// `program_id` fold, which matters in-guest where both are expensive.
+pub(crate) fn verify_prepared(
+    vm_proof: &VmProof,
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
+    verify_proof_parts(
+        MultiProofView::Owned(&vm_proof.proof),
+        &vm_proof.table_counts,
+        &vm_proof.runtime_page_ranges,
+        vm_proof.num_private_input_pages,
+        &vm_proof.public_output,
+        program,
+        elf_digest,
+        proof_options,
+        decode_commitment,
+        page_commitments,
+    )
+}
+
+/// The single VM-proof verification implementation, given the proof's
+/// metadata fields plus an already-parsed ELF and its digest. Both
+/// [`verify_prepared`] (owned proof) and [`verify_recursion_blob`] (guest
+/// blob, zero-copy) funnel here, passing a [`MultiProofView`] over their
+/// respective (owned or archived) proof data — no serialization, no
+/// duplicated verification logic, and no repeated `Elf::load`/digest.
+#[allow(clippy::too_many_arguments)]
+fn verify_proof_parts(
+    proofs: MultiProofView<'_, F, E, ()>,
+    table_counts: &TableCounts,
+    runtime_page_ranges: &[RuntimePageRange],
+    num_private_input_pages: usize,
+    public_output: &[u8],
+    program: &Elf,
+    elf_digest: &[u8; 32],
+    proof_options: &ProofOptions,
+    decode_commitment: Option<Commitment>,
+    page_commitments: Option<&[(u64, Commitment)]>,
+) -> Result<bool, Error> {
     // Validate table_counts before constructing AIRs.
     // A malicious prover could set counts to 0, removing entire constraint sets.
-    vm_proof.table_counts.validate()?;
+    table_counts.validate()?;
 
-    // Bound num_private_input_pages before allocating PageConfigs.
-    // MAX_PRIVATE_INPUT_SIZE fits in ~26 pages of DEFAULT_PAGE_SIZE.
+    // Bound num_private_input_pages before allocating PageConfigs — the tight honest
+    // max, shared with the continuation verifier (see `page::max_private_input_pages`).
     {
-        use crate::tables::page::DEFAULT_PAGE_SIZE;
-        use executor::vm::memory::MAX_PRIVATE_INPUT_SIZE;
-        let max_pages = (MAX_PRIVATE_INPUT_SIZE as usize + 4).div_ceil(DEFAULT_PAGE_SIZE) + 1;
-        if vm_proof.num_private_input_pages > max_pages {
+        let max_pages = crate::tables::page::max_private_input_pages();
+        if num_private_input_pages > max_pages {
             return Err(Error::InvalidTableCounts(format!(
-                "num_private_input_pages ({}) exceeds max ({max_pages})",
-                vm_proof.num_private_input_pages,
+                "num_private_input_pages ({num_private_input_pages}) exceeds max ({max_pages})",
             )));
         }
     }
 
-    let program = Elf::load(elf_bytes).map_err(|e| Error::ElfLoad(format!("{e}")))?;
     let page_configs = Traces::page_configs_from_elf_and_runtime(
-        &program,
-        &vm_proof.runtime_page_ranges,
-        vm_proof.num_private_input_pages,
+        program,
+        runtime_page_ranges,
+        num_private_input_pages,
     );
 
     // Cross-check: table_counts must match the number of sub-proofs.
     // FIXED_TABLE_COUNT always-present tables, plus page tables.
-    let expected_proof_count =
-        vm_proof.table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
-    if expected_proof_count != vm_proof.proof.proofs.len() {
+    let expected_proof_count = table_counts.total() + FIXED_TABLE_COUNT + page_configs.len();
+    if expected_proof_count != proofs.len() {
         return Err(Error::InvalidTableCounts(format!(
             "table_counts total ({}) + {FIXED_TABLE_COUNT} fixed + {} pages = {}, but proof contains {} sub-proofs",
-            vm_proof.table_counts.total(),
+            table_counts.total(),
             page_configs.len(),
             expected_proof_count,
-            vm_proof.proof.proofs.len(),
+            proofs.len(),
         )));
     }
 
     let airs = VmAirs::new(
-        &program,
+        program,
         proof_options,
         false,
         &page_configs,
-        &vm_proof.table_counts,
+        table_counts,
         decode_commitment,
+        true,
+        None,
         page_commitments,
+        None,
     );
 
-    // Recompute the COMMIT output bus offset from VmProof.public_output.
+    // Recompute the COMMIT output bus offset from the public output.
     // If public_output was tampered, the recomputed offset won't match the
     // actual bus total in the proof, and multi_verify will reject.
     let air_refs = airs.air_refs();
@@ -942,32 +1365,39 @@ pub fn verify_with_options(
     // field makes this diverge from the prover's transcript state, so every
     // derived challenge differs and verification rejects.
     let mut transcript = DefaultTranscript::<E>::new(&[]);
-    absorb_statement(
+    absorb_statement_with_digest(
         &mut transcript,
-        elf_bytes,
-        &vm_proof.public_output,
-        &vm_proof.table_counts,
-        vm_proof.num_private_input_pages,
-        &vm_proof.runtime_page_ranges,
+        StatementKind::Monolithic,
+        elf_digest,
+        public_output,
+        table_counts,
+        num_private_input_pages,
+        runtime_page_ranges,
+        proof_options.fri_final_poly_log_degree,
     );
 
     // Fork the post-absorb state: the replay helper advances through Phase A
     // independently of the multi_verify transcript, but both must start from
     // the same statement-bound state.
     let mut transcript_for_replay = transcript.clone();
-    let expected_bus_balance = match compute_expected_commit_bus_balance(
+    let expected_bus_balance = match compute_expected_commit_bus_balance_view(
         &air_refs,
-        &vm_proof.proof,
-        &vm_proof.public_output,
+        proofs,
+        public_output,
+        // Monolithic proof: commits are indexed from 0.
+        0,
         &mut transcript_for_replay,
     ) {
         Some(balance) => balance,
         None => return Ok(false),
     };
 
-    Ok(Verifier::multi_verify(
+    stark::profile_markers::step_marker::<{ stark::profile_markers::STEP_AIRS_AND_BUS_BALANCE_DONE }>(
+    );
+
+    Ok(Verifier::multi_verify_views(
         &air_refs,
-        &vm_proof.proof,
+        proofs,
         &mut transcript,
         &expected_bus_balance,
     ))

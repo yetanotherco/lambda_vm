@@ -1,14 +1,50 @@
+use crate::examples::simple_addition::{
+    SimpleAdditionAIR, SimpleAdditionPublicInputs, simple_addition_trace,
+};
+use crate::proof::options::ProofOptions;
+use crate::prover::{IsStarkProver, Prover};
 use crate::table::Table;
 use crate::trace::{TraceTable, compute_frame_evaluation_points};
+use crate::traits::AIR;
+use crypto::fiat_shamir::default_transcript::DefaultTranscript;
 use itertools::Itertools;
 use math::field::{
     element::FieldElement,
+    goldilocks::GoldilocksField,
     traits::{IsField, IsSubFieldOf},
 };
 use math::polynomial::Polynomial;
 
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
+
+/// Builds a valid 2-row `SimpleAddition` proof. Shared base for the
+/// proof-tamper / rejection tests in `small_trace_tests` and
+/// `row_pair_opening_tests`.
+pub fn make_valid_simple_proof() -> (
+    SimpleAdditionAIR<GoldilocksField>,
+    crate::proof::stark::StarkProof<
+        GoldilocksField,
+        GoldilocksField,
+        SimpleAdditionPublicInputs<GoldilocksField>,
+    >,
+) {
+    let mut trace = simple_addition_trace::<GoldilocksField>(2);
+    let proof_options = ProofOptions::default_test_options();
+    let pub_inputs = SimpleAdditionPublicInputs {
+        a: FieldElement::from(1u64),
+        b: FieldElement::from(2u64),
+    };
+    let air = SimpleAdditionAIR::<GoldilocksField>::new(&proof_options);
+    let proof = Prover::prove(
+        &air,
+        &mut trace,
+        &pub_inputs,
+        &mut DefaultTranscript::<GoldilocksField>::new(&[]),
+    )
+    .unwrap();
+    (air, proof)
+}
 
 /// Reference Horner-based trace-evaluation used as an oracle by the prover
 /// tests (`tests::prover_tests`). The production prover uses the LDE-based

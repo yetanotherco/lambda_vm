@@ -24,7 +24,7 @@
 //! JALR bit (the memory-width bits are 0), so `mem_flags ∈ {0,1} = JALR` and the
 //! `mem_flags` column is used directly as `JALR` wherever it is gated by `BRANCH`.
 
-use super::types::{BusId, DecodeEntry, FE, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
+use super::types::{BusId, DecodeEntry, GoldilocksExtension, GoldilocksField, VmTable, alu_op};
 use crate::Error;
 use executor::vm::{
     instruction::{decoding::Instruction, execution::SyscallNumbers},
@@ -314,7 +314,7 @@ impl CpuOperation {
         // address `pc + instruction_length` on every BRANCH row (written to `rd`
         // only by JAL/JALR — `cpu.toml` branch group); `res`
         // otherwise. The spec computes this `pc + len` via the ADD chip gated on
-        // `BRANCH`; we pin it with [`BranchRvdConstraint`] (carry-omitting, like
+        // `BRANCH`; we pin it with `emit_branch_rvd_pair` (carry-omitting, like
         // `next_pc`). For conditional branches `rvd` is computed but never
         // written (`write_register = 0`).
         let store = f.memory && jalr; // under MEMORY, mem_flags bit 0 = memory_op (1 = store)
@@ -440,7 +440,7 @@ pub fn generate_cpu_trace(
     let n = operations.len();
     let num_rows = n.next_power_of_two().max(4);
     let mut trace = TraceTable::new_main(
-        vec![FE::zero(); num_rows * cols::NUM_COLUMNS],
+        crate::tables::types::zeroed_fe_vec(num_rows * cols::NUM_COLUMNS),
         cols::NUM_COLUMNS,
         1,
     );

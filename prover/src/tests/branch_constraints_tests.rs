@@ -5,50 +5,25 @@
 //! - Carry computation validity
 //! - Sign extension handling
 
-use crate::tables::branch::{BranchOperation, branch_constraints, compute_carries};
+use crate::tables::branch::{BranchConstraints, BranchOperation, compute_carries};
 use crate::tables::types::FE;
-use stark::constraints::transition::TransitionConstraint;
+use stark::constraints::builder::ConstraintSet;
 
 // =========================================================================
 // Basic Constraint Property Tests
 // =========================================================================
 
 #[test]
-fn test_branch_constraint_degree() {
-    let (constraints, _) = branch_constraints(0);
-
-    // The 4 conditional carry IS_BIT constraints have degree 3:
-    //   cond (degree 1) * carry (degree 1) * (1 - carry) (degree 1)
-    // and the IS_BIT<JALR> constraint has degree 2: JALR * (1 - JALR).
-    for c in &constraints[..4] {
-        assert_eq!(c.degree(), 3);
+fn test_branch_constraint_set_meta() {
+    // 5 constraints: 4 conditional carry IS_BIT (degree 3) + IS_BIT<JALR> (degree 2),
+    // dense and idx-ordered.
+    let meta = BranchConstraints.meta();
+    assert_eq!(meta.len(), 5);
+    for (i, m) in meta.iter().enumerate() {
+        assert_eq!(m.constraint_idx, i);
     }
-    assert_eq!(constraints[4].degree(), 2);
-}
-
-#[test]
-fn test_branch_constraint_indices_unique() {
-    let (constraints, next_idx) = branch_constraints(0);
-
-    assert_eq!(constraints.len(), 5);
-    assert_eq!(constraints[0].constraint_idx(), 0);
-    assert_eq!(constraints[1].constraint_idx(), 1);
-    assert_eq!(constraints[2].constraint_idx(), 2);
-    assert_eq!(constraints[3].constraint_idx(), 3);
-    assert_eq!(constraints[4].constraint_idx(), 4);
-    assert_eq!(next_idx, 5);
-}
-
-#[test]
-fn test_branch_constraint_indices_with_offset() {
-    let (constraints, next_idx) = branch_constraints(10);
-
-    assert_eq!(constraints[0].constraint_idx(), 10);
-    assert_eq!(constraints[1].constraint_idx(), 11);
-    assert_eq!(constraints[2].constraint_idx(), 12);
-    assert_eq!(constraints[3].constraint_idx(), 13);
-    assert_eq!(constraints[4].constraint_idx(), 14);
-    assert_eq!(next_idx, 15);
+    // 4 conditional carry IS_BIT constraints are degree 3, so the table max is 3.
+    assert_eq!(BranchConstraints.max_degree(), 3);
 }
 
 // =========================================================================

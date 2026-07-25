@@ -50,6 +50,29 @@ impl TryFrom<u64> for SyscallNumbers {
     }
 }
 
+/// A syscall that drives a specialized in-circuit accelerator chip.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Accelerator {
+    Keccak,
+    Ecsm,
+}
+
+impl SyscallNumbers {
+    /// The accelerator this syscall drives, if any. Exhaustive `match self`:
+    /// adding a `SyscallNumbers` variant is a compile error here, so a new
+    /// accelerator can't be silently missed by counters that consume this.
+    pub fn accelerator(self) -> Option<Accelerator> {
+        match self {
+            SyscallNumbers::KeccakPermute => Some(Accelerator::Keccak),
+            SyscallNumbers::Ecsm => Some(Accelerator::Ecsm),
+            SyscallNumbers::Print
+            | SyscallNumbers::Panic
+            | SyscallNumbers::Commit
+            | SyscallNumbers::Halt => None,
+        }
+    }
+}
+
 /// Reads a 256-bit little-endian value as four doublewords at `addr + 8i`.
 fn load_u256_le(memory: &Memory, addr: u64) -> Result<[u8; 32], MemoryError> {
     let mut out = [0u8; 32];
@@ -412,11 +435,13 @@ impl Instruction {
                         {
                             return Err(ExecutionError::EcsmAddressOverflow);
                         }
-                        // xG and k are both read at the same proof timestamp, so their
-                        // 32-byte ranges must be disjoint or the trace is unprovable
-                        // (MEMW orders accesses per address by strictly increasing
-                        // timestamp). xR may alias either: its accesses are offset to
-                        // later timestamps.
+                        // xG and k must occupy disjoint 32-byte regions. The trace builder
+                        // reads each operand as unaligned doubleword MEMW accesses (xG at T,
+                        // k at T+1); if the regions overlap, the same address is touched at
+                        // both timestamps and the MEMW consistency argument can't prove the
+                        // access chain. The loaded values would still be well-defined — this
+                        // guard is about trace provability, not correctness of the multiply.
+                        // xR may alias either: its accesses are at a later timestamp.
                         if addr_xg.abs_diff(addr_k) < 32 {
                             return Err(ExecutionError::EcsmOperandOverlap);
                         }

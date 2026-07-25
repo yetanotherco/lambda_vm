@@ -1,6 +1,7 @@
+use crypto::hash::platform_keccak::PlatformKeccak256 as Keccak256;
+use digest::Digest;
 #[cfg(feature = "parallel")]
 use rayon::prelude::{IntoParallelIterator, ParallelIterator};
-use sha3::{Digest, Keccak256};
 
 const PREFIX: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xed];
 

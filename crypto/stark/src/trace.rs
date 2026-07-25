@@ -6,7 +6,11 @@ use math::polynomial::barycentric_inv_denoms;
 #[cfg(feature = "disk-spill")]
 use math::spill_safe::SpillSafe;
 #[cfg(feature = "parallel")]
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::{
+    IndexedParallelIterator, IntoParallelIterator, ParallelIterator, ParallelSliceMut,
+};
+#[cfg(feature = "cuda")]
+use std::sync::{Arc, OnceLock};
 
 /// A two-dimensional representation of an execution trace of the STARK
 /// protocol.
@@ -26,7 +30,52 @@ where
     pub num_main_columns: usize,
     pub num_aux_columns: usize,
     pub step_size: usize,
+    /// LogUp aux columns built resident on device (pre-LDE), threaded from the
+    /// R1 aux build to the R1 aux commit so they feed the aux LDE without a host
+    /// round-trip. None on the CPU / download path.
+    #[cfg(feature = "cuda")]
+    pub(crate) aux_resident: Option<math_cuda::logup::ResidentAux>,
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill,
+    /// which needs the aux columns in the host trace to spill them).
+    #[cfg(feature = "cuda")]
+    pub(crate) resident_aux_ok: bool,
+    /// Trace-domain main columns kept resident on device from the R1 main LDE
+    /// (column-major `[col*rows + row]`), so the R1 LogUp aux fingerprint kernel
+    /// reads them in place instead of re-uploading ~3 GB. None when the GPU main
+    /// LDE did not run for this table.
+    #[cfg(feature = "cuda")]
+    pub(crate) main_trace_dev: Option<ResidentMainTrace>,
 }
+
+/// Device-resident trace-domain main columns (column-major `[col*rows + row]`),
+/// retained from the R1 main LDE for the aux fingerprint kernel. GPU-only and
+/// transient; the device buffer is excluded from logical trace equality (only
+/// `rows` participates) and opaque in `Debug`, matching `ResidentAux`.
+#[cfg(feature = "cuda")]
+#[derive(Clone)]
+pub(crate) struct ResidentMainTrace {
+    pub(crate) buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+    pub(crate) rows: usize,
+}
+
+#[cfg(feature = "cuda")]
+impl core::fmt::Debug for ResidentMainTrace {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResidentMainTrace")
+            .field("rows", &self.rows)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl PartialEq for ResidentMainTrace {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+    }
+}
+
+#[cfg(feature = "cuda")]
+impl Eq for ResidentMainTrace {}
 
 impl<F, E> TraceTable<F, E>
 where
@@ -50,6 +99,12 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -72,6 +127,12 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
@@ -87,11 +148,69 @@ where
             num_main_columns,
             num_aux_columns,
             step_size,
+            #[cfg(feature = "cuda")]
+            aux_resident: None,
+            #[cfg(feature = "cuda")]
+            resident_aux_ok: true,
+            #[cfg(feature = "cuda")]
+            main_trace_dev: None,
         }
     }
 
     pub fn num_rows(&self) -> usize {
         self.main_table.height
+    }
+
+    /// Store the resident (pre-LDE) LogUp aux columns, threaded to the aux commit.
+    #[cfg(feature = "cuda")]
+    pub fn set_aux_resident(&mut self, ra: math_cuda::logup::ResidentAux) {
+        self.aux_resident = Some(ra);
+    }
+
+    /// Borrow the resident aux columns (read by the aux commit for the LDE).
+    #[cfg(feature = "cuda")]
+    pub fn aux_resident(&self) -> Option<&math_cuda::logup::ResidentAux> {
+        self.aux_resident.as_ref()
+    }
+
+    /// Whether the GPU-resident aux build is allowed (false under disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn resident_aux_ok(&self) -> bool {
+        self.resident_aux_ok
+    }
+
+    /// Disable the GPU-resident aux build (host trace needed, e.g. disk-spill).
+    #[cfg(feature = "cuda")]
+    pub fn set_resident_aux_ok(&mut self, ok: bool) {
+        self.resident_aux_ok = ok;
+    }
+
+    /// Stash the device-resident trace-domain main columns from the R1 main LDE
+    /// (column-major `[col*rows + row]`) so the aux fingerprint kernel reads them
+    /// in place.
+    #[cfg(feature = "cuda")]
+    pub fn set_main_trace_dev(
+        &mut self,
+        buf: std::sync::Arc<math_cuda::CudaSlice<u64>>,
+        rows: usize,
+    ) {
+        self.main_trace_dev = Some(ResidentMainTrace { buf, rows });
+    }
+
+    /// The device-resident main trace `(buffer, rows)`, if retained by R1.
+    #[cfg(feature = "cuda")]
+    pub fn main_trace_dev(&self) -> Option<(&math_cuda::CudaSlice<u64>, usize)> {
+        self.main_trace_dev
+            .as_ref()
+            .map(|r| (r.buf.as_ref(), r.rows))
+    }
+
+    /// Drop the retained device-resident main trace. Its only consumer is the
+    /// aux build, so the prover clears it right after that pass to reclaim the
+    /// snapshot's VRAM before the aux-commit + DEEP/FRI peak.
+    #[cfg(feature = "cuda")]
+    pub fn clear_main_trace_dev(&mut self) {
+        self.main_trace_dev = None;
     }
 
     pub fn num_steps(&self) -> usize {
@@ -174,36 +293,87 @@ where
     pub fn extract_columns_aux(&self, capacity: usize) -> Vec<Vec<FieldElement<E>>> {
         self.aux_table.extract_columns(capacity)
     }
+
+    /// Borrow the row-major main-trace buffer + its width. The trace `Table` is
+    /// already stored row-major, so this is zero-copy — it feeds the batched
+    /// row-major LDE without the col→row transpose `extract_columns_main` pays.
+    pub fn main_data_row_major(&self) -> (&[FieldElement<F>], usize) {
+        (self.main_table.row_major_data(), self.main_table.width)
+    }
+
+    /// Row-major aux-trace buffer + its width (empty / width 0 when no aux).
+    pub fn aux_data_row_major(&self) -> (&[FieldElement<E>], usize) {
+        (self.aux_table.row_major_data(), self.aux_table.width)
+    }
 }
-/// Column-major LDE trace table.
+/// Row-major LDE trace table.
 ///
-/// Stores LDE evaluations as separate column vectors rather than a row-major Table.
-/// This eliminates the expensive T2 transpose (col→row) that `Table::from_columns`
-/// performs, significantly reducing allocation and element clones.
-///
-/// Trade-off: row access requires gathering from columns (74 random reads per row),
-/// but this is negligible vs constraint evaluation cost. Column access (used by
-/// `get_main`/`get_aux`, barycentric eval, DEEP poly) is sequential and cache-friendly.
+/// Stores LDE evaluations in flat row-major buffers (`num_rows * num_cols`), so
+/// each row is a contiguous slice. This is the layout the batched row-major FFT
+/// (`coset_lde_full_expand_row_major`) produces directly and that the Merkle
+/// commit consumes without gathering across columns — the win behind the
+/// row-major LDE rework (batched twiddle reuse in the FFT + contiguous leaves).
 pub struct LDETraceTable<F, E>
 where
     E: IsField,
     F: IsSubFieldOf<E> + IsField,
 {
-    pub(crate) main_columns: Vec<Vec<FieldElement<F>>>,
-    pub(crate) aux_columns: Vec<Vec<FieldElement<E>>>,
+    /// Row-major main-trace buffer of length `num_rows * num_main_cols`.
+    pub(crate) main_data: Vec<FieldElement<F>>,
+    /// Row-major auxiliary-trace buffer of length `num_rows * num_aux_cols`.
+    pub(crate) aux_data: Vec<FieldElement<E>>,
+    pub(crate) num_main_cols: usize,
+    pub(crate) num_aux_cols: usize,
+    pub(crate) num_rows: usize,
     pub(crate) lde_step_size: usize,
     pub(crate) blowup_factor: usize,
-    /// If the main trace was LDE'd on the GPU via the fused pipeline,
-    /// the device buffer is retained here so downstream GPU rounds can
-    /// read the LDE without a re-H2D. `None` when the GPU LDE didn't run
-    /// for this table (below the size threshold or any CPU fallback:
-    /// preprocessed main, non-Goldilocks, or GPU error).
+    /// Full-residency (Stage 3): when true the round-1 D2H was intentionally
+    /// skipped and `main_data`/`aux_data` are empty — every round reads the LDE
+    /// off the device instead. Any code path that would read the host trace must
+    /// hard-abort on this flag rather than index an empty buffer, so a mis-gate
+    /// or an unexpected GPU fallback fails loudly instead of producing a wrong
+    /// proof. Set by `build_round1` when the device-only gate kept this table's
+    /// round-1 LDE on the GPU.
     #[cfg(feature = "cuda")]
-    pub(crate) gpu_main: Option<math_cuda::lde::GpuLdeBase>,
-    /// Same as `gpu_main` but for the aux trace (ext3 de-interleaved
-    /// layout on device).
+    pub(crate) host_trace_empty: bool,
+    /// Per table GPU residency session: owns this table's device LDE buffers
+    /// and bound stream. Threaded R1 to R4. Empty on the CPU path.
     #[cfg(feature = "cuda")]
-    pub(crate) gpu_aux: Option<math_cuda::lde::GpuLdeExt3>,
+    pub(crate) gpu_session: GpuTableSession,
+}
+
+/// Per table GPU residency session.
+///
+/// Owns the device buffers for one trace table: the main and aux trace LDE
+/// (resident R1 to R4), the composition parts LDE (R2 to R4), and a bound
+/// stream. The R4 local inv_denoms and FRI state stay local to R4.
+#[cfg(feature = "cuda")]
+pub(crate) struct GpuTableSession {
+    /// Main trace LDE, resident from the R1 fused pipeline through R4. None
+    /// when the GPU LDE did not run (below threshold, preprocessed main, not
+    /// Goldilocks, or a GPU error).
+    main_lde: Option<math_cuda::lde::GpuLdeBase>,
+    /// Aux trace LDE (ext3, deinterleaved on device), resident R1 to R4.
+    aux_lde: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Composition parts LDE (ext3, deinterleaved on device), produced in R2
+    /// and resident R2 to R4 so R4 DEEP reads them on device. None when the R2
+    /// GPU path did not run.
+    composition_parts: Option<math_cuda::lde::GpuLdeExt3>,
+    /// Stream bound to this table's GPU work, acquired lazily from the backend
+    /// pool and cached. None is cached when the backend is unavailable.
+    stream: OnceLock<Option<Arc<math_cuda::CudaStream>>>,
+}
+
+#[cfg(feature = "cuda")]
+impl GpuTableSession {
+    fn new() -> Self {
+        Self {
+            main_lde: None,
+            aux_lde: None,
+            composition_parts: None,
+            stream: OnceLock::new(),
+        }
+    }
 }
 
 impl<F, E> LDETraceTable<F, E>
@@ -211,84 +381,241 @@ where
     E: IsField,
     F: IsSubFieldOf<E>,
 {
-    /// Creates a column-major LDETraceTable by consuming column vectors directly.
-    /// No transpose is performed — columns are stored as-is.
+    /// Build a row-major LDETraceTable by consuming column vectors and
+    /// transposing them once into the flat buffers. The transpose is the only
+    /// O(N · M) data shuffle the table sees — every subsequent row access is a
+    /// contiguous slice. Used by the preprocessed / column-input path; the
+    /// batched-LDE fast path uses [`Self::from_row_major`] (no transpose).
     pub fn from_columns(
         main_columns: Vec<Vec<FieldElement<F>>>,
         aux_columns: Vec<Vec<FieldElement<E>>>,
         trace_step_size: usize,
         blowup_factor: usize,
-    ) -> Self {
+    ) -> Self
+    where
+        FieldElement<F>: Send + Sync,
+        FieldElement<E>: Send + Sync,
+        Vec<FieldElement<F>>: Sync,
+        Vec<FieldElement<E>>: Sync,
+    {
         let lde_step_size = trace_step_size * blowup_factor;
+        let num_main_cols = main_columns.len();
+        let num_aux_cols = aux_columns.len();
+        let num_rows = if num_main_cols > 0 {
+            main_columns[0].len()
+        } else if num_aux_cols > 0 {
+            aux_columns[0].len()
+        } else {
+            0
+        };
+
+        // Parallel col-major → row-major transpose: each row chunk gathers from
+        // the source columns independently.
+        let mut main_data: Vec<FieldElement<F>> =
+            vec![FieldElement::<F>::zero(); num_rows * num_main_cols];
+        if num_main_cols > 0 {
+            #[cfg(feature = "parallel")]
+            {
+                main_data
+                    .par_chunks_exact_mut(num_main_cols)
+                    .enumerate()
+                    .for_each(|(row, dst)| {
+                        for (col, src_col) in main_columns.iter().enumerate() {
+                            dst[col] = src_col[row].clone();
+                        }
+                    });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (row, dst) in main_data.chunks_exact_mut(num_main_cols).enumerate() {
+                    for (col, src_col) in main_columns.iter().enumerate() {
+                        dst[col] = src_col[row].clone();
+                    }
+                }
+            }
+        }
+
+        let mut aux_data: Vec<FieldElement<E>> =
+            vec![FieldElement::<E>::zero(); num_rows * num_aux_cols];
+        if num_aux_cols > 0 {
+            #[cfg(feature = "parallel")]
+            {
+                aux_data
+                    .par_chunks_exact_mut(num_aux_cols)
+                    .enumerate()
+                    .for_each(|(row, dst)| {
+                        for (col, src_col) in aux_columns.iter().enumerate() {
+                            dst[col] = src_col[row].clone();
+                        }
+                    });
+            }
+            #[cfg(not(feature = "parallel"))]
+            {
+                for (row, dst) in aux_data.chunks_exact_mut(num_aux_cols).enumerate() {
+                    for (col, src_col) in aux_columns.iter().enumerate() {
+                        dst[col] = src_col[row].clone();
+                    }
+                }
+            }
+        }
 
         Self {
-            main_columns,
-            aux_columns,
+            main_data,
+            aux_data,
+            num_main_cols,
+            num_aux_cols,
+            num_rows,
             lde_step_size,
             blowup_factor,
             #[cfg(feature = "cuda")]
-            gpu_main: None,
+            host_trace_empty: false,
             #[cfg(feature = "cuda")]
-            gpu_aux: None,
+            gpu_session: GpuTableSession::new(),
         }
     }
 
-    /// Attach an already-populated device LDE handle for the main columns.
-    /// Only set when the GPU fused pipeline produced the LDE. Callers that
-    /// ran the CPU path should leave this alone.
+    /// Build an LDETraceTable directly from row-major flat buffers. Skips the
+    /// O(N·M) col→row transpose that `from_columns` pays — the caller produces
+    /// the buffers row-major already (e.g. via `coset_lde_full_expand_row_major`).
+    pub fn from_row_major(
+        main_data: Vec<FieldElement<F>>,
+        num_main_cols: usize,
+        aux_data: Vec<FieldElement<E>>,
+        num_aux_cols: usize,
+        trace_step_size: usize,
+        blowup_factor: usize,
+    ) -> Self {
+        let lde_step_size = trace_step_size * blowup_factor;
+        let num_rows = if num_main_cols > 0 {
+            debug_assert_eq!(main_data.len() % num_main_cols, 0);
+            main_data.len() / num_main_cols
+        } else if num_aux_cols > 0 {
+            debug_assert_eq!(aux_data.len() % num_aux_cols, 0);
+            aux_data.len() / num_aux_cols
+        } else {
+            0
+        };
+
+        Self {
+            main_data,
+            aux_data,
+            num_main_cols,
+            num_aux_cols,
+            num_rows,
+            lde_step_size,
+            blowup_factor,
+            #[cfg(feature = "cuda")]
+            host_trace_empty: false,
+            #[cfg(feature = "cuda")]
+            gpu_session: GpuTableSession::new(),
+        }
+    }
+
+    /// Attach the device LDE handle for the main columns, produced by the GPU
+    /// fused pipeline. Leave unset on the CPU path.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_main(&mut self, h: math_cuda::lde::GpuLdeBase) {
-        self.gpu_main = Some(h);
+        self.gpu_session.main_lde = Some(h);
     }
 
     /// Attach an already-populated device LDE handle for the aux columns.
     #[cfg(feature = "cuda")]
     pub fn set_gpu_aux(&mut self, h: math_cuda::lde::GpuLdeExt3) {
-        self.gpu_aux = Some(h);
+        self.gpu_session.aux_lde = Some(h);
+    }
+
+    /// Mark this table's host LDE trace as intentionally empty (Stage-3
+    /// device-only path): the round-1 D2H was skipped and every host-trace read
+    /// must hard-abort instead of indexing the empty buffers.
+    #[cfg(feature = "cuda")]
+    pub fn set_host_trace_empty(&mut self, empty: bool) {
+        self.host_trace_empty = empty;
+    }
+
+    /// Override the LDE row count. Needed on the device-only path: the host
+    /// buffers are empty, so `from_row_major` cannot infer `num_rows` from
+    /// `main_data.len()` — the caller supplies it from the device handle's
+    /// `lde_size` instead.
+    #[cfg(feature = "cuda")]
+    pub fn set_num_rows(&mut self, num_rows: usize) {
+        self.num_rows = num_rows;
+    }
+
+    /// Whether the host LDE trace was intentionally left empty (see
+    /// [`Self::set_host_trace_empty`]). Guards on every host-read fallback check
+    /// this before touching `main_data`/`aux_data`.
+    #[cfg(feature = "cuda")]
+    pub fn host_trace_empty(&self) -> bool {
+        self.host_trace_empty
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_main(&self) -> Option<&math_cuda::lde::GpuLdeBase> {
-        self.gpu_main.as_ref()
+        self.gpu_session.main_lde.as_ref()
     }
 
     #[cfg(feature = "cuda")]
     pub fn gpu_aux(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
-        self.gpu_aux.as_ref()
+        self.gpu_session.aux_lde.as_ref()
     }
 
-    /// Consume self and return the owned column vectors.
-    #[allow(clippy::type_complexity)]
-    pub fn into_columns(self) -> (Vec<Vec<FieldElement<F>>>, Vec<Vec<FieldElement<E>>>) {
-        (self.main_columns, self.aux_columns)
+    /// Attach the composition parts LDE produced in R2. Read by R4 DEEP so the
+    /// parts are not re-uploaded.
+    #[cfg(feature = "cuda")]
+    pub fn set_gpu_composition_parts(&mut self, h: math_cuda::lde::GpuLdeExt3) {
+        self.gpu_session.composition_parts = Some(h);
+    }
+
+    #[cfg(feature = "cuda")]
+    pub fn gpu_composition_parts(&self) -> Option<&math_cuda::lde::GpuLdeExt3> {
+        self.gpu_session.composition_parts.as_ref()
+    }
+
+    /// The stream bound to this table's GPU work. Acquired lazily from the
+    /// backend pool on first call and cached, so all of a table's stream ops
+    /// share one queue. Returns None (cached) when the backend is unavailable.
+    #[cfg(feature = "cuda")]
+    pub fn bound_stream(&self) -> Option<Arc<math_cuda::CudaStream>> {
+        self.gpu_session
+            .stream
+            .get_or_init(|| math_cuda::device::backend().ok().map(|b| b.next_stream()))
+            .clone()
     }
 
     pub fn num_main_cols(&self) -> usize {
-        self.main_columns.len()
+        self.num_main_cols
     }
 
     pub fn num_aux_cols(&self) -> usize {
-        self.aux_columns.len()
+        self.num_aux_cols
     }
 
     pub fn num_rows(&self) -> usize {
-        if self.main_columns.is_empty() {
-            0
-        } else {
-            self.main_columns[0].len()
-        }
+        self.num_rows
     }
 
     /// Get a single main-trace element by (row, col).
     #[inline]
     pub fn get_main(&self, row: usize, col: usize) -> &FieldElement<F> {
-        &self.main_columns[col][row]
+        &self.main_data[row * self.num_main_cols + col]
     }
 
     /// Get a single aux-trace element by (row, col).
     #[inline]
     pub fn get_aux(&self, row: usize, col: usize) -> &FieldElement<E> {
-        &self.aux_columns[col][row]
+        &self.aux_data[row * self.num_aux_cols + col]
+    }
+
+    /// Borrow a full main-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn main_row(&self, row: usize) -> &[FieldElement<F>] {
+        &self.main_data[row * self.num_main_cols..(row + 1) * self.num_main_cols]
+    }
+
+    /// Borrow a full aux-trace row as a contiguous slice (row-major buffer).
+    #[inline]
+    pub fn aux_row(&self, row: usize) -> &[FieldElement<E>] {
+        &self.aux_data[row * self.num_aux_cols..(row + 1) * self.num_aux_cols]
     }
 
     /// Gather a full main-trace row into an owned Vec.
@@ -384,7 +711,11 @@ where
     // both via offset, with no per-eval-point or per-{main,aux} H2D.
     #[cfg(feature = "cuda")]
     let r3_ctx: Option<crate::gpu_lde::R3DevContext> =
-        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(&dc.points, &evaluation_points);
+        crate::gpu_lde::try_prep_r3_dev_context::<F, E>(
+            &dc.points,
+            &evaluation_points,
+            lde_trace.bound_stream(),
+        );
     #[allow(unused_variables)]
     #[cfg(not(feature = "cuda"))]
     let r3_ctx: Option<()> = None;
@@ -449,6 +780,13 @@ where
         let main_evals: Vec<FieldElement<E>> = if let Some(v) = main_gpu {
             v
         } else {
+            // Device-only tables have no host trace; a GPU fall-through here would
+            // read empty `main_data`. Hard-abort instead of a wrong OOD eval.
+            #[cfg(feature = "cuda")]
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R3 barycentric (main) fell back to the host trace, but it is device-only (empty)"
+            );
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
@@ -467,12 +805,11 @@ where
             let main_iter = 0..num_main_cols;
             main_iter
                 .map(|col_idx| {
-                    let lde_col = &lde_trace.main_columns[col_idx];
                     let sum = col_scale
                         .iter()
                         .enumerate()
                         .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                            acc + &lde_col[i * bf] * scale
+                            acc + lde_trace.get_main(i * bf, col_idx) * scale
                         });
                     &vanishing_factor * &sum
                 })
@@ -501,6 +838,13 @@ where
         let aux_evals: Vec<FieldElement<E>> = if let Some(v) = aux_gpu {
             v
         } else {
+            // Device-only tables have no host trace; a GPU fall-through here would
+            // read empty `aux_data`. Hard-abort instead of a wrong OOD eval.
+            #[cfg(feature = "cuda")]
+            assert!(
+                !lde_trace.host_trace_empty(),
+                "R3 barycentric (aux) fell back to the host trace, but it is device-only (empty)"
+            );
             let inv_denoms_v =
                 inv_denoms.get_or_insert_with(|| barycentric_inv_denoms(eval_point, &dc.points));
             let col_scale = col_scale.get_or_insert_with(|| {
@@ -519,12 +863,11 @@ where
             let aux_iter = 0..num_aux_cols;
             aux_iter
                 .map(|col_idx| {
-                    let lde_col = &lde_trace.aux_columns[col_idx];
                     let sum = col_scale
                         .iter()
                         .enumerate()
                         .fold(FieldElement::<E>::zero(), |acc, (i, scale)| {
-                            acc + scale * &lde_col[i * bf]
+                            acc + scale * lde_trace.get_aux(i * bf, col_idx)
                         });
                     &vanishing_factor * &sum
                 })
@@ -534,22 +877,6 @@ where
     }
 
     Table::new(table_data, table_width)
-}
-
-pub fn columns2rows<F>(columns: Vec<Vec<F>>) -> Vec<Vec<F>>
-where
-    F: Clone,
-{
-    let num_rows = columns[0].len();
-    let num_cols = columns.len();
-
-    (0..num_rows)
-        .map(|row_index| {
-            (0..num_cols)
-                .map(|col_index| columns[col_index][row_index].clone())
-                .collect()
-        })
-        .collect()
 }
 
 pub(crate) fn compute_frame_evaluation_points<F, E>(
