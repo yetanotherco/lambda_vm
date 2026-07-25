@@ -136,8 +136,21 @@ pub trait IsStarkVerifier<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_length as u64;
+        // Must mirror the prover exactly: FRI query indices live in the folded
+        // (power-of-two) domain of size `domain_size / 2`, sampled via
+        // `sample_bits` (masking, unbiased) so one Keccak squeeze serves many
+        // indices instead of one permutation per query.
+        let folded = domain_size >> 1;
+        debug_assert!(
+            folded.is_power_of_two(),
+            "FRI query domain size must be a power of two"
+        );
+        let bits = folded.trailing_zeros() as usize;
+        if bits == 0 {
+            return vec![0; number_of_queries];
+        }
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| transcript.sample_bits(bits) as usize)
             .collect::<Vec<usize>>()
     }
 

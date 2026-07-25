@@ -15,6 +15,26 @@ pub trait IsTranscript<F: IsField> {
     fn sample_field_element(&mut self) -> FieldElement<F>;
     /// Returns a random index in [0, `upper_bound`).
     fn sample_u64(&mut self, upper_bound: u64) -> u64;
+
+    /// Returns `bits` uniform random bits as a value in `[0, 2^bits)`.
+    ///
+    /// The range is a power of two, so masking is unbiased by construction --
+    /// no rejection sampling is needed (unlike [`Self::sample_u64`] for a
+    /// general bound). This is the right primitive for FRI query indices,
+    /// whose range is exactly the (power-of-two) folded LDE domain size.
+    ///
+    /// Concrete transcripts backed by a wide hash squeeze should amortize one
+    /// permutation across many `sample_bits` calls; the default below does not
+    /// (it just reuses the power-of-two `sample_u64` path) and exists only so
+    /// that alternative [`IsTranscript`] implementations keep compiling. A
+    /// prover and verifier that use the same transcript type always agree.
+    fn sample_bits(&mut self, bits: usize) -> u64 {
+        assert!(
+            (1..64).contains(&bits),
+            "sample_bits: bits must be in 1..=63"
+        );
+        self.sample_u64(1u64 << bits)
+    }
 }
 
 pub trait IsStarkTranscript<F: IsField, S: IsField + IsSubFieldOf<F>>: IsTranscript<F> {

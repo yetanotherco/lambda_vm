@@ -1583,8 +1583,22 @@ pub trait IsStarkProver<
         transcript: &mut impl IsStarkTranscript<FieldExtension, Field>,
     ) -> Vec<usize> {
         let domain_size = domain.lde_roots_of_unity_coset.len() as u64;
+        // FRI folds the LDE domain by 2, so query indices live in the folded
+        // domain of size `domain_size / 2` — always a power of two. That makes
+        // `sample_bits` unbiased by construction (mask, no rejection) and lets
+        // one Keccak squeeze serve ~256/bits indices instead of one per query.
+        let folded = domain_size >> 1;
+        debug_assert!(
+            folded.is_power_of_two(),
+            "FRI query domain size must be a power of two"
+        );
+        let bits = folded.trailing_zeros() as usize;
+        if bits == 0 {
+            // Degenerate single-index domain: 0 is the only valid index.
+            return vec![0; number_of_queries];
+        }
         (0..number_of_queries)
-            .map(|_| (transcript.sample_u64(domain_size >> 1)) as usize)
+            .map(|_| transcript.sample_bits(bits) as usize)
             .collect::<Vec<usize>>()
     }
 
