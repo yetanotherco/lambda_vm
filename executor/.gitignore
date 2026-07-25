@@ -2,3 +2,7 @@
 /program_artifacts/rust
 /tests/ethrex_hoodi.bin
 /tests/ethrex_bench_*.bin
+# _4 is committed (~17 KB): used by `make recursion-profile-block-input` and
+# scripts/bench_recursion_scaling.sh. Other sizes stay ignored — scaling.sh
+# generates any missing fixture on demand via tooling/ethrex-fixtures.
+!/tests/ethrex_bench_4.bin
