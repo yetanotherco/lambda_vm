@@ -31,7 +31,6 @@ use crate::config::{Commitment, FriLayerMerkleTreeBackend};
 use crate::domain::Domain;
 use crate::fri::fri_commitment::FriLayer;
 use crate::fri::fri_decommit::FriDecommitment;
-use crate::fri::fri_functions::compute_coset_twiddles_inv;
 use crate::trace::LDETraceTable;
 
 /// Break-even LDE size. For LDE sizes smaller than this, the CPU
@@ -1893,6 +1892,7 @@ pub(crate) fn try_fri_commit_gpu<F, E, T>(
     domain_size: usize,
     blowup_log: u32,
     final_poly_log_degree: u32,
+    inv_twiddles: &[FieldElement<F>],
 ) -> Option<(
     Vec<FieldElement<E>>,
     Vec<FriLayer<E, FriLayerMerkleTreeBackend<E>>>,
@@ -1922,12 +1922,11 @@ where
         return None;
     }
 
-    // Pre-compute inv_twiddles on CPU (matches commit_phase_from_evaluations)
-    // and pack to u64 before any transcript mutation, so on H2D / state
-    // construction failure the caller's transcript is untouched.
-    let inv_twiddles = compute_coset_twiddles_inv::<F>(coset_offset, domain_size);
+    // Pack the per-domain cached inv_twiddles to u64 before any transcript
+    // mutation, so on H2D / state construction failure the caller's
+    // transcript is untouched.
     let mut inv_tw_u64: Vec<u64> = Vec::with_capacity(inv_twiddles.len());
-    for t in &inv_twiddles {
+    for t in inv_twiddles {
         // SAFETY: F == Goldilocks per TypeId check; FieldElement<Gl> is
         // #[repr(transparent)] over u64.
         let v: u64 = unsafe { *(t.value() as *const _ as *const u64) };

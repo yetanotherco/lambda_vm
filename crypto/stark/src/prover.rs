@@ -1,3 +1,4 @@
+use std::any::Any;
 use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "instruments")]
@@ -36,7 +37,7 @@ use crate::trace::LDETraceTable;
 
 use super::config::{BatchedMerkleTree, BatchedMerkleTreeBackend, Commitment};
 use super::constraints::evaluator::ConstraintEvaluator;
-use super::domain::{Domain, DomainConstants};
+use super::domain::Domain;
 use super::fri::fri_decommit::FriDecommitment;
 use super::grinding;
 use super::lookup::BusPublicInputs;
@@ -387,6 +388,8 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// Composition half-extension cache, initialized only when the degree-2
     /// decomposition path actually runs on CPU.
     composition: OnceLock<CompositionLdeTwiddles<F>>,
+    /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition — see [`Self::inv_2x`].
+    inv_2x: OnceLock<Vec<FieldElement<F>>>,
 }
 
 pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
@@ -463,6 +466,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .expect("valid forward two-half twiddles"),
             coset_weights,
             composition: OnceLock::new(),
+            inv_2x: OnceLock::new(),
         }
     }
 
@@ -478,6 +482,73 @@ impl<F: IsFFTField> LdeTwiddles<F> {
     pub(crate) fn has_composition_cache(&self) -> bool {
         self.composition.get().is_some()
     }
+
+    /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition, computed once per
+    /// domain (an LDE/2-size batch inversion per table per epoch otherwise).
+    fn inv_2x(&self, domain: &Domain<F>) -> &[FieldElement<F>] {
+        self.inv_2x.get_or_init(|| {
+            let n = domain.lde_roots_of_unity_coset.len() / 2;
+            let mut inv: Vec<FieldElement<F>> = (0..n)
+                // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
+                .map(|i| domain.lde_roots_of_unity_coset[i].double())
+                .collect();
+            FieldElement::inplace_batch_inverse(&mut inv).expect("Coset points are non-zero");
+            inv
+        })
+    }
+}
+
+/// Process-wide `Domain` + `LdeTwiddles` cache keyed by
+/// `(field, trace_length, blowup, coset_offset)`. Continuation epochs and
+/// concurrent epoch proves otherwise rebuild the same ~24 MB `Domain` and
+/// ~32 MB twiddle set per epoch; sharing the `Arc`s also lets every lazy
+/// domain-derived cache (composition twiddles, `inv_2x`, OOD constants, FRI
+/// inverse twiddles) fill once per process instead of once per epoch.
+#[allow(clippy::type_complexity)]
+fn domain_twiddle_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<(std::any::TypeId, usize, usize, u64), Box<dyn Any + Send + Sync>>,
+> {
+    static CACHE: OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                (std::any::TypeId, usize, usize, u64),
+                Box<dyn Any + Send + Sync>,
+            >,
+        >,
+    > = OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn domain_and_twiddles<F, A>(air: &A, trace_length: usize) -> (Arc<Domain<F>>, Arc<LdeTwiddles<F>>)
+where
+    F: IsFFTField + 'static,
+    FieldElement<F>: Send + Sync,
+    A: AIR<Field = F> + ?Sized,
+{
+    type Entry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
+    let key = (
+        std::any::TypeId::of::<F>(),
+        trace_length,
+        air.options().blowup_factor as usize,
+        air.options().coset_offset,
+    );
+    {
+        let cache = domain_twiddle_cache().lock().unwrap();
+        if let Some(e) = cache.get(&key).and_then(|b| b.downcast_ref::<Entry<F>>()) {
+            #[cfg(test)]
+            crate::tests::domain_cache_stats::record(true);
+            return e.clone();
+        }
+    }
+    #[cfg(test)]
+    crate::tests::domain_cache_stats::record(false);
+    let d = Arc::new(Domain::new(air, trace_length));
+    let t = Arc::new(LdeTwiddles::new(&d));
+    domain_twiddle_cache()
+        .lock()
+        .unwrap()
+        .insert(key, Box::new((d.clone(), t.clone())));
+    (d, t)
 }
 
 /// Number of tables to process concurrently in `multi_prove`.
@@ -1298,20 +1369,17 @@ pub trait IsStarkProver<
         let n = two_n / 2;
         debug_assert_eq!(two_n, n * 2);
 
-        // Step 1: Compute 1/(2·g·ω^i) for i=0..N-1 via batch inversion.
-        // The LDE coset points are g·ω^i = domain.lde_roots_of_unity_coset[i].
-        // Compute entirely in base field — mixed F×E multiplication when used with extension values.
-        let two_base = FieldElement::<Field>::from(2u64);
-        let mut inv_2x: Vec<FieldElement<Field>> = (0..n)
-            // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
-            .map(|i| domain.lde_roots_of_unity_coset[i].double())
-            .collect();
-        FieldElement::inplace_batch_inverse(&mut inv_2x).expect("Coset points are non-zero");
+        // Step 1: 1/(2·g·ω^i) for i=0..N-1, cached once per domain in the
+        // shared twiddles (base field — mixed F×E multiplication below).
+        let inv_2x = twiddles.inv_2x(domain);
+        debug_assert_eq!(inv_2x.len(), n);
 
         // Step 2: Pointwise decomposition.
         // H₀((g·ω^i)²) = (evals[i] + evals[i+N]) / 2
         // H₁((g·ω^i)²) = (evals[i] - evals[i+N]) / (2·g·ω^i)
-        let two_inv = two_base.inv().expect("2 is non-zero in the field");
+        let two_inv = FieldElement::<Field>::from(2u64)
+            .inv()
+            .expect("2 is non-zero in the field");
         let (h0_evals, h1_evals) = crate::par::map_unzip(n, |i| {
             let sum = &constraint_evaluations[i] + &constraint_evaluations[i + n];
             let diff = &constraint_evaluations[i] - &constraint_evaluations[i + n];
@@ -1540,8 +1608,8 @@ pub trait IsStarkProver<
         let domain_size = domain.interpolation_domain_size;
         let blowup_factor = domain.blowup_factor;
 
-        // === Shared domain constants for barycentric evaluation ===
-        let dc = DomainConstants::from_domain(domain);
+        // === Shared domain constants for barycentric evaluation (cached per domain) ===
+        let dc = domain.ood_constants();
 
         // === Composition poly parts: barycentric evaluation at z^num_parts ===
         let comp_z_pow_n = z_power.pow(domain_size);
@@ -1574,7 +1642,7 @@ pub trait IsStarkProver<
             z,
             &air.context().transition_offsets,
             air.step_size(),
-            &dc,
+            dc,
         );
 
         Round3 {
@@ -1678,6 +1746,7 @@ pub trait IsStarkProver<
             domain_size,
             domain.blowup_factor.trailing_zeros(),
             air.options().fri_final_poly_log_degree as u32,
+            domain.fri_inv_twiddles(),
         );
         #[cfg(feature = "instruments")]
         let r4_merkle_dur = t_sub.elapsed();
@@ -2498,44 +2567,14 @@ pub trait IsStarkProver<
         #[cfg(feature = "instruments")]
         let __sp = crate::instruments::span("r1_prepass");
 
-        // Deduplicate Domain + LdeTwiddles by (trace_length, blowup_factor, coset_offset).
-        // Many tables share the same domain size (e.g., 7+ tables at 2^20).
-        // Without dedup, each creates its own Domain (~24 MB) and LdeTwiddles (~32 MB).
-        type DomainEntry<F> = (Arc<Domain<F>>, Arc<LdeTwiddles<F>>);
-        let mut domain_cache: std::collections::HashMap<(usize, usize, u64), DomainEntry<Field>> =
-            std::collections::HashMap::new();
-
         let mut domains = Vec::with_capacity(num_airs);
         let mut twiddle_caches: Vec<Arc<LdeTwiddles<Field>>> = Vec::with_capacity(num_airs);
 
         for (air, trace, _pub_inputs) in &*air_trace_pairs {
-            let trace_length = trace.num_rows();
-            let blowup = air.options().blowup_factor as usize;
-            let coset_offset = air.options().coset_offset;
-            let key = (trace_length, blowup, coset_offset);
-
-            #[cfg(test)]
-            let was_hit = domain_cache.contains_key(&key);
-
-            let (domain, twiddles) = domain_cache
-                .entry(key)
-                .or_insert_with(|| {
-                    let d = Domain::new(*air, trace_length);
-                    let t = LdeTwiddles::new(&d);
-                    (Arc::new(d), Arc::new(t))
-                })
-                .clone();
-
-            #[cfg(test)]
-            crate::tests::domain_cache_stats::record(was_hit);
-
+            let (domain, twiddles) = domain_and_twiddles(*air, trace.num_rows());
             domains.push(domain);
             twiddle_caches.push(twiddles);
         }
-        // Free the HashMap (which holds extra strong Arc references) before the
-        // long proving rounds begin. `domains` and `twiddle_caches` already hold
-        // the only surviving Arcs we care about.
-        drop(domain_cache);
 
         let k = table_parallelism().min(num_airs).max(1);
 

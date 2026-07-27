@@ -55,6 +55,10 @@ pub struct Domain<F: IsFFTField> {
     pub(crate) coset_offset: FieldElement<F>,
     pub(crate) blowup_factor: usize,
     pub(crate) interpolation_domain_size: usize,
+    /// Domain-derived values that rounds 3-4 otherwise rebuild per table per
+    /// epoch (each involves an LDE-size-order batch inversion or clone).
+    ood_constants: std::sync::OnceLock<DomainConstants<F>>,
+    fri_inv_twiddles: std::sync::OnceLock<Vec<FieldElement<F>>>,
 }
 
 impl<F: IsFFTField> Domain<F> {
@@ -93,7 +97,26 @@ impl<F: IsFFTField> Domain<F> {
             blowup_factor,
             coset_offset,
             interpolation_domain_size: trace_length,
+            ood_constants: std::sync::OnceLock::new(),
+            fri_inv_twiddles: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Barycentric OOD constants (round 3), computed once per domain.
+    pub fn ood_constants(&self) -> &DomainConstants<F> {
+        self.ood_constants
+            .get_or_init(|| DomainConstants::from_domain(self))
+    }
+
+    /// FRI folding inverse twiddles for the LDE coset (round 4), computed once
+    /// per domain. Callers copy them into their per-layer working buffer.
+    pub(crate) fn fri_inv_twiddles(&self) -> &[FieldElement<F>] {
+        self.fri_inv_twiddles.get_or_init(|| {
+            crate::fri::fri_functions::compute_coset_twiddles_inv(
+                &self.coset_offset,
+                self.interpolation_domain_size * self.blowup_factor,
+            )
+        })
     }
 }
 
