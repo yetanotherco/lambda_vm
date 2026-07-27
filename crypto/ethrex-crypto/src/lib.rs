@@ -16,6 +16,9 @@
 //! Every other `Crypto` method inherits the trait default (vetted pure-Rust
 //! crates: `ark-bn254`, `bls12_381`, `p256`, `sha2`, `ripemd`, …).
 
+// Only the host `keccak256` falls back to software keccak; the guest routes
+// through the precompile, so on riscv64 this import would be unused.
+#[cfg(not(target_arch = "riscv64"))]
 use ethrex_crypto::keccak::keccak_hash;
 use ethrex_crypto::{Crypto, CryptoError};
 use k256::elliptic_curve::group::prime::PrimeCurveAffine;
