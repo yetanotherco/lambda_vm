@@ -18,7 +18,7 @@
 //! into the raw `u64` slices below. The stark-side dispatch
 //! (`stark::constraint_ir::gpu_interp`) owns that flattening + the TypeId gate.
 
-use cudarc::driver::{LaunchConfig, PushKernelArg};
+use cudarc::driver::{CudaSlice, LaunchConfig, PushKernelArg};
 
 use crate::Result;
 use crate::device::backend;
@@ -169,11 +169,38 @@ pub struct CompositionAccum<'a> {
     pub b_value: &'a [u64],
     /// Boundary combination coefficients β_b (`num_boundary * 3` u64, ext3).
     pub b_beta: &'a [u64],
-    /// Boundary zerofier inverses, base field: one `num_rows`-length slice per
-    /// boundary constraint. Uploaded slice-by-slice into one device buffer
-    /// (kernel indexing `b * num_rows + row`), so the caller never materializes
-    /// a flattened host copy.
-    pub b_z_inv: &'a [&'a [u64]],
+    /// Boundary zerofier inverses, base field: one device-resident column per
+    /// boundary constraint (see [`GpuBaseVec`]). D2D-copied into one flat
+    /// device buffer (kernel indexing `b * num_rows + row`) — no PCIe traffic
+    /// per dispatch.
+    pub b_z_inv: &'a [&'a GpuBaseVec],
+}
+
+/// A base-field column resident on device, uploaded once and reused across
+/// dispatches (e.g. a boundary-zerofier inverse vector, identical for every
+/// table/epoch sharing a domain). The upload synchronizes its stream, so any
+/// later stream may read the buffer.
+pub struct GpuBaseVec {
+    buf: CudaSlice<u64>,
+    len: usize,
+}
+
+impl GpuBaseVec {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+pub fn upload_base_vec(v: &[u64]) -> Result<GpuBaseVec> {
+    let be = backend()?;
+    let stream = be.next_stream();
+    let buf = stream.clone_htod(v)?;
+    stream.synchronize()?;
+    Ok(GpuBaseVec { buf, len: v.len() })
 }
 
 /// Evaluate the constraints AND fuse the composition accumulation on-device:
@@ -254,14 +281,14 @@ pub fn eval_composition_on_device(
             stream.clone_htod(accum.b_beta)?,
         )
     };
-    // Per-slice upload straight from the caller's per-constraint vectors into
-    // the flat `b * num_rows + row` device layout — no flattened host copy, no
-    // zeroing (the slice uploads cover every element the kernel reads).
+    // D2D from the resident per-constraint columns into the flat
+    // `b * num_rows + row` device layout — no PCIe, no flattened host copy,
+    // no zeroing (the copies cover every element the kernel reads).
     let mut d_b_z_inv = unsafe { stream.alloc::<u64>((num_boundary * num_rows).max(1)) }?;
     {
-        for (b, slice) in accum.b_z_inv.iter().enumerate() {
+        for (b, src) in accum.b_z_inv.iter().enumerate() {
             let mut dst = d_b_z_inv.slice_mut(b * num_rows..(b + 1) * num_rows);
-            stream.memcpy_htod(*slice, &mut dst)?;
+            stream.memcpy_dtod(&src.buf, &mut dst)?;
         }
     }
 

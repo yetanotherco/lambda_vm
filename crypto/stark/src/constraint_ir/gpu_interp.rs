@@ -125,9 +125,64 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     pub b_beta: &'a [FieldElement<E>],
     /// Boundary zerofier inverses (base field): one `num_rows`-length vector
     /// per boundary constraint (constraints sharing a step share the Arc,
-    /// cached per domain) — the device layer uploads each slice into the flat
-    /// `b * num_rows + row` device buffer, so no flattened host copy is built.
+    /// cached per domain) — resolved to device-resident columns via
+    /// [`bzinv_device_handles`], so nothing LDE-sized crosses PCIe per dispatch.
     pub b_z_inv: &'a [std::sync::Arc<Vec<FieldElement<F>>>],
+}
+
+type GoldilocksBZInv = std::sync::Arc<Vec<FieldElement<GoldilocksField>>>;
+
+/// Device-resident boundary-zerofier columns, keyed by the host Arc
+/// allocation. The entry stores the Arc, pinning the allocation: a key can
+/// never be reused while its entry lives (entries live for the process, like
+/// the per-domain host cache that feeds them).
+#[allow(clippy::type_complexity)]
+fn bzinv_device_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<
+        usize,
+        (
+            GoldilocksBZInv,
+            std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>,
+        ),
+    >,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<
+                usize,
+                (
+                    GoldilocksBZInv,
+                    std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>,
+                ),
+            >,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+/// Resolve each host column to its device-resident copy, uploading once per
+/// distinct Arc. Returns `None` on any upload failure (→ CPU fallback).
+fn bzinv_device_handles(
+    vecs: &[GoldilocksBZInv],
+) -> Option<Vec<std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>>> {
+    vecs.iter()
+        .map(|v| {
+            let key = std::sync::Arc::as_ptr(v) as usize;
+            if let Some((_, h)) = bzinv_device_cache().lock().unwrap().get(&key) {
+                return Some(h.clone());
+            }
+            // SAFETY: `F == GoldilocksField` by the type alias.
+            let raw = unsafe { base_slice_as_u64(v.as_slice()) };
+            let h = std::sync::Arc::new(
+                math_cuda::constraint_interp::upload_base_vec(raw).ok()?,
+            );
+            bzinv_device_cache()
+                .lock()
+                .unwrap()
+                .insert(key, (v.clone(), h.clone()));
+            Some(h)
+        })
+        .collect()
 }
 
 /// The program-derived half of a lowered call: the flat device blob plus its
@@ -289,12 +344,13 @@ where
     let z_inv = unsafe { base_slice_to_u64(inputs.z_inv) };
     let b_value = unsafe { ext3_slice_to_u64(inputs.b_value) };
     let b_beta = unsafe { ext3_slice_to_u64(inputs.b_beta) };
-    let b_z_inv: Vec<&[u64]> = inputs
-        .b_z_inv
-        .iter()
-        // SAFETY: `F` is Goldilocks (established in `lower_and_pack`).
-        .map(|v| unsafe { base_slice_as_u64(v.as_slice()) })
-        .collect();
+    // SAFETY: `F` is Goldilocks (established in `lower_and_pack`);
+    // `Vec<FieldElement<F>>` and the concrete Vec share their layout.
+    let b_z_inv_conc: &[GoldilocksBZInv] =
+        unsafe { &*(inputs.b_z_inv as *const _ as *const _) };
+    let b_z_inv_handles = bzinv_device_handles(b_z_inv_conc)?;
+    let b_z_inv: Vec<&math_cuda::constraint_interp::GpuBaseVec> =
+        b_z_inv_handles.iter().map(|h| h.as_ref()).collect();
     let b_col: Vec<u64> = inputs.b_col.iter().map(|&c| c as u64).collect();
     let b_is_aux: Vec<u64> = inputs.b_is_aux.iter().map(|&a| a as u64).collect();
 
