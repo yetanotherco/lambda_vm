@@ -52,3 +52,13 @@ ethrex_10_transfers.bin
   sha256: 38901ee4d40b99cf0aa7f642a92f0fc8db76d974bf43033a1673839020c3c28e
   contents: stateless ethrex block with ten plain ETH transfer transactions
 ```
+
+## Real-block fixtures
+
+The blocks above are synthetic (N plain ETH transfers over a small genesis).
+For a representative workload — real contract execution, real trie depth, real
+bytecode — `make ethrex-real-block-fixture` generates
+`ethrex_hoodi_1265656.bin` from an ethrex-replay cache. It is ~1 MB, so it is
+gitignored and generated on demand rather than committed, and its checksum is
+pinned in `tooling/ethrex-real-block/README.md` rather than above (the
+checksum script only covers committed fixtures).

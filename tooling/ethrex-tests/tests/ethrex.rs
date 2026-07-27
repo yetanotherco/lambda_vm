@@ -86,3 +86,53 @@ fn test_ethrex_empty_block() {
     let output = execution_program(input, Arc::new(NativeCrypto)).unwrap();
     run_program_and_check_public_output(ELF_PATH, output.encode(), inputs);
 }
+
+const REAL_BLOCK_FIXTURE: &str = "ethrex_hoodi_1265656.bin";
+
+/// Host-only acceptance gate for the real-block fixture produced by
+/// `tooling/ethrex-real-block` (`make ethrex-real-block-fixture`): the block is
+/// re-executed statelessly against its own witness, so a successful run means
+/// the recovered tries, codes and headers reproduce the header's post-state
+/// root. Needs no guest ELF, which is what keeps it runnable where the RV64
+/// toolchain isn't available.
+///
+/// Checks the *serialized artifact* specifically — that the committed rkyv
+/// bytes deserialize and execute — which is why it reads the `.bin` rather
+/// than converting the cache itself. It runs under `NativeCrypto` (ethrex's
+/// full precompile set) because this crate builds `ethrex-guest-program` with
+/// default features, so it does NOT speak to the guest's reduced surface;
+/// `tooling/ethrex-real-block`'s `real_block_executes_under_guest_crypto`
+/// covers that, under `lambdavm` features + `LambdaVmEcsmCrypto`.
+#[test]
+fn test_ethrex_real_block_native() {
+    use ethrex_guest_program::crypto::NativeCrypto;
+    use ethrex_guest_program::l1::{ProgramInput, execution_program};
+    use rkyv::rancor::Error;
+    use std::sync::Arc;
+    let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    execution_program(input, Arc::new(NativeCrypto)).unwrap();
+}
+
+/// The same real block through the guest ELF, checking the VM's committed
+/// output matches the native reference. Split from the native gate above
+/// because this one needs the ethrex ELF and is far heavier than the synthetic
+/// fixtures (a ~1 MB witness, real contract execution).
+///
+/// Deliberately excluded from the PR CI step, which otherwise runs everything
+/// via `--include-ignored`: the cycle cost of a real block in the VM has not
+/// been measured yet, so it is opt-in until we know what it does to job time.
+/// Run it explicitly with:
+///   cd tooling/ethrex-tests && cargo test --release test_ethrex_real_block_vm -- --ignored
+#[ignore = "real block through the VM; unmeasured runtime, run explicitly on a build server"]
+#[test]
+fn test_ethrex_real_block_vm() {
+    use ethrex_guest_program::crypto::NativeCrypto;
+    use ethrex_guest_program::l1::{ProgramInput, execution_program};
+    use rkyv::rancor::Error;
+    use std::sync::Arc;
+    let inputs = std::fs::read(format!("{FIXTURES_DIR}/{REAL_BLOCK_FIXTURE}")).unwrap();
+    let input = rkyv::from_bytes::<ProgramInput, Error>(&inputs).unwrap();
+    let output = execution_program(input, Arc::new(NativeCrypto)).unwrap();
+    run_program_and_check_public_output(ELF_PATH, output.encode(), inputs);
+}

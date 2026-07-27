@@ -6,7 +6,7 @@ test-profile-recursion-block recursion-profile-block-input \
 test-fast test-prover test-prover-all test-prover-debug test-disk-spill test-math-cuda test-cuda-integration test-cuda-fallback \
 test-prover-cuda test-prover-comprehensive-cuda \
 bench-math-cuda bench-prover bench-prover-cuda build check clippy fmt lint regen-ethrex-fixtures \
-update-ethrex-fixture-checksums check-ethrex-fixture-checksums
+update-ethrex-fixture-checksums check-ethrex-fixture-checksums ethrex-real-block-fixture
 
 UNAME := $(shell uname)
 
@@ -271,9 +271,36 @@ test-asm: compile-programs-asm
 test-rust: compile-programs-rust
 	cargo test -p executor --test rust
 
+# Real-block fixture: a genuine Hoodi block (4.4M gas, 11 txs, ~124 KB of
+# contract bytecode, 1705 state-trie nodes), as opposed to the synthetic
+# N-plain-transfer blocks from tooling/ethrex-fixtures. ~1 MB, so it is
+# generated on demand and gitignored rather than committed.
+#
+# The source is ethrex-replay's cache JSON, not that tool's own rkyv output:
+# ethrex-replay tracks ethrex `main`, where `ProgramInput` has diverged from the
+# rev our guest pins, so only the JSON is safe to read across the two.
+ETHREX_REAL_BLOCK ?= 1265656
+# Pinned by immutable `rev`, as the guest pins ethrex itself: a branch ref would
+# let the benchmark's input change under a fixed fixture name, silently breaking
+# comparability across runs. Re-pin deliberately when adopting a new block.
+ETHREX_REPLAY_REV := 2693e0182a8734117151d8ea2891eda5afc60383
+ETHREX_REAL_BLOCK_CACHE := tooling/ethrex-real-block/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
+ETHREX_REAL_BLOCK_FIXTURE := executor/tests/ethrex_hoodi_$(ETHREX_REAL_BLOCK).bin
+
+ethrex-real-block-fixture: $(ETHREX_REAL_BLOCK_FIXTURE)
+
+$(ETHREX_REAL_BLOCK_CACHE):
+	mkdir -p $(dir $@)
+	curl -fsSL -o $@ \
+		https://raw.githubusercontent.com/lambdaclass/ethrex-replay/$(ETHREX_REPLAY_REV)/caches/cache_hoodi_$(ETHREX_REAL_BLOCK).json
+
+$(ETHREX_REAL_BLOCK_FIXTURE): $(ETHREX_REAL_BLOCK_CACHE) tooling/ethrex-real-block/src/main.rs
+	cd tooling/ethrex-real-block && \
+		cargo run --release -- ../../$(ETHREX_REAL_BLOCK_CACHE) ../../$@
+
 # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
 # workspace (ethrex pins rkyv's `unaligned` feature; isolated Cargo.lock).
-test-ethrex: compile-programs-rust
+test-ethrex: compile-programs-rust $(ETHREX_REAL_BLOCK_FIXTURE)
 	cd tooling/ethrex-tests && cargo test --release -- --include-ignored
 
 test-flamegraph:

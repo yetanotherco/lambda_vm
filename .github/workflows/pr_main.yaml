@@ -101,15 +101,32 @@ jobs:
         run: |
           cargo test --release -p executor test_ckzg -- --ignored
 
+      # The real-block fixture (~1 MB) is gitignored and generated on demand;
+      # test_ethrex_real_block_native below needs it present. This also
+      # downloads the ethrex-replay cache the converter's own tests read.
+      - name: Generate ethrex real-block fixture
+        run: make ethrex-real-block-fixture
+
+      # Detached workspace, and the only place the block is executed against the
+      # guest's actual precompile surface (lambdavm features + LambdaVmEcsmCrypto),
+      # so it is what catches a block needing an accelerator we don't have.
+      - name: Run ethrex real-block converter tests (detached workspace)
+        run: |
+          cd tooling/ethrex-real-block && cargo test --release
+
       # ethrex host-reference tests live in the detached `tooling/ethrex-tests`
       # workspace (ethrex pins rkyv's `unaligned` feature, which must not
       # feature-unify with the main workspace's aligned proof format), so run
       # them from that directory to use its isolated Cargo.lock. The guest ELF
       # and committed fixtures are already present from the steps above.
       # --include-ignored also runs the heavier synthetic-block test.
+      # `test_ethrex_real_block_vm` is skipped: it drives a real block through
+      # the VM and its runtime is not yet measured, so it stays opt-in rather
+      # than sitting in the PR gate. Run it manually on a build server.
       - name: Run ethrex host-reference tests (detached workspace)
         run: |
-          cd tooling/ethrex-tests && cargo test --release -- --include-ignored
+          cd tooling/ethrex-tests && \
+            cargo test --release -- --include-ignored --skip test_ethrex_real_block_vm
 
   test-cli:
     name: CLI tests
