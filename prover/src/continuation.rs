@@ -1186,6 +1186,11 @@ pub fn prove_continuation(
     // Trace-builder worker: drain collected epochs, build their trace tables
     // (pure epoch-local work) and forward the prepared epoch to the provers.
     // Errors propagate through the prove channel, exactly like producer errors.
+    //
+    // Test-only fault injection, keyed by a magic private input no real caller
+    // passes (stateless, so concurrent tests can never trip it): exercises the
+    // mid-pipeline error path, which must return `Err` instead of wedging the
+    // bounded channels (see `test_fault`).
     let build_worker =
         |_lane: usize, tx: std::sync::mpsc::SyncSender<Result<PreparedEpoch, Error>>| {
             loop {
@@ -1202,6 +1207,13 @@ pub fn prove_continuation(
                 };
                 if first_err.lock().unwrap().is_some() {
                     continue; // a prover failed; drain and discard
+                }
+                #[cfg(test)]
+                if job.index == test_fault::FAIL_INDEX && private_inputs == test_fault::MAGIC {
+                    let _ = tx.send(Err(Error::ContinuationInvariant(
+                        "injected pipeline fault (test)".to_string(),
+                    )));
+                    continue;
                 }
                 #[cfg(feature = "nvtx")]
                 let __nvtx = stark::instruments::nvtx_range_fmt(|| {
@@ -1759,6 +1771,15 @@ pub fn prove_and_verify_continuation(
     verify_continuation(elf_bytes, &bundle, opts)
 }
 
+/// Stateless test-only fault trigger for the epoch pipeline: the builder
+/// injects an error at epoch [`FAIL_INDEX`] when the prove's private input is
+/// exactly [`MAGIC`]. Constants only — concurrent tests can never trip it.
+#[cfg(test)]
+pub(crate) mod test_fault {
+    pub(crate) const MAGIC: &[u8] = b"__inject_pipeline_fault__";
+    pub(crate) const FAIL_INDEX: u64 = 3;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1809,6 +1830,36 @@ mod tests {
             split.as_deref(),
             Some(&expected_output[..]),
             "commit in a later epoch must verify and aggregate to the same output"
+        );
+    }
+
+    // The pipeline's error path: a mid-run failure with several epochs still
+    // pending (past the bounded channels' slack) must surface as `Err` — the
+    // regression this guards wedged every channel and hung `prove_continuation`
+    // forever. Run under a timeout so a regression fails instead of hanging CI.
+    #[test]
+    fn test_prove_error_mid_pipeline_returns_err() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let elf_bytes = asm_elf_bytes("all_loadstore_32");
+        // 4-cycle epochs over ~34 cycles → ~9 epochs; the injected failure at
+        // epoch 3 leaves enough pending work to fill every bounded channel.
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let r = prove_continuation(
+                &elf_bytes,
+                test_fault::MAGIC,
+                2,
+                &ProofOptions::default_test_options(),
+            );
+            let _ = done_tx.send(r.map(|_| ()));
+        });
+        let result = done_rx
+            .recv_timeout(std::time::Duration::from_secs(300))
+            .expect("prove_continuation wedged: the pipeline did not shut down on error");
+        let err = result.expect_err("the injected fault must surface as Err");
+        assert!(
+            format!("{err:?}").contains("injected pipeline fault"),
+            "unexpected error: {err:?}"
         );
     }
 
