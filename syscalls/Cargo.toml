@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# embedded-alloc TLSF heap: the previous default guest allocator, now selectable via
+# the `tlsf-alloc` feature. Kept a hard dep so switching allocators needs no dep edits;
+# it's only linked into the guest and dropped when dlmalloc (the default) is selected.
 embedded-alloc = "0.6"
 riscv = { version = "0.15", features = ["critical-section-single-hart"] }
 thiserror = "1.0"
@@ -11,10 +14,19 @@ getrandom = { version = "0.3.4", default-features = false }
 getrandom_v2 = {version = "0.2.15", features = ["custom"], package = "getrandom"}
 lazy_static = "1.5.0"
 rand = "0.9.2"
+# Default guest allocator: Doug Lea's malloc. Cheaper per alloc/free than TLSF on zkVM
+# guests (fewer guest cycles + smaller memory table) and still reclaims freed memory
+# (no OOM). `critical-section` gives the Sync a #[global_allocator] static needs; its
+# single-hart impl comes from `riscv` above. See `src/allocator.rs`.
+dlmalloc = { version = "0.2.14", default-features = false }
+critical-section = "1.2"
 
 [features]
-# BENCH: swap the guest global allocator from embedded-alloc TLSF to a monotonic
-# bump allocator (no-op dealloc). See `syscalls/src/allocator.rs`. Off by default.
+# BENCH/fallback guest allocators — the default (no feature) is dlmalloc. At most one
+# may be enabled (a compile_error guards conflicts). See `src/allocator.rs`.
+#   tlsf-alloc: embedded-alloc TLSF (the previous default; reclaims, safe).
+#   bump-alloc: monotonic bump, no-op dealloc — fastest but OOM-prone (never frees).
+tlsf-alloc = []
 bump-alloc = []
 
 [dev-dependencies]
