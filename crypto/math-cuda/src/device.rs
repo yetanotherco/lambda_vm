@@ -247,6 +247,7 @@ pub struct Backend {
     // constraint_interp.cubin
     pub constraint_interp_kernel: CudaFunction,
     pub constraint_composition_kernel: CudaFunction,
+    pub decompose_d2_kernel: CudaFunction,
 
     // Twiddle caches keyed by log_n.
     fwd_twiddles: Mutex<Vec<Option<Arc<CudaSlice<u64>>>>>,
@@ -468,6 +469,7 @@ impl Backend {
                 .load_function("constraint_interp_kernel")?,
             constraint_composition_kernel: constraint_interp
                 .load_function("constraint_composition_kernel")?,
+            decompose_d2_kernel: constraint_interp.load_function("decompose_d2_ext3")?,
             fwd_twiddles: Mutex::new(vec![None; max_log]),
             inv_twiddles: Mutex::new(vec![None; max_log]),
             ctx,

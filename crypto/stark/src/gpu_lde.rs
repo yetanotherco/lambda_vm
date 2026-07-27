@@ -570,6 +570,84 @@ where
     Some((lde_h0, lde_h1))
 }
 
+/// Fully device-resident degree-2 decomposition + half extension: takes the
+/// resident composition evals `H`, decomposes into H0/H1 on device, LDE-extends
+/// both, drains the evaluations to host (R3/openings still read them) and
+/// keeps the de-interleaved parts buffer as a `GpuLdeExt3` for R4 DEEP.
+/// `None` → the caller downloads `H` and runs the host decompose path.
+pub(crate) fn try_decompose_extend_d2_dev<F, E>(
+    h: &math_cuda::constraint_interp::GpuCompH,
+    inv_2x: &std::sync::Arc<Vec<FieldElement<F>>>,
+    weights: &[FieldElement<F>],
+) -> Option<(Vec<Vec<FieldElement<E>>>, math_cuda::lde::GpuLdeExt3)>
+where
+    F: IsField + 'static,
+    E: IsField + 'static,
+{
+    if TypeId::of::<F>() != TypeId::of::<GoldilocksField>() {
+        return None;
+    }
+    if TypeId::of::<E>() != TypeId::of::<Degree3GoldilocksExtensionField>() {
+        return None;
+    }
+    let lde_size = h.num_rows;
+    if lde_size < gpu_lde_threshold() || !lde_size.is_power_of_two() {
+        return None;
+    }
+    let n = lde_size / 2;
+    if weights.len() != n || inv_2x.len() < n {
+        return None;
+    }
+
+    // SAFETY: `F == GoldilocksField` (gated above); the Arc'd Vecs share layout.
+    let inv_conc: &crate::constraint_ir::gpu_interp::GoldilocksBZInv =
+        unsafe { &*(inv_2x as *const _ as *const _) };
+    let inv_handle = crate::constraint_ir::gpu_interp::base_vec_device_handle(inv_conc)?;
+
+    let two_inv_fe = FieldElement::<F>::from(2u64).inv().ok()?;
+    // SAFETY: F == Goldilocks; FieldElement<Gl> is repr(transparent) over u64.
+    let two_inv: u64 = unsafe { *(two_inv_fe.value() as *const _ as *const u64) };
+
+    let (slabs, stream, n_dev) =
+        math_cuda::constraint_interp::decompose_d2_into_slabs(h, &inv_handle, two_inv).ok()?;
+    debug_assert_eq!(n_dev, n);
+
+    GPU_EXTEND_HALVES_CALLS.fetch_add(1, Ordering::Relaxed);
+    GPU_LDE_CALLS.fetch_add(6, Ordering::Relaxed);
+
+    let mut lde_h0 = vec![FieldElement::<E>::zero(); lde_size];
+    let mut lde_h1 = vec![FieldElement::<E>::zero(); lde_size];
+    // SAFETY: F == Goldilocks (repr u64); ext3 outputs are [u64; 3] per element.
+    let weights_u64: &[u64] =
+        unsafe { from_raw_parts(weights.as_ptr() as *const u64, weights.len()) };
+    let ext3_len = lde_size.checked_mul(3).expect("ext3 output length overflow");
+    let out0 = unsafe { from_raw_parts_mut(lde_h0.as_mut_ptr() as *mut u64, ext3_len) };
+    let out1 = unsafe { from_raw_parts_mut(lde_h1.as_mut_ptr() as *mut u64, ext3_len) };
+    let mut outputs: [&mut [u64]; 2] = [out0, out1];
+
+    let handle = math_cuda::lde::coset_lde_batch_ext3_slabs_keep(
+        &stream,
+        slabs,
+        2,
+        n,
+        2,
+        weights_u64,
+        &mut outputs,
+    )
+    .ok()?;
+
+    Some((vec![lde_h0, lde_h1], handle))
+}
+
+/// D2H bridge for the fallback: download a resident `H` and lift it into
+/// field elements (the exact input the host decompose expects).
+pub(crate) fn download_comp_h_to_field<E: IsField + 'static>(
+    h: &math_cuda::constraint_interp::GpuCompH,
+) -> Option<Vec<FieldElement<E>>> {
+    let raw = math_cuda::constraint_interp::download_comp_h(h).ok()?;
+    crate::constraint_ir::gpu_interp::ext3_u64_to_field::<E>(&raw)
+}
+
 pub(crate) static GPU_LEAF_HASH_CALLS: AtomicU64 = AtomicU64::new(0);
 pub fn gpu_leaf_hash_calls() -> u64 {
     GPU_LEAF_HASH_CALLS.load(Ordering::Relaxed)

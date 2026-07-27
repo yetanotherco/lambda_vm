@@ -453,10 +453,12 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
         b_beta: &b_beta,
         b_z_inv: &b_z_inv,
     };
-    let gpu = try_eval_composition_gpu(
-        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs,
-    )
-    .unwrap_or_else(|| panic!("[{label}] GPU composition path must engage"));
+    let gpu = match try_eval_composition_gpu(
+        prog, &main, &aux, &rap, &alpha, &offset, NEXT_STEP, NUM_ROWS, &inputs, false,
+    ) {
+        Some(stark::constraint_ir::gpu_interp::GpuComposition::Host(raw)) => raw,
+        _ => panic!("[{label}] GPU composition path must engage (host mode)"),
+    };
     assert_eq!(gpu.len(), NUM_ROWS * 3, "[{label}] H shape");
 
     // CPU oracle, row by row.

@@ -1982,6 +1982,103 @@ pub fn coset_lde_batch_ext3_into(
     Ok(())
 }
 
+/// Batched ext3 coset LDE over columns ALREADY resident on device in slab
+/// layout (`3m` slabs of `lde_size` u64, first `n` of each filled, rest
+/// zero-padded), e.g. from the on-device degree-2 decomposition. Runs the
+/// same butterfly pipeline as [`coset_lde_batch_ext3_into`], drains the
+/// evaluations to `outputs` (interleaved ext3, `3*lde_size` u64 each), and
+/// keeps the device buffer as a [`GpuLdeExt3`] handle (synchronized by the
+/// drain, so `ready: None`).
+pub fn coset_lde_batch_ext3_slabs_keep(
+    stream: &Arc<CudaStream>,
+    mut buf: CudaSlice<u64>,
+    m: usize,
+    n: usize,
+    blowup_factor: usize,
+    weights: &[u64],
+    outputs: &mut [&mut [u64]],
+) -> Result<GpuLdeExt3> {
+    assert!(m > 0 && n.is_power_of_two(), "slab LDE shape");
+    assert_eq!(weights.len(), n, "weights length must match n");
+    assert!(blowup_factor.is_power_of_two(), "blowup must be power of two");
+    let lde_size = n * blowup_factor;
+    let mb = 3 * m;
+    assert_eq!(buf.len(), mb * lde_size, "slab buffer shape");
+    assert_eq!(outputs.len(), m, "outputs must match column count");
+    for o in outputs.iter() {
+        assert_eq!(o.len(), 3 * lde_size, "each output must be 3*lde_size u64s");
+    }
+    assert_u32_domain(lde_size, "coset_lde_batch_ext3_slabs_keep lde_size");
+    let log_n = n.trailing_zeros() as u64;
+    let log_lde = lde_size.trailing_zeros() as u64;
+
+    let be = backend()?;
+    let inv_tw = be.inv_twiddles_for(log_n)?;
+    let fwd_tw = be.fwd_twiddles_for(log_lde)?;
+    let weights_dev = stream.clone_htod(weights)?;
+
+    let n_u64 = n as u64;
+    let lde_u64 = lde_size as u64;
+    let col_stride_u64 = lde_size as u64;
+    let mb_u32 = mb as u32;
+
+    launch_bit_reverse_batched(stream.as_ref(), be, &mut buf, n_u64, log_n, col_stride_u64, mb_u32)?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        inv_tw.as_ref(),
+        n_u64,
+        log_n,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_pointwise_mul_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        &weights_dev,
+        n_u64,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    launch_bit_reverse_batched(
+        stream.as_ref(),
+        be,
+        &mut buf,
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+    run_batched_ntt_body(
+        stream.as_ref(),
+        &mut buf,
+        fwd_tw.as_ref(),
+        lde_u64,
+        log_lde,
+        col_stride_u64,
+        mb_u32,
+    )?;
+
+    let pending =
+        crate::device::async_dtoh_via(stream, be.pinned_staging(), &be.ctx, &buf, mb * lde_size)?;
+    pending.wait_and_read(|bytes| {
+        // SAFETY: the pinned slab is u64-aligned by construction and the copy
+        // deposited exactly `mb * lde_size` u64s.
+        let pinned =
+            unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u64, mb * lde_size) };
+        unpack_pinned_slabs_to_ext3(pinned, outputs, lde_size);
+    })?;
+
+    Ok(GpuLdeExt3 {
+        buf: Arc::new(buf),
+        m,
+        lde_size,
+        tree: None,
+        ready: None,
+    })
+}
+
 /// Run the DIT butterfly body of a bit-reversed-input NTT over `m` batched
 /// columns in one device buffer. Same fusion strategy as `run_ntt_body`:
 /// first 8 levels shmem-fused (coalesced), subsequent levels one kernel each.

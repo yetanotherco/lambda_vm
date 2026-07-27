@@ -205,15 +205,28 @@ where
         // zerofier is non-uniform, or the transition offsets are non-contiguous.
         #[cfg(feature = "cuda")]
         {
-            if let Some(h) = self.try_evaluate_composition_gpu(
-                air,
-                lde_trace,
-                rap_challenges,
-                transition_coefficients,
-                boundary_coefficients,
-                &zerofier_data,
-                &boundary_zerofiers_inverse_evaluations,
-            ) {
+            if let Some(crate::constraint_ir::gpu_interp::GpuComposition::Host(raw)) = self
+                .try_evaluate_composition_gpu(
+                    air,
+                    lde_trace,
+                    rap_challenges,
+                    transition_coefficients,
+                    boundary_coefficients,
+                    &zerofier_data,
+                    &boundary_zerofiers_inverse_evaluations,
+                    false,
+                )
+            {
+                // SAFETY: the TypeId gate established `FieldExtension ==
+                // Degree3GoldilocksExtensionField`, `#[repr(transparent)]`
+                // over `[u64; 3]`; `raw.len() == num_rows * 3`.
+                let h: Vec<FieldElement<FieldExtension>> = unsafe {
+                    std::slice::from_raw_parts(
+                        raw.as_ptr() as *const FieldElement<FieldExtension>,
+                        raw.len() / 3,
+                    )
+                }
+                .to_vec();
                 return h;
             }
         }
@@ -295,7 +308,8 @@ where
         boundary_coefficients: &[FieldElement<FieldExtension>],
         zerofier_data: &ZerofierEvaluations<Field>,
         boundary_z_inv: &[std::sync::Arc<Vec<FieldElement<Field>>>],
-    ) -> Option<Vec<FieldElement<FieldExtension>>>
+        keep: bool,
+    ) -> Option<crate::constraint_ir::gpu_interp::GpuComposition>
     where
         Field: 'static,
         FieldExtension: 'static,
@@ -352,7 +366,7 @@ where
         let next_step = lde_trace.lde_step_size; // == blowup_factor (single-row steps)
         let num_rows = lde_trace.num_rows();
 
-        let raw = crate::constraint_ir::gpu_interp::try_eval_composition_gpu(
+        crate::constraint_ir::gpu_interp::try_eval_composition_gpu(
             prog,
             main,
             aux,
@@ -362,18 +376,48 @@ where
             next_step,
             num_rows,
             &inputs,
-        )?;
+            keep,
+        )
+    }
 
-        // SAFETY: the TypeId gate established `FieldExtension ==
-        // Degree3GoldilocksExtensionField`, which is `#[repr(transparent)]` over
-        // `[u64; 3]`; `raw.len() == num_rows * 3`.
-        let h: Vec<FieldElement<FieldExtension>> = unsafe {
-            std::slice::from_raw_parts(
-                raw.as_ptr() as *const FieldElement<FieldExtension>,
-                raw.len() / 3,
-            )
+    /// GPU composition path keeping `H` resident on device, for the on-device
+    /// degree-2 decomposition. `None` → the caller runs [`Self::evaluate`]
+    /// (the host path) instead.
+    #[cfg(feature = "cuda")]
+    pub(crate) fn evaluate_dev(
+        &self,
+        air: &dyn AIR<Field = Field, FieldExtension = FieldExtension, PublicInputs = PI>,
+        lde_trace: &LDETraceTable<Field, FieldExtension>,
+        domain: &Domain<Field>,
+        transition_coefficients: &[FieldElement<FieldExtension>],
+        boundary_coefficients: &[FieldElement<FieldExtension>],
+        rap_challenges: &[FieldElement<FieldExtension>],
+    ) -> Option<math_cuda::constraint_interp::GpuCompH>
+    where
+        Field: 'static,
+        FieldExtension: 'static,
+    {
+        let boundary_zerofiers_inverse_evaluations: Vec<
+            std::sync::Arc<Vec<FieldElement<Field>>>,
+        > = self
+            .boundary_constraints
+            .constraints
+            .iter()
+            .map(|bc| domain.boundary_zerofier_inv(bc.step))
+            .collect();
+        let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
+        match self.try_evaluate_composition_gpu(
+            air,
+            lde_trace,
+            rap_challenges,
+            transition_coefficients,
+            boundary_coefficients,
+            &zerofier_data,
+            &boundary_zerofiers_inverse_evaluations,
+            true,
+        )? {
+            crate::constraint_ir::gpu_interp::GpuComposition::Dev(h) => Some(h),
+            crate::constraint_ir::gpu_interp::GpuComposition::Host(_) => None,
         }
-        .to_vec();
-        Some(h)
     }
 }

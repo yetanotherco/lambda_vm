@@ -130,7 +130,7 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     pub b_z_inv: &'a [std::sync::Arc<Vec<FieldElement<F>>>],
 }
 
-type GoldilocksBZInv = std::sync::Arc<Vec<FieldElement<GoldilocksField>>>;
+pub(crate) type GoldilocksBZInv = std::sync::Arc<Vec<FieldElement<GoldilocksField>>>;
 
 /// Device-resident boundary-zerofier columns, keyed by the host Arc
 /// allocation. The entry stores the Arc, pinning the allocation: a key can
@@ -160,29 +160,29 @@ fn bzinv_device_cache() -> &'static std::sync::Mutex<
     CACHE.get_or_init(Default::default)
 }
 
-/// Resolve each host column to its device-resident copy, uploading once per
-/// distinct Arc. Returns `None` on any upload failure (→ CPU fallback).
+/// Resolve a host base-field column to its device-resident copy, uploading
+/// once per distinct Arc. Returns `None` on upload failure (→ CPU fallback).
+pub(crate) fn base_vec_device_handle(
+    v: &GoldilocksBZInv,
+) -> Option<std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>> {
+    let key = std::sync::Arc::as_ptr(v) as usize;
+    if let Some((_, h)) = bzinv_device_cache().lock().unwrap().get(&key) {
+        return Some(h.clone());
+    }
+    // SAFETY: `F == GoldilocksField` by the type alias.
+    let raw = unsafe { base_slice_as_u64(v.as_slice()) };
+    let h = std::sync::Arc::new(math_cuda::constraint_interp::upload_base_vec(raw).ok()?);
+    bzinv_device_cache()
+        .lock()
+        .unwrap()
+        .insert(key, (v.clone(), h.clone()));
+    Some(h)
+}
+
 fn bzinv_device_handles(
     vecs: &[GoldilocksBZInv],
 ) -> Option<Vec<std::sync::Arc<math_cuda::constraint_interp::GpuBaseVec>>> {
-    vecs.iter()
-        .map(|v| {
-            let key = std::sync::Arc::as_ptr(v) as usize;
-            if let Some((_, h)) = bzinv_device_cache().lock().unwrap().get(&key) {
-                return Some(h.clone());
-            }
-            // SAFETY: `F == GoldilocksField` by the type alias.
-            let raw = unsafe { base_slice_as_u64(v.as_slice()) };
-            let h = std::sync::Arc::new(
-                math_cuda::constraint_interp::upload_base_vec(raw).ok()?,
-            );
-            bzinv_device_cache()
-                .lock()
-                .unwrap()
-                .insert(key, (v.clone(), h.clone()));
-            Some(h)
-        })
-        .collect()
+    vecs.iter().map(base_vec_device_handle).collect()
 }
 
 /// The program-derived half of a lowered call: the flat device blob plus its
@@ -312,8 +312,16 @@ where
     })
 }
 
-/// Fused composition-poly evaluation on the GPU: returns `H(row)` as raw ext3
-/// limbs (`num_rows * 3` u64), or `None` for non-Goldilocks towers (→ CPU
+/// The result of a fused GPU composition evaluation: `H` downloaded to host
+/// (raw ext3 limbs, `num_rows * 3` u64) or kept resident on device for the
+/// on-device degree-2 decomposition.
+pub enum GpuComposition {
+    Host(Vec<u64>),
+    Dev(math_cuda::constraint_interp::GpuCompH),
+}
+
+/// Fused composition-poly evaluation on the GPU: returns `H(row)` (host or
+/// device-resident per `keep`), or `None` for non-Goldilocks towers (→ CPU
 /// fallback). `H(row) = z_inv·Σβᵢ·Cᵢ + Σ_b z_b_inv·β_b·(trace_b − value_b)`,
 /// the uniform-zerofier accumulation of `evaluator::evaluate`.
 #[allow(clippy::too_many_arguments)]
@@ -327,7 +335,8 @@ pub fn try_eval_composition_gpu<F, E>(
     next_step: usize,
     num_rows: usize,
     inputs: &CompositionInputs<F, E>,
-) -> Option<Vec<u64>>
+    keep: bool,
+) -> Option<GpuComposition>
 where
     F: IsField + 'static,
     E: IsField + 'static,
@@ -364,23 +373,45 @@ where
         b_z_inv: &b_z_inv,
     };
 
-    let result = math_cuda::constraint_interp::eval_composition_on_device(
-        &lowered.nodes,
-        lowered.dev.nodes.len(),
-        lowered.dev.num_base_slots as usize,
-        lowered.dev.num_ext_slots as usize,
-        &lowered.dev.base_consts,
-        &lowered.ext_consts,
-        &lowered.roots,
-        &rap,
-        &alpha,
-        &offset,
-        main,
-        aux,
-        next_step,
-        num_rows,
-        &accum,
-    );
+    let result = if keep {
+        math_cuda::constraint_interp::eval_composition_on_device_keep(
+            &lowered.nodes,
+            lowered.dev.nodes.len(),
+            lowered.dev.num_base_slots as usize,
+            lowered.dev.num_ext_slots as usize,
+            &lowered.dev.base_consts,
+            &lowered.ext_consts,
+            &lowered.roots,
+            &rap,
+            &alpha,
+            &offset,
+            main,
+            aux,
+            next_step,
+            num_rows,
+            &accum,
+        )
+        .map(GpuComposition::Dev)
+    } else {
+        math_cuda::constraint_interp::eval_composition_on_device(
+            &lowered.nodes,
+            lowered.dev.nodes.len(),
+            lowered.dev.num_base_slots as usize,
+            lowered.dev.num_ext_slots as usize,
+            &lowered.dev.base_consts,
+            &lowered.ext_consts,
+            &lowered.roots,
+            &rap,
+            &alpha,
+            &offset,
+            main,
+            aux,
+            next_step,
+            num_rows,
+            &accum,
+        )
+        .map(GpuComposition::Host)
+    };
     if result.is_ok() {
         crate::gpu_lde::GPU_COMPOSITION_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }

@@ -466,3 +466,32 @@ extern "C" __global__ void constraint_composition_kernel(
         d_h[row] = h;
     }
 }
+
+// ============================================================================
+// Degree-2 quotient decomposition, pointwise on the LDE coset:
+//   H0[i] = two_inv  * (h[i] + h[i+n])
+//   H1[i] = inv_2x[i] * (h[i] - h[i+n])
+// Reads the interleaved ext3 composition evals `h` (2n rows); writes the two
+// halves in slab layout (3 base slabs per half, `slab_stride` u64 each; rows
+// n.. stay zero as the LDE zero-pad).
+extern "C" __global__ void decompose_d2_ext3(
+    const uint64_t *__restrict__ h,
+    const uint64_t *__restrict__ inv_2x,
+    uint64_t two_inv,
+    uint64_t n,
+    uint64_t slab_stride,
+    uint64_t *__restrict__ out) {
+    for (uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x; i < n;
+         i += (uint64_t)gridDim.x * blockDim.x) {
+        Fe3 x = ext3::make(h[i * 3], h[i * 3 + 1], h[i * 3 + 2]);
+        Fe3 y = ext3::make(h[(i + n) * 3], h[(i + n) * 3 + 1], h[(i + n) * 3 + 2]);
+        Fe3 h0 = ext3::mul_base(ext3::add(x, y), two_inv);
+        Fe3 h1 = ext3::mul_base(ext3::sub(x, y), inv_2x[i]);
+        out[0 * slab_stride + i] = h0.a;
+        out[1 * slab_stride + i] = h0.b;
+        out[2 * slab_stride + i] = h0.c;
+        out[3 * slab_stride + i] = h1.a;
+        out[4 * slab_stride + i] = h1.b;
+        out[5 * slab_stride + i] = h1.c;
+    }
+}

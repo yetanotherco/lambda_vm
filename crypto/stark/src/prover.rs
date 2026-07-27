@@ -389,7 +389,7 @@ pub(crate) struct LdeTwiddles<F: IsFFTField> {
     /// decomposition path actually runs on CPU.
     composition: OnceLock<CompositionLdeTwiddles<F>>,
     /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition — see [`Self::inv_2x`].
-    inv_2x: OnceLock<Vec<FieldElement<F>>>,
+    inv_2x: OnceLock<Arc<Vec<FieldElement<F>>>>,
 }
 
 pub(crate) struct CompositionLdeTwiddles<F: IsFFTField> {
@@ -485,7 +485,9 @@ impl<F: IsFFTField> LdeTwiddles<F> {
 
     /// `1/(2·g·ωⁱ)` for the degree-2 quotient decomposition, computed once per
     /// domain (an LDE/2-size batch inversion per table per epoch otherwise).
-    fn inv_2x(&self, domain: &Domain<F>) -> &[FieldElement<F>] {
+    /// `Arc`'d so the device-resident copy can pin it (see
+    /// `gpu_interp::base_vec_device_handle`).
+    fn inv_2x(&self, domain: &Domain<F>) -> &Arc<Vec<FieldElement<F>>> {
         self.inv_2x.get_or_init(|| {
             let n = domain.lde_roots_of_unity_coset.len() / 2;
             let mut inv: Vec<FieldElement<F>> = (0..n)
@@ -493,7 +495,7 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 .map(|i| domain.lde_roots_of_unity_coset[i].double())
                 .collect();
             FieldElement::inplace_batch_inverse(&mut inv).expect("Coset points are non-zero");
-            inv
+            Arc::new(inv)
         })
     }
 }
@@ -1456,37 +1458,95 @@ pub trait IsStarkProver<
             round_1_result.bus_public_inputs.as_ref(),
             trace_length,
         );
-        #[cfg(feature = "instruments")]
-        let t_sub = Instant::now();
-        let constraint_evaluations = evaluator.evaluate(
-            air,
-            &round_1_result.lde_trace,
-            domain,
-            transition_coefficients,
-            boundary_coefficients,
-            &round_1_result.rap_challenges,
-        );
-        #[cfg(feature = "instruments")]
-        let constraints_dur = t_sub.elapsed();
-
         let number_of_parts = air.composition_poly_degree_bound(trace_length) / trace_length;
 
         #[cfg(feature = "instruments")]
         let t_sub = Instant::now();
         #[cfg(feature = "cuda")]
         let mut gpu_composition_parts: Option<math_cuda::lde::GpuLdeExt3> = None;
-        let lde_composition_poly_parts_evaluations = if number_of_parts == 2 {
+
+        // Fully device-resident d=2 path: H stays on device through decompose +
+        // half extension, the parts handle feeds R4 DEEP, and only the final
+        // evaluations are drained to host (for the commit tree and openings).
+        // Any miss falls through to the host path below (downloading H when
+        // the evaluation itself already ran on device).
+        #[cfg(feature = "cuda")]
+        let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+        #[cfg(feature = "cuda")]
+        if number_of_parts == 2 {
+            if let Some(h_dev) = evaluator.evaluate_dev(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            ) {
+                match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                    &h_dev,
+                    twiddles.inv_2x(domain),
+                    &twiddles.composition(domain).weights,
+                ) {
+                    Some((parts, handle)) => {
+                        gpu_composition_parts = Some(handle);
+                        precomputed_parts = Some(parts);
+                    }
+                    None => {
+                        if let Some(h) =
+                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
+                        {
+                            precomputed_parts =
+                                Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
+                        }
+                    }
+                }
+            }
+        }
+        #[cfg(not(feature = "cuda"))]
+        let precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
+
+        #[cfg(feature = "instruments")]
+        let constraints_dur = t_sub.elapsed();
+        #[cfg(feature = "instruments")]
+        let t_sub = Instant::now();
+
+        let lde_composition_poly_parts_evaluations = if let Some(parts) = precomputed_parts {
+            parts
+        } else if number_of_parts == 2 {
             // Direct quotient decomposition: avoid full-size iFFT by algebraically
             // splitting H(x) = H₀(x²) + x·H₁(x²) using:
             //   H₀(x²) = (H(x) + H(-x)) / 2
             //   H₁(x²) = (H(x) - H(-x)) / (2x)
             // On the LDE coset {g·ω^i}, we have -g·ω^i = g·ω^{i+N} since ω^N = -1.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            );
             Self::decompose_and_extend_d2(&constraint_evaluations, domain, twiddles)
         } else if number_of_parts == 1 {
             // Degree bound equals trace length: constraint evals are the LDE directly.
-            vec![constraint_evaluations]
+            vec![evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            )]
         } else {
             // Fallback for any future AIR with d > 2.
+            let constraint_evaluations = evaluator.evaluate(
+                air,
+                &round_1_result.lde_trace,
+                domain,
+                transition_coefficients,
+                boundary_coefficients,
+                &round_1_result.rap_challenges,
+            );
             let composition_poly =
                 Polynomial::interpolate_offset_fft(&constraint_evaluations, &domain.coset_offset)?;
             let composition_poly_parts = composition_poly.break_in_parts(number_of_parts);
