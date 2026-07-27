@@ -2,8 +2,18 @@ name: Bench ABBA tiebreaker
 
 # Drift-free paired (A/B/B/A) prover benchmark for resolving small (~1%) deltas the
 # cheap PR benchmark can't confirm. It builds both binaries and runs ~20 interleaved
-# pairs, so it OCCUPIES THE SINGLE BENCH SERVER FOR ~30-40 MIN. For that reason it
+# pairs — at the default workload that OCCUPIES THE SINGLE BENCH SERVER FOR SEVERAL
+# HOURS (a 100tx continuations prove is ~7 min on a 16-core box). For that reason it
 # NEVER auto-triggers -- it runs only on an explicit `/bench-abba` comment on a PR.
+#
+# Syntax: "/bench-abba [N] [cont[TX]|mono[TX]]" (N = pair count, default 20). The
+# workload defaults to ethrex 100tx with --continuations — the production proving
+# mode at a size where per-epoch effects amortize (63 epochs). "cont10" gives the
+# small continuation workload (~45s/prove — good when a coarse answer fast matters
+# more than resolution); "mono[TX]", e.g. "mono5", the legacy monolithic prove. The
+# ~3.1 GiB cont100 proof requires rkyv pointer_width_64 on BOTH sides (see
+# prover/Cargo.toml), so PR branches older than that fix must rebase before a cont100
+# bench.
 on:
   issue_comment:
     types: [created]
@@ -26,9 +36,12 @@ jobs:
       startsWith(github.event.comment.body, '/bench-abba') &&
       contains(fromJSON('["MEMBER","OWNER","COLLABORATOR"]'), github.event.comment.author_association)
     runs-on: [self-hosted, bench]
-    # Generous ceiling so a hang/OOM can't strand the single bench runner; the
-    # workload itself is ~30-40 min at the default 20 pairs (clamped to <=40).
-    timeout-minutes: 120
+    # Generous ceiling so a hang/OOM can't strand the single bench runner — not the
+    # expected duration. Measured on a 16-core box: a 100tx-continuations CPU prove
+    # is ~7 min, so the default 20 pairs (40 proves) runs ~4.5-5 hr and the 40-pair
+    # clamp ceiling ~9.5 hr; builds add ~10-20 min. (The old 5tx-monolithic workload
+    # was ~30-40 min total at 20 pairs.)
+    timeout-minutes: 600
     steps:
       - name: Acknowledge (react + occupancy notice)
         uses: actions/github-script@v7
@@ -41,10 +54,10 @@ jobs:
             await github.rest.issues.createComment({
               owner: context.repo.owner, repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: '⏳ **ABBA tiebreaker started** on the bench server (~30–40 min). The bench server is occupied until it finishes.'
+              body: '⏳ **ABBA tiebreaker started** on the bench server (~4-5 hr at the default 20 pairs of ethrex 100tx continuations; pass a smaller pair count or `cont10` for a quicker, coarser run). The bench server is occupied until it finishes.'
             });
 
-      - name: Resolve PR head + pair count
+      - name: Resolve PR head + bench config
         id: cfg
         env:
           GH_TOKEN: ${{ github.token }}
@@ -56,15 +69,59 @@ jobs:
           # force-push race mid-run.
           HEAD_SHA=$(gh pr view "$PR_NUM" --repo "$GITHUB_REPOSITORY" --json headRefOid -q .headRefOid)
           echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          # Optional pair count, e.g. "/bench-abba 32"; default 20. Clamp to [2,40]
-          # so a "/bench-abba 10000" can't monopolize the single bench server.
-          N=$(echo "$COMMENT_BODY" | sed -n 's|^/bench-abba[[:space:]]*\([0-9]\+\).*|\1|p')
-          N=${N:-20}
-          if [ "$N" -lt 2 ] 2>/dev/null || [ "$N" -gt 40 ] 2>/dev/null; then
-            echo "::warning::pair count $N out of range [2,40]; using 20"
-            N=20
+          # Everything after "/bench-abba" on its line, tokens in any order: a number =
+          # pair count (default 20); cont[TX]/mono[TX] = workload. Default: ethrex 100tx
+          # with --continuations — the production proving mode, where the epoch-level
+          # optimizations (pipeline, K provers, cross-epoch caches) actually execute,
+          # at a size (63 epochs) where per-epoch effects amortize. The old
+          # 5tx-monolithic default never entered prove_continuation and under-reported
+          # continuation PRs ~8x. "mono[TX]" keeps the legacy monolithic prove
+          # reachable for historical comparison (TX defaults to 5).
+          ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -n 's|^/bench-abba||p' | head -n1)
+          PAIRS=20; CONTINUATIONS=1; TX_COUNT=100
+          for tok in $ARGS; do
+            case "$tok" in
+              cont)       CONTINUATIONS=1; TX_COUNT=100 ;;
+              mono)       CONTINUATIONS=0; TX_COUNT=5 ;;
+              cont[0-9]*) CONTINUATIONS=1; TX_COUNT="${tok#cont}" ;;
+              mono[0-9]*) CONTINUATIONS=0; TX_COUNT="${tok#mono}" ;;
+              [0-9]*)     PAIRS="$tok" ;;
+              *)          echo "::warning::ignoring unrecognized token '$tok'" ;;
+            esac
+          done
+          # Digits-only + clamps: TX_COUNT sizes the fixture (the 10-transfer one is
+          # committed; others are generated on the runner); PAIRS is clamped to [2,40]
+          # so a "/bench-abba 10000" can't monopolize the single bench server. The TX
+          # ceiling is mode-aware: monolithic peak heap grows with the trace (20tx was
+          # ~78 GB), so mono is capped at the classic 5; continuations are flat-memory,
+          # capped at the validated 100.
+          if [ "$CONTINUATIONS" = "1" ]; then TX_DEFAULT=100; TX_MAX=100; else TX_DEFAULT=5; TX_MAX=5; fi
+          case "$TX_COUNT" in
+            ''|*[!0-9]*) echo "::warning::invalid tx count '$TX_COUNT'; using $TX_DEFAULT"; TX_COUNT=$TX_DEFAULT ;;
+          esac
+          if [ "$TX_COUNT" -lt 1 ] || [ "$TX_COUNT" -gt "$TX_MAX" ]; then
+            echo "::warning::tx count $TX_COUNT out of range [1,$TX_MAX] for this mode; using $TX_DEFAULT"
+            TX_COUNT=$TX_DEFAULT
           fi
-          echo "pairs=$N" >> "$GITHUB_OUTPUT"
+          case "$PAIRS" in
+            ''|*[!0-9]*) echo "::warning::invalid pair count '$PAIRS'; using 20"; PAIRS=20 ;;
+          esac
+          if [ "$PAIRS" -lt 2 ] || [ "$PAIRS" -gt 40 ]; then
+            echo "::warning::pair count $PAIRS out of range [2,40]; using 20"
+            PAIRS=20
+          fi
+          if [ "$CONTINUATIONS" = "1" ]; then
+            WORKLOAD="ethrex ${TX_COUNT}tx continuations"
+          else
+            WORKLOAD="ethrex ${TX_COUNT}tx monolithic"
+          fi
+          {
+            echo "pairs=$PAIRS"
+            echo "continuations=$CONTINUATIONS"
+            echo "tx_count=$TX_COUNT"
+            echo "workload=$WORKLOAD"
+          } >> "$GITHUB_OUTPUT"
+          echo "Using $PAIRS A/B/B/A pairs on $WORKLOAD"
 
       - name: Checkout (full history for ref resolution)
         uses: actions/checkout@v4
@@ -84,6 +141,9 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
+          # Workload knobs read directly by bench_abba.sh from the environment.
+          CONTINUATIONS: ${{ steps.cfg.outputs.continuations }}
+          TX_COUNT: ${{ steps.cfg.outputs.tx_count }}
         run: |
           export SYSROOT_DIR="$HOME/.lambda-vm-sysroot"
           set -o pipefail
@@ -100,12 +160,14 @@ jobs:
           HEAD_SHA: ${{ steps.cfg.outputs.head_sha }}
           PAIRS: ${{ steps.cfg.outputs.pairs }}
           OUTCOME: ${{ steps.run.outcome }}
+          WORKLOAD: ${{ steps.cfg.outputs.workload }}
         with:
           script: |
             const fs = require('fs');
             const read = (p) => { try { return fs.readFileSync(p, 'utf8').trim(); } catch { return ''; } };
             const head = (process.env.HEAD_SHA || '').slice(0, 10), pairs = process.env.PAIRS;
-            let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs)\n\n`;
+            const workload = process.env.WORKLOAD || 'ethrex';
+            let body = `## ABBA tiebreaker — \`${head}\` vs \`main\` (${pairs} pairs, ${workload})\n\n`;
             if (process.env.OUTCOME === 'success') {
               const res = read('/tmp/abba_result.txt') || read('/tmp/abba_out.txt');
               body += '```\n' + res + '\n```\n';
