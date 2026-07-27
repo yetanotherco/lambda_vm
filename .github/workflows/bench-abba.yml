@@ -94,6 +94,11 @@ jobs:
             echo "::warning::pair count $PAIRS out of range [2,40]; using 20"
             PAIRS=20
           fi
+          # Even is ideal so the AB/BA orders balance; round an odd request up by one.
+          if [ "$((PAIRS % 2))" -ne 0 ]; then
+            PAIRS=$((PAIRS + 1))
+            echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
+          fi
           # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
           # continuation proof exceeds rkyv's old 2 GiB cap and only dies after
           # blocking the single bench server for hours. Skip if the fetch fails.
