@@ -95,6 +95,7 @@ jobs:
           fi
           # Defaults: continuations with the 100-transfer fixture (production mode).
           CONTINUATIONS=1; TX_COUNT=100
+          set -f  # tokens must not glob-expand against the runner's CWD
           for tok in $ARGS; do
             case "$tok" in
               cont)       CONTINUATIONS=1; TX_COUNT=100 ;;
@@ -130,6 +131,18 @@ jobs:
           if [ "$((PAIRS % 2))" -ne 0 ]; then
             PAIRS=$((PAIRS + 1))
             echo "::notice::rounded odd pair count up to $PAIRS so AB/BA orders balance"
+          fi
+          # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
+          # continuation proof exceeds rkyv's old 2 GiB cap and only dies after the
+          # full dual build (~1 hr of GPU rental). Skip the check if the fetch fails.
+          if [ "$CONTINUATIONS" = "1" ] && [ "$TX_COUNT" -ge 40 ]; then
+            REF="${OUT_HEAD_SHA:-$OUT_BRANCH}"
+            SIDE=$(gh api "repos/$GITHUB_REPOSITORY/contents/prover/Cargo.toml?ref=$REF" \
+              -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+            if [ -n "$SIDE" ] && ! printf '%s' "$SIDE" | grep -q pointer_width_64; then
+              echo "::error::PR branch predates the rkyv pointer_width_64 fix — a ${TX_COUNT}tx continuation proof cannot serialize. Rebase onto main, or bench with cont10/mono."
+              exit 1
+            fi
           fi
           if [ "$CONTINUATIONS" = "1" ]; then
             WORKLOAD="ethrex ${TX_COUNT}tx continuations"

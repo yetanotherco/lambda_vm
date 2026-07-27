@@ -33,7 +33,7 @@ jobs:
     runs-on: [self-hosted, bench]
     # Hang guardrail, not expected duration: a cont100 CPU prove is ~7 min, so the
     # default 20 pairs runs ~4.5-5 hr and the 40-pair clamp ~9.5 hr, plus builds.
-    timeout-minutes: 600
+    timeout-minutes: 720
     steps:
       - name: Acknowledge (react + occupancy notice)
         uses: actions/github-script@v7
@@ -65,6 +65,7 @@ jobs:
           # pair count; cont[TX]/mono[TX] = workload.
           ARGS=$(printf '%s' "$COMMENT_BODY" | tr -d '\r' | sed -n 's|^/bench-abba||p' | head -n1)
           PAIRS=20; CONTINUATIONS=1; TX_COUNT=100
+          set -f  # tokens must not glob-expand against the runner's CWD
           for tok in $ARGS; do
             case "$tok" in
               cont)       CONTINUATIONS=1; TX_COUNT=100 ;;
@@ -92,6 +93,17 @@ jobs:
           if [ "$PAIRS" -lt 2 ] || [ "$PAIRS" -gt 40 ]; then
             echo "::warning::pair count $PAIRS out of range [2,40]; using 20"
             PAIRS=20
+          fi
+          # Fail fast if the PR side predates the pointer_width_64 fix: a >=40tx
+          # continuation proof exceeds rkyv's old 2 GiB cap and only dies after
+          # blocking the single bench server for hours. Skip if the fetch fails.
+          if [ "$CONTINUATIONS" = "1" ] && [ "$TX_COUNT" -ge 40 ]; then
+            SIDE=$(gh api "repos/$GITHUB_REPOSITORY/contents/prover/Cargo.toml?ref=$HEAD_SHA" \
+              -H "Accept: application/vnd.github.raw" 2>/dev/null || true)
+            if [ -n "$SIDE" ] && ! printf '%s' "$SIDE" | grep -q pointer_width_64; then
+              echo "::error::PR branch predates the rkyv pointer_width_64 fix — a ${TX_COUNT}tx continuation proof cannot serialize. Rebase onto main, or bench with cont10/mono."
+              exit 1
+            fi
           fi
           if [ "$CONTINUATIONS" = "1" ]; then
             WORKLOAD="ethrex ${TX_COUNT}tx continuations"
