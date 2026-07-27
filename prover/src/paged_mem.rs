@@ -108,6 +108,14 @@ impl<T: Copy> PagedMem<T> {
     /// hashing) — lets PAGE trace generation read each offset's final value
     /// straight from the store instead of a sparse `FinalStateMap` lookup.
     pub fn page_data(&self, base: u64) -> Option<&[T]> {
+        // Unlike `get`/`set`, this searches the raw `base` (no `split`), so an
+        // unaligned argument silently misses and returns `None` — which a caller
+        // like `collect_bitwise_from_page` would read as "empty page" and skew its
+        // ARE_BYTES multiplicities. Surface the misuse instead of hiding it.
+        debug_assert!(
+            base.is_multiple_of(DEFAULT_PAGE_SIZE as u64),
+            "page_data: base must be page-aligned"
+        );
         match self.pages.binary_search_by_key(&base, |(b, _)| *b) {
             Ok(i) => Some(&self.pages[i].1.data),
             Err(_) => None,

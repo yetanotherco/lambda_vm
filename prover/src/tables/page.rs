@@ -295,6 +295,14 @@ pub fn generate_page_trace(
 /// (`collect_bitwise_from_page`), so the two cannot drift and the AreBytes bus
 /// stays balanced.
 pub fn page_final(init: u8, value: u8, timestamp: u64, exclude_touched: bool) -> (u8, u64) {
+    // The `ts == 0 → (init, 0)` collapse only matches the sparse path when every
+    // ts==0 cell holds its init byte: image bytes are seeded `(init, 0)` from the
+    // same image `init_values` is read from, and runtime writes carry `ts >= 4`.
+    // Pin it here so both call sites inherit the check; debug-only, free in release.
+    debug_assert!(
+        timestamp != 0 || value == init,
+        "page_final: a ts==0 cell must equal its init byte (value={value}, init={init})"
+    );
     if timestamp == 0 || (exclude_touched && timestamp > 0) {
         (init, 0)
     } else {

@@ -256,10 +256,11 @@ fn page_commitments_empty_list_matches_none() {
 /// (`exclude_touched = true`) cases. Locks the PR's "exact same PAGE trace"
 /// claim directly, instead of relying only on full prove+verify integration.
 ///
-/// Compares `main_table` (PAGE is a main-only table): `Table<F>: PartialEq` only
-/// holds without `disk-spill`, and the whole `TraceTable` can't be compared
-/// because its `aux_table: Table<E>` param lacks `PartialEq`.
-#[cfg(not(feature = "disk-spill"))]
+/// Compares `main_table` (PAGE is a main-only table). `Table<F>: PartialEq` holds
+/// in both configs (derived without `disk-spill`, hand-impl'd with it), so no
+/// feature gate is needed. The whole `TraceTable` still can't be compared because
+/// its `aux_table: Table<E>` param needs `E: PartialEq`, which
+/// `Degree3GoldilocksExtensionField` lacks.
 #[test]
 fn generate_page_trace_dense_matches_sparse() {
     use crate::paged_mem::PagedMem;

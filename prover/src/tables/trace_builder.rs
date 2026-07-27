@@ -2128,9 +2128,9 @@ fn collect_bitwise_from_page<I: ImageSource>(
     // Read each offset's final `(value, timestamp)` straight from the dense
     // per-page store instead of a sparse `FinalStateMap` lookup per offset
     // (mostly-miss) — same optimization as `generate_page_tables`. `page_final`
-    // computes `(init, fini)` identically to `generate_page_trace_from_dense`, so
-    // the ARE_BYTES multiplicities match the PAGE table's FINI column and the
-    // AreBytes bus stays balanced.
+    // derives the final `(fini, ts)` exactly as `generate_page_trace_from_dense`
+    // does, so the ARE_BYTES multiplicities match the PAGE table's FINI column and
+    // the AreBytes bus stays balanced.
     for &page_base in &page_bases {
         let init_data = init_page_data.get(&page_base);
         let final_page = memory_state.cells.page_data(page_base);
