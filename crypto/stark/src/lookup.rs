@@ -834,7 +834,10 @@ pub struct AirWithBuses<
     num_base: usize,
     /// Lazily captured flat IR of every transition constraint, built once on
     /// first request (prover/GPU/tests only — the verify path never forces it).
-    constraint_program: std::sync::OnceLock<crate::constraint_ir::ConstraintProgram<F, E>>,
+    /// Behind `Arc` so clones share the allocation instead of deep-copying the
+    /// program (16-25K nodes on the big tables) per epoch/shard instance.
+    constraint_program:
+        std::sync::OnceLock<std::sync::Arc<crate::constraint_ir::ConstraintProgram<F, E>>>,
     auxiliary_trace_build_data: AuxiliaryTraceBuildData,
     boundary_constraint_builder: PhantomData<(B, PI)>,
     /// Commitment to precomputed columns (if this is a preprocessed table)
@@ -850,7 +853,7 @@ pub struct AirWithBuses<
 
 /// Cloning an `AirWithBuses` copies its derived artifacts — the MetaBuilder-run
 /// constraint metadata, the LogUp layout, and (if already forced) the captured
-/// constraint IR inside the `OnceLock` — so a pre-built, pre-captured prototype
+/// constraint IR, shared via `Arc` — so a pre-built, pre-captured prototype
 /// clones into per-shard/per-epoch instances without re-running the constraint
 /// bodies. `B`/`PI` ride in `PhantomData` and need no bounds.
 impl<
@@ -1124,13 +1127,15 @@ where
         // Lazily captured once (prover/GPU/tests only — the verify path never
         // calls this). Runs the table set AND the LogUp emission through one
         // CaptureBuilder, matching the folder emission order/indexing exactly.
-        self.constraint_program.get_or_init(|| {
-            let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
-            self.constraint_set.eval(&mut cb);
-            emit_logup_constraints(&mut cb, &self.logup, self.num_base);
-            let (prog, _degrees) = cb.finish(self.num_base);
-            prog
-        })
+        self.constraint_program
+            .get_or_init(|| {
+                let mut cb = crate::constraints::builder::CaptureBuilder::<F, E>::new();
+                self.constraint_set.eval(&mut cb);
+                emit_logup_constraints(&mut cb, &self.logup, self.num_base);
+                let (prog, _degrees) = cb.finish(self.num_base);
+                std::sync::Arc::new(prog)
+            })
+            .as_ref()
     }
 
     fn build_auxiliary_trace(

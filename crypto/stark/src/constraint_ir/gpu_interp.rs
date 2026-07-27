@@ -130,16 +130,64 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     pub b_z_inv: &'a [Vec<FieldElement<F>>],
 }
 
-/// The lowered device program plus the packed per-proof uniforms shared by both
-/// GPU dispatch entry points. Produced by [`lower_and_pack`].
-struct LoweredCall {
+/// The program-derived half of a lowered call: the flat device blob plus its
+/// packed program uniforms. Depends only on the program content — identical
+/// across continuation epochs and table shards — so it is cached process-wide
+/// (see [`lowering_cache`]).
+struct LoweredProgram {
     dev: DeviceProgram,
     nodes: Vec<u64>,
     ext_consts: Vec<u64>,
     roots: Vec<u64>,
+}
+
+/// The lowered device program plus the packed per-proof uniforms shared by both
+/// GPU dispatch entry points. Produced by [`lower_and_pack`].
+struct LoweredCall {
+    lowered: std::sync::Arc<LoweredProgram>,
     rap: Vec<u64>,
     alpha: Vec<u64>,
     offset: Vec<u64>,
+}
+
+type GoldilocksProgram = ConstraintProgram<GoldilocksField, GoldilocksExtension>;
+
+/// Process-wide cache of lowered programs, keyed by content fingerprint. A hit
+/// must pass the full-equality check against the stored snapshot — a
+/// fingerprint collision re-lowers, never aliases another program.
+#[allow(clippy::type_complexity)]
+fn lowering_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<u64, (GoldilocksProgram, std::sync::Arc<LoweredProgram>)>,
+> {
+    static CACHE: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, (GoldilocksProgram, std::sync::Arc<LoweredProgram>)>,
+        >,
+    > = std::sync::OnceLock::new();
+    CACHE.get_or_init(Default::default)
+}
+
+fn program_fingerprint(p: &GoldilocksProgram) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    p.nodes.hash(&mut h);
+    p.dims.hash(&mut h);
+    // The const tables lack `Hash`: hash their canonical limbs.
+    // SAFETY: `p` is the concrete Goldilocks program.
+    unsafe { base_slice_as_u64(&p.base_consts) }.hash(&mut h);
+    unsafe { ext3_slice_to_u64(&p.ext_consts) }.hash(&mut h);
+    p.roots.hash(&mut h);
+    p.num_base.hash(&mut h);
+    h.finish()
+}
+
+fn program_eq(a: &GoldilocksProgram, b: &GoldilocksProgram) -> bool {
+    a.num_base == b.num_base
+        && a.roots == b.roots
+        && a.nodes == b.nodes
+        && a.dims == b.dims
+        && a.base_consts == b.base_consts
+        && a.ext_consts == b.ext_consts
 }
 
 /// The single concrete-Goldilocks lowering seam shared by
@@ -165,13 +213,36 @@ where
     // `E = Degree3GoldilocksExtensionField`; the generic program has the exact
     // layout of the concrete one (constants are `#[repr(transparent)]` over
     // `u64` / `[u64; 3]`).
-    let prog: &ConstraintProgram<GoldilocksField, GoldilocksExtension> =
-        unsafe { &*(prog as *const _ as *const _) };
+    let prog: &GoldilocksProgram = unsafe { &*(prog as *const _ as *const _) };
 
-    let dev = DeviceProgram::lower(prog);
-    let nodes = pack_nodes(&dev);
-    let ext_consts = flatten_ext3(&dev.ext_consts);
-    let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+    let key = program_fingerprint(prog);
+    let hit = {
+        let cache = lowering_cache().lock().unwrap();
+        match cache.get(&key) {
+            Some((snapshot, low)) if program_eq(snapshot, prog) => Some(low.clone()),
+            _ => None,
+        }
+    };
+    let lowered = match hit {
+        Some(low) => low,
+        None => {
+            let dev = DeviceProgram::lower(prog);
+            let nodes = pack_nodes(&dev);
+            let ext_consts = flatten_ext3(&dev.ext_consts);
+            let roots: Vec<u64> = dev.roots.iter().map(|&r| r as u64).collect();
+            let low = std::sync::Arc::new(LoweredProgram {
+                dev,
+                nodes,
+                ext_consts,
+                roots,
+            });
+            lowering_cache()
+                .lock()
+                .unwrap()
+                .insert(key, (prog.clone(), low.clone()));
+            low
+        }
+    };
 
     // SAFETY: `E` is the ext3 tower (gated above).
     let rap = unsafe { ext3_slice_to_u64(rap_challenges) };
@@ -179,10 +250,7 @@ where
     let offset = unsafe { ext3_slice_to_u64(std::slice::from_ref(table_offset)) };
 
     Some(LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
@@ -210,10 +278,7 @@ where
     E: IsField + 'static,
 {
     let LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
@@ -244,13 +309,13 @@ where
     };
 
     let result = math_cuda::constraint_interp::eval_composition_on_device(
-        &nodes,
-        dev.nodes.len(),
-        dev.num_base_slots as usize,
-        dev.num_ext_slots as usize,
-        &dev.base_consts,
-        &ext_consts,
-        &roots,
+        &lowered.nodes,
+        lowered.dev.nodes.len(),
+        lowered.dev.num_base_slots as usize,
+        lowered.dev.num_ext_slots as usize,
+        &lowered.dev.base_consts,
+        &lowered.ext_consts,
+        &lowered.roots,
         &rap,
         &alpha,
         &offset,
@@ -290,23 +355,20 @@ where
     E: IsField + 'static,
 {
     let LoweredCall {
-        dev,
-        nodes,
-        ext_consts,
-        roots,
+        lowered,
         rap,
         alpha,
         offset,
     } = lower_and_pack(prog, rap_challenges, alpha_powers, table_offset)?;
 
     let result = math_cuda::constraint_interp::eval_constraints_on_device(
-        &nodes,
-        dev.nodes.len(),
-        dev.num_base_slots as usize,
-        dev.num_ext_slots as usize,
-        &dev.base_consts,
-        &ext_consts,
-        &roots,
+        &lowered.nodes,
+        lowered.dev.nodes.len(),
+        lowered.dev.num_base_slots as usize,
+        lowered.dev.num_ext_slots as usize,
+        &lowered.dev.base_consts,
+        &lowered.ext_consts,
+        &lowered.roots,
         &rap,
         &alpha,
         &offset,
