@@ -2033,7 +2033,7 @@ mod tests {
         let _ = env_logger::builder().is_test(true).try_init();
         let elf_bytes = asm_elf_bytes("test_private_input_multipage");
 
-        // Page 1 starts at memory address START + page_size = 0xFF040000, which is data
+        // Page 1 starts at memory address START + page_size = 0xFF008000, which is data
         // index `page_size - 4` (the 4-byte length prefix sits at START). The program
         // commits the 8 bytes there, so the input must extend through that.
         let page_size = page::DEFAULT_PAGE_SIZE;
