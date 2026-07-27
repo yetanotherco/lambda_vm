@@ -124,10 +124,10 @@ pub struct CompositionInputs<'a, F: IsField, E: IsField> {
     /// Boundary coefficients β_b.
     pub b_beta: &'a [FieldElement<E>],
     /// Boundary zerofier inverses (base field): one `num_rows`-length vector
-    /// per boundary constraint, borrowed as-is from the evaluator — the device
-    /// layer uploads each slice into the flat `b * num_rows + row` device
-    /// buffer, so no flattened host copy is ever built.
-    pub b_z_inv: &'a [Vec<FieldElement<F>>],
+    /// per boundary constraint (constraints sharing a step share the Arc,
+    /// cached per domain) — the device layer uploads each slice into the flat
+    /// `b * num_rows + row` device buffer, so no flattened host copy is built.
+    pub b_z_inv: &'a [std::sync::Arc<Vec<FieldElement<F>>>],
 }
 
 /// The program-derived half of a lowered call: the flat device blob plus its

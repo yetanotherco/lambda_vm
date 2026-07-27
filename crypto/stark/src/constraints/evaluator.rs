@@ -188,29 +188,14 @@ where
         FieldExtension: 'static,
     {
         let boundary_constraints = &self.boundary_constraints;
-        let mut boundary_step_points: Vec<(usize, FieldElement<Field>)> = Vec::new();
-        let boundary_zerofiers_inverse_evaluations: Vec<Vec<FieldElement<Field>>> =
+        // Per-step inverse zerofier vectors, cached in the (process-shared)
+        // domain: constraints sharing a step get the same Arc.
+        let boundary_zerofiers_inverse_evaluations: Vec<std::sync::Arc<Vec<FieldElement<Field>>>> =
             boundary_constraints
                 .constraints
                 .iter()
-                .map(|bc| {
-                    let point = match boundary_step_points.iter().find(|(s, _)| *s == bc.step) {
-                        Some((_, p)) => p.clone(),
-                        None => {
-                            let p = domain.trace_primitive_root.pow(bc.step as u64);
-                            boundary_step_points.push((bc.step, p.clone()));
-                            p
-                        }
-                    };
-                    let mut evals = domain
-                        .lde_roots_of_unity_coset
-                        .iter()
-                        .map(|v| v - &point)
-                        .collect::<Vec<FieldElement<Field>>>();
-                    FieldElement::inplace_batch_inverse(&mut evals).unwrap();
-                    evals
-                })
-                .collect::<Vec<Vec<FieldElement<Field>>>>();
+                .map(|bc| domain.boundary_zerofier_inv(bc.step))
+                .collect();
 
         let zerofier_data = air.transition_zerofier_evaluations_grouped(domain);
 
@@ -309,7 +294,7 @@ where
         transition_coefficients: &[FieldElement<FieldExtension>],
         boundary_coefficients: &[FieldElement<FieldExtension>],
         zerofier_data: &ZerofierEvaluations<Field>,
-        boundary_z_inv: &[Vec<FieldElement<Field>>],
+        boundary_z_inv: &[std::sync::Arc<Vec<FieldElement<Field>>>],
     ) -> Option<Vec<FieldElement<FieldExtension>>>
     where
         Field: 'static,

@@ -401,10 +401,10 @@ fn check_composition(prog: &ConstraintProgram<Gl, Ext>, label: &str, seed: u64) 
     let b_value: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
     let b_beta: Vec<Fp3> = (0..num_boundary).map(|_| rng.fp3()).collect();
     // b_z_inv: one num_rows-length vector per boundary constraint (the
-    // per-constraint shape the evaluator hands over; device layout is still
-    // b*num_rows + row).
-    let b_z_inv: Vec<Vec<Fp>> = (0..num_boundary)
-        .map(|_| (0..NUM_ROWS).map(|_| fp(rng.next_u64())).collect())
+    // per-constraint Arc-shared shape the evaluator hands over; device layout
+    // is still b*num_rows + row).
+    let b_z_inv: Vec<std::sync::Arc<Vec<Fp>>> = (0..num_boundary)
+        .map(|_| std::sync::Arc::new((0..NUM_ROWS).map(|_| fp(rng.next_u64())).collect()))
         .collect();
 
     // Upload the LDE and build handles.

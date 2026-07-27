@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use math::{
     fft::roots_of_unity::get_powers_of_primitive_root_coset,
     field::{
@@ -55,10 +57,11 @@ pub struct Domain<F: IsFFTField> {
     pub(crate) coset_offset: FieldElement<F>,
     pub(crate) blowup_factor: usize,
     pub(crate) interpolation_domain_size: usize,
-    /// Domain-derived values that rounds 3-4 otherwise rebuild per table per
+    /// Domain-derived values that rounds 2-4 otherwise rebuild per table per
     /// epoch (each involves an LDE-size-order batch inversion or clone).
     ood_constants: std::sync::OnceLock<DomainConstants<F>>,
     fri_inv_twiddles: std::sync::OnceLock<Vec<FieldElement<F>>>,
+    boundary_z_inv: std::sync::Mutex<std::collections::HashMap<usize, Arc<Vec<FieldElement<F>>>>>,
 }
 
 impl<F: IsFFTField> Domain<F> {
@@ -99,7 +102,31 @@ impl<F: IsFFTField> Domain<F> {
             interpolation_domain_size: trace_length,
             ood_constants: std::sync::OnceLock::new(),
             fri_inv_twiddles: std::sync::OnceLock::new(),
+            boundary_z_inv: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
+    }
+
+    /// Boundary-zerofier inverse evaluations `1/(x − g^step)` over the LDE
+    /// coset, cached per step: boundary constraints, tables, and epochs that
+    /// share this domain otherwise each pay an LDE-size batch inversion.
+    pub(crate) fn boundary_zerofier_inv(&self, step: usize) -> Arc<Vec<FieldElement<F>>> {
+        if let Some(v) = self.boundary_z_inv.lock().unwrap().get(&step) {
+            return v.clone();
+        }
+        let point = self.trace_primitive_root.pow(step as u64);
+        let mut evals: Vec<FieldElement<F>> = self
+            .lde_roots_of_unity_coset
+            .iter()
+            .map(|v| v - &point)
+            .collect();
+        FieldElement::inplace_batch_inverse(&mut evals)
+            .expect("LDE coset points never coincide with a trace root");
+        let v = Arc::new(evals);
+        self.boundary_z_inv
+            .lock()
+            .unwrap()
+            .insert(step, v.clone());
+        v
     }
 
     /// Barycentric OOD constants (round 3), computed once per domain.
