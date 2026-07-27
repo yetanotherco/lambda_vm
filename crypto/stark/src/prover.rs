@@ -494,7 +494,10 @@ impl<F: IsFFTField> LdeTwiddles<F> {
                 // 2·(g·ωⁱ) = (g·ωⁱ).double() — one add, vs a base mul+reduce per element.
                 .map(|i| domain.lde_roots_of_unity_coset[i].double())
                 .collect();
-            FieldElement::inplace_batch_inverse(&mut inv).expect("Coset points are non-zero");
+            // Sequential: parallel inversion inside a OnceLock init can
+            // deadlock the rayon pool (workers block on this same cell).
+            FieldElement::inplace_batch_inverse_sequential(&mut inv)
+                .expect("Coset points are non-zero");
             Arc::new(inv)
         })
     }
@@ -546,6 +549,14 @@ where
     crate::tests::domain_cache_stats::record(false);
     let d = Arc::new(Domain::new(air, trace_length));
     let t = Arc::new(LdeTwiddles::new(&d));
+    // Pre-fill every lazy domain-derived cache from this setup thread, so no
+    // rayon worker ever runs — or blocks waiting on — an initializer
+    // mid-prove (a worker parked on a OnceLock can starve the initializer's
+    // own pool work and deadlock the prove).
+    let _ = d.ood_constants();
+    let _ = d.fri_inv_twiddles();
+    let _ = t.composition(&d);
+    let _ = t.inv_2x(&d);
     domain_twiddle_cache()
         .lock()
         .unwrap()
@@ -1473,31 +1484,31 @@ pub trait IsStarkProver<
         #[cfg(feature = "cuda")]
         let mut precomputed_parts: Option<Vec<Vec<FieldElement<FieldExtension>>>> = None;
         #[cfg(feature = "cuda")]
-        if number_of_parts == 2 {
-            if let Some(h_dev) = evaluator.evaluate_dev(
+        if number_of_parts == 2
+            && let Some(h_dev) = evaluator.evaluate_dev(
                 air,
                 &round_1_result.lde_trace,
                 domain,
                 transition_coefficients,
                 boundary_coefficients,
                 &round_1_result.rap_challenges,
+            )
+        {
+            match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
+                &h_dev,
+                twiddles.inv_2x(domain),
+                &twiddles.composition(domain).weights,
             ) {
-                match crate::gpu_lde::try_decompose_extend_d2_dev::<Field, FieldExtension>(
-                    &h_dev,
-                    twiddles.inv_2x(domain),
-                    &twiddles.composition(domain).weights,
-                ) {
-                    Some((parts, handle)) => {
-                        gpu_composition_parts = Some(handle);
-                        precomputed_parts = Some(parts);
-                    }
-                    None => {
-                        if let Some(h) =
-                            crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
-                        {
-                            precomputed_parts =
-                                Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
-                        }
+                Some((parts, handle)) => {
+                    gpu_composition_parts = Some(handle);
+                    precomputed_parts = Some(parts);
+                }
+                None => {
+                    if let Some(h) =
+                        crate::gpu_lde::download_comp_h_to_field::<FieldExtension>(&h_dev)
+                    {
+                        precomputed_parts =
+                            Some(Self::decompose_and_extend_d2(&h, domain, twiddles));
                     }
                 }
             }

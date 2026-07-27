@@ -119,7 +119,11 @@ impl<F: IsFFTField> Domain<F> {
             .iter()
             .map(|v| v - &point)
             .collect();
-        FieldElement::inplace_batch_inverse(&mut evals)
+        // Sequential: this runs at most once per (domain, step) per process,
+        // possibly from a rayon worker — parallel inversion here can starve
+        // against workers waiting on the same cache (see
+        // `inplace_batch_inverse_sequential`).
+        FieldElement::inplace_batch_inverse_sequential(&mut evals)
             .expect("LDE coset points never coincide with a trace root");
         let v = Arc::new(evals);
         self.boundary_z_inv
