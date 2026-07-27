@@ -4,6 +4,9 @@
 
 #let ecsm = raw("ECSM")
 #let ecdas = raw("ECDAS")
+#let ecsm2 = raw("ECSM2")
+#let ecdas2 = raw("ECDAS2")
+#let ect0 = raw("EC_T0")
 #let lincomb = raw("LINCOMB2")
 
 The elliptic-curve accelerator computes scalar multiples on the secp256k1
@@ -11,25 +14,28 @@ curve. Its purpose is Ethereum's `ecrecover`: given a signature, recover the
 public key that produced it, which for a real block is the single most
 expensive operation the guest performs.
 
-Two chips exist today. #ecsm handles one `ECALL` and owns everything about the
-_inputs and outputs_ of a scalar multiplication: range checks, curve
-membership, and the scalar's bit decomposition. #ecdas proves one step of the
-double-and-add chain and holds no opinion about what the chain means; the two
-are joined by a bus that telescopes the chain from #ecsm's seed to #ecsm's
-drain. A third mode, #lincomb, is _specified but not yet implemented_ and is
-described in the #lincomb section below; it replaces four #ecsm calls per
-`ecrecover` with
-one, and it is the reason this chapter has a security-assumptions section
-("Security assumptions").
+*Two implementations ship side by side.* The _single-scalar path_ proves one
+$k dot P$ per call: #ecsm owns the inputs and outputs of a scalar
+multiplication and #ecdas proves one step of its double-and-add chain. The
+_joint-chain path_ proves a whole two-term linear combination
+$Q = u_1 P_1 + u_2 P_2$ in one call: #ecsm2 owns the call and #ecdas2 proves one
+step of a joint Shamir--Straus chain. Both pairs are joined by the same
+`Ecdas` bus, which telescopes a chain from a core chip's seed to its drain.
+
+`ecrecover` uses the joint-chain path. The single-scalar path remains live and
+is the general-purpose $x$-only accelerator; it is also the chip family the
+joint chain was derived from, and every argument in this chapter that is not
+explicitly marked as new is shared by both.
 
 #todo[
   The machine-rendered variable and constraint tables that every other chip
   chapter carries (`render_chip_variable_table`, `render_constraint_table`) are
-  missing here: there is no `src/ecsm.toml` or `src/ecdas.toml` yet, so the
-  column and constraint listings below are prose. Several doc comments in the
-  prover (`prover/src/tables/ecsm.rs`, `ecdas.rs`, `crypto/ecsm/src/*.rs`)
-  already point at `spec/src/ecsm.toml` and `ecsm.typ`; those references were
-  dead until this chapter, and the `.toml` half is still outstanding.
+  missing here: there is no `src/ecsm.toml`, `ecdas.toml`, `ecsm2.toml` or
+  `ecdas2.toml` yet, so the column and constraint listings below are prose.
+  Several doc comments in the prover (`prover/src/tables/ecsm.rs`, `ecdas.rs`,
+  `crypto/ecsm/src/*.rs`) already point at `spec/src/ecsm.toml` and `ecsm.typ`;
+  those references were dead until this chapter, and the `.toml` half is still
+  outstanding.
 ]
 
 = The curve
@@ -52,6 +58,49 @@ load-bearing and are used without further comment below:
 All values crossing the `ECALL` boundary are 32-byte *little-endian* integers.
 Inside the chips every 256-bit quantity is carried as 32 range-checked `Byte`
 variables, least significant first.
+
+= Byte range checks are paired
+
+All four chips obtain their byte bounds from the `AreBytes` lookup, and an
+`AreBytes` send carries *two* elements, both of which the `BITWISE` receiver
+matches against the precomputed table's `X` and `Y` columns. That table
+enumerates the full byte-pair space, so a send $[a, b]$ matches a row if and
+only if $a$ *and* $b$ are bytes.
+
+Every byte range check originally shipped as its own send shaped $[b, 0]$,
+which is the $y = 0$ special case of that same contract and wastes the second
+slot. Adjacent bytes now share one send:
+
+/ #ecdas: the 32-byte prefixes of `LAMBDA`, `XR`, `YR`, `Q0`, `Q1`, `Q2` pair
+  internally as $(2i, 2i+1)$, giving 96 sends; of the four remaining odd bytes,
+  two pairs are formed across blocks --- `(ROUND, Q0[32])` and
+  `(Q1[32], Q2[32])`. 196 sends become 98, and interactions per row fall from
+  388 to *290*.
+/ #ecsm: `X2`, `Q0`, `YG` and `Q1`'s 32-byte prefix pair the same way, giving
+  64 sends; the odd 33rd quotient byte rides alone as `[q1[32], 0]`. 129 sends
+  become 65, and interactions per row fall from 579 to *515*.
+
+#ecdas2 and #ecsm2 use the identical layout from the start.
+
+*This is a bus repacking and nothing else.* No witness value, column count
+(667 for #ecsm, 521 for #ecdas), constraint count (413 and 200) or maximum
+degree changes; only `bus_interactions()` and the trace builder's mirrored
+multiplicity collectors move, and they move together.
+
+The saving is in the `LogUp` auxiliary trace, which costs one cubic-extension
+column per two interactions --- $1.5$ committed base cells per interaction. For
+#ecdas that is 194 auxiliary extension columns down to 145, i.e. 147 fewer
+committed base cells against a row of 1,103: *$-13.3%$ of the table's committed
+footprint*, on the table that carries the volume.
+
+Soundness is preserved verbatim, with no lemma re-run. Every lemma of the
+machine-checked gate consumes the byte contract *per column*, never per send,
+and the set of columns covered is identical before and after --- each
+previously-checked byte appears in exactly one paired send. Pairing bytes from
+different logical operands is equally sound: an `AreBytes` row asserts no
+relation between its two elements, since every combination exists in the table,
+so pairing unrelated bytes adds no coupling. The argument is recorded in
+`thoughts/ec-recover-opt/gate/pairing-equivalence.md`.
 
 = #ecsm chip
 
@@ -118,6 +167,9 @@ reduced. That is deliberate --- the relations are mod-$p$ identities and the
 quotient absorbs the slack --- and it is why the canonicalisation checks sit at
 the boundaries rather than on every row.
 
+The same machinery, with the same carry offsets, is reused unchanged by
+#ecdas, #ecsm2 and #ecdas2; it is described once here.
+
 = #ecdas chip
 
 #ecdas contributes one row of 521 columns per double-or-add step. A row receives an
@@ -168,8 +220,9 @@ throughout, so $c equiv 1$ is impossible; $c equiv -1$ needs $c = N - 1 >= 2^255
 which forces $k >= 2N - 2 > N$ and contradicts the range check on $k$. The
 argument consumes the $k < N$ check and the prefix structure, and nothing else.
 
-This paragraph is the one that does *not* survive the joint chain of
-the #lincomb chip below. That is the subject of "Security assumptions".
+This paragraph is the one that does *not* survive the joint chain, whose
+scalars, points and message are all attacker-supplied. #ecdas2 closes the same
+edge a different way --- with a witnessed inverse, and equally unconditionally.
 
 == Verification status
 
@@ -177,21 +230,27 @@ The constraint systems of #ecsm and #ecdas have been machine-checked with an
 SMT solver: the limb/carry lifting, the mod-$p$ step lemmas and their side
 conditions, the chain argument, and an end-to-end pin against an independent
 reference are recorded as lemmas L1--L8 in `thoughts/ec-recover-opt/gate/`, with
-the transcription anchored by evaluating the model on real prover witnesses.
+the transcription anchored by evaluating the model on real prover witnesses
+(872k checks).
 Two checks were confirmed load-bearing by exhibiting the forgery that appears
 when they are removed ($c_63 = 0$ and the $x_R < p$ canonicalisation); four
 others are individually redundant but retained. The results rest on stated
 contracts for the range-check tables, the `LogUp` multiset argument, `ECALL`
 binding and timestamp uniqueness, plus the primality of $p$ and $N$.
 
-= #lincomb chip (specified, not implemented)
+= The joint-chain chips
+
+#ecsm2 and #ecdas2 evaluate $Q = u_1 P_1 + u_2 P_2$ over one joint chain and
+return *both* coordinates. They are what `ecrecover` calls.
+
+== Why the joint chain exists
 
 `ecrecover` evaluates $Q = u_1 G + u_2 R$. With an $x$-only accelerator the
-guest must issue *four* scalar multiplications --- $x(u_1 G)$, $x((u_1 + 1)G)$,
-$x(u_2 R)$, $x((u_2 + 1)R)$ --- because the $+1$ queries are the only way to
-recover a $y$ from an $x$-only oracle. #lincomb computes the linear combination
-directly and returns both coordinates, replacing roughly 1,530 #ecdas rows per
-`ecrecover` with roughly 450.
+guest cannot get that in one piece: the old path issued *four* scalar
+multiplications --- $x(u_1 G)$, $x((u_1 + 1)G)$, $x(u_2 R)$, $x((u_2 + 1)R)$
+--- and then reconstructed the two missing $y$ coordinates in software, because
+the $+1$ queries are the only way to recover a $y$ from an $x$-only oracle. One
+joint chain replaces all four chains and the reconstruction.
 
 == Interface
 
@@ -203,21 +262,62 @@ that the elliptic-curve accelerators stay contiguous.
 / `A2` #h(0.6em) `= x12`: address of $x_(P_2) parallel y_(P_2)$
 / `A3` #h(0.6em) `= x13`: address of $u_1 parallel u_2$
 
-Unlike #ecsm, this call *does not trap* on degenerate input. The status word is
-returned *in a register* rather than as a byte of the result buffer, so the
-guest can branch before it reads memory at all and the result region stays a
-clean aligned 64 bytes. Status $0$ means success; each rejection class --- a
-zero or out-of-range scalar, an off-curve or non-canonical point,
-$P_1 = plus.minus P_2$, $Q$ at infinity, and $P_1 != G$ --- has its own nonzero
-value, so a debugging or benchmarking path can tell them apart while the guest
-only tests against zero. On a nonzero status nothing is written to the result
-buffer and no row is emitted: there is no witness to prove.
+*$P_1$ is pinned to the generator.* The chip has no membership sub-witness for
+an arbitrary first point, so instead of proving $P_1$ on-curve it asserts that
+memory at `A1` holds exactly $G$, by giving the eight doubleword reads
+*constant* values. That costs zero columns and zero constraints and makes
+$P_1$'s curve membership a compile-time fact. The executor agrees by
+construction: any other bytes at `A1` return status $7$, which is the software
+fallback rather than an unprovable block. Generalising later means adding a
+membership block and its witness, not reworking the ABI.
 
-A nonzero status is always *sound*, whoever produced it: the fallback is
-ordinary guest code and is proven by the CPU tables, so a lying status can only
-waste cycles, never change a result. The reason to prefer this over trapping is
-availability: a trap would let one crafted transaction make an entire block
-unprovable.
+The status word is returned *in a register* rather than as a byte of the result
+buffer, so the guest can branch before it reads memory at all and the result
+region stays a clean aligned 64 bytes. Status $0$ means success; each rejection
+class --- a zero scalar, an out-of-range scalar, an off-curve point, a
+non-canonical point, $P_1 = plus.minus P_2$, $Q$ at infinity, and
+$P_1 != G$ --- has its own nonzero value, so a debugging or benchmarking path
+can tell them apart while the guest only tests against zero.
+
+== The status contract
+
+Unlike #ecsm, this call *does not trap* on degenerate input, and that choice is
+about availability: a trap would let one crafted transaction make an entire
+block unprovable. A nonzero status makes the guest run
+`ProjectivePoint::lincomb` in software, which is ordinary proven CPU execution,
+so a status that lies in that direction can only waste cycles.
+
+The converse direction has to be *enforced*, or a prover simply declines to
+prove anything, writes status $0$, and the guest reads a fabricated $Q$ out of
+memory. #ecsm2 therefore carries two flags rather than one:
+
+/ `MU`: a real lincomb2 ecall happened at this timestamp. Gates the `Ecall`
+  receive and the combined `x10` read+write that binds the status.
+/ `OK`: the status is $0$, i.e. the chain is proven. Gates *everything else* ---
+  every operand read, the result write, every range check, every relation, and
+  every chain, addend and digit bus.
+
+both `IS_BIT`, with the three constraints
+
+$ &"OK" dot (1 - "MU") = 0 \
+  &"OK" dot "STATUS" = 0 \
+  &"MU" dot ("STATUS" dot "S"_"INV" - (1 - "OK")) = 0. $
+
+The first says a proven chain implies a real ecall; the second says claiming
+the chain forces the status to zero; the third says a real ecall that does not
+claim the chain must carry an *invertible*, i.e. nonzero, status. The witnessed
+inverse is what keeps the per-variant error codes distinguishable --- a boolean
+status would work too, and would lose them.
+
+An error row is therefore not the same thing as a padding row. It sets
+$"OK" = 0$ with every math column zero, so all convolution and carry relations
+close at zero carries by exactly the argument padding rows already use, but it
+keeps $"MU" = 1$ and carries the real result address and status that the `x10`
+access binds. The split is not stylistic. The CPU sends on `Ecall` for every
+ecall, so an unmatched syscall unbalances that bus and the all-zero padding
+trick is unavailable; and the $P_1 != G$ status must stay provable, which it
+would not be if the `A1` reads --- which assert that memory there holds $G$ ---
+were gated by `MU` instead of `OK`.
 
 == Schedule
 
@@ -237,22 +337,98 @@ MSB-first, with one doubling per round regardless of the digits:
 with $"len" = max(op("msb")(u_1), op("msb")(u_2)) + 1$, and the accumulator
 seeded at the blinding point $T_0$ below rather than at infinity.
 
-Two rows break the otherwise uniform telescoping and are the places a chip
-implementation is most likely to go quietly wrong: the *precompute* row sits
-off the accumulator line entirely (its left operand is $P_1$, not the previous
-row's result), and the *correction* row consumes the last accumulator against a
+Two rows break the otherwise uniform telescoping, and they are the places the
+implementation had to work hardest: the *precompute* row sits off the
+accumulator line entirely (its left operand is $P_1$, not the previous row's
+result), and the *correction* row consumes the last accumulator against a
 constant addend. Every other row's left operand is its predecessor's result.
 
-On a doubling row the addend cancels out of all three relations --- the slope's
-$op = 0$ branch mentions neither coordinate, $x_R$'s $-x_G$ term cancels against
-$(1 - op)(x_G - x_A)$, and $y_R$ uses neither --- so doubling rows carry the
-addend $(0, 0)$ and consume nothing from the addend bus.
+Neither break can be distinguished by the round index --- both special rows are
+emitted at $"round" = 0$, and the main loop's last iteration also produces
+genuine round-$0$ rows. The chain is instead split into three separately keyed
+*phases*, carried as $"PHASE" = "PH"_1 + 2 "PH"_2$ with $"PH"_1 dot "PH"_2 = 0$
+inside the `Ecdas` tuple:
+
+/ phase 0 --- precompute: exactly one row, seeded with $a = P_1 = G$ and addend
+  $P_2$, drained into #ecsm2's $P_(12)$ columns.
+/ phase 1 --- main chain: seeded with $a = T_0$ at round $"len" - 1$; $"len"$
+  doublings and their adds.
+/ phase 2 --- correction: exactly one row, seeded with the last accumulator and
+  addend $-2^"len" dot T_0$, drained into #ecsm2's $Q$ columns.
+
+#ecsm2 pins every segment at *both* ends at multiplicity `OK`, so a row can
+execute in a phase only if #ecsm2 published that phase, and exactly one phase-0
+and one phase-2 row can exist per proven call.
+
+The phase-1 to phase-2 hand-off deliberately goes *through* #ecsm2 --- the
+phase-1 drain is received into accumulator columns and re-sent as the phase-2
+seed --- rather than along the chain. A direct hand-off is not expressible: a
+row's outgoing tuple pins its successor's $op$ to its own $"NB"$ flag, and the
+last main-chain row has $"NB" = 0$ while the correction row is an addition.
+
+*Round bookkeeping.* A doubling and its optional add share a round, so the
+successor round is $"round" - 1 + "NB"$ and the successor $op$ is $"NB"$ ---
+exactly the mechanism the single-scalar chain uses, under the joint name "an
+add follows me at this round". On a doubling $"NB"$ is the OR of that round's
+two digits; the defining constraint is $op$-gated, because an add row carries
+the same digits (it needs them to select its addend) but always has $"NB" = 0$.
+
+*Doubling rows carry no addend.* On $op = 0$ no relation reads the addend: the
+slope's $op = 0$ branch mentions neither coordinate, $x_R$'s $-x_G$ term
+cancels exactly against $(1 - op)(x_G - x_A)$, $y_R$ uses neither, and the
+non-degeneracy relation below sits entirely inside its own gate. So doubling
+rows carry the addend $(0, 0)$ and stay silent on the addend bus --- but only
+because $op = S_1 + S_2 + S_3 + S_"CORR"$ forces every selector to zero there.
+Without that one degree-1 constraint the cancellation is still real and the
+*gating* is forgeable: a prover would set a selector on a doubling and mint a
+spurious addend receive.
+
+== Shape and cost
+
+#ecsm2 contributes one row of 1,155 columns and 817 interactions per ecall;
+#ecdas2 one row of 658 columns, 288 constraints and 388 interactions per joint
+step. At $1.5$ committed base cells per interaction that is about 2,380 cells
+for the #ecsm2 row and *1,240* cells per #ecdas2 row.
+
+The chain is $449.1$ rows per `ecrecover` on average. *Capacity must be
+budgeted at 514*, which is $1 + 256 + 256 + 1$: the worst case over the valid
+input domain is $(u_1, u_2) = (2^255, 2^255 - 1)$, both in $[1, N)$ with
+*complementary* bit patterns, so every one of the 256 rounds carries a nonzero
+joint digit and therefore an addition. It is complementarity that maximises,
+not popcount --- $(N-1, N-1)$ shares every addition and reaches only 449. A
+submitter can construct the worst case deliberately and cheaply, so no bound
+may be read off a random sample; the mean governs the cost model and nothing
+else.
+
+Against the live post-pairing baseline of $1.467"M"$ committed base cells per
+`ecrecover` (four chains of 382 #ecdas rows plus four #ecsm rows), the joint
+chain costs $0.559"M"$ at the mean and $0.640"M"$ at the 514-row worst case:
+
+#figure(table(
+  columns: 4,
+  align: (left, right, right, right),
+  table.header([], [rows], [cells per `ecrecover`], [vs. baseline]),
+  [baseline (4 $times$ #ecsm)], [4 $times$ 382], [1.467M], [---],
+  [joint chain, mean], [449.1], [0.559M], [$-61.9%$],
+  [joint chain, worst case], [514], [0.640M], [$-56.4%$],
+))
+
+The design document's headline of $-74.3%$ should *not* be quoted: it is
+denominated against the pre-pairing baseline of $1.69"M"$, so it re-banks the
+paired-range-check win described above on top of this one. The
+non-degeneracy relation, which is what makes the chain unconditionally sound,
+also costs roughly 129 columns and 96 interactions per #ecdas2 row --- so part
+of the gap between the two figures was spent buying soundness, and that is
+worth stating alongside the number.
+
+The secondary win is guest cycles: $approx 78.5"k"$ fewer per `ecrecover`,
+measured on two ethrex blocks that agree to $0.4%$. The design document
+predicted 100--150k, so the measurement is below the low end of the estimate.
 
 == The blinding point $T_0$
 
-$T_0$ is a nothing-up-my-sleeve point: it must be *verifiably not chosen*, since
-its whole purpose is that nobody knows its discrete logarithm. It is derived by
-SHA-256 try-and-increment from a fixed tag:
+$T_0$ is a nothing-up-my-sleeve point: it must be *verifiably not chosen*. It
+is derived by SHA-256 try-and-increment from a fixed tag:
 
 #raw(
 "tag = \"lambdavm/ecsm/lincomb2/T0/v1\"          (28 ASCII bytes)
@@ -269,31 +445,155 @@ Counter $0$ yields no valid $x$; counter $1$ succeeds:
 $ &x(T_0) = "0xaf319aa90f91a86b297de85edb330a665efba79aa98893db1b49070cb1ae7864" \
   &y(T_0) = "0x1481a038143c0732071db0bcf3b05b8ca2e624fa217d82193f3c254a606277a0" $
 
-The even root is taken for determinism; either root would serve, since only
-ignorance of the discrete logarithm matters.
+The even root is taken for determinism; either root would serve.
+
+*What the blind buys is one simplification, and nothing else.* Because the
+accumulator starts at $T_0$ and the correction is keyed by $"len"$, any
+$"len"$ at least as large as the true one yields the same $Q$: the extra
+leading doublings only double $T_0$, and the keyed correction absorbs them. So
+$"len"$ never has to be pinned to the exact MSB, and the sub-lemma that would
+have done so is dropped outright. The blind was *also* intended to close the
+incomplete-addition edge; it does not, and "Security assumptions" below says
+why. It is a convenience, not a defence.
+
+== The #ect0 table
 
 The correction row subtracts $2^"len" dot T_0$, supplied from a preprocessed
-table that stores the *negation* $-2^i dot T_0$ directly --- the correction row
-adds its addend, so storing the negation removes a per-row negation from the
-chip and the table is constant either way. The table is keyed by
-$"len" - 1 in [0, 255]$ and has exactly 256 real rows with no padding, which
-makes the bound $"len" <= 256$ *structural*: there is no row for a larger index,
-so no consumer has to enforce it. Its contents are a deterministic function of
-$T_0$ and need no separate trust.
+table of 66 columns and exactly 256 rows, every one of them real. Row $j$ holds
+the key $"len" - 1 = j$ and the point for $"len" = j + 1$.
 
-The blind buys one unambiguous simplification: $"len"$ no longer has to be
-pinned to the exact MSB. Any $"len"$ at least as large as the true one yields
-the same $Q$, because the extra leading doublings only double $T_0$ and the
-keyed correction absorbs them. It was also intended to buy soundness for the
-incomplete-addition edge; see "Security assumptions" for why it does not.
+The table stores the *negation* $-2^"len" dot T_0$ directly. That is not a
+preference: it is what the witness generator emits as the correction row's
+addend, so the lookup wires straight into #ecdas2's addend columns with no
+in-circuit modular negation. Only $y$ differs from the positive blind, since
+$x(-P) = x(P)$, which makes mixing the two conventions a silent sign flip that
+still type-checks.
+
+Keying by $"len" - 1$ rather than $"len"$ makes the bound $"len" <= 256$
+*structural*. The consumer sends a plain $"len"$ and the table's receive key
+re-adds the $1$, so the published key range is exactly $[1, 256]$ with one row
+per value and nothing else in the table --- a send outside it matches no row,
+`LogUp` cannot balance, and the proof is rejected. No consumer-side check is
+needed, and none should be added. An earlier design keyed by $"len"$ directly
+over 257 rows padded to 512, and *did* need one: a send at $"len" > 256$ would
+have resolved to a zeroed padding row holding the off-curve point $(0, 0)$,
+which the correction row would then have added.
+
+The contents are a deterministic doubling chain off the pinned $T_0$, so the
+table is constant in every sense that matters and needs no separate trust.
+
+== Buses
+
+Beyond `Ecall`, `Memw`, `AreBytes`, `IsHalfword` and `Zero`, the joint chain
+uses:
+
+/ `Addend` (29): $["ts"_"lo", "ts"_"hi", "sel", x(32), y(32)]$. #ecsm2 publishes
+  the three point addends at witnessed counts and the correction constant at
+  multiplicity `OK`; #ecdas2 receives once per addend-consuming row at
+  multiplicity $S_1 + S_2 + S_3 + S_"CORR"$, with
+  $"sel" = S_1 + 2 S_2 + 3 S_3 + 4 S_"CORR" in {1, 2, 3, 4}$. The multiplicity
+  is linear in four terms rather than the three-term form, because the
+  correction row is the fourth. $"sel"$ is *never* $0$: a bus element that is
+  zero on a row contributes nothing to the fingerprint, so a $"sel" = 0$ addend
+  would alias a shorter tuple.
+/ `EcT0` (32): the #ect0 lookup described above.
+/ `JointBit` (33): $["ts"_"lo", "ts"_"hi", "round", "stream"]$ with
+  $"stream" in {1, 2}$, one stream per scalar. #ecdas2 sends at multiplicity
+  $D_1$ or $D_2$; #ecsm2 receives at $2 dot "bit"$.
+
+The factor of $2$ on the `JointBit` receive is load-bearing, not bookkeeping. A
+set digit is carried by *both* the round's doubling and its add, and both send,
+so a $2 times$ receive is what forces the add to exist at all --- with only the
+doubling available the total can never reach two. At $1 times$ there is a
+concrete counterexample: at a round where both digits are set, a prover splits
+them across the two rows and the add then selects $P_2$ where the schedule
+calls for $P_(12)$.
+
+The `Ecdas` bus (28) is *shared* with the single-scalar chain. What separates
+them is the first tuple element, a constant $0$ for the old chain and $1$ for
+the joint one, so the difference of the two fingerprint polynomials has a
+nonzero coefficient at a fixed power of the challenge. Differing arity would
+*not* have sufficed: the fingerprint's positional weights advance
+unconditionally and trailing zeros never re-align a tuple, but zero-padding a
+tuple to a common width is a designed-in feature, so arity alone never
+separates two chips on one bus.
+
+== The non-degeneracy relation
+
+#ecdas2 carries a *fourth* convolution relation beside the three of #ecdas:
+
+$ D_"INV" dot (x_B - x_A) equiv 1 mod p. $
+
+*This is the check that makes the joint chain sound, and it rests on no
+computational assumption.* When $x_B = x_A$ the slope relation degenerates:
+with $y_B = y_A$ it reads $0 = 0$ for *every* $lambda$, and $x_R$ and $y_R$
+then produce a point of the prover's choosing which the rest of the chain
+accepts --- the addend balance, the digit counting and the phase pinning are
+all still satisfied. The row proves nothing. A witnessed inverse of
+$x_B - x_A$ exists exactly when $x_B equiv.not x_A mod p$, so imposing it costs
+no completeness and closes the case outright.
+
+It is gated by $S_1 + S_2 + S_3 + S_"CORR"$ --- the same sum that receives the
+addend --- so it covers every row that consumes one, including the precompute
+and correction rows (both chord adds), and never covers doublings. Gating by
+that sum rather than by $op$ is deliberate even though a constraint makes the
+two equal: it ties the check to the very expression that counts the addend
+receive, so it cannot drift away from the rows that consume one.
+
+A gated-off row is not a hole. With the gate at zero only the shifted-quotient
+term survives, and the limb-lifting argument turns that into
+$p dot (mu dot R - q_3) = 0$ --- so the quotient is *pinned* to $3p$ on a live
+doubling and to $0$ on a padding row, not left free. Gating at all is a cost
+choice rather than a correctness one: $x = 0$ is not on secp256k1, so
+$x_B - x_A = -x_A$ would be invertible on doublings too, but there is no addend
+there and the cells would be wasted.
+
+One more degeneracy is closed by its own constraint: the phase-0 row must add
+$P_2$. Without that, a prover points the precompute at $P_1$, making the chord
+$P_1 + P_1$, whose slope relation degenerates the same way and admits an
+arbitrary $P_(12)$.
+
+== Padding rows must be inert
+
+"The columns are zero as generated" is *not* an argument --- a malicious prover
+fills padding rows freely. Every interaction has to be inert by *constraint*,
+and the question to ask of each one is not "is it gated?" but "which column
+supplies its multiplicity, and what forces that column to zero?".
+
+Most interactions in both chips take their multiplicity from `MU` or `OK` and
+are inert for free. Two families do not: #ecdas2's digit sends count the raw
+digit columns, and its addend receive counts the raw selector sum. The family
+
+$ (1 - "MU") dot {D_1, D_2, S_1, S_2, S_3, S_"CORR"} = 0 $
+
+is what closes them, and both were live forgeries before it was added:
+
++ A row with $"MU" = 0$, $"PH"_1 = 1$, $"NB" = 1$, $D_1 = 1$ at any round $r$
+  satisfies every other constraint and emits a real `JointBit` digit. *Two* such
+  rows supply the $2 times$ receive that an honest round pays with its doubling
+  and its add, so the prover can drop the round-$r$ addition entirely --- with
+  both digits zero on the real doubling, nothing demands one. The chain then
+  computes $(u_1 - 2^r) P_1 + u_2 P_2$, and back-solving the signature for a
+  chosen target needs one modular inversion and no discrete logarithm. The
+  result is an *arbitrary chosen recovered public key*.
++ A row with $"MU" = 0$, $op = 1$, $S_2 = 1$ keeps $op = sum S$ satisfied and
+  mints a spurious addend receive.
+
+$"NB"$ needs no companion: with every selector zero, $op = sum S$ forces
+$op = 0$, and the round-bookkeeping constraint then reads $"NB" = D_1 or D_2 = 0$.
+
+#ecsm2 carries the same discipline for its own two ungated families --- the
+scalar bit columns, which are the `JointBit` receive multiplicities, and the
+addend publish counts --- with $(sum "bit") dot (1 - "OK") = 0$ and
+$N_j dot (1 - "OK") = 0$.
 
 == Canonicalisation obligations
 
-#lincomb handles a point whose *sign* matters, which #ecsm never did: an
-$x$-only chip is free to lift to whichever $y$ it likes, because
+The joint chain handles a point whose *sign* matters, which #ecsm never did:
+an $x$-only chip is free to lift to whichever $y$ it likes, because
 $x(k P) = x(k(-P))$, and that symmetry is exactly what a linear combination
-gives up. It is worth being precise about what this does and does not require,
-because the two ends of the call are not symmetric.
+gives up. The two ends of the call are not symmetric, and it is worth being
+precise about which is which.
 
 *The inputs are already bound.* The guest decompresses $R$ from the signature's
 $(r, v)$ in software and writes both coordinates to memory; that is proven CPU
@@ -303,15 +603,16 @@ substitute $-P_2$ for $P_2$: doing so would require the guest's own proven
 execution to have written different bytes.
 
 In particular a $y_(P_2) < p$ check does *not* separate a point from its
-negation, and should not be described as doing so. Negation is
+negation, and must not be described as doing so. Negation is
 $(x, y) |-> (x, p - y)$, and both $y$ and $p - y$ are already below $p$; the
 non-canonical encoding $y + p$ (which fits in 32 bytes only for the vanishingly
 rare $y < 2^32 + 977$) is congruent to $y$, i.e. the *same* point, and changes
 no result. The witness carries a $y_(P_2) < p$ column, and it is worth keeping
 so that the chip's soundness argument stands on its own constraints rather than
 on the correctness of guest code --- the same reason #ecsm re-checks ranges the
-executor has already enforced --- but it is defence in depth, not a forgery
-closed.
+executor has already enforced --- but it is *defence in depth, not a forgery
+closed*. Removing it is the one negative control in the suite that comes back
+with no forgery, and that is the expected result.
 
 *The output is not bound by anything else,* and here the checks are genuinely
 load-bearing:
@@ -325,87 +626,118 @@ load-bearing:
   $x_R < p$ for #ecsm, where removing the check was shown to produce a concrete
   forgery.
 
+== Verification status
+
+The joint-chain chips have their own machine-checked board, recorded in
+`thoughts/ec-recover-opt/gate/RESULTS-lincomb2.md`. *Every lemma is discharged
+and no lemma is open.*
+
+The three relation arms #ecdas2 shares with #ecdas were shown textually
+identical per arm, modulo the rename of the fixed generator to the per-row
+addend. Every lemma quantified over those three relations --- the limb lifting,
+the value lemmas, the step lemmas and the no-$y equiv 0$ side condition, L1
+through L5a --- therefore transfers verbatim rather than being re-proved. What
+was genuinely redone:
+
+- *The width audit*, because the addend now varies per row and one of its
+  values ($P_(12)$) is an interior chip output that is byte-bounded but never
+  proven $< p$. The existing carry windows still bound it with about $2^39$ of
+  headroom. The argument never depended on the addend being *canonical*, only
+  on its limbs being *bytes* --- which is inherited through the keyed addend
+  tuple, and which would silently break if that tuple were ever repacked to
+  carry more than one byte per element.
+- *The step lemma's side condition*, now discharged unconditionally by the
+  non-degeneracy relation rather than by any assumption.
+- *The counting argument*, over two interleaved digit streams, three phases and
+  a per-row addend selection.
+- *The exact-MSB sub-lemma*, dropped: the blind makes any
+  $"len" in ["msb" + 1, 256]$ yield the same $Q$, and $"len" <= 256$ is
+  structural.
+
+The battery of negative controls produced *seven constructive forgeries* and
+zero live holes. Two of the seven were live holes in the chips when the gate
+began --- the padding-row digit sends and the missing non-degeneracy relation
+--- which is the strongest available evidence that the gate can see real bugs.
+Two controls came back redundant and are recorded as such rather than papered
+over.
+
+Before any result was trusted, the transcribed model was evaluated on real
+prover witnesses: 265 cases, *5,960 #ecdas2 rows and about 3.3 million
+individual checks*, every constraint value zero, every carry inside its window,
+every quotient inside 33 bytes, and the prover's own non-degeneracy columns
+equal to an independent group-law derivation.
+
+The standing residual risk is the same one the keccak chapter names: the model
+is transcribed by hand from the chips, mitigated but not eliminated by that
+anchor. The durable fix is to generate the SMT problem from the constraint IR.
+
 = Security assumptions
 
 == What is unconditional
 
-Everything the #ecsm chip proves, and the per-step content of #ecdas, follows from the
-constraint system alone, given the range-check contracts and the primality of
-$p$ and $N$. For the single-scalar chain that includes the incomplete-addition
-edge, which is closed outright by the $k < N$ check.
+*Everything.* Both chip families follow from their constraint systems alone,
+given the range-check contracts, the `LogUp` multiset argument, `ECALL` binding
+and timestamp uniqueness, and the primality of $p$ and $N$.
 
-== The assumption #lincomb introduces
+For the single-scalar chain the incomplete-addition edge is closed outright by
+the $k < N$ check. For the joint chain it is closed outright by the witnessed
+inverse $D_"INV" dot (x_B - x_A) equiv 1 mod p$. *The joint-chain path rests on
+no cryptographic assumption that the single-scalar path did not.*
 
-The argument that closes the incomplete-addition edge for #ecsm does not
-transfer to the joint chain, and no analogue of it exists. In the joint chain
-both scalars, both points, and the message are attacker-supplied: the values
-$(z, v, r, s)$ of an `ecrecover` are free bytes, $z$ is not forced through any
-hash, and a prover may pick $rho$ and set $r = x(rho G)$, thereby *knowing*
-$log_G R$. It can then solve for a prefix of $u_1$ that drives the accumulator
-onto its addend at a chosen step, retry cheaply over $rho$ and $u_2$, and land a
-row whose $lambda$ is unconstrained --- and therefore a forged $Q$, a forged
-recovered address, and an apparently valid transaction from a sender who never
-signed it.
+== The assumption that was proposed, and why it is not used
 
-Blinding the accumulator with $T_0$ is intended to answer this. Every
-intermediate accumulator becomes $2^j T_0 + (c_1 P_1 + c_2 P_2)$, so a collision
-appears to require a known linear relation involving $log(T_0)$ --- a discrete
-logarithm nobody has. Stated as a named assumption:
+The joint chain was originally designed to close the incomplete-addition edge
+by blinding: seed the accumulator at $T_0$, so that every intermediate
+accumulator is $2^j T_0 + (c_1 P_1 + c_2 P_2)$ and a collision appears to
+require a known linear relation on $log(T_0)$ --- a discrete logarithm nobody
+has. That would have named an assumption:
 
-#aside("Assumption T0-DL (blinding-point discrete log) --- AWAITING SIGN-OFF")[
-  No efficient prover can produce a known linear relation on $log(T_0)$.
+#aside("Assumption T0-DL (blinding-point discrete log) --- NOT USED, DO NOT SIGN")[
+  No efficient prover can produce a known linear relation on $log(T_0)$: no
+  probabilistic polynomial-time algorithm, given the public description of
+  secp256k1 and the point $T_0$, outputs integers $(alpha, beta)$ with
+  $alpha equiv.not 0 mod N$ and $alpha T_0 = beta G$.
 
-  Formally: no probabilistic polynomial-time algorithm, given the public
-  description of secp256k1 and the point $T_0$ derived above, outputs integers
-  $(alpha, beta)$ with $alpha equiv.not 0 mod N$ and $alpha T_0 = beta G$.
+  Because $N$ is prime this is *equivalent* to computing $log_G (T_0)$, i.e. it
+  is exactly the discrete-logarithm problem instantiated at one fixed,
+  verifiably-unchosen point. As an assumption it is unobjectionable and
+  introduces no new hardness class.
 
-  Because $N$ is prime, $alpha$ is invertible and this is *equivalent* to
-  computing $log_G (T_0)$ outright. The assumption is therefore exactly the
-  discrete-logarithm problem on secp256k1, instantiated at one fixed,
-  verifiably-unchosen point --- strictly within what ECDSA and `ecrecover`
-  already assume about the very chain being proved. It introduces no new
-  hardness class.
-
-  Its cost is nonetheless real and should not be glossed: it converts one lemma
-  of the elliptic-curve soundness argument from *unconditional* to
-  *computational*. #ecsm today rests on no cryptographic assumption at all.
+  *The problem is not the assumption. It is that the reduction to it does not
+  close* --- so assuming it would buy nothing.
 ]
 
-== Open: the reduction to T0-DL is incomplete
-
-#todo[
-  *This section blocks sign-off.* The assumption above is *necessary but not
-  sufficient*: the reduction from the incomplete-addition edge to T0-DL does not
-  hold as stated, and there is a constructive counterexample. Do not read the
-  blinded design as closing the edge.
-]
-
-The reduction assumes the prover cannot relate $P_1$ and $P_2$ to $T_0$. It can.
-For `ecrecover`, $P_2 = R = "lift"_x (r)$ and $r$ is a signature component the
-submitter chooses freely --- the same freedom the attack above already uses. So
-the prover may set $P_2 = mu T_0$ for a $mu$ it picks, and then the $T_0$
-coefficient of the collision equation cancels against $P_2$'s. Writing the
-accumulator entering the addition at round $r r$ as
-$"acc" = alpha T_0 + beta_1 G + beta_2 P_2$ with $alpha, beta_1, beta_2$ public
-functions of the schedule and the scalar bits, and taking $u_1 < 2^(r r)$ so
-that $beta_1 = e_1 = 0$, the collision $"acc" = "addend" = P_2$ reduces to a
-single scalar equation
+The reduction assumes the prover cannot relate $P_1$ and $P_2$ to $T_0$. It
+can. For `ecrecover`, $P_2 = R = "lift"_x (r)$ and $r$ is a signature component
+the submitter chooses freely, so the prover may set $P_2 = mu T_0$ for a $mu$
+it picks, and the $T_0$ coefficient of the collision equation cancels against
+$P_2$'s. Writing the accumulator entering the addition at round $j$ as
+$"acc" = alpha T_0 + beta_1 G + beta_2 P_2$, with $alpha, beta_1, beta_2$
+public functions of the schedule and the scalar bits, and taking
+$u_1 < 2^j$ so that $beta_1 = 0$, the collision
+$"acc" = "addend" = P_2$ reduces to a single scalar equation
 
 $ alpha + mu (beta_2 - 1) equiv 0 mod N quad ==> quad mu = -alpha \/ (beta_2 - 1), $
 
-one modular inversion. The construction costs one scalar multiplication and no
-search at all --- cheaper than the attack on the *unblinded* chain that the
-blind was introduced to prevent. Concrete instances, together with the
-`ecrecover` inputs $(z, v, r, s)$ that reach them and a check that the guest's
-own decomposition reproduces them, are in
-`thoughts/ec-recover-opt/lincomb2/FINDING-nums-blinding.log`.
+one modular inversion. With $P_1 = G$ and $u_1 = 1$ it takes the concrete form
+$mu (c_2 - 1) equiv -2^j mod N$. The construction costs one scalar
+multiplication and no search at all --- *cheaper* than the corresponding attack
+on the unblinded chain, which the blind was introduced to prevent. It was
+verified 5 out of 5 over a range of schedule lengths, each instance packaged as
+a well-formed $(z, v, r, s)$, corroborated by the Python reference, the Rust
+witness and an independent Jacobian implementation.
+#footnote([`thoughts/ec-recover-opt/oracle/nums_blinding_probe.py`; writeup in `thoughts/ec-recover-opt/lincomb2/FINDING-nums-blinding.log`.])
 
-Consequently #lincomb needs an explicit non-degeneracy obligation on addition
-rows --- a witnessed inverse $d^(-1) (x_B - x_A) equiv 1 mod p$, or a
-detect-and-branch row variant --- which closes the edge *unconditionally* and
-without appeal to T0-DL. Which of the two, and what it costs, is not settled
-here.
+The witness generator rejects all of these with a nonzero status, so the
+honest path never reaches them; the forgery lives entirely on the
+malicious-prover side, where a row never passes through the witness generator
+at all. *Only a constraint can catch it*, which is what the non-degeneracy
+relation is.
 
-The blind remains worth keeping for the $"len"$ simplification noted above,
-but that is a convenience, not a soundness property, and does
-not by itself require T0-DL.
+== What the blinding is retained for
+
+The blind survives for a reason that has nothing to do with soundness: it lets
+any $"len"$ at least as large as the true MSB yield the correct $Q$, which
+drops the exact-MSB sub-lemma from the counting argument and lets $"len" <= 256$
+be structural in the #ect0 table. That is a convenience. It should not be
+described as a defence, and no part of the soundness argument may appeal to it.
